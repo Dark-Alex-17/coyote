@@ -8196,7 +8196,7 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     let asked_by = string_literals(&fn_body("src/repl/mesh.rs", "asked_by"));
     for needle in [
         "asked by {}",
-        "asked by {} (ended)",
+        "asked by {}{ENDED_SESSION_MARK}",
         "asked by another session",
     ] {
         assert!(
@@ -8832,12 +8832,12 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
     let label = "Mesh-Commands.md";
     let page = read(wiki.join(label));
     let commands = flat(&page);
-    let row = "`<name or id8> . <dest8> . <trust> . <hops> hops . heard <age>`";
+    let row = "`<user> / <session> . <dest8> . <trust> . <hops> hops . heard <age>`";
     let row_at = commands
         .find(row)
         .unwrap_or_else(|| panic!("{label}'s TAB note does not quote the row {row}"));
     for needle in [
-        "else the identity's short hash (or the destination's own, for a block on a hash never heard)",
+        "borrows no name and reads its short hashes, `unnamed` for the user when no identity is known",
         "`heard never`",
         "offered once, with its newest knock's age",
         "A knocker's row ends with its intro",

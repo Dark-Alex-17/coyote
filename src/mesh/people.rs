@@ -443,6 +443,28 @@ impl Namer {
             session: self.session(identity, destination),
         }
     }
+
+    /// `who` for a session whose identity is only `claimed`, never proven: no name is
+    /// lent to it, so it reads as the short hashes (`unnamed` with no claim), unless it is
+    /// one of your own sessions, which the local registry vouches for, and claims nobody
+    /// else's identity.
+    pub(crate) fn who_claimed(&self, claimed: Option<&str>, destination: &str) -> Who {
+        let claimed = claimed.filter(|identity| !identity.trim().is_empty());
+        if self
+            .own_sessions
+            .contains_key(&destination.to_ascii_lowercase())
+            && claimed.is_none_or(|identity| self.is_you(identity))
+        {
+            return self.who(None, destination);
+        }
+        Who {
+            user: claimed.map_or_else(
+                || UNNAMED.to_string(),
+                |identity| short(identity).to_ascii_lowercase(),
+            ),
+            session: short(destination).to_ascii_lowercase(),
+        }
+    }
 }
 
 /// The owner's alias shadows the advertised name even when it is itself hidden, so a card
@@ -652,6 +674,21 @@ mod tests {
             namer.who(Some(&owner), &plain).to_string(),
             format!("Alex / {}", short(&plain)),
             "a session with no name of its own reads its short hash under its user's name"
+        );
+        assert_eq!(
+            namer.who_claimed(Some(&owner), &owned).to_string(),
+            format!("{} / {}", short(&owner), short(&owned)),
+            "a row that only claims a user borrows neither their name nor their session's"
+        );
+        assert_eq!(
+            namer.who_claimed(None, &own_dest).to_string(),
+            "you / temp",
+            "the local registry vouches for your own sessions"
+        );
+        assert_eq!(
+            namer.who_claimed(Some(&owner), &own_dest).to_string(),
+            format!("{} / {}", short(&owner), short(&own_dest)),
+            "a row at your session's destination under another identity is not yours"
         );
     }
 

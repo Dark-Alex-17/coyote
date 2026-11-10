@@ -42,7 +42,7 @@ use crate::mesh::message::{
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
-    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerRecord, PeerSighting, PeerTable,
+    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
     Correlations, InboundKind, InboundRecord, InboundStore, OtherSessionAsk, PendingRecord,
@@ -1253,8 +1253,8 @@ impl MeshRuntime {
 
     /// Every name the human verbs resolve: your running sessions in destination order,
     /// `you`, then each user's and session's addressable name in hash order. An unnamed
-    /// session names nothing. A user's sessions are only the peer rows whose destination
-    /// re-derives from the identity, never a row's identity column on its word.
+    /// session names nothing. A user's sessions are the ones `known_sessions` proves, the
+    /// same set `<user>/<session>` picks from, never a row's identity column on its word.
     pub(crate) fn address_names(&self) -> Vec<AddressName> {
         let mut sessions: Vec<(String, String)> = self
             .own_sessions()
@@ -1281,12 +1281,7 @@ impl MeshRuntime {
                 sessions: own_destinations,
             },
         });
-        let peers: Vec<PeerRecord> = self
-            .peers()
-            .snapshot()
-            .into_iter()
-            .filter(row_derives)
-            .collect();
+        let known = self.known_sessions();
         let namer = self.namer();
         let mut people: Vec<(&str, Option<&str>, &str)> = namer
             .people()
@@ -1301,10 +1296,10 @@ impl MeshRuntime {
                     identity: identity.to_string(),
                 },
                 None => {
-                    let mut sessions: Vec<String> = peers
+                    let mut sessions: Vec<String> = known
                         .iter()
-                        .filter(|peer| peer.identity_hash.eq_ignore_ascii_case(identity))
-                        .map(|peer| peer.destination_hash.clone())
+                        .filter(|(at, _)| at.eq_ignore_ascii_case(identity))
+                        .map(|(_, destination)| destination.clone())
                         .collect();
                     sessions.sort_unstable();
                     sessions.dedup();
@@ -1405,6 +1400,23 @@ impl MeshRuntime {
 
     pub(crate) fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    /// A sighting of another session of this node's own identity at instance `instance`,
+    /// whose destination re-derives from the identity as a real announce's does.
+    #[cfg(test)]
+    pub(crate) fn own_session_sighting(&self, instance: &str, display_name: &str) -> PeerSighting {
+        let name = session_destination_name(instance);
+        let announced = SingleInputDestination::new(self.transport_identity.clone(), name);
+        PeerSighting {
+            destination_hash: announced.desc.address_hash.to_hex_string(),
+            identity_hash: self.fingerprint.clone(),
+            name_hash: hex_lower(name.as_name_hash_slice()),
+            public_key: None,
+            display_name: Some(display_name.to_string()),
+            protocol_version: 1,
+            hops: 1,
+        }
     }
 
     pub(crate) fn self_trust_seeded_on_upgrade(&self) -> bool {
@@ -5933,8 +5945,6 @@ impl MeshSlot {
             .unwrap_or_default()
     }
 
-    /// `<user> / <session>` for the session at `destination` of `identity`, as every
-    /// human-facing line names a peer.
     /// `<user> / <session>` for the session at `destination` of `identity`; empty for a
     /// message that names no session.
     pub(crate) fn who(&self, identity: &str, destination: &str) -> String {
@@ -6333,7 +6343,7 @@ enum RefusalPath {
 
 /// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
 /// the rolled-over counts first, then the one line the first refusal of the hour earns.
-/// `who` is the peer's label and is printed as it is.
+/// `who` is the peer as `<user> / <session>`, printed as it is.
 fn fold_lines(
     who: &str,
     reason: RefusalReason,
@@ -18923,8 +18933,9 @@ mod tests {
 
         /// Your named sessions come first in destination order, then `you`, then each
         /// user's and session's name; a user carries every session the peer table proves
-        /// is theirs, never a row whose identity column does not derive its destination,
-        /// and an unnamed session names nothing. Naming a user grants nothing.
+        /// is theirs and every one the trust list bound to them, even once its row aged
+        /// out, never a row whose identity column does not derive its destination, and an
+        /// unnamed session names nothing. Naming a user grants nothing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn address_names_lists_sessions_then_users_with_their_proven_sessions() {
             let started = started_runtime("node-address-names").await;
@@ -18983,6 +18994,26 @@ mod tests {
                 now,
             );
             let trust = runtime.trust();
+            // A trusted session of the first user whose row has since aged out.
+            let quiet_origin = [7u8; NAME_HASH_LEN];
+            let quiet = destination_address(&quiet_origin, &parse_hash(&identities[0]).unwrap())
+                .to_hex_string();
+            runtime.peers().observe(
+                PeerSighting {
+                    destination_hash: quiet.clone(),
+                    identity_hash: identities[0].clone(),
+                    name_hash: hex_lower(&quiet_origin),
+                    public_key: None,
+                    display_name: None,
+                    protocol_version: MESH_PROTOCOL_VERSION,
+                    hops: 1,
+                },
+                now - PEER_TTL - Duration::from_secs(60),
+            );
+            trust
+                .trust_destination(slot.as_ref(), &quiet, TrustOptions::default(), now)
+                .unwrap();
+            assert_eq!(runtime.peers().sweep(now), vec![quiet.clone()]);
             for (identity, name) in identities
                 .iter()
                 .zip(["none-heard", "one-heard", "two-heard"])
@@ -18993,7 +19024,7 @@ mod tests {
                 .set_session_alias(&identities[1], &heard[0], Some("laptop"), &[])
                 .unwrap();
             assert_eq!(
-                trust.identity_standing(&identities[0]),
+                trust.identity_standing(&identities[1]),
                 IdentityStanding::Unknown,
                 "a name grants nothing"
             );
@@ -19026,7 +19057,16 @@ mod tests {
                 NameTarget::User { sessions, .. } => sessions.clone(),
                 other => panic!("{user} is {other:?}"),
             };
-            assert!(sessions_of("none-heard").is_empty());
+            assert_eq!(
+                sessions_of("none-heard"),
+                std::slice::from_ref(&quiet),
+                "a trusted session counts once its row aged out, as `<user>/<session>` counts it"
+            );
+            assert_eq!(
+                runtime.who_at(&quiet).to_string(),
+                format!("none-heard / {}", short(&quiet)),
+                "a quiet trusted session is named under the identity its record is bound to"
+            );
             assert_eq!(
                 sessions_of("one-heard"),
                 [heard[0].clone()],

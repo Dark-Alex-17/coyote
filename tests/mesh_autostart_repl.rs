@@ -3591,7 +3591,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
     let out = trust_verb(
         &mut session,
         &format!(".mesh access revoke {dest} --yes"),
-        "Untrusted Ida (abababab): its destination record is gone; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.",
+        "Untrusted Ida / abababab (abababab): its destination record is gone; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.",
     );
     assert!(!out.contains("Error:"), "{out:?}");
     assert!(
@@ -5575,10 +5575,13 @@ fn people_names_at_a_cold_prompt_show_everywhere_and_the_naming_rules_refuse_wha
     );
     assert_eq!(people_section(&dir), before);
 
-    // A user where one session is needed, none of theirs heard: refused, nothing sent.
+    // A user where one session is needed, with two trusted sessions none of which is
+    // heard: refused listing both, the same sessions `<user>/<session>` picks from.
     let out = people_command(&mut session, ".mesh people status maki");
     assert!(
-        out.contains("Error: `Maki` is a user") && out.contains("no session"),
+        out.contains("Error: `Maki` is a user with 2 sessions")
+            && out.contains("`Maki/1111aaaa` (1111aaaa)")
+            && out.contains("`Maki/2222bbbb` (2222bbbb)"),
         "{out:?}"
     );
 

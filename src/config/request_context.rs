@@ -55,7 +55,8 @@ use crate::mesh::pending::{InboundKind, InboundRecord};
 use crate::mesh::people::UNNAMED;
 use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{
-    Decision, IdentityStanding, OverlayRecord, Rule, Tier, TrustRecord, Verdict, same_hash,
+    Decision, IdentityStanding, OverlayRecord, Rule, Tier, TrustRecord, Verdict, row_derives,
+    same_hash,
 };
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
@@ -419,12 +420,16 @@ impl DestinationCandidate {
 
     /// Whether the row's `<user> / <session>` carries a name rather than two short hashes.
     fn named(&self) -> bool {
-        let user = match self.identity.as_str() {
-            "" => UNNAMED.to_string(),
-            identity => short(identity).to_ascii_lowercase(),
+        // A row whose identity is not proven reads `unnamed`, whatever identity it claims.
+        let session = short(&self.destination).to_ascii_lowercase();
+        let unnamed = format!("{UNNAMED} / {session}");
+        let hashed = match self.identity.as_str() {
+            "" => unnamed.clone(),
+            identity => format!("{} / {session}", short(identity).to_ascii_lowercase()),
         };
-        let fallback = format!("{user} / {}", short(&self.destination).to_ascii_lowercase());
-        self.name.as_deref().is_some_and(|name| name != fallback)
+        self.name
+            .as_deref()
+            .is_some_and(|name| name != unnamed && name != hashed)
     }
 }
 
@@ -621,6 +626,18 @@ impl Sighting<'_> {
         }
     }
 
+    /// The identity that names the row: a peer row's only when its destination
+    /// re-derives from it, a record's bound one (bound when it was trusted), and none for
+    /// a knock, so no row borrows the name of a user it only claims to be.
+    fn proven_identity(&self) -> Option<&str> {
+        match self {
+            Self::Peer(peer) => row_derives(peer).then_some(peer.identity_hash.as_str()),
+            Self::Knock(_) => None,
+            Self::Record(record) => record.identity.as_deref(),
+        }
+        .filter(|identity| !identity.is_empty())
+    }
+
     fn provable(&self) -> bool {
         match self {
             Self::Peer(peer) => !peer.name_hash.is_empty(),
@@ -756,6 +773,7 @@ fn collect_destination_rows(
                     .expect("one extra verdict per record held under another key")
                     .1
             });
+            let proven = sighting.proven_identity().is_some();
             let mut candidate =
                 sighting.candidate(record, *verdict, *standing, record_standing, now);
             candidate.typed = typed_name(
@@ -764,8 +782,13 @@ fn collect_destination_rows(
                 &candidate.identity,
                 filter.offers_identity_labels(),
             );
-            let identity = (!candidate.identity.is_empty()).then_some(candidate.identity.as_str());
-            candidate.name = Some(namer.who(identity, &candidate.destination).to_string());
+            let claimed = (!candidate.identity.is_empty()).then_some(candidate.identity.as_str());
+            let who = if proven {
+                namer.who(claimed, &candidate.destination)
+            } else {
+                namer.who_claimed(claimed, &candidate.destination)
+            };
+            candidate.name = Some(who.to_string());
             candidate
         })
         .filter(|candidate| filter.keep(candidate))

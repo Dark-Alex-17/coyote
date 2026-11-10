@@ -46,7 +46,7 @@ use crate::mesh::trust::{
     BindingConflict, Decision, Forgotten, IdentityStanding, KeyChange, LiveMesh, Rule,
     SELF_TRUST_LABEL, SelfTrustRotation, ServedBy, Tier, TrustChange, TrustOptions, TrustOutcome,
     TrustRecord, TrustStore, Verdict, decode_name_hash, nothing_to_untrust_identity, parse_hash,
-    same_hash,
+    row_derives, same_hash,
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
@@ -71,7 +71,7 @@ use chrono::{DateTime, Utc};
 use inquire::{Confirm, Text};
 use log::debug;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Read};
@@ -682,6 +682,7 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
                 || runtime.link_failed(&peer.destination_hash)
                 || !runtime.path_known(&peer.destination_hash).await,
             own_gone,
+            claimed_only: !row_derives(peer),
         });
     }
     let trust = runtime.trust();
@@ -1056,10 +1057,8 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     out_path_text(
         &NoticeText::from("who: ")
             .peer(
-                runtime
-                    .namer()
-                    .who(Some(&identity), &destination)
-                    .to_string(),
+                // Named by the identity the row proves, never the one it only claims.
+                runtime.who_at(&destination).to_string(),
             )
             .frame("\n")
             .then(render_peer_detail(
@@ -2186,7 +2185,7 @@ async fn message(
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let trust = runtime.trust();
-    let who = runtime.namer().who(Some(&peer.identity_hash), &destination);
+    let who = runtime.who_at(&destination);
     let name = who.to_string();
     out_path_text(
         &send_confirmation(
@@ -2988,10 +2987,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         bail!(refusal);
     }
     let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
-    let name = runtime
-        .namer()
-        .who(Some(&peer.identity_hash), &destination)
-        .to_string();
+    let name = runtime.who_at(&destination).to_string();
     out_path_text(
         &knock_confirmation(
             &name,
@@ -4276,6 +4272,7 @@ fn prune(
         return Ok(());
     }
     if expected.is_none() {
+        let namer = trust_namer(ctx, store);
         let records = store.records();
         let mut lines = vec![format!(
             "Trusted instances not heard from in the last {threshold_text}:"
@@ -4288,7 +4285,7 @@ fn prune(
                 .map(|record| {
                     let mut who = format!(
                         "{}  last seen {}",
-                        record_label(record),
+                        record_label(&namer, record),
                         age_text(now, record.last_seen_at)
                     );
                     if let Some(change) = &record.key_changed {
@@ -4383,7 +4380,8 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 out_text(NOTHING_CHANGED);
                 return Ok(());
             }
-            let name = identity_name(&store, mesh, &preview.identity, &destination);
+            let namer = trust_namer(ctx, &store);
+            let name = identity_name(&namer, &preview.identity, &destination);
             let outcome = store.untrust_destination(mesh, &destination, false)?;
             reset_knock_surfacing(ctx, &outcome.identity);
             out_text(&format!(
@@ -4396,7 +4394,8 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         UntrustArg::Identity { target, confirm } => {
             let identity = identity_hash(ctx, &target)?;
             let confirmed = confirm.is_some();
-            untrust_identity(&store, mesh, &identity, confirm, now)?;
+            let namer = trust_namer(ctx, &store);
+            untrust_identity(&store, &namer, mesh, &identity, confirm, now)?;
             if confirmed {
                 reset_knock_surfacing(ctx, &identity);
             }
@@ -4423,32 +4422,19 @@ fn untrusted_tail(destination: &str, deny_stays: bool) -> String {
     }
 }
 
-/// The name an untrust sentence calls an identity: its record's label, else the
-/// destination record's, else the peer table's display name, else the short hash.
-fn identity_name(
-    store: &TrustStore,
-    mesh: &dyn LiveMesh,
-    identity: &str,
-    destination: &str,
-) -> String {
-    let records = store.records();
-    let label_of = |tier: Tier, hash: &str| {
-        records
-            .iter()
-            .find(|record| record.tier == tier && record.hash == hash)
-            .and_then(|record| record.label.as_deref())
-            .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
-    };
-    label_of(Tier::Identity, identity)
-        .or_else(|| label_of(Tier::Destination, destination))
-        .or_else(|| {
-            mesh.peers()
-                .and_then(|peers| peers.get(destination))
-                .filter(|peer| peer.identity_hash == identity)
-                .and_then(|peer| peer.display_name)
-                .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
-        })
-        .unwrap_or_else(|| short(identity).to_string())
+/// The name an untrust sentence calls the session whose record goes: `<user> / <session>`
+/// under the identity the record is bound to, never one a peer row now claims.
+fn identity_name(namer: &Namer, identity: &str, destination: &str) -> String {
+    namer.who(Some(identity), destination).to_string()
+}
+
+/// The namer for the trust verbs: the running node's, else one read from `store` alone
+/// when the node is off, which knows no session of yours.
+fn trust_namer(ctx: &RequestContext, store: &TrustStore) -> Namer {
+    match ctx.app.mesh.get() {
+        Some(runtime) => runtime.namer(),
+        None => Namer::new(store.people(&[]), None, HashMap::new()),
+    }
 }
 
 fn title_case(word: &str) -> String {
@@ -4466,6 +4452,7 @@ fn title_case(word: &str) -> String {
 /// the confirmed output appends the sweep line `access forget` and `access block --identity` print.
 fn untrust_identity(
     store: &TrustStore,
+    namer: &Namer,
     mesh: &dyn LiveMesh,
     identity: &str,
     confirm: Option<String>,
@@ -4518,7 +4505,7 @@ fn untrust_identity(
                 format!(
                     "  identity {}  {}  {scope}",
                     short(identity),
-                    record_label(identity_record)
+                    record_label(namer, identity_record)
                 ),
             ];
             if !bound.is_empty() {
@@ -4531,7 +4518,7 @@ fn untrust_identity(
                 lines.push(format!(
                     "    instance {}  {}  last seen {}{}",
                     record.hash,
-                    record_label(record),
+                    record_label(namer, record),
                     age_text(now, record.last_seen_at),
                     if record.denied { "  refused" } else { "" }
                 ));
@@ -4704,7 +4691,10 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let record = records.iter().find(|record| record.hash == *hash);
             lines.push(format!(
                 "  instance {hash}  {}  last seen {}{}",
-                record.map_or_else(|| "-".to_string(), record_label),
+                record.map_or_else(
+                    || "-".to_string(),
+                    |record| record_label(&runtime.namer(), record)
+                ),
                 record.map_or_else(
                     || "-".to_string(),
                     |record| age_text(now, record.last_seen_at)
@@ -8215,6 +8205,35 @@ mod name_addressing_tests {
         );
     }
 
+    /// A heard row whose destination does not re-derive from the identity it claims
+    /// borrows no name: claiming Maki reads as Maki's short hash, not `Maki`, and its
+    /// session's name is not lent either; it sorts with the unnamed rows.
+    #[test]
+    fn a_row_that_only_claims_a_user_borrows_no_name() {
+        let now = SystemTime::now();
+        let rows = vec![PeerRow::Heard(
+            PeerRecord {
+                identity_hash: MAKI.to_string(),
+                destination_hash: LAPTOP.to_string(),
+                ..peer(None, 5, now)
+            },
+            "untrusted",
+            None,
+            HeardFacts {
+                claimed_only: true,
+                ..HeardFacts::default()
+            },
+        )];
+        let text = render_peers(&rows, &namer(), now).plain();
+        let row = &table_rows(&text)[0];
+        assert_eq!(
+            (row[0].as_str(), row[1].as_str()),
+            (short(MAKI), short(LAPTOP)),
+            "{text}"
+        );
+        assert!(!text.contains("Maki") && !text.contains("laptop"), "{text}");
+    }
+
     /// The people list names each row by user and session, groups rows by user with you
     /// first, and keeps both short hashes in its last column.
     #[test]
@@ -8429,14 +8448,15 @@ fn trusted_destination_line(store: &TrustStore, outcome: &TrustOutcome) -> Strin
     )
 }
 
-/// A trust record as one word: its label, else the short identity it is bound to.
-fn record_label(record: &TrustRecord) -> String {
-    record
-        .label
-        .as_deref()
-        .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
-        .or_else(|| record.identity.as_deref().map(|id| short(id).to_string()))
-        .unwrap_or_else(|| "-".to_string())
+/// A trust record as the listings name it: an identity record by its user, a destination
+/// record as `<user> / <session>` under the identity it is bound to.
+fn record_label(namer: &Namer, record: &TrustRecord) -> String {
+    match record.tier {
+        Tier::Identity => namer.user(Some(&record.hash)),
+        Tier::Destination => namer
+            .who(record.identity.as_deref(), &record.hash)
+            .to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -9760,11 +9780,14 @@ enum PeerRow {
 /// the transport holds no path to (from the cached path table alone), one whose last link
 /// failed or one of your sessions that has ended reads; and whether it is one of your own
 /// sessions that the instance registry keeps as ended. Its user and session names come
-/// from the `Namer` the table is rendered with.
+/// from the `Namer` the table is rendered with, under the row's identity only when the
+/// destination re-derives from it: `claimed_only` marks a row whose identity column is the
+/// peer's word alone, which then names no user.
 #[derive(Debug, Default, Clone)]
 struct HeardFacts {
     no_route: bool,
     own_gone: bool,
+    claimed_only: bool,
 }
 
 /// How the pending lists name one of your own sessions.
@@ -9784,7 +9807,7 @@ fn asked_by(asker: Option<&InstanceSession>) -> String {
             format!("asked by {}", own_session_name(session))
         }
         Some(InstanceSession::Gone(session)) => {
-            format!("asked by {} (ended)", own_session_name(session))
+            format!("asked by {}{ENDED_SESSION_MARK}", own_session_name(session))
         }
         None => "asked by another session".to_string(),
     }
@@ -9940,7 +9963,17 @@ fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText 
                 )
             }
         };
-        let mut who = namer.who(identity.as_deref(), destination);
+        // A heard row's identity column is what the peer sent: it names the row only when
+        // the destination re-derives from it, so a row cannot borrow another user's name.
+        let (proven, mut who) = match row {
+            PeerRow::Heard(.., facts) if facts.claimed_only => {
+                (None, namer.who_claimed(identity.as_deref(), destination))
+            }
+            _ => (
+                identity.clone(),
+                namer.who(identity.as_deref(), destination),
+            ),
+        };
         if matches!(row, PeerRow::Heard(.., facts) if facts.own_gone) {
             who.session.push_str(ENDED_SESSION_MARK);
         }
@@ -9950,7 +9983,7 @@ fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText 
             identity.as_deref().map_or("-", short),
             short(destination)
         );
-        built.push((identity, who, cells));
+        built.push((proven, who, cells));
     }
     let mut first_seen: Vec<&str> = Vec::new();
     for (_, who, _) in &built {
@@ -10012,6 +10045,7 @@ mod peers_route_tests {
     const NO_PATH: HeardFacts = HeardFacts {
         no_route: true,
         own_gone: false,
+        claimed_only: false,
     };
 
     fn heard(peer: PeerRecord, facts: HeardFacts) -> PeerRow {
@@ -10144,6 +10178,7 @@ mod peers_route_tests {
             HeardFacts {
                 no_route: true,
                 own_gone: true,
+                claimed_only: false,
             },
         )];
         let text = render_peers(&own_gone, now).plain();
@@ -10243,6 +10278,7 @@ mod peers_you_tests {
                 HeardFacts {
                     no_route: true,
                     own_gone: true,
+                    claimed_only: false,
                 },
             ),
             PeerRow::Heard(
@@ -11409,10 +11445,10 @@ fn pending_entry(
     lines
 }
 
-/// The peers' names and their owners' remedies are quoted as they stand; the counts and
-/// this node's own hints follow the prefix.
 /// The `.mesh messaging broadcast` report: one row per recipient, named by `who` from its
 /// destination as every other line names a session, then the tally.
+/// The peers' names and their owners' remedies are quoted as they stand; the counts and
+/// this node's own hints follow the prefix.
 fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) -> NoticeText {
     if outcome.recipients.is_empty() {
         return "No trusted peer has a known path right now; nothing was sent. `.mesh people list` lists what this node has heard from.".into();
@@ -13256,6 +13292,7 @@ mod tests {
                 HeardFacts {
                     no_route: true,
                     own_gone: true,
+                    claimed_only: false,
                 },
             ),
             PeerRow::Heard(
@@ -13279,6 +13316,7 @@ mod tests {
                 HeardFacts {
                     no_route: true,
                     own_gone: false,
+                    claimed_only: false,
                 },
             ),
             PeerRow::Heard(
@@ -20299,19 +20337,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let runtime = started.runtime.clone();
                         let (unrouted, _) = heard_peer(&runtime, "Tia", SystemTime::now());
                         assert!(!runtime.path_known(&unrouted).await);
-                        let other_session = hex_lower(&[0x4e; 16]);
-                        runtime.peers().observe(
-                            PeerSighting {
-                                destination_hash: other_session.clone(),
-                                identity_hash: runtime.fingerprint().to_string(),
-                                name_hash: String::new(),
-                                public_key: None,
-                                display_name: Some("Laptop".to_string()),
-                                protocol_version: 1,
-                                hops: 1,
-                            },
-                            SystemTime::now(),
-                        );
+                        let sighting = runtime.own_session_sighting("laptop", "Laptop");
+                        let other_session = sighting.destination_hash.clone();
+                        runtime.peers().observe(sighting, SystemTime::now());
 
                         let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         let rows = table_rows(&out);
@@ -20366,9 +20394,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                 }
 
+                /// Hears another session of `runtime`'s own identity that runs nowhere on
+                /// this computer, its destination derived from the identity as a real
+                /// announce's is; returns that destination.
+                fn heard_own_elsewhere(runtime: &MeshRuntime) -> String {
+                    let sighting = runtime.own_session_sighting("elsewhere", "Laptop");
+                    let destination = sighting.destination_hash.clone();
+                    runtime.peers().observe(sighting, SystemTime::now());
+                    destination
+                }
+
                 /// With sessions `a` and `temp` running on one cache dir, `a` names temp's
-                /// row `(you: temp)` in `.mesh people list` and in `.mesh messaging sent`, while an own
-                /// identity row no running session serves stays `(you)`.
+                /// row `you / temp` in `.mesh people list` and in `.mesh messaging sent`, while an
+                /// own-identity row no running session serves reads `you / <dest8>`.
                 #[test]
                 #[serial]
                 fn a_running_own_session_is_named_by_its_session() {
@@ -20384,9 +20422,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut ctx = ctx_with(MeshConfig::default(), true);
                         ctx.app.mesh.install(a.clone()).unwrap();
                         let temp_dest = temp.current_destination_hash();
-                        let gone_session = hex_lower(&[0x4e; 16]);
                         heard_as_you(&a, &temp_dest);
-                        heard_as_you(&a, &gone_session);
+                        let gone_session = heard_own_elsewhere(&a);
 
                         let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         let rows = table_rows(&out);
@@ -20718,8 +20755,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 },
                                 SystemTime::now(),
                             );
-                            let gone_session = hex_lower(&[0x4e; 16]);
-                            heard_as_you(&a, &gone_session);
+                            let gone_session = heard_own_elsewhere(&a);
 
                             let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                             let rows = table_rows(&out);
@@ -28448,7 +28484,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(out.contains("This untrusts instance"), "{out}");
                     assert!(
                         out.ends_with(&format!(
-                            "Untrusted Tia ({}): its destination record is gone; the identity {} stays known. It is served no longer; a knock from it will be filed again.",
+                            "Untrusted Tia / {0} ({0}): its destination record is gone; the identity {1} stays known. It is served no longer; a knock from it will be filed again.",
                             short(&dest),
                             short(&id)
                         )),
@@ -29892,7 +29928,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap();
                     assert!(
-                        out.contains(&format!("Untrusted Bo ({})", short(&dest_b))),
+                        out.contains(&format!("Untrusted Bo / {0} ({0})", short(&dest_b))),
                         "{out}"
                     );
                     assert!(
@@ -32476,7 +32512,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "This untrusts instance {d8}: its destination record goes; the identity {i8} stays known. {tail}\nUntrusted Tia ({d8}): its destination record is gone; the identity {i8} stays known. {tail}",
+                            "This untrusts instance {d8}: its destination record goes; the identity {i8} stays known. {tail}\nUntrusted Tia / {d8} ({d8}): its destination record is gone; the identity {i8} stays known. {tail}",
                             d8 = short(&dest),
                             i8 = short(&id)
                         )
@@ -32531,7 +32567,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out.lines().last().unwrap(),
                         format!(
-                            "Untrusted Tia ({d8}): its destination record is gone; the identity {i8} stays known. {tail}",
+                            "Untrusted Tia / {d8} ({d8}): its destination record is gone; the identity {i8} stays known. {tail}",
                             d8 = short(&dest),
                             i8 = short(&id)
                         ),
@@ -32639,7 +32675,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         out,
                         format!(
-                            "{preview}\nUntrusted Tia ({}): its destination record is gone; the identity {} stays known. {tail}",
+                            "{preview}\nUntrusted Tia / {0} ({0}): its destination record is gone; the identity {1} stays known. {tail}",
                             short(&dest),
                             short(&id)
                         )
