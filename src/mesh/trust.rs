@@ -756,6 +756,9 @@ pub(crate) struct Forgotten {
     /// Every deny on a destination of the identity, whether or not a record held it.
     pub denies: Vec<String>,
     pub blocked: bool,
+    /// The people section held names of the identity or of its sessions, which revoke
+    /// and block leave in place.
+    pub names: bool,
 }
 
 impl Forgotten {
@@ -764,6 +767,7 @@ impl Forgotten {
             && self.instances.is_empty()
             && self.denies.is_empty()
             && !self.blocked
+            && !self.names
     }
 }
 
@@ -2756,12 +2760,13 @@ impl TrustStore {
                 file.denied_destinations.remove(hash);
             }
             let blocked = file.blocked_identities.remove(&identity).is_some();
-            let named = file.people.remove(&identity).is_some();
+            let names = file.people.remove(&identity).is_some();
             let forgotten = Forgotten {
                 identity_record,
                 instances,
                 denies,
                 blocked,
+                names,
             };
             if dry_run {
                 return Ok(forgotten);
@@ -2770,7 +2775,7 @@ impl TrustStore {
                 || !removed.is_empty()
                 || !forgotten.denies.is_empty()
                 || blocked
-                || named
+                || names
             {
                 self.commit(
                     &mut state,
@@ -2945,6 +2950,9 @@ impl TrustStore {
     /// says it and its person are called, each cleaned first. Each replaces the one an
     /// earlier card gave, and a field the card left out clears it. An owner's alias is
     /// never touched. Writes only when something changed; returns whether it did.
+    /// Nothing here checks the pair: the caller passes the identity and destination the
+    /// card was proven to come from, and only for a session it trusts, so a stranger's
+    /// card never grows the file.
     pub(crate) fn record_advertised(
         &self,
         identity_hash: &str,
@@ -6877,6 +6885,7 @@ mod tests {
                 heard.destination_hash.clone(),
             ]),
             blocked: false,
+            names: false,
         };
         let before = fx.file_bytes();
 
@@ -8909,6 +8918,7 @@ mod tests {
                 instances: vec![bound.destination_hash.clone()],
                 denies: vec![heard.destination_hash.clone()],
                 blocked: false,
+                names: false,
             }
         );
         assert!(fx.store.denied().is_empty());
@@ -13344,7 +13354,7 @@ mod tests {
             );
             assert_eq!(names(&fx.reopen()), named, "and the file keeps them");
 
-            fx.store.forget_identity(&fx.mesh, id, true).unwrap();
+            assert!(fx.store.forget_identity(&fx.mesh, id, true).unwrap().names);
             assert_eq!(names(&fx.store), named, "a dry run erases nothing");
 
             fx.store.forget_identity(&fx.mesh, id, false).unwrap();
@@ -13367,10 +13377,15 @@ mod tests {
                 .forget_identity(&fx.mesh, &stranger, false)
                 .unwrap();
 
-            assert!(
-                forgotten.is_empty(),
-                "no access record was held: {forgotten:?}"
+            assert_eq!(
+                forgotten,
+                Forgotten {
+                    names: true,
+                    ..Forgotten::default()
+                },
+                "only the names were held"
             );
+            assert!(!forgotten.is_empty(), "names are something to forget");
             let reopened = fx.reopen();
             assert_eq!(person_name(&reopened, &stranger), None);
             assert_eq!(person_name(&reopened, &other).as_deref(), Some("Cy"));
@@ -13534,6 +13549,64 @@ mod tests {
 
             assert_eq!(record(&store, &peer).label.as_deref(), Some("New"));
             assert_eq!(person_name(&store, &peer).as_deref(), Some("New"));
+        }
+
+        /// Two labels an older file kept that read the same become two owner aliases
+        /// that collide: both are kept, and the people view marks both hidden. The trust
+        /// listing's own record label still shows the stored text until the display
+        /// reads the people view.
+        #[test]
+        fn colliding_migrated_labels_are_kept_but_hidden() {
+            let tmp = TempDir::new("trust-people-migrate-collide");
+            let path = trust_path(&tmp);
+            let (a, b, c) = (fake_hash(0x21), fake_hash(0x22), fake_hash(0x23));
+            let ts = "2026-01-01T00:00:00Z";
+            let identity = |hash: &str, label: &str| {
+                format!(
+                    "  {hash}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: {label}\n    note: null\n    all_destinations: true\n"
+                )
+            };
+            fs::write(
+                &path,
+                format!(
+                    "version: {TRUST_FILE_VERSION}\nidentities:\n{}{}{}",
+                    identity(&a, "Sam"),
+                    identity(&b, "sam"),
+                    identity(&c, "Kim"),
+                ),
+            )
+            .unwrap();
+
+            let store = TrustStore::open(&tmp.path).unwrap();
+            let people = store.people(&[]);
+            for hash in [&a, &b] {
+                let alias = people.person(hash).unwrap();
+                assert_eq!(alias.source, AliasSource::Owner);
+                assert_eq!(alias.status, AliasUse::Hidden, "{}", alias.text);
+                assert!(!alias.displayable() && !alias.addressable());
+            }
+            assert!(people.person(&c).unwrap().addressable());
+            let people = store.people(&["kim"]);
+            assert_eq!(
+                people.person(&c).unwrap().status,
+                AliasUse::Hidden,
+                "a name reading as an own session is hidden too"
+            );
+            assert_eq!(record(&store, &a).label.as_deref(), Some("Sam"));
+
+            store.set_person_alias(&c, Some("Kit"), &[]).unwrap();
+            let file: TrustFile =
+                serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                file.people[&a].alias.as_deref(),
+                Some("Sam"),
+                "kept on file"
+            );
+            assert_eq!(
+                file.people[&b].alias.as_deref(),
+                Some("sam"),
+                "kept on file"
+            );
         }
 
         #[test]

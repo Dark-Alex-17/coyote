@@ -6313,8 +6313,9 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// Names are display only: B named by A's owner, and by B's own card, is still a
-    /// stranger whose request A drops unanswered.
+    /// Names are display only: B named by A's owner, and by the names B's card
+    /// advertised (recorded directly here), is still a stranger whose request A drops
+    /// unanswered; the drop leaves the names on file and logs none of them.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_named_stranger_is_dropped_as_unknown() {
         install_log_collector();
@@ -6324,15 +6325,18 @@ pub(crate) mod network {
         let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
         let b_destination = pair.responder.desc.address_hash.to_hex_string();
         let trust = pair.node_a.trust();
+        let names = ["Quorra-rq1", "Quorra-rq2", "Quorra-rq3", "Quorra-rq4"];
         trust
-            .set_person_alias(&b_identity, Some("Bea"), &[])
+            .set_person_alias(&b_identity, Some(names[0]), &[])
             .unwrap();
         trust
-            .set_session_alias(&b_identity, &b_destination, Some("review"), &[])
+            .set_session_alias(&b_identity, &b_destination, Some(names[1]), &[])
             .unwrap();
-        trust
-            .record_advertised(&b_identity, &b_destination, Some("Beatrice"), Some("temp"))
-            .unwrap();
+        assert!(
+            trust
+                .record_advertised(&b_identity, &b_destination, Some(names[2]), Some(names[3]))
+                .unwrap()
+        );
         assert_eq!(
             trust.identity_standing(&b_identity),
             IdentityStanding::Unknown
@@ -6354,6 +6358,28 @@ pub(crate) mod network {
         assert_eq!(cached_knocks(&pair), 0);
         assert!(idle.0.lock().is_empty(), "{:#?}", idle.0.lock());
         assert!(pair.trust_records_of_others().is_empty());
+        let people = trust.people(&[]);
+        assert_eq!(
+            people.person(&b_identity).map(|alias| alias.text.as_str()),
+            Some(names[0])
+        );
+        assert_eq!(
+            people
+                .session(&b_identity, &b_destination)
+                .map(|alias| alias.text.as_str()),
+            Some(names[1])
+        );
+        let logged: Vec<String> = crate::testing::debug_snapshot()
+            .into_iter()
+            .chain(crate::testing::info_snapshot())
+            .chain(crate::testing::warn_snapshot())
+            .collect();
+        for name in names {
+            assert!(
+                !logged.iter().any(|line| line.contains(name)),
+                "{name} was logged"
+            );
+        }
         pair.stop_node_a().await;
     }
 
@@ -6505,6 +6531,7 @@ pub(crate) mod network {
                 instances: vec![other_instance.clone()],
                 denies: vec![other_instance.clone()],
                 blocked: false,
+                names: false,
             }
         );
         assert_eq!(knocks, 1);

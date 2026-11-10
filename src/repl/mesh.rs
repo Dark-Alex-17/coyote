@@ -4535,6 +4535,9 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         if forgotten.blocked {
             lines.push(format!("  block on identity {}", short(&identity)));
         }
+        if forgotten.names {
+            lines.push("  the names of this person and their sessions".to_string());
+        }
         if knocks > 0 {
             lines.push(format!("  {}", plural(knocks, "knock", "knocks")));
         }
@@ -28174,6 +28177,77 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "once swept, the identity is a stranger"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Revoking keeps the name the owner gave a session, so an identity the access
+            /// store no longer holds is still something to forget: the dry run lists its
+            /// names, the confirmed run erases them, and only then is it a stranger.
+            #[test]
+            #[serial]
+            fn forget_identity_erases_the_names_a_revoke_left_behind() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-forget-names");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-forget-names").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    let token = format!("forget-{}", short(&id));
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust {dest} --yes --label \"Tia's desk\""),
+                    )
+                    .await
+                    .unwrap();
+                    trust
+                        .untrust_destination(ctx.app.mesh.as_ref(), &dest, false)
+                        .unwrap();
+                    trust
+                        .untrust_identity(ctx.app.mesh.as_ref(), &id, false)
+                        .unwrap();
+                    assert_eq!(trust.identity_standing(&id), IdentityStanding::Unknown);
+                    let names = "  the names of this person and their sessions";
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgetting identity {id} erases:\n{names}\n{DRY_RUN_NOTHING_CHANGED} To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm {token}"
+                        )
+                    );
+                    assert!(
+                        trust.people(&[]).session(&id, &dest).is_some(),
+                        "a dry run keeps the names"
+                    );
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgot identity {}: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.\n{names}",
+                            short(&id)
+                        )
+                    );
+                    assert_eq!(trust.people(&[]).session(&id, &dest), None);
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access forget --identity {id}")).await;
+                    assert!(err.contains("is a stranger already"), "{err}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

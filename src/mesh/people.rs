@@ -26,7 +26,7 @@ const RESERVED_NAMES: [&str; 2] = ["you", "unnamed"];
 /// A run of this many hex digits or more reads as a hash prefix, which an address takes.
 const HASH_LIKE_MIN_CHARS: usize = 8;
 
-pub(crate) const NAME_TAKEN: &str = "Another person or session already has that name (names are compared ignoring case); nothing was changed.";
+pub(crate) const NAME_TAKEN: &str = "Another person or session already has that name (names are compared ignoring case); nothing was changed. `.mesh people list` shows the names in use; pick another.";
 
 /// One person's names, keyed in the trust list by their identity hash.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,19 +111,24 @@ pub(crate) enum NameRule {
 
 impl NameRule {
     fn sentence(self) -> String {
-        match self {
-            Self::Empty => "A name cannot be empty; nothing was changed.".to_string(),
+        let why = match self {
+            Self::Empty => "A name cannot be empty".to_string(),
             Self::TooLong => {
-                format!("A name is at most {NAME_MAX_CHARS} characters; nothing was changed.")
+                format!("A name is at most {NAME_MAX_CHARS} characters")
             }
-            Self::Slash => "A name cannot contain `/`, which separates a person from a session; nothing was changed.".to_string(),
-            Self::Reserved => "`you` and `unnamed` are reserved and cannot be a name; nothing was changed.".to_string(),
+            Self::Slash => {
+                "A name cannot contain `/`, which separates a person from a session".to_string()
+            }
+            Self::Reserved => "`you` and `unnamed` are reserved and cannot be a name".to_string(),
             Self::HashLike => format!(
-                "A name of {HASH_LIKE_MIN_CHARS} or more hex characters would read as a hash; nothing was changed."
+                "A name of {HASH_LIKE_MIN_CHARS} or more hex characters would read as a hash"
             ),
-        }
+        };
+        format!("{why}; nothing was changed. {RETRY}")
     }
 }
+
+const RETRY: &str = "Give the name again in another form.";
 
 /// The first naming rule `name` breaks, judged on the text as given.
 pub(crate) fn broken_rule(name: &str) -> Option<NameRule> {
@@ -150,7 +155,9 @@ pub(crate) fn broken_rule(name: &str) -> Option<NameRule> {
 /// is the caller's, which holds the other names.
 pub(crate) fn owner_alias(raw: &str) -> Result<String> {
     if raw.chars().any(is_control_or_invisible) {
-        bail!("A name cannot contain control or invisible characters; nothing was changed.");
+        bail!(
+            "A name cannot contain control or invisible characters; nothing was changed. {RETRY}"
+        );
     }
     let name = raw.trim();
     if let Some(rule) = broken_rule(name) {
@@ -167,6 +174,12 @@ pub(crate) fn clean_advertised(raw: &str) -> Option<String> {
 
 fn fold(name: &str) -> String {
     name.to_lowercase()
+}
+
+/// What two names are compared on: the text as it would be shown, ignoring case. `None`
+/// for a stored name with nothing printable left, which counts as unset.
+fn name_key(raw: &str) -> Option<String> {
+    clean_advertised(raw).map(|text| fold(&text))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -239,7 +252,10 @@ impl People {
         for (index, candidate) in candidates.iter().enumerate() {
             by_name.entry(&candidate.folded).or_default().push(index);
         }
-        let own: Vec<String> = own_sessions.iter().map(|name| fold(name)).collect();
+        let own: Vec<String> = own_sessions
+            .iter()
+            .filter_map(|name| name_key(name))
+            .collect();
         let hidden: Vec<bool> = candidates
             .iter()
             .map(|candidate| {
@@ -319,23 +335,31 @@ pub(crate) fn owner_alias_taken(
     name: &str,
     own_sessions: &[&str],
 ) -> bool {
-    let wanted = fold(name);
+    let Some(wanted) = name_key(name) else {
+        return false;
+    };
     let subject = subject_of(identity, destination);
-    if matches!(subject, Subject::Person(_)) && own_sessions.iter().any(|own| fold(own) == wanted) {
+    if matches!(subject, Subject::Person(_))
+        && own_sessions
+            .iter()
+            .any(|own| name_key(own).as_ref() == Some(&wanted))
+    {
         return true;
     }
+    let same = |alias: &str| name_key(alias).as_ref() == Some(&wanted);
     entries.iter().any(|(other_identity, entry)| {
         let person = Subject::Person(other_identity.clone());
         let person_taken = entry
             .alias
             .as_deref()
-            .is_some_and(|alias| fold(alias.trim()) == wanted && collide(&subject, &person));
+            .is_some_and(|alias| same(alias) && collide(&subject, &person));
         person_taken
             || entry.sessions.iter().any(|(other_destination, names)| {
                 let session = subject_of(other_identity, Some(other_destination));
-                names.alias.as_deref().is_some_and(|alias| {
-                    fold(alias.trim()) == wanted && collide(&subject, &session)
-                })
+                names
+                    .alias
+                    .as_deref()
+                    .is_some_and(|alias| same(alias) && collide(&subject, &session))
             })
     })
 }
@@ -474,7 +498,11 @@ mod tests {
         ] {
             let err = owner_alias(raw).unwrap_err().to_string();
             assert!(err.contains(needle), "{raw:?}: {err}");
-            assert!(err.ends_with("nothing was changed."), "{err}");
+            assert!(err.contains("; nothing was changed. "), "{err}");
+            assert!(
+                err.ends_with(RETRY),
+                "the refusal says what to do next: {err}"
+            );
             if !raw.is_empty() && broken_rule(raw) != Some(NameRule::Reserved) {
                 assert!(!err.contains(raw), "the refusal repeats the name: {err}");
             }
@@ -678,6 +706,11 @@ mod tests {
         );
         assert!(taken(&b, None, "main", &["Main"]));
         assert!(!taken(&a, Some(&d2), "main", &["Main"]));
+        assert!(
+            taken(&b, None, "alex\u{200b}", &[]),
+            "names compare as they are shown"
+        );
+        assert!(NAME_TAKEN.contains("`.mesh people list`"), "{NAME_TAKEN}");
     }
 
     #[test]

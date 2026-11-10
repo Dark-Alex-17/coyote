@@ -36,7 +36,8 @@ pub(crate) const TODO_GOAL_MAX_CHARS: usize = 280;
 pub(crate) const ABOUT_MAX_CHARS: usize = 200;
 pub(crate) const CAPS_MAX_ENTRIES: usize = 16;
 pub(crate) const CAP_MAX_CHARS: usize = 32;
-/// Cap on the `session` and `person_name` card fields, cleaned on both sides.
+/// Cap on a person's or a session's name, in characters after `display_text` cleaning:
+/// the owner's alias and the `session` and `person_name` names a card advertises.
 pub(crate) const NAME_MAX_CHARS: usize = 64;
 
 /// What a trusted peer learns about this session when it asks `/status`.

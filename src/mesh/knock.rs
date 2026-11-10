@@ -1962,22 +1962,24 @@ mod tests {
     }
 
     /// Names are display only: a stranger the owner named, and whose card names it, is
-    /// still a stranger to the gate.
+    /// still a stranger to the gate, which logs none of the names.
     #[test]
     fn a_named_stranger_is_still_never_a_knock() {
+        crate::testing::install_log_collector();
         let rig = Rig::new("knock-gate-named-stranger", TrustList::default());
         let (stranger, instance) = (hash_of("stranger"), hash_of("inst"));
+        let names = ["Quorra-kn1", "Quorra-kn2", "Quorra-kn3", "Quorra-kn4"];
         rig.gate
             .trust
-            .set_person_alias(&stranger, Some("Bea"), &[])
+            .set_person_alias(&stranger, Some(names[0]), &[])
             .unwrap();
         rig.gate
             .trust
-            .set_session_alias(&stranger, &instance, Some("review"), &[])
+            .set_session_alias(&stranger, &instance, Some(names[1]), &[])
             .unwrap();
         rig.gate
             .trust
-            .record_advertised(&stranger, &instance, Some("Beatrice"), Some("temp"))
+            .record_advertised(&stranger, &instance, Some(names[2]), Some(names[3]))
             .unwrap();
 
         for via in [KnockVia::Direct, KnockVia::StoreAndForward] {
@@ -1992,6 +1994,17 @@ mod tests {
         assert!(rig.surface.texts().is_empty());
         assert!(!rig.gate.cache().path().exists());
         assert!(rig.gate.tracked_identities().is_empty());
+        let logged: Vec<String> = crate::testing::debug_snapshot()
+            .into_iter()
+            .chain(crate::testing::info_snapshot())
+            .chain(crate::testing::warn_snapshot())
+            .collect();
+        for name in names {
+            assert!(
+                !logged.iter().any(|line| line.contains(name)),
+                "{name} was logged"
+            );
+        }
     }
 
     #[test]

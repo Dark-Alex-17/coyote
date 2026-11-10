@@ -39292,7 +39292,7 @@ mod tests {
                 "Bea . {} . blocked (instance) . 1 hops . heard 1m ago",
                 short(&dest)
             ),
-            "the block took the labelled record, so the announced name leads"
+            "the block took the record, and a blocked row names no identity to find the kept session name under, so the announced name leads"
         );
         assert_eq!(
             completion_values(&fixture.complete(&["access", "unblock", "--identity", ""])),
