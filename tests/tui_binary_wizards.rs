@@ -3712,6 +3712,49 @@ fn update_with_a_tty_on_stdout_but_a_piped_stdin_is_refused_cleanly() {
     assert_tty_restored(&plain);
 }
 
+/// `--add-secret <name>` with a terminal on stdout but stdin redirected
+/// from `/dev/null`: the Password prompt could paint but never read, so
+/// the vault refuses in the shared shape with nothing but a terminal as
+/// the remedy, exits non-zero, paints no prompt and writes no vault file.
+#[test]
+#[serial]
+fn add_secret_with_a_tty_on_stdout_but_a_piped_stdin_is_refused_in_the_shared_shape() {
+    let dir = fresh_config_dir("add-secret-piped-stdin");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let files_before = walk(&dir);
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --add-secret piped-secret-k2v",
+    );
+    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+
+    assert_ne!(exit_code(&plain), 0, "{plain}");
+    assert_eq!(
+        refusal_shape(&plain),
+        Some(("add secret 'piped-secret-k2v'".into(), ".".into())),
+        "the piped-stdin `--add-secret` is not refused in the shared shape:\n{plain}"
+    );
+    assert!(
+        !plain.contains("Enter the secret value") && !plain.contains("Secret?"),
+        "the secret prompt was painted with nothing to read it from:\n{plain}"
+    );
+    for name in ["vault", "piped-secret-k2v"] {
+        let written = new_files_named(&dir, &files_before, name);
+        assert!(
+            written.is_empty(),
+            "the refused `--add-secret` still wrote {written:?}:\n{plain}"
+        );
+    }
+    assert_tty_restored(&plain);
+}
+
 // ---------------------------------------------------------------------
 // Wizards driven from a clean config dir: the rag wizard's Input modal
 // against its plain-REPL twin, the closed Select's key handling, and
