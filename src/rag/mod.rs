@@ -3483,6 +3483,7 @@ mod tests {
 
     /// With no human to answer, every question of the wizard is refused.
     #[test]
+    #[serial]
     fn wizard_prompts_without_a_human_are_refused() {
         let model = embedding_model("small", None);
         let errors = [
@@ -3547,6 +3548,7 @@ mod tests {
     /// A rejected answer is asked again with the reason in front of the
     /// label, so the field keeps its name in the modal.
     #[test]
+    #[serial]
     fn rejected_wizard_answers_are_asked_again_with_the_reason() {
         let required = ScriptedPrompter::new(vec![text(""), text("x")]);
         assert_eq!(
@@ -3595,6 +3597,7 @@ mod tests {
     /// A select over described options hands back the value behind the
     /// chosen display line, and only a line that was offered.
     #[test]
+    #[serial]
     fn select_option_maps_the_chosen_display_line_back_to_its_value() {
         let options = || {
             vec![

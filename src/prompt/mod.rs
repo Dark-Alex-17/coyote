@@ -985,6 +985,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn select_closed_hands_back_an_offered_option() {
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("b".to_string())]);
         let options = vec!["a".to_string(), "b".to_string()];
@@ -998,6 +999,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn select_closed_rejects_an_answer_outside_the_options() {
         let prompter =
             ScriptedPrompter::new(vec![PromptAnswer::Selected("not-offered".to_string())]);
@@ -1014,6 +1016,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn select_closed_without_a_human_is_a_needs_human_refusal() {
         let err = select_closed(
             &HeadlessPrompter,
@@ -1025,6 +1028,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn confirm_with_help_carries_the_printed_context_as_help() {
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
         assert!(

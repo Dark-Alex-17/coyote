@@ -4337,8 +4337,16 @@ mod tests {
 
         let queue = NotificationQueue::new();
         queued::queue_user_message(&queue, "hello q9d-q");
+        // The sink is process-global; other tests publish prompts on it
+        // concurrently, so only this test's own events are judged.
+        let own_events = |sink: &crate::events::RecordingSink, token: &str| -> Vec<Event> {
+            sink.drain()
+                .into_iter()
+                .filter(|event| format!("{event:?}").contains(token))
+                .collect()
+        };
         assert_eq!(
-            sink.drain(),
+            own_events(&sink, "q9d-q"),
             vec![Event::QueuedInput {
                 text: "hello q9d-q".to_string()
             }]
@@ -4366,7 +4374,7 @@ mod tests {
                 },
             ]
         );
-        assert!(sink.drain().is_empty());
+        assert!(own_events(&sink, ".info").is_empty());
         let frame = harness.draw();
         assert!(frame.contains("pending: 2"), "{frame}");
 

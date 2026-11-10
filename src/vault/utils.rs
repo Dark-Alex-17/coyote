@@ -870,6 +870,7 @@ mod tests {
     /// A required field left empty is asked again with inquire's own
     /// wording in front of its label; the first non-empty answer lands.
     #[test]
+    #[serial]
     fn an_empty_required_field_is_asked_again() {
         let prompter = ScriptedPrompter::new(vec![text(""), text("proj")]);
         let SupportedProvider::GcpSecretManager { provider_def } =
@@ -887,6 +888,7 @@ mod tests {
     /// A choice outside the offered providers is rejected with the shared
     /// closed-select message, not a crash.
     #[test]
+    #[serial]
     fn an_unknown_provider_choice_is_an_error() {
         let prompter =
             ScriptedPrompter::new(vec![PromptAnswer::Selected("vaultwarden".to_string())]);
@@ -946,6 +948,7 @@ mod tests {
     /// An empty configured password file is filled through the
     /// prompter after a confirm that defaults to yes.
     #[test]
+    #[serial]
     fn an_empty_password_file_is_filled_through_the_prompter() {
         let dir = TempDir::new("fill");
         let configured = dir.0.join("configured");
@@ -979,6 +982,7 @@ mod tests {
     /// validator's own wording in front of the label, and so is a
     /// password that is empty or shorter than ten characters.
     #[test]
+    #[serial]
     fn a_rejected_path_or_short_password_is_asked_again() {
         let dir = TempDir::new("re-ask");
         let taken = dir.0.join("taken");
@@ -1017,6 +1021,7 @@ mod tests {
     /// Declining leaves the file alone with the same errors as before; a
     /// cancelled password keeps the wording the inquire failure had.
     #[test]
+    #[serial]
     fn declining_or_cancelling_writes_no_password_file() {
         let dir = TempDir::new("decline");
         let configured = dir.0.join("configured");
@@ -1058,6 +1063,7 @@ mod tests {
     /// With no human to answer, every prompt of the wizard is refused
     /// and nothing is written or chosen.
     #[test]
+    #[serial]
     fn provider_and_password_prompts_without_a_human_are_refused() {
         let dir = TempDir::new("headless");
         let mut vault = dir.local_vault("configured");
