@@ -2507,8 +2507,15 @@ SUB_REPO = os.path.join(TMP, "subtask-repo")
 os.makedirs(SUB_REPO)
 
 
+def scratch_git(repo, *a, env=None):
+    """git in a scratch repo with a fixed identity: CI hosts have none configured."""
+    ident = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", "-C", repo, *a], check=True, capture_output=True, text=True,
+                          env={**os.environ, **ident, **(env or {})}).stdout.strip()
+
+
 def sub_git(*a):
-    return subprocess.run(["git", "-C", SUB_REPO, *a], check=True, capture_output=True, text=True).stdout.strip()
+    return scratch_git(SUB_REPO, *a)
 
 
 sub_git("init", "-q")
@@ -2629,8 +2636,7 @@ os.makedirs(os.path.join(UNC, "plans"))
 
 
 def unc_git(*a, env=None):
-    return subprocess.run(["git", "-C", UNC, *a], check=True, capture_output=True, text=True,
-                          env={**os.environ, **(env or {})}).stdout.strip()
+    return scratch_git(UNC, *a, env=env)
 
 
 unc_git("init", "-q")
@@ -2684,8 +2690,7 @@ os.makedirs(PULL)
 
 
 def pull_git(*a, env=None):
-    return subprocess.run(["git", "-C", PULL, *a], check=True, capture_output=True, text=True,
-                          env={**os.environ, **(env or {})}).stdout.strip()
+    return scratch_git(PULL, *a, env=env)
 
 
 pull_git("init", "-q")
