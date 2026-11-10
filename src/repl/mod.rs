@@ -175,7 +175,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 97]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -210,6 +210,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 97]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(
+            ".mesh",
+            "List the mesh commands by group",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
             ".mesh on",
             "Join the mesh for this session only; config.yaml is not changed",
             AssertState::pass(),
@@ -220,143 +225,43 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 97]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh peers",
-            "List the nodes heard on the mesh",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh knocks",
-            "List the untrusted nodes that knocked",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh info",
-            "Show the mesh settings and this node, or one peer",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
             ".mesh status",
-            "Show this node's status card, set its objective, or fetch a peer's card",
+            "Show this node's status card or set its objective",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh brief",
-            "Show the brief your envoy answers peers with, or set its note or mode",
+            ".mesh help",
+            "List the mesh commands by group",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh inbox",
-            "Drain the peer messages waiting for this node",
+            ".mesh people",
+            "See the nodes heard on the mesh and what one of them is doing",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh pending",
-            "List the questions this node asked and the ones peers escalated to you",
+            ".mesh access",
+            "Decide which peers this node trusts, blocks or forgets, and answer knocks",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh answer",
-            "Answer an escalated question, or follow up on one this node asked",
+            ".mesh messaging",
+            "Send to peers, read the inbox and follow up on the questions this node asked",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh dismiss",
-            "Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
+            ".mesh envoy",
+            "Shape what your envoy tells peers and handle what it escalates to you",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh message",
-            "Send your own text to one peer, bypassing the model",
+            ".mesh files",
+            "Share files with peers, decide their access requests and fetch theirs",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh broadcast",
-            "Send a bulletin to every trusted peer with a known path",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh trust",
-            "Trust one instance, or every instance of an identity, or prune stale trusted instances",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh untrust",
-            "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh forget",
-            "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh block",
-            "Refuse one instance without a knock, or silence a whole identity; `block` remembers where `untrust` only stops serving",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh unblock",
-            "Lift a block on an instance or an identity; it grants nothing, so only trust the list still holds serves it afterwards",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh rotate",
-            "Mint a new mesh identity while the node is off; peers must re-trust the new one",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh sync",
-            "Sync the messages a propagation node holds for this node now",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh knock",
-            "Ask an untrusted peer to trust this instance, with an optional intro",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh allow",
-            "Share files matching a pattern with every trusted peer, or with one peer",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh deny",
-            "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh unshare",
-            "Remove the allow or deny share rule that holds a pattern",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh shares",
-            "List the share rules and the file each came from, or the files a peer can fetch",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh grant",
-            "Grant a peer's access request: once for a while, or standing in the share list",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh refuse",
-            "Refuse a peer's access request",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh request",
-            "Ask a trusted peer's human for access to files it does not share yet",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh fetch",
-            "Fetch one file a trusted peer shares into this node's staging inbox",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh memory",
-            "Forget what the envoy remembers of a peer's threads: one identity, one of its threads, or everything",
+            ".mesh config",
+            "Show the mesh settings and rotate this node's identity",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -5200,7 +5105,7 @@ local_hello() {\n\
         run_async(async {
             let mut ctx = engage_graph_agent(repl_ctx(), &name).await;
 
-            repl_command(&mut ctx, ".mesh info").await.unwrap();
+            repl_command(&mut ctx, ".mesh config show").await.unwrap();
 
             assert_eq!(ctx.last_graph_branch, None);
             let session = ctx.session.as_ref().unwrap();
@@ -9636,8 +9541,8 @@ local_hello() {\n\
     #[test]
     fn parse_command_mesh_dispatches_under_the_configured_prefix() {
         assert_eq!(
-            parse_command("/mesh trust abc", CommandPrefix::Slash),
-            Some((Cow::Owned(".mesh".to_string()), Some("trust abc")))
+            parse_command("/mesh access trust abc", CommandPrefix::Slash),
+            Some((Cow::Owned(".mesh".to_string()), Some("access trust abc")))
         );
         assert!(parse_command("/mesh status", CommandPrefix::Dot).is_none());
     }
@@ -9969,8 +9874,8 @@ local_hello() {\n\
     }
 
     #[test]
-    fn repl_commands_has_97_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 97);
+    fn repl_commands_has_78_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 78);
     }
 
     #[test]
@@ -9990,12 +9895,23 @@ local_hello() {\n\
                     .map(|verb| (verb, cmd.description))
             })
             .collect();
-        let verbs: Vec<(&str, &str)> = mesh::VERBS
+        let tree: Vec<(&str, &str)> = mesh::COMMANDS
             .iter()
-            .map(|(verb, description, _)| (*verb, *description))
+            .filter(|(group, ..)| group.is_empty())
+            .map(|(_, verb, _, summary)| (*verb, *summary))
+            .chain(mesh::GROUPS.iter().copied())
             .collect();
-        assert_eq!(commands.len(), 30);
-        assert_eq!(commands, verbs);
+        assert_eq!(commands.len(), 10);
+        assert_eq!(commands, tree);
+        let help = mesh::COMMANDS
+            .iter()
+            .find(|(group, verb, ..)| group.is_empty() && *verb == "help")
+            .map(|(.., summary)| *summary);
+        let bare = REPL_COMMANDS
+            .iter()
+            .find(|cmd| cmd.name == ".mesh")
+            .map(|cmd| cmd.description);
+        assert_eq!(bare, help);
     }
 
     #[test]

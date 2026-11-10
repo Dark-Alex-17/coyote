@@ -389,20 +389,26 @@ mod prefix_tests {
 
     #[test]
     fn mesh_verbs_complete_under_the_configured_sigil() {
-        // The mesh rows are multi-word entries like every other built-in, so
+        // The mesh groups are multi-word entries like every other built-in, so
         // a `/`-typed `mesh` token lists them with the typed sigil under
         // slash and both, the dot form keeps working under both, and the
-        // sigil the prefix rejects yields nothing.
+        // sigil the prefix rejects yields nothing. A group's verbs and then
+        // their arguments complete from the command table.
         for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
-            let verbs = values(prefix, "/mesh tr");
+            let groups = values(prefix, "/mesh pe");
             assert!(
-                verbs.contains(&"/mesh trust ".to_string()),
-                "{prefix}: {verbs:?}"
+                groups.contains(&"/mesh people ".to_string()),
+                "{prefix}: {groups:?}"
             );
             assert!(
-                verbs.iter().all(|v| v.starts_with("/mesh ")),
-                "{prefix}: {verbs:?}"
+                groups.iter().all(|v| v.starts_with("/mesh ")),
+                "{prefix}: {groups:?}"
             );
+            let verbs = values(prefix, "/mesh access tr");
+            assert!(verbs.contains(&"trust ".to_string()), "{prefix}: {verbs:?}");
+            let mut people = values(prefix, "/mesh people ");
+            people.sort();
+            assert_eq!(people, ["info ", "list ", "status "], "{prefix}");
             // The argument stage is reached through the slash token too.
             let args: Vec<String> = values(prefix, "/mesh status ")
                 .into_iter()
@@ -410,24 +416,30 @@ mod prefix_tests {
                 .collect();
             assert!(args.contains(&"clear".to_string()), "{prefix}: {args:?}");
         }
-        let dot = values(CommandPrefix::Both, ".mesh tr");
-        assert!(dot.contains(&".mesh trust ".to_string()), "{dot:?}");
+        let dot = values(CommandPrefix::Both, ".mesh pe");
+        assert!(dot.contains(&".mesh people ".to_string()), "{dot:?}");
+        let dot = values(CommandPrefix::Both, ".mesh access tr");
+        assert!(dot.contains(&"trust ".to_string()), "{dot:?}");
         assert!(
-            values(CommandPrefix::Dot, "/mesh tr").is_empty(),
+            values(CommandPrefix::Dot, "/mesh pe").is_empty(),
             "a slash token is chat under dot"
         );
         assert!(
-            values(CommandPrefix::Slash, ".mesh tr").is_empty(),
+            values(CommandPrefix::Slash, ".mesh pe").is_empty(),
             "a dot token is chat under slash"
+        );
+        assert!(
+            values(CommandPrefix::Dot, "/mesh people ").is_empty(),
+            "a slash token is chat under dot"
         );
     }
 
-    /// The verb stage offers `message` and never the name it replaced: `.mesh mes`
-    /// completes to the one verb, `.mesh me` to `message` and `memory` alone, and a
-    /// typed `rep` finds nothing (the match is fuzzy, so `re` still offers `refuse`
-    /// among others, but no row ending in `reply`). The same under the slash sigil.
+    /// The group stage offers `messaging` and never a cut verb: `.mesh mes` completes
+    /// to the one group, `.mesh messaging se` to `send` and `sent`, and a typed `rep`
+    /// finds nothing (the match is fuzzy, so `he` offers `help` among others, but no
+    /// row ending in `reply`). The same under the slash sigil.
     #[test]
-    fn mesh_message_completes_at_the_verb_stage_and_reply_never_does() {
+    fn mesh_messaging_completes_at_the_group_stage_and_cut_verbs_never_do() {
         let values_of = |prefix, line: &str| -> Vec<String> {
             values(prefix, line)
                 .into_iter()
@@ -436,30 +448,37 @@ mod prefix_tests {
         };
         assert_eq!(
             values_of(CommandPrefix::Dot, ".mesh mes"),
-            [".mesh message"]
+            [".mesh messaging"]
         );
-        let mut me = values_of(CommandPrefix::Dot, ".mesh me");
-        me.sort();
-        assert_eq!(me, [".mesh memory", ".mesh message"]);
+        let mut se = values_of(CommandPrefix::Dot, ".mesh messaging se");
+        se.sort();
+        assert_eq!(se, ["send", "sent"]);
         assert!(
             values_of(CommandPrefix::Dot, ".mesh rep").is_empty(),
             "{:?}",
             values_of(CommandPrefix::Dot, ".mesh rep")
         );
-        let re = values_of(CommandPrefix::Dot, ".mesh re");
-        assert!(re.contains(&".mesh refuse".to_string()), "{re:?}");
-        assert!(!re.iter().any(|v| v.ends_with(" reply")), "{re:?}");
+        let he = values_of(CommandPrefix::Dot, ".mesh he");
+        assert!(he.contains(&".mesh help".to_string()), "{he:?}");
+        assert!(!he.iter().any(|v| v.ends_with(" reply")), "{he:?}");
 
         assert_eq!(
             values_of(CommandPrefix::Slash, "/mesh mes"),
-            ["/mesh message"]
+            ["/mesh messaging"]
         );
         assert!(values_of(CommandPrefix::Slash, "/mesh rep").is_empty());
 
-        // Every `.mesh` row the completer knows is a verb the table has; none is `reply`.
+        // Every `.mesh` row the completer knows is a top-level verb or a group the
+        // table has; none is a cut verb.
         let all = values_of(CommandPrefix::Dot, ".mesh ");
-        assert_eq!(all.len(), 30, "{all:?}");
-        assert!(!all.iter().any(|v| v.ends_with(" reply")), "{all:?}");
+        assert_eq!(all.len(), 10, "{all:?}");
+        for cut in [" reply", " message", " peers"] {
+            assert!(!all.iter().any(|v| v.ends_with(cut)), "{cut}: {all:?}");
+        }
+        let messaging = values_of(CommandPrefix::Dot, ".mesh messaging ");
+        for cut in ["reply", "message", "pending", "answer"] {
+            assert!(!messaging.iter().any(|v| v == cut), "{cut}: {messaging:?}");
+        }
     }
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {

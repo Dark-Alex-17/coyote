@@ -6298,110 +6298,8 @@ impl RequestContext {
                         .collect(),
                 );
             }
-        } else if cmd == ".mesh"
-            && args.len() >= 2
-            && matches!(args[0], "allow" | "deny" | "unshare" | "shares")
-        {
-            values = self.mesh_completion_share_verb(args[0], &args[1..]);
-        } else if cmd == ".mesh"
-            && args.len() == 2
-            && matches!(args[0], "info" | "status" | "message" | "knock")
-        {
-            let filter = match args[0] {
-                "info" => DestinationFilter::HeardOrKnocked,
-                "knock" => DestinationFilter::Heard,
-                _ => DestinationFilter::TrustedAndHeard,
-            };
-            values = self.mesh_completion_destinations(filter);
-            match args[0] {
-                "status" => values.push(("clear".to_string(), None)),
-                "message" => values.push(("--yes".to_string(), None)),
-                "knock" => {
-                    values.push(("--yes".to_string(), None));
-                    values.push(("--intro ".to_string(), None));
-                }
-                _ => {}
-            }
-        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "message" && args[1] == "--yes" {
-            values = self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard);
-        } else if cmd == ".mesh" && args.len() >= 3 && matches!(args[0], "answer" | "message") {
-            values = self.mesh_completion_message_verb(args[0], &args[1..]);
-        } else if cmd == ".mesh" && args.len() >= 2 && matches!(args[0], "grant" | "refuse") {
-            values = self.mesh_completion_decision_verb(args[0], &args[1..]);
-        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "fetch" {
-            values = self.mesh_completion_fetch(&args[1..]);
-        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "request" {
-            values = self.mesh_completion_request(&args[1..]);
-        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "inbox" {
-            values = mesh_completion_inbox(&args[1..]);
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "memory" {
-            values = super::map_completion_values(vec!["forget "]);
-        } else if cmd == ".mesh" && args.len() >= 3 && args[0] == "memory" && args[1] == "forget" {
-            values = self.mesh_completion_memory_forget(&args[2..]);
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "trust" {
-            values = self.mesh_completion_destinations(DestinationFilter::Trustable);
-            values.push(("--identity ".to_string(), None));
-            values.push(("--prune".to_string(), None));
-        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--identity"
-        {
-            values = self.mesh_completion_identities(false);
-        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--prune" {
-            values = super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "]);
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "rotate" {
-            values = super::map_completion_values(vec!["--dry-run", "--confirm "]);
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "untrust" {
-            values = self.mesh_completion_destinations(DestinationFilter::TrustedRecord);
-            values.push(("--identity ".to_string(), None));
-            values.push(("--dry-run".to_string(), None));
-        } else if cmd == ".mesh"
-            && args.len() == 3
-            && args[0] == "untrust"
-            && args[1] == "--identity"
-        {
-            values = self.mesh_completion_untrustable_identities();
-        } else if cmd == ".mesh"
-            && args.len() == 3
-            && args[0] == "untrust"
-            && args[1] == "--dry-run"
-        {
-            values = self.mesh_completion_destinations(DestinationFilter::TrustedRecord);
-            values.push(("--identity ".to_string(), None));
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "forget" {
-            values = super::map_completion_values(vec!["--identity ", "--dry-run"]);
-        } else if cmd == ".mesh"
-            && args.len() == 3
-            && args[0] == "forget"
-            && args[1] == "--identity"
-        {
-            values = self.mesh_completion_trusted_identities();
-            push_missing(&mut values, self.mesh_completion_blocked());
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
-            values = self.mesh_completion_destinations(DestinationFilter::Blockable);
-            values.push(("--identity ".to_string(), None));
-        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "block" && args[1] == "--identity"
-        {
-            values = self.mesh_completion_identities(true);
-        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
-            values = self.mesh_completion_destinations(DestinationFilter::Denied);
-            values.push(("--identity ".to_string(), None));
-        } else if cmd == ".mesh"
-            && args.len() == 3
-            && args[0] == "unblock"
-            && args[1] == "--identity"
-        {
-            values = self.mesh_completion_blocked();
-        } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
-            values = self.mesh_completion_questions();
-        } else if cmd == ".mesh" && args.first() == Some(&"dismiss") && args.len() == 2 {
-            values = self.mesh_completion_escalated_questions("dismiss", SystemTime::now());
-        } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
-            values = super::map_completion_values(vec!["note ", "auto", "manual", "off"]);
-        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "brief" && args[1] == "note" {
-            values = super::map_completion_values(vec!["clear"]);
-        } else if cmd == ".mesh" && args.first() == Some(&"on") && args.len() == 2 {
-            values = super::map_completion_values(vec!["--yes", "--fresh"]);
-        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "off" | "broadcast") {
-            values = super::map_completion_values(vec!["--yes"]);
+        } else if cmd == ".mesh" && args.len() >= 2 {
+            values = self.mesh_completion(args);
         } else if cmd == ".info" && args.first() == Some(&"mcp-server") && args.len() == 2 {
             let mut names: Vec<String> = self
                 .tool_scope
@@ -7163,6 +7061,127 @@ impl RequestContext {
         values
     }
 
+    /// Completions after `.mesh`, `args` ending with the token being typed: a group's
+    /// verbs right after the group, then the arguments of the command its path names.
+    fn mesh_completion(&self, args: &[&str]) -> Vec<(String, Option<String>)> {
+        let ((group, verb), rest) = match args {
+            [group, _] if crate::repl::mesh::is_group(group) => {
+                return crate::repl::mesh::COMMANDS
+                    .iter()
+                    .filter(|(name, ..)| name == group)
+                    .map(|(_, verb, _, summary)| (format!("{verb} "), Some(summary.to_string())))
+                    .collect();
+            }
+            [group, verb, rest @ ..] if crate::repl::mesh::is_group(group) => {
+                ((*group, *verb), rest)
+            }
+            [verb, rest @ ..] => (("", *verb), rest),
+            [] => return Vec::new(),
+        };
+        match ((group, verb), rest) {
+            (("files", "allow" | "deny" | "unshare" | "list"), [_, ..]) => {
+                self.mesh_completion_share_verb(verb, rest)
+            }
+            (("people", "info"), [_]) => {
+                self.mesh_completion_destinations(DestinationFilter::HeardOrKnocked)
+            }
+            (("people", "status"), [_]) | (("messaging", "send"), ["--yes", _]) => {
+                self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard)
+            }
+            (("messaging", "send"), [_]) => {
+                let mut values =
+                    self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard);
+                values.push(("--yes".to_string(), None));
+                values
+            }
+            (("access", "ask"), [_]) => {
+                let mut values = self.mesh_completion_destinations(DestinationFilter::Heard);
+                values.push(("--yes".to_string(), None));
+                values.push(("--intro ".to_string(), None));
+                values
+            }
+            (("envoy", "answer") | ("messaging", "follow-up" | "send"), [_, _, ..]) => {
+                self.mesh_completion_message_verb(verb, rest)
+            }
+            (("files", "grant" | "refuse"), [_, ..]) => {
+                self.mesh_completion_decision_verb(verb, rest)
+            }
+            (("files", "fetch"), [_, ..]) => self.mesh_completion_fetch(rest),
+            (("files", "request"), [_, ..]) => self.mesh_completion_request(rest),
+            (("messaging", "inbox"), [_, ..]) => mesh_completion_inbox(rest),
+            (("envoy", "memory"), [_]) => super::map_completion_values(vec!["forget "]),
+            (("envoy", "memory"), ["forget", forget @ ..]) if !forget.is_empty() => {
+                self.mesh_completion_memory_forget(forget)
+            }
+            (("access", "trust"), [_]) => {
+                let mut values = self.mesh_completion_destinations(DestinationFilter::Trustable);
+                values.push(("--identity ".to_string(), None));
+                values
+            }
+            (("access", "trust"), ["--identity", _]) => self.mesh_completion_identities(false),
+            (("access", "revoke"), ["--stale", _]) => {
+                super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "])
+            }
+            (("config", "rotate-identity"), [_]) => {
+                super::map_completion_values(vec!["--dry-run", "--confirm "])
+            }
+            (("access", "revoke"), [_]) => {
+                let mut values =
+                    self.mesh_completion_destinations(DestinationFilter::TrustedRecord);
+                values.push(("--identity ".to_string(), None));
+                values.push(("--dry-run".to_string(), None));
+                values.push(("--stale".to_string(), None));
+                values
+            }
+            (("access", "revoke"), ["--identity", _]) => {
+                self.mesh_completion_untrustable_identities()
+            }
+            (("access", "revoke"), ["--dry-run", _]) => {
+                let mut values =
+                    self.mesh_completion_destinations(DestinationFilter::TrustedRecord);
+                values.push(("--identity ".to_string(), None));
+                values
+            }
+            (("access", "forget"), [_]) => {
+                super::map_completion_values(vec!["--identity ", "--dry-run"])
+            }
+            (("access", "forget"), ["--identity", _]) => {
+                let mut values = self.mesh_completion_trusted_identities();
+                push_missing(&mut values, self.mesh_completion_blocked());
+                values
+            }
+            (("access", "block"), [_]) => {
+                let mut values = self.mesh_completion_destinations(DestinationFilter::Blockable);
+                values.push(("--identity ".to_string(), None));
+                values
+            }
+            (("access", "block"), ["--identity", _]) => self.mesh_completion_identities(true),
+            (("access", "unblock"), [_]) => {
+                let mut values = self.mesh_completion_destinations(DestinationFilter::Denied);
+                values.push(("--identity ".to_string(), None));
+                values
+            }
+            (("access", "unblock"), ["--identity", _]) => self.mesh_completion_blocked(),
+            (("envoy", "answer"), [_]) => {
+                self.mesh_completion_escalated_questions("answer", SystemTime::now())
+            }
+            (("messaging", "follow-up"), [_]) => self.mesh_completion_asked_questions(),
+            (("envoy", "dismiss"), [_]) => {
+                self.mesh_completion_escalated_questions("dismiss", SystemTime::now())
+            }
+            (("envoy", "brief"), [_]) => {
+                super::map_completion_values(vec!["note ", "auto", "manual", "off"])
+            }
+            (("envoy", "brief"), ["note", _]) => super::map_completion_values(vec!["clear"]),
+            (("", "on"), [_]) => super::map_completion_values(vec!["--yes", "--fresh"]),
+            (("", "off") | ("messaging", "broadcast"), [_]) => {
+                super::map_completion_values(vec!["--yes"])
+            }
+            (("", "status"), [_]) => super::map_completion_values(vec!["clear"]),
+            _ => Vec::new(),
+        }
+    }
+
     /// What peers escalated and this node has not yet decided; empty, with a debug line,
     /// when the store cannot be read, since completion never fails the prompt.
     fn mesh_completion_inbound(&self, verb: &str, now: SystemTime) -> Vec<InboundRecord> {
@@ -7233,31 +7252,28 @@ impl RequestContext {
             .collect()
     }
 
-    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
-    /// node asked, each a `describe_question` row.
-    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+    /// Ids for `.mesh messaging follow-up <TAB>`: the questions this node asked, each a
+    /// `describe_question` row.
+    fn mesh_completion_asked_questions(&self) -> Vec<(String, Option<String>)> {
         let now = SystemTime::now();
-        let mut values = self.mesh_completion_escalated_questions("answer", now);
-        values.extend(
-            self.app
-                .mesh
-                .correlations()
-                .list()
-                .into_iter()
-                .map(|correlation| {
-                    let record = correlation.record;
-                    let description = self.describe_question(
-                        now,
-                        &record.id,
-                        &record.peer_destination,
-                        &record.peer_identity,
-                        &record.sent_at,
-                        &record.question,
-                    );
-                    (record.id, Some(description))
-                }),
-        );
-        values
+        self.app
+            .mesh
+            .correlations()
+            .list()
+            .into_iter()
+            .map(|correlation| {
+                let record = correlation.record;
+                let description = self.describe_question(
+                    now,
+                    &record.id,
+                    &record.peer_destination,
+                    &record.peer_identity,
+                    &record.sent_at,
+                    &record.question,
+                );
+                (record.id, Some(description))
+            })
+            .collect()
     }
 
     /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
@@ -7470,10 +7486,11 @@ impl RequestContext {
         values
     }
 
-    /// Completions for `.mesh answer` and `.mesh message` once the id or destination is
-    /// given, `rest` being everything after the verb: the share-root paths after
-    /// `--attach`; otherwise `--attach ` until a file is attached and `--force` once one
-    /// is, plus `--yes` for `message`, each offered once. Empty while the mesh is off.
+    /// Completions for `.mesh envoy answer`, `.mesh messaging follow-up` and `.mesh
+    /// messaging send` once the id or destination is given, `rest` being everything after
+    /// the verb: the share-root paths after `--attach`; otherwise `--attach ` until a file
+    /// is attached and `--force` once one is, plus `--yes` for `send`, each offered once.
+    /// Empty while the mesh is off.
     fn mesh_completion_message_verb(
         &self,
         verb: &str,
@@ -7493,7 +7510,7 @@ impl RequestContext {
         } else {
             "--attach "
         }];
-        if verb == "message" {
+        if verb == "send" {
             flags.push("--yes");
         }
         flags
@@ -7521,7 +7538,7 @@ impl RequestContext {
         if prior.last() == Some(&"--peer") {
             let takes_peer = match verb {
                 "allow" => !prior.contains(&"--force"),
-                "shares" => true,
+                "list" => true,
                 _ => false,
             };
             if !takes_peer {
@@ -37395,7 +37412,7 @@ mod tests {
                 ),
             );
 
-            let rows = fixture.complete(&["fetch", ""]);
+            let rows = fixture.complete(&["files", "fetch", ""]);
             assert_eq!(completion_values(&rows), ["bea-lab"]);
             assert!(
                 completion_description(&rows, "bea-lab").ends_with(" . fetch"),
@@ -37406,12 +37423,12 @@ mod tests {
             {
                 let listed = format!("{}.md", short(destination));
                 assert_eq!(
-                    completion_values(&fixture.complete(&["fetch", name, ""])),
+                    completion_values(&fixture.complete(&["files", "fetch", name, ""])),
                     [listed.as_str(), "--if-sha256 "],
                     "{name}"
                 );
                 assert_eq!(
-                    completion_values(&fixture.complete(&["request", name, ""])),
+                    completion_values(&fixture.complete(&["files", "request", name, ""])),
                     [listed.as_str(), "--reason ", "--yes"],
                     "{name}"
                 );
@@ -37660,25 +37677,31 @@ mod tests {
     fn repl_complete_mesh_offers_words_but_no_peers_while_the_mesh_is_off() {
         let ctx = create_test_ctx();
 
-        assert!(ctx.repl_complete(".mesh", &["info", ""], "").is_empty());
-        assert!(ctx.repl_complete(".mesh", &["answer", ""], "").is_empty());
-        assert!(ctx.repl_complete(".mesh", &["reply", ""], "").is_empty());
         assert!(
-            ctx.repl_complete(".mesh", &["brief", "set", ""], "")
+            ctx.repl_complete(".mesh", &["people", "info", ""], "")
                 .is_empty()
         );
         assert!(
-            ctx.repl_complete(".mesh", &["brief", "clear", ""], "")
+            ctx.repl_complete(".mesh", &["envoy", "answer", ""], "")
+                .is_empty()
+        );
+        assert!(ctx.repl_complete(".mesh", &["reply", ""], "").is_empty());
+        assert!(
+            ctx.repl_complete(".mesh", &["envoy", "brief", "set", ""], "")
+                .is_empty()
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["envoy", "brief", "clear", ""], "")
                 .is_empty()
         );
         let brief: Vec<String> = ctx
-            .repl_complete(".mesh", &["brief", ""], "")
+            .repl_complete(".mesh", &["envoy", "brief", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
         assert_eq!(brief, ["note ", "auto", "manual", "off"]);
         let note: Vec<String> = ctx
-            .repl_complete(".mesh", &["brief", "note", ""], "")
+            .repl_complete(".mesh", &["envoy", "brief", "note", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
@@ -37695,36 +37718,37 @@ mod tests {
             .map(|(value, _)| value)
             .collect();
         assert_eq!(on, ["--yes", "--fresh"]);
-        for verb in ["off", "broadcast"] {
+        for path in [&["off"][..], &["messaging", "broadcast"]] {
+            let verb = path.join(" ");
             let flags: Vec<String> = ctx
-                .repl_complete(".mesh", &[verb, ""], "")
+                .repl_complete(".mesh", &[path, &[""]].concat(), "")
                 .into_iter()
                 .map(|(value, _)| value)
                 .collect();
             assert_eq!(flags, ["--yes"], "{verb}");
             assert!(
-                ctx.repl_complete(".mesh", &[verb, "words", ""], "")
+                ctx.repl_complete(".mesh", &[path, &["words", ""]].concat(), "")
                     .is_empty(),
                 "{verb}: the flag is only honoured as the leading word"
             );
         }
         let message: Vec<String> = ctx
-            .repl_complete(".mesh", &["message", ""], "")
+            .repl_complete(".mesh", &["messaging", "send", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
         assert_eq!(message, ["--yes"], "no peers heard, so the flag alone");
         assert!(
-            ctx.repl_complete(".mesh", &["message", "--yes", ""], "")
+            ctx.repl_complete(".mesh", &["messaging", "send", "--yes", ""], "")
                 .is_empty(),
             "after the flag come peers, of which there are none, never the flag again"
         );
         assert!(
-            ctx.repl_complete(".mesh", &["message", "words", ""], "")
+            ctx.repl_complete(".mesh", &["messaging", "send", "words", ""], "")
                 .is_empty()
         );
         let knock: Vec<String> = ctx
-            .repl_complete(".mesh", &["knock", ""], "")
+            .repl_complete(".mesh", &["access", "ask", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
@@ -37734,27 +37758,23 @@ mod tests {
             "no peers heard, so the flags alone"
         );
         let trust: Vec<String> = ctx
-            .repl_complete(".mesh", &["trust", ""], "")
+            .repl_complete(".mesh", &["access", "trust", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
-        assert_eq!(
-            trust,
-            ["--identity ", "--prune"],
-            "no knocks or peers heard"
-        );
+        assert_eq!(trust, ["--identity "], "no knocks or peers heard");
         let untrust: Vec<String> = ctx
-            .repl_complete(".mesh", &["untrust", ""], "")
+            .repl_complete(".mesh", &["access", "revoke", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
         assert_eq!(
             untrust,
-            ["--identity ", "--dry-run"],
+            ["--identity ", "--dry-run", "--stale"],
             "no trust store to read"
         );
         let forget: Vec<String> = ctx
-            .repl_complete(".mesh", &["forget", ""], "")
+            .repl_complete(".mesh", &["access", "forget", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
@@ -37763,9 +37783,9 @@ mod tests {
             ["--identity ", "--dry-run"],
             "`forget` takes no destination"
         );
-        for verb in ["block", "unblock"] {
+        for (group, verb) in [("access", "block"), ("access", "unblock")] {
             let flags: Vec<String> = ctx
-                .repl_complete(".mesh", &[verb, ""], "")
+                .repl_complete(".mesh", &[group, verb, ""], "")
                 .into_iter()
                 .map(|(value, _)| value)
                 .collect();
@@ -37776,25 +37796,26 @@ mod tests {
             );
         }
         assert!(
-            ctx.repl_complete(".mesh", &["sync", ""], "").is_empty(),
+            ctx.repl_complete(".mesh", &["messaging", "sync", ""], "")
+                .is_empty(),
             "`sync` takes no arguments"
         );
         assert!(
-            ctx.repl_complete(".mesh", &["trust", "--identity", ""], "")
+            ctx.repl_complete(".mesh", &["access", "trust", "--identity", ""], "")
                 .is_empty()
         );
         assert!(
-            ctx.repl_complete(".mesh", &["untrust", "--identity", ""], "")
+            ctx.repl_complete(".mesh", &["access", "revoke", "--identity", ""], "")
                 .is_empty()
         );
         let prune: Vec<String> = ctx
-            .repl_complete(".mesh", &["trust", "--prune", ""], "")
+            .repl_complete(".mesh", &["access", "revoke", "--stale", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
         assert_eq!(prune, ["--older-than ", "--dry-run", "--confirm "]);
         let rotate: Vec<String> = ctx
-            .repl_complete(".mesh", &["rotate", ""], "")
+            .repl_complete(".mesh", &["config", "rotate-identity", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
@@ -37817,10 +37838,11 @@ mod tests {
         ctx.update_app_config(|app| app.mesh.enabled = true);
         ctx.app.mesh.install(started.runtime.clone()).unwrap();
 
-        let brief = ctx.repl_complete(".mesh", &["brief", ""], "");
+        let brief = ctx.repl_complete(".mesh", &["envoy", "brief", ""], "");
         assert_eq!(brief.len(), 4, "{brief:?}");
         assert!(
-            ctx.repl_complete(".mesh", &["info", ""], "").is_empty(),
+            ctx.repl_complete(".mesh", &["people", "info", ""], "")
+                .is_empty(),
             "an empty peer table and knock cache offer nothing"
         );
 
@@ -37884,7 +37906,7 @@ mod tests {
             short(&named_identity),
             short(&named)
         );
-        let before = ctx.repl_complete(".mesh", &["info", ""], "");
+        let before = ctx.repl_complete(".mesh", &["people", "info", ""], "");
         assert_eq!(
             before,
             [
@@ -37908,7 +37930,7 @@ mod tests {
             ],
             "peer rows read `{{label or name or id8}} . {{dest8}} . {{trust}} . N hops . heard {{age}}`, the named most recently seen first, then the nameless, the label and the name cut to the display cap"
         );
-        let knock = ctx.repl_complete(".mesh", &["knock", ""], "");
+        let knock = ctx.repl_complete(".mesh", &["access", "ask", ""], "");
         assert_eq!(
             &knock[..before.len()],
             &before[..],
@@ -37991,7 +38013,7 @@ mod tests {
                 .unwrap();
         }
 
-        let info = ctx.repl_complete(".mesh", &["info", ""], "");
+        let info = ctx.repl_complete(".mesh", &["people", "info", ""], "");
         let kim_row = (
             kim.clone(),
             Some(format!(
@@ -38031,19 +38053,22 @@ mod tests {
             "the shared destination's row is the peer's, without the knock's intro"
         );
         assert_eq!(
-            ctx.repl_complete(".mesh", &["knock", ""], ""),
+            ctx.repl_complete(".mesh", &["access", "ask", ""], ""),
             knock,
             "`knock` never offers a knocker"
         );
-        for (verb, tail) in [("message", "--yes"), ("status", "clear")] {
+        for (group, verb, tail) in [
+            ("messaging", "send", &["--yes"][..]),
+            ("people", "status", &[]),
+        ] {
             assert_eq!(
-                completion_values(&ctx.repl_complete(".mesh", &[verb, ""], "")),
-                [trusted.as_str(), tail],
+                completion_values(&ctx.repl_complete(".mesh", &[group, verb, ""], "")),
+                [&[trusted.as_str()][..], tail].concat(),
                 "`{verb}` offers the heard peers the list allows, never a merely heard one or a knocker"
             );
         }
         assert_eq!(
-            completion_values(&ctx.repl_complete(".mesh", &["message", "--yes", ""], "")),
+            completion_values(&ctx.repl_complete(".mesh", &["messaging", "send", "--yes", ""], "")),
             [trusted.as_str()]
         );
 
@@ -38309,7 +38334,7 @@ mod tests {
         let unproven_destination =
             seed_peer_proven_only_by_a_later_knock(&fixture, "rc-mesh-complete-trust");
 
-        let trust = fixture.complete(&["trust", ""]);
+        let trust = fixture.complete(&["access", "trust", ""]);
         assert_eq!(
             completion_values(&trust),
             [
@@ -38318,7 +38343,6 @@ mod tests {
                 fixture.refused_destination.as_str(),
                 fixture.provable_knock.destination_hash.as_str(),
                 "--identity ",
-                "--prune",
             ],
             "provable heard peers newest first, then provable knockers, then the flags"
         );
@@ -38359,9 +38383,12 @@ mod tests {
                 .any(|(value, _)| *value == unproven_destination),
             "a peer row without its name hash is what `trust` reads, whatever a later knock carries: {trust:?}"
         );
-        for verb in ["block", "info"] {
+        for (group, verb) in [("access", "block"), ("people", "info")] {
             assert_eq!(
-                completion_description(&fixture.complete(&[verb, ""]), &unproven_destination),
+                completion_description(
+                    &fixture.complete(&[group, verb, ""]),
+                    &unproven_destination
+                ),
                 format!(
                     "Gus . {} . untrusted . 1 hops . heard 6m ago",
                     short(&unproven_destination)
@@ -38395,14 +38422,14 @@ mod tests {
         );
         assert!(
             fixture
-                .complete(&["info", ""])
+                .complete(&["people", "info", ""])
                 .iter()
                 .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
             "the knock is still cached; the `trust` filter keeps it out"
         );
         assert_eq!(
             completion_description(
-                &fixture.complete(&["info", ""]),
+                &fixture.complete(&["people", "info", ""]),
                 &fixture.blocked_knock.destination_hash
             ),
             format!(
@@ -38480,18 +38507,18 @@ mod tests {
             .trust_identity(mesh, &record_identity, TrustOptions::default(), now)
             .unwrap();
 
-        let offered = |verb: &str| -> Vec<String> {
+        let offered = |group: &str, verb: &str| -> Vec<String> {
             fixture
-                .complete(&[verb, ""])
+                .complete(&[group, verb, ""])
                 .into_iter()
                 .map(|(value, _)| value)
                 .filter(|value| value.len() == 32 && value.bytes().all(|b| b.is_ascii_hexdigit()))
                 .collect()
         };
-        let trustable = offered("trust");
-        let untrustable = offered("untrust");
-        let blockable = offered("block");
-        let unblockable = offered("unblock");
+        let trustable = offered("access", "trust");
+        let untrustable = offered("access", "revoke");
+        let blockable = offered("access", "block");
+        let unblockable = offered("access", "unblock");
 
         assert!(
             !untrustable.contains(&rekeyed_destination),
@@ -38585,13 +38612,14 @@ mod tests {
         assert_eq!(swept.len(), 2, "only the two stale rows age out: {swept:?}");
         unheard.sort_unstable();
         assert_eq!(
-            completion_values(&fixture.complete(&["untrust", ""])),
+            completion_values(&fixture.complete(&["access", "revoke", ""])),
             [
                 fixture.trusted_destination.as_str(),
                 unheard[0].as_str(),
                 unheard[1].as_str(),
                 "--identity ",
-                "--dry-run"
+                "--dry-run",
+                "--stale"
             ],
             "the heard record first, then the records no cache holds in key order"
         );
@@ -38604,7 +38632,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            completion_values(&fixture.complete(&["unblock", ""])),
+            completion_values(&fixture.complete(&["access", "unblock", ""])),
             [
                 fixture.refused_destination.as_str(),
                 knocker,
@@ -38640,21 +38668,21 @@ mod tests {
             .peers()
             .observe(desk, SystemTime::now() - Duration::from_secs(7 * 60));
 
-        let info = fixture.complete(&["info", ""]);
+        let info = fixture.complete(&["people", "info", ""]);
         assert_eq!(
             completion_description(&info, &known),
             format!("Bea . {} . known . 1 hops . heard 7m ago", short(&known)),
             "the announced name leads, there being no record to label it"
         );
-        for verb in ["knock", "block", "trust"] {
+        for (group, verb) in [("access", "ask"), ("access", "block"), ("access", "trust")] {
             assert_eq!(
-                completion_description(&fixture.complete(&[verb, ""]), &known),
+                completion_description(&fixture.complete(&[group, verb, ""]), &known),
                 completion_description(&info, &known),
                 "`{verb}` keeps the known instance in the same row"
             );
         }
-        for verb in ["status", "message"] {
-            let rows = fixture.complete(&[verb, ""]);
+        for (group, verb) in [("people", "status"), ("messaging", "send")] {
+            let rows = fixture.complete(&[group, verb, ""]);
             assert!(
                 !rows.iter().any(|(value, _)| *value == known),
                 "`{verb}` would not send to a known instance: {rows:?}"
@@ -38676,7 +38704,7 @@ mod tests {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-trust-id").await;
 
-        let identities = fixture.complete(&["trust", "--identity", ""]);
+        let identities = fixture.complete(&["access", "trust", "--identity", ""]);
         assert_eq!(
             identities,
             [
@@ -38716,9 +38744,9 @@ mod tests {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust").await;
 
-        let untrust = fixture.complete(&["untrust", ""]);
+        let untrust = fixture.complete(&["access", "revoke", ""]);
         assert_eq!(
-            completion_values(&fixture.complete(&["forget", ""])),
+            completion_values(&fixture.complete(&["access", "forget", ""])),
             ["--identity ", "--dry-run"],
             "`forget` takes no destination, so it offers the flags alone"
         );
@@ -38727,11 +38755,12 @@ mod tests {
             [
                 fixture.trusted_destination.as_str(),
                 "--identity ",
-                "--dry-run"
+                "--dry-run",
+                "--stale"
             ],
             "the destination-tier records, then the flags"
         );
-        let dry_run = fixture.complete(&["untrust", "--dry-run", ""]);
+        let dry_run = fixture.complete(&["access", "revoke", "--dry-run", ""]);
         assert_eq!(
             completion_values(&dry_run),
             [fixture.trusted_destination.as_str(), "--identity "],
@@ -38760,7 +38789,7 @@ mod tests {
         );
         assert!(
             fixture
-                .complete(&["trust", ""])
+                .complete(&["access", "trust", ""])
                 .iter()
                 .any(|(value, _)| *value == fixture.refused_destination),
             "the blocked instance is still heard, so `trust` offers it"
@@ -38780,13 +38809,14 @@ mod tests {
             .peers()
             .sweep(SystemTime::now() + crate::mesh::PEER_TTL + Duration::from_secs(60));
         assert_eq!(swept.len(), 5, "{swept:?}");
-        let unheard = fixture.complete(&["untrust", ""]);
+        let unheard = fixture.complete(&["access", "revoke", ""]);
         assert_eq!(
             completion_values(&unheard),
             [
                 fixture.trusted_destination.as_str(),
                 "--identity ",
-                "--dry-run"
+                "--dry-run",
+                "--stale"
             ]
         );
         assert_eq!(
@@ -38808,8 +38838,8 @@ mod tests {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-untrust-id").await;
 
-        let identities = fixture.complete(&["untrust", "--identity", ""]);
-        let forget = fixture.complete(&["forget", "--identity", ""]);
+        let identities = fixture.complete(&["access", "revoke", "--identity", ""]);
+        let forget = fixture.complete(&["access", "forget", "--identity", ""]);
         // `forget --identity` takes every identity-tier record: Bea's binding-only entry
         // (her destination's grant recorded her identity without all-destinations), the
         // identity trusted outright, Eve's, whose only instance the block took, and the
@@ -38901,7 +38931,7 @@ mod tests {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-block").await;
 
-        let destinations = fixture.complete(&["block", ""]);
+        let destinations = fixture.complete(&["access", "block", ""]);
         assert_eq!(
             completion_values(&destinations),
             [
@@ -38942,7 +38972,7 @@ mod tests {
             "a knocker without a name is named by its identity's short hash, and one without an intro ends at the age"
         );
 
-        let block = fixture.complete(&["block", "--identity", ""]);
+        let block = fixture.complete(&["access", "block", "--identity", ""]);
         assert_eq!(
             block,
             [
@@ -38973,7 +39003,7 @@ mod tests {
                 .any(|(value, _)| *value == fixture.blocked_identity),
             "an identity already blocked leaves `block` nothing to do"
         );
-        let info = fixture.complete(&["info", ""]);
+        let info = fixture.complete(&["people", "info", ""]);
         for value in [
             &fixture.blocked_destination,
             &fixture.blocked_knock.destination_hash,
@@ -39011,7 +39041,7 @@ mod tests {
             )
             .unwrap();
 
-        let destinations = fixture.complete(&["unblock", ""]);
+        let destinations = fixture.complete(&["access", "unblock", ""]);
         assert_eq!(
             completion_values(&destinations),
             [
@@ -39038,7 +39068,7 @@ mod tests {
             "with no identity to name it by, the destination's own short hash leads"
         );
 
-        let unblock = fixture.complete(&["unblock", "--identity", ""]);
+        let unblock = fixture.complete(&["access", "unblock", "--identity", ""]);
         assert_eq!(
             completion_values(&unblock),
             [fixture.blocked_identity.as_str()],
@@ -39093,28 +39123,28 @@ mod tests {
         );
         assert!(trust.denied().iter().any(|record| record.hash == dest));
 
-        let rows = fixture.complete(&["untrust", ""]);
+        let rows = fixture.complete(&["access", "revoke", ""]);
         assert_eq!(
             completion_values(&rows),
-            ["--identity ", "--dry-run"],
+            ["--identity ", "--dry-run", "--stale"],
             "nothing but the flags once every destination record is blocked"
         );
-        let trust_rows = fixture.complete(&["trust", ""]);
+        let trust_rows = fixture.complete(&["access", "trust", ""]);
         assert!(
             trust_rows.iter().any(|(value, _)| *value == dest),
             "`trust <dest>` lifts the block, so the heard instance stays offered: {trust_rows:?}"
         );
-        let block_rows = fixture.complete(&["block", ""]);
+        let block_rows = fixture.complete(&["access", "block", ""]);
         assert!(
             !block_rows.iter().any(|(value, _)| *value == dest),
             "a blocked instance has nothing left for `block`: {block_rows:?}"
         );
-        let block_identities = fixture.complete(&["block", "--identity", ""]);
+        let block_identities = fixture.complete(&["access", "block", "--identity", ""]);
         assert!(
             block_identities.iter().any(|(value, _)| *value == identity),
             "a blocked instance's identity is not blocked, so `block --identity` still offers it: {block_identities:?}"
         );
-        let unblock_rows = fixture.complete(&["unblock", ""]);
+        let unblock_rows = fixture.complete(&["access", "unblock", ""]);
         assert!(
             unblock_rows.iter().any(|(value, _)| *value == dest),
             "the blocked instance is offered to `unblock`: {unblock_rows:?}"
@@ -39128,11 +39158,11 @@ mod tests {
             "the block took the labelled record, so the announced name leads"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["unblock", "--identity", ""])),
+            completion_values(&fixture.complete(&["access", "unblock", "--identity", ""])),
             [fixture.blocked_identity.as_str()],
             "the deny is a destination rule, never an identity block"
         );
-        let untrust_identities = fixture.complete(&["untrust", "--identity", ""]);
+        let untrust_identities = fixture.complete(&["access", "revoke", "--identity", ""]);
         assert!(
             untrust_identities
                 .iter()
@@ -39149,20 +39179,20 @@ mod tests {
             trust.authorize(&identity, &dest).rule,
             Rule::DestinationTrusted
         );
-        let rows = fixture.complete(&["untrust", ""]);
+        let rows = fixture.complete(&["access", "revoke", ""]);
         assert_eq!(
             completion_values(&rows),
-            ["--identity ", "--dry-run"],
+            ["--identity ", "--dry-run", "--stale"],
             "the lifted record sits under a trusted-all identity, which `untrust` refuses"
         );
         assert_eq!(
-            completion_description(&fixture.complete(&["block", ""]), &dest),
+            completion_description(&fixture.complete(&["access", "block", ""]), &dest),
             format!("Bea . {} . trusted . 1 hops . heard 1m ago", short(&dest)),
             "`block` offers the lifted instance again"
         );
         assert!(
             !fixture
-                .complete(&["unblock", ""])
+                .complete(&["access", "unblock", ""])
                 .iter()
                 .any(|(value, _)| *value == dest),
             "nothing left to unblock"
@@ -39204,20 +39234,24 @@ mod tests {
 
         for (args, kept, offers_identities) in [
             (
-                &["info", ""][..],
+                &["people", "info", ""][..],
                 vec![bea, cal, dov, eve, fay, dov_knock, kim, bare],
                 false,
             ),
-            (&["status", ""], vec![bea], false),
-            (&["message", ""], vec![bea], false),
-            (&["knock", ""], vec![bea, cal, fay], false),
-            (&["trust", ""], vec![bea, cal, eve, kim], false),
-            (&["untrust", ""], vec![bea], false),
-            (&["block", ""], vec![bea, cal, fay, kim, bare], false),
-            (&["unblock", ""], vec![eve], false),
-            (&["fetch", ""], vec![bea], false),
-            (&["allow", "x", "--peer", ""], vec![bea], true),
-            (&["shares", "--peer", ""], vec![bea], true),
+            (&["people", "status", ""], vec![bea], false),
+            (&["messaging", "send", ""], vec![bea], false),
+            (&["access", "ask", ""], vec![bea, cal, fay], false),
+            (&["access", "trust", ""], vec![bea, cal, eve, kim], false),
+            (&["access", "revoke", ""], vec![bea], false),
+            (
+                &["access", "block", ""],
+                vec![bea, cal, fay, kim, bare],
+                false,
+            ),
+            (&["access", "unblock", ""], vec![eve], false),
+            (&["files", "fetch", ""], vec![bea], false),
+            (&["files", "allow", "x", "--peer", ""], vec![bea], true),
+            (&["files", "list", "--peer", ""], vec![bea], true),
         ] {
             let verb = args.join(" ");
             let rows = fixture.complete(args);
@@ -39309,8 +39343,8 @@ mod tests {
             "Quin . {} . untrusted . 2 hops . heard 10m ago . newest",
             short(&destination)
         );
-        for verb in ["trust", "info", "block"] {
-            let rows = fixture.complete(&[verb, ""]);
+        for (group, verb) in [("access", "trust"), ("people", "info"), ("access", "block")] {
+            let rows = fixture.complete(&[group, verb, ""]);
             assert_eq!(
                 rows.iter()
                     .filter(|(value, _)| *value == destination)
@@ -39371,13 +39405,13 @@ mod tests {
                 .unwrap();
         }
 
-        let trust = fixture.complete(&["trust", ""]);
+        let trust = fixture.complete(&["access", "trust", ""]);
         assert!(
             !trust.iter().any(|(value, _)| *value == destination),
             "the newest knock is the one `trust` reads, and it proves nothing: {trust:?}"
         );
-        for verb in ["info", "block"] {
-            let rows = fixture.complete(&[verb, ""]);
+        for (group, verb) in [("people", "info"), ("access", "block")] {
+            let rows = fixture.complete(&[group, verb, ""]);
             assert_eq!(
                 rows.iter()
                     .filter(|(value, _)| *value == destination)
@@ -39425,7 +39459,7 @@ mod tests {
         let reports_before = unreadable_reports();
 
         assert_eq!(
-            completion_values(&fixture.complete(&["knock", ""])),
+            completion_values(&fixture.complete(&["access", "ask", ""])),
             [
                 fixture.trusted_destination.as_str(),
                 fixture.heard_destination.as_str(),
@@ -39436,7 +39470,7 @@ mod tests {
             "`knock` completes the peer table with the knock cache unreadable"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["message", ""])),
+            completion_values(&fixture.complete(&["messaging", "send", ""])),
             [fixture.trusted_destination.as_str(), "--yes"],
             "`message` completes the trusted peers with the knock cache unreadable"
         );
@@ -39447,7 +39481,7 @@ mod tests {
         );
 
         assert_eq!(
-            completion_values(&fixture.complete(&["info", ""])),
+            completion_values(&fixture.complete(&["people", "info", ""])),
             [
                 fixture.trusted_destination.as_str(),
                 fixture.heard_destination.as_str(),
@@ -39488,7 +39522,7 @@ mod tests {
             )
             .unwrap();
 
-        let block = fixture.complete(&["block", ""]);
+        let block = fixture.complete(&["access", "block", ""]);
         assert_eq!(
             completion_description(&block, &fixture.heard_destination),
             format!(
@@ -39497,7 +39531,7 @@ mod tests {
             ),
             "the identity-covered instance reads trusted"
         );
-        let untrust = fixture.complete(&["untrust", ""]);
+        let untrust = fixture.complete(&["access", "revoke", ""]);
         assert!(
             !untrust
                 .iter()
@@ -39506,7 +39540,7 @@ mod tests {
         );
         assert!(
             fixture
-                .complete(&["untrust", "--identity", ""])
+                .complete(&["access", "revoke", "--identity", ""])
                 .iter()
                 .any(|(value, _)| *value == fixture.heard_identity),
             "the grant that covers it is the identity's, which `untrust --identity` takes"
@@ -39539,7 +39573,7 @@ mod tests {
             )
             .unwrap();
 
-        let untrust = fixture.complete(&["untrust", ""]);
+        let untrust = fixture.complete(&["access", "revoke", ""]);
         assert!(
             !untrust
                 .iter()
@@ -39548,7 +39582,7 @@ mod tests {
         );
         assert_eq!(
             completion_description(
-                &fixture.complete(&["block", ""]),
+                &fixture.complete(&["access", "block", ""]),
                 &fixture.trusted_destination
             ),
             format!(
@@ -39559,7 +39593,7 @@ mod tests {
         );
         assert!(
             fixture
-                .complete(&["untrust", "--identity", ""])
+                .complete(&["access", "revoke", "--identity", ""])
                 .iter()
                 .any(|(value, _)| *value == fixture.trusted_peer_identity),
             "the grant is the identity's, which `untrust --identity` withdraws"
@@ -39592,7 +39626,7 @@ mod tests {
         trust
             .deny_destination(mesh, &dest, None, now, false)
             .unwrap();
-        let forget_identities = fixture.complete(&["forget", "--identity", ""]);
+        let forget_identities = fixture.complete(&["access", "forget", "--identity", ""]);
         assert!(
             forget_identities
                 .iter()
@@ -39628,14 +39662,14 @@ mod tests {
             "the other blocked instance keeps its deny"
         );
 
-        let rows = fixture.complete(&["untrust", ""]);
+        let rows = fixture.complete(&["access", "revoke", ""]);
         assert_eq!(
             completion_values(&rows),
-            ["--identity ", "--dry-run"],
+            ["--identity ", "--dry-run", "--stale"],
             "a forgotten instance is not a trusted destination, got {rows:?}"
         );
-        for verb in ["untrust", "forget"] {
-            let identities = fixture.complete(&[verb, "--identity", ""]);
+        for (group, verb) in [("access", "revoke"), ("access", "forget")] {
+            let identities = fixture.complete(&[group, verb, "--identity", ""]);
             assert!(
                 !identities.iter().any(|(value, _)| *value == identity),
                 "{verb} --identity: a forgotten identity is a stranger, got {identities:?}"
@@ -39643,12 +39677,12 @@ mod tests {
         }
         assert!(
             !fixture
-                .complete(&["unblock", ""])
+                .complete(&["access", "unblock", ""])
                 .iter()
                 .any(|(value, _)| *value == dest),
             "no deny is left to unblock"
         );
-        let trust_rows = fixture.complete(&["trust", ""]);
+        let trust_rows = fixture.complete(&["access", "trust", ""]);
         assert!(
             trust_rows.iter().any(|(value, _)| *value == dest),
             "the instance is still heard, so `trust` offers it: {trust_rows:?}"
@@ -39693,9 +39727,9 @@ mod tests {
         };
         let heard = ann.destination_hash.clone();
         started.runtime.peers().observe(ann, now);
-        for verb in ["status", "message"] {
+        for (group, verb) in [("people", "status"), ("messaging", "send")] {
             assert_eq!(
-                ctx.repl_complete(".mesh", &[verb, ""], "")
+                ctx.repl_complete(".mesh", &[group, verb, ""], "")
                     .iter()
                     .filter(|(value, _)| *value == heard)
                     .count(),
@@ -39708,8 +39742,13 @@ mod tests {
             .trust()
             .trust_destination(ctx.app.mesh.as_ref(), &heard, TrustOptions::default(), now)
             .unwrap();
-        for verb in ["info", "status", "message", "knock"] {
-            let offered = ctx.repl_complete(".mesh", &[verb, ""], "");
+        for (group, verb) in [
+            ("people", "info"),
+            ("people", "status"),
+            ("messaging", "send"),
+            ("access", "ask"),
+        ] {
+            let offered = ctx.repl_complete(".mesh", &[group, verb, ""], "");
             let peer = offered
                 .iter()
                 .find(|(value, _)| *value == heard)
@@ -39724,7 +39763,7 @@ mod tests {
             );
         }
         let after_flag: Vec<String> = ctx
-            .repl_complete(".mesh", &["message", "--yes", ""], "")
+            .repl_complete(".mesh", &["messaging", "send", "--yes", ""], "")
             .into_iter()
             .map(|(value, _)| value)
             .collect();
@@ -39734,7 +39773,7 @@ mod tests {
             "message --yes offers peers alone"
         );
         // A prefix narrows the offer: the heard destination stays, the fixed word goes.
-        let narrowed = ctx.repl_complete(".mesh", &["status", &heard[..4]], &heard[..4]);
+        let narrowed = ctx.repl_complete(".mesh", &["people", "status", &heard[..4]], &heard[..4]);
         assert!(
             narrowed.iter().any(|(value, _)| *value == heard),
             "{narrowed:?}"
@@ -39782,12 +39821,15 @@ mod tests {
                 now,
             )
             .unwrap();
-        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let mut answers = ctx.repl_complete(".mesh", &["envoy", "answer", ""], "");
+        let follow_ups = ctx.repl_complete(".mesh", &["messaging", "follow-up", ""], "");
+        assert_eq!(follow_ups.len(), 1, "only this node's own: {follow_ups:?}");
+        answers.extend(follow_ups);
         let ids: Vec<&str> = answers.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             ids,
             ["p1", "q1"],
-            "escalated questions first, then this node's own"
+            "escalated questions under envoy answer, this node's own under follow-up"
         );
         let asker8 = &hex_lower(&[0x12; 16])[..8];
         let describe = |id: &str| -> String {
@@ -39840,7 +39882,7 @@ mod tests {
                 now,
             )
             .unwrap();
-        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let answers = ctx.repl_complete(".mesh", &["envoy", "answer", ""], "");
         let p3 = answers
             .iter()
             .find(|(id, _)| id == "p3")
@@ -39873,7 +39915,7 @@ mod tests {
                 now,
             )
             .unwrap();
-        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let answers = ctx.repl_complete(".mesh", &["envoy", "answer", ""], "");
         let description = answers
             .iter()
             .find(|(id, _)| id == "p2")
@@ -39910,7 +39952,7 @@ mod tests {
             )
             .unwrap();
         let ids: Vec<String> = ctx
-            .repl_complete(".mesh", &["answer", ""], "")
+            .repl_complete(".mesh", &["envoy", "answer", ""], "")
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -39923,11 +39965,11 @@ mod tests {
         // `.mesh dismiss <TAB>` offers the questions peers escalated and nothing else:
         // not this node's own question (only the peer's reply closes it), not the access
         // request (`grant`/`refuse` decide it), each row the shape the answer row has.
-        let dismissals = ctx.repl_complete(".mesh", &["dismiss", ""], "");
+        let dismissals = ctx.repl_complete(".mesh", &["envoy", "dismiss", ""], "");
         let mut offered: Vec<&str> = dismissals.iter().map(|(id, _)| id.as_str()).collect();
         offered.sort_unstable();
         assert_eq!(offered, ["p1", "p2", "p3"], "{dismissals:?}");
-        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let answers = ctx.repl_complete(".mesh", &["envoy", "answer", ""], "");
         for (id, description) in &dismissals {
             let twin = answers
                 .iter()
@@ -39937,12 +39979,12 @@ mod tests {
             assert_eq!(description, &twin, "one row shape for both verbs: {id}");
         }
         assert!(
-            ctx.repl_complete(".mesh", &["dismiss", "p1", ""], "")
+            ctx.repl_complete(".mesh", &["envoy", "dismiss", "p1", ""], "")
                 .is_empty(),
             "nothing is offered after the id"
         );
         assert!(
-            ctx.repl_complete(".mesh", &["dismiss", "--all", ""], "")
+            ctx.repl_complete(".mesh", &["envoy", "dismiss", "--all", ""], "")
                 .is_empty(),
             "nothing is offered after --all"
         );
@@ -40110,24 +40152,24 @@ mod tests {
             .chain(ALLOW_FLAGS)
             .collect::<Vec<_>>();
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", ""])),
+            completion_values(&fixture.complete(&["files", "allow", ""])),
             expected_top,
             "plain files and directories, slashed, then the flags; secrets, `.git`, the \
              config dir, the symlink out of the root and the symlinked directory inside it \
              are hidden"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "docs/"])),
+            completion_values(&fixture.complete(&["files", "allow", "docs/"])),
             ["docs/a.md"],
             "a typed directory prefix lists that directory; the flags fall to the filter"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "RE"])),
+            completion_values(&fixture.complete(&["files", "allow", "RE"])),
             ["README.md"],
             "a typed name prefix narrows the rows"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["deny", ""])),
+            completion_values(&fixture.complete(&["files", "deny", ""])),
             ["README.md", "docs/"]
                 .into_iter()
                 .chain(DENY_FLAGS)
@@ -40182,7 +40224,7 @@ mod tests {
         let warns_before = sharing_off_warns();
         assert_eq!(serving.probed_case_for(&root.path), None, "a fresh root");
 
-        let rows = fixture.complete(&["allow", ""]);
+        let rows = fixture.complete(&["files", "allow", ""]);
         let values = completion_values(&rows);
 
         assert!(
@@ -40232,7 +40274,7 @@ mod tests {
         let files: Vec<&str> = names.iter().map(String::as_str).collect();
         seed_share_files(&root.path, &files);
 
-        let rows = fixture.complete(&["allow", ""]);
+        let rows = fixture.complete(&["files", "allow", ""]);
         let paths: Vec<&str> = completion_values(&rows)
             .into_iter()
             .filter(|value| !value.starts_with("--"))
@@ -40253,32 +40295,33 @@ mod tests {
         seed_share_files(&root.path, &["docs/a.md"]);
 
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "docs/**", ""])),
+            completion_values(&fixture.complete(&["files", "allow", "docs/**", ""])),
             ["--peer ", "--global", "--workspace", "--yes", "--dry-run"],
             "the positional is taken, so only flags remain; a glob cannot be forced"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "docs/a.md", ""])),
+            completion_values(&fixture.complete(&["files", "allow", "docs/a.md", ""])),
             ALLOW_FLAGS,
             "one exact file keeps --force on offer"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "x", "--global", ""])),
+            completion_values(&fixture.complete(&["files", "allow", "x", "--global", ""])),
             ["--peer ", "--force", "--yes", "--dry-run"],
             "--global is used and excludes --workspace"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "x", "--dry-run", ""])),
+            completion_values(&fixture.complete(&["files", "allow", "x", "--dry-run", ""])),
             ["--peer ", "--force", "--global", "--workspace"],
             "--dry-run is used and excludes --yes"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "--force", ""])),
+            completion_values(&fixture.complete(&["files", "allow", "--force", ""])),
             ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
             "a flag before the positional leaves the paths on offer; --force excludes --peer"
         );
         assert_eq!(
             completion_values(&fixture.complete(&[
+                "files",
                 "allow",
                 "--peer",
                 &fixture.trusted_destination,
@@ -40288,12 +40331,13 @@ mod tests {
             "the value after --peer is not the positional; --peer excludes --force"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "x", "--force", ""])),
+            completion_values(&fixture.complete(&["files", "allow", "x", "--force", ""])),
             ["--global", "--workspace", "--yes", "--dry-run"],
             "--force is used and excludes --peer"
         );
         assert_eq!(
             completion_values(&fixture.complete(&[
+                "files",
                 "allow",
                 "x",
                 "--peer",
@@ -40315,7 +40359,7 @@ mod tests {
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-peer").await;
         let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-peer-root");
 
-        let rows = fixture.complete(&["allow", "x", "--peer", ""]);
+        let rows = fixture.complete(&["files", "allow", "x", "--peer", ""]);
         let values = completion_values(&rows);
         assert_eq!(
             values[0],
@@ -40358,7 +40402,7 @@ mod tests {
             "no flags while a peer is being typed: {rows:?}"
         );
         assert_eq!(
-            fixture.complete(&["shares", "--peer", ""]),
+            fixture.complete(&["files", "list", "--peer", ""]),
             rows,
             "shares --peer takes the same records"
         );
@@ -40388,8 +40432,8 @@ mod tests {
             )
             .unwrap();
         for prior in [
-            ["allow", "x", "--peer", ""].as_slice(),
-            &["shares", "--peer", ""],
+            ["files", "allow", "x", "--peer", ""].as_slice(),
+            &["files", "list", "--peer", ""],
         ] {
             assert_eq!(
                 completion_values(&fixture.complete(prior))[0],
@@ -40399,7 +40443,7 @@ mod tests {
         }
         assert!(
             !fixture
-                .complete(&["untrust", ""])
+                .complete(&["access", "revoke", ""])
                 .iter()
                 .any(|(value, _)| *value == fixture.trusted_destination),
             "`untrust` drops the same record, since the verb refuses it"
@@ -40431,7 +40475,7 @@ mod tests {
             fs::write(path, yaml).unwrap();
         }
 
-        let rows = fixture.complete(&["unshare", ""]);
+        let rows = fixture.complete(&["files", "unshare", ""]);
         let described = |value: &str| Some(value.to_string());
         assert_eq!(
             rows,
@@ -40451,7 +40495,7 @@ mod tests {
             "global entries first, a pattern both files hold once, then the flags"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["unshare", "docs/**", ""])),
+            completion_values(&fixture.complete(&["files", "unshare", "docs/**", ""])),
             DENY_FLAGS,
             "nothing but flags once the pattern is typed"
         );
@@ -40469,20 +40513,21 @@ mod tests {
         let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-shares-root");
 
         assert_eq!(
-            completion_values(&fixture.complete(&["shares", ""])),
+            completion_values(&fixture.complete(&["files", "list", ""])),
             ["--peer ", "--effective"]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["shares", "--effective", ""])),
+            completion_values(&fixture.complete(&["files", "list", "--effective", ""])),
             ["--peer ", "--all"]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["shares", "--effective", "--all", ""])),
+            completion_values(&fixture.complete(&["files", "list", "--effective", "--all", ""])),
             ["--peer "]
         );
         assert_eq!(
             completion_values(&fixture.complete(&[
-                "shares",
+                "files",
+                "list",
                 "--peer",
                 &fixture.trusted_destination,
                 ""
@@ -40522,7 +40567,7 @@ mod tests {
             let fixture = seed_mesh_completion_fixture("rc-mesh-complete-request").await;
 
             assert_eq!(
-                completion_values(&fixture.complete(&["request", ""])),
+                completion_values(&fixture.complete(&["files", "request", ""])),
                 [fixture.trusted_destination.as_str()],
                 "never a heard-only peer, a blocked instance or an identity record"
             );
@@ -40539,13 +40584,13 @@ mod tests {
             let trusted = fixture.trusted_destination.clone();
 
             assert_eq!(
-                completion_values(&fixture.complete(&["request", &trusted, ""])),
+                completion_values(&fixture.complete(&["files", "request", &trusted, ""])),
                 ["--reason ", "--yes"],
                 "no listing heard yet"
             );
             seed_listing(&fixture, &["docs/a.md", "README.md", "docs/a.md"]);
             assert_eq!(
-                completion_values(&fixture.complete(&["request", &trusted, ""])),
+                completion_values(&fixture.complete(&["files", "request", &trusted, ""])),
                 ["docs/a.md", "README.md", "--reason ", "--yes"],
                 "the last listing once each in its own order, then the flags"
             );
@@ -40563,11 +40608,18 @@ mod tests {
             seed_listing(&fixture, &["docs/a.md", "README.md", "notes.md"]);
 
             assert_eq!(
-                completion_values(&fixture.complete(&["request", &trusted, "docs/a.md", ""])),
+                completion_values(&fixture.complete(&[
+                    "files",
+                    "request",
+                    &trusted,
+                    "docs/a.md",
+                    ""
+                ])),
                 ["README.md", "notes.md", "--reason ", "--yes"]
             );
             assert_eq!(
                 completion_values(&fixture.complete(&[
+                    "files",
                     "request",
                     &trusted,
                     "docs/a.md",
@@ -40592,15 +40644,18 @@ mod tests {
             seed_listing(&fixture, &["docs/a.md", "notes.md"]);
 
             assert_eq!(
-                completion_values(&fixture.complete(&["request", &trusted, "--yes", ""])),
+                completion_values(&fixture.complete(&["files", "request", &trusted, "--yes", ""])),
                 ["docs/a.md", "notes.md", "--reason "]
             );
             assert_eq!(
-                completion_values(&fixture.complete(&["request", &trusted, "--reason", "why", ""])),
+                completion_values(
+                    &fixture.complete(&["files", "request", &trusted, "--reason", "why", ""])
+                ),
                 ["docs/a.md", "notes.md", "--yes"]
             );
             assert_eq!(
                 completion_values(&fixture.complete(&[
+                    "files",
                     "request",
                     "--yes",
                     &trusted,
@@ -40627,7 +40682,7 @@ mod tests {
 
             assert!(
                 fixture
-                    .complete(&["request", &trusted, "docs/a.md", "--reason", ""])
+                    .complete(&["files", "request", &trusted, "docs/a.md", "--reason", ""])
                     .is_empty()
             );
 
@@ -40638,9 +40693,12 @@ mod tests {
         fn repl_complete_mesh_request_offers_nothing_while_the_mesh_is_off() {
             let ctx = create_test_ctx();
 
-            assert!(ctx.repl_complete(".mesh", &["request", ""], "").is_empty());
             assert!(
-                ctx.repl_complete(".mesh", &["request", "abc", ""], "")
+                ctx.repl_complete(".mesh", &["files", "request", ""], "")
+                    .is_empty()
+            );
+            assert!(
+                ctx.repl_complete(".mesh", &["files", "request", "abc", ""], "")
                     .is_empty()
             );
         }
@@ -40665,15 +40723,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            completion_values(&ctx.repl_complete(".mesh", &["allow", ""], "")),
+            completion_values(&ctx.repl_complete(".mesh", &["files", "allow", ""], "")),
             ALLOW_FLAGS
         );
         assert_eq!(
-            completion_values(&ctx.repl_complete(".mesh", &["deny", ""], "")),
+            completion_values(&ctx.repl_complete(".mesh", &["files", "deny", ""], "")),
             DENY_FLAGS
         );
         assert_eq!(
-            completion_values(&ctx.repl_complete(".mesh", &["unshare", ""], "")),
+            completion_values(&ctx.repl_complete(".mesh", &["files", "unshare", ""], "")),
             ["docs/**"]
                 .into_iter()
                 .chain(DENY_FLAGS)
@@ -40700,7 +40758,7 @@ mod tests {
         std::os::unix::fs::symlink(root.path.join("docs/a.md"), root.path.join("alias.md"))
             .unwrap();
 
-        let rows = fixture.complete(&["allow", ""]);
+        let rows = fixture.complete(&["files", "allow", ""]);
         let top = completion_values(&rows);
         assert!(top.contains(&"docs/"), "{top:?}");
         assert!(!top.iter().any(|value| value.contains("leak")), "{top:?}");
@@ -40709,11 +40767,11 @@ mod tests {
             "a link to a file inside the root is hidden too: {top:?}"
         );
 
-        let rows = fixture.complete(&["allow", "docs/"]);
+        let rows = fixture.complete(&["files", "allow", "docs/"]);
         let docs = completion_values(&rows);
         assert_eq!(docs, ["docs/a.md", "docs/sub/"], "{docs:?}");
 
-        let rows = fixture.complete(&["allow", "docs/sub/"]);
+        let rows = fixture.complete(&["files", "allow", "docs/sub/"]);
         let deep = completion_values(&rows);
         assert_eq!(deep, ["docs/sub/deep.md"], "{deep:?}");
 
@@ -40747,11 +40805,11 @@ mod tests {
             "the real directory is offered, the link beside it is not"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "sub/"])),
+            completion_values(&fixture.complete(&["files", "allow", "sub/"])),
             ["sub/notes.md"]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["allow", "docs/"])),
+            completion_values(&fixture.complete(&["files", "allow", "docs/"])),
             ["docs/a.md"]
         );
 
@@ -40778,27 +40836,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            completion_values(&fixture.complete(&["deny", "docs/**", "--yes", ""])),
+            completion_values(&fixture.complete(&["files", "deny", "docs/**", "--yes", ""])),
             ["--global", "--workspace"],
             "--yes is used and excludes --dry-run"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["deny", "docs/**", "--workspace", ""])),
+            completion_values(&fixture.complete(&["files", "deny", "docs/**", "--workspace", ""])),
             ["--yes", "--dry-run"],
             "--workspace is used and excludes --global"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["unshare", "--global", ""])),
+            completion_values(&fixture.complete(&["files", "unshare", "--global", ""])),
             ["docs/**", "--yes", "--dry-run"],
             "a layer flag before the positional leaves the patterns on offer"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["unshare", "docs/**", "--dry-run", ""])),
+            completion_values(&fixture.complete(&["files", "unshare", "docs/**", "--dry-run", ""])),
             ["--global", "--workspace"],
             "--dry-run is used and excludes --yes"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["shares", "--effective", "--peer", ""]))
+            completion_values(&fixture.complete(&["files", "list", "--effective", "--peer", ""]))
                 .iter()
                 .filter(|value| value.starts_with("--"))
                 .count(),
@@ -40830,7 +40888,7 @@ mod tests {
         );
 
         for typed in [".", ".g", ".git/", ".git/H", ".coyote/", ".co"] {
-            let rows = fixture.complete(&["allow", typed]);
+            let rows = fixture.complete(&["files", "allow", typed]);
             let values = completion_values(&rows);
             assert!(
                 !values
@@ -40839,7 +40897,7 @@ mod tests {
                 "{typed}: {values:?}"
             );
         }
-        let rows = fixture.complete(&["allow", "."]);
+        let rows = fixture.complete(&["files", "allow", "."]);
         let dot = completion_values(&rows);
         assert_eq!(
             dot,
@@ -40881,7 +40939,7 @@ mod tests {
             "the probe fails against the read-only root"
         );
 
-        let rows = fixture.complete(&["allow", ""]);
+        let rows = fixture.complete(&["files", "allow", ""]);
         let values = completion_values(&rows);
 
         set_mode(0o755);
@@ -40910,7 +40968,7 @@ mod tests {
         snapshot.cwd = root.path.clone();
         fixture.ctx.app.mesh.publish(snapshot);
 
-        let rows = fixture.complete(&["allow", ""]);
+        let rows = fixture.complete(&["files", "allow", ""]);
         assert_eq!(
             completion_values(&rows),
             ["README.md", "inbound/"]
@@ -41053,8 +41111,8 @@ mod tests {
         );
         seed_inbound(&fixture.ctx, "q-1", InboundKind::Question, &[], "", now);
 
-        let grant = fixture.complete(&["grant", ""]);
-        let refuse = fixture.complete(&["refuse", ""]);
+        let grant = fixture.complete(&["files", "grant", ""]);
+        let refuse = fixture.complete(&["files", "refuse", ""]);
         assert_eq!(
             completion_values(&grant),
             ["a-1"],
@@ -41077,7 +41135,7 @@ mod tests {
             }
         }
         assert_eq!(
-            completion_values(&fixture.complete(&["answer", ""])),
+            completion_values(&fixture.complete(&["envoy", "answer", ""])),
             ["q-1"],
             "an access request is decided, not answered"
         );
@@ -41115,7 +41173,7 @@ mod tests {
         let refuse_before = unreadable_reports("refuse");
         let grant_before = unreadable_reports("grant");
 
-        assert!(fixture.complete(&["refuse", ""]).is_empty());
+        assert!(fixture.complete(&["files", "refuse", ""]).is_empty());
         assert_eq!(
             unreadable_reports("refuse"),
             refuse_before + 1,
@@ -41127,7 +41185,7 @@ mod tests {
             "`refuse` did not report under `grant`"
         );
 
-        assert!(fixture.complete(&["grant", ""]).is_empty());
+        assert!(fixture.complete(&["files", "grant", ""]).is_empty());
         assert_eq!(unreadable_reports("grant"), grant_before + 1);
         assert_eq!(unreadable_reports("refuse"), refuse_before + 1);
 
@@ -41142,26 +41200,26 @@ mod tests {
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant-flags").await;
 
         assert_eq!(
-            completion_values(&fixture.complete(&["grant", "a-1", ""])),
+            completion_values(&fixture.complete(&["files", "grant", "a-1", ""])),
             ["--standing", "--for "]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["grant", "a-1", "--standing", ""])),
+            completion_values(&fixture.complete(&["files", "grant", "a-1", "--standing", ""])),
             ["--global", "--workspace"],
             "the share-file flags follow `--standing`; `--for` does not apply"
         );
         assert!(
             fixture
-                .complete(&["grant", "a-1", "--for", "2h", ""])
+                .complete(&["files", "grant", "a-1", "--for", "2h", ""])
                 .is_empty(),
             "a timed grant is neither standing nor written to a share file"
         );
         assert!(
             fixture
-                .complete(&["grant", "a-1", "--standing", "--global", ""])
+                .complete(&["files", "grant", "a-1", "--standing", "--global", ""])
                 .is_empty()
         );
-        assert!(fixture.complete(&["refuse", "a-1", ""]).is_empty());
+        assert!(fixture.complete(&["files", "refuse", "a-1", ""]).is_empty());
 
         fixture.stop().await;
     }
@@ -41178,13 +41236,13 @@ mod tests {
         let runtime = fixture.ctx.app.mesh.get().unwrap();
 
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", ""])),
+            completion_values(&fixture.complete(&["files", "fetch", ""])),
             [trusted.as_str()],
             "the trusted heard peers; never a heard-only peer, a blocked instance or an identity record"
         );
 
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            completion_values(&fixture.complete(&["files", "fetch", &trusted, ""])),
             ["--if-sha256 "],
             "no listing heard yet"
         );
@@ -41200,17 +41258,17 @@ mod tests {
             SystemTime::now(),
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            completion_values(&fixture.complete(&["files", "fetch", &trusted, ""])),
             ["docs/a.md", "README.md", "--if-sha256 "],
             "the last listing in its own order, then the flag"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", &trusted, "docs/a.md", ""])),
+            completion_values(&fixture.complete(&["files", "fetch", &trusted, "docs/a.md", ""])),
             ["--if-sha256 "]
         );
         assert!(
             fixture
-                .complete(&["fetch", &trusted, "docs/a.md", "--if-sha256", ""])
+                .complete(&["files", "fetch", &trusted, "docs/a.md", "--if-sha256", ""])
                 .is_empty()
         );
 
@@ -41236,7 +41294,7 @@ mod tests {
         runtime
             .memory()
             .remember_reference(&trusted, &identity, "fedcba9876543210", "notes.txt");
-        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        let rows = fixture.complete(&["files", "fetch", &trusted, ""]);
         assert_eq!(
             completion_values(&rows),
             ["docs/plan.md", "notes.txt", "--if-sha256 "],
@@ -41255,7 +41313,7 @@ mod tests {
             .memory()
             .mark_fetched(&trusted, "docs/plan.md", Path::new("/tmp/staged/plan.md"));
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            completion_values(&fixture.complete(&["files", "fetch", &trusted, ""])),
             ["notes.txt", "--if-sha256 "],
             "a fetched reference is no longer offered"
         );
@@ -41287,7 +41345,7 @@ mod tests {
         runtime
             .memory()
             .remember_grant(&trusted, &identity, "always/standing.md", None);
-        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        let rows = fixture.complete(&["files", "fetch", &trusted, ""]);
         assert_eq!(
             completion_values(&rows),
             ["soon/timed.md", "always/standing.md", "--if-sha256 "],
@@ -41331,7 +41389,7 @@ mod tests {
             ],
             heard_at,
         );
-        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        let rows = fixture.complete(&["files", "fetch", &trusted, ""]);
         assert_eq!(
             completion_values(&rows),
             ["docs/a.md", "README.md", "--if-sha256 "]
@@ -41382,7 +41440,7 @@ mod tests {
             "only/referenced.md",
         );
 
-        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        let rows = fixture.complete(&["files", "fetch", &trusted, ""]);
         assert_eq!(
             completion_values(&rows),
             [
@@ -41461,7 +41519,7 @@ mod tests {
             "only/referenced.md",
         );
 
-        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        let rows = fixture.complete(&["files", "fetch", &trusted, ""]);
         assert_eq!(
             completion_values(&rows),
             [
@@ -41524,7 +41582,7 @@ mod tests {
         memory.remember_grant(&trusted, &identity, "docs/b.md", None);
         memory.remember_reference(&trusted, &identity, "aaaabbbbccccdddd", "docs/a.md");
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            completion_values(&fixture.complete(&["files", "fetch", &trusted, ""])),
             ["docs/a.md", "docs/b.md", "docs/l.md", "--if-sha256 "]
         );
 
@@ -41543,7 +41601,7 @@ mod tests {
         );
 
         assert_eq!(
-            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            completion_values(&fixture.complete(&["files", "fetch", &trusted, ""])),
             ["docs/l.md", "--if-sha256 "],
             "the old identity's attachment and grant are gone; the listing is the destination's"
         );
@@ -41599,7 +41657,7 @@ mod tests {
         memory.remember_reference(&trusted, &identity, "aaaabbbbccccdddd", "docs/plain.md");
         memory.remember_grant(&trusted, &identity, "only/granted.md", None);
 
-        let rows = fixture.complete(&["fetch", &trusted, ""]);
+        let rows = fixture.complete(&["files", "fetch", &trusted, ""]);
         assert_eq!(
             completion_values(&rows),
             [
@@ -41666,7 +41724,7 @@ mod tests {
             .unwrap();
         let second_untagged = format!("Cal . {} . trusted . 1 hops . heard 2m ago", short(&second));
 
-        let fresh = fixture.complete(&["fetch", ""]);
+        let fresh = fixture.complete(&["files", "fetch", ""]);
         assert_eq!(
             completion_values(&fresh),
             [trusted.as_str(), second.as_str()]
@@ -41679,7 +41737,7 @@ mod tests {
         assert_eq!(completion_description(&fresh, &second), second_untagged);
 
         runtime.memory().remember_card(&trusted, card(&["fetch"]));
-        let capable = fixture.complete(&["fetch", ""]);
+        let capable = fixture.complete(&["files", "fetch", ""]);
         assert_eq!(
             completion_values(&capable),
             [trusted.as_str(), second.as_str()],
@@ -41700,7 +41758,7 @@ mod tests {
             .memory()
             .remember_card(&trusted, card(&["list", "message"]));
         assert_eq!(
-            fixture.complete(&["fetch", ""]),
+            fixture.complete(&["files", "fetch", ""]),
             fresh,
             "a card without the `fetch` cap leaves the row as it was"
         );
@@ -41728,32 +41786,47 @@ mod tests {
         let heard = fixture.heard_destination.clone();
 
         assert_eq!(
-            completion_values(&fixture.complete(&["answer", "p1", ""])),
+            completion_values(&fixture.complete(&["envoy", "answer", "p1", ""])),
             ["--attach "]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["answer", "p1", "--attach", ""])),
+            completion_values(&fixture.complete(&["envoy", "answer", "p1", "--attach", ""])),
             ["README.md", "docs/"],
             "the share-root completer, secrets and the config dir hidden"
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["answer", "p1", "--attach", "docs/a.md", ""])),
+            completion_values(&fixture.complete(&[
+                "envoy",
+                "answer",
+                "p1",
+                "--attach",
+                "docs/a.md",
+                ""
+            ])),
             ["--force"]
         );
         assert!(
             fixture
-                .complete(&["answer", "p1", "--attach", "docs/a.md", "--force", ""])
+                .complete(&[
+                    "envoy",
+                    "answer",
+                    "p1",
+                    "--attach",
+                    "docs/a.md",
+                    "--force",
+                    ""
+                ])
                 .is_empty()
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["message", &heard, ""])),
+            completion_values(&fixture.complete(&["messaging", "send", &heard, ""])),
             ["--attach ", "--yes"]
         );
         assert_eq!(
-            completion_values(&fixture.complete(&["message", &heard, "--yes", ""])),
+            completion_values(&fixture.complete(&["messaging", "send", &heard, "--yes", ""])),
             ["--attach "]
         );
-        let after_flag = fixture.complete(&["message", "--yes", ""]);
+        let after_flag = fixture.complete(&["messaging", "send", "--yes", ""]);
         assert_eq!(
             completion_values(&after_flag),
             [fixture.trusted_destination.as_str()],
@@ -41769,15 +41842,15 @@ mod tests {
         let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
 
         assert_eq!(
-            complete(&["inbox", ""]),
+            complete(&["messaging", "inbox", ""]),
             [("--purge-files".to_string(), None)]
         );
         assert_eq!(
-            complete(&["inbox", "--purge-files", ""]),
+            complete(&["messaging", "inbox", "--purge-files", ""]),
             [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
         );
-        assert!(complete(&["inbox", "--purge-files", "--dry-run", ""]).is_empty());
-        assert!(complete(&["inbox", "--purge-files", "--yes", ""]).is_empty());
+        assert!(complete(&["messaging", "inbox", "--purge-files", "--dry-run", ""]).is_empty());
+        assert!(complete(&["messaging", "inbox", "--purge-files", "--yes", ""]).is_empty());
     }
 
     const REMEMBERED_IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";
@@ -41831,9 +41904,12 @@ mod tests {
         assert!(ctx.app.mesh.get().is_none());
         let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
 
-        assert_eq!(complete(&["memory", ""]), [("forget ".to_string(), None)]);
         assert_eq!(
-            complete(&["memory", "forget", ""]),
+            complete(&["envoy", "memory", ""]),
+            [("forget ".to_string(), None)]
+        );
+        assert_eq!(
+            complete(&["envoy", "memory", "forget", ""]),
             [(
                 "all".to_string(),
                 Some("every remembered conversation".to_string())
@@ -41844,7 +41920,7 @@ mod tests {
         seed_envoy_memory(&MeshPaths::from_env().cache_dir);
 
         assert_eq!(
-            complete(&["memory", "forget", ""]),
+            complete(&["envoy", "memory", "forget", ""]),
             [
                 (
                     REMEMBERED_IDENTITY_A.to_string(),
@@ -41865,7 +41941,7 @@ mod tests {
             "the records outlive the node, so the verb and its completion work with the mesh off"
         );
         assert_eq!(
-            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, ""]),
+            complete(&["envoy", "memory", "forget", REMEMBERED_IDENTITY_A, ""]),
             [
                 ("a-first".to_string(), None),
                 ("a-second".to_string(), None),
@@ -41875,6 +41951,7 @@ mod tests {
         );
         assert_eq!(
             complete(&[
+                "envoy",
                 "memory",
                 "forget",
                 &REMEMBERED_IDENTITY_B.to_uppercase(),
@@ -41888,15 +41965,22 @@ mod tests {
             "the identity is matched in either case"
         );
         assert_eq!(
-            complete(&["memory", "forget", "all", ""]),
+            complete(&["envoy", "memory", "forget", "all", ""]),
             [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
         );
         assert!(
-            complete(&["memory", "forget", "all", "--yes", ""]).is_empty(),
+            complete(&["envoy", "memory", "forget", "all", "--yes", ""]).is_empty(),
             "either flag rules the other out"
         );
         assert_eq!(
-            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, "--dry-run", ""]),
+            complete(&[
+                "envoy",
+                "memory",
+                "forget",
+                REMEMBERED_IDENTITY_A,
+                "--dry-run",
+                ""
+            ]),
             [
                 ("a-first".to_string(), None),
                 ("a-second".to_string(), None)
@@ -41904,7 +41988,7 @@ mod tests {
             "a flag takes no position: the thread is still accepted after it"
         );
         assert_eq!(
-            complete(&["memory", "forget", "--yes", ""]),
+            complete(&["envoy", "memory", "forget", "--yes", ""]),
             [
                 (
                     REMEMBERED_IDENTITY_A.to_string(),
@@ -41926,6 +42010,7 @@ mod tests {
         );
         assert!(
             complete(&[
+                "envoy",
                 "memory",
                 "forget",
                 REMEMBERED_IDENTITY_A,
@@ -41935,7 +42020,7 @@ mod tests {
             ])
             .is_empty()
         );
-        assert!(complete(&["memory", "list", ""]).is_empty());
+        assert!(complete(&["envoy", "memory", "list", ""]).is_empty());
     }
 
     #[cfg(unix)]
@@ -41985,7 +42070,7 @@ mod tests {
             )
             .unwrap();
 
-        let values = fixture.complete(&["memory", "forget", ""]);
+        let values = fixture.complete(&["envoy", "memory", "forget", ""]);
 
         let (remembered, rest) = values.split_at(2);
         let mut remembered = remembered.to_vec();
@@ -42045,7 +42130,13 @@ mod tests {
         );
 
         assert_eq!(
-            fixture.complete(&["memory", "forget", &fixture.trusted_peer_identity, ""]),
+            fixture.complete(&[
+                "envoy",
+                "memory",
+                "forget",
+                &fixture.trusted_peer_identity,
+                ""
+            ]),
             [
                 ("bea-first".to_string(), None),
                 ("bea-second".to_string(), None),

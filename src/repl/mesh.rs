@@ -79,153 +79,247 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-/// (verb, one-line description, example), in `.mesh` help order.
-pub(super) const VERBS: &[(&str, &str, &str)] = &[
+/// (group, one-line summary), in `.mesh help` order.
+pub(super) const GROUPS: &[(&str, &str)] = &[
     (
+        "people",
+        "See the nodes heard on the mesh and what one of them is doing",
+    ),
+    (
+        "access",
+        "Decide which peers this node trusts, blocks or forgets, and answer knocks",
+    ),
+    (
+        "messaging",
+        "Send to peers, read the inbox and follow up on the questions this node asked",
+    ),
+    (
+        "envoy",
+        "Shape what your envoy tells peers and handle what it escalates to you",
+    ),
+    (
+        "files",
+        "Share files with peers, decide their access requests and fetch theirs",
+    ),
+    (
+        "config",
+        "Show the mesh settings and rotate this node's identity",
+    ),
+];
+
+/// (group, verb, usage, one-line summary), in `.mesh help` order; group "" is the top
+/// level. Dispatch, completion, the listings and every usage line read this table.
+pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
+    (
+        "",
         "on",
-        "Join the mesh for this session only; config.yaml is not changed",
         ".mesh on [--yes] [--fresh]",
+        "Join the mesh for this session only; config.yaml is not changed",
     ),
     (
+        "",
         "off",
-        "Leave the mesh and drop the mesh__* tools",
         ".mesh off [--yes]",
-    ),
-    ("peers", "List the nodes heard on the mesh", ".mesh peers"),
-    (
-        "knocks",
-        "List the untrusted nodes that knocked",
-        ".mesh knocks",
+        "Leave the mesh and drop the mesh__* tools",
     ),
     (
-        "info",
-        "Show the mesh settings and this node, or one peer",
-        ".mesh info [<destination>]",
-    ),
-    (
+        "",
         "status",
-        "Show this node's status card, set its objective, or fetch a peer's card",
-        ".mesh status [\"objective\"|clear|<destination>]",
+        ".mesh status [\"objective\"|clear]",
+        "Show this node's status card or set its objective",
+    ),
+    ("", "help", ".mesh help", "List the mesh commands by group"),
+    (
+        "people",
+        "list",
+        ".mesh people list",
+        "List the nodes heard on the mesh",
     ),
     (
-        "brief",
-        "Show the brief your envoy answers peers with, or set its note or mode",
-        ".mesh brief [note \"text\"|note clear|auto|manual|off]",
+        "people",
+        "info",
+        ".mesh people info <destination>",
+        "Show what this node knows of one peer",
     ),
     (
-        "inbox",
-        "Drain the peer messages waiting for this node",
-        ".mesh inbox [--purge-files [--yes|--dry-run]]",
+        "people",
+        "status",
+        ".mesh people status <destination>",
+        "Fetch a trusted peer's status card",
     ),
     (
-        "pending",
-        "List the questions this node asked and the ones peers escalated to you",
-        ".mesh pending",
-    ),
-    (
-        "answer",
-        "Answer an escalated question, or follow up on one this node asked",
-        ".mesh answer <id> [\"text\"] [--attach <path> [--force]]",
-    ),
-    (
-        "dismiss",
-        "Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
-        ".mesh dismiss <id> [--silent] | --all [--silent] [--yes|--dry-run]",
-    ),
-    (
-        "message",
-        "Send your own text to one peer, bypassing the model",
-        ".mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]",
-    ),
-    (
-        "broadcast",
-        "Send a bulletin to every trusted peer with a known path",
-        ".mesh broadcast [--yes] \"text\"",
-    ),
-    (
+        "access",
         "trust",
-        "Trust one instance, or every instance of an identity, or prune stale trusted instances",
-        ".mesh trust <destination> [--yes] [--label \"text\"] | --identity <identity> [--yes] [--label \"text\"] | --prune [--older-than 30d] [--dry-run|--confirm prune-<N>]",
+        ".mesh access trust <destination> [--yes] [--label \"text\"] | --identity <identity> [--yes] [--label \"text\"]",
+        "Trust one instance, or every instance of an identity",
     ),
     (
-        "untrust",
-        "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own",
-        ".mesh untrust <destination> [--yes|--dry-run] | --identity <identity> [--dry-run|--confirm untrust-<identity-short>]",
+        "access",
+        "revoke",
+        ".mesh access revoke <destination> [--yes|--dry-run] | --identity <identity> [--dry-run|--confirm untrust-<identity-short>] | --stale [--older-than 30d] [--dry-run|--confirm prune-<N>]",
+        "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own. `--stale` prunes the trusted instances not heard from lately",
     ),
     (
-        "forget",
-        "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger",
-        ".mesh forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]",
-    ),
-    (
+        "access",
         "block",
+        ".mesh access block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]",
         "Refuse one instance without a knock, or silence a whole identity; `block` remembers where `untrust` only stops serving",
-        ".mesh block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]",
     ),
     (
+        "access",
         "unblock",
+        ".mesh access unblock <destination> [--yes] | --identity <identity> [--yes]",
         "Lift a block on an instance or an identity; it grants nothing, so only trust the list still holds serves it afterwards",
-        ".mesh unblock <destination> [--yes] | --identity <identity> [--yes]",
     ),
     (
-        "rotate",
-        "Mint a new mesh identity while the node is off; peers must re-trust the new one",
-        ".mesh rotate [--dry-run|--confirm rotate-<identity-short>]",
+        "access",
+        "forget",
+        ".mesh access forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]",
+        "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger",
     ),
     (
-        "sync",
-        "Sync the messages a propagation node holds for this node now",
-        ".mesh sync",
+        "access",
+        "requests",
+        ".mesh access requests",
+        "List the untrusted nodes that knocked",
     ),
     (
-        "knock",
+        "access",
+        "ask",
+        ".mesh access ask <destination> [--yes] [--intro \"text\"]",
         "Ask an untrusted peer to trust this instance, with an optional intro",
-        ".mesh knock <destination> [--yes] [--intro \"text\"]",
     ),
     (
-        "allow",
-        "Share files matching a pattern with every trusted peer, or with one peer",
-        ".mesh allow docs/** [--peer <identity|destination>] [--force] [--global|--workspace] [--yes|--dry-run]",
+        "messaging",
+        "send",
+        ".mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]",
+        "Send your own text to one peer, bypassing the model",
     ),
     (
-        "deny",
-        "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)",
-        ".mesh deny \"src/vault/*\" [--global|--workspace] [--yes|--dry-run]",
+        "messaging",
+        "broadcast",
+        ".mesh messaging broadcast [--yes] \"text\"",
+        "Send a bulletin to every trusted peer with a known path",
     ),
     (
-        "unshare",
-        "Remove the allow or deny share rule that holds a pattern",
-        ".mesh unshare docs/** [--global|--workspace] [--yes|--dry-run]",
+        "messaging",
+        "inbox",
+        ".mesh messaging inbox [--purge-files [--yes|--dry-run]]",
+        "Drain the peer messages waiting for this node",
     ),
     (
-        "shares",
-        "List the share rules and the file each came from, or the files a peer can fetch",
-        ".mesh shares [--peer <identity|destination>] [--effective [--all]]",
+        "messaging",
+        "sync",
+        ".mesh messaging sync",
+        "Sync the messages a propagation node holds for this node now",
     ),
     (
-        "grant",
-        "Grant a peer's access request: once for a while, or standing in the share list",
-        ".mesh grant <id> [--standing [--global|--workspace]] [--for 30m|2h|1d]",
+        "messaging",
+        "sent",
+        ".mesh messaging sent",
+        "List the questions this node asked that are still open",
     ),
     (
-        "refuse",
-        "Refuse a peer's access request",
-        ".mesh refuse <id>",
+        "messaging",
+        "follow-up",
+        ".mesh messaging follow-up <id> [\"text\"] [--attach <path> [--force]]",
+        "Follow up on a question this node asked",
     ),
     (
-        "request",
-        "Ask a trusted peer's human for access to files it does not share yet",
-        ".mesh request <destination> <path>... [--reason \"text\"] [--yes]",
+        "envoy",
+        "brief",
+        ".mesh envoy brief [note \"text\"|note clear|auto|manual|off]",
+        "Show the brief your envoy answers peers with, or set its note or mode",
     ),
     (
-        "fetch",
-        "Fetch one file a trusted peer shares into this node's staging inbox",
-        ".mesh fetch <destination> <path> [--if-sha256 <hex>]",
-    ),
-    (
+        "envoy",
         "memory",
+        ".mesh envoy memory forget <identity|all> [thread] [--yes|--dry-run]",
         "Forget what the envoy remembers of a peer's threads: one identity, one of its threads, or everything",
-        ".mesh memory forget <identity|all> [thread] [--yes|--dry-run]",
+    ),
+    (
+        "envoy",
+        "questions",
+        ".mesh envoy questions",
+        "List the questions peers escalated to you",
+    ),
+    (
+        "envoy",
+        "answer",
+        ".mesh envoy answer <id> [\"text\"] [--attach <path> [--force]]",
+        "Answer a question a peer escalated to you",
+    ),
+    (
+        "envoy",
+        "dismiss",
+        ".mesh envoy dismiss <id> [--silent] | --all [--silent] [--yes|--dry-run]",
+        "Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
+    ),
+    (
+        "files",
+        "list",
+        ".mesh files list [--peer <identity|destination>] [--effective [--all]]",
+        "List the share rules and the file each came from, or the files a peer can fetch",
+    ),
+    (
+        "files",
+        "allow",
+        ".mesh files allow docs/** [--peer <identity|destination>] [--force] [--global|--workspace] [--yes|--dry-run]",
+        "Share files matching a pattern with every trusted peer, or with one peer",
+    ),
+    (
+        "files",
+        "deny",
+        ".mesh files deny \"src/vault/*\" [--global|--workspace] [--yes|--dry-run]",
+        "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)",
+    ),
+    (
+        "files",
+        "unshare",
+        ".mesh files unshare docs/** [--global|--workspace] [--yes|--dry-run]",
+        "Remove the allow or deny share rule that holds a pattern",
+    ),
+    (
+        "files",
+        "requests",
+        ".mesh files requests",
+        "List the access requests peers sent",
+    ),
+    (
+        "files",
+        "grant",
+        ".mesh files grant <id> [--standing [--global|--workspace]] [--for 30m|2h|1d]",
+        "Grant a peer's access request: once for a while, or standing in the share list",
+    ),
+    (
+        "files",
+        "refuse",
+        ".mesh files refuse <id>",
+        "Refuse a peer's access request",
+    ),
+    (
+        "files",
+        "request",
+        ".mesh files request <destination> <path>... [--reason \"text\"] [--yes]",
+        "Ask a trusted peer's human for access to files it does not share yet",
+    ),
+    (
+        "files",
+        "fetch",
+        ".mesh files fetch <destination> <path> [--if-sha256 <hex>]",
+        "Fetch one file a trusted peer shares into this node's staging inbox",
+    ),
+    (
+        "config",
+        "show",
+        ".mesh config show",
+        "Show the mesh settings and this node",
+    ),
+    (
+        "config",
+        "rotate-identity",
+        ".mesh config rotate-identity [--dry-run|--confirm rotate-<identity-short>]",
+        "Mint a new mesh identity while the node is off; peers must re-trust the new one",
     ),
 ];
 
@@ -260,63 +354,95 @@ pub(crate) async fn run(
     abort_signal: AbortSignal,
     args: Option<&str>,
 ) -> Result<()> {
-    let Some((verb, rest)) = split_verb(args) else {
+    let Some((first, rest)) = split_verb(args) else {
         out_text(&render_help());
         return Ok(());
     };
-    match verb {
-        "on" => turn_on(ctx, rest).await,
-        "off" => turn_off(ctx, rest).await,
-        "peers" => peers(ctx).await,
-        "knocks" => knocks(ctx),
-        "info" => info(ctx, &abort_signal, rest).await,
-        "status" => status(ctx, &abort_signal, rest).await,
-        "brief" => brief(ctx, rest),
-        "inbox" => inbox(ctx, rest),
-        "pending" => pending(ctx),
-        "answer" => answer(ctx, rest).await,
-        "dismiss" => dismiss(ctx, rest).await,
-        "message" => message(ctx, &abort_signal, rest).await,
-        "broadcast" => broadcast(ctx, rest).await,
-        "trust" => trust(ctx, &abort_signal, rest).await,
-        "untrust" => untrust(ctx, rest),
-        "forget" => forget(ctx, rest),
-        "block" => block(ctx, rest),
-        "unblock" => unblock(ctx, rest),
-        "rotate" => rotate(ctx, rest),
-        "sync" => sync(ctx, &abort_signal, rest).await,
-        "knock" => knock(ctx, &abort_signal, rest).await,
-        "allow" => allow(ctx, rest),
-        "deny" => deny(ctx, rest),
-        "unshare" => unshare(ctx, rest),
-        "shares" => shares(ctx, rest),
-        "grant" => grant(ctx, rest).await,
-        "refuse" => refuse(ctx, rest).await,
-        "request" => request(ctx, &abort_signal, rest).await,
-        "fetch" => fetch(ctx, &abort_signal, rest).await,
-        "memory" => memory(ctx, rest),
-        other => bail!("{}", unknown_verb_error(other)),
+    let (group, verb, rest) = if is_group(first) {
+        match split_verb(rest) {
+            None | Some(("help", None)) => {
+                out_text(&render_group_help(first));
+                return Ok(());
+            }
+            Some((verb, rest)) => (first, verb, rest),
+        }
+    } else {
+        ("", first, rest)
+    };
+    if !COMMANDS
+        .iter()
+        .any(|(g, v, _, _)| *g == group && *v == verb)
+    {
+        bail!("{}", unknown_command_error(group, verb));
+    }
+    if rest == Some("--help") {
+        out_text(&render_verb_help(group, verb));
+        return Ok(());
+    }
+    match (group, verb) {
+        ("", "on") => turn_on(ctx, rest).await,
+        ("", "off") => turn_off(ctx, rest).await,
+        ("", "status") => status(ctx, rest),
+        ("", "help") => {
+            parse_args(rest, &[], "", "help")?;
+            out_text(&render_help());
+            Ok(())
+        }
+        ("people", "list") => peers(ctx).await,
+        ("people", "info") => info(ctx, &abort_signal, rest).await,
+        ("people", "status") => peer_status(ctx, &abort_signal, rest).await,
+        ("access", "trust") => trust(ctx, &abort_signal, rest).await,
+        ("access", "revoke") => untrust(ctx, rest),
+        ("access", "block") => block(ctx, rest),
+        ("access", "unblock") => unblock(ctx, rest),
+        ("access", "forget") => forget(ctx, rest),
+        ("access", "requests") => knocks(ctx),
+        ("access", "ask") => knock(ctx, &abort_signal, rest).await,
+        ("messaging", "send") => message(ctx, &abort_signal, rest).await,
+        ("messaging", "broadcast") => broadcast(ctx, rest).await,
+        ("messaging", "inbox") => inbox(ctx, rest),
+        ("messaging", "sync") => sync(ctx, &abort_signal, rest).await,
+        ("messaging", "sent") => pending(ctx, PendingList::Asked),
+        ("messaging", "follow-up") => answer(ctx, AnswerRoute::Outbound, rest).await,
+        ("envoy", "brief") => brief(ctx, rest),
+        ("envoy", "memory") => memory(ctx, rest),
+        ("envoy", "questions") => pending(ctx, PendingList::Escalated),
+        ("envoy", "answer") => answer(ctx, AnswerRoute::Inbound, rest).await,
+        ("envoy", "dismiss") => dismiss(ctx, rest).await,
+        ("files", "list") => shares(ctx, rest),
+        ("files", "allow") => allow(ctx, rest),
+        ("files", "deny") => deny(ctx, rest),
+        ("files", "unshare") => unshare(ctx, rest),
+        ("files", "requests") => pending(ctx, PendingList::Access),
+        ("files", "grant") => grant(ctx, rest).await,
+        ("files", "refuse") => refuse(ctx, rest).await,
+        ("files", "request") => request(ctx, &abort_signal, rest).await,
+        ("files", "fetch") => fetch(ctx, &abort_signal, rest).await,
+        ("config", "show") => {
+            parse_args(rest, &[], "config", "show")?;
+            show_config(ctx);
+            Ok(())
+        }
+        ("config", "rotate-identity") => rotate(ctx, rest),
+        _ => bail!("{}", unknown_command_error(group, verb)),
     }
 }
 
-/// The retired `reply` verb is refused with the `message` usage to type instead.
-fn unknown_verb_error(verb: &str) -> String {
-    match verb {
-        "reply" => {
-            let (_, _, example) = VERBS
-                .iter()
-                .find(|(name, _, _)| *name == "message")
-                .expect("VERBS has a message row");
-            format!(
-                "Unknown .mesh command 'reply'. To message a peer, use `{example}`. Type `.mesh` for the list."
-            )
-        }
-        other => format!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
-    }
+pub(crate) fn is_group(word: &str) -> bool {
+    GROUPS.iter().any(|(group, _)| *group == word)
+}
+
+fn unknown_command_error(group: &str, verb: &str) -> String {
+    let typed = if group.is_empty() {
+        verb.to_string()
+    } else {
+        format!("{group} {verb}")
+    };
+    format!("Unknown .mesh command '{typed}'. Type `.mesh help` for the list.")
 }
 
 async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
-    let args = parse_args(rest, &["--yes", "--fresh"], "on")?;
+    let args = parse_args(rest, &["--yes", "--fresh"], "", "on")?;
     join(
         ctx,
         JoinOptions {
@@ -459,7 +585,7 @@ fn running_agent(ctx: &RequestContext) -> Option<String> {
 }
 
 async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
-    let args = parse_args(rest, &["--yes"], "off")?;
+    let args = parse_args(rest, &["--yes"], "", "off")?;
     if ctx.app.mesh.get().is_none() {
         ctx.set_mesh_enabled_for_session(false);
         let app = Arc::clone(&ctx.app.config);
@@ -651,34 +777,38 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
 
 const NODE_OFF_LINE: &str = "node: off - .mesh on joins";
 
+fn show_config(ctx: &RequestContext) {
+    let node = ctx.app.mesh.get();
+    // A running node lists every interface itself, with its state, under the same
+    // row names the settings would use.
+    let mut rows = mesh_settings_rows(&ctx.app.config.mesh, node.is_none());
+    match node {
+        Some(runtime) => {
+            rows.push((
+                "reach".to_string(),
+                reach_row_of_states(&runtime.interface_states()),
+            ));
+            let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
+            rows.extend(node_fact_rows(
+                &runtime,
+                predecessors.as_deref(),
+                SystemTime::now(),
+            ));
+        }
+        None => {
+            out_path_text(&NoticeText::from(NODE_OFF_LINE).render(live_prefix()));
+            rows.push((
+                "reach".to_string(),
+                reach_line(&reach_facts_of_config(&ctx.app.config.mesh)),
+            ));
+        }
+    }
+    out_path_text(&NoticeText::from(render_info_table(rows)).render(live_prefix()));
+}
+
 async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        let node = ctx.app.mesh.get();
-        // A running node lists every interface itself, with its state, under the same
-        // row names the settings would use.
-        let mut rows = mesh_settings_rows(&ctx.app.config.mesh, node.is_none());
-        match node {
-            Some(runtime) => {
-                rows.push((
-                    "reach".to_string(),
-                    reach_row_of_states(&runtime.interface_states()),
-                ));
-                let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
-                rows.extend(node_fact_rows(
-                    &runtime,
-                    predecessors.as_deref(),
-                    SystemTime::now(),
-                ));
-            }
-            None => {
-                out_path_text(&NoticeText::from(NODE_OFF_LINE).render(live_prefix()));
-                rows.push((
-                    "reach".to_string(),
-                    reach_line(&reach_facts_of_config(&ctx.app.config.mesh)),
-                ));
-            }
-        }
-        out_path_text(&NoticeText::from(render_info_table(rows)).render(live_prefix()));
+        out_path_text(&NoticeText::from(render_verb_help("people", "info")).render(live_prefix()));
         return Ok(());
     };
     let runtime = live(ctx)?;
@@ -740,11 +870,7 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     Ok(())
 }
 
-async fn status(
-    ctx: &RequestContext,
-    abort_signal: &AbortSignal,
-    rest: Option<&str>,
-) -> Result<()> {
+fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     match classify_status(rest) {
         StatusArg::Own => {
             let runtime = live(ctx)?;
@@ -765,48 +891,60 @@ async fn status(
             ctx.app.mesh.set_objective_override(None);
             out_text("Objective override cleared; the card shows the session's own objective.");
         }
-        StatusArg::Fetch(token) => {
-            let runtime = live(ctx)?;
-            let destination = destination_hash(ctx, token).map_err(|err| {
-                if is_hash_prefix(token) {
-                    err
-                } else {
-                    QuotingError::followed_by(err, quote_status_tail(token))
-                }
-            })?;
-            let Some(peer) =
-                peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal).await?
-            else {
-                return Ok(());
-            };
-            let route = match route_to(&runtime, &destination, abort_signal).await {
-                Ok(route) => route,
-                Err(Unrouted::NoAnswer) => bail!(
-                    "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
-                    unreachable_head(&destination),
-                    left_mesh_hint(Some(&peer), SystemTime::now())
-                ),
-                Err(Unrouted::Interrupted) => {
-                    out_text("Status request interrupted.");
-                    return Ok(());
-                }
-            };
-            out_text(&format!(
-                "Asking {} for its status card; Ctrl-C cancels...",
-                short(&destination)
-            ));
-            result_follows();
-            let card = tokio::select! {
-                outcome = runtime.request_status(route) => outcome.map_err(quoted_status_failure)?,
-                _ = wait_user_interrupt(Some(abort_signal)) => {
-                    out_text("Status request interrupted.");
-                    return Ok(());
-                }
-            };
-            out_text(&render_for_human(&card, SystemTime::now()));
-        }
-        StatusArg::Help => out_text(&render_verb_help("status")),
+        StatusArg::Fetch(_) | StatusArg::Help => out_text(&render_verb_help("", "status")),
     }
+    Ok(())
+}
+
+/// Only a single unquoted word names a peer; anything `classify_status` reads as this
+/// node's own status prints the usage.
+async fn peer_status(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    rest: Option<&str>,
+) -> Result<()> {
+    let StatusArg::Fetch(token) = classify_status(rest) else {
+        out_text(&render_verb_help("people", "status"));
+        return Ok(());
+    };
+    let runtime = live(ctx)?;
+    let destination = destination_hash(ctx, token).map_err(|err| {
+        if is_hash_prefix(token) {
+            err
+        } else {
+            QuotingError::followed_by(err, quote_status_tail(token))
+        }
+    })?;
+    let Some(peer) =
+        peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
+    };
+    let route = match route_to(&runtime, &destination, abort_signal).await {
+        Ok(route) => route,
+        Err(Unrouted::NoAnswer) => bail!(
+            "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh peers` shows when it was last heard.",
+            unreachable_head(&destination),
+            left_mesh_hint(Some(&peer), SystemTime::now())
+        ),
+        Err(Unrouted::Interrupted) => {
+            out_text("Status request interrupted.");
+            return Ok(());
+        }
+    };
+    out_text(&format!(
+        "Asking {} for its status card; Ctrl-C cancels...",
+        short(&destination)
+    ));
+    result_follows();
+    let card = tokio::select! {
+        outcome = runtime.request_status(route) => outcome.map_err(quoted_status_failure)?,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text("Status request interrupted.");
+            return Ok(());
+        }
+    };
+    out_text(&render_for_human(&card, SystemTime::now()));
     Ok(())
 }
 
@@ -856,7 +994,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                 ".mesh brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
             ))
         ),
-        BriefArg::Help => out_text(&render_verb_help("brief")),
+        BriefArg::Help => out_text(&render_verb_help("envoy", "brief")),
     }
     Ok(())
 }
@@ -909,18 +1047,23 @@ fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         return drain_inbox(ctx);
     };
-    let args = parse_mutation_args(rest, "inbox", &["--purge-files", "--yes", "--dry-run"])?;
+    let args = parse_mutation_args(
+        rest,
+        "messaging",
+        "inbox",
+        &["--purge-files", "--yes", "--dry-run"],
+    )?;
     if let Some(token) = args.positional.first() {
-        return Err(unexpected(token, "inbox"));
+        return Err(unexpected(token, "messaging", "inbox"));
     }
     if !args.purge_files {
         bail!(
             "`--yes` and `--dry-run` go with `--purge-files`; pass it or drop them. {}",
-            render_verb_help("inbox")
+            render_verb_help("messaging", "inbox")
         );
     }
     if args.dry_run && args.yes {
-        return Err(unexpected("--yes", "inbox"));
+        return Err(unexpected("--yes", "messaging", "inbox"));
     }
     purge_inbox_files(ctx, args.yes, args.dry_run)
 }
@@ -1135,7 +1278,7 @@ fn walk_staged(root: &Path, bound: usize) -> std::io::Result<StagedWalk> {
 
 /// Expired escalations are swept first, so their `[mesh:message]` lines are pushed
 /// once and no row that just expired renders.
-fn pending(ctx: &RequestContext) -> Result<()> {
+fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
     let runtime = live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
@@ -1192,6 +1335,7 @@ fn pending(ctx: &RequestContext) -> Result<()> {
     }
     out_path_text(
         &render_pending(
+            list,
             &asked,
             &escalated,
             &access,
@@ -1211,17 +1355,23 @@ enum Answering {
     OwnQuestion(Box<Correlation>),
 }
 
-/// The attachment is judged before anything is printed, as every attach refusal
-/// promises; then the question block, so the human reads what they are answering
-/// before the prompt asks for the text (a refused `--attach` therefore never lands
-/// after the answer was typed); the send comes last.
-async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+/// `envoy answer` (`wanted` Inbound) takes the questions peers escalated and
+/// `messaging follow-up` (`wanted` Outbound) the ones this node asked; each refuses the
+/// other kind. The attachment is judged before anything is printed, as every attach
+/// refusal promises; then the question block, so the human reads what they are
+/// answering before the prompt asks for the text (a refused `--attach` therefore never
+/// lands after the answer was typed); the send comes last.
+async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -> Result<()> {
+    let (group, verb) = match wanted {
+        AnswerRoute::Outbound => ("messaging", "follow-up"),
+        _ => ("envoy", "answer"),
+    };
     let Some(rest) = rest.map(str::trim).filter(|rest| !rest.is_empty()) else {
-        out_text(&render_verb_help("answer"));
+        out_text(&render_verb_help(group, verb));
         return Ok(());
     };
     let (id, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-    let (attach, rest) = take_attach(rest, "answer")?;
+    let (attach, rest) = take_attach(rest, group, verb)?;
     let given = message_text(&rest);
     let runtime = live(ctx)?;
     let now = SystemTime::now();
@@ -1238,6 +1388,9 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if record.kind == InboundKind::Access {
                 return Err(access_not_a_question(id));
             }
+            if wanted != AnswerRoute::Inbound {
+                return Err(escalated_not_asked(id));
+            }
             if attach.is_some() {
                 ctx.app.mesh.refuse_held_by_envoy(id)?;
             }
@@ -1253,6 +1406,9 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             )
         }
         (AnswerRoute::Outbound, _, Some(correlation)) => {
+            if wanted != AnswerRoute::Outbound {
+                return Err(asked_not_escalated(id));
+            }
             let name = name_at(
                 ctx,
                 &ctx.app.mesh.address_names(),
@@ -1388,33 +1544,34 @@ fn outbound_answer(
 /// closes every open question at once and leaves access requests to `grant`/`refuse`.
 async fn dismiss(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest.map(str::trim).filter(|rest| !rest.is_empty()) else {
-        out_text(&render_verb_help("dismiss"));
+        out_text(&render_verb_help("envoy", "dismiss"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
+        "envoy",
         "dismiss",
         &["--silent", "--all", "--yes", "--dry-run"],
     )?;
     if args.all {
         if let Some(token) = args.positional.first() {
-            return Err(unexpected(token, "dismiss"));
+            return Err(unexpected(token, "envoy", "dismiss"));
         }
         if args.dry_run && args.yes {
-            return Err(unexpected("--yes", "dismiss"));
+            return Err(unexpected("--yes", "envoy", "dismiss"));
         }
         return dismiss_all(ctx, args.silent, args.yes, args.dry_run).await;
     }
     if args.yes || args.dry_run {
         bail!(
             "`--yes` and `--dry-run` go with `--all`; pass it or drop them. {}",
-            render_verb_help("dismiss")
+            render_verb_help("envoy", "dismiss")
         );
     }
     let Some(id) = args.positional.first() else {
         bail!(
             "`.mesh dismiss` takes an id or `--all`. {}",
-            render_verb_help("dismiss")
+            render_verb_help("envoy", "dismiss")
         );
     };
     dismiss_one(ctx, id, args.silent).await
@@ -1754,24 +1911,52 @@ fn no_open_question(id: &str) -> anyhow::Error {
     )
 }
 
+/// `messaging follow-up` given a peer's escalated question; the id is quoted as typed.
+fn escalated_not_asked(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(id)
+            .frame(" is a question a peer escalated to you, not one this node asked; answer it with `.mesh envoy answer ")
+            .peer(id)
+            .frame(" \"<text>\"`."),
+    )
+}
+
+/// `envoy answer` given a question this node asked; the id is quoted as typed.
+fn asked_not_escalated(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .peer(id)
+            .frame(" is a question this node asked, not one escalated to you; follow up on it with `.mesh messaging follow-up ")
+            .peer(id)
+            .frame(" \"<text>\"`."),
+    )
+}
+
 async fn message(
     ctx: &RequestContext,
     abort_signal: &AbortSignal,
     rest: Option<&str>,
 ) -> Result<()> {
     let Some(rest) = rest else {
-        out_path_text(&NoticeText::from(render_verb_help("message")).render(live_prefix()));
+        out_path_text(
+            &NoticeText::from(render_verb_help("messaging", "send")).render(live_prefix()),
+        );
         return Ok(());
     };
     let (yes_first, rest) = take_flag(rest, "--yes");
     let Some((target, rest)) = rest.split_once(char::is_whitespace) else {
-        out_path_text(&NoticeText::from(render_verb_help("message")).render(live_prefix()));
+        out_path_text(
+            &NoticeText::from(render_verb_help("messaging", "send")).render(live_prefix()),
+        );
         return Ok(());
     };
     let destination = destination_hash(ctx, target)?;
-    let (attach, rest) = take_attach(rest, "message")?;
+    let (attach, rest) = take_attach(rest, "messaging", "send")?;
     let Some(outgoing) = parse_outgoing(&rest) else {
-        out_path_text(&NoticeText::from(render_verb_help("message")).render(live_prefix()));
+        out_path_text(
+            &NoticeText::from(render_verb_help("messaging", "send")).render(live_prefix()),
+        );
         return Ok(());
     };
     let runtime = live(ctx)?;
@@ -2094,14 +2279,14 @@ struct AttachArgs {
 /// `--attach <path>` and `--force` lifted out of `rest` from wherever they stand outside
 /// the quoted message, with the message left as typed. `--force` lifts only the
 /// built-in deny for an attached file, so alone it is refused rather than ignored.
-fn take_attach(rest: &str, verb: &str) -> Result<(Option<AttachArgs>, String)> {
-    let (path, rest) = take_option(rest, "--attach", verb)?;
+fn take_attach(rest: &str, group: &str, verb: &str) -> Result<(Option<AttachArgs>, String)> {
+    let (path, rest) = take_option(rest, "--attach", group, verb)?;
     let (force, rest) = take_switch(&rest, "--force");
     match path {
         Some(path) => Ok((Some(AttachArgs { path, force }), rest)),
         None if force => bail!(
             "`--force` only lifts the built-in deny for an attached file; pass `--attach <path>` or drop it. {}",
-            render_verb_help(verb)
+            render_verb_help(group, verb)
         ),
         None => Ok((None, rest)),
     }
@@ -2109,7 +2294,12 @@ fn take_attach(rest: &str, verb: &str) -> Result<(Option<AttachArgs>, String)> {
 
 /// `flag` and the word after it taken out of `text`; `Ok(None)` when the flag is absent,
 /// an error when it stands with no value, or another flag, after it.
-fn take_option(text: &str, flag: &str, verb: &str) -> Result<(Option<String>, String)> {
+fn take_option(
+    text: &str,
+    flag: &str,
+    group: &str,
+    verb: &str,
+) -> Result<(Option<String>, String)> {
     let Some(index) = unquoted_word(text, flag) else {
         return Ok((None, text.to_string()));
     };
@@ -2117,7 +2307,7 @@ fn take_option(text: &str, flag: &str, verb: &str) -> Result<(Option<String>, St
     let value = after.trim_start();
     let value = &value[..value.find(char::is_whitespace).unwrap_or(value.len())];
     if value.is_empty() || value.starts_with("--") {
-        bail!("'{flag}' needs a value. {}", render_verb_help(verb));
+        bail!("'{flag}' needs a value. {}", render_verb_help(group, verb));
     }
     let end = text.len() - after.trim_start().len() + value.len();
     Ok((Some(value.to_string()), without(text, index, end)))
@@ -2485,7 +2675,7 @@ fn unheard_denial(runtime: &MeshRuntime, destination: &str, tail: &str) -> Optio
 
 async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(outgoing) = rest.and_then(parse_outgoing) else {
-        out_text(&render_verb_help("broadcast"));
+        out_text(&render_verb_help("messaging", "broadcast"));
         return Ok(());
     };
     let runtime = live(ctx)?;
@@ -2504,7 +2694,7 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// fetch already running, here or in another process of this identity, is reported and
 /// left to finish rather than treated as a failure.
 async fn sync(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
-    parse_args(rest, &[], "sync")?;
+    parse_args(rest, &[], "messaging", "sync")?;
     let runtime = live(ctx)?;
     out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
     result_follows();
@@ -2538,12 +2728,12 @@ fn sync_outcome_text(outcome: Result<FetchReport, FetchError>) -> Result<String>
 /// refused for a destination this node has blocked or an identity it has blocked.
 async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_path_text(&NoticeText::from(render_verb_help("knock")).render(live_prefix()));
+        out_path_text(&NoticeText::from(render_verb_help("access", "ask")).render(live_prefix()));
         return Ok(());
     };
-    let args = parse_mutation_args(rest, "knock", &["--yes", "--intro"])?;
+    let args = parse_mutation_args(rest, "access", "ask", &["--yes", "--intro"])?;
     let Some(target) = args.positional.first() else {
-        out_path_text(&NoticeText::from(render_verb_help("knock")).render(live_prefix()));
+        out_path_text(&NoticeText::from(render_verb_help("access", "ask")).render(live_prefix()));
         return Ok(());
     };
     let destination = destination_hash(ctx, target)?;
@@ -2694,11 +2884,15 @@ async fn request(
     rest: Option<&str>,
 ) -> Result<()> {
     let Some(rest) = rest else {
-        out_path_text(&NoticeText::from(render_verb_help("request")).render(live_prefix()));
+        out_path_text(
+            &NoticeText::from(render_verb_help("files", "request")).render(live_prefix()),
+        );
         return Ok(());
     };
     let Some(args) = parse_request_args(rest)? else {
-        out_path_text(&NoticeText::from(render_verb_help("request")).render(live_prefix()));
+        out_path_text(
+            &NoticeText::from(render_verb_help("files", "request")).render(live_prefix()),
+        );
         return Ok(());
     };
     let destination = destination_hash(ctx, &args.destination)?;
@@ -2884,12 +3078,15 @@ fn parse_request_args(rest: &str) -> Result<Option<RequestArgs>> {
         if token == "--reason" {
             match tokens.next() {
                 Some(value) if !value.starts_with("--") => reason = Some(value),
-                _ => bail!("'{token}' needs a value. {}", render_verb_help("request")),
+                _ => bail!(
+                    "'{token}' needs a value. {}",
+                    render_verb_help("files", "request")
+                ),
             }
         } else if token == "--yes" {
             yes = true;
         } else if token.starts_with("--") {
-            return Err(unexpected(&token, "request"));
+            return Err(unexpected(&token, "files", "request"));
         } else {
             positional.push(token);
         }
@@ -2920,11 +3117,11 @@ fn parse_request_args(rest: &str) -> Result<Option<RequestArgs>> {
 /// shares into the staging inbox and says where it landed. The bytes are never printed.
 async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_path_text(&NoticeText::from(render_verb_help("fetch")).render(live_prefix()));
+        out_path_text(&NoticeText::from(render_verb_help("files", "fetch")).render(live_prefix()));
         return Ok(());
     };
     let Some(args) = parse_fetch_args(rest)? else {
-        out_path_text(&NoticeText::from(render_verb_help("fetch")).render(live_prefix()));
+        out_path_text(&NoticeText::from(render_verb_help("files", "fetch")).render(live_prefix()));
         return Ok(());
     };
     let destination = destination_hash(ctx, &args.destination)?;
@@ -3162,18 +3359,21 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
         if token == "--if-sha256" {
             let value = match tokens.next() {
                 Some(value) if !value.starts_with("--") => value,
-                _ => bail!("'{token}' needs a value. {}", render_verb_help("fetch")),
+                _ => bail!(
+                    "'{token}' needs a value. {}",
+                    render_verb_help("files", "fetch")
+                ),
             };
             let hash = decode_hex(&value).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
             let Some(hash) = hash else {
                 bail!(
                     "`--if-sha256` takes the 64-hex sha256 `.mesh fetch` printed last time; '{value}' is not one. {}",
-                    render_verb_help("fetch")
+                    render_verb_help("files", "fetch")
                 );
             };
             if_sha256 = Some(hash);
         } else if token.starts_with("--") || positional.len() == 2 {
-            return Err(unexpected(&token, "fetch"));
+            return Err(unexpected(&token, "files", "fetch"));
         } else {
             positional.push(token);
         }
@@ -3205,13 +3405,13 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
 /// `mesh.envoy_memory.enabled` false, since the records may be on disk from when it was on.
 fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some((sub_verb, rest)) = split_verb(rest) else {
-        out_text(&render_verb_help("memory"));
+        out_text(&render_verb_help("envoy", "memory"));
         return Ok(());
     };
     if sub_verb != "forget" {
         bail!(
             "'{sub_verb}' is not a `.mesh memory` command; `forget` is the one it takes. {}",
-            render_verb_help("memory")
+            render_verb_help("envoy", "memory")
         );
     }
     let cache_dir = ctx
@@ -3229,7 +3429,7 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             .unwrap_or_default()
     };
     let Some(args) = parse_memory_forget_args(ctx, rest, &remembered_identities)? else {
-        out_text(&render_verb_help("memory"));
+        out_text(&render_verb_help("envoy", "memory"));
         return Ok(());
     };
     let remembered = EnvoySessions::remembered_everywhere(&cache_dir, config)?;
@@ -3435,13 +3635,13 @@ fn parse_memory_forget_args(
             "--yes" => yes = true,
             "--dry-run" => dry_run = true,
             _ if token.starts_with("--") || positional.len() == 2 => {
-                return Err(unexpected(&token, "memory"));
+                return Err(unexpected(&token, "envoy", "memory"));
             }
             _ => positional.push(token),
         }
     }
     if yes && dry_run {
-        return Err(unexpected("--yes", "memory"));
+        return Err(unexpected("--yes", "envoy", "memory"));
     }
     let mut positional = positional.into_iter();
     let Some(target) = positional.next() else {
@@ -3450,7 +3650,7 @@ fn parse_memory_forget_args(
     let thread = positional.next();
     let scope = if target == "all" {
         if let Some(thread) = thread {
-            return Err(unexpected(&thread, "memory"));
+            return Err(unexpected(&thread, "envoy", "memory"));
         }
         ForgetScope::All
     } else {
@@ -3458,7 +3658,7 @@ fn parse_memory_forget_args(
         match thread {
             Some(thread) if !is_wire_id(&thread) => bail!(
                 "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {}",
-                render_verb_help("memory")
+                render_verb_help("envoy", "memory")
             ),
             Some(thread) => ForgetScope::Thread { identity, thread },
             None => ForgetScope::Identity(identity),
@@ -3707,24 +3907,24 @@ mod sync_ask_line_tests {
 
 async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("trust"));
+        out_text(&render_verb_help("access", "trust"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
+        "access",
         "trust",
         &[
             "--yes",
             "--label",
             "--identity",
-            "--prune",
             "--older-than",
             "--dry-run",
             "--confirm",
         ],
     )?;
     let Some(arg) = classify_trust(args)? else {
-        out_text(&render_verb_help("trust"));
+        out_text(&render_verb_help("access", "trust"));
         return Ok(());
     };
     let store = trust_store(ctx)?;
@@ -3821,12 +4021,6 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 lines.push(OWN_IDENTITY_TRUSTED.to_string());
             }
             out_text(&lines.join("\n"));
-        }
-        TrustArg::Prune {
-            older_than,
-            confirm,
-        } => {
-            prune(ctx, &store, mesh, older_than, confirm, now)?;
         }
     }
     Ok(())
@@ -3931,16 +4125,24 @@ fn prune(
 /// final line.
 fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("untrust"));
+        out_text(&render_verb_help("access", "revoke"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
-        "untrust",
-        &["--yes", "--identity", "--dry-run", "--confirm"],
+        "access",
+        "revoke",
+        &[
+            "--yes",
+            "--identity",
+            "--dry-run",
+            "--confirm",
+            "--stale",
+            "--older-than",
+        ],
     )?;
     let Some(arg) = classify_untrust(args)? else {
-        out_text(&render_verb_help("untrust"));
+        out_text(&render_verb_help("access", "revoke"));
         return Ok(());
     };
     let store = trust_store(ctx)?;
@@ -3986,6 +4188,12 @@ fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if confirmed {
                 reset_knock_surfacing(ctx, &identity);
             }
+        }
+        UntrustArg::Stale {
+            older_than,
+            confirm,
+        } => {
+            prune(ctx, &store, mesh, older_than, confirm, now)?;
         }
     }
     Ok(())
@@ -4224,16 +4432,17 @@ fn unreadable_memory_stores(stores: usize) -> Option<String> {
 /// remembered attachments, grants and access requests are swept third.
 fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("forget"));
+        out_text(&render_verb_help("access", "forget"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
+        "access",
         "forget",
         &["--yes", "--identity", "--dry-run", "--confirm"],
     )?;
     let Some(ForgetArg { target, confirm }) = classify_forget(args)? else {
-        out_text(&render_verb_help("forget"));
+        out_text(&render_verb_help("access", "forget"));
         return Ok(());
     };
     let store = trust_store(ctx)?;
@@ -4374,12 +4583,12 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("block"));
+        out_text(&render_verb_help("access", "block"));
         return Ok(());
     };
-    let args = parse_mutation_args(rest, "block", &["--yes", "--note", "--identity"])?;
+    let args = parse_mutation_args(rest, "access", "block", &["--yes", "--note", "--identity"])?;
     let Some(arg) = classify_block(args, "block")? else {
-        out_text(&render_verb_help("block"));
+        out_text(&render_verb_help("access", "block"));
         return Ok(());
     };
     let store = trust_store(ctx)?;
@@ -4504,12 +4713,12 @@ fn block_identity(
 
 fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("unblock"));
+        out_text(&render_verb_help("access", "unblock"));
         return Ok(());
     };
-    let args = parse_mutation_args(rest, "unblock", &["--yes", "--identity"])?;
+    let args = parse_mutation_args(rest, "access", "unblock", &["--yes", "--identity"])?;
     let Some(arg) = classify_block(args, "unblock")? else {
-        out_text(&render_verb_help("unblock"));
+        out_text(&render_verb_help("access", "unblock"));
         return Ok(());
     };
     let store = trust_store(ctx)?;
@@ -4585,7 +4794,8 @@ fn unblocked_standing(destination: &str, served_by: &ServedBy) -> String {
 fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_mutation_args(
         rest.unwrap_or(""),
-        "rotate",
+        "config",
+        "rotate-identity",
         &["--dry-run", "--confirm", "--yes"],
     )?;
     if args.yes {
@@ -4594,10 +4804,10 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         );
     }
     if let Some(token) = args.positional.first() {
-        return Err(unexpected(token, "rotate"));
+        return Err(unexpected(token, "config", "rotate-identity"));
     }
     if args.dry_run && args.confirm.is_some() {
-        return Err(unexpected("--dry-run", "rotate"));
+        return Err(unexpected("--dry-run", "config", "rotate-identity"));
     }
     if ctx.app.mesh.get().is_some() {
         bail!(ROTATE_NEEDS_OFF);
@@ -4777,11 +4987,12 @@ fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
 /// global file may carry.
 fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("allow"));
+        out_text(&render_verb_help("files", "allow"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
+        "files",
         "allow",
         &[
             "--peer",
@@ -4793,7 +5004,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         ],
     )?;
     let Some(args) = classify_share(args, "allow")? else {
-        out_text(&render_verb_help("allow"));
+        out_text(&render_verb_help("files", "allow"));
         return Ok(());
     };
     let ShareArgs {
@@ -4852,13 +5063,13 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             Some(BuiltinHit::ByResolution { resolved }) => {
                 let resolved = shown_pattern(&resolved);
                 bail!(
-                    "`{pattern}` resolves to `{resolved}`, which the built-in deny names; `.mesh allow {resolved} --force --global` lifts that file."
+                    "`{pattern}` resolves to `{resolved}`, which the built-in deny names; `.mesh files allow {resolved} --force --global` lifts that file."
                 )
             }
             Some(BuiltinHit::LinkNamedLikeASecret { resolved }) => {
                 let resolved = shown_pattern(&resolved);
                 bail!(
-                    "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name, so there is nothing to lift; `.mesh allow {resolved}` shares that file."
+                    "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name, so there is nothing to lift; `.mesh files allow {resolved}` shares that file."
                 )
             }
             Some(BuiltinHit::UnresolvableLink) => {
@@ -4871,18 +5082,18 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     } else if !pattern.contains(GLOB_METACHARACTERS) {
         match set.builtin_denies(&pattern, case_insensitive)? {
             Some(BuiltinHit::ByText) => bail!(
-                "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh allow {pattern} --force --global` lifts it for this one file."
+                "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh files allow {pattern} --force --global` lifts it for this one file."
             ),
             Some(BuiltinHit::ByResolution { resolved }) => {
                 let resolved = shown_pattern(&resolved);
                 bail!(
-                    "`{pattern}` resolves to `{resolved}`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow {resolved} --force --global` lifts that file."
+                    "`{pattern}` resolves to `{resolved}`, which the built-in deny names, so an allow alone would share nothing; `.mesh files allow {resolved} --force --global` lifts that file."
                 )
             }
             Some(BuiltinHit::LinkNamedLikeASecret { resolved }) => {
                 let resolved = shown_pattern(&resolved);
                 bail!(
-                    "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name; `.mesh allow {resolved}` shares that file."
+                    "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name; `.mesh files allow {resolved}` shares that file."
                 )
             }
             Some(BuiltinHit::UnresolvableLink) => {
@@ -4982,16 +5193,17 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// in the pattern's place is the withdrawn peer verb's spelling and is sent to `untrust`.
 fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("deny"));
+        out_text(&render_verb_help("files", "deny"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
+        "files",
         "deny",
         &["--global", "--workspace", "--yes", "--dry-run"],
     )?;
     let Some(args) = classify_share(args, "deny")? else {
-        out_text(&render_verb_help("deny"));
+        out_text(&render_verb_help("files", "deny"));
         return Ok(());
     };
     let ShareArgs {
@@ -5085,16 +5297,17 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// it, both are named and the removal confirmed before either is edited.
 fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("unshare"));
+        out_text(&render_verb_help("files", "unshare"));
         return Ok(());
     };
     let args = parse_mutation_args(
         rest,
+        "files",
         "unshare",
         &["--global", "--workspace", "--yes", "--dry-run"],
     )?;
     let Some(args) = classify_share(args, "unshare")? else {
-        out_text(&render_verb_help("unshare"));
+        out_text(&render_verb_help("files", "unshare"));
         return Ok(());
     };
     let ShareArgs {
@@ -5256,11 +5469,12 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_mutation_args(
         rest.unwrap_or(""),
-        "shares",
+        "files",
+        "list",
         &["--peer", "--effective", "--all"],
     )?;
     if let Some(token) = args.positional.first() {
-        return Err(unexpected(token, "shares"));
+        return Err(unexpected(token, "files", "list"));
     }
     if args.all && !args.effective {
         bail!("`--all` works with `--effective`: run `.mesh shares --effective --all`.");
@@ -5311,22 +5525,23 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// begin with `-`.
 async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("grant"));
+        out_text(&render_verb_help("files", "grant"));
         return Ok(());
     };
     let (id, flags) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let args = parse_mutation_args(
         flags,
+        "files",
         "grant",
         &["--standing", "--for", "--global", "--workspace"],
     )?;
     if let Some(token) = args.positional.first() {
-        return Err(unexpected(token, "grant"));
+        return Err(unexpected(token, "files", "grant"));
     }
     if args.standing && args.for_.is_some() {
         bail!(
             "`--standing` has no end, so `--for` does not apply; drop one of them. {}",
-            render_verb_help("grant")
+            render_verb_help("files", "grant")
         );
     }
     if args.for_.is_some_and(|ttl| ttl > GRANT_FOR_MAX) {
@@ -5335,7 +5550,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     if !args.standing && (args.global || args.workspace) {
         bail!(
             "`--global` and `--workspace` name the share file a standing grant writes to; pass `--standing` or drop them. {}",
-            render_verb_help("grant")
+            render_verb_help("files", "grant")
         );
     }
     let scope = scope_flag(&args, "grant")?;
@@ -5396,12 +5611,12 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// `.mesh refuse <id>`: tells the peer no; nothing is written.
 async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        out_text(&render_verb_help("refuse"));
+        out_text(&render_verb_help("files", "refuse"));
         return Ok(());
     };
     let (id, flags) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     if let Some(token) = split_tokens(flags).first() {
-        return Err(unexpected(token, "refuse"));
+        return Err(unexpected(token, "files", "refuse"));
     }
     live(ctx)?;
     let now = SystemTime::now();
@@ -5924,7 +6139,7 @@ struct ShareArgs {
 /// `None` when the pattern is missing, which the verb answers with its usage.
 fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
     if args.dry_run && args.yes {
-        return Err(unexpected("--yes", verb));
+        return Err(unexpected("--yes", "files", verb));
     }
     let scope = scope_flag(&args, verb)?;
     Ok(args.positional.into_iter().next().map(|pattern| ShareArgs {
@@ -5941,7 +6156,7 @@ fn scope_flag(args: &MutationArgs, verb: &str) -> Result<WriteScope> {
     Ok(match (args.global, args.workspace) {
         (true, true) => bail!(
             "`--global` and `--workspace` name different files; pass one. {}",
-            render_verb_help(verb)
+            render_verb_help("files", verb)
         ),
         (true, false) => WriteScope::Global,
         (false, true) => WriteScope::Workspace,
@@ -6115,14 +6330,14 @@ fn refuse_link_in_pattern(
         }
         match set.builtin_denies(pattern, case_insensitive)? {
             None => bail!(
-                "`{prefix}` is a link to `{resolved}`; `.mesh {verb} {resolved}` names that file."
+                "`{prefix}` is a link to `{resolved}`; `.mesh files {verb} {resolved}` names that file."
             ),
             Some(_) if verb != "deny" => {}
             Some(BuiltinHit::ByText | BuiltinHit::ByResolution { .. }) => bail!(
                 "`{prefix}` is a link to `{resolved}`, which the built-in deny already holds back; nothing to deny."
             ),
             Some(BuiltinHit::LinkNamedLikeASecret { .. }) => bail!(
-                "`{prefix}` is a link to `{resolved}`; `.mesh deny {resolved}` keeps that file back."
+                "`{prefix}` is a link to `{resolved}`; `.mesh files deny {resolved}` keeps that file back."
             ),
             Some(BuiltinHit::UnresolvableLink) => bail!(dead_link_sentence(&link, prefix)),
         }
@@ -7377,7 +7592,7 @@ mod name_addressing_tests {
             peer_left: None,
         };
         let now = SystemTime::now();
-        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false);
+        let pending = render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false);
         let entry = "  1. .info (maki) (22222222) asked at an unknown time . id p1";
         assert_eq!(pending.render(CommandPrefix::Dot), pending.plain());
         assert!(pending.plain().contains(entry), "{pending}");
@@ -7522,47 +7737,22 @@ enum TrustArg {
         label: Option<String>,
         yes: bool,
     },
-    Prune {
-        older_than: Option<Duration>,
-        confirm: Option<String>,
-    },
 }
 
 /// `None` when no target was named: the caller prints the usage.
 fn classify_trust(args: MutationArgs) -> Result<Option<TrustArg>> {
-    if args.prune {
-        if args.yes {
-            bail!("`.mesh trust --prune` takes `--confirm prune-<N>` from a dry run, not `--yes`.");
-        }
-        if let Some(target) = args.positional.first() {
-            return Err(unexpected(target, "trust"));
-        }
-        if args.identity.is_some() {
-            return Err(unexpected("--identity", "trust"));
-        }
-        if args.label.is_some() {
-            return Err(unexpected("--label", "trust"));
-        }
-        if args.dry_run && args.confirm.is_some() {
-            return Err(unexpected("--dry-run", "trust"));
-        }
-        return Ok(Some(TrustArg::Prune {
-            older_than: args.older_than,
-            confirm: args.confirm,
-        }));
-    }
     for (given, flag) in [
         (args.older_than.is_some(), "--older-than"),
         (args.dry_run, "--dry-run"),
         (args.confirm.is_some(), "--confirm"),
     ] {
         if given {
-            return Err(unexpected(flag, "trust"));
+            return Err(unexpected(flag, "access", "trust"));
         }
     }
     if let Some(identity) = args.identity {
         if let Some(target) = args.positional.first() {
-            return Err(unexpected(target, "trust"));
+            return Err(unexpected(target, "access", "trust"));
         }
         return Ok(Some(TrustArg::Identity {
             target: identity,
@@ -7592,9 +7782,36 @@ enum UntrustArg {
         target: String,
         confirm: Option<String>,
     },
+    Stale {
+        older_than: Option<Duration>,
+        confirm: Option<String>,
+    },
 }
 
 fn classify_untrust(args: MutationArgs) -> Result<Option<UntrustArg>> {
+    if args.stale {
+        if args.yes {
+            bail!(
+                "`.mesh access revoke --stale` takes `--confirm prune-<N>` from a dry run, not `--yes`."
+            );
+        }
+        if let Some(target) = args.positional.first() {
+            return Err(unexpected(target, "access", "revoke"));
+        }
+        if args.identity.is_some() {
+            return Err(unexpected("--identity", "access", "revoke"));
+        }
+        if args.dry_run && args.confirm.is_some() {
+            return Err(unexpected("--dry-run", "access", "revoke"));
+        }
+        return Ok(Some(UntrustArg::Stale {
+            older_than: args.older_than,
+            confirm: args.confirm,
+        }));
+    }
+    if args.older_than.is_some() {
+        return Err(unexpected("--older-than", "access", "revoke"));
+    }
     if let Some(identity) = args.identity {
         let (target, confirm) = confirmed_identity_arg(
             identity,
@@ -7603,14 +7820,15 @@ fn classify_untrust(args: MutationArgs) -> Result<Option<UntrustArg>> {
             args.dry_run,
             args.confirm,
             "untrust",
+            "revoke",
         )?;
         return Ok(Some(UntrustArg::Identity { target, confirm }));
     }
     if args.dry_run && args.yes {
-        return Err(unexpected("--yes", "untrust"));
+        return Err(unexpected("--yes", "access", "revoke"));
     }
     if args.confirm.is_some() {
-        return Err(unexpected("--confirm", "untrust"));
+        return Err(unexpected("--confirm", "access", "revoke"));
     }
     Ok(args
         .positional
@@ -7623,26 +7841,28 @@ fn classify_untrust(args: MutationArgs) -> Result<Option<UntrustArg>> {
         }))
 }
 
-/// The `--identity` form of `untrust` and `forget`: a dry run until `--confirm
-/// <verb>-<identity-short>` comes back, never `--yes`, and no positional beside it.
+/// The `--identity` form of `access revoke` and `access forget`: a dry run until
+/// `--confirm <token>-<identity-short>` comes back, never `--yes`, and no positional
+/// beside it.
 fn confirmed_identity_arg(
     identity: String,
     positional: &[String],
     yes: bool,
     dry_run: bool,
     confirm: Option<String>,
+    token: &str,
     verb: &str,
 ) -> Result<(String, Option<String>)> {
     if yes {
         bail!(
-            "`.mesh {verb} --identity` takes `--confirm {verb}-<identity-short>` from a dry run, not `--yes`."
+            "`.mesh {token} --identity` takes `--confirm {token}-<identity-short>` from a dry run, not `--yes`."
         );
     }
     if let Some(target) = positional.first() {
-        return Err(unexpected(target, verb));
+        return Err(unexpected(target, "access", verb));
     }
     if dry_run && confirm.is_some() {
-        return Err(unexpected("--dry-run", verb));
+        return Err(unexpected("--dry-run", "access", verb));
     }
     Ok((identity, confirm))
 }
@@ -7671,6 +7891,7 @@ fn classify_forget(args: MutationArgs) -> Result<Option<ForgetArg>> {
         args.dry_run,
         args.confirm,
         "forget",
+        "forget",
     )?;
     Ok(Some(ForgetArg { target, confirm }))
 }
@@ -7694,7 +7915,7 @@ enum BlockArg {
 fn classify_block(args: MutationArgs, verb: &str) -> Result<Option<BlockArg>> {
     if let Some(identity) = args.identity {
         if let Some(target) = args.positional.first() {
-            return Err(unexpected(target, verb));
+            return Err(unexpected(target, "access", verb));
         }
         return Ok(Some(BlockArg::Identity {
             target: identity,
@@ -7713,8 +7934,8 @@ fn classify_block(args: MutationArgs, verb: &str) -> Result<Option<BlockArg>> {
         }))
 }
 
-fn unexpected(token: &str, verb: &str) -> anyhow::Error {
-    anyhow!("Unexpected '{token}'. {}", render_verb_help(verb))
+fn unexpected(token: &str, group: &str, verb: &str) -> anyhow::Error {
+    anyhow!("Unexpected '{token}'. {}", render_verb_help(group, verb))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -7722,7 +7943,7 @@ struct MutationArgs {
     positional: Vec<String>,
     yes: bool,
     dry_run: bool,
-    prune: bool,
+    stale: bool,
     identity: Option<String>,
     label: Option<String>,
     note: Option<String>,
@@ -7744,31 +7965,36 @@ struct MutationArgs {
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
 /// sit anywhere; `message` differs, honouring `--yes` as the leading word only, because the
 /// rest of its line is free text.
-fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<MutationArgs> {
+fn parse_mutation_args(
+    rest: &str,
+    group: &str,
+    verb: &str,
+    allowed: &[&str],
+) -> Result<MutationArgs> {
     let mut args = MutationArgs::default();
     let mut tokens = split_tokens(rest).into_iter();
     while let Some(token) = tokens.next() {
         if !token.starts_with("--") {
             if !args.positional.is_empty() {
-                return Err(unexpected(&token, verb));
+                return Err(unexpected(&token, group, verb));
             }
             args.positional.push(token);
             continue;
         }
         if !allowed.contains(&token.as_str()) {
-            return Err(unexpected(&token, verb));
+            return Err(unexpected(&token, group, verb));
         }
         let mut value = || match tokens.next() {
             Some(value) if !value.starts_with("--") => Ok(value),
             _ => Err(anyhow!(
                 "'{token}' needs a value. {}",
-                render_verb_help(verb)
+                render_verb_help(group, verb)
             )),
         };
         match token.as_str() {
             "--yes" => args.yes = true,
             "--dry-run" => args.dry_run = true,
-            "--prune" => args.prune = true,
+            "--stale" => args.stale = true,
             "--identity" => args.identity = Some(value()?),
             "--label" => args.label = Some(value()?),
             "--note" => args.note = Some(value()?),
@@ -7785,7 +8011,7 @@ fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<Mutat
             "--purge-files" => args.purge_files = true,
             "--all" => args.all = true,
             "--silent" => args.silent = true,
-            _ => return Err(unexpected(&token, verb)),
+            _ => return Err(unexpected(&token, group, verb)),
         }
     }
     Ok(args)
@@ -7895,11 +8121,16 @@ impl Flags<'_> {
     }
 }
 
-fn parse_args<'a>(rest: Option<&'a str>, allowed: &[&str], verb: &str) -> Result<Flags<'a>> {
+fn parse_args<'a>(
+    rest: Option<&'a str>,
+    allowed: &[&str],
+    group: &str,
+    verb: &str,
+) -> Result<Flags<'a>> {
     let mut flags = Vec::new();
     for token in rest.unwrap_or("").split_whitespace() {
         if !allowed.contains(&token) {
-            bail!("Unexpected '{token}'. {}", render_verb_help(verb));
+            bail!("Unexpected '{token}'. {}", render_verb_help(group, verb));
         }
         flags.push(token);
     }
@@ -8425,19 +8656,39 @@ pub(crate) mod capture {
 }
 
 fn render_help() -> String {
-    let mut lines = vec![
-        "Mesh commands (nothing here writes config.yaml; trust, rotate and share rules persist under the mesh/ directory, share rules also in the workspace file):".to_string(),
-    ];
-    for (verb, description, example) in VERBS {
-        lines.push(format!("  .mesh {verb:<10} {description}"));
-        lines.push(format!("  {:<16} e.g. {example}", ""));
-    }
-    lines.join("\n")
+    let mut blocks = vec![format!(
+        "Mesh commands (nothing here writes config.yaml; trust, rotate and share rules persist under the mesh/ directory, share rules also in the workspace file):\n{}",
+        render_verb_rows("")
+    )];
+    blocks.extend(GROUPS.iter().map(|(group, _)| render_group_help(group)));
+    blocks.join("\n\n")
 }
 
-fn render_verb_help(verb: &str) -> String {
-    match VERBS.iter().find(|(name, _, _)| *name == verb) {
-        Some((_, description, example)) => format!("Usage: {example}\n  {description}"),
+/// `group`'s name and summary, then each of its verbs: the usage, and under it the summary.
+fn render_group_help(group: &str) -> String {
+    let summary = GROUPS
+        .iter()
+        .find(|(name, _)| *name == group)
+        .map(|(_, summary)| *summary)
+        .unwrap_or_default();
+    format!("{group}: {summary}\n{}", render_verb_rows(group))
+}
+
+fn render_verb_rows(group: &str) -> String {
+    COMMANDS
+        .iter()
+        .filter(|(name, ..)| *name == group)
+        .map(|(_, _, usage, summary)| format!("  {usage}\n      {summary}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_verb_help(group: &str, verb: &str) -> String {
+    match COMMANDS
+        .iter()
+        .find(|(g, v, _, _)| *g == group && *v == verb)
+    {
+        Some((_, _, usage, summary)) => format!("Usage: {usage}\n  {summary}"),
         None => render_help(),
     }
 }
@@ -10223,17 +10474,30 @@ fn quoted_ids(ids: &[String]) -> Vec<NoticeText> {
         .collect()
 }
 
-/// Three sections in a fixed order, every one shown: a header carrying the count and,
-/// once, the commands its ids go to (`<title>: none` when empty), then its numbered
-/// entries. Entries show only the short id, which those commands take as a prefix. The
-/// header commands start in one column so the three read as a list. An id whose short
-/// form another listed id shares is shown at the length that tells them apart, so every
-/// printed id picks its entry when typed back, except an id that is the whole of one
-/// entry's id and also how another's begins, or one that differs from another only in
-/// case. Those stay ambiguous on purpose, so a peer cannot mint an id that takes the
-/// place of another, and the refusal names how the entries clear. Peer names, ids and
-/// words are quoted as they stand; the headers' hints follow the prefix.
+/// The three lists the open ids fall into, each its own verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingList {
+    /// The questions peers escalated, for `envoy questions`.
+    Escalated,
+    /// The access requests peers sent, for `files requests`.
+    Access,
+    /// The questions this node and its other sessions asked, for `messaging sent`.
+    Asked,
+}
+
+/// The `list` section: a header carrying the count and the commands its ids go to
+/// (`<title>: none` when empty), then its numbered entries. Entries show only the short
+/// id, which those commands take as a prefix. The header commands start in the column
+/// the longest of the three headers would need, so the three listings line up alike.
+/// An id whose short form another open id shares, in any of the three lists, is shown
+/// at the length that tells them apart, since every verb resolves an id across all
+/// three; so every printed id picks its entry when typed back, except an id that is the
+/// whole of one entry's id and also how another's begins, or one that differs from
+/// another only in case. Those stay ambiguous on purpose, so a peer cannot mint an id
+/// that takes the place of another, and the refusal names how the entries clear. Peer
+/// names, ids and words are quoted as they stand; the header's hints follow the prefix.
 fn render_pending(
+    list: PendingList,
     asked: &[QuestionRow],
     escalated: &[QuestionRow],
     access: &[QuestionRow],
@@ -10243,51 +10507,78 @@ fn render_pending(
 ) -> NoticeText {
     let sections = [
         (
+            PendingList::Escalated,
             "Waiting for YOU",
             "answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>",
             escalated,
             false,
         ),
         (
+            PendingList::Access,
             "Access requests",
             "grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>",
             access,
             false,
         ),
         (
+            PendingList::Asked,
             "Asked by this node",
             "collect: mesh__collect --id <id> (the model) . follow up: .mesh answer <id> \"<text>\"",
             asked,
             true,
         ),
     ];
-    let counted: Vec<String> = sections
+    let column = sections
         .iter()
-        .map(|(title, _, rows, _)| format!("{title} ({})", rows.len()))
-        .collect();
-    let column = counted.iter().map(String::len).max().unwrap_or(0) + 2;
+        .map(|(_, title, _, rows, _)| format!("{title} ({})", rows.len()).len())
+        .max()
+        .unwrap_or(0)
+        + 2;
     let ids: Vec<String> = sections
         .iter()
-        .flat_map(|(_, _, rows, _)| rows.iter().map(|row| row.id.to_ascii_lowercase()))
+        .flat_map(|(_, _, _, rows, _)| rows.iter().map(|row| row.id.to_ascii_lowercase()))
         .collect();
-    let mut lines: Vec<NoticeText> = Vec::new();
-    for ((title, commands, rows, outbound), counted) in sections.iter().zip(&counted) {
-        let header = if rows.is_empty() {
-            format!("{title}: none")
-        } else {
-            format!("{counted:<column$}{commands}")
-        };
-        lines.push(NoticeText::from(if colour {
-            tool_name_text_forced(&header)
-        } else {
-            header
-        }));
-        for (index, row) in rows.iter().enumerate() {
-            let id_len = shown_id_len(&row.id, &ids);
-            lines.extend(pending_entry(index + 1, row, *outbound, id_len, now, width));
-        }
+    let (_, title, commands, rows, outbound) = sections
+        .into_iter()
+        .find(|(shown, ..)| *shown == list)
+        .expect("every list has a section");
+    let header = if rows.is_empty() {
+        format!("{title}: none")
+    } else {
+        format!("{:<column$}{commands}", format!("{title} ({})", rows.len()))
+    };
+    let mut lines = vec![NoticeText::from(if colour {
+        tool_name_text_forced(&header)
+    } else {
+        header
+    })];
+    for (index, row) in rows.iter().enumerate() {
+        let id_len = shown_id_len(&row.id, &ids);
+        lines.extend(pending_entry(index + 1, row, outbound, id_len, now, width));
     }
     joined_text(lines, "\n")
+}
+
+/// The three lists one after another, in the order the escalation, access and asked
+/// verbs are listed, for the rendering tests that check how the lists line up.
+#[cfg(test)]
+fn render_pending_lists(
+    asked: &[QuestionRow],
+    escalated: &[QuestionRow],
+    access: &[QuestionRow],
+    now: SystemTime,
+    width: usize,
+    colour: bool,
+) -> NoticeText {
+    joined_text(
+        [
+            PendingList::Escalated,
+            PendingList::Access,
+            PendingList::Asked,
+        ]
+        .map(|list| render_pending(list, asked, escalated, access, now, width, colour)),
+        "\n",
+    )
 }
 
 /// How many characters of `id` tell it apart, without regard to case, from every id in
@@ -10787,7 +11078,8 @@ mod tests {
             };
             let left = Some(now - Duration::from_secs(3600));
             let row = QuestionRow::outbound(&record, "bob".to_string()).waiting_on(&record, left);
-            let pending = render_pending(std::slice::from_ref(&row), &[], &[], now, 120, false);
+            let pending =
+                render_pending_lists(std::slice::from_ref(&row), &[], &[], now, 120, false);
             assert!(
                 pending.plain().contains(
                     "  1. -> bob (fedcba98) 2d ago . open . peer left 1h ago . id 01234567"
@@ -10800,7 +11092,8 @@ mod tests {
             };
             let row =
                 QuestionRow::outbound(&answered, "bob".to_string()).waiting_on(&answered, left);
-            let pending = render_pending(std::slice::from_ref(&row), &[], &[], now, 120, false);
+            let pending =
+                render_pending_lists(std::slice::from_ref(&row), &[], &[], now, 120, false);
             assert!(
                 !pending.plain().contains("peer left"),
                 "an answered question waits on no one: {pending}"
@@ -11029,99 +11322,115 @@ mod tests {
     #[test]
     fn help_lists_every_verb_with_an_example() {
         let help = render_help();
-        for (verb, description, example) in VERBS {
-            assert!(help.contains(&format!(".mesh {verb}")), "{help}");
-            assert!(help.contains(description), "{help}");
-            assert!(help.contains(example), "{help}");
+        for (group, verb, usage, summary) in COMMANDS {
+            let path = format!("{group} {verb}");
+            assert!(
+                help.contains(&format!(".mesh {}", path.trim_start())),
+                "{help}"
+            );
+            assert!(help.contains(summary), "{help}");
+            assert!(help.contains(usage), "{help}");
+        }
+        for (group, summary) in GROUPS {
+            assert!(help.contains(&format!("{group}: {summary}")), "{help}");
         }
         assert!(help.contains("config.yaml"), "{help}");
     }
 
     #[test]
     fn verb_help_shows_the_example_and_falls_back_to_the_full_list() {
-        let status = render_verb_help("status");
+        let status = render_verb_help("", "status");
         assert!(status.starts_with("Usage: .mesh status"), "{status}");
-        assert_eq!(render_verb_help("nope"), render_help());
+        let status = render_verb_help("people", "status");
+        assert!(
+            status.starts_with("Usage: .mesh people status <destination>"),
+            "{status}"
+        );
+        assert_eq!(render_verb_help("", "nope"), render_help());
+        assert_eq!(render_verb_help("people", "nope"), render_help());
     }
 
     #[test]
     fn untrust_and_block_help_contrast_each_other() {
-        for verb in ["trust", "untrust", "forget", "block", "unblock"] {
-            assert!(VERBS.iter().any(|(name, _, _)| *name == verb), "{verb}");
+        for verb in ["trust", "revoke", "forget", "block", "unblock"] {
+            assert!(
+                COMMANDS
+                    .iter()
+                    .any(|(group, name, _, _)| *group == "access" && *name == verb),
+                "{verb}"
+            );
         }
-        assert!(render_verb_help("untrust").contains("Stop serving one trusted instance"));
+        assert!(render_verb_help("access", "revoke").contains("Stop serving one trusted instance"));
         assert!(
-            render_verb_help("block")
+            render_verb_help("access", "block")
                 .contains("`block` remembers where `untrust` only stops serving")
         );
-        assert!(render_verb_help("forget").contains("Erase everything this node knows"));
+        assert!(render_verb_help("access", "forget").contains("Erase everything this node knows"));
     }
 
-    /// The withdrawn verbs appear in neither place. The `untrust` line says it stops
+    /// The withdrawn verbs appear in neither place. The `revoke` line says it stops
     /// serving an instance or withdraws an identity grant, leaving the instances; `forget`
-    /// says it erases an identity; `unblock` says it grants nothing; the `untrust` usage
+    /// says it erases an identity; `unblock` says it grants nothing; the `revoke` usage
     /// reads `[--yes|--dry-run]`, the grammar the parser takes, and `forget` takes
-    /// `--identity` alone.
+    /// `--identity` alone. The command list carries the groups, never a verb.
     #[test]
     fn help_literals_match_in_the_verb_table_and_the_command_list() {
-        const UNTRUST: &str = "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own";
+        const UNTRUST: &str = "Stop serving one trusted instance (its identity stays known), or withdraw an identity grant; its instances stay trusted on their own. `--stale` prunes the trusted instances not heard from lately";
         const FORGET: &str = "Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger";
         const UNBLOCK: &str = "Lift a block on an instance or an identity; it grants nothing, so only trust the list still holds serves it afterwards";
         const DENY: &str = "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `block`)";
 
-        let verb_description = |verb: &str| -> &str {
-            VERBS
+        let verb_description = |group: &str, verb: &str| -> &str {
+            COMMANDS
                 .iter()
-                .find(|(name, _, _)| *name == verb)
-                .map(|(_, description, _)| *description)
-                .unwrap_or_else(|| panic!("no VERBS row for {verb}"))
+                .find(|(g, name, _, _)| *g == group && *name == verb)
+                .map(|(_, _, _, summary)| *summary)
+                .unwrap_or_else(|| panic!("no COMMANDS row for {group} {verb}"))
         };
-        let command_description = |verb: &str| -> &str {
-            let name = format!(".mesh {verb}");
+        let listed = |name: &str| -> bool {
             crate::repl::REPL_COMMANDS
                 .iter()
-                .find(|command| command.name == name)
-                .map(|command| command.description)
-                .unwrap_or_else(|| panic!("no REPL_COMMANDS row for {name}"))
+                .any(|command| command.name == name)
         };
 
-        assert_eq!(verb_description("untrust"), UNTRUST);
-        assert_eq!(command_description("untrust"), UNTRUST);
-        assert_eq!(verb_description("forget"), FORGET);
-        assert_eq!(command_description("forget"), FORGET);
-        assert_eq!(verb_description("unblock"), UNBLOCK);
-        assert_eq!(command_description("unblock"), UNBLOCK);
+        assert_eq!(verb_description("access", "revoke"), UNTRUST);
+        assert_eq!(verb_description("access", "forget"), FORGET);
+        assert_eq!(verb_description("access", "unblock"), UNBLOCK);
+        assert!(listed(".mesh access"));
+        for verb in [
+            ".mesh access revoke",
+            ".mesh access revoke",
+            ".mesh access forget",
+        ] {
+            assert!(!listed(verb), "{verb} is listed");
+        }
         assert!(
-            render_verb_help("untrust").starts_with("Usage: .mesh untrust <destination> [--yes|--dry-run] | --identity <identity> [--dry-run|--confirm untrust-<identity-short>]"),
+            render_verb_help("access", "revoke").starts_with("Usage: .mesh access revoke <destination> [--yes|--dry-run] | --identity <identity> [--dry-run|--confirm untrust-<identity-short>]"),
             "{}",
-            render_verb_help("untrust")
+            render_verb_help("access", "revoke")
         );
         assert!(
-            render_verb_help("forget").starts_with("Usage: .mesh forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"),
+            render_verb_help("access", "forget").starts_with("Usage: .mesh access forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"),
             "{}",
-            render_verb_help("forget")
+            render_verb_help("access", "forget")
         );
 
         let help = render_help();
         for present in [
-            ".mesh sync ",
-            ".mesh forget ",
-            ".mesh untrust ",
-            ".mesh trust ",
+            ".mesh messaging sync",
+            ".mesh access forget ",
+            ".mesh access revoke ",
+            ".mesh access trust ",
         ] {
             assert!(help.contains(present), "{present:?} missing from\n{help}");
         }
         // `deny` is a file verb; the peer refusal is `block`.
-        assert_eq!(verb_description("deny"), DENY);
-        assert_eq!(command_description("deny"), DENY);
-        let withdrawn = ".mesh undeny";
-        assert!(!help.contains(withdrawn), "{withdrawn:?} still in\n{help}");
-        assert!(
-            !crate::repl::REPL_COMMANDS
-                .iter()
-                .any(|command| command.name == withdrawn),
-            "{withdrawn:?} still listed"
-        );
+        assert_eq!(verb_description("files", "deny"), DENY);
+        assert!(listed(".mesh files"));
+        for withdrawn in [".mesh undeny", ".mesh files undeny"] {
+            assert!(!help.contains(withdrawn), "{withdrawn:?} still in\n{help}");
+            assert!(!listed(withdrawn), "{withdrawn:?} still listed");
+        }
     }
 
     #[test]
@@ -11168,7 +11477,7 @@ mod tests {
 
         #[test]
         fn reason_without_a_value_names_the_usage() {
-            let usage = render_verb_help("request");
+            let usage = render_verb_help("files", "request");
             for line in ["peer a.md --reason", "peer a.md --reason --yes"] {
                 assert_eq!(
                     parse_request_args(line).unwrap_err().to_string(),
@@ -11185,7 +11494,7 @@ mod tests {
                 parse_request_args("peer a.md --force")
                     .unwrap_err()
                     .to_string(),
-                unexpected("--force", "request").to_string()
+                unexpected("--force", "files", "request").to_string()
             );
         }
 
@@ -11222,7 +11531,6 @@ mod tests {
         "--yes",
         "--label",
         "--identity",
-        "--prune",
         "--older-than",
         "--dry-run",
         "--confirm",
@@ -11231,26 +11539,27 @@ mod tests {
     #[test]
     fn parse_mutation_args_reads_flags_anywhere_and_refuses_the_rest() {
         let hash = "ab".repeat(16);
-        let args = parse_mutation_args(&format!("{hash} --yes"), "trust", TRUST_FLAGS).unwrap();
+        let args =
+            parse_mutation_args(&format!("{hash} --yes"), "access", "trust", TRUST_FLAGS).unwrap();
         assert!(args.yes);
         assert_eq!(args.positional, vec![hash.clone()]);
 
-        let err = parse_mutation_args(&format!("{hash} --bogus"), "trust", TRUST_FLAGS)
+        let err = parse_mutation_args(&format!("{hash} --bogus"), "access", "trust", TRUST_FLAGS)
             .unwrap_err()
             .to_string();
         assert!(err.contains("Unexpected '--bogus'"), "{err}");
-        assert!(err.contains(&render_verb_help("trust")), "{err}");
+        assert!(err.contains(&render_verb_help("access", "trust")), "{err}");
 
-        let err = parse_mutation_args(&format!("{hash} --label"), "trust", TRUST_FLAGS)
+        let err = parse_mutation_args(&format!("{hash} --label"), "access", "trust", TRUST_FLAGS)
             .unwrap_err()
             .to_string();
         assert!(err.contains("'--label' needs a value"), "{err}");
-        let err = parse_mutation_args("--label --yes", "trust", TRUST_FLAGS)
+        let err = parse_mutation_args("--label --yes", "access", "trust", TRUST_FLAGS)
             .unwrap_err()
             .to_string();
         assert!(err.contains("'--label' needs a value"), "{err}");
 
-        let err = parse_mutation_args(&format!("{hash} {hash}"), "trust", TRUST_FLAGS)
+        let err = parse_mutation_args(&format!("{hash} {hash}"), "access", "trust", TRUST_FLAGS)
             .unwrap_err()
             .to_string();
         assert!(err.contains(&format!("Unexpected '{hash}'")), "{err}");
@@ -11281,20 +11590,29 @@ mod tests {
     #[test]
     fn trust_argument_shapes_are_classified() {
         let hash = "ab".repeat(16);
-        let trust_arg =
-            |rest: &str| parse_mutation_args(rest, "trust", TRUST_FLAGS).and_then(classify_trust);
+        let trust_arg = |rest: &str| {
+            parse_mutation_args(rest, "access", "trust", TRUST_FLAGS).and_then(classify_trust)
+        };
         let untrust_arg = |rest: &str| {
             parse_mutation_args(
                 rest,
-                "untrust",
-                &["--yes", "--identity", "--dry-run", "--confirm"],
+                "access",
+                "revoke",
+                &[
+                    "--yes",
+                    "--identity",
+                    "--dry-run",
+                    "--confirm",
+                    "--stale",
+                    "--older-than",
+                ],
             )
             .and_then(classify_untrust)
         };
 
-        let err = trust_arg("--prune --yes").unwrap_err().to_string();
+        let err = untrust_arg("--stale --yes").unwrap_err().to_string();
         assert!(err.contains("--confirm prune-<N>"), "{err}");
-        let err = trust_arg(&format!("--prune {hash}"))
+        let err = untrust_arg(&format!("--stale {hash}"))
             .unwrap_err()
             .to_string();
         assert!(err.contains(&format!("Unexpected '{hash}'")), "{err}");
@@ -11311,8 +11629,8 @@ mod tests {
             _ => panic!("--identity is the identity shape"),
         }
         assert!(matches!(
-            trust_arg("--prune --older-than 12h --confirm prune-2").unwrap(),
-            Some(TrustArg::Prune {
+            untrust_arg("--stale --older-than 12h --confirm prune-2").unwrap(),
+            Some(UntrustArg::Stale {
                 older_than: Some(older_than),
                 confirm: Some(confirm),
             }) if older_than == Duration::from_secs(12 * 3_600) && confirm == "prune-2"
@@ -11362,12 +11680,12 @@ mod tests {
 
     #[test]
     fn parse_args_accepts_known_flags_and_refuses_the_rest() {
-        let args = parse_args(Some("--yes --fresh"), &["--yes", "--fresh"], "on").unwrap();
+        let args = parse_args(Some("--yes --fresh"), &["--yes", "--fresh"], "", "on").unwrap();
         assert!(args.has("--yes"));
         assert!(args.has("--fresh"));
-        let none = parse_args(None, &["--yes"], "off").unwrap();
+        let none = parse_args(None, &["--yes"], "", "off").unwrap();
         assert!(!none.has("--yes"));
-        let err = parse_args(Some("--force"), &["--yes"], "off")
+        let err = parse_args(Some("--force"), &["--yes"], "", "off")
             .unwrap_err()
             .to_string();
         assert!(err.contains("--force"), "{err}");
@@ -14450,7 +14768,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn pending_lists_both_directions_or_says_none() {
         let now = pending_now();
-        let empty = render_pending(&[], &[], &[], now, 80, false).plain();
+        let empty = render_pending_lists(&[], &[], &[], now, 80, false).plain();
         let lines: Vec<&str> = empty.lines().collect();
         assert_eq!(
             lines,
@@ -14469,7 +14787,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             escalated_row("p1", "Share the plan?"),
             escalated_row("p2", ""),
         ];
-        let text = render_pending(&asked, &escalated, &[], now, 80, false).plain();
+        let text = render_pending_lists(&asked, &escalated, &[], now, 80, false).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines,
@@ -14673,9 +14991,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "only the header is painted: {painted:?}"
         );
 
-        let pending = render_pending(&[], std::slice::from_ref(&row), &[], now, 80, true).plain();
+        let pending =
+            render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, true).plain();
         let plain_pending =
-            render_pending(&[], std::slice::from_ref(&row), &[], now, 80, false).plain();
+            render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false).plain();
         for (painted, plain) in pending.lines().zip(plain_pending.lines()) {
             if plain.starts_with("  ") {
                 assert_eq!(painted, plain, "entries stay plain: {pending:?}");
@@ -14698,7 +15017,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             .join(" ");
         assert_eq!(question.chars().count(), 299);
         assert!(question.chars().count() > INBOX_CONTENT_MAX_CHARS);
-        let text = render_pending(
+        let text = render_pending_lists(
             &[],
             &[escalated_row("p1", &question)],
             &[],
@@ -14720,7 +15039,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let access = access_row("acc-1");
         let question = escalated_row("p1", "");
 
-        let text = render_pending(
+        let text = render_pending_lists(
             &[],
             std::slice::from_ref(&question),
             std::slice::from_ref(&access),
@@ -14759,7 +15078,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(!text.contains(secret), "{secret} leaked: {text}");
         }
 
-        let questions_only = render_pending(&[], &[question], &[], now, 80, false).plain();
+        let questions_only = render_pending_lists(&[], &[question], &[], now, 80, false).plain();
         assert!(
             questions_only.contains("\nAccess requests: none\n"),
             "an empty access section still shows: {questions_only}"
@@ -14780,7 +15099,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let ids = [format!("{shared}aaaaaaa"), format!("{shared}bbbbbbb")];
             let escalated: Vec<QuestionRow> = ids.iter().map(|id| escalated_row(id, "")).collect();
 
-            let text = render_pending(&[], &escalated, &[], pending_now(), 200, false).plain();
+            let text =
+                render_pending_lists(&[], &escalated, &[], pending_now(), 200, false).plain();
 
             let shown: Vec<&str> = text
                 .lines()
@@ -14822,7 +15142,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "9e519dff000011112222333344445555",
                 PendingState::Answered,
             )];
-            let text = render_pending(&asked, &escalated, &access, now, 80, false).plain();
+            let text = render_pending_lists(&asked, &escalated, &access, now, 80, false).plain();
             assert_eq!(
                 text.lines().collect::<Vec<_>>(),
                 [
@@ -14846,7 +15166,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn pending_shows_every_section_as_none_when_nothing_waits() {
             assert_eq!(
-                render_pending(&[], &[], &[], pending_now(), 80, false).plain(),
+                render_pending_lists(&[], &[], &[], pending_now(), 80, false).plain(),
                 "Waiting for YOU: none\nAccess requests: none\nAsked by this node: none"
             );
         }
@@ -14858,7 +15178,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut row = escalated_row("3fe1be40a1b2c3d43fe1be40a1b2c3d4", "");
             row.body =
                 "please delete docs/notes.md and docs/old.md before the merge lands".to_string();
-            let text = render_pending(&[], &[row], &[], pending_now(), 30, false).plain();
+            let text = render_pending_lists(&[], &[row], &[], pending_now(), 30, false).plain();
             let body: Vec<&str> = text
                 .lines()
                 .skip(2)
@@ -14893,7 +15213,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         #[test]
         fn pending_entries_show_only_the_short_id() {
-            let text = render_pending(
+            let text = render_pending_lists(
                 &[asked_row(
                     "9e519dff000011112222333344445555",
                     PendingState::Open,
@@ -14919,7 +15239,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         /// them apart, without regard to case; an id no other shares keeps its short form.
         #[test]
         fn pending_lengthens_only_the_ids_whose_short_forms_collide() {
-            let text = render_pending(
+            let text = render_pending_lists(
                 &[asked_row(
                     "320B8F7B9999BBBB320B8F7B9999BBBB",
                     PendingState::Open,
@@ -14964,7 +15284,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         #[test]
         fn the_listing_keeps_peer_names_ids_and_words_while_its_hints_slash() {
             let listing =
-                render_pending(&[], &[command_shaped_row()], &[], pending_now(), 80, false);
+                render_pending_lists(&[], &[command_shaped_row()], &[], pending_now(), 80, false);
             assert_eq!(
                 listing.render(CommandPrefix::Dot),
                 "Waiting for YOU (1)     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh trust x\"\nAccess requests: none\nAsked by this node: none"
@@ -15485,7 +15805,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
     #[test]
     fn attach_is_lifted_from_around_the_quoted_text_and_never_from_inside_it() {
-        let (attach, rest) = take_attach("\"see this\" --attach docs/notes.md", "message").unwrap();
+        let (attach, rest) =
+            take_attach("\"see this\" --attach docs/notes.md", "messaging", "send").unwrap();
         let attach = attach.unwrap();
         assert_eq!(
             (attach.path.as_str(), attach.force),
@@ -15493,21 +15814,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert_eq!(message_text(&rest), Some("see this"));
 
-        let (attach, rest) =
-            take_attach("--attach .env --force \"use --attach x\"", "answer").unwrap();
+        let (attach, rest) = take_attach(
+            "--attach .env --force \"use --attach x\"",
+            "envoy",
+            "answer",
+        )
+        .unwrap();
         let attach = attach.unwrap();
         assert_eq!((attach.path.as_str(), attach.force), (".env", true));
         assert_eq!(message_text(&rest), Some("use --attach x"));
 
-        let (attach, rest) = take_attach("plain words --force --attach a.txt", "message").unwrap();
+        let (attach, rest) =
+            take_attach("plain words --force --attach a.txt", "messaging", "send").unwrap();
         assert!(attach.unwrap().force);
         assert_eq!(message_text(&rest), Some("plain words"));
 
-        let (attach, rest) = take_attach("\"--attach inside\"", "message").unwrap();
+        let (attach, rest) = take_attach("\"--attach inside\"", "messaging", "send").unwrap();
         assert!(attach.is_none());
         assert_eq!(message_text(&rest), Some("--attach inside"));
 
-        let (attach, rest) = take_attach("--attachments are words", "message").unwrap();
+        let (attach, rest) = take_attach("--attachments are words", "messaging", "send").unwrap();
         assert!(attach.is_none());
         assert_eq!(rest, "--attachments are words");
     }
@@ -15515,23 +15841,25 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
     #[test]
     fn attach_without_a_value_and_force_without_attach_are_refused_with_the_usage() {
         for line in ["\"text\" --attach", "\"text\" --attach --force"] {
-            let err = take_attach(line, "message").unwrap_err().to_string();
+            let err = take_attach(line, "messaging", "send")
+                .unwrap_err()
+                .to_string();
             assert!(
                 err.starts_with(&format!(
                     "'--attach' needs a value. {}",
-                    render_verb_help("message")
+                    render_verb_help("messaging", "send")
                 )),
                 "{line}: {err}"
             );
         }
-        let err = take_attach("\"text\" --force", "answer")
+        let err = take_attach("\"text\" --force", "envoy", "answer")
             .unwrap_err()
             .to_string();
         assert_eq!(
             err,
             format!(
                 "`--force` only lifts the built-in deny for an attached file; pass `--attach <path>` or drop it. {}",
-                render_verb_help("answer")
+                render_verb_help("envoy", "answer")
             )
         );
     }
@@ -15788,7 +16116,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
         let mut escalated = escalated_row("p1", hostile);
         escalated.body = hostile.to_string();
-        let text = render_pending(
+        let text = render_pending_lists(
             &[asked_row("q1", PendingState::Open)],
             &[escalated],
             &[],
@@ -15861,7 +16189,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(rows[0][4], "(no intro)", "{text}");
         let mut escalated = escalated_row("p2", blank);
         escalated.body = blank.to_string();
-        let text = render_pending(&[], &[escalated], &[], pending_now(), 200, false).plain();
+        let text = render_pending_lists(&[], &[escalated], &[], pending_now(), 200, false).plain();
         assert!(
             !text.contains("envoy asks"),
             "a blank envoy question prints no envoy line: {text}"
@@ -16024,7 +16352,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     set_prefix(&mut ctx, prefix);
                     let _capture = capture::install();
 
-                    run_async(run(&mut ctx, &format!("{sigil}mesh info"))).unwrap();
+                    run_async(run(&mut ctx, &format!("{sigil}mesh config show"))).unwrap();
                     run_async(run(&mut ctx, &format!("{sigil}mesh off"))).unwrap();
 
                     let out = stdout_of_capture();
@@ -16036,7 +16364,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ),
                         "{prefix}"
                     );
-                    for verb in ["pending", "knocks"] {
+                    for verb in [
+                        "messaging sent",
+                        "envoy questions",
+                        "files requests",
+                        "access requests",
+                    ] {
                         let err =
                             run_async(run(&mut ctx, &format!("{sigil}mesh {verb}"))).unwrap_err();
                         assert_eq!(
@@ -16064,10 +16397,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let knock = || Notification::new(Source::Knock, "`.mesh trust 1a2b`").render();
                 let _capture = capture::install();
 
-                run_async(run(&mut ctx, ".mesh info")).unwrap();
+                run_async(run(&mut ctx, ".mesh config show")).unwrap();
                 printer.notify(knock());
                 set_prefix(&mut ctx, CommandPrefix::Slash);
-                run_async(run(&mut ctx, "/mesh info")).unwrap();
+                run_async(run(&mut ctx, "/mesh config show")).unwrap();
                 printer.notify(knock());
 
                 let infos: Vec<String> = stdout_of_capture()
@@ -16135,11 +16468,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn every_mesh_verb_is_refused_inside_a_macro() {
             let mut ctx = off_ctx();
             ctx.macro_flag = true;
-            for (verb, _, _) in VERBS {
-                let err = err_of(&mut ctx, &format!(".mesh {verb}"));
+            for (group, verb, _, _) in COMMANDS {
+                let line = format!(".mesh {group} {verb}");
+                let err = err_of(&mut ctx, &line);
                 assert_eq!(
                     err, "Cannot perform this operation because you are in a macro",
-                    "{verb}"
+                    "{line}"
                 );
             }
         }
@@ -16149,7 +16483,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn bare_info_while_off_is_one_key_value_table() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
-            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
             assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
@@ -16186,7 +16520,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn info_says_how_to_join_when_off() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
-            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
             assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
@@ -16225,7 +16559,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 },
                 true,
             );
-            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
             assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
@@ -16250,7 +16584,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 port: 4242,
             });
             let mut ctx = ctx_with(both, true);
-            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
             assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
@@ -16294,40 +16628,40 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             for line in [
                 ".mesh",
-                ".mesh brief note",
-                ".mesh brief nonsense",
-                ".mesh info",
-                ".mesh answer",
-                ".mesh message",
-                ".mesh broadcast",
-                ".mesh message 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
-                ".mesh trust",
-                ".mesh untrust",
-                ".mesh forget",
-                ".mesh block",
-                ".mesh unblock",
-                ".mesh knock",
-                ".mesh allow",
-                ".mesh deny",
-                ".mesh unshare",
+                ".mesh envoy brief note",
+                ".mesh envoy brief nonsense",
+                ".mesh config show",
+                ".mesh envoy answer",
+                ".mesh messaging send",
+                ".mesh messaging broadcast",
+                ".mesh messaging send 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
+                ".mesh access trust",
+                ".mesh access revoke",
+                ".mesh access forget",
+                ".mesh access block",
+                ".mesh access unblock",
+                ".mesh access ask",
+                ".mesh files allow",
+                ".mesh files deny",
+                ".mesh files unshare",
             ] {
                 run_async(run(&mut ctx, line)).unwrap_or_else(|err| panic!("{line}: {err}"));
             }
             let out = stdout_lines().join("\n");
             for example in [
-                ".mesh answer <id>",
-                ".mesh message <destination>",
-                ".mesh broadcast",
-                ".mesh trust <destination>",
-                ".mesh untrust <destination>",
-                ".mesh forget --identity <identity>",
-                ".mesh block <destination>",
-                ".mesh unblock <destination>",
-                ".mesh sync",
-                ".mesh knock <destination>",
-                ".mesh allow docs/**",
-                ".mesh deny \"src/vault/*\"",
-                ".mesh unshare docs/**",
+                ".mesh envoy answer <id>",
+                ".mesh messaging send <destination>",
+                ".mesh messaging broadcast",
+                ".mesh access trust <destination>",
+                ".mesh access revoke <destination>",
+                ".mesh access forget --identity <identity>",
+                ".mesh access block <destination>",
+                ".mesh access unblock <destination>",
+                ".mesh messaging sync",
+                ".mesh access ask <destination>",
+                ".mesh files allow docs/**",
+                ".mesh files deny \"src/vault/*\"",
+                ".mesh files unshare docs/**",
             ] {
                 assert!(out.contains(example), "{example} missing from {out}");
             }
@@ -16357,15 +16691,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             let h = "ab".repeat(16);
             for line in [
-                format!(".mesh trust {h}"),
-                format!(".mesh trust --identity {h}"),
-                ".mesh trust --prune".to_string(),
-                format!(".mesh untrust {h}"),
-                format!(".mesh untrust --identity {h}"),
-                format!(".mesh forget --identity {h}"),
-                format!(".mesh block {h}"),
-                format!(".mesh block --identity {h}"),
-                format!(".mesh unblock {h}"),
+                format!(".mesh access trust {h}"),
+                format!(".mesh access trust --identity {h}"),
+                ".mesh access revoke --stale".to_string(),
+                format!(".mesh access revoke {h}"),
+                format!(".mesh access revoke --identity {h}"),
+                format!(".mesh access forget --identity {h}"),
+                format!(".mesh access block {h}"),
+                format!(".mesh access block --identity {h}"),
+                format!(".mesh access unblock {h}"),
             ] {
                 assert_eq!(
                     err_of(&mut ctx, &line),
@@ -16387,9 +16721,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             let h = "ab".repeat(16);
             for line in [
-                ".mesh sync".to_string(),
-                format!(".mesh knock {h}"),
-                format!(".mesh knock {h} --yes --intro \"hi\""),
+                ".mesh messaging sync".to_string(),
+                format!(".mesh access ask {h}"),
+                format!(".mesh access ask {h} --yes --intro \"hi\""),
             ] {
                 assert_eq!(err_of(&mut ctx, &line), MESH_OFF, "{line}");
             }
@@ -16411,10 +16745,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn sync_with_arguments_is_a_usage_error_naming_the_verb() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
-            for line in [".mesh sync now", ".mesh sync --yes"] {
+            for line in [".mesh messaging sync now", ".mesh messaging sync --yes"] {
                 let err = err_of(&mut ctx, line);
                 assert!(err.starts_with("Unexpected '"), "{line}: {err}");
-                assert!(err.contains(".mesh sync"), "{line}: {err}");
+                assert!(err.contains(".mesh messaging sync"), "{line}: {err}");
                 assert_ne!(err, MESH_OFF, "{line}: the usage check comes first");
             }
             assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -16546,7 +16880,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 .brief()
                 .expect("a snapshot and a user brief serve one");
 
-            run_async(run(&mut ctx, ".mesh brief")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief")).unwrap();
 
             let out = stdout_lines().join("\n");
             assert!(out.contains("brief mode:"), "{out}");
@@ -16566,7 +16900,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             ctx.app.mesh.publish(snapshot_fixture());
 
-            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             let lines: Vec<&str> = out.lines().collect();
             assert_eq!(lines[0], "brief mode: auto", "{out}");
             assert_eq!(
@@ -16589,7 +16923,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ctx.app
                 .mesh
                 .set_user_brief(Some("we ship on Friday".to_string()));
-            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             assert!(
                 out.contains(&format!(
                     "\nsections: card . digest (as of {}) . your note . todo (empty)\n",
@@ -16598,11 +16932,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "{out}"
             );
 
-            run_async(run(&mut ctx, ".mesh brief manual")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief manual")).unwrap();
             let mut snapshot = snapshot_fixture();
             snapshot.brief.mode = MeshBrief::Manual;
             ctx.app.mesh.publish(snapshot);
-            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             assert!(
                 out.contains(
                     "\nsections: card . digest (not used in manual mode) . your note . todo (empty)\n"
@@ -16633,7 +16967,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.",
                 ),
             ] {
-                let out = run_async(out_of(&mut ctx, &format!(".mesh brief {word}"))).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, &format!(".mesh envoy brief {word}"))).unwrap();
                 assert_eq!(out, expected);
             }
         }
@@ -16650,7 +16985,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ctx.app.mesh.brief().is_none(),
                 "no snapshot is published before the first turn boundary"
             );
-            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             assert_eq!(
                 out,
                 "brief mode: auto\nNo brief is assembled yet: it is built at the first turn boundary after the mesh is on."
@@ -16673,7 +17008,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let _capture = capture::install();
             let mut ctx = off_ctx();
             ctx.app.mesh.publish(snapshot_fixture());
-            run_async(run(&mut ctx, ".mesh brief off")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief off")).unwrap();
             let mut snapshot = snapshot_fixture();
             snapshot.brief.mode = MeshBrief::Off;
             ctx.app.mesh.publish(snapshot);
@@ -16682,7 +17017,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "off mode assembles no brief"
             );
 
-            let out = run_async(out_of(&mut ctx, ".mesh brief")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             assert_eq!(
                 out,
                 "brief mode: off\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on."
@@ -16698,11 +17033,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn a_note_set_under_off_names_the_modes_that_will_carry_it() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
-            run_async(run(&mut ctx, ".mesh brief off")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief off")).unwrap();
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Off);
 
-            let out =
-                run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
+            let out = run_async(out_of(
+                &mut ctx,
+                ".mesh envoy brief note \"we ship on Friday\"",
+            ))
+            .unwrap();
             assert_eq!(
                 out,
                 "Note set, but brief mode is off, so your envoy does not include it until `.mesh brief auto` or `.mesh brief manual`; then it goes with the card (and, in auto mode, the digest)."
@@ -16727,23 +17065,25 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let hash = "ab".repeat(16);
             // `.mesh rotate` is gated the other way round and has its own tests.
             for line in [
-                ".mesh peers".to_string(),
-                ".mesh knocks".to_string(),
+                ".mesh people list".to_string(),
+                ".mesh access requests".to_string(),
                 ".mesh status".to_string(),
-                format!(".mesh status {hash}"),
-                format!(".mesh info {hash}"),
-                ".mesh pending".to_string(),
-                ".mesh answer q1 text".to_string(),
-                format!(".mesh message {hash} text"),
-                ".mesh broadcast text".to_string(),
-                ".mesh sync".to_string(),
-                format!(".mesh knock {hash}"),
+                format!(".mesh people status {hash}"),
+                format!(".mesh people info {hash}"),
+                ".mesh envoy questions".to_string(),
+                ".mesh files requests".to_string(),
+                ".mesh messaging sent".to_string(),
+                ".mesh envoy answer q1 text".to_string(),
+                format!(".mesh messaging send {hash} text"),
+                ".mesh messaging broadcast text".to_string(),
+                ".mesh messaging sync".to_string(),
+                format!(".mesh access ask {hash}"),
             ] {
                 let err = err_of(&mut ctx, &line);
                 assert!(err.contains(".mesh on"), "{line}: {err}");
             }
             // The inbox outlives the node: messages filed before `.mesh off` stay readable.
-            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            run_async(run(&mut ctx, ".mesh messaging inbox")).unwrap();
             assert!(
                 stdout_lines().iter().any(|line| line == "Inbox is empty."),
                 "{:?}",
@@ -17082,7 +17422,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 .peer_inbox()
                 .deliver(raw(format!("{head}\x1b[31m\u{7}\r\n{tail}"), "m1"));
 
-            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            run_async(run(&mut ctx, ".mesh messaging inbox")).unwrap();
 
             let out = stdout_lines().join("\n");
             let mut lines = out.lines();
@@ -17105,7 +17445,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
 
             let before = stdout_lines().len();
-            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            run_async(run(&mut ctx, ".mesh messaging inbox")).unwrap();
             assert_eq!(
                 stdout_lines()[before..],
                 ["Inbox is empty.".to_string()],
@@ -17119,7 +17459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .deliver(raw(format!("note {i}"), "m2"));
             }
             let before = stdout_lines().len();
-            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            run_async(run(&mut ctx, ".mesh messaging inbox")).unwrap();
             let rows: Vec<String> = stdout_lines()[before..]
                 .iter()
                 .flat_map(|text| text.lines().map(str::to_string).collect::<Vec<_>>())
@@ -17182,7 +17522,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             inbox.deliver(raw(String::new(), "r1"));
             inbox.deliver(raw("ab".repeat(16), "r2"));
 
-            let out = run_async(out_of(&mut ctx, ".mesh inbox")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
 
             let blocks: Vec<&str> = out.split("\n\n").collect();
             assert_eq!(blocks.len(), 2, "{out}");
@@ -17273,7 +17613,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ],
             ));
 
-            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            run_async(run(&mut ctx, ".mesh messaging inbox")).unwrap();
 
             let out = stdout_lines().join("\n");
             let lines = logical_lines(&out);
@@ -17329,6 +17669,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             Ok(stdout_lines()[before..].join("\n"))
         }
 
+        /// The three open-id listings one after another, typed under `sigil`.
+        async fn pending_out(ctx: &mut RequestContext, sigil: &str) -> Result<String> {
+            let mut lists = Vec::new();
+            for path in ["envoy questions", "files requests", "messaging sent"] {
+                lists.push(out_of(ctx, &format!("{sigil}mesh {path}")).await?);
+            }
+            Ok(lists.join("\n"))
+        }
+
         /// An off-mesh context whose chat path completes offline under
         /// `prefix`, so a line that is NOT a command under that prefix can be
         /// told apart from one that is: the former succeeds and prints no mesh
@@ -17362,14 +17711,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 // Bare `/mesh` is the verb list, `/mesh info` the info card.
                 let help = run_async(out_of(&mut ctx, "/mesh")).unwrap();
                 assert!(help.contains("Mesh commands"), "{prefix}: {help}");
-                let info = run_async(out_of(&mut ctx, "/mesh info")).unwrap();
+                let info = run_async(out_of(&mut ctx, "/mesh config show")).unwrap();
                 assert!(has_info_row(&info, "reach"), "{prefix}: {info}");
 
                 // A verb typed without its argument prints its usage, exactly
                 // as the dot form does, instead of going to the model.
-                let usage = run_async(out_of(&mut ctx, "/mesh trust")).unwrap();
+                let usage = run_async(out_of(&mut ctx, "/mesh access trust")).unwrap();
                 assert!(
-                    usage.contains("Usage:") && usage.contains("mesh trust"),
+                    usage.contains("Usage:") && usage.contains("mesh access trust"),
                     "{prefix}: {usage}"
                 );
 
@@ -17400,7 +17749,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             // Under slash, `.mesh info` is prose: the dry-run chat path
             // completes and nothing of the info card is printed.
             let mut ctx = chat_capable_ctx(CommandPrefix::Slash);
-            let out = run_async(out_of(&mut ctx, ".mesh info"))
+            let out = run_async(out_of(&mut ctx, ".mesh config show"))
                 .expect("a dot-led line is chat under slash, never an unknown command");
             assert!(
                 !has_info_row(&out, "reach"),
@@ -17408,19 +17757,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             );
             // ...and a dot-led verb that would print its usage as a command
             // prints none of it as chat.
-            let out = run_async(out_of(&mut ctx, ".mesh trust"))
+            let out = run_async(out_of(&mut ctx, ".mesh access trust"))
                 .expect("a dot-led line is chat under slash");
             assert!(!out.contains("Usage:"), "{out}");
 
             // Under dot, the slash form is prose the same way.
             let mut ctx = chat_capable_ctx(CommandPrefix::Dot);
-            let out = run_async(out_of(&mut ctx, "/mesh info"))
+            let out = run_async(out_of(&mut ctx, "/mesh config show"))
                 .expect("a slash-led line is chat under dot, never an unknown command");
             assert!(
                 !has_info_row(&out, "reach"),
                 "the info card must not render for a chat line: {out}"
             );
-            let out = run_async(out_of(&mut ctx, "/mesh trust"))
+            let out = run_async(out_of(&mut ctx, "/mesh access trust"))
                 .expect("a slash-led line is chat under dot");
             assert!(!out.contains("Usage:"), "{out}");
         }
@@ -17635,7 +17984,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             let err = err_of(&mut ctx, ".mesh bogus");
             assert!(err.starts_with("Unknown .mesh command 'bogus'"), "{err}");
-            assert!(err.contains("`.mesh`"), "{err}");
+            assert!(err.contains("`.mesh help`"), "{err}");
             assert!(!err.contains("Unknown command. Type"), "{err}");
             assert!(!err.to_lowercase().contains("macro"), "{err}");
         }
@@ -17653,15 +18002,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
             let slot = Arc::clone(&ctx.app.mesh);
 
-            run_async(run(&mut ctx, ".mesh brief manual")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief manual")).unwrap();
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Manual);
-            run_async(run(&mut ctx, ".mesh brief off")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief off")).unwrap();
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Off);
-            run_async(run(&mut ctx, ".mesh brief auto")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief auto")).unwrap();
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
 
-            let out =
-                run_async(out_of(&mut ctx, ".mesh brief note \"we ship on Friday\"")).unwrap();
+            let out = run_async(out_of(
+                &mut ctx,
+                ".mesh envoy brief note \"we ship on Friday\"",
+            ))
+            .unwrap();
             assert_eq!(
                 out,
                 "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from."
@@ -17670,15 +18022,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
                 Some("we ship on Friday")
             );
-            run_async(run(&mut ctx, ".mesh brief")).unwrap();
+            run_async(run(&mut ctx, ".mesh envoy brief")).unwrap();
             for retired in [
-                ".mesh brief set \"other\"",
-                ".mesh brief set",
-                ".mesh brief clear",
-                ".mesh brief clear now",
+                ".mesh envoy brief set \"other\"",
+                ".mesh envoy brief set",
+                ".mesh envoy brief clear",
+                ".mesh envoy brief clear now",
             ] {
                 let err = err_of(&mut ctx, retired);
-                let word = retired.split_whitespace().nth(2).unwrap();
+                let word = retired.split_whitespace().nth(3).unwrap();
                 assert_eq!(
                     err,
                     format!(
@@ -17691,7 +18043,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "{retired} changes nothing"
                 );
             }
-            let out = run_async(out_of(&mut ctx, ".mesh brief note clear")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief note clear")).unwrap();
             assert_eq!(
                 out,
                 "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one."
@@ -17728,7 +18080,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             const OFF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on";
 
             for (mode, row) in [("manual", MANUAL_ROW), ("off", OFF_ROW), ("auto", AUTO_ROW)] {
-                run_async(run(&mut ctx, &format!(".mesh brief {mode}"))).unwrap();
+                run_async(run(&mut ctx, &format!(".mesh envoy brief {mode}"))).unwrap();
                 let out = run_async(out_of(&mut ctx, ".mesh on")).unwrap();
                 let rows: Vec<&str> = out.lines().collect();
                 let card = rows
@@ -17766,43 +18118,34 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
         }
 
-        /// The verb that sends a first message is `message`; its old name is refused
-        /// like any unknown word, the error alone naming the `message` usage from the
-        /// verb table.
+        /// The verb that sends a first message is `messaging send`; the old `reply` is
+        /// refused like any unknown word, with no pointer to the verb that replaced it.
         #[test]
         #[serial]
-        fn the_retired_reply_verb_is_refused_and_names_message() {
+        fn the_retired_reply_verb_is_refused_like_any_unknown_word() {
             let _capture = capture::install();
             let mut ctx = off_ctx();
             let hash = "ab".repeat(16);
             let err = err_of(&mut ctx, &format!(".mesh reply {hash} --yes hi"));
-            let (_, _, example) = VERBS
-                .iter()
-                .find(|(name, _, _)| *name == "message")
-                .unwrap();
             assert_eq!(
                 err,
-                format!(
-                    "Unknown .mesh command 'reply'. To message a peer, use `{example}`. Type `.mesh` for the list."
-                )
+                "Unknown .mesh command 'reply'. Type `.mesh help` for the list."
             );
             assert!(
                 !err.contains(".mesh on"),
                 "the verb is unknown on or off: {err}"
             );
 
-            let out = run_async(out_of(&mut ctx, ".mesh message")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh messaging send")).unwrap();
             assert!(
-                out.starts_with("Usage: .mesh message <destination>"),
+                out.starts_with("Usage: .mesh messaging send <destination>"),
                 "{out}"
             );
         }
 
-        /// The concession is for the one old verb alone: a bare `.mesh reply` is the
-        /// same unknown-verb refusal (never the usage of `message`), and any other
-        /// unknown word gets the plain refusal with no `message` pointer. The list
-        /// `.mesh` prints carries the `message` and `brief note` rows and no retired
-        /// spelling, and `.mesh message` with no destination prints its own usage.
+        /// A bare `.mesh reply`, every cut verb and any other unknown word get the same
+        /// plain refusal. The list `.mesh` prints carries the `messaging send` and
+        /// `envoy brief note` rows and no retired spelling.
         #[test]
         #[serial]
         fn help_and_unknown_verbs_name_message_and_never_a_retired_spelling() {
@@ -17812,14 +18155,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let bare = err_of(&mut ctx, ".mesh reply");
             assert_eq!(
                 bare,
-                "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list."
+                "Unknown .mesh command 'reply'. Type `.mesh help` for the list."
             );
-            for other in ["replyy", "replies", "send", "Reply"] {
+            for other in [
+                "replyy", "replies", "send", "Reply", "message", "peers", "pending",
+            ] {
                 let err = err_of(&mut ctx, &format!(".mesh {other} hi"));
                 assert_eq!(
                     err,
-                    format!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
-                    "only the exact old verb hears the new one"
+                    format!("Unknown .mesh command '{other}'. Type `.mesh help` for the list."),
+                    "no word hears a pointer"
                 );
             }
 
@@ -17828,35 +18173,33 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 .lines()
                 .filter(|line| line.trim_start().starts_with(".mesh "))
                 .collect();
-            assert_eq!(rows.len(), 30, "{list}");
+            assert_eq!(rows.len(), COMMANDS.len(), "{list}");
             assert!(
                 rows.iter()
-                    .any(|row| row.trim_start().starts_with(".mesh message ")),
+                    .any(|row| row.trim_start().starts_with(".mesh messaging send ")),
                 "{list}"
             );
             assert!(
-                !rows
-                    .iter()
-                    .any(|row| row.trim_start().starts_with(".mesh reply")),
+                !rows.iter().any(|row| row.trim_start().contains(" reply")),
                 "{list}"
             );
             assert!(
                 list.contains(
-                    "e.g. .mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]"
+                    "  .mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]"
                 ),
                 "{list}"
             );
             assert!(
-                list.contains("e.g. .mesh brief [note \"text\"|note clear|auto|manual|off]"),
+                list.contains("  .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"),
                 "{list}"
             );
             for retired in [
                 "brief set",
                 "brief clear",
                 ".mesh reply",
-                ".mesh forget <destination>",
-                ".mesh block <identity>",
-                ".mesh unblock <identity>",
+                ".mesh access forget <destination>",
+                ".mesh access block <identity>",
+                ".mesh access unblock <identity>",
             ] {
                 assert!(
                     !list.contains(retired),
@@ -17874,7 +18217,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let _capture = capture::install();
             let mut ctx = off_ctx();
 
-            let out = run_async(out_of(&mut ctx, ".mesh brief note \"clear\"")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief note \"clear\"")).unwrap();
             assert!(out.starts_with("Note set;"), "{out}");
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
@@ -17882,7 +18225,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 "a quoted word is the note's text"
             );
 
-            let out = run_async(out_of(&mut ctx, ".mesh brief   note    clear  ")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief   note    clear  ")).unwrap();
             assert_eq!(
                 out,
                 "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one."
@@ -17890,14 +18233,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(ctx.app.mesh.user_brief().is_none());
 
             // Clearing an already empty note is the same quiet confirmation.
-            let out = run_async(out_of(&mut ctx, ".mesh brief note clear")).unwrap();
+            let out = run_async(out_of(&mut ctx, ".mesh envoy brief note clear")).unwrap();
             assert!(out.starts_with("Note cleared;"), "{out}");
 
             // `note` alone, or with empty quotes, is the verb's usage, not a cleared note.
-            for incomplete in [".mesh brief note", ".mesh brief note \"\""] {
+            for incomplete in [".mesh envoy brief note", ".mesh envoy brief note \"\""] {
                 let out = run_async(out_of(&mut ctx, incomplete)).unwrap();
                 assert!(
-                    out.starts_with("Usage: .mesh brief ["),
+                    out.starts_with("Usage: .mesh envoy brief ["),
                     "{incomplete}: {out}"
                 );
                 assert!(
@@ -17949,7 +18292,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             let token = format!("rotate-{}", short(&old));
 
-            for line in [".mesh rotate", ".mesh rotate --dry-run"] {
+            for line in [
+                ".mesh config rotate-identity",
+                ".mesh config rotate-identity --dry-run",
+            ] {
                 let printed = stdout_lines().len();
                 run_async(run(&mut ctx, line)).unwrap();
                 let out = stdout_lines()[printed..].join("\n");
@@ -17985,9 +18331,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let token = format!("rotate-{}", short(&old));
 
             for line in [
-                ".mesh rotate".to_string(),
-                ".mesh rotate --dry-run".to_string(),
-                format!(".mesh rotate --confirm {token}"),
+                ".mesh config rotate-identity".to_string(),
+                ".mesh config rotate-identity --dry-run".to_string(),
+                format!(".mesh config rotate-identity --confirm {token}"),
             ] {
                 let err = err_of(&mut ctx, &line);
                 assert!(err.contains("no readable `version` field"), "{line}: {err}");
@@ -18013,9 +18359,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let token = format!("rotate-{}", short(&old));
 
             for line in [
-                ".mesh rotate".to_string(),
-                ".mesh rotate --dry-run".to_string(),
-                format!(".mesh rotate --confirm {token}"),
+                ".mesh config rotate-identity".to_string(),
+                ".mesh config rotate-identity --dry-run".to_string(),
+                format!(".mesh config rotate-identity --confirm {token}"),
             ] {
                 let err = err_of(&mut ctx, &line);
                 assert!(err.contains(".mesh off"), "{line}: {err}");
@@ -18037,7 +18383,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let (path, before, old) = minted_key(&guard);
             let mut ctx = off_ctx();
 
-            let err = err_of(&mut ctx, ".mesh rotate --confirm rotate-nope");
+            let err = err_of(
+                &mut ctx,
+                ".mesh config rotate-identity --confirm rotate-nope",
+            );
 
             assert!(err.contains("'rotate-nope' is not the token"), "{err}");
             assert!(
@@ -18070,7 +18419,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             run_async(run(
                 &mut ctx,
-                &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+                &format!(
+                    ".mesh config rotate-identity --confirm rotate-{}",
+                    short(&old)
+                ),
             ))
             .unwrap();
 
@@ -18111,7 +18463,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let mut ctx = off_ctx();
             let token = format!("rotate-{}", short(&old));
 
-            let err = err_of(&mut ctx, ".mesh rotate --yes");
+            let err = err_of(&mut ctx, ".mesh config rotate-identity --yes");
             assert_eq!(
                 err,
                 "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
@@ -18119,9 +18471,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(fs::read(&path).unwrap(), before);
 
             for (line, offending) in [
-                (format!(".mesh rotate {token}"), token.as_str()),
                 (
-                    format!(".mesh rotate --dry-run --confirm {token}"),
+                    format!(".mesh config rotate-identity {token}"),
+                    token.as_str(),
+                ),
+                (
+                    format!(".mesh config rotate-identity --dry-run --confirm {token}"),
                     "--dry-run",
                 ),
             ] {
@@ -18130,7 +18485,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     err.starts_with(&format!("Unexpected '{offending}'.")),
                     "{line}: {err}"
                 );
-                assert!(err.contains(".mesh rotate ["), "{line}: {err}");
+                assert!(
+                    err.contains(".mesh config rotate-identity ["),
+                    "{line}: {err}"
+                );
                 assert_eq!(fs::read(&path).unwrap(), before, "{line}");
             }
         }
@@ -18141,7 +18499,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let guard = TestConfigDirGuard::new("repl-mesh-rotate-no-identity");
             let mut ctx = off_ctx();
 
-            let err = err_of(&mut ctx, ".mesh rotate");
+            let err = err_of(&mut ctx, ".mesh config rotate-identity");
 
             assert!(err.contains("No mesh identity"), "{err}");
             assert!(err.contains(".mesh on"), "{err}");
@@ -18177,7 +18535,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 run_async(run(
                     &mut ctx,
-                    &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+                    &format!(
+                        ".mesh config rotate-identity --confirm rotate-{}",
+                        short(&old)
+                    ),
                 ))
                 .unwrap();
 
@@ -18261,12 +18622,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             fn rotate_twice(ctx: &mut RequestContext, old: &str) -> (String, String) {
                 let printed = stdout_lines().len();
-                run_async(run(ctx, ".mesh rotate")).unwrap();
+                run_async(run(ctx, ".mesh config rotate-identity")).unwrap();
                 let dry_run = stdout_lines()[printed..].join("\n");
                 let printed = stdout_lines().len();
                 run_async(run(
                     ctx,
-                    &format!(".mesh rotate --confirm rotate-{}", short(old)),
+                    &format!(
+                        ".mesh config rotate-identity --confirm rotate-{}",
+                        short(old)
+                    ),
                 ))
                 .unwrap();
                 (dry_run, stdout_lines()[printed..].join("\n"))
@@ -18375,7 +18739,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let trust_path = corrupt_trust_file(&guard);
                 let mut ctx = off_ctx();
 
-                run_async(run(&mut ctx, ".mesh rotate")).unwrap();
+                run_async(run(&mut ctx, ".mesh config rotate-identity")).unwrap();
 
                 let out = stdout_lines().join("\n");
                 assert!(
@@ -18403,7 +18767,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let err = run_async(run(
                     &mut ctx,
-                    &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+                    &format!(
+                        ".mesh config rotate-identity --confirm rotate-{}",
+                        short(&old)
+                    ),
                 ))
                 .unwrap_err();
 
@@ -18917,7 +19284,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let old_dest = heard_as("first", now - PEER_STALE_AFTER);
                     let new_dest = heard_as("second", now - Duration::from_secs(5));
 
-                    let out = out_of(&mut ctx, &format!(".mesh info {old_dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {old_dest}"))
                         .await
                         .unwrap();
                     let last_seen = out
@@ -18933,7 +19300,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh info {new_dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {new_dest}"))
                         .await
                         .unwrap();
                     assert!(
@@ -18979,7 +19346,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             SystemTime::now(),
                         );
 
-                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         let rows = table_rows(&out);
                         let row = |destination: &str| {
                             rows.iter()
@@ -19054,7 +19421,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         heard_as_you(&a, &temp_dest);
                         heard_as_you(&a, &gone_session);
 
-                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         let rows = table_rows(&out);
                         let row = |destination: &str| {
                             rows.iter()
@@ -19091,7 +19458,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 now,
                             )
                             .unwrap();
-                        let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut ctx, ".").await.unwrap();
                         assert!(out.contains("(you: temp)"), "{out}");
                         assert!(!out.contains("Laptop"), "{out}");
 
@@ -19155,7 +19522,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         assert!(temp_slot.stop().await.unwrap());
 
-                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         let rows = table_rows(&out);
                         let row = rows
                             .iter()
@@ -19211,7 +19578,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             a.requests_made()
                         );
 
-                        let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut ctx, ".").await.unwrap();
                         assert!(
                             out.contains(
                                 "asked by (you, gone: temp) . collect it from that session"
@@ -19286,7 +19653,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         file["instances"][gone_id.as_str()] = gone_row;
                         std::fs::write(&registry, serde_json::to_vec(&file).unwrap()).unwrap();
 
-                        let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut ctx, ".").await.unwrap();
 
                         assert!(out.contains("Asked by this node (3)"), "{out}");
                         for line in [
@@ -19302,13 +19669,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let running = "Question q-temp-0001 was asked by (you: temp), not this session, and only the session that asked it can collect the reply or follow up: run `.mesh answer q-temp-0001 \"<text>\"` in session temp.";
                         for verb in [
-                            ".mesh answer q-temp-0001 \"main\"",
-                            ".mesh dismiss q-temp-0001",
+                            ".mesh envoy answer q-temp-0001 \"main\"",
+                            ".mesh envoy dismiss q-temp-0001",
                         ] {
                             let refused = out_of(&mut ctx, verb).await.unwrap_err().to_string();
                             assert_eq!(refused, running, "{verb}");
                         }
-                        let gone = out_of(&mut ctx, ".mesh answer q-gone-0001 \"main\"")
+                        let gone = out_of(&mut ctx, ".mesh envoy answer q-gone-0001 \"main\"")
                             .await
                             .unwrap_err()
                             .to_string();
@@ -19316,7 +19683,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             gone,
                             "Question q-gone-0001 was asked by (you, gone: old), which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session old` and `.mesh on`, then run `.mesh answer q-gone-0001 \"<text>\"` in session old."
                         );
-                        let by_prefix = out_of(&mut ctx, ".mesh answer q-lost-0 \"main\"")
+                        let by_prefix = out_of(&mut ctx, ".mesh envoy answer q-lost-0 \"main\"")
                             .await
                             .unwrap_err()
                             .to_string();
@@ -19371,7 +19738,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let gone_session = hex_lower(&[0x4e; 16]);
                             heard_as_you(&a, &gone_session);
 
-                            let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                            let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                             let rows = table_rows(&out);
                             let row = |destination: &str| {
                                 rows.iter()
@@ -19411,7 +19778,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     )
                                     .unwrap();
                             }
-                            let out = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                            let out = pending_out(&mut ctx, ".").await.unwrap();
                             assert!(!out.contains("(you: temp)"), "{out}");
                             assert!(out.contains("Forged"), "{out}");
                             assert!(out.contains("(you)"), "{out}");
@@ -19468,11 +19835,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let dest_a = heard_as("first");
                     let dest_b = heard_as("second");
 
-                    out_of(&mut ctx, &format!(".mesh trust {dest_a} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest_a} --yes"))
                         .await
                         .unwrap();
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row = |destination: &str| {
                         out.lines()
                             .find(|line| line.contains(short(destination)))
@@ -19482,7 +19849,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(row(&dest_b).contains(" known "), "{}", row(&dest_b));
                     assert!(!row(&dest_b).contains("untrusted"), "{}", row(&dest_b));
 
-                    let out = out_of(&mut ctx, &format!(".mesh info {dest_b}"))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {dest_b}"))
                         .await
                         .unwrap();
                     assert!(out.lines().any(|line| line == "trust: known"), "{out}");
@@ -19558,7 +19925,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
                         period_text(PEER_TTL)
                     );
-                    let first = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let first = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row = |text: &str, destination: &str| -> (String, String) {
                         table_rows(text)
                             .into_iter()
@@ -19615,7 +19982,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the legend is the last line: {first}"
                     );
 
-                    let second = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let second = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert_eq!(first, second, "listing twice renders the same bytes");
 
                     peers.persist_if_dirty().unwrap();
@@ -19636,7 +20003,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "every heard row is persisted, the superseded one included:\n{persisted}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh info {exactly}"))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {exactly}"))
                         .await
                         .unwrap();
                     let last_seen = out
@@ -19644,7 +20011,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .find(|line| line.starts_with("last seen: "))
                         .unwrap_or_else(|| panic!("no last seen line in {out}"));
                     assert_eq!(last_seen, format!("last seen: 2h ago {stale}"), "{out}");
-                    let out = out_of(&mut ctx, &format!(".mesh info {nearly}"))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {nearly}"))
                         .await
                         .unwrap();
                     assert!(
@@ -19709,7 +20076,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .mesh
                         .record_envoy_exchange(&question, "content of r1");
 
-                    let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh messaging inbox").await.unwrap();
 
                     let blocks: Vec<&str> = out.split("\n\n").collect();
                     assert_eq!(blocks.len(), 2, "{out}");
@@ -19733,7 +20100,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(blocks[1].lines().nth(1), Some("  content of r1"), "{out}");
 
                     assert_eq!(
-                        out_of(&mut ctx, ".mesh inbox").await.unwrap(),
+                        out_of(&mut ctx, ".mesh messaging inbox").await.unwrap(),
                         "Inbox is empty."
                     );
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -19776,7 +20143,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
 
                     ctx.app.mesh.record_envoy_exchange(&question, "yes, green");
-                    let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh messaging inbox").await.unwrap();
 
                     let blocks: Vec<&str> = out.split("\n\n").collect();
                     assert_eq!(blocks.len(), 2, "{out}");
@@ -19840,7 +20207,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
 
-                    let out = out_of(&mut ctx, ".mesh inbox").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh messaging inbox").await.unwrap();
 
                     let blocks: Vec<&str> = out.split("\n\n").collect();
                     assert_eq!(blocks.len(), 2, "{out}");
@@ -20238,12 +20605,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.objective_override().is_none());
 
                     for line in [
-                        ".mesh peers",
-                        ".mesh knocks",
-                        ".mesh info",
-                        ".mesh pending",
-                        ".mesh inbox",
-                        ".mesh brief",
+                        ".mesh people list",
+                        ".mesh access requests",
+                        ".mesh config show",
+                        ".mesh envoy questions",
+                        ".mesh files requests",
+                        ".mesh messaging sent",
+                        ".mesh messaging inbox",
+                        ".mesh envoy brief",
                     ] {
                         run(&mut ctx, line)
                             .await
@@ -20273,13 +20642,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let hash = "ab".repeat(16);
 
                     for line in [
-                        ".mesh message".to_string(),
-                        format!(".mesh message {hash}"),
-                        format!(".mesh message {hash} \"\""),
-                        ".mesh answer".to_string(),
-                        ".mesh broadcast".to_string(),
-                        ".mesh broadcast --yes".to_string(),
-                        ".mesh brief note".to_string(),
+                        ".mesh messaging send".to_string(),
+                        format!(".mesh messaging send {hash}"),
+                        format!(".mesh messaging send {hash} \"\""),
+                        ".mesh envoy answer".to_string(),
+                        ".mesh messaging broadcast".to_string(),
+                        ".mesh messaging broadcast --yes".to_string(),
+                        ".mesh envoy brief note".to_string(),
                     ] {
                         run(&mut ctx, &line)
                             .await
@@ -20288,15 +20657,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.correlations().list().is_empty());
                     let out = stdout_lines().join("\n");
                     for usage in [
-                        "Usage: .mesh message <destination>",
-                        "Usage: .mesh answer <id>",
-                        "Usage: .mesh broadcast",
-                        "Usage: .mesh brief [",
+                        "Usage: .mesh messaging send <destination>",
+                        "Usage: .mesh envoy answer <id>",
+                        "Usage: .mesh messaging broadcast",
+                        "Usage: .mesh envoy brief [",
                     ] {
                         assert!(out.contains(usage), "{usage} missing from {out}");
                     }
 
-                    let err = run(&mut ctx, ".mesh brief set")
+                    let err = run(&mut ctx, ".mesh envoy brief set")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -20309,26 +20678,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "Asking the mesh for {}'s announce; Ctrl-C cancels...",
                         short(&hash)
                     );
-                    let err = run(&mut ctx, &format!(".mesh info {hash}"))
+                    let err = run(&mut ctx, &format!(".mesh people info {hash}"))
                         .await
                         .unwrap_err()
                         .to_string();
                     assert_eq!(err, unanswered_path_request(&hash));
                     assert!(stdout_lines().contains(&waiting), "{:?}", stdout_lines());
 
-                    let err = run(&mut ctx, ".mesh info nothex")
+                    let err = run(&mut ctx, ".mesh people info nothex")
                         .await
                         .unwrap_err()
                         .to_string();
                     assert!(err.contains("unique prefix"), "{err}");
 
-                    let err = run(&mut ctx, ".mesh message nothex --yes hi")
+                    let err = run(&mut ctx, ".mesh messaging send nothex --yes hi")
                         .await
                         .unwrap_err()
                         .to_string();
                     assert!(err.contains("unique prefix"), "{err}");
 
-                    let err = run(&mut ctx, ".mesh status nonsense")
+                    let err = run(&mut ctx, ".mesh people status nonsense")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -20336,7 +20705,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // A bare id is a valid form now (the text is prompted for), so an
                     // unknown one is refused with or without text, before any prompt.
-                    for line in [".mesh answer nope \"yes\"", ".mesh answer nope"] {
+                    for line in [".mesh envoy answer nope \"yes\"", ".mesh envoy answer nope"] {
                         let err = run(&mut ctx, line).await.unwrap_err().to_string();
                         assert!(err.contains("No open question has id nope"), "{err}");
                         assert!(err.contains(".mesh pending"), "{err}");
@@ -20344,7 +20713,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
-                    let err = run(&mut ctx, &format!(".mesh status {hash}"))
+                    let err = run(&mut ctx, &format!(".mesh people status {hash}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -20366,7 +20735,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let runtime = started.runtime.clone();
 
-                    run(&mut ctx, ".mesh info").await.unwrap();
+                    run(&mut ctx, ".mesh config show").await.unwrap();
 
                     let out = stdout_lines().join("\n");
                     let rows = info_rows(&out);
@@ -20495,7 +20864,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(Arc::clone(&runtime)).unwrap();
                     let label = format!("private 127.0.0.1:{closed}");
 
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
 
                     assert_eq!(
                         info_row(&out, "interfaces[0]"),
@@ -20528,8 +20897,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("rotate-{}", short(&fingerprint(&minted)));
 
                     for line in [
-                        ".mesh rotate".to_string(),
-                        format!(".mesh rotate --confirm {token}"),
+                        ".mesh config rotate-identity".to_string(),
+                        format!(".mesh config rotate-identity --confirm {token}"),
                     ] {
                         let err = refusal(&mut ctx, &line).await;
                         assert_eq!(err, ROTATE_NEEDS_OFF, "{line}");
@@ -20555,7 +20924,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let runtime = started.runtime.clone();
 
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(!has_info_row(&out, "identity predecessors"), "{out}");
                     assert!(!has_info_row(&out, "key changes"), "{out}");
 
@@ -20578,7 +20947,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         1
                     );
 
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     let predecessors = info_row(&out, "identity predecessors");
                     assert!(
                         predecessors
@@ -20593,7 +20962,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     fs::write(identity::predecessors_path(&path), "not json\n").unwrap();
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     let row = info_row(&out, "identity predecessors");
                     assert!(row.starts_with("unreadable: "), "{out}");
                     assert!(row.contains(identity::PREDECESSORS_FILE), "{out}");
@@ -20697,7 +21066,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
 
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
 
                     let joined = info_row(&out, "joined");
                     assert!(joined.ends_with("s ago"), "{out}");
@@ -20875,7 +21244,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
 
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     let keys: Vec<String> =
                         info_rows(&out).into_iter().map(|(key, _)| key).collect();
                     let settings: Vec<String> = mesh_settings_rows(&ctx.app.config.mesh, false)
@@ -20927,7 +21296,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(&mut ctx, ".mesh status").await.unwrap();
                     assert_eq!(status_envoy_memory(&out), "off", "{out}");
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(info_row(&out, "envoy memory"), "off", "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -20976,7 +21345,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "0 conversations, 0 identities",
                         "{out}"
                     );
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&out, "envoy memory"),
                         "0 conversations, 0 identities",
@@ -21023,7 +21392,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "3 conversations, 2 identities",
                         "{out}"
                     );
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&out, "envoy memory"),
                         "3 conversations, 2 identities",
@@ -21066,7 +21435,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         SystemTime::now(),
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let marker = key_change_line_of(&out);
                     assert!(
                         marker.starts_with(&format!("{} key changed:", short(&old_dest))),
@@ -21085,7 +21454,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {new_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("added"), "{out}");
@@ -21097,9 +21466,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(out.contains(&format!(".mesh untrust {old_dest}")), "{out}");
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(!out.contains("key changed:"), "{out}");
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(!has_info_row(&out, "key changes"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -21144,7 +21513,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         1
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let marker = key_change_line_of(&out);
                     assert!(
                         marker.starts_with(&format!("{} key changed:", short(&old_dest))),
@@ -21164,7 +21533,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {new_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("added"), "{out}");
@@ -21208,12 +21577,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let runtime = started.runtime.clone();
                     let (old_dest, old_identity) = heard_peer(&runtime, "Tia", SystemTime::now());
-                    out_of(&mut ctx, &format!(".mesh trust {old_dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {old_dest} --yes"))
                         .await
                         .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh trust --identity {old_identity} --yes"),
+                        &format!(".mesh access trust --identity {old_identity} --yes"),
                     )
                     .await
                     .unwrap();
@@ -21241,7 +21610,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         1
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {new_dest} --yes"))
                         .await
                         .unwrap();
 
@@ -21259,7 +21628,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let trust = runtime.trust();
                     let before = trust_file(&trust).unwrap();
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {old_dest} --yes")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access revoke {old_dest} --yes")).await;
                     assert!(
                         err.contains(&format!(
                             "To stop serving just this instance, run .mesh block {old_dest}."
@@ -21271,7 +21641,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         Some(before.as_slice()),
                         "a refused untrust writes nothing"
                     );
-                    let out = out_of(&mut ctx, &format!(".mesh unblock {old_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access unblock {old_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -21331,7 +21701,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh trust --identity {new_identity} --yes"),
+                        &format!(".mesh access trust --identity {new_identity} --yes"),
                     )
                     .await
                     .unwrap();
@@ -21341,7 +21711,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "trusting the identity for all destinations clears no mark"
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let marker = out
                         .lines()
                         .find(|line| line.contains("key changed:"))
@@ -21352,7 +21722,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the successor is named although its identity is trusted for all: {out}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {new_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("added"), "{out}");
@@ -21366,7 +21736,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         mark_of(&old_dest).is_none(),
                         "cleared by the new-destination trust"
                     );
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(!out.contains("key changed:"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -21412,13 +21782,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(runtime.peers().sweep(now), vec![old_dest.clone()]);
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh trust --identity {new_identity} --yes"),
+                        &format!(".mesh access trust --identity {new_identity} --yes"),
                     )
                     .await
                     .unwrap();
                     assert!(out.contains("added"), "{out}");
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let unheard = table_rows(&out)
                         .into_iter()
                         .find(|row| row[0] == "(not heard)")
@@ -21438,11 +21808,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(!marker.contains("its new destination once heard"), "{out}");
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {new_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("added"), "{out}");
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(!out.contains("key changed:"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -21487,7 +21857,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(runtime.peers().sweep(now), vec![old_dest.clone()]);
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let rows: Vec<Vec<String>> = table_rows(&out)
                         .into_iter()
                         .filter(|row| row[1] == short(&old_dest))
@@ -21553,7 +21923,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row_of = |dest: &str| {
                         out.lines()
                             .find(|line| line.contains(short(dest)))
@@ -21615,7 +21985,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the first-heard holder is served"
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row_of = |dest: &str| {
                         out.lines()
                             .find(|line| line.contains(short(dest)))
@@ -21674,7 +22044,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     {
                         runtime.trust().set_collision_protection(protection);
                         assert_eq!(served_verdict(&runtime, &new_dest).decision, served);
-                        let out = out_of(&mut ctx, &format!(".mesh info {new_dest}"))
+                        let out = out_of(&mut ctx, &format!(".mesh people info {new_dest}"))
                             .await
                             .unwrap();
                         assert!(
@@ -21729,7 +22099,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for protection in [false, true] {
                         runtime.trust().set_collision_protection(protection);
-                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                         let row = out
                             .lines()
                             .find(|line| line.contains(short(&new_dest)))
@@ -21872,7 +22242,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the old row aged out: the refusal stands from memory"
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row = out
                         .lines()
                         .find(|line| line.contains(short(&old_dest)))
@@ -21886,7 +22256,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh untrust --identity {old_identity} --confirm untrust-{}",
+                            ".mesh access revoke --identity {old_identity} --confirm untrust-{}",
                             short(&old_identity)
                         ),
                     )
@@ -21915,7 +22285,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh block --identity {new_identity} --yes"),
+                        &format!(".mesh access block --identity {new_identity} --yes"),
                     )
                     .await
                     .unwrap();
@@ -21935,7 +22305,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     out_of(
                         &mut ctx,
-                        &format!(".mesh unblock --identity {new_identity} --yes"),
+                        &format!(".mesh access unblock --identity {new_identity} --yes"),
                     )
                     .await
                     .unwrap();
@@ -22071,7 +22441,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (&blocked_dest, "blocked (identity)"),
                             (&stranger_dest, "untrusted"),
                         ] {
-                            let out = out_of(&mut ctx, &format!(".mesh info {dest}"))
+                            let out = out_of(&mut ctx, &format!(".mesh people info {dest}"))
                                 .await
                                 .unwrap();
                             let trust_lines: Vec<&str> = out
@@ -22157,7 +22527,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         1
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {old_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {old_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("updated"), "{out}");
@@ -22165,12 +22535,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         mark_of(&old_dest).is_some(),
                         "re-trusting the marked destination itself answers nothing about the new key"
                     );
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(out.contains("key changed:"), "{out}");
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh block --identity {new_identity} --yes"),
+                        &format!(".mesh access block --identity {new_identity} --yes"),
                     )
                     .await
                     .unwrap();
@@ -22186,7 +22556,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         mark_of(&old_dest).is_some(),
                         "blocking silences, it does not clear"
                     );
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(out.contains("key changed:"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -22434,7 +22804,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         warnings[0]
                     );
                     assert!(!warnings[0].contains("rnsd"), "{}", warnings[0]);
-                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(
                         info_row(&info, "interfaces[0]")
                             .starts_with("public relay.invalid:4242  unreachable, retrying: "),
@@ -22586,7 +22956,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let runtime = ctx.app.mesh.get().unwrap();
                     let reason = recorded_reason(&runtime, &label);
                     assert_eq!(warnings(), vec![loopback_warning(held, &reason)]);
-                    let before = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let before = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&before, "interfaces[1]"),
                         format!("{label}  unreachable, retrying: {reason}"),
@@ -22609,7 +22979,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     })
                     .await;
 
-                    let after = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let after = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&after, "interfaces[0]"),
                         format!("private 127.0.0.1:{}  connected", addr.port()),
@@ -22702,7 +23072,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{summary}"
                     );
                     assert!(!summary.contains("127.0.0.2"), "{summary}");
-                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[0]"),
                         format!("{label}  unreachable, retrying: {reason}"),
@@ -22793,7 +23163,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                 let name = format!("interfaces[{index}]");
                 loop {
-                    let info = out_of(ctx, ".mesh info").await.unwrap();
+                    let info = out_of(ctx, ".mesh config show").await.unwrap();
                     let row = info_row(&info, &name);
                     if want(&row) {
                         return info;
@@ -22882,7 +23252,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{summary}"
                     );
                     assert!(!summary.contains("local rnsd"), "{summary}");
-                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[1]"),
                         format!("{label}  connecting, retrying: {reason}"),
@@ -23022,7 +23392,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{summary}"
                     );
                     assert!(!summary.contains("local rnsd"), "{summary}");
-                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[1]"),
                         format!("{label}  connecting, retrying: {reason}"),
@@ -23204,7 +23574,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
 
                     // Off: the settings rows, one per configured interface, nothing else.
-                    let off = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let off = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(off.starts_with("node: off - .mesh on joins\n"), "{off}");
                     assert_eq!(heads(&off).len(), 2, "{off}");
                     assert_eq!(rows_of(&off), settings, "{off}");
@@ -23218,7 +23588,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(warnings().len(), 1, "{:?}", stderr_lines());
 
                     // On, degraded: exactly one row per head, each the node's label + state.
-                    let on = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let on = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(!on.starts_with("node:"), "{on}");
                     assert_eq!(
                         heads(&on).len(),
@@ -23259,7 +23629,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.get().is_none());
 
                     // Off again: the settings rows are back, the node's rows are gone.
-                    let off_again = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let off_again = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(
                         off_again.starts_with("node: off - .mesh on joins\n"),
                         "{off_again}"
@@ -23306,7 +23676,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let states = started.runtime.interface_states();
 
-                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
 
                     let rows: Vec<(String, String)> = info_rows(&out)
                         .into_iter()
@@ -23363,7 +23733,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
 
-                    run(&mut ctx, &format!(".mesh message {hash} hello"))
+                    run(&mut ctx, &format!(".mesh messaging send {hash} hello"))
                         .await
                         .unwrap();
                     let out = stdout_lines();
@@ -23373,7 +23743,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(notice < nothing, "{out:?}");
                     let before = out.len();
 
-                    run(&mut ctx, ".mesh broadcast hello").await.unwrap();
+                    run(&mut ctx, ".mesh messaging broadcast hello")
+                        .await
+                        .unwrap();
                     let out = stdout_lines()[before..].to_vec();
                     let notice = index_of(&out, BROADCAST_NOTICE);
                     let nothing = index_of(&out, "Nothing was sent.");
@@ -23398,8 +23770,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for line in [
                         ".mesh off".to_string(),
-                        format!(".mesh message {hash} hi"),
-                        ".mesh broadcast hi".to_string(),
+                        format!(".mesh messaging send {hash} hi"),
+                        ".mesh messaging broadcast hi".to_string(),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         assert!(err.contains("--yes"), "{line}: {err}");
@@ -23430,10 +23802,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
 
                     for line in [
-                        format!(".mesh message {hash} please say --yes"),
-                        format!(".mesh message {hash} \"--yes in quotes\""),
-                        ".mesh broadcast ship it --yes".to_string(),
-                        ".mesh broadcast \"--yes\" now".to_string(),
+                        format!(".mesh messaging send {hash} please say --yes"),
+                        format!(".mesh messaging send {hash} \"--yes in quotes\""),
+                        ".mesh messaging broadcast ship it --yes".to_string(),
+                        ".mesh messaging broadcast \"--yes\" now".to_string(),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         assert!(err.contains("--yes"), "{line}: {err}");
@@ -23453,7 +23825,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let err = run(
                         &mut ctx,
-                        &format!(".mesh message {hash} --yes please say --yes"),
+                        &format!(".mesh messaging send {hash} --yes please say --yes"),
                     )
                     .await
                     .unwrap_err()
@@ -23532,7 +23904,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
 
-                    let err = run(&mut ctx, ".mesh answer q1 \"yes\"")
+                    let err = run(&mut ctx, ".mesh messaging follow-up q1 \"yes\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23543,7 +23915,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(ctx.app.mesh.correlations().get("q1").is_some());
 
-                    let err = run(&mut ctx, ".mesh answer p1 \"no\"")
+                    let err = run(&mut ctx, ".mesh envoy answer p1 \"no\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23570,7 +23942,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(!out.iter().any(|line| line.contains("Answered")), "{out:?}");
 
-                    let err = run(&mut ctx, ".mesh message q1 --yes hi")
+                    let err = run(&mut ctx, ".mesh messaging send q1 --yes hi")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23659,7 +24031,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // With text: the block, then the notice, then the send.
                     let script = prompt_script::install_text(&[]);
-                    let err = run(&mut ctx, ".mesh answer p1 \"no\"")
+                    let err = run(&mut ctx, ".mesh envoy answer p1 \"no\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23684,7 +24056,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // No text, a terminal: the typed answer, trimmed, goes out.
                     let script = prompt_script::install_text(&[Some("  no  ")]);
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, ".mesh answer p1")
+                    let err = run(&mut ctx, ".mesh envoy answer p1")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23703,8 +24075,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // this node's own question gets the same treatment.
                     let script = prompt_script::install_text(&[None, Some("   ")]);
                     let before = stdout_lines().len();
-                    run(&mut ctx, ".mesh answer q1").await.unwrap();
-                    run(&mut ctx, ".mesh answer p1").await.unwrap();
+                    run(&mut ctx, ".mesh messaging follow-up q1").await.unwrap();
+                    run(&mut ctx, ".mesh envoy answer p1").await.unwrap();
                     assert_eq!(prompt_script::prompts_asked(), 2);
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
@@ -23740,7 +24112,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // block and before any send.
                     let _script = prompt_script::install_non_interactive();
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, ".mesh answer q1")
+                    let err = run(&mut ctx, ".mesh messaging follow-up q1")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23835,7 +24207,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // check), never the empty quotes.
                     let script = prompt_script::install_text(&[Some("  yes  ")]);
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, ".mesh answer p1 \"\"")
+                    let err = run(&mut ctx, ".mesh envoy answer p1 \"\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23854,7 +24226,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // with the full id, no notice, the question still open.
                     let script = prompt_script::install_text(&[Some("")]);
                     let before = stdout_lines().len();
-                    run(&mut ctx, ".mesh answer q1 \"   \"").await.unwrap();
+                    run(&mut ctx, ".mesh messaging follow-up q1 \"   \"")
+                        .await
+                        .unwrap();
                     assert_eq!(prompt_script::prompts_asked(), 1, "the prompt opened once");
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
@@ -23875,7 +24249,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // before any send; the question stays filed.
                     let _script = prompt_script::install_non_interactive();
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, ".mesh answer p1 \"\"")
+                    let err = run(&mut ctx, ".mesh envoy answer p1 \"\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -23972,7 +24346,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Only an access row: both question sections read `none`, the access
                     // entry is the only one, and nothing peer-supplied but the id shows.
-                    run(&mut ctx, ".mesh pending").await.unwrap();
+                    pending_out(&mut ctx, ".").await.unwrap();
                     let text = stdout_lines().join("\n");
                     let out: Vec<&str> = text.lines().collect();
                     assert!(
@@ -24007,7 +24381,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     // Answering the access id: teaching error, nothing sent, still filed.
-                    let err = run(&mut ctx, ".mesh answer acc-1 \"yes\"")
+                    let err = run(&mut ctx, ".mesh envoy answer acc-1 \"yes\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24035,7 +24409,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // block is printed or any prompt asked, and a question under another id
                     // still routes as a question.
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, ".mesh answer acc-1")
+                    let err = run(&mut ctx, ".mesh envoy answer acc-1")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24063,7 +24437,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             now,
                         )
                         .unwrap();
-                    let err = run(&mut ctx, ".mesh answer p1 \"no\"")
+                    let err = run(&mut ctx, ".mesh envoy answer p1 \"no\"")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24175,7 +24549,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .trust_destination(slot, &trusted, TrustOptions::default(), now)
                         .unwrap();
 
-                    let err = run(&mut ctx, &format!(".mesh status {trusted}"))
+                    let err = run(&mut ctx, &format!(".mesh people status {trusted}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24227,7 +24601,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .unwrap();
 
                             let err =
-                                refusal(&mut ctx, &format!(".mesh status {destination}")).await;
+                                refusal(&mut ctx, &format!(".mesh people status {destination}"))
+                                    .await;
 
                             assert!(err.contains("could not be reached"), "{err}");
                             assert_eq!(err.contains(hint), says_left, "{err}");
@@ -24285,7 +24660,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let err = run(
                         &mut ctx,
-                        &format!(".mesh request {trusted} docs/a.md --yes"),
+                        &format!(".mesh files request {trusted} docs/a.md --yes"),
                     )
                     .await
                     .unwrap_err()
@@ -24363,7 +24738,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let asked = std::time::Instant::now();
                     run(
                         &mut ctx,
-                        &format!(".mesh request {trusted} docs/a.md --yes"),
+                        &format!(".mesh files request {trusted} docs/a.md --yes"),
                     )
                     .await
                     .unwrap_err();
@@ -24416,7 +24791,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     pair.recorder_b
                         .queue(Script::Reply(Reply::Code(RefusalCode::NoAccess)));
 
-                    let err = run(&mut ctx, &format!(".mesh status {b_hex}"))
+                    let err = run(&mut ctx, &format!(".mesh people status {b_hex}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24498,16 +24873,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let press_after = Duration::from_millis(600);
                     let verbs = [
                         (
-                            format!(".mesh status {trusted}"),
+                            format!(".mesh people status {trusted}"),
                             "Status request interrupted.",
                         ),
-                        (format!(".mesh knock {trusted} --yes"), "Knock interrupted."),
                         (
-                            format!(".mesh fetch {trusted} docs/a.md"),
+                            format!(".mesh access ask {trusted} --yes"),
+                            "Knock interrupted.",
+                        ),
+                        (
+                            format!(".mesh files fetch {trusted} docs/a.md"),
                             "Fetch of `docs/a.md` interrupted; nothing was staged.",
                         ),
                         (
-                            format!(".mesh request {trusted} docs/a.md --yes"),
+                            format!(".mesh files request {trusted} docs/a.md --yes"),
                             "Request interrupted; nothing was sent.",
                         ),
                     ];
@@ -24625,7 +25003,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (&denied, "blocked (instance)"),
                         (&blocked, "blocked (identity)"),
                     ] {
-                        let err = run(&mut ctx, &format!(".mesh status {destination}"))
+                        let err = run(&mut ctx, &format!(".mesh people status {destination}"))
                             .await
                             .unwrap_err()
                             .to_string();
@@ -24635,7 +25013,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                     }
                     assert!(
-                        run(&mut ctx, &format!(".mesh status {deny_only}"))
+                        run(&mut ctx, &format!(".mesh people status {deny_only}"))
                             .await
                             .is_err(),
                         "an unheard denied destination is never fetched"
@@ -24646,7 +25024,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "no status link may be opened toward a refused destination: {out:?}"
                     );
 
-                    run(&mut ctx, ".mesh peers").await.unwrap();
+                    run(&mut ctx, ".mesh people list").await.unwrap();
                     let out = stdout_lines();
                     let row = |destination: &str| {
                         out.iter()
@@ -24718,7 +25096,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
                     std::fs::write(&cache_path, "{this is not a knock record\n").unwrap();
 
-                    run(&mut ctx, &format!(".mesh info {known}")).await.unwrap();
+                    run(&mut ctx, &format!(".mesh people info {known}"))
+                        .await
+                        .unwrap();
                     let out = stdout_lines();
                     assert!(out.iter().any(|line| line.contains("Kay")), "{out:?}");
                     assert!(out.iter().any(|line| line.contains(&known)), "{out:?}");
@@ -24734,7 +25114,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let unknown = hex_lower(&[0x6b; 16]);
                     assert!(
-                        run(&mut ctx, &format!(".mesh info {unknown}"))
+                        run(&mut ctx, &format!(".mesh people info {unknown}"))
                             .await
                             .is_err(),
                         "nothing known must be an error"
@@ -24743,7 +25123,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         !stdout_lines().iter().any(|line| line.contains(&unknown)),
                         "an unknown destination renders no detail"
                     );
-                    let err = run(&mut ctx, ".mesh knocks").await.unwrap_err().to_string();
+                    let err = run(&mut ctx, ".mesh access requests")
+                        .await
+                        .unwrap_err()
+                        .to_string();
                     assert!(err.contains("knock"), "{err}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -24768,7 +25151,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let unheard = hex_lower(&[0x6c; 16]);
 
-                    let err = run(&mut ctx, &format!(".mesh info {unheard}"))
+                    let err = run(&mut ctx, &format!(".mesh people info {unheard}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24777,7 +25160,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let cache_path = started.runtime.knock_gate().cache().path().to_path_buf();
                     std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
                     std::fs::write(&cache_path, "{this is not a knock record\n").unwrap();
-                    let err = run(&mut ctx, &format!(".mesh info {unheard}"))
+                    let err = run(&mut ctx, &format!(".mesh people info {unheard}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24818,14 +25201,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_ne!(dest8, id8, "the fixture's two hashes must differ early");
 
                     // Lookups: info prints the whole destination it was given eight of.
-                    let out = out_of(&mut ctx, &format!(".mesh info {}", dest8.to_uppercase()))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh people info {}", dest8.to_uppercase()),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains(&destination), "{out}");
                     assert!(out.contains("Tia"), "{out}");
 
                     // Trust mutations: the record lands under the whole hash.
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest8} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest8} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -24842,9 +25228,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // Contact verbs: the gate passes and the path lookup names the whole
                     // destination, which is what would have gone on the wire.
                     for line in [
-                        format!(".mesh knock {dest8} --yes"),
-                        format!(".mesh fetch {dest8} docs/a.md"),
-                        format!(".mesh status {dest8}"),
+                        format!(".mesh access ask {dest8} --yes"),
+                        format!(".mesh files fetch {dest8} docs/a.md"),
+                        format!(".mesh people status {dest8}"),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         assert!(
@@ -24854,7 +25240,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{line}: {err}"
                         );
                     }
-                    let out = out_of(&mut ctx, &format!(".mesh message {dest8} \"hi\""))
+                    let out = out_of(&mut ctx, &format!(".mesh messaging send {dest8} \"hi\""))
                         .await
                         .unwrap();
                     assert!(
@@ -24866,7 +25252,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(out.ends_with("Nothing was sent."), "{out}");
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest8} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest8} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains(short(&destination)), "{out}");
@@ -24880,17 +25266,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     // Identity verbs: block and unblock by the identity's first eight.
-                    out_of(&mut ctx, &format!(".mesh block --identity {id8} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id8} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(runtime.trust().is_blocked_identity(&identity));
-                    out_of(&mut ctx, &format!(".mesh unblock --identity {id8} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access unblock --identity {id8} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(!runtime.trust().is_blocked_identity(&identity));
-                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id8} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id8} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains(short(&identity)), "{out}");
                     assert!(
                         runtime.trust().records().iter().any(|record| {
@@ -24900,7 +25295,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     // `--peer` on the share verbs takes either hash by prefix.
-                    let err = run(&mut ctx, &format!(".mesh shares --peer {id8}"))
+                    let err = run(&mut ctx, &format!(".mesh files list --peer {id8}"))
                         .await
                         .err()
                         .map(|err| err.to_string())
@@ -24934,7 +25329,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             now,
                         );
                     }
-                    let err = run(&mut ctx, &format!(".mesh info {dest8}"))
+                    let err = run(&mut ctx, &format!(".mesh people info {dest8}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24947,13 +25342,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             shown.join("..., ")
                         )
                     );
-                    let out = out_of(&mut ctx, &format!(".mesh info {}", &twin_a[..9]))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {}", &twin_a[..9]))
                         .await
                         .unwrap();
                     assert!(out.contains("Ann") && out.contains(&twin_a), "{out}");
 
                     // Unknown, too short and not hex.
-                    let err = run(&mut ctx, ".mesh info deadbeef")
+                    let err = run(&mut ctx, ".mesh people info deadbeef")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24961,7 +25356,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         err,
                         "Destination deadbeef has not been heard from: no destination this node knows starts with it. Give the whole hash, or check what `.mesh peers` lists."
                     );
-                    let err = run(&mut ctx, &format!(".mesh knock {}", &dest8[..7]))
+                    let err = run(&mut ctx, &format!(".mesh access ask {}", &dest8[..7]))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -24972,7 +25367,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &dest8[..7]
                         )
                     );
-                    let err = run(&mut ctx, ".mesh block --identity nothex00")
+                    let err = run(&mut ctx, ".mesh access block --identity nothex00")
                         .await
                         .unwrap_err()
                         .to_string();
@@ -25034,7 +25429,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                     }
 
-                    run(&mut ctx, &format!(".mesh info {knocker}"))
+                    run(&mut ctx, &format!(".mesh people info {knocker}"))
                         .await
                         .unwrap();
 
@@ -25049,7 +25444,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out:?}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh info {second_instance}"))
+                    let out = out_of(&mut ctx, &format!(".mesh people info {second_instance}"))
                         .await
                         .unwrap();
                     assert!(
@@ -25140,7 +25535,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // (declined) prompt is asked and nothing is sent.
                     let asked_before = prompt_script::prompts_asked();
                     let before = stdout_lines().len();
-                    run(&mut ctx, &format!(".mesh message {trusted} hello"))
+                    run(&mut ctx, &format!(".mesh messaging send {trusted} hello"))
                         .await
                         .unwrap();
                     let out = stdout_lines()[before..].to_vec();
@@ -25164,8 +25559,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (&blocked, "blocked (identity)"),
                     ] {
                         for line in [
-                            format!(".mesh message {destination} hello"),
-                            format!(".mesh message --yes {destination} hello"),
+                            format!(".mesh messaging send {destination} hello"),
+                            format!(".mesh messaging send --yes {destination} hello"),
                         ] {
                             let asked_before = prompt_script::prompts_asked();
                             let before = stdout_lines().len();
@@ -25193,7 +25588,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // refused before the prompt, and never announced as a plain unheard node.
                     let asked_before = prompt_script::prompts_asked();
                     let before = stdout_lines().len();
-                    let result = run(&mut ctx, &format!(".mesh message {deny_only} hello")).await;
+                    let result =
+                        run(&mut ctx, &format!(".mesh messaging send {deny_only} hello")).await;
                     let out = stdout_lines()[before..].to_vec();
                     assert!(
                         result.is_err(),
@@ -25211,10 +25607,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // With consent given up front nothing may leave either, and the
                     // announcement must still not misreport the standing.
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, &format!(".mesh message --yes {deny_only} hello"))
-                        .await
-                        .unwrap_err()
-                        .to_string();
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh messaging send --yes {deny_only} hello"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
                     let out = stdout_lines()[before..].to_vec();
                     assert!(!out.iter().any(|text| text.starts_with("Sent ")), "{out:?}");
                     assert!(
@@ -25276,8 +25675,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         short(&unheard)
                     );
                     for line in [
-                        format!(".mesh message {unheard} hello"),
-                        format!(".mesh message --yes {unheard} hello"),
+                        format!(".mesh messaging send {unheard} hello"),
+                        format!(".mesh messaging send --yes {unheard} hello"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
                         let before = stdout_lines().len();
@@ -25301,8 +25700,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // Heard but untrusted (default-closed): the verdict is not Allow, so the
                     // gate refuses naming the standing before any notice or prompt.
                     for line in [
-                        format!(".mesh message {untrusted} hello"),
-                        format!(".mesh message --yes {untrusted} hello"),
+                        format!(".mesh messaging send {untrusted} hello"),
+                        format!(".mesh messaging send --yes {untrusted} hello"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
                         let before = stdout_lines().len();
@@ -25349,25 +25748,28 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    run(&mut ctx, ".mesh knock").await.unwrap();
+                    run(&mut ctx, ".mesh access ask").await.unwrap();
                     let out = stdout_lines();
                     assert!(
                         out.iter()
-                            .any(|line| line.contains(".mesh knock <destination>")),
+                            .any(|line| line.contains(".mesh access ask <destination>")),
                         "{out:?}"
                     );
 
-                    let err = run(&mut ctx, ".mesh knock nothex")
+                    let err = run(&mut ctx, ".mesh access ask nothex")
                         .await
                         .unwrap_err()
                         .to_string();
                     assert!(err.contains("is not a destination hash"), "{err}");
 
                     let long = "x".repeat(KNOCK_INTRO_MAX_CHARS + 1);
-                    let err = run(&mut ctx, &format!(".mesh knock {heard} --intro \"{long}\""))
-                        .await
-                        .unwrap_err()
-                        .to_string();
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh access ask {heard} --intro \"{long}\""),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
                     assert!(
                         err.contains(&format!(
                             "above the {KNOCK_INTRO_MAX_CHARS}-character limit"
@@ -25378,7 +25780,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // Heard, but its announce never reached the transport: refused after the
                     // consent, before any link is opened.
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, &format!(".mesh knock {heard} --yes"))
+                    let err = run(&mut ctx, &format!(".mesh access ask {heard} --yes"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -25411,9 +25813,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    run(&mut ctx, &format!(".mesh knock {heard} --intro \"hello\""))
-                        .await
-                        .unwrap();
+                    run(
+                        &mut ctx,
+                        &format!(".mesh access ask {heard} --intro \"hello\""),
+                    )
+                    .await
+                    .unwrap();
                     let out = stdout_lines();
                     let notice = index_of(&out, "This knocks on Tia (");
                     assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
@@ -25454,8 +25859,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         short(&unheard)
                     );
                     for line in [
-                        format!(".mesh knock {unheard}"),
-                        format!(".mesh knock {unheard} --yes --intro \"hi\""),
+                        format!(".mesh access ask {unheard}"),
+                        format!(".mesh access ask {unheard} --yes --intro \"hi\""),
                     ] {
                         let before = stdout_lines().len();
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
@@ -25547,15 +25952,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         (&blocked, "blocked (identity)"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
-                        let status_err = run(&mut ctx, &format!(".mesh status {destination}"))
-                            .await
-                            .unwrap_err()
-                            .to_string();
-                        let message_err =
-                            run(&mut ctx, &format!(".mesh message {destination} hello"))
+                        let status_err =
+                            run(&mut ctx, &format!(".mesh people status {destination}"))
                                 .await
                                 .unwrap_err()
                                 .to_string();
+                        let message_err = run(
+                            &mut ctx,
+                            &format!(".mesh messaging send {destination} hello"),
+                        )
+                        .await
+                        .unwrap_err()
+                        .to_string();
                         assert_eq!(
                             classify(&message_err),
                             expected,
@@ -25642,7 +26050,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
 
                     let declined = prompt_script::install(&[false]);
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest}"))
                         .await
                         .unwrap();
                     assert!(out.contains(NOTHING_CHANGED), "{out}");
@@ -25652,9 +26060,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     drop(declined);
 
                     let _script = prompt_script::install(&[true]);
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --label \"Tia box\""))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust {dest} --label \"Tia box\""),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("added"), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
@@ -25665,7 +26076,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         trust.records()
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("updated"), "{out}");
@@ -25691,7 +26102,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
 
@@ -25702,7 +26113,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(out.lines().any(|line| line == expected), "{out}");
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     let expected = format!(
@@ -25712,10 +26123,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(out.lines().any(|line| line == expected), "{out}");
 
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     let expected = format!(
@@ -25756,10 +26170,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(before.is_some());
 
                     for line in [
-                        format!(".mesh trust {dest}"),
-                        format!(".mesh untrust {dest}"),
-                        format!(".mesh block {dest}"),
-                        format!(".mesh block --identity {id}"),
+                        format!(".mesh access trust {dest}"),
+                        format!(".mesh access revoke {dest}"),
+                        format!(".mesh access block {dest}"),
+                        format!(".mesh access block --identity {id}"),
                     ] {
                         let err = refusal(&mut ctx, &line).await;
                         assert!(err.contains("pass --yes to confirm"), "{line}: {err}");
@@ -25767,32 +26181,39 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     assert_eq!(trust_file(&trust), before);
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Untrusted"), "{out}");
                     assert!(!trusted_hashes(&trust).contains(&dest));
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Trusted"), "{out}");
                     assert!(trusted_hashes(&trust).contains(&dest));
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("Blocked"), "{out}");
                     assert!(trust.blocked().iter().any(|record| record.hash == id));
                     assert!(
                         !trusted_hashes(&trust).contains(&dest),
                         "a block removes the identity's instance record"
                     );
-                    let err = refusal(&mut ctx, &format!(".mesh unblock --identity {id}")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access unblock --identity {id}")).await;
                     assert!(err.contains("pass --yes to confirm"), "{err}");
                     assert!(trust.blocked().iter().any(|record| record.hash == id));
                     assert_eq!(prompt_script::prompts_asked(), 0);
-                    let out = out_of(&mut ctx, &format!(".mesh unblock --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access unblock --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("Unblocked"), "{out}");
                     assert!(trust.blocked().is_empty());
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -25815,7 +26236,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (_, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust --identity {id}"))
                         .await
                         .unwrap();
                     assert!(out.contains("every instance"), "{out}");
@@ -25867,7 +26288,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let withdrawn = out_of(
                             &mut ctx,
                             &format!(
-                                ".mesh untrust --identity {own} --confirm untrust-{}",
+                                ".mesh access revoke --identity {own} --confirm untrust-{}",
                                 short(&own)
                             ),
                         )
@@ -25880,9 +26301,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "the start-up grant is gone from trust.yaml"
                         );
 
-                        let first = out_of(&mut ctx, &format!(".mesh trust --identity {own}"))
-                            .await
-                            .unwrap();
+                        let first =
+                            out_of(&mut ctx, &format!(".mesh access trust --identity {own}"))
+                                .await
+                                .unwrap();
                         assert!(first.contains("added"), "{first}");
                         assert!(first.contains(sentence), "{first}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
@@ -25894,9 +26316,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         let before = fs::read(trust.path()).unwrap();
 
-                        let second = out_of(&mut ctx, &format!(".mesh trust --identity {own}"))
-                            .await
-                            .unwrap();
+                        let second =
+                            out_of(&mut ctx, &format!(".mesh access trust --identity {own}"))
+                                .await
+                                .unwrap();
                         assert!(second.contains(sentence), "{second}");
                         assert!(
                             second.contains(
@@ -25925,9 +26348,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         let (_, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                        let out = out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                            .await
-                            .unwrap();
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh access trust --identity {id} --yes"),
+                        )
+                        .await
+                        .unwrap();
                         assert!(out.contains("added"), "{out}");
                         assert!(!out.contains("your own identity"), "{out}");
 
@@ -25963,7 +26389,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(before.is_some());
 
                     let tty = prompt_script::install(&[]);
-                    for line in [".mesh trust --prune", ".mesh trust --prune --dry-run"] {
+                    for line in [
+                        ".mesh access revoke --stale",
+                        ".mesh access revoke --stale --dry-run",
+                    ] {
                         let out = out_of(&mut ctx, line).await.unwrap();
                         assert!(out.contains(&old), "{line}: {out}");
                         assert!(!out.contains(&fresh), "{line}: {out}");
@@ -25980,7 +26409,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     drop(tty);
 
                     let _script = prompt_script::install_non_interactive();
-                    for line in [".mesh trust --prune", ".mesh trust --prune --dry-run"] {
+                    for line in [
+                        ".mesh access revoke --stale",
+                        ".mesh access revoke --stale --dry-run",
+                    ] {
                         let out = out_of(&mut ctx, line).await.unwrap();
                         assert!(out.contains(&old), "{line}: {out}");
                         assert!(out.contains("This was a dry run"), "{line}: {out}");
@@ -25988,15 +26420,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(trust_file(&trust), before, "{line}");
                     }
 
-                    let err = refusal(&mut ctx, ".mesh trust --prune --confirm prune-2").await;
+                    let err =
+                        refusal(&mut ctx, ".mesh access revoke --stale --confirm prune-2").await;
                     assert!(err.contains("has changed since the dry run"), "{err}");
-                    let err = refusal(&mut ctx, ".mesh trust --prune --yes").await;
+                    let err = refusal(&mut ctx, ".mesh access revoke --stale --yes").await;
                     assert!(err.contains("--confirm prune-<N>"), "{err}");
-                    let err = refusal(&mut ctx, ".mesh trust --prune --confirm bogus").await;
+                    let err =
+                        refusal(&mut ctx, ".mesh access revoke --stale --confirm bogus").await;
                     assert!(err.contains("prune-<N>"), "{err}");
                     assert_eq!(trust_file(&trust), before);
 
-                    let out = out_of(&mut ctx, ".mesh trust --prune --confirm prune-1")
+                    let out = out_of(&mut ctx, ".mesh access revoke --stale --confirm prune-1")
                         .await
                         .unwrap();
                     assert!(out.contains("Removed 1"), "{out}");
@@ -26005,7 +26439,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(!hashes.contains(&old), "{hashes:?}");
                     assert!(hashes.contains(&fresh), "{hashes:?}");
 
-                    let out = out_of(&mut ctx, ".mesh trust --prune --older-than 1m")
+                    let out = out_of(&mut ctx, ".mesh access revoke --stale --older-than 1m")
                         .await
                         .unwrap();
                     assert!(out.contains("nothing to prune"), "{out}");
@@ -26048,7 +26482,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let before = trust_file(&trust);
 
-                    let out = out_of(&mut ctx, ".mesh trust --prune").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh access revoke --stale")
+                        .await
+                        .unwrap();
 
                     let marked_row = out
                         .lines()
@@ -26072,7 +26508,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust_file(&trust), before);
 
-                    let out = out_of(&mut ctx, ".mesh trust --prune --confirm prune-1")
+                    let out = out_of(&mut ctx, ".mesh access revoke --stale --confirm prune-1")
                         .await
                         .unwrap();
                     assert!(out.contains("Removed 1"), "{out}");
@@ -26109,15 +26545,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
                     let dest = heard_trusted_peer(&started.runtime, slot);
                     let id = identity_of(&trust, &dest);
-                    run(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    run(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     let token = format!("untrust-{}", short(&id));
 
                     for line in [
-                        format!(".mesh untrust --identity {id}"),
-                        format!(".mesh untrust --identity {id} --dry-run"),
+                        format!(".mesh access revoke --identity {id}"),
+                        format!(".mesh access revoke --identity {id} --dry-run"),
                     ] {
                         let out = out_of(&mut ctx, &line).await.unwrap();
                         let lines: Vec<&str> = out.lines().collect();
@@ -26145,18 +26584,21 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     }
                     let err = refusal(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id} --confirm untrust-nope"),
+                        &format!(".mesh access revoke --identity {id} --confirm untrust-nope"),
                     )
                     .await;
                     assert!(err.contains(&token), "{err}");
-                    let err =
-                        refusal(&mut ctx, &format!(".mesh untrust --identity {id} --yes")).await;
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh access revoke --identity {id} --yes"),
+                    )
+                    .await;
                     assert!(err.contains("--confirm untrust-"), "{err}");
                     assert_eq!(trust_file(&trust), before);
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -26180,14 +26622,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the identity is known through its instance, granting nothing"
                     );
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
-                    let err = refusal(&mut ctx, &format!(".mesh untrust --identity {id}")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access revoke --identity {id}")).await;
                     assert!(err.contains("holds no grant for all destinations"), "{err}");
 
                     let unknown = hex_lower(&[0x5b; 16]);
-                    let err =
-                        refusal(&mut ctx, &format!(".mesh untrust --identity {unknown}")).await;
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh access revoke --identity {unknown}"),
+                    )
+                    .await;
                     assert!(err.contains("nothing to untrust"), "{err}");
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Untrusted"), "{out}");
@@ -26197,7 +26643,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         hashes.contains(&id),
                         "the binding-only record is left for untrust --identity to take: {hashes:?}"
                     );
-                    let dry = out_of(&mut ctx, &format!(".mesh untrust --identity {id}"))
+                    let dry = out_of(&mut ctx, &format!(".mesh access revoke --identity {id}"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -26214,7 +26660,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -26271,14 +26717,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("added"), "{out}");
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
 
                     let (other, _, _) = announced_peer();
-                    let err = refusal(&mut ctx, &format!(".mesh trust {other} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access trust {other} --yes")).await;
                     assert_eq!(err, unanswered_path_request(&other));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -26301,11 +26747,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
 
                     for flag in ["", " --yes"] {
-                        let err =
-                            refusal(&mut ctx, &format!(".mesh block --identity nothex{flag}"))
-                                .await;
+                        let err = refusal(
+                            &mut ctx,
+                            &format!(".mesh access block --identity nothex{flag}"),
+                        )
+                        .await;
                         assert!(err.contains("is not an identity hash"), "{err}");
-                        for verb in ["untrust", "block"] {
+                        for verb in ["access revoke", "access block"] {
                             let err =
                                 refusal(&mut ctx, &format!(".mesh {verb} nothex{flag}")).await;
                             assert!(err.contains("is not a destination hash"), "{verb}: {err}");
@@ -26340,14 +26788,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for (verb, noun) in [
                         ("trust", "<destination>"),
-                        ("untrust", "<destination>"),
+                        ("revoke", "<destination>"),
                         ("forget", "--identity <identity>"),
                         ("block", "<destination>"),
                         ("unblock", "<destination>"),
                     ] {
-                        let out = out_of(&mut ctx, &format!(".mesh {verb}")).await.unwrap();
+                        let out = out_of(&mut ctx, &format!(".mesh access {verb}"))
+                            .await
+                            .unwrap();
                         assert!(
-                            out.contains(&format!(".mesh {verb} {noun}")),
+                            out.contains(&format!(".mesh access {verb} {noun}")),
                             "{verb}: {out}"
                         );
                         assert!(
@@ -26355,17 +26805,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{verb}: help is never an action: {out}"
                         );
                     }
-                    let untrust_help = out_of(&mut ctx, ".mesh untrust").await.unwrap();
+                    let untrust_help = out_of(&mut ctx, ".mesh access revoke").await.unwrap();
                     assert!(
                         untrust_help.contains("Stop serving one trusted instance"),
                         "{untrust_help}"
                     );
-                    let block_help = out_of(&mut ctx, ".mesh block").await.unwrap();
+                    let block_help = out_of(&mut ctx, ".mesh access block").await.unwrap();
                     assert!(
                         block_help.contains("`untrust` only stops serving"),
                         "{block_help}"
                     );
-                    let forget_help = out_of(&mut ctx, ".mesh forget").await.unwrap();
+                    let forget_help = out_of(&mut ctx, ".mesh access forget").await.unwrap();
                     assert!(forget_help.contains("Erase everything"), "{forget_help}");
 
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -26398,7 +26848,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
 
                     let declined = prompt_script::install(&[false]);
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest}"))
                         .await
                         .unwrap();
                     assert!(out.contains(NOTHING_CHANGED), "{out}");
@@ -26408,7 +26858,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     drop(declined);
 
                     let _script = prompt_script::install(&[true]);
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest}"))
                         .await
                         .unwrap();
                     assert!(out.contains("Untrusted"), "{out}");
@@ -26461,17 +26911,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     let sibling = hex_lower(&[0x5c; 16]);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     assert!(before.is_some());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
 
                     let declined = prompt_script::install(&[false, false]);
                     for line in [
-                        format!(".mesh block {dest}"),
-                        format!(".mesh block --identity {id}"),
+                        format!(".mesh access block {dest}"),
+                        format!(".mesh access block --identity {id}"),
                     ] {
                         let out = out_of(&mut ctx, &line).await.unwrap();
                         assert!(out.contains(NOTHING_CHANGED), "{line}: {out}");
@@ -26482,7 +26935,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     drop(declined);
 
                     let _script = prompt_script::install(&[]);
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access revoke {dest} --yes")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -26498,7 +26951,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains(&format!("Blocked {}", short(&dest))), "{out}");
@@ -26511,9 +26964,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "block of a destination stops one instance, not the identity"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -26528,9 +26984,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust.authorize(&id, &sibling).rule, Rule::IdentityBlocked);
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access unblock --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("Unblocked"), "{out}");
                     assert_eq!(
                         trust.authorize(&id, &dest).rule,
@@ -26538,7 +26997,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "unblocking the identity does not lift the destination's deny"
                     );
                     assert_eq!(trust.authorize(&id, &sibling).rule, Rule::DefaultClosed);
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -26570,10 +27029,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {dest} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {dest} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -26586,7 +27045,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(row.identity, None, "a block binds no record");
                     let before = trust_file(&trust);
 
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access revoke {dest} --yes")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -26623,18 +27082,24 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let clause = "instance(s) of this identity stay blocked; .mesh unblock <destination> lifts each.";
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(!out.contains("stay blocked"), "{out}");
-                    out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let preview = out.lines().next().unwrap();
                     assert!(preview.starts_with("This trusts identity"), "{out}");
                     assert!(preview.ends_with(&format!(" 1 {clause}")), "{preview}");
@@ -26664,14 +27129,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     assert!(before.is_some());
 
                     let printed = stdout_lines().len();
-                    let err = refusal(&mut ctx, &format!(".mesh block {dest}")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access block {dest}")).await;
                     assert!(err.contains("--yes"), "{err}");
                     assert_eq!(
                         stdout_lines()[printed..],
@@ -26708,13 +27176,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     assert!(before.is_some());
 
-                    out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     let lines = stdout_lines();
@@ -26756,9 +27227,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     assert!(before.is_some());
 
@@ -26769,7 +27243,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let printed = stdout_lines().len();
                     for flag in ["--dry-run", "--yes"] {
-                        let err = refusal(&mut ctx, &format!(".mesh untrust {dest} {flag}")).await;
+                        let err =
+                            refusal(&mut ctx, &format!(".mesh access revoke {dest} {flag}")).await;
                         assert_eq!(err, sentence, "{flag}");
                     }
                     assert_eq!(
@@ -26804,7 +27279,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
                     assert!(before.is_some());
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --dry-run"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --dry-run"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -26840,16 +27315,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
-                    out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     let before = trust_file(&trust);
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest}"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -26863,7 +27341,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust_file(&trust), before);
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("This also lifts the refusal on it."), "{out}");
@@ -26897,7 +27375,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let dest = heard_trusted_peer(&started.runtime, slot);
                     let id = identity_of(&trust, &dest);
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("This untrusts instance"), "{out}");
@@ -26934,17 +27412,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
-                    out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     let before = trust_file(&trust);
 
                     for flag in ["", " --yes"] {
-                        let out = out_of(&mut ctx, &format!(".mesh block {dest}{flag}"))
+                        let out = out_of(&mut ctx, &format!(".mesh access block {dest}{flag}"))
                             .await
                             .unwrap();
                         assert_eq!(
@@ -26983,18 +27464,24 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         short(&dest)
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes --note first"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block {dest} --yes --note first"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(out, lines);
                     let first = trust.denied();
                     assert_eq!(first.len(), 1);
                     assert_eq!(first[0].hash, dest);
                     assert_eq!(first[0].note.as_deref(), Some("first"));
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes --note second"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block {dest} --yes --note second"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(out, lines);
                     let noted = trust.denied();
                     assert_eq!(noted.len(), 1);
@@ -27006,7 +27493,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let before = trust_file(&trust);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -27052,14 +27539,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (blocked, blocked_id) = heard_peer(&started.runtime, "Dee", now);
                     let unheard = hex_lower(&[0x5d; 16]);
                     for line in [
-                        format!(".mesh trust --identity {granted_id} --yes"),
-                        format!(".mesh block {granted} --yes"),
-                        format!(".mesh trust {own} --yes"),
-                        format!(".mesh block {bare} --yes"),
-                        format!(".mesh trust {blocked} --yes"),
-                        format!(".mesh block {blocked} --yes"),
-                        format!(".mesh block --identity {blocked_id} --yes"),
-                        format!(".mesh block {unheard} --yes"),
+                        format!(".mesh access trust --identity {granted_id} --yes"),
+                        format!(".mesh access block {granted} --yes"),
+                        format!(".mesh access trust {own} --yes"),
+                        format!(".mesh access block {bare} --yes"),
+                        format!(".mesh access trust {blocked} --yes"),
+                        format!(".mesh access block {blocked} --yes"),
+                        format!(".mesh access block --identity {blocked_id} --yes"),
+                        format!(".mesh access block {unheard} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -27073,7 +27560,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         trust.denied().iter().any(|record| record.hash == dest)
                     };
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock {granted} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access unblock {granted} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -27092,7 +27579,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         Rule::IdentityTrusted
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock {own} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access unblock {own} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -27109,7 +27596,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         Rule::DestinationTrusted
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock {bare} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access unblock {bare} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -27122,7 +27609,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust.authorize(&bare_id, &bare).rule, Rule::DefaultClosed);
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock {blocked} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access unblock {blocked} --yes"))
                         .await
                         .unwrap();
                     let standing = format!(
@@ -27142,7 +27629,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         trust.authorize(&blocked_id, &blocked).rule,
                         Rule::IdentityBlocked
                     );
-                    let err = refusal(&mut ctx, &format!(".mesh unblock {blocked}")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access unblock {blocked}")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -27151,7 +27638,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock {unheard} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access unblock {unheard} --yes"))
                         .await
                         .unwrap();
                     let standing = format!(
@@ -27192,17 +27679,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
                     assert!(trust.is_blocked_identity(&id));
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityBlocked);
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access unblock --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -27221,9 +27711,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(before.is_some());
                     let printed = stdout_lines().len();
                     for flag in ["", " --yes"] {
-                        let err =
-                            refusal(&mut ctx, &format!(".mesh unblock --identity {id}{flag}"))
-                                .await;
+                        let err = refusal(
+                            &mut ctx,
+                            &format!(".mesh access unblock --identity {id}{flag}"),
+                        )
+                        .await;
                         assert_eq!(
                             err,
                             format!(
@@ -27258,8 +27750,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -27269,7 +27761,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(before.is_some());
 
                     let printed = stdout_lines().len();
-                    let err = refusal(&mut ctx, &format!(".mesh untrust --identity {id}")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access revoke --identity {id}")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -27281,9 +27774,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust_file(&trust), before);
                     assert!(trust.is_blocked_identity(&id));
 
-                    let out = out_of(&mut ctx, &format!(".mesh unblock --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access unblock --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.starts_with("This lifts the block on identity"), "{out}");
                     assert!(!trust.is_blocked_identity(&id));
                     let others = records_of_others(&started.runtime);
@@ -27322,7 +27818,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for dest in [&trusted, &heard] {
                         for flag in ["", " --yes"] {
                             let err =
-                                refusal(&mut ctx, &format!(".mesh unblock {dest}{flag}")).await;
+                                refusal(&mut ctx, &format!(".mesh access unblock {dest}{flag}"))
+                                    .await;
                             assert_eq!(
                                 err,
                                 format!(
@@ -27363,8 +27860,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let printed = stdout_lines().len();
                     for flag in ["", " --dry-run", &format!(" --confirm {token}")] {
-                        let err =
-                            refusal(&mut ctx, &format!(".mesh forget --identity {id}{flag}")).await;
+                        let err = refusal(
+                            &mut ctx,
+                            &format!(".mesh access forget --identity {id}{flag}"),
+                        )
+                        .await;
                         assert_eq!(
                             err,
                             format!(
@@ -27416,16 +27916,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
                     let rows = |ctx: &RequestContext| -> Vec<String> {
-                        ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                        ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
                             .into_iter()
                             .map(|(value, _)| value)
                             .collect()
                     };
 
                     memory.remember_reference(&dest, &id, "0123456789abcdef", "docs/a.md");
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -27436,9 +27939,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     memory.remember_grant(&dest, &id, "docs/b.md", None);
                     assert_eq!(rows(&ctx), ["docs/a.md", "docs/b.md", "--if-sha256 "]);
 
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -27454,7 +27960,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -27475,7 +27981,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "nothing is offered for that instance any more"
                     );
 
-                    let err = refusal(&mut ctx, &format!(".mesh forget --identity {id}")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access forget --identity {id}")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -27517,7 +28024,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let token = format!("forget-{}", short(&id));
                     let rows = |ctx: &RequestContext| -> Vec<String> {
-                        ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                        ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
                             .into_iter()
                             .map(|(value, _)| value)
                             .collect()
@@ -27585,9 +28092,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ["--if-sha256 "],
                         "a request still open is no grant"
                     );
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -27598,7 +28108,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -27642,18 +28152,24 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let lines = format!(
                         "This blocks identity {}: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed.\nBlocked {}.",
                         short(&id),
                         short(&id)
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(out, lines);
                     assert!(trust.is_blocked_identity(&id));
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityBlocked);
@@ -27664,9 +28180,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
                     assert!(before.is_some());
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -27679,7 +28198,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh block --identity {id} --yes --note quiet"),
+                        &format!(".mesh access block --identity {id} --yes --note quiet"),
                     )
                     .await
                     .unwrap();
@@ -27720,13 +28239,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     let stranger = hex_lower(&[0x6e; 16]);
-                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(identity_of(&trust, &dest), id);
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -27749,7 +28268,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(row.identity, None, "the record is gone");
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {stranger} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {stranger} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -27815,9 +28334,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
 
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     knock(&dest, &id, String::new());
                     knock(&dest, &id, String::new());
                     assert_eq!(knocks_of(&id), 2);
@@ -27832,9 +28354,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let bystander_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
                     memory.remember_grant(bystander_dest, bystander_id, "docs/a.md", None);
 
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -27851,7 +28376,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -27894,7 +28419,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {knocker_id} --dry-run"),
+                        &format!(".mesh access forget --identity {knocker_id} --dry-run"),
                     )
                     .await
                     .unwrap();
@@ -27908,7 +28433,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {knocker_id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {knocker_id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -27926,8 +28451,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         before,
                         "knocks alone leave the trust file as it was"
                     );
-                    let err =
-                        refusal(&mut ctx, &format!(".mesh forget --identity {knocker_id}")).await;
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {knocker_id}"),
+                    )
+                    .await;
                     assert!(err.contains("is a stranger already"), "{err}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -27982,7 +28510,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{admissions:?}"
                     );
 
-                    let out = out_of(&mut ctx, ".mesh knocks").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh access requests").await.unwrap();
 
                     assert!(
                         out.contains("3 knock(s). Names and intros are peer-supplied text."),
@@ -28029,11 +28557,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {dest} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
-                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {dest} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -28049,14 +28577,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     let before = trust_file(&trust);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
                         out,
                         format!("{} is already blocked.\n{NOTHING_CHANGED}", short(&dest))
                     );
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --dry-run")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access revoke {dest} --dry-run")).await;
                     assert!(
                         err.contains(&format!(
                             "To stop serving just this instance, run .mesh block {dest}."
@@ -28092,7 +28621,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let id = identity_of(&trust, &dest);
                     let before = trust_file(&trust);
 
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access forget --identity {id}"))
                         .await
                         .unwrap();
                     let last = out.lines().last().unwrap();
@@ -28105,14 +28634,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust_file(&trust), before);
 
-                    let err = refusal(&mut ctx, ".mesh forget --prune").await;
+                    let err = refusal(&mut ctx, ".mesh access forget --prune").await;
                     assert!(
-                        err.starts_with("Unexpected '--prune'. Usage: .mesh forget"),
+                        err.starts_with("Unexpected '--prune'. Usage: .mesh access forget"),
                         "{err}"
                     );
                     assert_eq!(trust_file(&trust), before);
 
-                    let err = refusal(&mut ctx, &format!(".mesh forget {dest} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access forget {dest} --yes")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -28125,7 +28654,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh forget --identity {id} --confirm forget-{}",
+                            ".mesh access forget --identity {id} --confirm forget-{}",
                             short(&id)
                         ),
                     )
@@ -28218,7 +28747,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .is_some()
                     };
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest_b} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -28233,19 +28762,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("forget-{}", short(&id_a));
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id_a} --dry-run"),
+                        &format!(".mesh access forget --identity {id_a} --dry-run"),
                     )
                     .await
                     .unwrap();
                     assert!(out.contains("This was a dry run"), "{out}");
-                    let err =
-                        refusal(&mut ctx, &format!(".mesh forget --identity {id_a} --yes")).await;
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id_a} --yes"),
+                    )
+                    .await;
                     assert!(err.contains("--confirm forget-"), "{err}");
                     assert!(held(&id_a, "a-first") && held(&id_a, "a-second"));
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -28279,9 +28811,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(held(&id_b, "b-first") && held(&id_c, "c-first"));
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_c} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_c} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains(&format!("Blocked {}", short(&id_c))), "{out}");
                     assert!(
                         !held(&id_c, "c-first"),
@@ -28341,7 +28876,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
                     let token = format!("forget-{}", short(&id));
 
-                    let dry = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
+                    let dry = out_of(&mut ctx, &format!(".mesh access forget --identity {id}"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -28364,7 +28899,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -28388,7 +28923,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust_file(&trust), before, "nothing was written");
 
-                    let err = refusal(&mut ctx, &format!(".mesh forget --identity {id}")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access forget --identity {id}")).await;
                     assert!(err.contains("is a stranger already"), "{err}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -28427,7 +28963,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
                     let token = format!("forget-{}", short(&id));
 
-                    let dry = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
+                    let dry = out_of(&mut ctx, &format!(".mesh access forget --identity {id}"))
                         .await
                         .unwrap();
 
@@ -28535,7 +29071,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         !held(&served, identity, thread) && !held(&unserved, identity, thread)
                     };
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest_b} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Untrusted"), "{out}");
@@ -28547,7 +29083,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("forget-{}", short(&id_a));
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -28558,9 +29094,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(both_hold(&id_b, "b-first") && both_hold(&id_c, "c-first"));
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_c} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_c} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("Blocked"), "{out}");
                     assert!(
                         neither_holds(&id_c, "c-first"),
@@ -28569,9 +29108,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(both_hold(&id_b, "b-first"));
 
                     // Revoking again finds nothing to forget and is not an error.
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_a} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_a} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("Blocked"), "{out}");
                     assert!(neither_holds(&id_a, "a-first"));
                     assert_eq!(served.stats().unwrap(), (1, 1));
@@ -28678,7 +29220,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .count()
                     };
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest_b} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Untrusted"), "{out}");
@@ -28691,7 +29233,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("untrust-{}", short(&id_a));
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -28709,7 +29251,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("forget-{}", short(&id_a));
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -28722,9 +29264,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(holders(&id_b, "b-first"), 2);
                     assert_eq!(holders(&id_c, "c-first"), 2);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_c} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_c} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("Blocked"), "{out}");
                     assert_eq!(
                         holders(&id_c, "c-first"),
@@ -28829,8 +29374,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(remembered_of(&id_a), 3);
 
                     for line in [
-                        format!(".mesh untrust {dest_a} --dry-run"),
-                        format!(".mesh untrust {dest_a} --yes"),
+                        format!(".mesh access revoke {dest_a} --dry-run"),
+                        format!(".mesh access revoke {dest_a} --yes"),
                     ] {
                         let out = out_of(&mut ctx, &line).await.unwrap();
                         assert!(!out.contains("envoy"), "{line}: {out}");
@@ -28855,7 +29400,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let token = format!("untrust-{}", short(&id_a));
                     let untrust_dry_run =
-                        out_of(&mut ctx, &format!(".mesh untrust --identity {id_a}"))
+                        out_of(&mut ctx, &format!(".mesh access revoke --identity {id_a}"))
                             .await
                             .unwrap();
                     assert!(
@@ -28872,7 +29417,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(remembered_of(&id_a), 3, "the dry run forgets nothing");
 
                     let forget_dry_run =
-                        out_of(&mut ctx, &format!(".mesh forget --identity {id_a}"))
+                        out_of(&mut ctx, &format!(".mesh access forget --identity {id_a}"))
                             .await
                             .unwrap();
                     assert!(
@@ -28893,7 +29438,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -28913,7 +29458,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh forget --identity {id_a} --confirm forget-{}",
+                            ".mesh access forget --identity {id_a} --confirm forget-{}",
                             short(&id_a)
                         ),
                     )
@@ -28928,9 +29473,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(remembered_of(&id_a), 0);
                     assert_eq!(remembered_of(&id_b), 1, "another identity's thread stays");
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_b} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_b} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(
                         out.lines().next().unwrap().ends_with(
                             ", identity and instances alike, is removed, and the 1 envoy conversation remembered of it is forgotten."
@@ -28956,9 +29504,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
                     for line in [
-                        format!(".mesh forget --identity {id_c}"),
-                        format!(".mesh block --identity {id_c} --yes"),
-                        format!(".mesh block --identity {id_a} --yes"),
+                        format!(".mesh access forget --identity {id_c}"),
+                        format!(".mesh access block --identity {id_c} --yes"),
+                        format!(".mesh access block --identity {id_a} --yes"),
                     ] {
                         let out = out_of(&mut ctx, &line).await.unwrap();
                         assert!(!out.contains("envoy"), "{line}: {out}");
@@ -29064,7 +29612,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("forget-{}", short(&id_a));
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -29092,7 +29640,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     // The remedy, now that the store can be written, clears what was kept.
-                    let out = out_of(&mut ctx, &format!(".mesh memory forget {id_a} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh envoy memory forget {id_a} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -29160,11 +29708,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // and no failure.
                     let untrust_token = format!("untrust-{}", short(&id_a));
                     for line in [
-                        format!(".mesh untrust {dest_b} --dry-run"),
-                        format!(".mesh untrust {dest_b} --yes"),
-                        format!(".mesh block {dest_b} --yes"),
-                        format!(".mesh untrust --identity {id_a}"),
-                        format!(".mesh untrust --identity {id_a} --confirm {untrust_token}"),
+                        format!(".mesh access revoke {dest_b} --dry-run"),
+                        format!(".mesh access revoke {dest_b} --yes"),
+                        format!(".mesh access block {dest_b} --yes"),
+                        format!(".mesh access revoke --identity {id_a}"),
+                        format!(".mesh access revoke --identity {id_a} --confirm {untrust_token}"),
                     ] {
                         let out = out_of(&mut ctx, &line).await.unwrap();
                         assert!(!out.contains("envoy"), "{line}: {out}");
@@ -29174,7 +29722,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // The forget dry run and the block intro: the count is unreadable,
                     // the sweep is promised all the same.
                     let token = format!("forget-{}", short(&id_a));
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id_a}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access forget --identity {id_a}"))
                         .await
                         .unwrap();
                     assert!(
@@ -29196,7 +29744,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -29208,9 +29756,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the remedy names the verb: {out}"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_b} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_b} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let intro = out.lines().next().unwrap_or_default();
                     assert!(intro.starts_with("This blocks identity"), "{out}");
                     assert!(
@@ -29317,9 +29868,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // mention.
                     let token = format!("untrust-{}", short(&id_a));
                     for line in [
-                        format!(".mesh untrust {dest_b} --dry-run"),
-                        format!(".mesh untrust {dest_b} --yes"),
-                        format!(".mesh untrust --identity {id_a}"),
+                        format!(".mesh access revoke {dest_b} --dry-run"),
+                        format!(".mesh access revoke {dest_b} --yes"),
+                        format!(".mesh access revoke --identity {id_a}"),
                     ] {
                         let out = out_of(&mut ctx, &line).await.unwrap();
                         assert!(!out.contains("envoy"), "{line}: {out}");
@@ -29331,7 +29882,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // is the token sentence alone.
                     let err = refusal(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id_a} --confirm nope"),
+                        &format!(".mesh access revoke --identity {id_a} --confirm nope"),
                     )
                     .await;
                     assert!(
@@ -29344,7 +29895,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // The forget dry run: the count that could be read, then the store
                     // that could not, each on its own row.
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id_a}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access forget --identity {id_a}"))
                         .await
                         .unwrap();
                     let lines: Vec<&str> = out.lines().collect();
@@ -29369,7 +29920,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // on the same line, after what was forgotten.
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id_a} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -29385,7 +29936,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh forget --identity {id_a} --confirm forget-{}",
+                            ".mesh access forget --identity {id_a} --confirm forget-{}",
                             short(&id_a)
                         ),
                     )
@@ -29409,9 +29960,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // `block` of an identity nothing is remembered of: the intro still
                     // names the store, and so does the line after the write, on its own.
-                    let out = out_of(&mut ctx, &format!(".mesh block --identity {id_b} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access block --identity {id_b} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let intro = out.lines().next().unwrap_or_default();
                     assert!(intro.starts_with("This blocks identity"), "{out}");
                     assert!(intro.ends_with(&format!("is removed. {clause}.")), "{out}");
@@ -29428,7 +29982,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     untouched("block leaves a store it cannot read");
 
                     // The remedy the verbs named is the one that reaches it.
-                    let out = out_of(&mut ctx, ".mesh memory forget all --yes")
+                    let out = out_of(&mut ctx, ".mesh envoy memory forget all --yes")
                         .await
                         .unwrap();
                     assert!(
@@ -29458,9 +30012,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(
                         !trust
                             .records()
@@ -29469,7 +30026,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the instance is known from the peer table alone"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -29515,9 +30072,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     assert!(before.is_some());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
@@ -29527,8 +30087,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         short(&dest)
                     );
                     for (expected, line) in [
-                        (deny_teaching.clone(), format!(".mesh deny {dest}")),
-                        (deny_teaching.clone(), format!(".mesh deny {dest} --yes")),
+                        (deny_teaching.clone(), format!(".mesh files deny {dest}")),
+                        (
+                            deny_teaching.clone(),
+                            format!(".mesh files deny {dest} --yes"),
+                        ),
                         (
                             "Unknown .mesh command 'undeny'".to_string(),
                             format!(".mesh undeny {dest}"),
@@ -29554,9 +30117,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Verb help for a withdrawn word falls back to the full list, which
                     // names the verbs that replaced them and none of the withdrawn ones.
-                    assert_eq!(render_verb_help("undeny"), render_help());
+                    assert_eq!(render_verb_help("", "undeny"), render_help());
                     let help = render_help();
-                    for present in [".mesh sync", ".mesh forget", ".mesh untrust", ".mesh block"] {
+                    for present in [
+                        ".mesh messaging sync",
+                        ".mesh access forget",
+                        ".mesh access revoke",
+                        ".mesh access block",
+                    ] {
                         assert!(help.contains(present), "{present}: {help}");
                     }
                     for absent in [".mesh undeny", "undeny"] {
@@ -29599,9 +30167,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     let sibling = hex_lower(&[0x5d; 16]);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let before = trust_file(&trust);
                     assert!(before.is_some());
                     let sentence = format!(
@@ -29610,7 +30181,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let printed = stdout_lines().len();
                     for flag in [" --dry-run", " --yes", ""] {
-                        let err = refusal(&mut ctx, &format!(".mesh forget {dest}{flag}")).await;
+                        let err =
+                            refusal(&mut ctx, &format!(".mesh access forget {dest}{flag}")).await;
                         assert_eq!(err, sentence, "{flag}");
                     }
                     assert_eq!(
@@ -29622,7 +30194,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(trust.denied().is_empty());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains(&format!("Blocked {}", short(&dest))), "{out}");
@@ -29636,7 +30208,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.denied().len(), 1);
                     assert_eq!(trust.denied()[0].hash, dest);
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -29648,21 +30220,27 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let token = format!("forget-{}", short(&id));
                     let before = trust_file(&trust);
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id} --dry-run"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(out.contains("This was a dry run"), "{out}");
                     assert!(out.contains(&format!("--confirm {token}")), "{out}");
                     assert_eq!(trust_file(&trust), before);
-                    let err =
-                        refusal(&mut ctx, &format!(".mesh forget --identity {id} --yes")).await;
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {id} --yes"),
+                    )
+                    .await;
                     assert!(err.contains("--confirm forget-"), "{err}");
                     assert!(err.contains(".mesh forget --identity"), "{err}");
                     assert_eq!(trust_file(&trust), before);
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -29697,15 +30275,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     out_of(
                         &mut ctx,
-                        &format!(".mesh trust {dest} --yes --label \"Tia's desk\""),
+                        &format!(".mesh access trust {dest} --yes --label \"Tia's desk\""),
                     )
                     .await
                     .unwrap();
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Blocked"), "{out}");
@@ -29721,7 +30302,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
 
                     let token = format!("untrust-{}", short(&id));
-                    let dry = out_of(&mut ctx, &format!(".mesh untrust --identity {id}"))
+                    let dry = out_of(&mut ctx, &format!(".mesh access revoke --identity {id}"))
                         .await
                         .unwrap();
                     assert!(
@@ -29740,7 +30321,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -29769,7 +30350,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh forget --identity {id} --confirm forget-{}",
+                            ".mesh access forget --identity {id} --confirm forget-{}",
                             short(&id)
                         ),
                     )
@@ -29813,9 +30394,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .expect("an enabled store is opened at start");
                     let now = SystemTime::now();
                     let (_dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let turns = vec![
                         EnvoyTurn {
                             role: EnvoyRole::User,
@@ -29839,7 +30423,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh untrust --identity {id} --confirm untrust-{}",
+                            ".mesh access revoke --identity {id} --confirm untrust-{}",
                             short(&id)
                         ),
                     )
@@ -29886,10 +30470,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Blocked"), "{out}");
@@ -29906,7 +30493,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("forget-{}", short(&id));
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm {token}"),
+                        &format!(".mesh access forget --identity {id} --confirm {token}"),
                     )
                     .await
                     .unwrap();
@@ -29923,7 +30510,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
                     let before = trust_file(&trust);
 
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access revoke {dest} --yes")).await;
                     assert!(err.contains("not in the trust list"), "{err}");
                     assert_eq!(trust_file(&trust), before);
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -29955,16 +30542,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     out_of(
                         &mut ctx,
-                        &format!(".mesh trust {dest} --yes --label \"Tia's desk\""),
+                        &format!(".mesh access trust {dest} --yes --label \"Tia's desk\""),
                     )
                     .await
                     .unwrap();
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let offers =
                         |ctx: &RequestContext, verb: &str| -> Vec<(String, Option<String>)> {
-                            ctx.repl_complete(".mesh", &[verb, ""], "")
+                            ctx.repl_complete(".mesh", &["access", verb, ""], "")
                         };
                     let offered_as = |rows: &[(String, Option<String>)], value: &str| {
                         rows.iter()
@@ -29972,9 +30562,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .map(|(_, description)| description.clone().unwrap_or_default())
                     };
                     assert!(
-                        offered_as(&offers(&ctx, "untrust"), &dest).is_none(),
+                        offered_as(&offers(&ctx, "revoke"), &dest).is_none(),
                         "`untrust <dest>` refuses a record under a trusted-all identity: {:?}",
-                        offers(&ctx, "untrust")
+                        offers(&ctx, "revoke")
                     );
                     assert!(
                         offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
@@ -29986,7 +30576,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         offers(&ctx, "block")
                     );
 
-                    out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
@@ -29997,7 +30587,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     let before = trust_file(&trust);
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -30022,9 +30612,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(trust.denied().is_empty());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
                     assert!(
-                        offered_as(&offers(&ctx, "untrust"), &dest).is_none(),
+                        offered_as(&offers(&ctx, "revoke"), &dest).is_none(),
                         "the lifted record is still under the trusted-all identity: {:?}",
-                        offers(&ctx, "untrust")
+                        offers(&ctx, "revoke")
                     );
                     assert!(
                         offered_as(&offers(&ctx, "block"), &dest).is_some_and(|text| text
@@ -30036,7 +30626,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         offers(&ctx, "block")
                     );
 
-                    let again = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let again = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -30071,7 +30661,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (_, impostor_id) = heard_peer(&started.runtime, "Impostor", now);
                     out_of(
                         &mut ctx,
-                        &format!(".mesh trust --identity {impostor_id} --yes"),
+                        &format!(".mesh access trust --identity {impostor_id} --yes"),
                     )
                     .await
                     .unwrap();
@@ -30091,7 +30681,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
                     assert!(before.is_some());
 
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access revoke {dest} --yes")).await;
                     assert!(err.contains("not in the trust list"), "{err}");
                     assert!(
                         !err.contains("belongs to identity"),
@@ -30139,9 +30729,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let offers = |ctx: &RequestContext, words: &[&str]| -> Vec<String> {
                         ctx.repl_complete(".mesh", words, "")
                             .into_iter()
@@ -30150,19 +30743,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     /// The trust cell of Tia's `.mesh peers` row.
                     async fn peers_trust(ctx: &mut RequestContext) -> String {
-                        let out = out_of(ctx, ".mesh peers").await.unwrap();
+                        let out = out_of(ctx, ".mesh people list").await.unwrap();
                         table_rows(&out)
                             .into_iter()
                             .find(|row| row[0] == "Tia")
                             .map(|row| row[3].clone())
                             .unwrap_or_else(|| panic!("no Tia row in {out}"))
                     }
-                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
-                    assert!(offers(&ctx, &["trust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["access", "trust", ""]).contains(&dest));
                     assert_eq!(peers_trust(&mut ctx).await, "trusted");
                     let before = trust_file(&trust);
 
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --dry-run")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access revoke {dest} --dry-run")).await;
                     assert!(
                         err.contains(&format!(
                             "To stop serving just this instance, run .mesh block {dest}."
@@ -30181,7 +30775,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(trust.denied().is_empty());
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(out.contains("Blocked "), "{out}");
@@ -30198,26 +30792,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let trust_cell = peers_trust(&mut ctx).await;
                     assert_eq!(trust_cell, "blocked (instance)", "{trust_cell}");
-                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
-                    assert!(offers(&ctx, &["trust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["access", "trust", ""]).contains(&dest));
                     assert!(
-                        offers(&ctx, &["untrust", "--identity", ""]).contains(&id),
+                        offers(&ctx, &["access", "revoke", "--identity", ""]).contains(&id),
                         "the identity stays trusted, so it stays under `untrust --identity`"
                     );
                     assert!(
-                        offers(&ctx, &["block", "--identity", ""]).contains(&id),
+                        offers(&ctx, &["access", "block", "--identity", ""]).contains(&id),
                         "a block on one instance is not a block on the identity"
                     );
                     assert!(
-                        !offers(&ctx, &["block", ""]).contains(&dest),
+                        !offers(&ctx, &["access", "block", ""]).contains(&dest),
                         "`block` has nothing left to do for a blocked instance"
                     );
                     assert_eq!(
-                        offers(&ctx, &["unblock", ""]),
+                        offers(&ctx, &["access", "unblock", ""]),
                         [dest.clone(), "--identity ".to_string()]
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -30228,14 +30822,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust_cell = peers_trust(&mut ctx).await;
                     assert_eq!(trust_cell, "trusted", "{trust_cell}");
                     assert!(
-                        !offers(&ctx, &["untrust", ""]).contains(&dest),
+                        !offers(&ctx, &["access", "revoke", ""]).contains(&dest),
                         "the identity grant still covers the lifted record, so `untrust <dest>` is refused and the record stays out of `untrust <TAB>`"
                     );
                     assert!(
-                        offers(&ctx, &["untrust", "--identity", ""]).contains(&id),
+                        offers(&ctx, &["access", "revoke", "--identity", ""]).contains(&id),
                         "`untrust --identity` is the verb the refusal points at"
                     );
-                    let rows = ctx.repl_complete(".mesh", &["block", ""], "");
+                    let rows = ctx.repl_complete(".mesh", &["access", "block", ""], "");
                     let description = rows
                         .iter()
                         .find(|(candidate, _)| *candidate == dest)
@@ -30278,8 +30872,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     let (refused, refused_id) = heard_peer(&started.runtime, "Gone", long_ago);
                     for line in [
-                        format!(".mesh trust --identity {refused_id} --yes"),
-                        format!(".mesh block {refused} --yes"),
+                        format!(".mesh access trust --identity {refused_id} --yes"),
+                        format!(".mesh access block {refused} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -30292,7 +30886,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(refused_row.identity, None, "a block writes no record");
                     let before = trust_file(&trust);
 
-                    for line in [".mesh trust --prune", ".mesh trust --prune --dry-run"] {
+                    for line in [
+                        ".mesh access revoke --stale",
+                        ".mesh access revoke --stale --dry-run",
+                    ] {
                         let out = out_of(&mut ctx, line).await.unwrap();
                         assert!(out.contains(&stale), "{line}: {out}");
                         assert!(
@@ -30307,11 +30904,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(trust_file(&trust), before, "{line}");
                     }
-                    let err = refusal(&mut ctx, ".mesh trust --prune --confirm prune-2").await;
+                    let err =
+                        refusal(&mut ctx, ".mesh access revoke --stale --confirm prune-2").await;
                     assert!(err.contains("has changed since the dry run"), "{err}");
                     assert_eq!(trust_file(&trust), before);
 
-                    let out = out_of(&mut ctx, ".mesh trust --prune --confirm prune-1")
+                    let out = out_of(&mut ctx, ".mesh access revoke --stale --confirm prune-1")
                         .await
                         .unwrap();
                     assert!(out.contains("Removed 1"), "{out}");
@@ -30325,7 +30923,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         Rule::DestinationDenied
                     );
                     assert_eq!(trust.denied().len(), 1);
-                    let out = out_of(&mut ctx, ".mesh trust --prune").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh access revoke --stale")
+                        .await
+                        .unwrap();
                     assert!(out.contains("nothing to prune"), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
@@ -30352,10 +30952,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {dest} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {dest} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -30374,9 +30974,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
 
                     for line in [
-                        format!(".mesh untrust {dest}"),
-                        format!(".mesh untrust {dest} --dry-run"),
-                        format!(".mesh untrust {dest} --yes"),
+                        format!(".mesh access revoke {dest}"),
+                        format!(".mesh access revoke {dest} --dry-run"),
+                        format!(".mesh access revoke {dest} --yes"),
                     ] {
                         assert_eq!(refusal(&mut ctx, &line).await, teaching, "{line}");
                     }
@@ -30388,10 +30988,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .map(|(candidate, _)| candidate)
                             .collect()
                     };
-                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
-                    assert!(offers(&ctx, &["trust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["access", "trust", ""]).contains(&dest));
 
-                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
@@ -30403,13 +31003,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .expect("the lift wrote the record");
                     assert!(!record.denied);
                     assert_eq!(record.identity.as_deref(), Some(id.as_str()));
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row = table_rows(&out)
                         .into_iter()
                         .find(|row| row[0] == "Tia")
                         .unwrap_or_else(|| panic!("no Tia row in {out}"));
                     assert_eq!(row[3], "trusted", "{row:?}");
-                    assert!(offers(&ctx, &["untrust", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["access", "revoke", ""]).contains(&dest));
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -30437,11 +31037,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {dest} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
-                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {dest} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -30459,7 +31059,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let before = trust_file(&trust);
 
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest}"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -30482,9 +31082,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.denied().len(), 1);
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     let preview = out.lines().next().unwrap();
                     assert!(
                         preview.ends_with(
@@ -30492,14 +31095,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ),
                         "{out}"
                     );
-                    let dry = out_of(&mut ctx, &format!(".mesh untrust --identity {id}"))
+                    let dry = out_of(&mut ctx, &format!(".mesh access revoke --identity {id}"))
                         .await
                         .unwrap();
                     assert!(
                         !dry.contains(&format!("instance {dest}")),
                         "no record is bound to the identity: {dry}"
                     );
-                    let dry = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
+                    let dry = out_of(&mut ctx, &format!(".mesh access forget --identity {id}"))
                         .await
                         .unwrap();
                     assert!(
@@ -30531,11 +31134,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {dest} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
-                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {dest} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -30554,7 +31157,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Bare form first: with no `--yes`, a prompt here would be the failure.
                     for flag in ["", " --yes"] {
-                        let out = out_of(&mut ctx, &format!(".mesh block {dest}{flag}"))
+                        let out = out_of(&mut ctx, &format!(".mesh access block {dest}{flag}"))
                             .await
                             .unwrap();
                         assert_eq!(
@@ -30601,11 +31204,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {dest} --yes"),
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
-                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {dest} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -30628,7 +31231,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .collect()
                     };
 
-                    let err = refusal(&mut ctx, &format!(".mesh forget {dest} --dry-run")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access forget {dest} --dry-run")).await;
                     assert_eq!(
                         err,
                         format!(
@@ -30643,7 +31247,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(row(&trust).unwrap().identity, None);
 
                     // Bare form: with no `--confirm`, a prompt here would be the failure.
-                    let out = out_of(&mut ctx, &format!(".mesh forget --identity {id}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access forget --identity {id}"))
                         .await
                         .unwrap();
                     assert!(
@@ -30656,14 +31260,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     // Completion never offers what the verb refuses: the blocked instance
                     // stays off `untrust` and on `trust`.
-                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
-                    assert!(offers(&ctx, &["trust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["access", "trust", ""]).contains(&dest));
 
                     // Forgetting the identity takes the deny with it.
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh forget --identity {id} --confirm forget-{}",
+                            ".mesh access forget --identity {id} --confirm forget-{}",
                             short(&id)
                         ),
                     )
@@ -30677,10 +31281,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(!trust.is_trusted_identity(&id));
                     assert_ne!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
-                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
-                    assert!(!offers(&ctx, &["untrust", "--identity", ""]).contains(&id));
+                    assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["access", "revoke", "--identity", ""]).contains(&id));
                     assert_eq!(
-                        refusal(&mut ctx, &format!(".mesh untrust {dest}")).await,
+                        refusal(&mut ctx, &format!(".mesh access revoke {dest}")).await,
                         format!(
                             "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
                         )
@@ -30709,12 +31313,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
 
                     // While the peer row proves the record's identity, its name is used.
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --yes"))
                         .await
                         .unwrap();
                     let tail = "It is served no longer; a knock from it will be filed again.";
@@ -30728,7 +31332,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
                     // Trust it again on a fresh, unlabelled record.
-                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
@@ -30759,7 +31363,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         other
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --dry-run"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --dry-run"))
                         .await
                         .unwrap();
                     assert!(
@@ -30767,7 +31371,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
                     assert!(!out.contains("Mallory") && !out.contains("Tia"), "{out}");
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -30819,7 +31423,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let trust = started.runtime.trust();
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
-                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -30862,7 +31466,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         short(&dest),
                         short(&id)
                     );
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --dry-run"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest} --dry-run"))
                         .await
                         .unwrap();
                     assert_eq!(out, format!("{preview}\n{DRY_RUN_NOTHING_CHANGED}"));
@@ -30875,7 +31479,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Consented: the record goes, the deny stays and the line says so.
                     let _script = prompt_script::install(&[true]);
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {dest}"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -30910,15 +31514,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Afterwards the destination is a deny-only row: the block is named.
                     assert_eq!(
-                        refusal(&mut ctx, &format!(".mesh untrust {dest}")).await,
+                        refusal(&mut ctx, &format!(".mesh access revoke {dest}")).await,
                         format!(
                             "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
                         )
                     );
-                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
-                    assert!(offers(&ctx, &["unblock", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["access", "revoke", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["access", "unblock", ""]).contains(&dest));
                     assert!(
-                        offers(&ctx, &["trust", ""]).contains(&dest),
+                        offers(&ctx, &["access", "trust", ""]).contains(&dest),
                         "still heard, so `trust` offers it"
                     );
                     assert!(sink.drain().is_empty());
@@ -30950,7 +31554,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let now = SystemTime::now();
                     let (disk_dest, disk_id) = heard_peer(&started.runtime, "Tia", now);
                     let (session_dest, session_id) = heard_peer(&started.runtime, "Bea", now);
-                    out_of(&mut ctx, &format!(".mesh trust {disk_dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {disk_dest} --yes"))
                         .await
                         .unwrap();
                     trust
@@ -30980,7 +31584,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     trust.set_observer(Arc::new(TrustHookObserver(hooks)));
 
                     // Untrusting the disk record leaves both denies where they are.
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {disk_dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access revoke {disk_dest} --yes"))
                         .await
                         .unwrap();
                     assert!(
@@ -31012,9 +31616,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let between = trust_file(&trust).expect("the file holds both denies");
 
                     // The session record never reached the file; its deny did, and stays.
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {session_dest} --dry-run"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access revoke {session_dest} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
                     assert_eq!(
                         out,
                         format!(
@@ -31025,9 +31632,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert_eq!(trust_file(&trust).as_deref(), Some(between.as_slice()));
                     assert!(sink.drain().is_empty());
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {session_dest} --yes"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh access revoke {session_dest} --yes"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(
                         out.ends_with(&format!(
                             " It stays blocked, so it is refused without a knock; .mesh unblock {session_dest} lifts that."
@@ -31061,7 +31671,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "--yes stood in for every question"
                     );
                     assert_eq!(
-                        refusal(&mut ctx, &format!(".mesh untrust {session_dest}")).await,
+                        refusal(&mut ctx, &format!(".mesh access revoke {session_dest}")).await,
                         format!(
                             "Destination {session_dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {session_dest} lifts the block."
                         )
@@ -31119,14 +31729,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for flag in ["", " --yes"] {
                         let err =
-                            refusal(&mut ctx, &format!(".mesh trust {legacy_dest}{flag}")).await;
+                            refusal(&mut ctx, &format!(".mesh access trust {legacy_dest}{flag}"))
+                                .await;
                         assert!(
                             err.contains("knocked before its name hash was kept"),
                             "a knock without its name hash teaches what to wait for: {err}"
                         );
                         assert!(!err.contains("- added"), "{err}");
                         let err =
-                            refusal(&mut ctx, &format!(".mesh trust {forged_dest}{flag}")).await;
+                            refusal(&mut ctx, &format!(".mesh access trust {forged_dest}{flag}"))
+                                .await;
                         assert!(
                             err.contains(&forged_dest) && !err.contains("- added"),
                             "a forged knock is refused naming the destination: {err}"
@@ -31163,13 +31775,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust);
 
                     let non_tty = prompt_script::install_non_interactive();
-                    let err = refusal(&mut ctx, &format!(".mesh trust --identity {id}")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access trust --identity {id}")).await;
                     assert!(err.contains("--yes"), "{err}");
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     drop(non_tty);
 
                     let _script = prompt_script::install(&[false]);
-                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id}"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust --identity {id}"))
                         .await
                         .unwrap();
                     assert!(out.contains(NOTHING_CHANGED), "{out}");
@@ -31207,7 +31820,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     fake.script.reply_with([Value::Array(vec![])]);
 
-                    run(&mut ctx, ".mesh sync").await.unwrap();
+                    run(&mut ctx, ".mesh messaging sync").await.unwrap();
 
                     let lines = stdout_lines();
                     let asking = index_of(
@@ -31251,7 +31864,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     })
                     .await;
 
-                    run(&mut ctx, ".mesh sync").await.unwrap();
+                    run(&mut ctx, ".mesh messaging sync").await.unwrap();
 
                     let lines = stdout_lines();
                     index_of(&lines, "A sync is already running; wait for it to finish.");
@@ -31276,7 +31889,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
 
-                    let err = refusal(&mut ctx, ".mesh sync").await;
+                    let err = refusal(&mut ctx, ".mesh messaging sync").await;
                     assert!(
                         err.starts_with("No LXMF propagation node has announced itself"),
                         "{err}"
@@ -31305,7 +31918,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     fake.script.reply_with([Value::Array(vec![])]);
 
-                    run(&mut ctx, ".mesh sync").await.unwrap();
+                    run(&mut ctx, ".mesh messaging sync").await.unwrap();
 
                     let lines = stdout_lines();
                     index_of(
@@ -31338,7 +31951,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     fake.script.reply_with([Value::Array(vec![])]);
 
-                    run(&mut ctx, ".mesh sync").await.unwrap();
+                    run(&mut ctx, ".mesh messaging sync").await.unwrap();
 
                     let lines = stdout_lines();
                     index_of(
@@ -31379,7 +31992,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                     holder.try_lock().unwrap();
 
-                    run(&mut ctx, ".mesh sync").await.unwrap();
+                    run(&mut ctx, ".mesh messaging sync").await.unwrap();
 
                     let lines = stdout_lines();
                     let held = index_of(&lines, "another Coyote process");
@@ -31398,7 +32011,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     drop(holder);
                     fake.script.reply_with([Value::Array(vec![])]);
-                    run(&mut ctx, ".mesh sync").await.unwrap();
+                    run(&mut ctx, ".mesh messaging sync").await.unwrap();
                     let lines = stdout_lines();
                     index_of(
                         &lines,
@@ -31429,7 +32042,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    let err = refusal(&mut ctx, &format!(".mesh knock {heard}")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access ask {heard}")).await;
                     assert!(err.contains("--yes"), "{err}");
                     let out = stdout_lines();
                     assert!(
@@ -31444,8 +32057,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let before = stdout_lines().len();
                     let long = "y".repeat(KNOCK_INTRO_MAX_CHARS + 1);
-                    let err =
-                        refusal(&mut ctx, &format!(".mesh knock {heard} --intro \"{long}\"")).await;
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh access ask {heard} --intro \"{long}\""),
+                    )
+                    .await;
                     assert!(
                         err.contains(&format!(
                             "above the {KNOCK_INTRO_MAX_CHARS}-character limit"
@@ -31485,7 +32101,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
 
-                    let err = refusal(&mut ctx, &format!(".mesh message {heard} hi")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh messaging send {heard} hi")).await;
                     assert!(
                         err.contains(MESSAGE_REFUSAL_TAIL),
                         "message is trust-gated: {err}"
@@ -31495,7 +32111,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let at_bound = "z".repeat(KNOCK_INTRO_MAX_CHARS);
                     run(
                         &mut ctx,
-                        &format!(".mesh knock {heard} --intro \"{at_bound}\""),
+                        &format!(".mesh access ask {heard} --intro \"{at_bound}\""),
                     )
                     .await
                     .unwrap();
@@ -31554,7 +32170,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ] {
                         let before = stdout_lines().len();
                         let err =
-                            refusal(&mut ctx, &format!(".mesh knock {destination} --yes")).await;
+                            refusal(&mut ctx, &format!(".mesh access ask {destination} --yes"))
+                                .await;
                         assert!(
                             err.contains(&format!(" is {standing} in this node's trust list")),
                             "{standing}: {err}"
@@ -31610,20 +32227,21 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         Decision::Refuse,
                         "fixture: the new key is not trusted"
                     );
-                    let peers = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let peers = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert!(
                         peers.contains("key changed:") && peers.contains(short(&new_identity)),
                         "fixture: the peer table marks the key change: {peers}"
                     );
 
-                    let err = refusal(&mut ctx, &format!(".mesh message {new_dest} hi")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh messaging send {new_dest} hi")).await;
                     assert!(
                         err.contains(MESSAGE_REFUSAL_TAIL),
                         "message stays gated: {err}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
-                    run(&mut ctx, &format!(".mesh knock {new_dest}"))
+                    run(&mut ctx, &format!(".mesh access ask {new_dest}"))
                         .await
                         .unwrap();
 
@@ -31672,7 +32290,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     run(
                         &mut ctx,
-                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                        &format!(".mesh access ask {peer} --yes --intro \"hi\""),
                     )
                     .await
                     .unwrap();
@@ -31747,7 +32365,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .clone()
                     };
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert_eq!(listed(&out)[6], NO_ROUTE_STATE, "{out}");
                     let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
                         .await
@@ -31756,7 +32374,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = out_of(
                         &mut ctx,
-                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                        &format!(".mesh access ask {peer} --yes --intro \"hi\""),
                     )
                     .await
                     .unwrap();
@@ -31773,7 +32391,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the link that came up lifts the mark"
                     );
 
-                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     assert_eq!(listed(&out)[6], "", "{out}");
                     let result = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
                         .await
@@ -31812,7 +32430,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     stub.announce(Some("Tia")).await;
                     let peer = stub.destination_hex();
                     stub.wait_to_be_filed(&runtime.peers(), &peer).await;
-                    out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {peer} --yes"))
                         .await
                         .unwrap();
                     let now = SystemTime::now();
@@ -31835,7 +32453,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(runtime.peers().mark_left(&peer, now));
                     assert!(runtime.path_known(&peer).await);
 
-                    let pending = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                    let pending = pending_out(&mut ctx, ".").await.unwrap();
                     let row = pending
                         .lines()
                         .find(|line| line.contains("-> ") && line.contains(short(&peer)))
@@ -31856,20 +32474,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let asked = std::time::Instant::now();
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
-                        .await
-                        .unwrap_err()
-                        .to_string();
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh messaging send {peer} --yes hello"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
                     assert!(
                         err.starts_with(
                             "The peer is unreachable and no propagation node is known yet to hold the message for it."
                         ),
                         "{err}"
                     );
-                    let err = run(&mut ctx, &format!(".mesh request {peer} docs/a.md --yes"))
-                        .await
-                        .unwrap_err()
-                        .to_string();
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh files request {peer} docs/a.md --yes"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
                     assert!(
                         err.contains(
                             "The peer is unreachable and no propagation node is known yet to hold the access request for it."
@@ -31966,7 +32590,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 stub.announce(Some("Tia")).await;
                 let peer = stub.destination_hex();
                 stub.wait_to_be_filed(&runtime.peers(), &peer).await;
-                out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                out_of(&mut ctx, &format!(".mesh access trust {peer} --yes"))
                     .await
                     .unwrap();
                 pn.announce(&propagation_announce_app_data(true, 0, 256))
@@ -32023,10 +32647,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut timings = Vec::new();
                     let mut started_at = std::time::Instant::now();
 
-                    let out = out_of(&mut ctx, &format!(".mesh message {peer} --yes hello"))
-                        .await
-                        .unwrap();
-                    timings.push((".mesh message", started_at.elapsed()));
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh messaging send {peer} --yes hello"),
+                    )
+                    .await
+                    .unwrap();
+                    timings.push((".mesh messaging send", started_at.elapsed()));
                     assert!(out.contains(&format!(" to {}: ", short(&peer))), "{out}");
                     assert!(held(&out, "Tia"), "{out}");
                     assert!(out.contains("'s sessions when one syncs."), "{out}");
@@ -32034,10 +32661,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     pn.next_received().await;
 
                     started_at = std::time::Instant::now();
-                    let out = out_of(&mut ctx, &format!(".mesh request {peer} docs/a.md --yes"))
-                        .await
-                        .unwrap();
-                    timings.push((".mesh request", started_at.elapsed()));
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh files request {peer} docs/a.md --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    timings.push((".mesh files request", started_at.elapsed()));
                     assert!(
                         out.contains(&format!(": pending; {} left ", short(&peer))),
                         "{out}"
@@ -32125,7 +32755,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     pn.nothing_else_received();
 
-                    let pending = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                    let pending = pending_out(&mut ctx, ".").await.unwrap();
                     let row = pending
                         .lines()
                         .find(|line| line.contains("-> ") && line.contains(short(&peer)))
@@ -32136,7 +32766,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         runtime.peers().get(&peer).unwrap().left_at.is_none()
                     })
                     .await;
-                    let pending = out_of(&mut ctx, ".mesh pending").await.unwrap();
+                    let pending = pending_out(&mut ctx, ".").await.unwrap();
                     assert!(!pending.contains("peer left"), "{pending}");
                     let result = handle_mesh_tool(
                         &mut ctx,
@@ -32180,9 +32810,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(crate::mesh::test_support::expire_path(&runtime, &peer).await);
                     let started_at = std::time::Instant::now();
 
-                    let out = out_of(&mut ctx, &format!(".mesh message {peer} --yes hello"))
-                        .await
-                        .unwrap();
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh messaging send {peer} --yes hello"),
+                    )
+                    .await
+                    .unwrap();
                     assert!(
                         out.contains("Tia has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard "),
                         "{out}"
@@ -32332,7 +32965,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     run(
                         &mut ctx,
-                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                        &format!(".mesh access ask {peer} --yes --intro \"hi\""),
                     )
                     .await
                     .unwrap();
@@ -32387,7 +33020,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let own = started.runtime.current_destination_hash();
                     let d8 = short(&peer).to_string();
 
-                    let out = out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access trust {peer} --yes"))
                         .await
                         .unwrap();
                     let expected = format!(
@@ -32396,7 +33029,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(out.lines().any(|line| line == expected), "{out}");
 
-                    let listed = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let listed = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let row = listed
                         .lines()
                         .find(|line| line.contains(&d8))
@@ -32407,10 +33040,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "\"Tia\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh trust {own} (or .mesh unblock {own} if it blocked this instance). (This node does trust {d8}.)"
                     );
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
-                        .await
-                        .unwrap_err()
-                        .to_string();
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh messaging send {peer} --yes hello"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
                     assert_eq!(err, refusal);
                     let out = stdout_lines()[before..].to_vec();
                     let notice = index_of(&out, "This sends your text to Tia (");
@@ -32420,7 +33056,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "a refused message must not be reported as sent: {out:?}"
                     );
 
-                    let err = run(&mut ctx, &format!(".mesh fetch {peer} docs/a.md"))
+                    let err = run(&mut ctx, &format!(".mesh files fetch {peer} docs/a.md"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -32464,7 +33100,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         stub.announce(Some("Tia")).await;
                         let peer = stub.destination_hex();
                         stub.wait_to_be_filed(&started.runtime.peers(), &peer).await;
-                        out_of(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                        out_of(&mut ctx, &format!(".mesh access trust {peer} --yes"))
                             .await
                             .unwrap();
                         let own = started.runtime.current_destination_hash();
@@ -32473,10 +33109,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             short(&peer)
                         );
 
-                        let err = run(&mut ctx, &format!(".mesh message {peer} --yes hello"))
-                            .await
-                            .unwrap_err()
-                            .to_string();
+                        let err = run(
+                            &mut ctx,
+                            &format!(".mesh messaging send {peer} --yes hello"),
+                        )
+                        .await
+                        .unwrap_err()
+                        .to_string();
                         assert_eq!(
                             err,
                             format!(
@@ -32484,7 +33123,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                         );
 
-                        let err = run(&mut ctx, &format!(".mesh status {peer}"))
+                        let err = run(&mut ctx, &format!(".mesh people status {peer}"))
                             .await
                             .unwrap_err()
                             .to_string();
@@ -32537,12 +33176,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let peer = stub.destination_hex();
                     let peers = started.runtime.peers();
                     stub.wait_to_be_filed(&peers, &peer).await;
-                    run(&mut ctx, &format!(".mesh trust {peer} --yes"))
+                    run(&mut ctx, &format!(".mesh access trust {peer} --yes"))
                         .await
                         .unwrap();
 
                     let before = stdout_lines().len();
-                    let err = run(&mut ctx, &format!(".mesh status {peer}"))
+                    let err = run(&mut ctx, &format!(".mesh people status {peer}"))
                         .await
                         .unwrap_err()
                         .to_string();
@@ -32620,14 +33259,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         stub.announce(Some(name)).await;
                         let destination = stub.destination_hex();
                         stub.wait_to_be_filed(&peers, &destination).await;
-                        out_of(&mut ctx, &format!(".mesh trust {destination} --yes"))
+                        out_of(&mut ctx, &format!(".mesh access trust {destination} --yes"))
                             .await
                             .unwrap();
                     }
                     let bea_d8 = short(&bea.destination_hex()).to_string();
                     let cee_d8 = short(&cee.destination_hex()).to_string();
 
-                    let out = out_of(&mut ctx, ".mesh broadcast --yes to everyone")
+                    let out = out_of(&mut ctx, ".mesh messaging broadcast --yes to everyone")
                         .await
                         .unwrap();
 
@@ -32703,7 +33342,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     let dest_a = heard_as("first");
                     let dest_b = heard_as("second");
-                    out_of(&mut ctx, &format!(".mesh trust {dest_a} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest_a} --yes"))
                         .await
                         .unwrap();
 
@@ -32711,16 +33350,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let request_tail = request_refusal_tail(&dest_b, None);
                     for (line, tail) in [
                         (
-                            format!(".mesh message {dest_b} --yes hello"),
+                            format!(".mesh messaging send {dest_b} --yes hello"),
                             MESSAGE_REFUSAL_TAIL,
                         ),
-                        (format!(".mesh status {dest_b}"), STATUS_REFUSAL_TAIL),
+                        (format!(".mesh people status {dest_b}"), STATUS_REFUSAL_TAIL),
                         (
-                            format!(".mesh fetch {dest_b} docs/a.md"),
+                            format!(".mesh files fetch {dest_b} docs/a.md"),
                             FETCH_REFUSAL_TAIL,
                         ),
                         (
-                            format!(".mesh request {dest_b} docs/a.md"),
+                            format!(".mesh files request {dest_b} docs/a.md"),
                             request_tail.as_str(),
                         ),
                     ] {
@@ -32776,7 +33415,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             SystemTime::now(),
                         );
                     }
-                    let out = out_of(&mut ctx, ".mesh knocks").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh access requests").await.unwrap();
                     assert!(
                         out.contains(&format!(
                             "2 knock(s) from {} dropped in the last 10 min",
@@ -32785,13 +33424,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    out_of(&mut ctx, &format!(".mesh forget --identity {identity}"))
-                        .await
-                        .unwrap();
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access forget --identity {identity}"),
+                    )
+                    .await
+                    .unwrap();
                     let out = out_of(
                         &mut ctx,
                         &format!(
-                            ".mesh forget --identity {identity} --confirm forget-{}",
+                            ".mesh access forget --identity {identity} --confirm forget-{}",
                             short(&identity)
                         ),
                     )
@@ -32802,7 +33444,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
 
-                    let out = out_of(&mut ctx, ".mesh knocks").await.unwrap();
+                    let out = out_of(&mut ctx, ".mesh access requests").await.unwrap();
                     assert!(out.starts_with("No knocks."), "{out}");
                     assert!(!out.contains("dropped in the last"), "{out}");
                     assert!(!out.contains(short(&identity)), "{out}");
@@ -32939,7 +33581,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         rig.surface_a();
 
                         let c = rig.c.clone();
-                        rig.run(&format!(".mesh trust {c} --yes")).await;
+                        rig.run(&format!(".mesh access trust {c} --yes")).await;
 
                         assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
                         rig.stop().await;
@@ -32957,7 +33599,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         rig.surface_a();
 
                         let identity = rig.identity.clone();
-                        rig.run(&format!(".mesh trust --identity {identity} --yes"))
+                        rig.run(&format!(".mesh access trust --identity {identity} --yes"))
                             .await;
 
                         assert_eq!(rig.knock_from_a(), Admission::AlreadyTrusted);
@@ -32978,7 +33620,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         rig.trust_instance(&c);
                         rig.surface_a();
 
-                        rig.run(&format!(".mesh untrust {c} --yes")).await;
+                        rig.run(&format!(".mesh access revoke {c} --yes")).await;
 
                         assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
                         rig.stop().await;
@@ -33009,7 +33651,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         rig.run(&format!(
-                            ".mesh untrust --identity {identity} --confirm untrust-{}",
+                            ".mesh access revoke --identity {identity} --confirm untrust-{}",
                             short(&identity)
                         ))
                         .await;
@@ -33030,7 +33672,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         rig.surface_a();
 
                         let c = rig.c.clone();
-                        rig.run(&format!(".mesh block {c} --yes")).await;
+                        rig.run(&format!(".mesh access block {c} --yes")).await;
 
                         assert_eq!(rig.knock_from_a(), Admission::Admitted { surfaced: true });
                         rig.stop().await;
@@ -33048,7 +33690,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         rig.surface_a();
 
                         let identity = rig.identity.clone();
-                        rig.run(&format!(".mesh block --identity {identity} --yes"))
+                        rig.run(&format!(".mesh access block --identity {identity} --yes"))
                             .await;
 
                         assert_eq!(rig.knock_from_a(), Admission::Blocked);
@@ -33069,7 +33711,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let identity = rig.identity.clone();
                         rig.run(&format!(
-                            ".mesh forget --identity {identity} --confirm forget-{}",
+                            ".mesh access forget --identity {identity} --confirm forget-{}",
                             short(&identity)
                         ))
                         .await;
@@ -33091,7 +33733,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         rig.surface_a();
 
                         let c = rig.c.clone();
-                        let out = rig.run(&format!(".mesh block {c}")).await;
+                        let out = rig.run(&format!(".mesh access block {c}")).await;
 
                         assert!(out.contains(NOTHING_CHANGED), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
@@ -33125,7 +33767,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         let out = rig
-                            .run(&format!(".mesh block --identity {identity} --yes"))
+                            .run(&format!(".mesh access block --identity {identity} --yes"))
                             .await;
 
                         assert!(out.contains("is already blocked."), "{out}");
@@ -33231,14 +33873,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = LateJoiner::start("repl-first-contact-trust").await;
                         let to_a = fx.to_a.clone();
                         let out = fx
-                            .asks_for_a(&format!(".mesh trust {to_a} --yes"))
+                            .asks_for_a(&format!(".mesh access trust {to_a} --yes"))
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
                         assert!(out.contains(&format!("Trusted {}", short(&to_a))), "{out}");
 
                         fx.a_trusts_b();
-                        let card = out_of(&mut fx.ctx, &format!(".mesh status {to_a}"))
+                        let card = out_of(&mut fx.ctx, &format!(".mesh people status {to_a}"))
                             .await
                             .unwrap();
                         assert!(
@@ -33267,7 +33909,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = LateJoiner::start("repl-first-contact-info").await;
                         let to_a = fx.to_a.clone();
-                        let out = fx.asks_for_a(&format!(".mesh info {to_a}")).await.unwrap();
+                        let out = fx
+                            .asks_for_a(&format!(".mesh people info {to_a}"))
+                            .await
+                            .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
                         assert!(out.contains(&format!("destination: {to_a}")), "{out}");
                         assert!(
@@ -33294,7 +33939,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.a_trusts_b();
                         let to_a = fx.to_a.clone();
                         let out = fx
-                            .asks_for_a(&format!(".mesh knock {to_a} --yes"))
+                            .asks_for_a(&format!(".mesh access ask {to_a} --yes"))
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
@@ -33337,7 +33982,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         let out = fx
-                            .asks_for_a(&format!(".mesh message {to_a} --yes hello"))
+                            .asks_for_a(&format!(".mesh messaging send {to_a} --yes hello"))
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
@@ -33382,8 +34027,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                         );
                         for line in [
-                            format!(".mesh trust {unheard} --yes"),
-                            format!(".mesh status {unheard}"),
+                            format!(".mesh access trust {unheard} --yes"),
+                            format!(".mesh people status {unheard}"),
                         ] {
                             let asked = Instant::now();
                             assert_eq!(
@@ -33400,12 +34045,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         assert!(records_of_others(&started.runtime).is_empty());
 
-                        out_of(&mut ctx, &format!(".mesh block {unheard} --yes"))
+                        out_of(&mut ctx, &format!(".mesh access block {unheard} --yes"))
                             .await
                             .unwrap();
                         let printed = stdout_lines().len();
                         let asked = Instant::now();
-                        let err = refusal(&mut ctx, &format!(".mesh info {unheard}")).await;
+                        let err = refusal(&mut ctx, &format!(".mesh people info {unheard}")).await;
                         assert!(
                             asked.elapsed() < Duration::from_secs(1),
                             "{:?}",
@@ -33414,9 +34059,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(err.ends_with(INFO_REFUSAL_TAIL), "{err}");
                         assert_eq!(stdout_lines().len(), printed, "nothing was asked: {err}");
                         for (line, tail) in [
-                            (format!(".mesh trust {unheard} --yes"), TRUST_REFUSAL_TAIL),
                             (
-                                format!(".mesh knock {unheard} --yes"),
+                                format!(".mesh access trust {unheard} --yes"),
+                                TRUST_REFUSAL_TAIL,
+                            ),
+                            (
+                                format!(".mesh access ask {unheard} --yes"),
                                 UNHEARD_KNOCK_REFUSAL_TAIL,
                             ),
                         ] {
@@ -33465,7 +34113,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         });
                         let before = stdout_lines().len();
                         let asked = Instant::now();
-                        let line = format!(".mesh trust {unheard} --yes");
+                        let line = format!(".mesh access trust {unheard} --yes");
                         let outcome = Box::pin(run_repl_command(&mut ctx, signal, &line)).await;
                         let waited = asked.elapsed();
                         assert!(
@@ -33503,13 +34151,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _script = prompt_script::install(&[]);
                     run_async(async {
                         for verb in [
-                            ".mesh status {}",
-                            ".mesh fetch {} docs/a.md",
-                            ".mesh request {} docs/a.md",
+                            ".mesh people status {}",
+                            ".mesh files fetch {} docs/a.md",
+                            ".mesh files request {} docs/a.md",
                         ] {
                             let mut fx = LateJoiner::start("repl-first-contact-status-fetch").await;
                             let line = verb.replace("{}", &fx.to_a);
-                            let tail = match verb.split(' ').nth(1) {
+                            let tail = match verb.split(' ').nth(2) {
                                 Some("status") => STATUS_REFUSAL_TAIL.to_string(),
                                 Some("fetch") => FETCH_REFUSAL_TAIL.to_string(),
                                 _ => request_refusal_tail(&fx.to_a, None),
@@ -33541,10 +34189,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         let non_hex = "z".repeat(32);
                         for line in [
-                            ".mesh trust 5d5d5d5d --yes".to_string(),
-                            ".mesh info 5d5d5d5d".to_string(),
-                            format!(".mesh status {non_hex}"),
-                            format!(".mesh message {non_hex} --yes hi"),
+                            ".mesh access trust 5d5d5d5d --yes".to_string(),
+                            ".mesh people info 5d5d5d5d".to_string(),
+                            format!(".mesh people status {non_hex}"),
+                            format!(".mesh messaging send {non_hex} --yes hi"),
                         ] {
                             let before = stdout_lines().len();
                             let asked = Instant::now();
@@ -33586,16 +34234,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let to_a = fx.to_a.clone();
                         let typed = to_a.to_ascii_uppercase();
                         assert_ne!(typed, to_a);
-                        let out = fx.asks_for_a(&format!(".mesh info {typed}")).await.unwrap();
+                        let out = fx
+                            .asks_for_a(&format!(".mesh people info {typed}"))
+                            .await
+                            .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
                         assert!(out.contains(&format!("destination: {to_a}")), "{out}");
 
-                        let peers = out_of(&mut fx.ctx, ".mesh peers").await.unwrap();
+                        let peers = out_of(&mut fx.ctx, ".mesh people list").await.unwrap();
                         assert!(peers.contains(short(&to_a)), "{peers}");
 
                         for line in [
-                            format!(".mesh info {to_a}"),
-                            format!(".mesh trust {to_a} --yes"),
+                            format!(".mesh people info {to_a}"),
+                            format!(".mesh access trust {to_a} --yes"),
                         ] {
                             let asked = Instant::now();
                             let out = out_of(&mut fx.ctx, &line).await.unwrap();
@@ -33659,13 +34310,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .await
                                 .unwrap();
                             for (line, hint) in [
-                                (format!("trust {unheard} --yes"), "peers"),
+                                (format!("access trust {unheard} --yes"), "peers"),
                                 (
-                                    format!("untrust --identity {unknown_identity}"),
+                                    format!("access revoke --identity {unknown_identity}"),
                                     "trust --identity",
                                 ),
-                                ("block nothex00".to_string(), "peers"),
-                                (format!("message {heard} hi"), "peers"),
+                                ("access block nothex00".to_string(), "peers"),
+                                (format!("messaging send {heard} hi"), "peers"),
                             ] {
                                 let err = run(&mut ctx, &format!("{sigil}mesh {line}"))
                                     .await
@@ -33721,7 +34372,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                         }
 
-                        let out = out_of(&mut ctx, "/mesh knocks").await.unwrap();
+                        let out = out_of(&mut ctx, "/mesh access requests").await.unwrap();
 
                         assert!(out.contains("/mesh trust "), "{out}");
                         assert!(!out.contains(".mesh"), "{out}");
@@ -33758,7 +34409,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             run(&mut ctx, &format!("{typed}set command_prefix {prefix}"))
                                 .await
                                 .unwrap();
-                            for verb in ["info", "knock"] {
+                            for verb in ["people info", "access ask"] {
                                 let err = run(&mut ctx, &format!("{sigil}mesh {verb} .vault"))
                                     .await
                                     .unwrap_err();
@@ -33932,9 +34583,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let err = format!(
                         "{:#}",
-                        run(&mut ctx, ".mesh knocks")
+                        run(&mut ctx, ".mesh access requests")
                             .await
-                            .expect_err(".mesh knocks")
+                            .expect_err(".mesh access requests")
                     );
 
                     assert!(err.contains(&path.display().to_string()), "{err}");
@@ -33980,10 +34631,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let now = SystemTime::now();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     let (plain, plain_id) = heard_peer(&started.runtime, "Pim", now);
-                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                        .await
-                        .unwrap();
-                    out_of(&mut ctx, &format!(".mesh trust {plain} --yes"))
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh access trust --identity {id} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    out_of(&mut ctx, &format!(".mesh access trust {plain} --yes"))
                         .await
                         .unwrap();
                     let before = trust_file(&trust).expect("both records are on disk");
@@ -34014,7 +34668,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Block branch: sentence, then the error.
                     let printed = stdout_lines().len();
-                    let err = refusal(&mut ctx, &format!(".mesh block {dest} --yes")).await;
+                    let err = refusal(&mut ctx, &format!(".mesh access block {dest} --yes")).await;
                     let after: Vec<String> = stdout_lines()[printed..].to_vec();
                     assert_eq!(after, vec![sentence.clone()], "{after:?}");
                     assert!(err.contains("Failed to write"), "{err}");
@@ -34042,7 +34696,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // Untrust branch: the untrusts line, then the error, record intact.
                     let printed = stdout_lines().len();
-                    let err = refusal(&mut ctx, &format!(".mesh untrust {plain} --yes")).await;
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh access revoke {plain} --yes")).await;
                     let after: Vec<String> = stdout_lines()[printed..].to_vec();
                     assert_eq!(after, vec![untrusts.clone()], "{after:?}");
                     assert!(err.contains("Failed to write"), "{err}");
@@ -34057,7 +34712,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let token = format!("untrust-{}", short(&id));
                     let err = refusal(
                         &mut ctx,
-                        &format!(".mesh untrust --identity {id} --confirm {token}"),
+                        &format!(".mesh access revoke --identity {id} --confirm {token}"),
                     )
                     .await;
                     assert!(err.contains("Failed to write"), "{err}");
@@ -34077,7 +34732,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // Writable again: the same command, same first line, now completes.
                     locked.restore();
                     drop(locked);
-                    let out = out_of(&mut ctx, &format!(".mesh block {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh access block {dest} --yes"))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -34116,9 +34771,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (dest, id) = heard_peer(&started.runtime, "Tia", now);
                     {
                         let _script = prompt_script::install(&[]);
-                        out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
-                            .await
-                            .unwrap();
+                        out_of(
+                            &mut ctx,
+                            &format!(".mesh access trust --identity {id} --yes"),
+                        )
+                        .await
+                        .unwrap();
                     }
                     let before = trust_file(&trust).expect("the identity record is on disk");
                     let sentence = format!(
@@ -34131,7 +34789,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     {
                         let _script = prompt_script::install_non_interactive();
                         let printed = stdout_lines().len();
-                        let err = refusal(&mut ctx, &format!(".mesh block {dest}")).await;
+                        let err = refusal(&mut ctx, &format!(".mesh access block {dest}")).await;
                         assert_eq!(stdout_lines()[printed..].to_vec(), vec![sentence.clone()]);
                         assert_eq!(
                             err,
@@ -34146,7 +34804,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // `untrust` under the identity grant is refused before any question.
                         let printed = stdout_lines().len();
-                        let err = refusal(&mut ctx, &format!(".mesh untrust {dest}")).await;
+                        let err = refusal(&mut ctx, &format!(".mesh access revoke {dest}")).await;
                         assert_eq!(
                             err,
                             format!(
@@ -34168,7 +34826,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // A terminal that answers no: sentence, then "Nothing was changed."
                     {
                         let _script = prompt_script::install(&[false]);
-                        let out = out_of(&mut ctx, &format!(".mesh block {dest}"))
+                        let out = out_of(&mut ctx, &format!(".mesh access block {dest}"))
                             .await
                             .unwrap();
                         assert_eq!(out, format!("{sentence}\n{NOTHING_CHANGED}"));
@@ -34183,7 +34841,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let short_id = short(&id);
                     let err = refusal(
                         &mut ctx,
-                        &format!(".mesh forget --identity {id} --confirm untrust-{short_id}"),
+                        &format!(
+                            ".mesh access forget --identity {id} --confirm untrust-{short_id}"
+                        ),
                     )
                     .await;
                     assert!(
@@ -34197,15 +34857,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // An unknown flag is refused under each verb's own usage.
                     let untrust_err =
-                        refusal(&mut ctx, &format!(".mesh untrust {dest} --label x")).await;
+                        refusal(&mut ctx, &format!(".mesh access revoke {dest} --label x")).await;
                     let forget_err =
-                        refusal(&mut ctx, &format!(".mesh forget {dest} --label x")).await;
+                        refusal(&mut ctx, &format!(".mesh access forget {dest} --label x")).await;
                     assert!(
-                        untrust_err.starts_with("Unexpected '--label'. Usage: .mesh untrust"),
+                        untrust_err.starts_with("Unexpected '--label'. Usage: .mesh access revoke"),
                         "{untrust_err}"
                     );
                     assert!(
-                        forget_err.starts_with("Unexpected '--label'. Usage: .mesh forget"),
+                        forget_err.starts_with("Unexpected '--label'. Usage: .mesh access forget"),
                         "{forget_err}"
                     );
                     assert!(
@@ -34220,12 +34880,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 });
             }
 
-            /// One row per verb in table order, `sync` and `forget` among them and none of
-            /// the withdrawn spellings; the `.mesh help` error is a single sentence that
-            /// does not name `sync`, and under the node it touches nothing.
+            /// One row per command in table order, `sync` and `forget` among them and none
+            /// of the withdrawn spellings; `.mesh help` prints the same list, `.mesh help
+            /// --yes` is a single usage refusal, and under the node neither touches
+            /// anything.
             #[test]
             #[serial]
-            fn bare_mesh_lists_the_thirty_verbs_and_the_old_help_spelling_points_at_it() {
+            fn bare_mesh_and_mesh_help_list_every_command_in_table_order() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -34235,48 +34896,70 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let trust = started.runtime.trust();
                     let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
-                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                    out_of(&mut ctx, &format!(".mesh access trust {dest} --yes"))
                         .await
                         .unwrap();
                     let before = trust_file(&trust).expect("the record is on disk");
 
                     let out = out_of(&mut ctx, ".mesh").await.unwrap();
-                    let listed: Vec<&str> = out
+                    let usages: Vec<&str> = out
                         .lines()
-                        .filter_map(|line| line.strip_prefix("  .mesh "))
-                        .map(|rest| rest.split_whitespace().next().unwrap())
+                        .filter_map(|line| line.strip_prefix("  "))
+                        .filter(|line| line.starts_with(".mesh "))
                         .collect();
-                    let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
-                    assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 30, "{out}");
+                    let expected: Vec<&str> =
+                        COMMANDS.iter().map(|(_, _, usage, _)| *usage).collect();
+                    assert_eq!(usages, expected, "{out}");
+                    let listed: Vec<String> = COMMANDS
+                        .iter()
+                        .map(|(group, verb, _, _)| {
+                            format!("{group} {verb}").trim_start().to_string()
+                        })
+                        .collect();
                     for present in [
-                        "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
-                        "unshare", "shares", "grant", "refuse", "memory",
+                        "messaging sync",
+                        "access forget",
+                        "access revoke",
+                        "access trust",
+                        "access block",
+                        "access unblock",
+                        "files allow",
+                        "files deny",
+                        "files unshare",
+                        "files list",
+                        "files grant",
+                        "files refuse",
+                        "envoy memory",
+                        "help",
                     ] {
-                        assert!(listed.contains(&present), "{present}: {out}");
+                        assert!(
+                            listed.iter().any(|path| path == present),
+                            "{present}: {out}"
+                        );
                     }
-                    for absent in ["undeny", "help"] {
-                        assert!(!listed.contains(&absent), "{absent}: {out}");
+                    for absent in ["undeny", "files undeny", "untrust", "shares"] {
+                        assert!(!listed.iter().any(|path| path == absent), "{absent}: {out}");
                     }
-                    assert!(out.contains("  .mesh sync       Sync the messages a propagation node holds for this node now"), "{out}");
+                    assert!(out.contains("  .mesh messaging sync\n      Sync the messages a propagation node holds for this node now"), "{out}");
                     assert!(
-                        out.contains("  .mesh forget     Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger"),
+                        out.contains("      Erase everything this node knows of an identity: grants, blocks, knocks and envoy memory; it becomes a stranger"),
                         "{out}"
                     );
+                    assert_eq!(out_of(&mut ctx, ".mesh help").await.unwrap(), out);
 
-                    for old in [".mesh help", ".mesh help --yes"] {
-                        let printed = stdout_lines().len();
-                        let err = refusal(&mut ctx, old).await;
-                        let word = old.split_whitespace().nth(1).unwrap();
-                        assert_eq!(
-                            err,
-                            format!("Unknown .mesh command '{word}'. Type `.mesh` for the list."),
-                            "{old}"
-                        );
-                        assert_eq!(stdout_lines().len(), printed, "{old} prints nothing else");
-                        assert_eq!(trust_file(&trust).as_deref(), Some(before.as_slice()));
-                        assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
-                    }
+                    let printed = stdout_lines().len();
+                    let err = refusal(&mut ctx, ".mesh help --yes").await;
+                    assert_eq!(
+                        err,
+                        format!("Unexpected '--yes'. {}", render_verb_help("", "help"))
+                    );
+                    assert_eq!(
+                        stdout_lines().len(),
+                        printed,
+                        "the refusal prints nothing else"
+                    );
+                    assert_eq!(trust_file(&trust).as_deref(), Some(before.as_slice()));
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -34310,11 +34993,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (blocked_dest, blocked_id) = heard_peer(&started.runtime, "Bob", now);
                     let (plain, plain_id) = heard_peer(&started.runtime, "Pim", now);
                     for line in [
-                        format!(".mesh trust --identity {refused_id} --yes"),
-                        format!(".mesh block {refused} --yes"),
-                        format!(".mesh trust {blocked_dest} --yes"),
-                        format!(".mesh block --identity {blocked_id} --yes"),
-                        format!(".mesh trust {plain} --yes"),
+                        format!(".mesh access trust --identity {refused_id} --yes"),
+                        format!(".mesh access block {refused} --yes"),
+                        format!(".mesh access trust {blocked_dest} --yes"),
+                        format!(".mesh access block --identity {blocked_id} --yes"),
+                        format!(".mesh access trust {plain} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -34337,14 +35020,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .map(|(candidate, _)| candidate)
                             .collect()
                     };
-                    let offered = offers(&ctx, &["untrust", ""]);
+                    let offered = offers(&ctx, &["access", "revoke", ""]);
                     assert!(offered.contains(&plain), "{offered:?}");
                     assert!(!offered.contains(&refused), "blocked instance: {offered:?}");
                     assert!(
                         !offered.contains(&blocked_dest),
                         "blocked identity's instance: {offered:?}"
                     );
-                    let identities = offers(&ctx, &["untrust", "--identity", ""]);
+                    let identities = offers(&ctx, &["access", "revoke", "--identity", ""]);
                     assert!(identities.contains(&refused_id), "{identities:?}");
                     assert!(!identities.contains(&blocked_id), "{identities:?}");
                     // An identity trusted at the destination tier only holds no grant to
@@ -34357,18 +35040,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for identity in &identities {
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh untrust --identity {identity} --dry-run"),
+                            &format!(".mesh access revoke --identity {identity} --dry-run"),
                         )
                         .await
                         .unwrap_or_else(|err| panic!("untrust --identity {identity}: {err}"));
                         assert!(out.contains(DRY_RUN_NOTHING_CHANGED), "{out}");
                     }
                     assert_eq!(
-                        offers(&ctx, &["forget", ""]),
+                        offers(&ctx, &["access", "forget", ""]),
                         ["--identity ", "--dry-run"],
                         "`forget` takes no destination"
                     );
-                    let forgettable = offers(&ctx, &["forget", "--identity", ""]);
+                    let forgettable = offers(&ctx, &["access", "forget", "--identity", ""]);
                     let mut trusted_identities = [
                         refused_id.clone(),
                         plain_id.clone(),
@@ -34388,28 +35071,28 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for identity in &forgettable {
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh forget --identity {identity} --dry-run"),
+                            &format!(".mesh access forget --identity {identity} --dry-run"),
                         )
                         .await
                         .unwrap_or_else(|err| panic!("forget --identity {identity}: {err}"));
                         assert!(out.contains(DRY_RUN_NOTHING_CHANGED), "{out}");
                     }
-                    let trustable = offers(&ctx, &["trust", ""]);
+                    let trustable = offers(&ctx, &["access", "trust", ""]);
                     assert!(trustable.contains(&refused), "{trustable:?}");
                     assert!(!trustable.contains(&blocked_dest), "{trustable:?}");
-                    let trust_identities = offers(&ctx, &["trust", "--identity", ""]);
+                    let trust_identities = offers(&ctx, &["access", "trust", "--identity", ""]);
                     assert!(
                         !trust_identities.contains(&blocked_id),
                         "{trust_identities:?}"
                     );
                     assert!(trust_identities.contains(&plain_id), "{trust_identities:?}");
-                    let blockable = offers(&ctx, &["block", ""]);
+                    let blockable = offers(&ctx, &["access", "block", ""]);
                     assert!(
                         !blockable.contains(&refused),
                         "already blocked: {blockable:?}"
                     );
                     assert!(blockable.contains(&plain), "{blockable:?}");
-                    let blockable_identities = offers(&ctx, &["block", "--identity", ""]);
+                    let blockable_identities = offers(&ctx, &["access", "block", "--identity", ""]);
                     assert!(
                         !blockable_identities.contains(&blocked_id),
                         "{blockable_identities:?}"
@@ -34419,25 +35102,28 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{blockable_identities:?}"
                     );
                     assert_eq!(
-                        offers(&ctx, &["unblock", ""]),
+                        offers(&ctx, &["access", "unblock", ""]),
                         [refused.clone(), "--identity ".to_string()]
                     );
                     assert_eq!(
-                        offers(&ctx, &["unblock", "--identity", ""]),
+                        offers(&ctx, &["access", "unblock", "--identity", ""]),
                         std::slice::from_ref(&blocked_id)
                     );
 
                     // What `untrust <TAB>` offered, `untrust` takes without a refusal.
                     let before = trust_file(&trust).unwrap();
-                    let hashes: Vec<String> = offers(&ctx, &["untrust", ""])
+                    let hashes: Vec<String> = offers(&ctx, &["access", "revoke", ""])
                         .into_iter()
                         .filter(|candidate| !candidate.starts_with("--"))
                         .collect();
                     assert_eq!(hashes, vec![plain.clone()], "{hashes:?}");
                     for candidate in hashes {
-                        let out = out_of(&mut ctx, &format!(".mesh untrust {candidate} --dry-run"))
-                            .await
-                            .unwrap_or_else(|err| panic!("{candidate}: {err}"));
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh access revoke {candidate} --dry-run"),
+                        )
+                        .await
+                        .unwrap_or_else(|err| panic!("{candidate}: {err}"));
                         assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
                     }
                     assert_eq!(trust_file(&trust).as_deref(), Some(before.as_slice()));
@@ -34478,8 +35164,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
                     for line in [
-                        format!(".mesh trust --identity {id} --yes"),
-                        format!(".mesh block {refused} --yes"),
+                        format!(".mesh access trust --identity {id} --yes"),
+                        format!(".mesh access block {refused} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -34492,9 +35178,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     assert!(refused_row(&trust).unwrap().denied);
 
-                    let preview = out_of(&mut ctx, ".mesh trust --prune --older-than 1d --dry-run")
-                        .await
-                        .unwrap();
+                    let preview = out_of(
+                        &mut ctx,
+                        ".mesh access revoke --stale --older-than 1d --dry-run",
+                    )
+                    .await
+                    .unwrap();
                     assert!(!preview.contains(short(&refused)), "{preview}");
                     assert!(!preview.contains(&refused), "{preview}");
                     assert!(preview.contains(&stale), "{preview}");
@@ -34504,7 +35193,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let out = out_of(
                         &mut ctx,
-                        ".mesh trust --prune --older-than 1d --confirm prune-1",
+                        ".mesh access revoke --stale --older-than 1d --confirm prune-1",
                     )
                     .await
                     .unwrap();
@@ -34516,7 +35205,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(!trusted_hashes(&trust).contains(&stale));
                     assert!(trusted_hashes(&trust).contains(&id));
 
-                    let peers = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let peers = out_of(&mut ctx, ".mesh people list").await.unwrap();
                     let tia = table_rows(&peers)
                         .into_iter()
                         .find(|row| row[0] == "Tia")
@@ -34524,8 +35213,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(tia[3], "blocked (instance)", "{tia:?}");
 
                     for line in [
-                        format!(".mesh block --identity {id} --yes"),
-                        format!(".mesh unblock --identity {id} --yes"),
+                        format!(".mesh access block --identity {id} --yes"),
+                        format!(".mesh access unblock --identity {id} --yes"),
                     ] {
                         out_of(&mut ctx, &line).await.unwrap();
                     }
@@ -34536,7 +35225,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     for flag in ["", " --dry-run", " --yes"] {
                         let err =
-                            refusal(&mut ctx, &format!(".mesh untrust {refused}{flag}")).await;
+                            refusal(&mut ctx, &format!(".mesh access revoke {refused}{flag}"))
+                                .await;
                         assert_eq!(err, teaching, "{flag}");
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -34837,7 +35527,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await;
                         assert!(!fx.locations.workspace.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
@@ -34879,7 +35571,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
                         assert!(
@@ -34899,7 +35591,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(fx.locations.workspace.exists());
                         assert!(!fx.locations.global.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow notes/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow notes/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.contains(&format!(
                                 "Allowed `notes/**` for every trusted peer; written to {}.",
@@ -34933,11 +35627,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &["docs/a.md", "notes/n.md"],
                         )
                         .await;
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow notes/** --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow notes/** --global")
                             .await
                             .unwrap();
 
@@ -35002,7 +35696,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // `**` is broad by its head alone, even over an empty match.
                         let declined = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **").await.unwrap();
                         assert!(
                             out.contains(&format!(
                                 "`**` matches 3 file(s) under {}.",
@@ -35016,7 +35710,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(declined);
 
                         let non_tty = prompt_script::install_non_interactive();
-                        let err = refusal(&mut fx.ctx, ".mesh allow **").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow **").await;
                         assert!(
                             err.contains("Share 3 files matching `**` with every trusted peer?"),
                             "{err}"
@@ -35027,7 +35721,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Three files under a literal head: written without a question.
                         let _script = prompt_script::install(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         assert!(out.contains("Allowed `docs/**`"), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
@@ -35037,7 +35733,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let many: Vec<&str> = many.iter().map(String::as_str).collect();
                         let mut fx = ShareFixture::new("repl-mesh-allow-broad-many", &many).await;
                         let accepted = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.contains(&format!(
                                 "`docs/**` matches more than 100 file(s) under {}.",
@@ -35063,7 +35761,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-allow-dry-run", &["docs/a.md"]).await;
 
-                        for line in [".mesh allow docs/** --dry-run", ".mesh allow ** --dry-run"] {
+                        for line in [
+                            ".mesh files allow docs/** --dry-run",
+                            ".mesh files allow ** --dry-run",
+                        ] {
                             let out = out_of(&mut fx.ctx, line).await.unwrap();
                             assert!(out.contains("matches 1 file(s) under"), "{line}: {out}");
                             assert!(
@@ -35089,7 +35790,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = ShareFixture::new("repl-mesh-allow-force", &[".env"]).await;
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow .env --force --global")
                             .await
                             .unwrap();
 
@@ -35134,10 +35835,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
 
-                        out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                        out_of(&mut fx.ctx, ".mesh files allow .env --force --global")
                             .await
                             .unwrap();
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
 
@@ -35173,21 +35874,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink("../.env", fx.root.path.join("docs/settings"))
                             .unwrap();
 
-                        let err =
-                            refusal(&mut fx.ctx, ".mesh allow docs/settings --force --global")
-                                .await;
+                        let err = refusal(
+                            &mut fx.ctx,
+                            ".mesh files allow docs/settings --force --global",
+                        )
+                        .await;
 
                         assert_eq!(
                             err,
-                            "`docs/settings` resolves to `.env`, which the built-in deny names; `.mesh allow .env --force --global` lifts that file."
+                            "`docs/settings` resolves to `.env`, which the built-in deny names; `.mesh files allow .env --force --global` lifts that file."
                         );
                         assert!(!fx.locations.global.exists());
                         assert!(fx.entries().is_empty());
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow docs/settings").await;
                         assert_eq!(
                             err,
-                            "`docs/settings` resolves to `.env`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow .env --force --global` lifts that file."
+                            "`docs/settings` resolves to `.env`, which the built-in deny names, so an allow alone would share nothing; `.mesh files allow .env --force --global` lifts that file."
                         );
                         assert!(!fx.locations.global.exists());
                         assert!(fx.entries().is_empty());
@@ -35217,13 +35920,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .unwrap();
 
-                        let err =
-                            refusal(&mut fx.ctx, ".mesh allow certs/server.key --force --global")
-                                .await;
+                        let err = refusal(
+                            &mut fx.ctx,
+                            ".mesh files allow certs/server.key --force --global",
+                        )
+                        .await;
 
                         assert_eq!(
                             err,
-                            "`certs/server.key` resolves to `real.key`, which the built-in deny names; `.mesh allow real.key --force --global` lifts that file."
+                            "`certs/server.key` resolves to `real.key`, which the built-in deny names; `.mesh files allow real.key --force --global` lifts that file."
                         );
                         assert!(!fx.locations.global.exists());
                         assert!(fx.entries().is_empty());
@@ -35245,22 +35950,24 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow dlink").await,
+                            refusal(&mut fx.ctx, ".mesh files allow dlink").await,
                             "`dlink` is a link to `docs`; share what is under it with `docs/**`, or one file by its path."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow dlink/**").await,
+                            refusal(&mut fx.ctx, ".mesh files allow dlink/**").await,
                             "`dlink` is a link to `docs`; name the path through it as `docs/**`."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny dlink/*.md").await,
+                            refusal(&mut fx.ctx, ".mesh files deny dlink/*.md").await,
                             "`dlink` is a link to `docs`; name the path through it as `docs/*.md`."
                         );
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert!(fx.entries().is_empty());
                         assert!(!fx.locations.global.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "{out}");
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
                         fx.stop().await;
@@ -35285,7 +35992,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let env = fx.root.path.join(".env");
 
                         std::os::unix::fs::symlink("missing", &env).unwrap();
-                        for line in [".mesh allow .env --force --global", ".mesh allow .env"] {
+                        for line in [
+                            ".mesh files allow .env --force --global",
+                            ".mesh files allow .env",
+                        ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
                                 "`.env` is a link to nothing, so no rule through it can share a file; nothing was written.",
@@ -35295,7 +36005,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         fs::remove_file(&env).unwrap();
                         std::os::unix::fs::symlink(&real, &env).unwrap();
-                        for line in [".mesh allow .env --force --global", ".mesh deny .env"] {
+                        for line in [
+                            ".mesh files allow .env --force --global",
+                            ".mesh files deny .env",
+                        ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
                                 "`.env` is a link that leaves the share root, so no rule through it can share a file; nothing was written.",
@@ -35325,17 +36038,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow readme-link").await,
-                            "`readme-link` is a link to `README.md`; `.mesh allow README.md` names that file."
+                            refusal(&mut fx.ctx, ".mesh files allow readme-link").await,
+                            "`readme-link` is a link to `README.md`; `.mesh files allow README.md` names that file."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny readme-link").await,
-                            "`readme-link` is a link to `README.md`; `.mesh deny README.md` names that file."
+                            refusal(&mut fx.ctx, ".mesh files deny readme-link").await,
+                            "`readme-link` is a link to `README.md`; `.mesh files deny README.md` names that file."
                         );
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert!(fx.entries().is_empty());
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow README.md").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow README.md")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "{out}");
                         assert_eq!(
                             fx.entries(),
@@ -35363,14 +36078,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow .env --force --workspace").await,
+                            refusal(&mut fx.ctx, ".mesh files allow .env --force --workspace")
+                                .await,
                             teaching
                         );
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow .env --force").await,
+                            refusal(&mut fx.ctx, ".mesh files allow .env --force").await,
                             teaching
                         );
 
@@ -35393,7 +36109,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-allow-force-glob", &["k.pem"]).await;
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow *.pem --force --global").await;
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh files allow *.pem --force --global").await;
 
                         assert_eq!(
                             err,
@@ -35415,7 +36132,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-allow-force-plain", &["README.md"]).await;
 
                         let err =
-                            refusal(&mut fx.ctx, ".mesh allow README.md --force --global").await;
+                            refusal(&mut fx.ctx, ".mesh files allow README.md --force --global")
+                                .await;
 
                         assert_eq!(
                             err,
@@ -35436,11 +36154,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-allow-builtin-plain", &[".env"]).await;
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow .env").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow .env").await;
 
                         assert_eq!(
                             err,
-                            "`.env` is under the built-in deny, so an allow alone would share nothing; `.mesh allow .env --force --global` lifts it for this one file."
+                            "`.env` is under the built-in deny, so an allow alone would share nothing; `.mesh files allow .env --force --global` lifts it for this one file."
                         );
                         assert!(!fx.locations.global.exists());
                         fx.stop().await;
@@ -35464,22 +36182,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         for (line, sentence) in [
                             (
-                                ".mesh allow .git/**",
+                                ".mesh files allow .git/**",
                                 "`.git/` is never shared, not even with `--force`; nothing was written.",
                             ),
                             (
-                                ".mesh allow .git/config --force --global",
+                                ".mesh files allow .git/config --force --global",
                                 "`.git/config` is under `.git/`, which is never shared, not even with `--force`; nothing was written.",
                             ),
                             (
-                                ".mesh allow .coyote/**",
+                                ".mesh files allow .coyote/**",
                                 "`.coyote/` is never shared, not even with `--force`; nothing was written.",
                             ),
                         ] {
                             assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
                         }
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny .git/**").await,
+                            refusal(&mut fx.ctx, ".mesh files deny .git/**").await,
                             "`.git/` is never shared, so no deny is needed; nothing was written."
                         );
                         assert!(!fx.locations.global.exists());
@@ -35505,11 +36223,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await;
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow inbox/**").await,
+                            refusal(&mut fx.ctx, ".mesh files allow inbox/**").await,
                             "`inbox/` is never shared, not even with `--force`; nothing was written."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny inbox/fetched.md").await,
+                            refusal(&mut fx.ctx, ".mesh files deny inbox/fetched.md").await,
                             "`inbox/fetched.md` is under `inbox/`, which is never shared, so no deny is needed; nothing was written."
                         );
                         assert!(!fx.locations.global.exists());
@@ -35536,35 +36254,35 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await;
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow .git").await,
+                            refusal(&mut fx.ctx, ".mesh files allow .git").await,
                             "`.git/` is never shared, not even with `--force`; nothing was written."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny .coyote").await,
+                            refusal(&mut fx.ctx, ".mesh files deny .coyote").await,
                             "`.coyote/` is never shared, so no deny is needed; nothing was written."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow inbox").await,
+                            refusal(&mut fx.ctx, ".mesh files allow inbox").await,
                             "`inbox/` is never shared, not even with `--force`; nothing was written."
                         );
                         for (line, sentence) in [
                             (
-                                ".mesh allow .git/",
+                                ".mesh files allow .git/",
                                 "`.git/` is never shared, not even with `--force`; nothing was written.",
                             ),
                             (
-                                ".mesh deny .git/",
+                                ".mesh files deny .git/",
                                 "`.git/` is never shared, so no deny is needed; nothing was written.",
                             ),
                             (
-                                ".mesh allow .git/hooks/",
+                                ".mesh files allow .git/hooks/",
                                 "`.git/hooks/` is under `.git/`, which is never shared, not even with `--force`; nothing was written.",
                             ),
                         ] {
                             assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
                         }
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare .git/").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare .git/").await,
                             "`.git/` names a directory; name what is under it with `.git/**`, or one file by its path.",
                             "a legacy rule under `.git/**` is still removable, so unshare keeps the teaching"
                         );
@@ -35593,23 +36311,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         for (line, sentence) in [
                             (
-                                ".mesh allow vendor/dep/.git/**",
+                                ".mesh files allow vendor/dep/.git/**",
                                 "`vendor/dep/.git/` is never shared, not even with `--force`; nothing was written.",
                             ),
                             (
-                                ".mesh allow vendor/dep/.git",
+                                ".mesh files allow vendor/dep/.git",
                                 "`vendor/dep/.git/` is never shared, not even with `--force`; nothing was written.",
                             ),
                             (
-                                ".mesh allow vendor/dep/.git/HEAD --force --global",
+                                ".mesh files allow vendor/dep/.git/HEAD --force --global",
                                 "`vendor/dep/.git/HEAD` is under `.git/`, which is never shared, not even with `--force`; nothing was written.",
                             ),
                             (
-                                ".mesh deny vendor/dep/.git/hooks/*",
+                                ".mesh files deny vendor/dep/.git/hooks/*",
                                 "`vendor/dep/.git/` is never shared, so no deny is needed; nothing was written.",
                             ),
                             (
-                                ".mesh deny vendor/dep/.git/HEAD",
+                                ".mesh files deny vendor/dep/.git/HEAD",
                                 "`vendor/dep/.git/HEAD` is under `.git/`, which is never shared, so no deny is needed; nothing was written.",
                             ),
                         ] {
@@ -35658,38 +36376,38 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for (line, sentence) in [
                         (
-                            ".mesh allow .coyote/",
+                            ".mesh files allow .coyote/",
                             "`.coyote/` is never shared, not even with `--force`; nothing was written.",
                         ),
                         (
-                            ".mesh deny .coyote/",
+                            ".mesh files deny .coyote/",
                             "`.coyote/` is never shared, so no deny is needed; nothing was written.",
                         ),
                         (
-                            ".mesh allow inbox/",
+                            ".mesh files allow inbox/",
                             "`inbox/` is never shared, not even with `--force`; nothing was written.",
                         ),
                         (
-                            ".mesh deny inbox/",
+                            ".mesh files deny inbox/",
                             "`inbox/` is never shared, so no deny is needed; nothing was written.",
                         ),
                         (
-                            ".mesh allow vendor/dep/.git/",
+                            ".mesh files allow vendor/dep/.git/",
                             "`vendor/dep/.git/` is never shared, not even with `--force`; nothing was written.",
                         ),
                         (
-                            ".mesh deny vendor/dep/.git/hooks/",
+                            ".mesh files deny vendor/dep/.git/hooks/",
                             "`vendor/dep/.git/hooks/` is under `.git/`, which is never shared, so no deny is needed; nothing was written.",
                         ),
                     ] {
                         assert_eq!(err_of(&mut ctx, line), sentence, "{line}");
                     }
                     assert_eq!(
-                        err_of(&mut ctx, ".mesh allow docs/"),
+                        err_of(&mut ctx, ".mesh files allow docs/"),
                         "`docs/` names a directory; share what is under it with `docs/**`, or one file by its path."
                     );
                     assert_eq!(
-                        err_of(&mut ctx, ".mesh allow inbox"),
+                        err_of(&mut ctx, ".mesh files allow inbox"),
                         MESH_OFF,
                         "the bare directory is judged against the root, which the gate guards"
                     );
@@ -35721,12 +36439,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         for line in [
-                            ".mesh allow lnk/**",
-                            ".mesh allow lnk",
-                            ".mesh allow cfg --force --global",
-                            ".mesh allow cfg",
+                            ".mesh files allow lnk/**",
+                            ".mesh files allow lnk",
+                            ".mesh files allow cfg --force --global",
+                            ".mesh files allow cfg",
                         ] {
-                            let pattern = line.split_whitespace().nth(2).unwrap();
+                            let pattern = line.split_whitespace().nth(3).unwrap();
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
                                 format!(
@@ -35736,11 +36454,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                         }
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow sub/cfg --force --global").await,
+                            refusal(&mut fx.ctx, ".mesh files allow sub/cfg --force --global")
+                                .await,
                             "`sub/cfg` is under `.git/`, which is never shared, not even with `--force`; nothing was written."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny sub/cfg").await,
+                            refusal(&mut fx.ctx, ".mesh files deny sub/cfg").await,
                             "`sub/cfg` is under `.git/`, which is never shared, so no deny is needed; nothing was written."
                         );
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -35776,18 +36495,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny s").await,
+                            refusal(&mut fx.ctx, ".mesh files deny s").await,
                             "`s` is a link to `secrets/id_rsa`, which the built-in deny already holds back; nothing to deny."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny certs/server.pem").await,
-                            "`certs/server.pem` is a link to `docs/a.txt`; `.mesh deny docs/a.txt` keeps that file back."
+                            refusal(&mut fx.ctx, ".mesh files deny certs/server.pem").await,
+                            "`certs/server.pem` is a link to `docs/a.txt`; `.mesh files deny docs/a.txt` keeps that file back."
                         );
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert!(fx.entries().is_empty());
                         assert!(!fx.locations.global.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh deny docs/a.txt").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny docs/a.txt")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "{out}");
                         assert_eq!(fx.entries(), [deny_entry(Layer::Global, "docs/a.txt")]);
                         fx.stop().await;
@@ -35809,9 +36530,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         for line in [
-                            ".mesh allow flink/*",
-                            ".mesh deny flink/**",
-                            ".mesh allow flink/x.md --force --global",
+                            ".mesh files allow flink/*",
+                            ".mesh files deny flink/**",
+                            ".mesh files allow flink/x.md --force --global",
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
@@ -35839,22 +36560,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-trailing-slash", &["docs/a.md"]).await;
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow docs/").await,
+                            refusal(&mut fx.ctx, ".mesh files allow docs/").await,
                             "`docs/` names a directory; share what is under it with `docs/**`, or one file by its path."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny docs/").await,
+                            refusal(&mut fx.ctx, ".mesh files deny docs/").await,
                             "`docs/` names a directory; keep what is under it back with `docs/**`, or one file by its path."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare docs/").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare docs/").await,
                             "`docs/` names a directory; name what is under it with `docs/**`, or one file by its path."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow docs//").await,
+                            refusal(&mut fx.ctx, ".mesh files allow docs//").await,
                             "`docs//` names a directory; share what is under it with `docs/**`, or one file by its path."
                         );
-                        for line in [".mesh allow /", ".mesh deny //", ".mesh unshare /docs/"] {
+                        for line in [
+                            ".mesh files allow /",
+                            ".mesh files deny //",
+                            ".mesh files unshare /docs/",
+                        ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
                                 err.contains("Share patterns are relative to the workspace root"),
@@ -35881,18 +36606,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-bare-directory", &["docs/a.md"]).await;
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow docs").await,
+                            refusal(&mut fx.ctx, ".mesh files allow docs").await,
                             "`docs` names a directory; share what is under it with `docs/**`, or one file by its path."
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny docs").await,
+                            refusal(&mut fx.ctx, ".mesh files deny docs").await,
                             "`docs` names a directory; keep what is under it back with `docs/**`, or one file by its path."
                         );
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert!(!fx.locations.global.exists());
                         assert!(!fx.locations.workspace.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.ends_with(&format!(
                                 "Allowed `docs/**` for every trusted peer; written to {}.",
@@ -35916,7 +36643,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-allow-absolute", &["docs/a.md"]).await;
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow /etc/passwd").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow /etc/passwd").await;
 
                         assert!(
                             err.contains("Share patterns are relative to the workspace root"),
@@ -35939,7 +36666,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-allow-peer", &["docs/a.md"]).await;
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh allow docs/** --peer bob").await,
+                            refusal(&mut fx.ctx, ".mesh files allow docs/** --peer bob").await,
                             "'bob' is not a peer hash: expected a peer hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
                         );
                         assert!(!fx.locations.global.exists());
@@ -35947,7 +36674,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let peer = "ab".repeat(16);
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh allow docs/** --peer {}", peer.to_uppercase()),
+                            &format!(".mesh files allow docs/** --peer {}", peer.to_uppercase()),
                         )
                         .await
                         .unwrap();
@@ -35975,10 +36702,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx =
                             ShareFixture::new("repl-mesh-allow-again", &["docs/a.md"]).await;
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         let before = fs::read(&fx.locations.global).unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
 
                         assert!(
                             out.ends_with(&format!(
@@ -36011,7 +36742,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (_, locations) = share_locations(&ctx).unwrap();
                     let peer = "ab".repeat(16);
 
-                    let err = err_of(&mut ctx, &format!(".mesh allow .env --force --peer {peer}"));
+                    let err = err_of(
+                        &mut ctx,
+                        &format!(".mesh files allow .env --force --peer {peer}"),
+                    );
 
                     assert_eq!(
                         err,
@@ -36030,10 +36764,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _script = prompt_script::install(&[]);
                     let mut ctx = off_ctx();
                     for verb in ["allow", "deny", "unshare"] {
-                        let err =
-                            err_of(&mut ctx, &format!(".mesh {verb} docs/** --yes --dry-run"));
+                        let err = err_of(
+                            &mut ctx,
+                            &format!(".mesh files {verb} docs/** --yes --dry-run"),
+                        );
                         assert!(err.starts_with("Unexpected '--yes'"), "{verb}: {err}");
-                        assert!(err.contains(&format!(".mesh {verb}")), "{verb}: {err}");
+                        assert!(
+                            err.contains(&format!(".mesh files {verb}")),
+                            "{verb}: {err}"
+                        );
                         assert_ne!(err, MESH_OFF, "{verb}: the usage check comes first");
                     }
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -36048,7 +36787,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for verb in ["allow", "deny", "unshare"] {
                         let err = err_of(
                             &mut ctx,
-                            &format!(".mesh {verb} docs/** --global --workspace"),
+                            &format!(".mesh files {verb} docs/** --global --workspace"),
                         );
                         assert!(
                             err.starts_with(
@@ -36057,7 +36796,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{verb}: {err}"
                         );
                         assert!(
-                            err.contains(&format!("Usage: .mesh {verb}")),
+                            err.contains(&format!("Usage: .mesh files {verb}")),
                             "{verb}: {err}"
                         );
                     }
@@ -36075,9 +36814,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-allow-hash", &["docs/a.md"]).await;
                         let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
 
-                        let err =
-                            refusal(&mut fx.ctx, &format!(".mesh allow {}", dest.to_uppercase()))
-                                .await;
+                        let err = refusal(
+                            &mut fx.ctx,
+                            &format!(".mesh files allow {}", dest.to_uppercase()),
+                        )
+                        .await;
 
                         assert_eq!(
                             err,
@@ -36101,9 +36842,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = ShareFixture::new("repl-mesh-deny-hash", &["docs/a.md"]).await;
                         let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
 
-                        let err =
-                            refusal(&mut fx.ctx, &format!(".mesh deny {}", dest.to_uppercase()))
-                                .await;
+                        let err = refusal(
+                            &mut fx.ctx,
+                            &format!(".mesh files deny {}", dest.to_uppercase()),
+                        )
+                        .await;
 
                         assert_eq!(
                             err,
@@ -36130,7 +36873,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await;
 
                         let quiet = prompt_script::install(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh deny \"src/vault/*\"")
+                        let out = out_of(&mut fx.ctx, ".mesh files deny \"src/vault/*\"")
                             .await
                             .unwrap();
                         assert!(
@@ -36151,16 +36894,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(quiet);
 
                         let declined = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh deny **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny **").await.unwrap();
                         assert!(out.ends_with(NOTHING_CHANGED), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         drop(declined);
 
                         let accepted = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh deny **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny **").await.unwrap();
                         assert!(out.contains("Denied `**` to every peer"), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
-                        let out = out_of(&mut fx.ctx, ".mesh deny ** --yes").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny ** --yes")
+                            .await
+                            .unwrap();
                         assert!(
                             out.ends_with(&format!(
                                 "`**` is already denied to every peer in {}; nothing was changed.",
@@ -36205,7 +36950,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                             run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
 
-                            let out = out_of(&mut fx.ctx, "/mesh deny .vault/** --yes")
+                            let out = out_of(&mut fx.ctx, "/mesh files deny .vault/** --yes")
                                 .await
                                 .unwrap();
 
@@ -36237,13 +36982,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let _prefix = live_prefix_override::install(live.clone());
                             run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
 
-                            let err = run(&mut fx.ctx, "/mesh allow .vault/server.key")
+                            let err = run(&mut fx.ctx, "/mesh files allow .vault/server.key")
                                 .await
                                 .unwrap_err();
 
                             assert_eq!(
                                 crate::render::command_error_text(&err, live.load()),
-                                "Error: `.vault/server.key` is under the built-in deny, so an allow alone would share nothing; `/mesh allow .vault/server.key --force --global` lifts it for this one file."
+                                "Error: `.vault/server.key` is under the built-in deny, so an allow alone would share nothing; `/mesh files allow .vault/server.key --force --global` lifts it for this one file."
                             );
                             fx.stop().await;
                         });
@@ -36264,7 +37009,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                             run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
 
-                            let out = out_of(&mut fx.ctx, "/mesh shares").await.unwrap();
+                            let out = out_of(&mut fx.ctx, "/mesh files list").await.unwrap();
                             assert!(
                                 out.ends_with(
                                     "`/mesh allow docs/**` shares docs/ with every trusted peer."
@@ -36306,10 +37051,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-unshare", &["docs/a.md", "secrets/s"])
                                 .await;
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh deny secrets/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files deny secrets/**")
+                            .await
+                            .unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --dry-run")
                             .await
                             .unwrap();
                         assert!(
@@ -36322,7 +37071,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
                         assert_eq!(fx.entries().len(), 2);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.ends_with(&format!(
                                 "Removed the allow for `docs/**` from {}.",
@@ -36332,7 +37083,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(fx.entries(), [deny_entry(Layer::Global, "secrets/**")]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare secrets/**")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare secrets/**")
                             .await
                             .unwrap();
                         assert!(
@@ -36357,8 +37108,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-unshare-both", &["docs/a.md"]).await;
                         let quiet = prompt_script::install(&[]);
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
                         drop(quiet);
@@ -36369,7 +37122,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.entries(), both);
 
                         let declined = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
@@ -36392,7 +37147,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(declined);
 
                         let accepted = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.contains(&format!(
                                 "Removed the allow for `docs/**` from {}.",
@@ -36434,7 +37191,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.entries(), both);
 
                         let _script = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
@@ -36493,15 +37252,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
                         let quiet = prompt_script::install(&[]);
-                        out_of(&mut fx.ctx, ".mesh allow ** --yes").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow ** --yes")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
                         drop(quiet);
 
                         let _non_tty = prompt_script::install_non_interactive();
-                        let err = refusal(&mut fx.ctx, ".mesh unshare ** --global").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare ** --global").await;
                         assert!(
                             err.starts_with(&format!(
                                 "Remove the allow for `**` (3 files) from {}?",
@@ -36509,7 +37272,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )),
                             "{err}"
                         );
-                        let err = refusal(&mut fx.ctx, ".mesh unshare docs/**").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare docs/**").await;
                         assert!(
                             err.starts_with("Remove all 2 rules for `docs/**`?"),
                             "{err}"
@@ -36531,13 +37294,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &["docs/a.md", "notes/n.md"],
                         )
                         .await;
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow notes/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow notes/** --workspace")
                             .await
                             .unwrap();
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare docs/**").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare docs/**").await,
                             format!(
                                 "`docs/**` is held by {g} (allow); without a flag `.mesh unshare` edits {w}, which does not hold it. Run `.mesh unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
@@ -36545,7 +37310,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare docs/** --workspace").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare docs/** --workspace").await,
                             format!(
                                 "`docs/**` is held by {g} (allow), not by {w}. Run `.mesh unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
@@ -36554,7 +37319,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(fx.entries().len(), 2);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --global")
                             .await
                             .unwrap();
                         assert!(
@@ -36593,7 +37358,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.write_global(
                             "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/**\n",
                         );
-                        out_of(&mut fx.ctx, ".mesh deny notes/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files deny notes/** --workspace")
                             .await
                             .unwrap();
                         let before = fx.entries();
@@ -36602,7 +37367,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // Workspace holds the deny; `--global` names the workspace file,
                         // the deny kind and the `--workspace` command.
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare notes/** --global").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare notes/** --global").await,
                             format!(
                                 "`notes/**` is held by {w} (deny), not by {g}. Run `.mesh unshare notes/** --workspace` to remove it from {w}.",
                                 g = fx.global(),
@@ -36611,7 +37376,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         // Global holds `docs/**` twice; the refusal names both kinds.
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare docs/** --workspace").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare docs/** --workspace").await,
                             format!(
                                 "`docs/**` is held by {g} (allow and deny), not by {w}. Run `.mesh unshare docs/** --global` to remove it from {g}.",
                                 g = fx.global(),
@@ -36622,7 +37387,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(prompt_script::prompts_asked(), 0);
 
                         // The command the refusal names does the removal.
-                        let out = out_of(&mut fx.ctx, ".mesh unshare notes/** --workspace")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare notes/** --workspace")
                             .await
                             .unwrap();
                         assert!(
@@ -36648,7 +37413,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-unshare-unknown", &["docs/a.md"]).await;
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh unshare nope/**").await,
+                            refusal(&mut fx.ctx, ".mesh files unshare nope/**").await,
                             format!(
                                 "No share rule has the pattern `nope/**` in {} or {}; `.mesh shares` lists them.",
                                 fx.global(),
@@ -36669,14 +37434,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-unshare-override", &[".env"]).await;
                         let quiet = prompt_script::install(&[]);
-                        out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                        out_of(&mut fx.ctx, ".mesh files allow .env --force --global")
                             .await
                             .unwrap();
                         assert_eq!(fx.entries().len(), 2);
                         drop(quiet);
 
                         let accepted = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare .env").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare .env")
+                            .await
+                            .unwrap();
                         assert!(
                             out.ends_with(&format!(
                                 "Removed the allow and override for `.env` from {}.",
@@ -36718,7 +37485,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             true
                         });
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **").await.unwrap();
 
                         assert!(
                             out.ends_with(&format!(
@@ -36760,7 +37527,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             true
                         });
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **").await.unwrap();
 
                         assert!(
                             out.contains(&format!("Will write to {}:", fx.global())),
@@ -36812,7 +37579,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             true
                         });
 
-                        let err = refusal(&mut fx.ctx, ".mesh unshare **").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare **").await;
 
                         assert_eq!(
                             err,
@@ -36842,7 +37609,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "version: 1\nallow:\n- pattern: notes/**\noverride:\n- path: k.pem\n",
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
@@ -36899,7 +37666,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!out.contains(&peer), "no full hash in the listing: {out}");
 
                         let other = "ef".repeat(16);
-                        let out = out_of(&mut fx.ctx, &format!(".mesh shares --peer {other}"))
+                        let out = out_of(&mut fx.ctx, &format!(".mesh files list --peer {other}"))
                             .await
                             .unwrap();
                         assert!(out.starts_with("Share rules ("), "{out}");
@@ -36921,14 +37688,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "denies apply to every peer: {out}"
                         );
 
-                        let out = out_of(&mut fx.ctx, &format!(".mesh shares --peer {peer}"))
+                        let out = out_of(&mut fx.ctx, &format!(".mesh files list --peer {peer}"))
                             .await
                             .unwrap();
                         assert!(out.contains("src/**"), "{out}");
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh shares docs/**").await,
-                            format!("Unexpected 'docs/**'. {}", render_verb_help("shares"))
+                            refusal(&mut fx.ctx, ".mesh files list docs/**").await,
+                            format!(
+                                "Unexpected 'docs/**'. {}",
+                                render_verb_help("files", "list")
+                            )
                         );
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
@@ -36948,7 +37718,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -36962,7 +37732,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.write_global(
                             "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/b.md\n",
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -36988,7 +37758,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let peer = "ab".repeat(16);
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh shares --effective --peer {peer}"),
+                            &format!(".mesh files list --effective --peer {peer}"),
                         )
                         .await
                         .unwrap();
@@ -37022,7 +37792,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "version: 1\nallow:\n- pattern: .git/HEAD\n- pattern: vendor/x/.git/HEAD\n- pattern: docs/**\noverride:\n- path: .git/HEAD\n- path: vendor/x/.git/HEAD\n",
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -37086,7 +37856,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-shares-effective-cap", &names).await;
                         fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -37128,7 +37898,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // Exactly a page of files: every file listed, and no cap line, so
                         // the line means "more than shown", not "a full page".
                         fs::remove_file(fx.root.path.join(&files[LIST_PAGE_SIZE])).unwrap();
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert_eq!(table_rows(&out).len(), LIST_PAGE_SIZE, "{}", out.len());
@@ -37158,7 +37928,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .await;
                             fx.write_global("version: 1\n");
 
-                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                            let out = out_of(&mut fx.ctx, ".mesh files list --effective --all")
                                 .await
                                 .unwrap();
                             assert_eq!(
@@ -37200,7 +37970,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 ShareFixture::new("repl-mesh-shares-all-cap", &names).await;
                             fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
 
-                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                            let out = out_of(&mut fx.ctx, ".mesh files list --effective --all")
                                 .await
                                 .unwrap();
                             let rows = table_rows(&out);
@@ -37233,7 +38003,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                     .await;
 
                             assert_eq!(
-                                refusal(&mut fx.ctx, ".mesh shares --all").await,
+                                refusal(&mut fx.ctx, ".mesh files list --all").await,
                                 "`--all` works with `--effective`: run `.mesh shares --effective --all`."
                             );
                             fx.stop().await;
@@ -37256,7 +38026,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .await;
                             fx.write_global("version: 1\n");
 
-                            let out = out_of(&mut fx.ctx, ".mesh shares --effective --all")
+                            let out = out_of(&mut fx.ctx, ".mesh files list --effective --all")
                                 .await
                                 .unwrap();
                             assert_eq!(table_rows(&out), [[".git/good/", "protected"]], "{out}");
@@ -37280,7 +38050,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     publish_root(&ctx, &root.path);
                     let (_, locations) = share_locations(&ctx).unwrap();
 
-                    run_async(run(&mut ctx, ".mesh shares")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list")).unwrap();
                     let out = stdout_lines().join("\n");
                     assert!(
                         out.starts_with(&format!(
@@ -37294,22 +38064,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         &locations.global,
                         "version: 1\nallow:\n- pattern: docs/**\n",
                     );
-                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
                     let out = stdout_lines().join("\n");
                     assert!(lists_path(&out, "docs/a.md"), "{out}");
 
                     for line in [
-                        ".mesh allow docs/**",
-                        ".mesh allow ** --yes",
-                        ".mesh deny docs/**",
-                        ".mesh unshare docs/**",
+                        ".mesh files allow docs/**",
+                        ".mesh files allow ** --yes",
+                        ".mesh files deny docs/**",
+                        ".mesh files unshare docs/**",
                     ] {
                         assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
                     }
                     for line in [
-                        ".mesh allow docs/** --bogus",
-                        ".mesh deny docs/** --peer x",
-                        ".mesh unshare docs/** --force",
+                        ".mesh files allow docs/** --bogus",
+                        ".mesh files deny docs/** --peer x",
+                        ".mesh files unshare docs/** --force",
                     ] {
                         let err = err_of(&mut ctx, line);
                         assert!(err.starts_with("Unexpected '"), "{line}: {err}");
@@ -37317,21 +38087,21 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     }
                     for (line, teaching) in [
                         (
-                            ".mesh allow /etc/passwd",
+                            ".mesh files allow /etc/passwd",
                             "Share patterns are relative to the workspace root",
                         ),
                         (
-                            ".mesh unshare /etc/passwd",
+                            ".mesh files unshare /etc/passwd",
                             "Share patterns are relative to the workspace root",
                         ),
                         (
-                            ".mesh allow 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
+                            ".mesh files allow 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
                             "takes a file pattern, not a peer",
                         ),
-                        (".mesh allow x --peer bob", "'bob' is not a peer hash"),
-                        (".mesh deny docs/", "`docs/` names a directory"),
-                        (".mesh unshare docs/", "`docs/` names a directory"),
-                        (".mesh allow *.pem --force", "`*.pem` is a pattern"),
+                        (".mesh files allow x --peer bob", "'bob' is not a peer hash"),
+                        (".mesh files deny docs/", "`docs/` names a directory"),
+                        (".mesh files unshare docs/", "`docs/` names a directory"),
+                        (".mesh files allow *.pem --force", "`*.pem` is a pattern"),
                     ] {
                         let err = err_of(&mut ctx, line);
                         assert!(err.contains(teaching), "{line}: {err}");
@@ -37364,7 +38134,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let peer = "ab".repeat(16);
 
-                    run_async(run(&mut ctx, &format!(".mesh shares --peer {peer}"))).unwrap();
+                    run_async(run(&mut ctx, &format!(".mesh files list --peer {peer}"))).unwrap();
 
                     assert_eq!(
                         stdout_lines().join("\n"),
@@ -37401,7 +38171,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
 
-                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
                     let out = stdout_lines().join("\n");
                     assert_eq!(table_rows(&out), [["docs/a.md", "shared"]], "{out}");
                     assert!(table_footer(&out).is_empty(), "{out}");
@@ -37561,7 +38331,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     let mut off = off_ctx();
-                    for line in [".mesh shares", ".mesh shares --effective"] {
+                    for line in [".mesh files list", ".mesh files list --effective"] {
                         assert_eq!(err_of(&mut off, line), SHARE_ROOT_UNKNOWN, "{line}");
                     }
                     run_async(async {
@@ -37569,9 +38339,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut ctx = ctx_with(MeshConfig::default(), true);
                         ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         for line in [
-                            ".mesh allow docs/**",
-                            ".mesh deny docs/**",
-                            ".mesh unshare docs/**",
+                            ".mesh files allow docs/**",
+                            ".mesh files deny docs/**",
+                            ".mesh files unshare docs/**",
                         ] {
                             assert_eq!(refusal(&mut ctx, line).await, SHARE_ROOT_UNKNOWN, "{line}");
                         }
@@ -37595,9 +38365,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let before = fs::read(&fx.locations.global).unwrap();
 
                         for line in [
-                            ".mesh allow docs/**",
-                            ".mesh deny docs/**",
-                            ".mesh unshare docs/**",
+                            ".mesh files allow docs/**",
+                            ".mesh files deny docs/**",
+                            ".mesh files unshare docs/**",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains(&fx.global()), "{line}: {err}");
@@ -37606,7 +38376,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fs::read(&fx.locations.global).unwrap(), before);
                         assert!(!fx.locations.workspace.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert_eq!(out, "Nothing is shared until it is fixed.");
                         let warned = stderr_lines();
                         assert_eq!(warned.len(), 1, "{warned:?}");
@@ -37639,7 +38409,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.entries(), both);
 
                         let quiet = prompt_script::install(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --dry-run")
                             .await
                             .unwrap();
                         assert!(out.contains("allow"), "{out}");
@@ -37650,7 +38420,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(quiet);
 
                         let declined = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
@@ -37670,7 +38442,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(declined);
 
                         let accepted = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.ends_with(&format!(
                                 "Removed the allow and deny for `docs/**` from {}.",
@@ -37684,7 +38458,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // The pattern is reusable once removed.
                         let _quiet = prompt_script::install(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         assert!(out.contains("Allowed `docs/**`"), "{out}");
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
                         fx.stop().await;
@@ -37703,13 +38479,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx =
                             ShareFixture::new("repl-mesh-probe-unshare-layer", &["docs/a.md"])
                                 .await;
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
                         assert_eq!(fx.entries().len(), 2);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --global")
                             .await
                             .unwrap();
 
@@ -37727,7 +38505,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(prompt_script::prompts_asked(), 0);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --workspace")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --workspace")
                             .await
                             .unwrap();
                         assert!(
@@ -37758,15 +38536,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
                         fx.write_workspace("version: 1\noverride:\n- path: k.pem\n");
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(out.contains("ignored: overrides are honoured"), "{out}");
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare k.pem").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare k.pem")
+                            .await
+                            .unwrap();
 
                         assert!(out.contains("k.pem"), "{out}");
                         assert!(out.contains(&fx.workspace()), "{out}");
                         assert!(fx.entries().is_empty(), "{:?}", fx.entries());
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(!out.contains("k.pem"), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
@@ -37787,7 +38567,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
 
-                        let out = out_of(&mut fx.ctx, ".mesh deny docs/** --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh files deny docs/** --dry-run")
                             .await
                             .unwrap();
 
@@ -37832,12 +38612,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(fx.root.path.join("src/main.rs"), SECRET).unwrap();
                         let peer = "ab".repeat(16);
                         let other = "ef".repeat(16);
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, &format!(".mesh allow src/** --peer {peer}"))
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
                             .await
                             .unwrap();
+                        out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh files allow src/** --peer {peer}"),
+                        )
+                        .await
+                        .unwrap();
 
-                        let everyone = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let everyone = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(lists_path(&everyone, "docs/a.md"), "{everyone}");
@@ -37845,7 +38630,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let scoped = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh shares --effective --peer {peer}"),
+                            &format!(".mesh files list --effective --peer {peer}"),
                         )
                         .await
                         .unwrap();
@@ -37854,14 +38639,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let unscoped = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh shares --effective --peer {other}"),
+                            &format!(".mesh files list --effective --peer {other}"),
                         )
                         .await
                         .unwrap();
                         assert!(lists_path(&unscoped, "docs/a.md"), "{unscoped}");
                         assert!(!lists_path(&unscoped, "src/main.rs"), "{unscoped}");
 
-                        let rules = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let rules = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         for out in [&everyone, &scoped, &unscoped, &rules] {
                             assert!(!out.contains(SECRET), "{out}");
                             assert!(!out.contains(&peer), "{out}");
@@ -37886,11 +38671,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let many: Vec<&str> = many.iter().map(String::as_str).collect();
                         let mut fx =
                             ShareFixture::new("repl-mesh-probe-effective-bound", &many).await;
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --yes")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --yes")
                             .await
                             .unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
 
@@ -37985,9 +38770,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut ctx = ctx_with(MeshConfig::default(), true);
                         ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         for verb in ["allow", "deny", "unshare"] {
-                            let out = out_of(&mut ctx, &format!(".mesh {verb}")).await.unwrap();
+                            let out = out_of(&mut ctx, &format!(".mesh files {verb}"))
+                                .await
+                                .unwrap();
                             assert!(
-                                out.contains(&format!("Usage: .mesh {verb}")),
+                                out.contains(&format!("Usage: .mesh files {verb}")),
                                 "{verb}: {out}"
                             );
                         }
@@ -37995,9 +38782,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         seed_files(&root.path, &["docs/a.md"]);
                         publish_root(&ctx, &root.path);
                         for verb in ["allow", "deny", "unshare"] {
-                            let out = out_of(&mut ctx, &format!(".mesh {verb}")).await.unwrap();
+                            let out = out_of(&mut ctx, &format!(".mesh files {verb}"))
+                                .await
+                                .unwrap();
                             assert!(
-                                out.contains(&format!("Usage: .mesh {verb}")),
+                                out.contains(&format!("Usage: .mesh files {verb}")),
                                 "{verb}: {out}"
                             );
                         }
@@ -38022,14 +38811,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = off_ctx();
                     let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
 
-                    let err = err_of(&mut ctx, &format!(".mesh deny {dest}"));
+                    let err = err_of(&mut ctx, &format!(".mesh files deny {dest}"));
                     assert!(err.contains(&format!(".mesh block {dest}")), "{err}");
                     assert_ne!(err, MESH_OFF);
 
                     let root = TempDir::new("repl-mesh-probe-classify-off-root");
                     seed_files(&root.path, &["docs/a.md"]);
                     publish_root(&ctx, &root.path);
-                    let err = err_of(&mut ctx, ".mesh shares --peer bob");
+                    let err = err_of(&mut ctx, ".mesh files list --peer bob");
                     assert!(err.contains("'bob'"), "{err}");
                     assert!(err.contains("peer hash"), "{err}");
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -38135,7 +38924,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink(&outside.path, fx.root.path.join("linked"))
                             .unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow ** --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow ** --dry-run")
                             .await
                             .unwrap();
                         assert!(
@@ -38145,7 +38934,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )),
                             "{out}"
                         );
-                        for line in [".mesh allow linked/** --dry-run", ".mesh allow linked/**"] {
+                        for line in [
+                            ".mesh files allow linked/** --dry-run",
+                            ".mesh files allow linked/**",
+                        ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("leaves the share root"), "{line}: {err}");
                             assert!(!err.contains("matches"), "{line}: {err}");
@@ -38171,7 +38963,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .await;
 
                         let declined = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh allow **/*.md").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **/*.md")
+                            .await
+                            .unwrap();
                         assert!(out.contains("matches 1 file(s) under"), "{out}");
                         assert!(out.ends_with(NOTHING_CHANGED), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
@@ -38180,9 +38974,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let quiet = prompt_script::install(&[]);
                         for line in [
-                            ".mesh allow docs/[",
-                            ".mesh allow docs/../x",
-                            ".mesh allow ./docs/**",
+                            ".mesh files allow docs/[",
+                            ".mesh files allow docs/../x",
+                            ".mesh files allow ./docs/**",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_ne!(err, MESH_OFF, "{line}");
@@ -38191,8 +38985,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!fx.locations.global.exists());
                         assert!(!fx.locations.workspace.exists());
 
-                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
                         assert_eq!(fx.entries().len(), 2);
@@ -38200,13 +38996,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(quiet);
 
                         let non_tty = prompt_script::install_non_interactive();
-                        let err = refusal(&mut fx.ctx, ".mesh unshare docs/**").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare docs/**").await;
                         assert!(err.contains("--yes"), "{err}");
                         assert_eq!(fx.entries().len(), 2);
                         drop(non_tty);
 
                         let _quiet = prompt_script::install(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --yes")
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.global()), "{out}");
@@ -38223,7 +39019,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     let mut ctx = off_ctx();
-                    for line in [".mesh allow docs/** --peer", ".mesh shares --peer"] {
+                    for line in [
+                        ".mesh files allow docs/** --peer",
+                        ".mesh files list --peer",
+                    ] {
                         let err = err_of(&mut ctx, line);
                         assert_ne!(err, MESH_OFF, "{line}");
                         assert!(err.contains("--peer"), "{line}: {err}");
@@ -38292,17 +39091,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let workspace_before = fs::read(&locations.workspace).unwrap();
 
                     for line in [
-                        ".mesh allow .git/HEAD",
-                        ".mesh deny .git/HEAD",
-                        ".mesh allow .env",
-                        ".mesh allow .env --force --global",
-                        ".mesh allow docs/a.md --force --global",
-                        ".mesh allow **",
-                        ".mesh allow **/*.rs",
-                        ".mesh deny **",
-                        ".mesh unshare **",
-                        ".mesh allow docs/** --workspace",
-                        ".mesh allow docs/** --dry-run",
+                        ".mesh files allow .git/HEAD",
+                        ".mesh files deny .git/HEAD",
+                        ".mesh files allow .env",
+                        ".mesh files allow .env --force --global",
+                        ".mesh files allow docs/a.md --force --global",
+                        ".mesh files allow **",
+                        ".mesh files allow **/*.rs",
+                        ".mesh files deny **",
+                        ".mesh files unshare **",
+                        ".mesh files allow docs/** --workspace",
+                        ".mesh files allow docs/** --dry-run",
                     ] {
                         assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
                     }
@@ -38347,7 +39146,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::create_dir_all(fx.locations.workspace.parent().unwrap()).unwrap();
                         std::os::unix::fs::symlink(&victim, &fx.locations.workspace).unwrap();
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow docs/** --workspace").await;
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh files allow docs/** --workspace").await;
 
                         assert!(err.contains("is a symlink"), "{err}");
                         assert!(
@@ -38359,17 +39159,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "the link is refused before the write is announced: {:?}",
                             stdout_lines()
                         );
-                        let broad = refusal(&mut fx.ctx, ".mesh allow **/*.md --workspace").await;
+                        let broad =
+                            refusal(&mut fx.ctx, ".mesh files allow **/*.md --workspace").await;
                         assert!(broad.contains("is a symlink"), "{broad}");
                         assert_eq!(
                             prompt_script::prompts_asked(),
                             0,
                             "a broad pattern on a linked share file asks nothing"
                         );
-                        let denied = refusal(&mut fx.ctx, ".mesh deny **/*.md --workspace").await;
+                        let denied =
+                            refusal(&mut fx.ctx, ".mesh files deny **/*.md --workspace").await;
                         assert!(denied.contains("is a symlink"), "{denied}");
                         let unshared =
-                            refusal(&mut fx.ctx, ".mesh unshare zzz/** --workspace").await;
+                            refusal(&mut fx.ctx, ".mesh files unshare zzz/** --workspace").await;
                         assert!(unshared.contains("is a symlink"), "{unshared}");
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert_eq!(fs::read_to_string(&victim).unwrap(), victim_yaml);
@@ -38391,7 +39193,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let planted = fx.locations.workspace.with_added_extension("tmp");
                         std::os::unix::fs::symlink(&planted_target, &planted).unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
 
@@ -38432,7 +39234,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "no temp file survives the write: {leftovers:?}"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh deny src/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny src/**")
+                            .await
+                            .unwrap();
                         assert!(
                             out.ends_with(&format!(
                                 "Denied `src/**` to every peer; written to {}.",
@@ -38504,9 +39308,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         pinned
                     );
 
-                    run_async(run(&mut ctx, ".mesh shares")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list")).unwrap();
                     let printed = stdout_lines().len();
-                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
                     let out = stdout_lines()[printed..].join("\n");
                     assert!(lists_path(&out, "src/lib.rs"), "{out}");
                     run_async(run(&mut ctx, ".mesh on")).unwrap();
@@ -38557,7 +39361,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         let before = fs::read(&fx.locations.global).unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **").await.unwrap();
                         // The match-count line precedes the sentence; what must not follow
                         // is an announced write or a prompt.
                         assert_eq!(
@@ -38572,7 +39376,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             !out.contains("rite to") && !out.contains("Allowed `"),
                             "no write is announced for a held rule: {out}"
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh deny **/*.rs").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny **/*.rs")
+                            .await
+                            .unwrap();
                         assert_eq!(
                             out.lines().last().unwrap(),
                             &format!(
@@ -38587,7 +39393,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         assert_eq!(fs::read(&fx.locations.global).unwrap(), before);
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow .env --force --global")
                             .await
                             .unwrap();
                         assert!(
@@ -38605,7 +39411,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "the allow is not duplicated; the override joins it"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow .env --force --global")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -38621,7 +39427,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "no write is announced for a held pair: {out}"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow id_rsa --force --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow id_rsa --force --global")
                             .await
                             .unwrap();
                         assert!(
@@ -38670,7 +39476,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             true
                         });
 
-                        let out = out_of(&mut fx.ctx, ".mesh deny **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files deny **").await.unwrap();
 
                         assert!(
                             out.contains(&format!(
@@ -38720,7 +39526,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             true
                         });
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **").await.unwrap();
 
                         assert!(
                             out.contains(&format!("Will write to {}:", fx.workspace())),
@@ -38768,7 +39574,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             true
                         });
 
-                        let err = refusal(&mut fx.ctx, ".mesh unshare **").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare **").await;
 
                         assert_eq!(
                             err,
@@ -38803,19 +39609,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
                     let other = "ab".repeat(16);
 
-                    let err = err_of(&mut ctx, &format!(".mesh allow {dest}"));
+                    let err = err_of(&mut ctx, &format!(".mesh files allow {dest}"));
                     assert_ne!(err, MESH_OFF, "a pure check fires before the mesh gate");
                     assert!(err.contains(&format!(".mesh trust {dest}")), "{err}");
                     assert!(err.contains(&format!("--peer {dest}")), "{err}");
 
-                    let err = err_of(&mut ctx, &format!(".mesh allow {dest} --peer {other}"));
+                    let err = err_of(
+                        &mut ctx,
+                        &format!(".mesh files allow {dest} --peer {other}"),
+                    );
                     assert_ne!(err, MESH_OFF, "{err}");
                     assert!(
                         err.contains(&format!(".mesh trust {dest}")),
                         "the positional is still a hash, whatever follows: {err}"
                     );
 
-                    let err = err_of(&mut ctx, &format!(".mesh allow {dest} --dry-run"));
+                    let err = err_of(&mut ctx, &format!(".mesh files allow {dest} --dry-run"));
                     assert_ne!(err, MESH_OFF, "{err}");
                     assert!(err.contains(&format!(".mesh trust {dest}")), "{err}");
 
@@ -38827,7 +39636,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     // The same hash is a fine `--peer` VALUE: with the mesh off the verb then
                     // reaches the gate, not the hash teaching.
-                    let err = err_of(&mut ctx, &format!(".mesh allow docs/** --peer {dest}"));
+                    let err = err_of(
+                        &mut ctx,
+                        &format!(".mesh files allow docs/** --peer {dest}"),
+                    );
                     assert_eq!(err, MESH_OFF);
                 }
 
@@ -38849,11 +39661,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(err.contains("undeny"), "{err}");
 
                     for verb in ["allow", "deny", "unshare"] {
-                        run_async(run(&mut ctx, &format!(".mesh {verb}"))).unwrap();
+                        run_async(run(&mut ctx, &format!(".mesh files {verb}"))).unwrap();
                     }
                     let out = stdout_lines().join("\n");
                     for verb in ["allow", "deny", "unshare"] {
-                        assert!(out.contains(&render_verb_help(verb)), "{verb}: {out}");
+                        assert!(
+                            out.contains(&render_verb_help("files", verb)),
+                            "{verb}: {out}"
+                        );
                     }
                     assert!(!out.contains(MESH_OFF), "{out}");
                     assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
@@ -38886,13 +39701,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             fx.root.path.display()
                         );
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow docs/**").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow docs/**").await;
                         assert_eq!(err, sentence);
                         assert!(!fx.locations.global.exists());
                         assert!(!fx.locations.workspace.exists());
 
                         fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
-                        let err = refusal(&mut fx.ctx, ".mesh shares --effective").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files list --effective").await;
                         assert_eq!(err, sentence);
 
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -38918,7 +39733,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
 
-                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
 
                     let out = stdout_lines().join("\n");
                     assert_eq!(
@@ -38951,7 +39766,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
 
-                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
 
                     let err = stderr_lines().join("\n");
                     assert!(err.contains("Failed to resolve the share root"), "{err}");
@@ -38992,12 +39807,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         for line in [
-                            ".mesh deny docs/a.md",
-                            ".mesh deny **",
-                            ".mesh unshare docs/**",
-                            ".mesh unshare secrets/**",
-                            ".mesh allow **",
-                            ".mesh allow docs/b.md --dry-run",
+                            ".mesh files deny docs/a.md",
+                            ".mesh files deny **",
+                            ".mesh files unshare docs/**",
+                            ".mesh files unshare secrets/**",
+                            ".mesh files allow **",
+                            ".mesh files allow docs/b.md --dry-run",
                         ] {
                             assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
                         }
@@ -39006,7 +39821,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fs::read_to_string(&fx.locations.global).unwrap(), before);
                         assert!(!fx.locations.workspace.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(out.starts_with("Share rules ("), "{out}");
                         assert!(out.contains("docs/**"), "{out}");
                         assert!(out.contains("secrets/**"), "{out}");
@@ -39014,7 +39829,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         locked.restore();
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh deny docs/a.md").await,
+                            refusal(&mut fx.ctx, ".mesh files deny docs/a.md").await,
                             sentence,
                             "the node's probe is memoised; the sentence's remedy is off/on"
                         );
@@ -39051,7 +39866,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "version: 1\nallow:\n- pattern: docs/**\n- pattern: dl/**\n- pattern: docs/sub/**\n- pattern: docs/*.md\n- pattern: docs/a.md\n",
                     );
 
-                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
                     let out = stdout_lines().join("\n");
                     assert_eq!(
                         out.lines().next().unwrap(),
@@ -39122,7 +39937,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         expected_global.push(format!("{global_name}.lock"));
                         expected_global.sort();
 
-                        out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/a.md")
+                            .await
+                            .unwrap();
                         assert_eq!(siblings_of(&fx.locations.global), expected_global);
                         assert!(
                             fs::symlink_metadata(&fx.locations.global)
@@ -39131,9 +39948,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .is_file()
                         );
 
-                        out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/a.md")
+                            .await
+                            .unwrap();
                         assert_eq!(siblings_of(&fx.locations.global), expected_global, "no-op");
-                        out_of(&mut fx.ctx, ".mesh deny docs/b.md --dry-run")
+                        out_of(&mut fx.ctx, ".mesh files deny docs/b.md --dry-run")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -39141,9 +39960,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             expected_global,
                             "dry run"
                         );
-                        out_of(&mut fx.ctx, ".mesh deny docs/b.md").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files deny docs/b.md")
+                            .await
+                            .unwrap();
                         assert_eq!(siblings_of(&fx.locations.global), expected_global, "deny");
-                        out_of(&mut fx.ctx, ".mesh unshare docs/b.md")
+                        out_of(&mut fx.ctx, ".mesh files unshare docs/b.md")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -39152,7 +39973,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "unshare"
                         );
 
-                        out_of(&mut fx.ctx, ".mesh allow notes/n.md --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow notes/n.md --workspace")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -39160,7 +39981,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             std::slice::from_ref(&workspace_name),
                             "workspace created"
                         );
-                        out_of(&mut fx.ctx, ".mesh allow docs/b.md").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow docs/b.md")
+                            .await
+                            .unwrap();
                         assert_eq!(
                             siblings_of(&fx.locations.workspace),
                             std::slice::from_ref(&workspace_name),
@@ -39204,7 +40027,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.entries(), both);
 
                         let _script = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/**")
+                            .await
+                            .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
@@ -39226,7 +40051,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         assert_eq!(fx.entries(), both);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --workspace")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs/** --workspace")
                             .await
                             .unwrap();
                         assert!(
@@ -39268,7 +40093,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         run_async(run(
                             &mut ctx,
-                            &format!(".mesh shares --effective --peer {peer}"),
+                            &format!(".mesh files list --effective --peer {peer}"),
                         ))
                         .unwrap();
                         let err = stderr_lines().join("\n");
@@ -39288,7 +40113,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "version: 99\nallow:\n- pattern: '**'\n",
                         );
 
-                        run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                        run_async(run(&mut ctx, ".mesh files list --effective")).unwrap();
                         let out = stdout_lines().join("\n");
                         let err = stderr_lines().join("\n");
                         let all = format!("{out}\n{err}");
@@ -39323,13 +40148,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink("../.env", fx.root.path.join("docs/settings"))
                             .unwrap();
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
-                        let taught = "`.mesh allow .env --force --global`";
+                        let err = refusal(&mut fx.ctx, ".mesh files allow docs/settings").await;
+                        let taught = "`.mesh files allow .env --force --global`";
                         assert!(err.contains(taught), "{err}");
                         assert!(err.contains("resolves to `.env`"), "{err}");
                         assert!(fx.entries().is_empty());
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow .env --force --global")
                             .await
                             .unwrap();
                         assert!(out.contains("written to"), "{out}");
@@ -39341,7 +40166,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ]
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -39355,7 +40180,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(table_rows(&out), [[".env", "shared"]], "{out}");
                         assert!(table_footer(&out).is_empty(), "{out}");
 
-                        let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow docs/settings").await;
                         assert!(err.contains("resolves to `.env`"), "{err}");
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
@@ -39382,14 +40207,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await;
                         std::os::unix::fs::symlink("notes.txt", fx.root.path.join(".env")).unwrap();
 
-                        let plain = refusal(&mut fx.ctx, ".mesh allow .env").await;
+                        let plain = refusal(&mut fx.ctx, ".mesh files allow .env").await;
                         assert!(
                             plain.contains("`notes.txt`"),
                             "names the real file: {plain}"
                         );
                         assert!(!fx.locations.global.exists(), "{plain}");
                         let forced =
-                            refusal(&mut fx.ctx, ".mesh allow .env --force --global").await;
+                            refusal(&mut fx.ctx, ".mesh files allow .env --force --global").await;
                         assert!(
                             forced.contains("`notes.txt`"),
                             "names the real file: {forced}"
@@ -39401,7 +40226,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         for err in [&plain, &forced] {
                             let taught = err
                                 .split('`')
-                                .find(|part| part.starts_with(".mesh allow "))
+                                .find(|part| part.starts_with(".mesh files allow "))
                                 .unwrap_or_else(|| panic!("no taught command in: {err}"));
                             let out = out_of(&mut fx.ctx, taught)
                                 .await
@@ -39413,7 +40238,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{out}"
                             );
                         }
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "notes.txt"), "{out}");
@@ -39443,8 +40268,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
 
                         for line in [
-                            ".mesh allow docs/settings",
-                            ".mesh allow docs/settings --force --global",
+                            ".mesh files allow docs/settings",
+                            ".mesh files allow docs/settings --force --global",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(!err.contains('\u{1b}'), "{line}: raw escape in: {err:?}");
@@ -39477,7 +40302,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ];
                         assert_eq!(fx.entries(), both, "the file loads with the odd peer");
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(!out.contains('\u{1b}'), "shares: raw escape in: {out:?}");
                         assert!(out.contains("scoped to no peer"), "{out}");
                         assert!(
@@ -39486,7 +40311,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         let _non_tty = prompt_script::install_non_interactive();
-                        let err = refusal(&mut fx.ctx, ".mesh unshare docs/**").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare docs/**").await;
                         let out = stdout_lines().join("\n");
                         let printed = format!("{out}\n{err}");
                         assert!(
@@ -39524,10 +40349,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink(".git", fx.root.path.join("git-link")).unwrap();
 
                         for line in [
-                            ".mesh allow git-link/**",
-                            ".mesh allow git-link/config --force --global",
-                            ".mesh allow git-link",
-                            ".mesh deny git-link/**",
+                            ".mesh files allow git-link/**",
+                            ".mesh files allow git-link/config --force --global",
+                            ".mesh files allow git-link",
+                            ".mesh files deny git-link/**",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("never shared"), "{line}: {err}");
@@ -39540,7 +40365,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // A link elsewhere in the tree is not a protected head; the walk
                         // simply never follows it, so the plain file next to it still shares.
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/**")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "{out}");
                         fx.stop().await;
                     });
@@ -39563,8 +40390,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
                         let quiet = prompt_script::install(&[]);
-                        out_of(&mut fx.ctx, ".mesh allow ** --yes").await.unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow ** --yes --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow ** --yes")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow ** --yes --workspace")
                             .await
                             .unwrap();
                         drop(quiet);
@@ -39573,7 +40402,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let workspace_siblings = siblings_of(&fx.locations.workspace);
 
                         let _non_tty = prompt_script::install_non_interactive();
-                        let err = refusal(&mut fx.ctx, ".mesh unshare **").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files unshare **").await;
                         assert!(
                             err.starts_with("Remove all 2 rules for `**` (3 files)?"),
                             "{err}"
@@ -39582,7 +40411,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(_non_tty);
 
                         let _yes = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh unshare **").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare **").await.unwrap();
                         assert!(out.contains("`**` matches 3 file(s)"), "{out}");
                         assert!(out.contains("Removed"), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
@@ -39606,9 +40435,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut ctx = ctx_with(MeshConfig::default(), true);
                         for verb in ["allow", "deny", "unshare"] {
-                            let err =
-                                refusal(&mut ctx, &format!(".mesh {verb} docs/** --yes --dry-run"))
-                                    .await;
+                            let err = refusal(
+                                &mut ctx,
+                                &format!(".mesh files {verb} docs/** --yes --dry-run"),
+                            )
+                            .await;
                             assert!(
                                 err.contains("--yes") && err.contains("--dry-run"),
                                 "{verb}: {err}"
@@ -39618,7 +40449,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{verb}: usage before the gate: {err}"
                             );
                             let err =
-                                refusal(&mut ctx, &format!(".mesh {verb} docs/** --bogus")).await;
+                                refusal(&mut ctx, &format!(".mesh files {verb} docs/** --bogus"))
+                                    .await;
                             assert!(
                                 !err.contains(MESH_OFF),
                                 "{verb}: usage before the gate: {err}"
@@ -39628,7 +40460,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{verb}: {err}"
                             );
                         }
-                        let err = refusal(&mut ctx, ".mesh shares --bogus").await;
+                        let err = refusal(&mut ctx, ".mesh files list --bogus").await;
                         assert!(err.contains("Usage") || err.contains("--bogus"), "{err}");
                         assert_eq!(prompt_script::prompts_asked(), 0);
                     });
@@ -39703,11 +40535,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink(&victim, &fx.locations.global).unwrap();
 
                         for line in [
-                            ".mesh allow ** --yes",
-                            ".mesh deny ** --yes",
-                            ".mesh allow docs/a.md",
-                            ".mesh deny src/main.rs --global",
-                            ".mesh unshare zzz/**",
+                            ".mesh files allow ** --yes",
+                            ".mesh files deny ** --yes",
+                            ".mesh files allow docs/a.md",
+                            ".mesh files deny src/main.rs --global",
+                            ".mesh files unshare zzz/**",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("is a symlink"), "{line}: {err}");
@@ -39754,8 +40586,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink(&victim, &fx.locations.global).unwrap();
 
                         for line in [
-                            ".mesh allow docs/** --dry-run",
-                            ".mesh deny docs/** --dry-run",
+                            ".mesh files allow docs/** --dry-run",
+                            ".mesh files deny docs/** --dry-run",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("is a symlink"), "{line}: {err}");
@@ -39792,7 +40624,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink(&victim, &fx.locations.workspace).unwrap();
                         assert_eq!(fx.entries().len(), 2, "both layers hold `**`");
 
-                        for line in [".mesh unshare **", ".mesh unshare ** --workspace"] {
+                        for line in [
+                            ".mesh files unshare **",
+                            ".mesh files unshare ** --workspace",
+                        ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("is a symlink"), "{line}: {err}");
                             assert!(
@@ -39808,7 +40643,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             holder_yaml
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare ** --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare ** --global")
                             .await
                             .unwrap();
                         assert!(out.contains("Removed"), "{out}");
@@ -39842,12 +40677,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.write_global("version: 1\nallow:\n- pattern: docs\n");
 
                         for line in [
-                            ".mesh allow docs/sub",
-                            ".mesh deny docs/sub",
-                            ".mesh allow docs/sub --dry-run",
-                            ".mesh deny docs/sub --dry-run",
-                            ".mesh allow docs/sub --global",
-                            ".mesh allow docs/sub --workspace",
+                            ".mesh files allow docs/sub",
+                            ".mesh files deny docs/sub",
+                            ".mesh files allow docs/sub --dry-run",
+                            ".mesh files deny docs/sub --dry-run",
+                            ".mesh files allow docs/sub --global",
+                            ".mesh files allow docs/sub --workspace",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("`docs/sub/**`"), "{line}: {err}");
@@ -39857,13 +40692,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs", None)]);
                         assert!(!fx.locations.workspace.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare docs").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare docs")
+                            .await
+                            .unwrap();
                         assert!(out.contains("Removed"), "{out}");
                         assert!(fx.entries().is_empty(), "{out}");
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/a.md")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "a bare file name writes: {out}");
-                        let out = out_of(&mut fx.ctx, ".mesh allow nothing-here")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow nothing-here")
                             .await
                             .unwrap();
                         assert!(out.contains("written to"), "an absent name writes: {out}");
@@ -39895,12 +40734,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     publish_root(&ctx, &root.path);
                     let (_, locations) = share_locations(&ctx).unwrap();
 
-                    assert_eq!(err_of(&mut ctx, ".mesh allow docs"), MESH_OFF);
-                    assert_eq!(err_of(&mut ctx, ".mesh deny docs"), MESH_OFF);
+                    assert_eq!(err_of(&mut ctx, ".mesh files allow docs"), MESH_OFF);
+                    assert_eq!(err_of(&mut ctx, ".mesh files deny docs"), MESH_OFF);
                     for line in [
-                        ".mesh allow docs/",
-                        ".mesh deny docs/",
-                        ".mesh unshare docs/",
+                        ".mesh files allow docs/",
+                        ".mesh files deny docs/",
+                        ".mesh files unshare docs/",
                     ] {
                         let err = err_of(&mut ctx, line);
                         assert_ne!(err, MESH_OFF, "{line}: pure check fires before the gate");
@@ -39927,7 +40766,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ShareFixture::new("repl-mesh-probe-dir-link", &["docs/a.md"]).await;
                         std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
 
-                        let result = run(&mut fx.ctx, ".mesh allow dlink").await;
+                        let result = run(&mut fx.ctx, ".mesh files allow dlink").await;
                         assert!(
                             result.is_err(),
                             "a rule for a linked directory serves nothing (the walk never follows a linked directory, so `dlink` and `dlink/**` both resolve to no file), yet the verb wrote it: {:?}",
@@ -39966,8 +40805,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         for line in [
-                            ".mesh allow certs/server.pem",
-                            ".mesh allow certs/server.pem --force --global",
+                            ".mesh files allow certs/server.pem",
+                            ".mesh files allow certs/server.pem --force --global",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
@@ -39975,7 +40814,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{line}: names the real file: {err}"
                             );
                             assert!(
-                                err.contains("`.mesh allow docs/a.txt`"),
+                                err.contains("`.mesh files allow docs/a.txt`"),
                                 "{line}: teaches the plain allow: {err}"
                             );
                             assert!(
@@ -39988,11 +40827,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                         }
 
-                        for line in [".mesh allow .env", ".mesh allow .env --force --global"] {
+                        for line in [
+                            ".mesh files allow .env",
+                            ".mesh files allow .env --force --global",
+                        ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("`secrets/id_rsa`"), "{line}: {err}");
                             assert!(
-                                err.contains("`.mesh allow secrets/id_rsa --force --global`"),
+                                err.contains("`.mesh files allow secrets/id_rsa --force --global`"),
                                 "{line}: teaches the forced allow of the resolved secret: {err}"
                             );
                         }
@@ -40001,14 +40843,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
 
                         // Both taught commands are accepted by the verb.
-                        let out = out_of(&mut fx.ctx, ".mesh allow docs/a.txt").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow docs/a.txt")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "{out}");
-                        let out =
-                            out_of(&mut fx.ctx, ".mesh allow secrets/id_rsa --force --global")
-                                .await
-                                .unwrap();
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh files allow secrets/id_rsa --force --global",
+                        )
+                        .await
+                        .unwrap();
                         assert!(out.contains("written to"), "{out}");
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "docs/a.txt"), "{out}");
@@ -40059,13 +40905,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Link head, plain-file tail, so the real file is taught.
                         for line in [
-                            ".mesh allow dlink/a.md",
-                            ".mesh allow dlink/a.md --dry-run",
-                            ".mesh allow dlink/a.md --global",
-                            ".mesh allow dlink/a.md --workspace",
-                            ".mesh allow dlink/a.md --force",
-                            ".mesh deny dlink/a.md",
-                            ".mesh allow sub/dlink/a.md",
+                            ".mesh files allow dlink/a.md",
+                            ".mesh files allow dlink/a.md --dry-run",
+                            ".mesh files allow dlink/a.md --global",
+                            ".mesh files allow dlink/a.md --workspace",
+                            ".mesh files allow dlink/a.md --force",
+                            ".mesh files deny dlink/a.md",
+                            ".mesh files allow sub/dlink/a.md",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_eq!(
@@ -40078,24 +40924,25 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Nested link head, so the pattern is re-rooted through the real dir.
                         for (line, taught) in [
-                            (".mesh allow sub/dlink", "docs/**"),
-                            (".mesh allow sub/dlink/**", "docs/**"),
-                            (".mesh allow sub/dlink/*.md --dry-run", "docs/*.md"),
-                            (".mesh deny sub/dlink/**", "docs/**"),
-                            (".mesh allow deep", "docs/sub/**"),
-                            (".mesh allow deep/**", "docs/sub/**"),
-                            (".mesh allow deep/x.md", "docs/sub/x.md"),
-                            (".mesh allow dlink/sub/**", "docs/sub/**"),
-                            (".mesh allow dlink/sub/x.md", "docs/sub/x.md"),
-                            (".mesh allow dlink/sub", "docs/sub"),
-                            (".mesh deny dlink/sub", "docs/sub"),
+                            (".mesh files allow sub/dlink", "docs/**"),
+                            (".mesh files allow sub/dlink/**", "docs/**"),
+                            (".mesh files allow sub/dlink/*.md --dry-run", "docs/*.md"),
+                            (".mesh files deny sub/dlink/**", "docs/**"),
+                            (".mesh files allow deep", "docs/sub/**"),
+                            (".mesh files allow deep/**", "docs/sub/**"),
+                            (".mesh files allow deep/x.md", "docs/sub/x.md"),
+                            (".mesh files allow dlink/sub/**", "docs/sub/**"),
+                            (".mesh files allow dlink/sub/x.md", "docs/sub/x.md"),
+                            (".mesh files allow dlink/sub", "docs/sub"),
+                            (".mesh files deny dlink/sub", "docs/sub"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
                         }
                         // The taught path is a directory, which is then taught its glob.
                         for verb in ["allow", "deny"] {
-                            let err = refusal(&mut fx.ctx, &format!(".mesh {verb} docs/sub")).await;
+                            let err =
+                                refusal(&mut fx.ctx, &format!(".mesh files {verb} docs/sub")).await;
                             assert_eq!(taught_pattern(&err), "docs/sub/**", "{verb}: {err}");
                         }
 
@@ -40107,12 +40954,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Every taught remedy is accepted by the verb and serves the real file.
                         for taught in ["docs/a.md", "docs/sub/**"] {
-                            let out = out_of(&mut fx.ctx, &format!(".mesh allow {taught}"))
+                            let out = out_of(&mut fx.ctx, &format!(".mesh files allow {taught}"))
                                 .await
                                 .unwrap();
                             assert!(out.contains("written to"), "{taught}: {out}");
                         }
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "docs/a.md"), "{out}");
@@ -40146,7 +40993,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
 
                         // Root-resolving link: the remedy must be a pattern the verb takes.
-                        for line in [".mesh allow here/docs/**", ".mesh allow here/docs/a.md"] {
+                        for line in [
+                            ".mesh files allow here/docs/**",
+                            ".mesh files allow here/docs/a.md",
+                        ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
                                 err.contains("`here`") && err.contains("share root"),
@@ -40158,7 +41008,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{line}: teaches a pattern validate_pattern accepts: {err}"
                             );
                         }
-                        for line in [".mesh allow here", ".mesh allow here/**"] {
+                        for line in [".mesh files allow here", ".mesh files allow here/**"] {
                             let err = refusal(&mut fx.ctx, line).await;
                             let taught = taught_pattern(&err);
                             assert!(
@@ -40167,20 +41017,22 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             );
                             // `--dry-run` never prompts, so a broad remedy is probed
                             // for acceptance without `--yes`.
-                            let out =
-                                out_of(&mut fx.ctx, &format!(".mesh allow {taught} --dry-run"))
-                                    .await
-                                    .unwrap_or_else(|err| {
-                                        panic!("{line}: taught `{taught}` is refused: {err}")
-                                    });
+                            let out = out_of(
+                                &mut fx.ctx,
+                                &format!(".mesh files allow {taught} --dry-run"),
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                panic!("{line}: taught `{taught}` is refused: {err}")
+                            });
                             assert!(!out.contains("written to"), "{out}");
                         }
 
                         // A link to a link to a directory resolves to that directory.
                         for (line, taught) in [
-                            (".mesh allow chain/**", "docs/**"),
-                            (".mesh allow chain", "docs/**"),
-                            (".mesh allow chain/a.md", "docs/a.md"),
+                            (".mesh files allow chain/**", "docs/**"),
+                            (".mesh files allow chain", "docs/**"),
+                            (".mesh files allow chain/a.md", "docs/a.md"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
@@ -40188,10 +41040,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // A nested link head into `.git` is never shared.
                         for line in [
-                            ".mesh allow sub/glink/**",
-                            ".mesh allow sub/glink/HEAD",
-                            ".mesh allow sub/glink/HEAD --force --global",
-                            ".mesh deny sub/glink/**",
+                            ".mesh files allow sub/glink/**",
+                            ".mesh files allow sub/glink/HEAD",
+                            ".mesh files allow sub/glink/HEAD --force --global",
+                            ".mesh files deny sub/glink/**",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
@@ -40236,18 +41088,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let (_, locations) = share_locations(&ctx).unwrap();
 
                         for line in [
-                            ".mesh allow dlink",
-                            ".mesh allow dlink/**",
-                            ".mesh allow dlink/a.md",
-                            ".mesh allow gone",
-                            ".mesh allow gone --force --global",
-                            ".mesh deny dlink/**",
-                            ".mesh unshare dlink/**",
+                            ".mesh files allow dlink",
+                            ".mesh files allow dlink/**",
+                            ".mesh files allow dlink/a.md",
+                            ".mesh files allow gone",
+                            ".mesh files allow gone --force --global",
+                            ".mesh files deny dlink/**",
+                            ".mesh files unshare dlink/**",
                         ] {
                             assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
                         }
                         // The trailing-slash teaching is pure and still fires first.
-                        let err = err_of(&mut ctx, ".mesh allow dlink/");
+                        let err = err_of(&mut ctx, ".mesh files allow dlink/");
                         assert_ne!(err, MESH_OFF);
                         assert!(err.contains("/**`"), "{err}");
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -40266,23 +41118,23 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         // The legacy rows are listed with their file and serve nothing.
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(out.contains("dlink/**"), "{out}");
                         assert!(out.contains("dlink/b.md"), "{out}");
                         assert!(out.contains(&fx.global()), "{out}");
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "docs/a.md"), "{out}");
                         assert!(!out.contains("dlink"), "{out}");
 
                         // Re-asking for the legacy allow is still refused (nothing doubled).
-                        let err = refusal(&mut fx.ctx, ".mesh allow dlink/**").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow dlink/**").await;
                         assert_eq!(taught_pattern(&err), "docs/**", "{err}");
                         assert_eq!(fx.entries().len(), 3);
 
                         // unshare works by text and removes each legacy row.
-                        let out = out_of(&mut fx.ctx, ".mesh unshare dlink/**")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare dlink/**")
                             .await
                             .unwrap_or_else(|err| {
                                 panic!(
@@ -40290,7 +41142,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 )
                             });
                         assert!(out.contains("dlink/**"), "{out}");
-                        let out = out_of(&mut fx.ctx, ".mesh unshare dlink/b.md")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare dlink/b.md")
                             .await
                             .unwrap_or_else(|err| {
                                 panic!(
@@ -40337,7 +41189,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ] {
                             let offered: Vec<String> = fx
                                 .ctx
-                                .repl_complete(".mesh", &["allow", prefix], "")
+                                .repl_complete(".mesh", &["files", "allow", prefix], "")
                                 .into_iter()
                                 .map(|(candidate, _)| candidate)
                                 .collect();
@@ -40358,7 +41210,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             }
                         }
                         // Each offered value through a link is one the verb refuses.
-                        let err = refusal(&mut fx.ctx, ".mesh allow dlink/a.md").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files allow dlink/a.md").await;
                         assert!(err.contains("`docs/a.md`"), "{err}");
                         assert!(fx.entries().is_empty());
                         fx.stop().await;
@@ -40385,14 +41237,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let (_, locations) = share_locations(&ctx).unwrap();
 
                     for line in [
-                        ".mesh allow .git/",
-                        ".mesh deny .git/",
-                        ".mesh allow .git/hooks/",
-                        ".mesh allow vendor/dep/.git/",
-                        ".mesh deny vendor/dep/.git/hooks/",
-                        ".mesh allow **/.git/",
-                        ".mesh deny vendor/*/.git/",
-                        ".mesh allow .git/ --force --global",
+                        ".mesh files allow .git/",
+                        ".mesh files deny .git/",
+                        ".mesh files allow .git/hooks/",
+                        ".mesh files allow vendor/dep/.git/",
+                        ".mesh files deny vendor/dep/.git/hooks/",
+                        ".mesh files allow **/.git/",
+                        ".mesh files deny vendor/*/.git/",
+                        ".mesh files allow .git/ --force --global",
                     ] {
                         let err = err_of(&mut ctx, line);
                         assert_ne!(err, MESH_OFF, "{line}: pure check fires before the gate");
@@ -40403,8 +41255,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                     }
                     for (line, taught) in [
-                        (".mesh unshare .git/", ".git/**"),
-                        (".mesh unshare vendor/dep/.git/", "vendor/dep/.git/**"),
+                        (".mesh files unshare .git/", ".git/**"),
+                        (".mesh files unshare vendor/dep/.git/", "vendor/dep/.git/**"),
                     ] {
                         let err = err_of(&mut ctx, line);
                         assert_ne!(err, MESH_OFF, "{line}");
@@ -40412,9 +41264,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     }
                     // The bare directory is judged against the root, which the gate guards.
                     for line in [
-                        ".mesh allow .git",
-                        ".mesh deny .git",
-                        ".mesh allow vendor/dep/.git",
+                        ".mesh files allow .git",
+                        ".mesh files deny .git",
+                        ".mesh files allow vendor/dep/.git",
                     ] {
                         assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
                     }
@@ -40464,38 +41316,47 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink("vendor/dep/src", root.join("srclink")).unwrap();
 
                         let skipped = [
-                            (".mesh allow clink", ".coyote"),
-                            (".mesh allow clink/**", ".coyote"),
-                            (".mesh allow clink/config.yaml", ".coyote"),
-                            (".mesh allow cfile --force --global", ".coyote"),
-                            (".mesh deny clink/**", ".coyote"),
-                            (".mesh deny cfile", ".coyote"),
-                            (".mesh allow ilink", "inbox"),
-                            (".mesh allow ilink/**", "inbox"),
-                            (".mesh allow ilink/fetched.md --force --global", "inbox"),
-                            (".mesh deny ilink/fetched.md", "inbox"),
-                            (".mesh allow nlink", "vendor/dep/.git"),
-                            (".mesh allow nlink/**", "vendor/dep/.git"),
-                            (".mesh allow hooks/**", "vendor/dep/.git"),
-                            (".mesh allow hooks/pre-commit", "vendor/dep/.git"),
-                            (".mesh allow nhead", "vendor/dep/.git"),
-                            (".mesh allow nhead --force --global", "vendor/dep/.git"),
-                            (".mesh deny nlink/**", "vendor/dep/.git"),
-                            (".mesh deny nhead", "vendor/dep/.git"),
-                            (".mesh allow docs/glink/**", "vendor/dep/.git"),
-                            (".mesh deny docs/glink/HEAD", "vendor/dep/.git"),
+                            (".mesh files allow clink", ".coyote"),
+                            (".mesh files allow clink/**", ".coyote"),
+                            (".mesh files allow clink/config.yaml", ".coyote"),
+                            (".mesh files allow cfile --force --global", ".coyote"),
+                            (".mesh files deny clink/**", ".coyote"),
+                            (".mesh files deny cfile", ".coyote"),
+                            (".mesh files allow ilink", "inbox"),
+                            (".mesh files allow ilink/**", "inbox"),
+                            (
+                                ".mesh files allow ilink/fetched.md --force --global",
+                                "inbox",
+                            ),
+                            (".mesh files deny ilink/fetched.md", "inbox"),
+                            (".mesh files allow nlink", "vendor/dep/.git"),
+                            (".mesh files allow nlink/**", "vendor/dep/.git"),
+                            (".mesh files allow hooks/**", "vendor/dep/.git"),
+                            (".mesh files allow hooks/pre-commit", "vendor/dep/.git"),
+                            (".mesh files allow nhead", "vendor/dep/.git"),
+                            (
+                                ".mesh files allow nhead --force --global",
+                                "vendor/dep/.git",
+                            ),
+                            (".mesh files deny nlink/**", "vendor/dep/.git"),
+                            (".mesh files deny nhead", "vendor/dep/.git"),
+                            (".mesh files allow docs/glink/**", "vendor/dep/.git"),
+                            (".mesh files deny docs/glink/HEAD", "vendor/dep/.git"),
                         ];
                         let mut violations = Vec::new();
                         // By name, with no link at all: `.git` below the root is a
                         // directory the walk never enters either.
                         let by_name = [
-                            (".mesh allow vendor/dep/.git/**", "vendor/dep/.git"),
+                            (".mesh files allow vendor/dep/.git/**", "vendor/dep/.git"),
                             (
-                                ".mesh allow vendor/dep/.git/HEAD --force --global",
+                                ".mesh files allow vendor/dep/.git/HEAD --force --global",
                                 "vendor/dep/.git",
                             ),
-                            (".mesh deny vendor/dep/.git/hooks/*", "vendor/dep/.git"),
-                            (".mesh allow vendor/dep/.git", "vendor/dep/.git"),
+                            (
+                                ".mesh files deny vendor/dep/.git/hooks/*",
+                                "vendor/dep/.git",
+                            ),
+                            (".mesh files allow vendor/dep/.git", "vendor/dep/.git"),
                         ];
                         for (line, under) in skipped.into_iter().chain(by_name) {
                             let err = match out_of(&mut fx.ctx, line).await {
@@ -40519,8 +41380,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .filter(|(index, _)| index % 2 == 1)
                                 .any(|(_, token)| {
                                     token.starts_with(&format!("{under}/")) && token.contains("**")
-                                        || token.starts_with(".mesh allow")
-                                        || token.starts_with(".mesh deny")
+                                        || token.starts_with(".mesh files allow")
+                                        || token.starts_with(".mesh files deny")
                                 });
                             if names_a_remedy_under {
                                 violations.push(format!("{line}: teaches a refused remedy: {err}"));
@@ -40529,9 +41390,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Control: a nested link beside the nested `.git` resolves normally.
                         for (line, taught) in [
-                            (".mesh allow srclink/**", "vendor/dep/src/**"),
-                            (".mesh allow srclink/lib.rs", "vendor/dep/src/lib.rs"),
-                            (".mesh deny srclink/*.rs", "vendor/dep/src/*.rs"),
+                            (".mesh files allow srclink/**", "vendor/dep/src/**"),
+                            (".mesh files allow srclink/lib.rs", "vendor/dep/src/lib.rs"),
+                            (".mesh files deny srclink/*.rs", "vendor/dep/src/*.rs"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
@@ -40550,7 +41411,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ));
                             // The operator's own view must agree with what the wire
                             // path serves for the rules that got written.
-                            let effective = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            let effective = out_of(&mut fx.ctx, ".mesh files list --effective")
                                 .await
                                 .unwrap();
                             let listed = effective
@@ -40577,11 +41438,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         assert_eq!(prompt_script::prompts_asked(), 0);
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow vendor/dep/src/**")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow vendor/dep/src/**")
                             .await
                             .unwrap();
                         assert!(out.contains("written to"), "{out}");
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "vendor/dep/src/lib.rs"), "{out}");
@@ -40615,11 +41476,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let mut violations = Vec::new();
                         for line in [
-                            ".mesh allow .coyote/",
-                            ".mesh deny .coyote/",
-                            ".mesh allow inbox/",
-                            ".mesh deny inbox/",
-                            ".mesh allow vendor/dep/.git/",
+                            ".mesh files allow .coyote/",
+                            ".mesh files deny .coyote/",
+                            ".mesh files allow inbox/",
+                            ".mesh files deny inbox/",
+                            ".mesh files allow vendor/dep/.git/",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             let taught = err
@@ -40630,8 +41491,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .find(|token| token.ends_with("/**"));
                             let Some(taught) = taught else { continue };
                             // Whatever is taught must be a pattern the verb takes.
-                            let verb = line.split_whitespace().nth(1).unwrap();
-                            let probe = format!(".mesh {verb} {taught} --dry-run");
+                            let verb = line.split_whitespace().nth(2).unwrap();
+                            let probe = format!(".mesh files {verb} {taught} --dry-run");
                             if let Err(err2) = out_of(&mut fx.ctx, &probe).await {
                                 violations.push(format!(
                                     "{line} => {err:?} teaches `{taught}`, which `{probe}` refuses: {err2}"
@@ -40681,12 +41542,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         std::os::unix::fs::symlink("dlink", root.join("chain")).unwrap();
 
                         for line in [
-                            ".mesh deny gone",
-                            ".mesh deny gone/**",
-                            ".mesh deny .env",
-                            ".mesh deny outdir/**",
-                            ".mesh deny outdir",
-                            ".mesh deny outfile",
+                            ".mesh files deny gone",
+                            ".mesh files deny gone/**",
+                            ".mesh files deny .env",
+                            ".mesh files deny outdir/**",
+                            ".mesh files deny outdir",
+                            ".mesh files deny outfile",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
@@ -40694,7 +41555,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "{line}: says it is a link and that nothing was written: {err}"
                             );
                             assert!(
-                                !err.contains("already holds back") && !err.contains(".mesh deny"),
+                                !err.contains("already holds back")
+                                    && !err.contains(".mesh files deny"),
                                 "{line}: a dead link is judged before the built-in deny and teaches nothing: {err}"
                             );
                             assert!(
@@ -40704,28 +41566,28 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
 
                         for (line, taught) in [
-                            (".mesh deny chain/**", "docs/**"),
-                            (".mesh deny chain/a.md", "docs/a.md"),
-                            (".mesh deny chain", "docs/**"),
+                            (".mesh files deny chain/**", "docs/**"),
+                            (".mesh files deny chain/a.md", "docs/a.md"),
+                            (".mesh files deny chain", "docs/**"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
                         }
                         for line in [
-                            ".mesh deny here/docs/**",
-                            ".mesh deny here/docs/a.md",
-                            ".mesh deny here",
+                            ".mesh files deny here/docs/**",
+                            ".mesh files deny here/docs/a.md",
+                            ".mesh files deny here",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             let taught = taught_pattern(&err);
-                            let out =
-                                out_of(&mut fx.ctx, &format!(".mesh deny {taught} --dry-run"))
-                                    .await
-                                    .unwrap_or_else(|err2| {
-                                        panic!(
-                                            "{line}: taught `{taught}` is refused by deny: {err2}"
-                                        )
-                                    });
+                            let out = out_of(
+                                &mut fx.ctx,
+                                &format!(".mesh files deny {taught} --dry-run"),
+                            )
+                            .await
+                            .unwrap_or_else(|err2| {
+                                panic!("{line}: taught `{taught}` is refused by deny: {err2}")
+                            });
                             assert!(!out.contains("written to"), "{out}");
                         }
 
@@ -40775,7 +41637,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let offered = |fx: &ShareFixture, prefix: &str| -> Vec<String> {
                             fx.ctx
-                                .repl_complete(".mesh", &["allow", prefix], "")
+                                .repl_complete(".mesh", &["files", "allow", prefix], "")
                                 .into_iter()
                                 .map(|(candidate, _)| candidate)
                                 .filter(|candidate| !candidate.starts_with("--"))
@@ -40813,9 +41675,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Each hidden prefix names something the verb refuses.
                         for line in [
-                            ".mesh allow vendor/dep/.git/HEAD",
-                            ".mesh allow docs/slink/b.md",
-                            ".mesh allow inbox/fetched.md",
+                            ".mesh files allow vendor/dep/.git/HEAD",
+                            ".mesh files allow docs/slink/b.md",
+                            ".mesh files allow inbox/fetched.md",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(!err.contains("written to"), "{line}: {err}");
@@ -40854,13 +41716,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let mut violations = Vec::new();
                         for line in [
-                            ".mesh allow vendor/*/.git/HEAD",
-                            ".mesh allow vendor/*/.git/**",
-                            ".mesh allow */.git/config",
-                            ".mesh allow **/.git/HEAD",
-                            ".mesh deny vendor/*/.git/hooks/*",
-                            ".mesh deny **/.git/**",
-                            ".mesh allow vendor/*/.git/HEAD --dry-run",
+                            ".mesh files allow vendor/*/.git/HEAD",
+                            ".mesh files allow vendor/*/.git/**",
+                            ".mesh files allow */.git/config",
+                            ".mesh files allow **/.git/HEAD",
+                            ".mesh files deny vendor/*/.git/hooks/*",
+                            ".mesh files deny **/.git/**",
+                            ".mesh files allow vendor/*/.git/HEAD --dry-run",
                         ] {
                             let before = stdout_lines().len();
                             match out_of(&mut fx.ctx, line).await {
@@ -40907,7 +41769,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         // The ordinary glob beside it is untouched by the check, and the
                         // walk it counts never enters the nested `.git`.
-                        let out = out_of(&mut fx.ctx, ".mesh allow vendor/*/** --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow vendor/*/** --dry-run")
                             .await
                             .unwrap();
                         assert!(out.contains("matches 1 file(s)"), "{out}");
@@ -40949,18 +41811,33 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let mut violations = Vec::new();
                         for (line, count) in [
-                            (".mesh allow .gitignore --dry-run", "matches 1 file(s)"),
-                            (".mesh allow .github/** --dry-run", "matches 2 file(s)"),
-                            (".mesh allow foo.git/HEAD --dry-run", "matches 1 file(s)"),
-                            (".mesh allow foo.git/** --dry-run", "matches 1 file(s)"),
-                            (".mesh allow src/git/x.rs --dry-run", "matches 1 file(s)"),
                             (
-                                ".mesh allow .coyote-notes/** --dry-run",
+                                ".mesh files allow .gitignore --dry-run",
                                 "matches 1 file(s)",
                             ),
-                            (".mesh allow inbox2/** --dry-run", "matches 1 file(s)"),
-                            (".mesh deny .github/** --dry-run", "matches 2 file(s)"),
-                            (".mesh deny .gitignore --dry-run", "matches 1 file(s)"),
+                            (
+                                ".mesh files allow .github/** --dry-run",
+                                "matches 2 file(s)",
+                            ),
+                            (
+                                ".mesh files allow foo.git/HEAD --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files allow foo.git/** --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files allow src/git/x.rs --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files allow .coyote-notes/** --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (".mesh files allow inbox2/** --dry-run", "matches 1 file(s)"),
+                            (".mesh files deny .github/** --dry-run", "matches 2 file(s)"),
+                            (".mesh files deny .gitignore --dry-run", "matches 1 file(s)"),
                         ] {
                             match out_of(&mut fx.ctx, line).await {
                                 Ok(out) => {
@@ -40973,10 +41850,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         // Trailing slash on a lookalike directory keeps the ordinary teaching.
                         for (line, taught) in [
-                            (".mesh allow .github/", ".github/**"),
-                            (".mesh allow foo.git/", "foo.git/**"),
-                            (".mesh allow .coyote-notes/", ".coyote-notes/**"),
-                            (".mesh allow inbox2/", "inbox2/**"),
+                            (".mesh files allow .github/", ".github/**"),
+                            (".mesh files allow foo.git/", "foo.git/**"),
+                            (".mesh files allow .coyote-notes/", ".coyote-notes/**"),
+                            (".mesh files allow inbox2/", "inbox2/**"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             if err.contains("never shared") || taught_pattern(&err) != taught {
@@ -40985,9 +41862,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         // Bare lookalike directories likewise.
                         for (line, taught) in [
-                            (".mesh allow .github", ".github/**"),
-                            (".mesh allow foo.git", "foo.git/**"),
-                            (".mesh allow inbox2", "inbox2/**"),
+                            (".mesh files allow .github", ".github/**"),
+                            (".mesh files allow foo.git", "foo.git/**"),
+                            (".mesh files allow inbox2", "inbox2/**"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             if err.contains("never shared") || taught_pattern(&err) != taught {
@@ -40995,7 +41872,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             }
                         }
                         // The completer offers the lookalikes and hides the real ones.
-                        let offered = fx.ctx.repl_complete(".mesh", &["allow", ""], "");
+                        let offered = fx.ctx.repl_complete(".mesh", &["files", "allow", ""], "");
                         let labels: Vec<&str> = offered.iter().map(|(v, _)| v.as_str()).collect();
                         for want in [
                             ".gitignore",
@@ -41014,13 +41891,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             }
                         }
                         // One real write, to prove the lookalike is a rule like any other.
-                        let out = out_of(&mut fx.ctx, ".mesh allow .github/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow .github/**")
+                            .await
+                            .unwrap();
                         assert!(out.contains("written to"), "{out}");
                         assert_eq!(
                             fx.entries(),
                             [allow_entry(Layer::Global, ".github/**", None)]
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(out.contains(".github/workflows/ci.yml"), "{out}");
@@ -41056,11 +41935,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "version: 1\nallow:\n- pattern: vendor/dep/.git/HEAD\n- pattern: docs/**\noverride:\n- path: vendor/dep/.git/HEAD\n",
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(out.contains("vendor/dep/.git/HEAD"), "{out}");
                         assert!(out.contains(&fx.global()), "{out}");
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(out.contains("docs/a.md"), "{out}");
@@ -41083,7 +41962,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "--effective must agree with the wire path: {out}"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare vendor/dep/.git/HEAD")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare vendor/dep/.git/HEAD")
                             .await
                             .unwrap();
                         assert!(
@@ -41111,7 +41990,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Gone: a second unshare finds no holder and writes nothing.
                         let entries = fx.entries();
-                        let err = refusal(&mut fx.ctx, ".mesh unshare vendor/dep/.git/HEAD").await;
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh files unshare vendor/dep/.git/HEAD").await;
                         assert!(!err.contains("never shared"), "{err}");
                         assert_eq!(fx.entries(), entries);
                         fx.stop().await;
@@ -41121,13 +42001,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // the slash form does not.
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     for line in [
-                        ".mesh allow vendor/dep/.git/HEAD",
-                        ".mesh allow vendor/*/.git/HEAD",
-                        ".mesh deny vendor/dep/.git/hooks/*",
+                        ".mesh files allow vendor/dep/.git/HEAD",
+                        ".mesh files allow vendor/*/.git/HEAD",
+                        ".mesh files deny vendor/dep/.git/hooks/*",
                     ] {
                         assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
                     }
-                    assert_ne!(err_of(&mut ctx, ".mesh allow vendor/dep/.git/"), MESH_OFF);
+                    assert_ne!(
+                        err_of(&mut ctx, ".mesh files allow vendor/dep/.git/"),
+                        MESH_OFF
+                    );
                 }
 
                 /// A link to a directory that CONTAINS a nested `.git`
@@ -41159,11 +42042,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let mut violations = Vec::new();
                         for (line, taught) in [
-                            (".mesh allow dlink", "vendor/dep/**"),
-                            (".mesh allow dlink/**", "vendor/dep/**"),
-                            (".mesh deny dlink", "vendor/dep/**"),
-                            (".mesh allow dlink/src/*.rs", "vendor/dep/src/*.rs"),
-                            (".mesh allow dlink/README.md", "vendor/dep/README.md"),
+                            (".mesh files allow dlink", "vendor/dep/**"),
+                            (".mesh files allow dlink/**", "vendor/dep/**"),
+                            (".mesh files deny dlink", "vendor/dep/**"),
+                            (".mesh files allow dlink/src/*.rs", "vendor/dep/src/*.rs"),
+                            (".mesh files allow dlink/README.md", "vendor/dep/README.md"),
                         ] {
                             match out_of(&mut fx.ctx, line).await {
                                 Ok(out) => violations.push(format!("{line}: accepted: {out:?}")),
@@ -41183,10 +42066,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         // Through the link into the nested `.git`: refused, no remedy under it.
                         for line in [
-                            ".mesh allow dlink/.git/HEAD",
-                            ".mesh allow dlink/.git/HEAD --force --global",
-                            ".mesh allow dlink/.git/**",
-                            ".mesh deny dlink/.git/hooks/*",
+                            ".mesh files allow dlink/.git/HEAD",
+                            ".mesh files allow dlink/.git/HEAD --force --global",
+                            ".mesh files allow dlink/.git/**",
+                            ".mesh files deny dlink/.git/hooks/*",
                         ] {
                             match out_of(&mut fx.ctx, line).await {
                                 Ok(out) => violations.push(format!("{line}: accepted: {out:?}")),
@@ -41211,13 +42094,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         // The taught remedies are accepted and the walk skips the `.git`.
                         for (line, count) in [
-                            (".mesh allow vendor/dep/** --dry-run", "matches 2 file(s)"),
                             (
-                                ".mesh allow vendor/dep/src/*.rs --dry-run",
+                                ".mesh files allow vendor/dep/** --dry-run",
+                                "matches 2 file(s)",
+                            ),
+                            (
+                                ".mesh files allow vendor/dep/src/*.rs --dry-run",
                                 "matches 1 file(s)",
                             ),
                             (
-                                ".mesh allow vendor/dep/README.md --dry-run",
+                                ".mesh files allow vendor/dep/README.md --dry-run",
                                 "matches 1 file(s)",
                             ),
                         ] {
@@ -41271,14 +42157,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let mut violations = Vec::new();
                         for line in [
-                            format!(".mesh allow */{dir}/mesh-shares.yaml"),
-                            format!(".mesh allow vendor/*/{dir}/**"),
-                            format!(".mesh allow **/{dir}/**"),
-                            format!(".mesh deny vendor/*/{dir}/*.yaml"),
-                            format!(".mesh deny **/{dir}/**"),
-                            format!(".mesh allow */{dir}/mesh-shares.yaml --dry-run"),
-                            format!(".mesh allow vendor/*/{dir}/ --dry-run"),
-                            format!(".mesh deny **/{dir}/"),
+                            format!(".mesh files allow */{dir}/mesh-shares.yaml"),
+                            format!(".mesh files allow vendor/*/{dir}/**"),
+                            format!(".mesh files allow **/{dir}/**"),
+                            format!(".mesh files deny vendor/*/{dir}/*.yaml"),
+                            format!(".mesh files deny **/{dir}/**"),
+                            format!(".mesh files allow */{dir}/mesh-shares.yaml --dry-run"),
+                            format!(".mesh files allow vendor/*/{dir}/ --dry-run"),
+                            format!(".mesh files deny **/{dir}/"),
                         ] {
                             let before = stdout_lines().len();
                             match out_of(&mut fx.ctx, &line).await {
@@ -41293,7 +42179,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                         violations.push(format!("{line}: {err}"));
                                     }
                                     // No remedy under the protected directory is taught.
-                                    if err.contains(".mesh allow") || err.contains(".mesh deny") {
+                                    if err.contains(".mesh files allow")
+                                        || err.contains(".mesh files deny")
+                                    {
                                         violations.push(format!("{line}: teaches a remedy: {err}"));
                                     }
                                 }
@@ -41317,7 +42205,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // held back by the built-in deny at any depth, so `--effective`
                         // never lists it (the match count is the pattern alone and may
                         // include it).
-                        let out = out_of(&mut fx.ctx, ".mesh allow vendor/*/**")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow vendor/*/**")
                             .await
                             .unwrap();
                         assert!(out.contains("written to"), "{out}");
@@ -41325,7 +42213,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             fx.entries(),
                             [allow_entry(Layer::Global, "vendor/*/**", None)]
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "vendor/dep/src/lib.rs"), "{out}");
@@ -41359,17 +42247,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // gate; the no-slash form needs the root and waits behind it.
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     for line in [
-                        format!(".mesh allow */{dir}/"),
-                        format!(".mesh deny **/{dir}/"),
-                        format!(".mesh allow vendor/*/{dir}/"),
+                        format!(".mesh files allow */{dir}/"),
+                        format!(".mesh files deny **/{dir}/"),
+                        format!(".mesh files allow vendor/*/{dir}/"),
                     ] {
                         let err = err_of(&mut ctx, &line);
                         assert_ne!(err, MESH_OFF, "{line}");
                         assert!(err.contains("never shared"), "{line}: {err}");
                     }
                     for line in [
-                        format!(".mesh allow */{dir}/mesh-shares.yaml"),
-                        format!(".mesh deny **/{dir}/**"),
+                        format!(".mesh files allow */{dir}/mesh-shares.yaml"),
+                        format!(".mesh files deny **/{dir}/**"),
                     ] {
                         assert_eq!(err_of(&mut ctx, &line), MESH_OFF, "{line}");
                     }
@@ -41413,21 +42301,42 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let mut violations = Vec::new();
                         for (line, count) in [
-                            (".mesh allow */.gitignore --dry-run", "matches 1 file(s)"),
-                            (".mesh allow */.github/** --dry-run", "matches 2 file(s)"),
-                            (".mesh allow */foo.git/HEAD --dry-run", "matches 1 file(s)"),
-                            (".mesh allow src/*/x.rs --dry-run", "matches 1 file(s)"),
                             (
-                                ".mesh allow */.coyote-notes/* --dry-run",
+                                ".mesh files allow */.gitignore --dry-run",
                                 "matches 1 file(s)",
                             ),
-                            (".mesh deny */.github/** --dry-run", "matches 2 file(s)"),
+                            (
+                                ".mesh files allow */.github/** --dry-run",
+                                "matches 2 file(s)",
+                            ),
+                            (
+                                ".mesh files allow */foo.git/HEAD --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files allow src/*/x.rs --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files allow */.coyote-notes/* --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files deny */.github/** --dry-run",
+                                "matches 2 file(s)",
+                            ),
                             // Glob segments that would match `.git` as a glob are not
                             // the name `.git`; the walk decides, and never enters it.
-                            (".mesh allow .git* --dry-run", "matches 2 file(s)"),
-                            (".mesh allow *.git/HEAD --dry-run", "matches 1 file(s)"),
-                            (".mesh allow vendor/*/.g*/** --dry-run", "matches 0 file(s)"),
-                            (".mesh deny .git* --dry-run", "matches 2 file(s)"),
+                            (".mesh files allow .git* --dry-run", "matches 2 file(s)"),
+                            (
+                                ".mesh files allow *.git/HEAD --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh files allow vendor/*/.g*/** --dry-run",
+                                "matches 0 file(s)",
+                            ),
+                            (".mesh files deny .git* --dry-run", "matches 2 file(s)"),
                         ] {
                             match out_of(&mut fx.ctx, line).await {
                                 Ok(out) => {
@@ -41441,9 +42350,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // Trailing slash on a lookalike behind a glob keeps the ordinary
                         // `<dir>/**` teaching, never the protected-directory refusal.
                         for (line, taught) in [
-                            (".mesh allow */.github/", "*/.github/**"),
-                            (".mesh allow */foo.git/", "*/foo.git/**"),
-                            (".mesh deny sub/.coyote-notes/", "sub/.coyote-notes/**"),
+                            (".mesh files allow */.github/", "*/.github/**"),
+                            (".mesh files allow */foo.git/", "*/foo.git/**"),
+                            (
+                                ".mesh files deny sub/.coyote-notes/",
+                                "sub/.coyote-notes/**",
+                            ),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             if err.contains("never shared") || taught_pattern(&err) != taught {
@@ -41453,11 +42365,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(prompt_script::prompts_asked(), 0, "{violations:?}");
 
                         // One real write behind a glob, and one broad one (confirmed).
-                        let out = out_of(&mut fx.ctx, ".mesh allow */.github/**")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow */.github/**")
                             .await
                             .unwrap();
                         assert!(out.contains("written to"), "{out}");
-                        let out = out_of(&mut fx.ctx, ".mesh allow **/.gitignore")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow **/.gitignore")
                             .await
                             .unwrap();
                         assert!(out.contains("written to"), "{out}");
@@ -41473,7 +42385,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 allow_entry(Layer::Global, "**/.gitignore", None),
                             ]
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         for want in [
@@ -41521,7 +42433,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "version: 1\nallow:\n- pattern: vendor/*/.git/HEAD\n- pattern: '**/.git/**'\n- pattern: docs/**\ndeny:\n- pattern: '*/.git/hooks/*'\n",
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         for want in [
                             "vendor/*/.git/HEAD",
                             "**/.git/**",
@@ -41532,13 +42444,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         assert!(out.contains(&fx.global()), "{out}");
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                        let out = out_of(&mut fx.ctx, ".mesh files list --effective")
                             .await
                             .unwrap();
                         assert!(shared(&out, "docs/a.md"), "{out}");
                         assert!(!out.contains(".git/"), "{out}");
 
-                        let offered = fx.ctx.repl_complete(".mesh", &["unshare", ""], "");
+                        let offered = fx.ctx.repl_complete(".mesh", &["files", "unshare", ""], "");
                         let labels: Vec<&str> = offered.iter().map(|(v, _)| v.as_str()).collect();
                         for want in ["vendor/*/.git/HEAD", "**/.git/**", "*/.git/hooks/*"] {
                             assert!(
@@ -41549,14 +42461,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // The write verbs still refuse the same spellings (no re-add).
                         for line in [
-                            ".mesh allow vendor/*/.git/HEAD",
-                            ".mesh deny */.git/hooks/*",
+                            ".mesh files allow vendor/*/.git/HEAD",
+                            ".mesh files deny */.git/hooks/*",
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(err.contains("never shared"), "{line}: {err}");
                         }
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare vendor/*/.git/HEAD")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare vendor/*/.git/HEAD")
                             .await
                             .unwrap();
                         assert!(
@@ -41569,7 +42481,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "a single holder asks nothing"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare */.git/hooks/*")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare */.git/hooks/*")
                             .await
                             .unwrap();
                         assert!(
@@ -41578,7 +42490,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(prompt_script::prompts_asked(), 0);
 
-                        let out = out_of(&mut fx.ctx, ".mesh unshare **/.git/**")
+                        let out = out_of(&mut fx.ctx, ".mesh files unshare **/.git/**")
                             .await
                             .unwrap();
                         assert!(
@@ -41594,7 +42506,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
 
                         // Gone: a second unshare finds no holder, and is not a never-shared refusal.
-                        let err = refusal(&mut fx.ctx, ".mesh unshare vendor/*/.git/HEAD").await;
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh files unshare vendor/*/.git/HEAD").await;
                         assert!(!err.contains("never shared"), "{err}");
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
                         fx.stop().await;
@@ -41617,10 +42530,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await;
 
-                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                        out_of(&mut fx.ctx, ".mesh files allow docs/** --workspace")
                             .await
                             .unwrap();
-                        out_of(&mut fx.ctx, ".mesh allow notes/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files allow notes/**")
+                            .await
+                            .unwrap();
                         assert_eq!(
                             fx.entries(),
                             [
@@ -41632,7 +42547,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         fs::remove_file(&fx.locations.workspace).unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow src/x.rs").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files allow src/x.rs")
+                            .await
+                            .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
                             lines,
@@ -41659,7 +42576,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(fx.entries(), [allow_entry(Layer::Global, "src/x.rs", None)]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         // The header names both files, the removed one as absent; the rows
                         // are the global file's alone.
                         assert!(out.contains(&fx.global()), "{out}");
@@ -41680,7 +42597,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{out}"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh allow etc/e.cfg --workspace")
+                        let out = out_of(&mut fx.ctx, ".mesh files allow etc/e.cfg --workspace")
                             .await
                             .unwrap();
                         assert!(
@@ -41725,9 +42642,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let declined = prompt_script::install(&[false, false, false]);
                         for line in [
-                            ".mesh deny docs/**",
-                            ".mesh allow **/*.md",
-                            ".mesh unshare **",
+                            ".mesh files deny docs/**",
+                            ".mesh files allow **/*.md",
+                            ".mesh files unshare **",
                         ] {
                             let out = out_of(&mut fx.ctx, line).await.unwrap();
                             assert!(out.contains(NOTHING_CHANGED), "{line}: {out}");
@@ -41737,10 +42654,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let _script = prompt_script::install(&[]);
                         for line in [
-                            ".mesh deny docs/** --dry-run",
-                            ".mesh allow **/*.md --dry-run",
-                            ".mesh unshare ** --dry-run",
-                            ".mesh allow notes/** --dry-run",
+                            ".mesh files deny docs/** --dry-run",
+                            ".mesh files allow **/*.md --dry-run",
+                            ".mesh files unshare ** --dry-run",
+                            ".mesh files allow notes/** --dry-run",
                         ] {
                             let out = out_of(&mut fx.ctx, line).await.unwrap();
                             assert!(!out.contains("written to"), "{line}: {out}");
@@ -41749,7 +42666,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         drop(_script);
 
                         let _non_tty = prompt_script::install_non_interactive();
-                        let err = refusal(&mut fx.ctx, ".mesh deny docs/**").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files deny docs/**").await;
                         assert!(err.contains("--yes"), "{err}");
 
                         assert_eq!(
@@ -41974,26 +42891,31 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh shares --effective --all prints it.";
                             for (line, expected) in [
                                 (
-                                    format!(".mesh request {to} {} --yes", seventeen.join(" ")),
+                                    format!(
+                                        ".mesh files request {to} {} --yes",
+                                        seventeen.join(" ")
+                                    ),
                                     format!(
                                         "The access request was not sent: it names 17 paths and a request carries at most {ACCESS_MAX_PATHS}. Ask for at most {ACCESS_MAX_PATHS} paths per request."
                                     ),
                                 ),
                                 (
-                                    format!(".mesh request {to} a.md --reason \"{long_reason}\""),
+                                    format!(
+                                        ".mesh files request {to} a.md --reason \"{long_reason}\""
+                                    ),
                                     AccessError::Invalid("reason is longer than the cap allows")
                                         .to_string(),
                                 ),
                                 (
-                                    format!(".mesh request {to} ../x"),
+                                    format!(".mesh files request {to} ../x"),
                                     not_a_wire_path.to_string(),
                                 ),
                                 (
-                                    format!(".mesh request {to} /docs/a.md"),
+                                    format!(".mesh files request {to} /docs/a.md"),
                                     not_a_wire_path.to_string(),
                                 ),
                                 (
-                                    format!(".mesh request {untrusted} a.md --yes"),
+                                    format!(".mesh files request {untrusted} a.md --yes"),
                                     untrusted_refusal,
                                 ),
                             ] {
@@ -42046,7 +42968,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                             let err = refusal(
                                 &mut fx.ctx,
-                                &format!(".mesh request {blocked} a.md --yes"),
+                                &format!(".mesh files request {blocked} a.md --yes"),
                             )
                             .await;
 
@@ -42095,7 +43017,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 .trust_destination(slot, &to, label, SystemTime::now())
                                 .unwrap();
 
-                            let err = refusal(&mut fx.ctx, ".mesh request maki-laptop x").await;
+                            let err =
+                                refusal(&mut fx.ctx, ".mesh files request maki-laptop x").await;
 
                             assert!(
                                 err.starts_with(&format!("Ask {} for 1 path(s): x? ", fx.dest())),
@@ -42117,7 +43040,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let to = fx.stub.destination_hex();
 
                             let err =
-                                refusal(&mut fx.ctx, &format!(".mesh request {to} a.md")).await;
+                                refusal(&mut fx.ctx, &format!(".mesh files request {to} a.md"))
+                                    .await;
 
                             assert_eq!(
                                 err,
@@ -42149,8 +43073,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let to = fx.stub.destination_hex();
 
                             for line in [
-                                format!(".mesh request {to} a.md b.md --reason \"need both\""),
-                                format!(".mesh request {to} a.md a.md"),
+                                format!(
+                                    ".mesh files request {to} a.md b.md --reason \"need both\""
+                                ),
+                                format!(".mesh files request {to} a.md a.md"),
                             ] {
                                 let out = out_of(&mut fx.ctx, &line).await.unwrap();
                                 assert_eq!(out, "Nothing was sent.", "{line}");
@@ -42184,7 +43110,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let (out, asked) = sent(
                                 &mut fx,
                                 &access,
-                                &format!(".mesh request {to} docs/a.md --reason \"need it\" --yes"),
+                                &format!(
+                                    ".mesh files request {to} docs/a.md --reason \"need it\" --yes"
+                                ),
                             )
                             .await;
 
@@ -42232,7 +43160,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let (out, asked) = sent(
                                 &mut fx,
                                 &access,
-                                &format!(".mesh request {to} docs/a.md docs/a.md --yes"),
+                                &format!(".mesh files request {to} docs/a.md docs/a.md --yes"),
                             )
                             .await;
                             assert_eq!(asked.paths, ["docs/a.md"]);
@@ -42251,7 +43179,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let (out, asked) = sent(
                                 &mut fx,
                                 &access,
-                                &format!(".mesh request {to} docs/a.md docs/b.md src/c.rs --yes"),
+                                &format!(
+                                    ".mesh files request {to} docs/a.md docs/b.md src/c.rs --yes"
+                                ),
                             )
                             .await;
                             assert_eq!(asked.paths, ["docs/a.md", "docs/b.md", "src/c.rs"]);
@@ -42270,7 +43200,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let (out, asked) = sent(
                                 &mut fx,
                                 &access,
-                                &format!(".mesh request {to} docs/a.md --yes"),
+                                &format!(".mesh files request {to} docs/a.md --yes"),
                             )
                             .await;
                             assert_eq!(
@@ -42314,7 +43244,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 let (out, asked) = sent(
                                     &mut fx,
                                     &access,
-                                    &format!(".mesh request {to} docs/a.md --yes"),
+                                    &format!(".mesh files request {to} docs/a.md --yes"),
                                 )
                                 .await;
                                 assert_eq!(
@@ -42369,7 +43299,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let outcome = Box::pin(run_repl_command(
                                 &mut fx.ctx,
                                 signal,
-                                &format!(".mesh request {to} docs/a.md --yes"),
+                                &format!(".mesh files request {to} docs/a.md --yes"),
                             ))
                             .await;
 
@@ -42426,7 +43356,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
                             fx.file("a-1", InboundKind::Access, &["docs/y.md"]);
 
-                            let out = out_of(&mut fx.ctx, "/mesh pending").await.unwrap();
+                            let out = pending_out(&mut fx.ctx, "/").await.unwrap();
 
                             assert!(
                                 out.lines().any(|line| line
@@ -42454,7 +43384,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             run(&mut fx.ctx, ".set command_prefix slash").await.unwrap();
                             fx.file("a-1", InboundKind::Access, &[".vault"]);
 
-                            let out = out_of(&mut fx.ctx, "/mesh grant a-1").await.unwrap();
+                            let out = out_of(&mut fx.ctx, "/mesh files grant a-1").await.unwrap();
 
                             assert_eq!(
                                 out.lines().next(),
@@ -42477,7 +43407,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-grant-once").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs", "docs/y.md"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1").await.unwrap();
 
                         let grants = fx.grants();
                         assert_eq!(grants.len(), 1, "{grants:?}");
@@ -42526,7 +43456,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
                         let before = SystemTime::now();
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --for 2h")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1 --for 2h")
                             .await
                             .unwrap();
 
@@ -42564,9 +43494,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
 
                         for line in [
-                            ".mesh grant a-1 --for 31d",
-                            ".mesh grant a-1 --for 721h",
-                            ".mesh grant a-1 --for 43201m",
+                            ".mesh files grant a-1 --for 31d",
+                            ".mesh files grant a-1 --for 721h",
+                            ".mesh files grant a-1 --for 43201m",
                         ] {
                             let printed = stdout_lines().len();
                             assert_eq!(
@@ -42581,7 +43511,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.pending_ids(), ["a-1"]);
 
                         let before = SystemTime::now();
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --for 30d")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1 --for 30d")
                             .await
                             .unwrap();
 
@@ -42624,7 +43554,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!global.starts_with(&guard.path));
                         assert!(!global.exists());
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --standing")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1 --standing")
                             .await
                             .unwrap();
 
@@ -42682,7 +43612,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::create_dir_all(root.join("docs")).unwrap();
                         fs::write(root.join("docs/private.md"), "private").unwrap();
                         fs::write(root.join(".env"), "SECRET=1\n").unwrap();
-                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                        out_of(&mut fx.ctx, ".mesh files deny docs/private.md --yes")
                             .await
                             .unwrap();
                         fx.file("a-1", InboundKind::Access, &["src/x.rs", "docs/private.md"]);
@@ -42690,11 +43620,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         for (line, expected) in [
                             (
-                                ".mesh grant a-1",
+                                ".mesh files grant a-1",
                                 "`docs/private.md` would not be served even once granted (a deny rule names it); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
                             ),
                             (
-                                ".mesh grant a-2 --for 2h",
+                                ".mesh files grant a-2 --for 2h",
                                 "`.env` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
                             ),
                         ] {
@@ -42729,7 +43659,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let printed = stdout_lines().len();
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh grant a-1").await,
+                            refusal(&mut fx.ctx, ".mesh files grant a-1").await,
                             "`src/vault/id_rsa` would not be served even once granted (the built-in deny names it); refuse the request with `.mesh refuse a-1`, or lift the rule first."
                         );
                         assert_eq!(stdout_lines().len(), printed);
@@ -42758,7 +43688,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-1", InboundKind::Access, &["docs/a.md", "docs"]);
 
                         let expected = "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.";
-                        for line in [".mesh grant a-1", ".mesh grant a-1 --standing"] {
+                        for line in [".mesh files grant a-1", ".mesh files grant a-1 --standing"] {
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -42797,7 +43727,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let expected = "`docs/big.bin` would not be served even once granted (it is 4.2 MB and this node serves at most 4194304 bytes); refuse the request with `.mesh refuse a-1`, or lift the rule first.";
                         let printed = stdout_lines().len();
-                        assert_eq!(refusal(&mut fx.ctx, ".mesh grant a-1").await, expected);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh files grant a-1").await,
+                            expected
+                        );
                         assert_eq!(stdout_lines().len(), printed, "the refusal prints nothing");
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert!(fx.grants().is_empty(), "{:?}", fx.grants());
@@ -42840,19 +43773,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         for (line, expected) in [
                             (
-                                ".mesh grant a-1",
+                                ".mesh files grant a-1",
                                 "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
                             ),
                             (
-                                ".mesh grant a-1 --standing",
+                                ".mesh files grant a-1 --standing",
                                 "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
                             ),
                             (
-                                ".mesh grant a-2 --for 2h",
+                                ".mesh files grant a-2 --for 2h",
                                 "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
                             ),
                             (
-                                ".mesh grant a-2 --standing --global",
+                                ".mesh files grant a-2 --standing --global",
                                 "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
                             ),
                         ] {
@@ -42873,7 +43806,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // The link to a regular file is granted, and the engine serves the
                         // grant the verb wrote: what the verb lets through, `/fetch` delivers.
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-3").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-3").await.unwrap();
                         assert!(out.starts_with("Paths asked for: `flink`."), "{out}");
                         assert!(out.contains("Granted a-3: 1 path for"), "{out}");
                         assert!(fx.heard().starts_with("access granted:"));
@@ -42925,14 +43858,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(root.join("docs/a.md"), "a").unwrap();
                         fx.file("a-1", InboundKind::Access, &["docs"]);
 
-                        let err = refusal(&mut fx.ctx, ".mesh grant a-1").await;
+                        let err = refusal(&mut fx.ctx, ".mesh files grant a-1").await;
                         assert_eq!(
                             err,
                             "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first."
                         );
                         assert_eq!(fx.pending_ids(), ["a-1"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files refuse a-1").await.unwrap();
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
                             lines,
@@ -42948,7 +43881,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!mesh_config_dir(&guard.path).join("shares.yaml").exists());
                         assert!(fx.pending_ids().is_empty());
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh grant a-1").await,
+                            refusal(&mut fx.ctx, ".mesh files grant a-1").await,
                             "No open access request has id a-1. `.mesh pending` lists the ones this node knows about."
                         );
                         fx.stop().await;
@@ -42970,7 +43903,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(root.join("docs/private.md"), "private").unwrap();
                         fs::create_dir_all(root.join(".git")).unwrap();
                         fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                        out_of(&mut fx.ctx, ".mesh files deny docs/private.md --yes")
                             .await
                             .unwrap();
                         let (_, locations) = share_locations(&fx.ctx).unwrap();
@@ -42980,11 +43913,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         for (line, expected) in [
                             (
-                                ".mesh grant a-1 --standing",
+                                ".mesh files grant a-1 --standing",
                                 "`docs/private.md` would not be served even once granted (a deny rule names it); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
                             ),
                             (
-                                ".mesh grant a-2 --standing --workspace",
+                                ".mesh files grant a-2 --standing --workspace",
                                 "`.git/HEAD` would not be served even once granted (it is under a directory that is never shared); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
                             ),
                         ] {
@@ -43020,7 +43953,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let before = fs::read(&locations.global).unwrap();
                         fx.file("a-1", InboundKind::Access, &["x.rs"]);
 
-                        for line in [".mesh grant a-1", ".mesh grant a-1 --standing"] {
+                        for line in [".mesh files grant a-1", ".mesh files grant a-1 --standing"] {
                             let printed = stdout_lines().len();
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
@@ -43037,7 +43970,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!locations.workspace.exists());
                         assert_eq!(fx.pending_ids(), ["a-1"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files refuse a-1").await.unwrap();
 
                         assert!(out.contains("Refused a-1: 1 path"), "{out}");
                         assert_eq!(fx.heard(), "access denied: 1 path");
@@ -43056,7 +43989,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-refuse").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files refuse a-1").await.unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
@@ -43084,50 +44017,50 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _script = prompt_script::install(&[]);
                     run_async(async {
                         let mut off = ctx_with(MeshConfig::default(), true);
-                        assert_eq!(refusal(&mut off, ".mesh grant a-1").await, MESH_OFF);
-                        assert_eq!(refusal(&mut off, ".mesh refuse a-1").await, MESH_OFF);
+                        assert_eq!(refusal(&mut off, ".mesh files grant a-1").await, MESH_OFF);
+                        assert_eq!(refusal(&mut off, ".mesh files refuse a-1").await, MESH_OFF);
 
                         let mut fx = PeerFixture::new("repl-mesh-grant-teaching").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
-                        let usage = render_verb_help("grant");
+                        let usage = render_verb_help("files", "grant");
                         for (line, expected) in [
                             (
-                                ".mesh grant a-1 --standing --for 1h",
+                                ".mesh files grant a-1 --standing --for 1h",
                                 format!(
                                     "`--standing` has no end, so `--for` does not apply; drop one of them. {usage}"
                                 ),
                             ),
                             (
-                                ".mesh grant a-1 --global",
+                                ".mesh files grant a-1 --global",
                                 format!(
                                     "`--global` and `--workspace` name the share file a standing grant writes to; pass `--standing` or drop them. {usage}"
                                 ),
                             ),
                             (
-                                ".mesh grant a-1 --standing --global --workspace",
+                                ".mesh files grant a-1 --standing --global --workspace",
                                 format!(
                                     "`--global` and `--workspace` name different files; pass one. {usage}"
                                 ),
                             ),
                             (
-                                ".mesh grant a-1 --for",
+                                ".mesh files grant a-1 --for",
                                 format!("'--for' needs a value. {usage}"),
                             ),
                             (
-                                ".mesh grant a-1 --for 5w",
+                                ".mesh files grant a-1 --for 5w",
                                 "'5w' is not a duration: use a whole number of days, hours or minutes, such as 30d, 12h or 90m.".to_string(),
                             ),
                             (
-                                ".mesh grant a-9",
+                                ".mesh files grant a-9",
                                 "No open access request has id a-9. `.mesh pending` lists the ones this node knows about.".to_string(),
                             ),
                             (
-                                ".mesh refuse a-9",
+                                ".mesh files refuse a-9",
                                 "No open access request has id a-9. `.mesh pending` lists the ones this node knows about.".to_string(),
                             ),
                             (
-                                ".mesh refuse a-1 --yes",
-                                format!("Unexpected '--yes'. {}", render_verb_help("refuse")),
+                                ".mesh files refuse a-1 --yes",
+                                format!("Unexpected '--yes'. {}", render_verb_help("files", "refuse")),
                             ),
                         ] {
                             let printed = stdout_lines().len();
@@ -43135,8 +44068,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
                         }
                         for verb in ["grant", "refuse"] {
-                            let out = out_of(&mut fx.ctx, &format!(".mesh {verb}")).await.unwrap();
-                            assert_eq!(out, render_verb_help(verb));
+                            let out = out_of(&mut fx.ctx, &format!(".mesh files {verb}"))
+                                .await
+                                .unwrap();
+                            assert_eq!(out, render_verb_help("files", verb));
                         }
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert!(fx.grants().is_empty());
@@ -43162,17 +44097,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let printed = stdout_lines().len();
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
+                            refusal(&mut fx.ctx, ".mesh envoy answer a-1 here you go").await,
                             access_not_a_question("a-1").to_string()
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
+                            refusal(&mut fx.ctx, ".mesh envoy answer a-1 here you go").await,
                             "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`"
                         );
                         for line in [
-                            ".mesh grant q-1",
-                            ".mesh grant q-1 --standing",
-                            ".mesh refuse q-1",
+                            ".mesh files grant q-1",
+                            ".mesh files grant q-1 --standing",
+                            ".mesh files refuse q-1",
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
@@ -43202,7 +44137,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-grant-dash-id").await;
                         fx.file("-x1", InboundKind::Access, &["src/x.rs"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant -x1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant -x1").await.unwrap();
 
                         let grants = fx.grants();
                         assert_eq!(grants.len(), 1, "{grants:?}");
@@ -43244,7 +44179,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Rule: a workspace file exists, so the grant is written there.
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --standing")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1 --standing")
                             .await
                             .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
@@ -43271,7 +44206,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // `--global` forces the global file although a workspace file exists.
                         fx.file("a-2", InboundKind::Access, &["docs/y.md"]);
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-2 --standing --global")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-2 --standing --global")
                             .await
                             .unwrap();
                         assert!(
@@ -43325,9 +44260,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert!(!locations.global.exists());
                         fx.file("a-3", InboundKind::Access, &["src/z.rs"]);
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-3 --standing --workspace")
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh files grant a-3 --standing --workspace")
+                                .await
+                                .unwrap();
                         assert!(
                             out.lines().last().unwrap().contains(&format!(
                                 "standing; written to {}",
@@ -43366,15 +44302,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = PeerFixture::new("repl-mesh-grant-twice").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
-                        out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh files grant a-1").await.unwrap();
                         assert_eq!(fx.grants().len(), 1);
                         let heard_before = fx.stub.seen().len();
                         let printed = stdout_lines().len();
 
                         for line in [
-                            ".mesh grant a-1",
-                            ".mesh refuse a-1",
-                            ".mesh grant a-1 --standing",
+                            ".mesh files grant a-1",
+                            ".mesh files refuse a-1",
+                            ".mesh files grant a-1 --standing",
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
@@ -43446,9 +44382,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-2", InboundKind::Access, &["docs/y.md"]);
                         let (_, locations) = share_locations(&fx.ctx).unwrap();
 
-                        let one_off = refusal(&mut fx.ctx, ".mesh grant a-1").await;
-                        let standing = refusal(&mut fx.ctx, ".mesh grant a-2 --standing").await;
-                        let refused = refusal(&mut fx.ctx, ".mesh refuse a-1").await;
+                        let one_off = refusal(&mut fx.ctx, ".mesh files grant a-1").await;
+                        let standing =
+                            refusal(&mut fx.ctx, ".mesh files grant a-2 --standing").await;
+                        let refused = refusal(&mut fx.ctx, ".mesh files refuse a-1").await;
 
                         for err in [&one_off, &standing, &refused] {
                             assert_eq!(err.lines().count(), 1, "{err}");
@@ -43475,14 +44412,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // The records came back whole: the human refuses a-1 and the peer
                         // takes it; a refused request leaves no grant behind.
                         gate.armed.store(false, Ordering::SeqCst);
-                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files refuse a-1").await.unwrap();
                         assert!(out.contains("Refused a-1: 1 path"), "{out}");
                         assert_eq!(gate.heard.lock()[0], "access denied: 1 path");
                         let grants_after_refusal = fx.grants();
                         assert_eq!(fx.pending_ids(), ["a-2"]);
 
                         // And a-2 granted standing succeeds on the second try, once.
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-2 --standing")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-2 --standing")
                             .await
                             .unwrap();
                         assert!(out.contains("Granted a-2: 1 path"), "{out}");
@@ -43523,10 +44460,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
 
-                        let _ = refusal(&mut fx.ctx, ".mesh grant a-1").await;
+                        let _ = refusal(&mut fx.ctx, ".mesh files grant a-1").await;
                         assert_eq!(fx.pending_ids(), ["a-1"]);
                         gate.armed.store(false, Ordering::SeqCst);
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1").await.unwrap();
 
                         assert!(out.contains("Granted a-1: 1 path"), "{out}");
                         assert!(
@@ -43561,7 +44498,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(root.join("docs/private.md"), "private").unwrap();
                         fs::create_dir_all(root.join(".git")).unwrap();
                         fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                        out_of(&mut fx.ctx, ".mesh files deny docs/private.md --yes")
                             .await
                             .unwrap();
                         let (_, locations) = share_locations(&fx.ctx).unwrap();
@@ -43572,12 +44509,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             &["docs/private.md", ".git/HEAD"],
                         );
                         assert!(
-                            refusal(&mut fx.ctx, ".mesh grant a-1")
+                            refusal(&mut fx.ctx, ".mesh files grant a-1")
                                 .await
                                 .contains("would not be served even once granted")
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files refuse a-1").await.unwrap();
 
                         assert!(out.contains("Refused a-1: 2 paths"), "{out}");
                         assert_eq!(fx.heard(), "access denied: 2 paths");
@@ -43615,7 +44552,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-1", InboundKind::Access, &["fits.bin", "big.bin"]);
                         fx.file("a-2", InboundKind::Access, &["fits.bin"]);
 
-                        for line in [".mesh grant a-1", ".mesh grant a-1 --standing"] {
+                        for line in [".mesh files grant a-1", ".mesh files grant a-1 --standing"] {
                             let printed = stdout_lines().len();
                             let err = refusal(&mut fx.ctx, line).await;
                             assert!(
@@ -43632,7 +44569,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ids.sort();
                         assert_eq!(ids, ["a-1", "a-2"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-2").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-2").await.unwrap();
 
                         assert!(out.contains("Granted a-2: 1 path"), "{out}");
                         assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
@@ -43667,7 +44604,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-1", InboundKind::Access, &["docs/big.bin"]);
                         fx.file("a-2", InboundKind::Access, &["docs/big.bin"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-1").await.unwrap();
 
                         assert!(out.contains("Granted a-1: 1 path"), "{out}");
                         assert!(
@@ -43685,7 +44622,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             fx.stub.seen()
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant a-2 --standing")
+                        let out = out_of(&mut fx.ctx, ".mesh files grant a-2 --standing")
                             .await
                             .unwrap();
 
@@ -43772,7 +44709,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(!locations.global.exists());
                         pair.recorder_b.queue(Script::Acknowledge);
 
-                        let out = out_of(&mut ctx, ".mesh grant a-1 --standing --workspace")
+                        let out = out_of(&mut ctx, ".mesh files grant a-1 --standing --workspace")
                             .await
                             .unwrap();
 
@@ -43921,7 +44858,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("a-2", InboundKind::Access, &["src/x.rs"]);
 
                         for text in ["29d23h", "30d1m", "1d12h", "0d", "1.5d"] {
-                            let line = format!(".mesh grant a-1 --for {text}");
+                            let line = format!(".mesh files grant a-1 --for {text}");
                             let printed = stdout_lines().len();
                             assert_eq!(
                                 refusal(&mut fx.ctx, &line).await,
@@ -43942,10 +44879,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let slack = Duration::from_secs(5);
                         for (id, text) in [("a-1", "720h"), ("a-2", "43200m")] {
                             let before = SystemTime::now();
-                            let out =
-                                out_of(&mut fx.ctx, &format!(".mesh grant {id} --for {text}"))
-                                    .await
-                                    .unwrap();
+                            let out = out_of(
+                                &mut fx.ctx,
+                                &format!(".mesh files grant {id} --for {text}"),
+                            )
+                            .await
+                            .unwrap();
                             let grant = fx
                                 .grants()
                                 .into_iter()
@@ -43993,7 +44932,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file(FIRST, InboundKind::Question, &[]);
                         fx.file(OTHER, InboundKind::Question, &[]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy answer 320b8f7b \"x\"")
                             .await
                             .unwrap();
 
@@ -44017,7 +44956,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-grant-prefix").await;
                         fx.file(OTHER, InboundKind::Access, &["src/x.rs"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh grant 1046c2c6").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh files grant 1046c2c6")
+                            .await
+                            .unwrap();
 
                         let grants = fx.grants();
                         assert_eq!(grants.len(), 1, "{grants:?}");
@@ -44039,7 +44980,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-refuse-prefix").await;
                         fx.file(OTHER, InboundKind::Access, &["src/x.rs"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh refuse 1046c2c6aa")
+                        let out = out_of(&mut fx.ctx, ".mesh files refuse 1046c2c6aa")
                             .await
                             .unwrap();
 
@@ -44068,7 +45009,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file(FIRST, InboundKind::Question, &[]);
                         fx.file(OTHER, InboundKind::Question, &[]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss 320b8f7b").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss 320b8f7b")
+                            .await
+                            .unwrap();
 
                         assert!(out.contains("Dismissed 320b8f7b; Stub hears"), "{out}");
                         let seen = fx.stub.seen();
@@ -44095,10 +45038,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file(SECOND, InboundKind::Access, &["src/x.rs"]);
 
                         for line in [
-                            ".mesh answer 320b8f7b \"x\"",
-                            ".mesh dismiss 320b8f7b",
-                            ".mesh grant 320b8f7b",
-                            ".mesh refuse 320b8f7b",
+                            ".mesh envoy answer 320b8f7b \"x\"",
+                            ".mesh envoy dismiss 320b8f7b",
+                            ".mesh files grant 320b8f7b",
+                            ".mesh files refuse 320b8f7b",
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
@@ -44115,7 +45058,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 /// The ids `.mesh pending` prints, in the order it prints them.
                 async fn listed_ids(fx: &mut PeerFixture) -> Vec<String> {
-                    out_of(&mut fx.ctx, ".mesh pending")
+                    pending_out(&mut fx.ctx, ".")
                         .await
                         .unwrap()
                         .lines()
@@ -44161,9 +45104,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             let listed = listed_ids(&mut fx).await;
                             assert_eq!(listed, [&held[..8]], "{held}");
 
-                            out_of(&mut fx.ctx, &format!(".mesh answer {} \"x\"", listed[0]))
-                                .await
-                                .unwrap();
+                            out_of(
+                                &mut fx.ctx,
+                                &format!(".mesh envoy answer {} \"x\"", listed[0]),
+                            )
+                            .await
+                            .unwrap();
 
                             let seen = fx.stub.seen();
                             assert_eq!(seen.last().unwrap().in_reply_to.as_deref(), Some(held));
@@ -44193,12 +45139,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(listed, ["320b8f7b", "320b8f7b1"]);
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"").await,
+                            refusal(&mut fx.ctx, ".mesh envoy answer 320b8f7b \"x\"").await,
                             "'320b8f7b' is a whole pending id and also how 320b8f7b1... begins, so it cannot pick one. Act on 320b8f7b1... first, typed as `.mesh pending` lists it, then '320b8f7b' picks the one left; or clear both with `.mesh dismiss --all`."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
 
-                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b1 \"x\"")
+                        out_of(&mut fx.ctx, ".mesh envoy answer 320b8f7b1 \"x\"")
                             .await
                             .unwrap();
                         let seen = fx.stub.seen();
@@ -44206,7 +45152,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(seen[0].in_reply_to.as_deref(), Some(FIRST));
                         assert_eq!(fx.pending_ids(), ["320b8f7b"]);
 
-                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"y\"")
+                        out_of(&mut fx.ctx, ".mesh envoy answer 320b8f7b \"y\"")
                             .await
                             .unwrap();
                         let seen = fx.stub.seen();
@@ -44232,7 +45178,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("AB12CD34", InboundKind::Access, &["src/x.rs"]);
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh refuse ab12cd34").await,
+                            refusal(&mut fx.ctx, ".mesh files refuse ab12cd34").await,
                             "'AB12CD34' and 'ab12cd34' differ only in case, so neither can be picked; AB12CD34 and ab12cd34 leave `.mesh pending` when they expire."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -44255,7 +45201,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PeerFixture::new("repl-mesh-answer-outbound-prefix").await;
                         ask_stub(&fx, SECOND, "t-root");
 
-                        out_of(&mut fx.ctx, ".mesh answer 320b8f7b \"x\"")
+                        out_of(&mut fx.ctx, ".mesh messaging follow-up 320b8f7b \"x\"")
                             .await
                             .unwrap();
 
@@ -44280,7 +45226,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ask_stub(&fx, SECOND, SECOND);
 
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh grant 320b8f7b").await,
+                            refusal(&mut fx.ctx, ".mesh files grant 320b8f7b").await,
                             format!(
                                 "{SECOND} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then."
                             )
@@ -44359,7 +45305,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let header_head =
                             format!("awaiting your answer . Stub ({}) . asked ", fx.dest());
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss p1").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss p1").await.unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines[0].starts_with(&header_head), "{out}");
@@ -44385,7 +45331,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(seen[0].content, HUMAN_DECLINED);
                         assert_eq!(fx.pending_ids(), ["p2"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss p2 --silent")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss p2 --silent")
                             .await
                             .unwrap();
                         let lines: Vec<&str> = out.lines().collect();
@@ -44405,7 +45351,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let before = stdout_lines().len();
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh dismiss p1").await,
+                            refusal(&mut fx.ctx, ".mesh envoy dismiss p1").await,
                             "No open question has id p1. `.mesh pending` lists the ones this node knows about."
                         );
                         assert_eq!(stdout_lines().len(), before, "nothing printed");
@@ -44424,7 +45370,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
                         let before = stdout_lines().len();
 
-                        for line in [".mesh dismiss acc-1", ".mesh dismiss acc-1 --silent"] {
+                        for line in [
+                            ".mesh envoy dismiss acc-1",
+                            ".mesh envoy dismiss acc-1 --silent",
+                        ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
                                 "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`",
@@ -44437,26 +45386,26 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(fx.stub.seen().is_empty());
 
                         // Bare, and with a stray token: the usage, never a send.
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss").await.unwrap();
-                        assert_eq!(out, render_verb_help("dismiss"));
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss").await.unwrap();
+                        assert_eq!(out, render_verb_help("envoy", "dismiss"));
                         for (line, token) in [
-                            (".mesh dismiss acc-1 extra", "extra"),
-                            (".mesh dismiss acc-1 --force", "--force"),
+                            (".mesh envoy dismiss acc-1 extra", "extra"),
+                            (".mesh envoy dismiss acc-1 --force", "--force"),
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                unexpected(token, "dismiss").to_string(),
+                                unexpected(token, "envoy", "dismiss").to_string(),
                                 "{line}"
                             );
                         }
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss acc-1 --yes").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss acc-1 --yes").await;
                         assert!(
                             err.starts_with(
                                 "`--yes` and `--dry-run` go with `--all`; pass it or drop them."
                             ),
                             "{err}"
                         );
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss --silent").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss --silent").await;
                         assert!(
                             err.starts_with("`.mesh dismiss` takes an id or `--all`."),
                             "{err}"
@@ -44476,7 +45425,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         ask_stub(&fx, "q1");
                         let before = stdout_lines().len();
 
-                        for line in [".mesh dismiss q1", ".mesh dismiss q1 --silent"] {
+                        for line in [".mesh envoy dismiss q1", ".mesh envoy dismiss q1 --silent"] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
                                 "q1 is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh pending` shows it until then.",
@@ -44506,7 +45455,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
 
                         let script = prompt_script::install(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --dry-run")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -44524,7 +45473,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // No terminal and no --yes: the list, then the refusal naming the flag.
                         let script = prompt_script::install_non_interactive();
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss --all").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss --all").await;
                         assert!(
                             err.starts_with(
                                 "Dismiss 2 open questions? Each asker hears that the human declined to answer. Standard input is not a terminal"
@@ -44540,7 +45489,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // A terminal that says no.
                         let script = prompt_script::install(&[false]);
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -44553,13 +45502,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let _script = prompt_script::install(&[]);
                         for (line, token) in [
-                            (".mesh dismiss --all --dry-run --yes", "--yes"),
-                            (".mesh dismiss --all p1", "p1"),
-                            (".mesh dismiss p1 --all", "p1"),
+                            (".mesh envoy dismiss --all --dry-run --yes", "--yes"),
+                            (".mesh envoy dismiss --all p1", "p1"),
+                            (".mesh envoy dismiss p1 --all", "p1"),
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                unexpected(token, "dismiss").to_string(),
+                                unexpected(token, "envoy", "dismiss").to_string(),
                                 "{line}"
                             );
                         }
@@ -44585,7 +45534,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let dest = fx.dest();
                         let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
 
@@ -44619,7 +45568,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "this node's own question stays"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -44628,7 +45577,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         fx.file("p3", InboundKind::Question, &[]);
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -44667,7 +45616,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let dest = fx.dest();
                         let row = |id: &str| format!("  {id} . Stub ({dest}) . asked 0s ago");
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
                             .unwrap();
 
@@ -44711,7 +45660,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
                         let dest8 = fx.dest();
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
                             .unwrap();
 
@@ -44731,9 +45680,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.pending_ids(), [id]);
 
                         *envoy.held.lock() = None;
-                        let out = out_of(&mut fx.ctx, &format!(".mesh dismiss {id} --silent"))
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, &format!(".mesh envoy dismiss {id} --silent"))
+                                .await
+                                .unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(
@@ -44794,7 +45744,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let dest8 = fx.dest();
                         let stranger8 = short(&stranger);
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
 
@@ -44872,7 +45822,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         plant("w1");
                         assert_eq!(fx.pending_ids(), ["w1"], "the planted row reads back");
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
                         let lines = with_ages_zeroed(&out);
@@ -44905,7 +45855,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // then the same composite line as the verb's error.
                         plant("w2");
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss w2").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss w2").await;
                         assert!(
                             err.contains("not trusted for messaging")
                                 && err.contains("; and `w2` ")
@@ -44965,7 +45915,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let stranger8 = short(&stranger);
                         let before = stdout_lines().len();
 
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss s1").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss s1").await;
 
                         assert!(
                             err.starts_with(&format!(
@@ -45052,7 +46002,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let dest8 = fx.dest();
                         let stranger8 = short(&stranger);
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
 
@@ -45114,7 +46064,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             fx.stop().await;
                             return;
                         }
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
                             .unwrap();
                         drop(locked);
@@ -45278,7 +46228,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .upsert(stale("old-a", InboundKind::Access), long_ago)
                             .unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut fx.ctx, ".").await.unwrap();
 
                         assert_eq!(
                             *idle.0.lock(),
@@ -45295,7 +46245,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(out.contains("\nAccess requests: none\n"), "{out}");
                         assert_eq!(fx.pending_ids(), ["p1"]);
 
-                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut fx.ctx, ".").await.unwrap();
                         assert_eq!(idle.0.lock().len(), 2, "each expiry is announced once");
                         assert!(out.contains(" . expires in 6d . id p1"), "{out}");
                         fx.stop().await;
@@ -45366,31 +46316,31 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (
                                 "old-q1",
                                 InboundKind::Question,
-                                ".mesh dismiss old-q1".to_string(),
+                                ".mesh envoy dismiss old-q1".to_string(),
                                 no_question("old-q1"),
                             ),
                             (
                                 "old-q2",
                                 InboundKind::Question,
-                                ".mesh dismiss old-q2 --silent".to_string(),
+                                ".mesh envoy dismiss old-q2 --silent".to_string(),
                                 no_question("old-q2"),
                             ),
                             (
                                 "old-q3",
                                 InboundKind::Question,
-                                ".mesh answer old-q3 \"yes\"".to_string(),
+                                ".mesh envoy answer old-q3 \"yes\"".to_string(),
                                 no_question("old-q3"),
                             ),
                             (
                                 "old-a1",
                                 InboundKind::Access,
-                                ".mesh grant old-a1".to_string(),
+                                ".mesh files grant old-a1".to_string(),
                                 no_access("old-a1"),
                             ),
                             (
                                 "old-a2",
                                 InboundKind::Access,
-                                ".mesh refuse old-a2".to_string(),
+                                ".mesh files refuse old-a2".to_string(),
                                 no_access("old-a2"),
                             ),
                         ];
@@ -45435,7 +46385,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(fx.pending_ids(), ["p1"], "the fresh row stays");
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss p1 --silent")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss p1 --silent")
                             .await
                             .unwrap();
                         assert!(
@@ -45474,7 +46424,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p1", InboundKind::Question, &[]);
                         let dest8 = fx.dest();
 
-                        out_of(&mut fx.ctx, ".mesh dismiss p1").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh envoy dismiss p1").await.unwrap();
 
                         assert_eq!(
                             *idle.0.lock(),
@@ -45486,7 +46436,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(heard[0].disposition, Some(Disposition::Refused));
                         assert_eq!(heard[0].content, HUMAN_DECLINED);
 
-                        let out = out_of(&mut fx.ctx, ".mesh inbox").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh messaging inbox").await.unwrap();
 
                         let blocks: Vec<&str> = out.split("\n\n").collect();
                         assert_eq!(blocks.len(), 1, "the own copy is the only entry: {out}");
@@ -45513,7 +46463,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "a reply this node sent waits for nothing: {out}"
                         );
                         assert_eq!(
-                            out_of(&mut fx.ctx, ".mesh inbox").await.unwrap(),
+                            out_of(&mut fx.ctx, ".mesh messaging inbox").await.unwrap(),
                             "Inbox is empty.",
                             "the copy is drained once read"
                         );
@@ -45535,10 +46485,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p1", InboundKind::Question, &[]);
                         let dest8 = fx.dest();
 
-                        out_of(&mut fx.ctx, ".mesh answer p1 \"the left one\"")
+                        out_of(&mut fx.ctx, ".mesh envoy answer p1 \"the left one\"")
                             .await
                             .unwrap();
-                        let out = out_of(&mut fx.ctx, ".mesh inbox").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh messaging inbox").await.unwrap();
 
                         let blocks: Vec<&str> = out.split("\n\n").collect();
                         assert_eq!(blocks.len(), 1, "the own copy is the only entry: {out}");
@@ -45636,7 +46586,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 true
                             })
                         };
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all")
+                            .await
+                            .unwrap();
                         assert_eq!(
                             with_ages_zeroed(&out),
                             [
@@ -45667,7 +46619,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 false
                             })
                         };
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -45696,7 +46648,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 true
                             })
                         };
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all")
+                            .await
+                            .unwrap();
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(lines.len(), 6, "{out}");
                         assert_eq!(
@@ -45742,7 +46696,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             calls: AtomicUsize::new(0),
                         }) as Arc<dyn EnvoySink>);
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss p4").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss p4").await;
                         assert_eq!(err, race("p4"), "not worded as a retry");
                         let printed = stdout_lines()[before..].to_vec();
                         assert_eq!(
@@ -45771,7 +46725,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             calls: AtomicUsize::new(0),
                         }) as Arc<dyn EnvoySink>);
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss p5 --silent").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss p5 --silent").await;
                         assert_eq!(err, race("p5"));
                         let printed = stdout_lines()[before..].to_vec();
                         assert_eq!(printed.len(), 1, "the block alone: {printed:?}");
@@ -45849,7 +46803,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "the expired row is handed back to the writer"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut fx.ctx, ".").await.unwrap();
 
                         assert!(
                             idle.0.lock().is_empty(),
@@ -45895,7 +46849,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .upsert(question("gone", now - PENDING_TTL, "gone?"), now)
                             .unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut fx.ctx, ".").await.unwrap();
 
                         assert_eq!(
                             *idle.0.lock(),
@@ -45921,7 +46875,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "the store files at the head, whatever the row's own stamp"
                         );
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss old-q --silent")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss old-q --silent")
                             .await
                             .unwrap();
                         assert!(
@@ -46007,7 +46961,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p6", InboundKind::Question, &[]);
                         fx.ctx.app.mesh.set_envoy(closing("p6"));
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss p6").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss p6").await;
                         assert_eq!(
                             err,
                             race("p6"),
@@ -46032,7 +46986,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p7", InboundKind::Question, &[]);
                         fx.ctx.app.mesh.set_envoy(closing("p7"));
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss p7 --silent").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss p7 --silent").await;
                         assert_eq!(
                             err,
                             race("p7"),
@@ -46048,7 +47002,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p8", InboundKind::Question, &[]);
                         fx.file("p9", InboundKind::Question, &[]);
                         fx.ctx.app.mesh.set_envoy(closing("p8"));
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -46073,7 +47027,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p10", InboundKind::Question, &[]);
                         fx.file("p11", InboundKind::Question, &[]);
                         fx.ctx.app.mesh.set_envoy(closing("p10"));
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -46184,10 +47138,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let no_access = "No open access request has id old-a. `.mesh pending` lists the ones this node knows about.";
                         let no_question = "No open question has id old-q. `.mesh pending` lists the ones this node knows about.";
                         let cases = [
-                            (".mesh grant old-a", no_access),
-                            (".mesh refuse old-a", no_access),
-                            (".mesh answer old-q \"yes\"", no_question),
-                            (".mesh dismiss old-q", no_question),
+                            (".mesh files grant old-a", no_access),
+                            (".mesh files refuse old-a", no_access),
+                            (".mesh envoy answer old-q \"yes\"", no_question),
+                            (".mesh envoy dismiss old-q", no_question),
                         ];
                         for (line, refused) in cases {
                             let before = stdout_lines().len();
@@ -46214,7 +47168,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         drop(locked);
 
-                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut fx.ctx, ".").await.unwrap();
                         assert!(
                             out.contains(" . expires in 6d . id a1"),
                             "the live request lists: {out}"
@@ -46315,9 +47269,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             Disposition::Answered,
                         ));
                         fx.file("p1", InboundKind::Question, &[]);
-                        out_of(&mut fx.ctx, ".mesh dismiss p1").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh envoy dismiss p1").await.unwrap();
 
-                        let out = out_of(&mut fx.ctx, ".mesh inbox").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh messaging inbox").await.unwrap();
                         let blocks: Vec<&str> = out.split("\n\n").collect();
                         assert_eq!(blocks.len(), 3, "{out}");
                         let disposition_row = |block: &str| -> String {
@@ -46472,7 +47426,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let dest8 = fx.dest();
                         let stayed8 = &stayed_id[..8];
 
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
                             .unwrap();
 
@@ -46510,8 +47464,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let stayed7 = &stayed_id[..7];
                         let before = stdout_lines().len();
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh dismiss {stayed7} --silent"))
-                                .await,
+                            refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh envoy dismiss {stayed7} --silent")
+                            )
+                            .await,
                             format!(
                                 "'{stayed7}' is too short to pick a pending id: give the whole id or 8 or more of its first characters; `.mesh pending` lists them."
                             )
@@ -46524,10 +47481,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(fx.pending_ids(), [stayed_id], "the row stays");
 
                         // The full id the summary offered, in the silent form it named, takes it.
-                        let out =
-                            out_of(&mut fx.ctx, &format!(".mesh dismiss {stayed_id} --silent"))
-                                .await
-                                .unwrap();
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh envoy dismiss {stayed_id} --silent"),
+                        )
+                        .await
+                        .unwrap();
                         assert_eq!(
                             out.lines().last(),
                             Some(
@@ -46554,7 +47513,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             fx.stop().await;
                             return;
                         }
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --silent --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
                             .unwrap();
                         drop(locked);
@@ -46641,7 +47600,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         let before = stdout_lines().len();
 
-                        let err = refusal(&mut fx.ctx, &format!(".mesh dismiss {id}")).await;
+                        let err = refusal(&mut fx.ctx, &format!(".mesh envoy dismiss {id}")).await;
 
                         assert!(
                             err.starts_with("Could not tell Stub that you declined (")
@@ -46680,9 +47639,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         // The retry the line names, with the id it carries, takes the question.
-                        let out = out_of(&mut fx.ctx, &format!(".mesh dismiss {id} --silent"))
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, &format!(".mesh envoy dismiss {id} --silent"))
+                                .await
+                                .unwrap();
                         assert_eq!(
                             out.lines().last(),
                             Some(
@@ -46701,7 +47661,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             vec![asked.clone()],
                             "and remembered nothing"
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh pending").await.unwrap();
+                        let out = pending_out(&mut fx.ctx, ".").await.unwrap();
                         assert!(
                             !out.contains(id8) && !out.contains("expired"),
                             "the dismissed question is gone and nothing expired: {out}"
@@ -46720,7 +47680,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )
                             .unwrap();
                         fx.file(id, InboundKind::Question, &[]);
-                        let out = out_of(&mut fx.ctx, &format!(".mesh dismiss {id}"))
+                        let out = out_of(&mut fx.ctx, &format!(".mesh envoy dismiss {id}"))
                             .await
                             .unwrap();
                         assert_eq!(
@@ -46805,7 +47765,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // The single form refuses `--dry-run` outright: nothing listed,
                         // nothing taken, nothing sent; the fresh row is untouched.
                         let before = stdout_lines().len();
-                        let err = refusal(&mut fx.ctx, ".mesh dismiss p1 --dry-run").await;
+                        let err = refusal(&mut fx.ctx, ".mesh envoy dismiss p1 --dry-run").await;
                         assert!(
                             err.starts_with(
                                 "`--yes` and `--dry-run` go with `--all`; pass it or drop them."
@@ -46826,7 +47786,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // The dry run of `--all` sweeps first: one expiry line, the row is
                         // gone from the store, and the listing shows only the live question.
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all --dry-run")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --dry-run")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -46854,7 +47814,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         again.received_at = rfc3339_utc(long_ago);
                         store.upsert(again, long_ago).unwrap();
                         let script = prompt_script::install(&[true]);
-                        let out = out_of(&mut fx.ctx, ".mesh dismiss --all").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all")
+                            .await
+                            .unwrap();
                         assert_eq!(
                             with_ages_zeroed(&out),
                             [
@@ -46998,7 +47960,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} \"see this\" --attach docs/notes.md"),
+                            &format!(
+                                ".mesh messaging send {to} \"see this\" --attach docs/notes.md"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -47041,7 +48005,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"take this\" --attach big.bin"),
+                            &format!(
+                                ".mesh messaging send {to} --yes \"take this\" --attach big.bin"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -47129,9 +48095,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
 
-                        let out = out_of(&mut fx.ctx, ".mesh answer q1 \"here\" --attach big.bin")
-                            .await
-                            .unwrap();
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh messaging follow-up q1 \"here\" --attach big.bin",
+                        )
+                        .await
+                        .unwrap();
 
                         let seen = fx.stub.seen();
                         assert_eq!(seen.len(), 1, "{seen:?}");
@@ -47230,7 +48199,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "`.env` is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it.",
                             ),
                         ] {
-                            let line = format!(".mesh answer q1 \"x\" {args}");
+                            let line = format!(".mesh messaging follow-up q1 \"x\" {args}");
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -47244,8 +48213,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         gate.armed.store(true, Ordering::SeqCst);
                         fx.stub
                             .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
-                        let err =
-                            refusal(&mut fx.ctx, ".mesh answer q1 \"x\" --attach big.bin").await;
+                        let err = refusal(
+                            &mut fx.ctx,
+                            ".mesh messaging follow-up q1 \"x\" --attach big.bin",
+                        )
+                        .await;
                         assert_eq!(err.lines().count(), 1, "{err}");
                         assert!(
                             !err.contains("stands until")
@@ -47263,7 +48235,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         gate.armed.store(false, Ordering::SeqCst);
                         let out = out_of(
                             &mut fx.ctx,
-                            ".mesh answer q1 \"here\" --attach docs/notes.md",
+                            ".mesh messaging follow-up q1 \"here\" --attach docs/notes.md",
                         )
                         .await
                         .unwrap();
@@ -47310,7 +48282,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            ".mesh answer p1 \"here\" --attach docs/notes.md",
+                            ".mesh envoy answer p1 \"here\" --attach docs/notes.md",
                         )
                         .await
                         .unwrap();
@@ -47399,7 +48371,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let before = stdout_lines().len();
                         let err = refusal(
                             &mut fx.ctx,
-                            ".mesh answer p1 \"here\" --attach docs/notes.md",
+                            ".mesh envoy answer p1 \"here\" --attach docs/notes.md",
                         )
                         .await;
 
@@ -47447,7 +48419,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.file("p1", InboundKind::Question, &[]);
                         let to = fx.stub.destination_hex();
                         let shown_root = root.display().to_string();
-                        let usage = render_verb_help("message");
+                        let usage = render_verb_help("messaging", "send");
 
                         for (args, expected) in [
                             (
@@ -47500,12 +48472,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ),
                             ("--attach", format!("'--attach' needs a value. {usage}")),
                         ] {
-                            let line = format!(".mesh message {to} \"x\" {args}");
+                            let line = format!(".mesh messaging send {to} \"x\" {args}");
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
                         }
-                        let line = ".mesh answer p1 \"x\" --attach docs/missing.md";
+                        let line = ".mesh envoy answer p1 \"x\" --attach docs/missing.md";
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, line).await,
@@ -47521,7 +48493,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach .env --force"),
+                            &format!(".mesh messaging send {to} --yes \"x\" --attach .env --force"),
                         )
                         .await
                         .unwrap();
@@ -47559,7 +48531,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let script = prompt_script::install_text(&[]);
                         let printed = stdout_lines().len();
                         assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh answer p1 --attach docs/missing.md").await,
+                            refusal(
+                                &mut fx.ctx,
+                                ".mesh envoy answer p1 --attach docs/missing.md"
+                            )
+                            .await,
                             format!(
                                 "`docs/missing.md` is not under {shown_root}; nothing was sent."
                             )
@@ -47576,9 +48552,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // With a good attachment the block, the prompt, then the send.
                         let script = prompt_script::install_text(&[Some("  yes, do it  ")]);
-                        let out = out_of(&mut fx.ctx, ".mesh answer p1 --attach docs/notes.md")
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh envoy answer p1 --attach docs/notes.md")
+                                .await
+                                .unwrap();
                         assert_eq!(prompt_script::prompts_asked(), 1, "asked exactly once");
                         let header = out.lines().next().unwrap_or_default();
                         assert!(
@@ -47618,7 +48595,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // block above the Sending notice.
                         fx.file("p2", InboundKind::Question, &[]);
                         let _script = prompt_script::install_text(&[]);
-                        let out = out_of(&mut fx.ctx, ".mesh answer p2 \"no\"").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh envoy answer p2 \"no\"")
+                            .await
+                            .unwrap();
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         assert_eq!(
                             after_question_block(&out, "p2", true),
@@ -47660,9 +48639,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let to = fx.stub.destination_hex();
 
                         for line in [
-                            ".mesh answer q-1 \"x\" --attach docs/pipe".to_string(),
-                            format!(".mesh message {to} \"x\" --attach docs/pipe"),
-                            ".mesh answer q-1 \"x\" --attach docs/pipe --force".to_string(),
+                            ".mesh envoy answer q-1 \"x\" --attach docs/pipe".to_string(),
+                            format!(".mesh messaging send {to} \"x\" --attach docs/pipe"),
+                            ".mesh envoy answer q-1 \"x\" --attach docs/pipe --force".to_string(),
                         ] {
                             let printed = stdout_lines().len();
                             let err = tokio::time::timeout(
@@ -47702,7 +48681,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         write(&fx.root.path, "fits.bin", &vec![0x5A; 2048]);
                         let to = fx.stub.destination_hex();
 
-                        let line = format!(".mesh message {to} --yes \"x\" --attach big.bin");
+                        let line =
+                            format!(".mesh messaging send {to} --yes \"x\" --attach big.bin");
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
@@ -47714,7 +48694,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach fits.bin"),
+                            &format!(".mesh messaging send {to} --yes \"x\" --attach fits.bin"),
                         )
                         .await
                         .unwrap();
@@ -47755,7 +48735,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach big.bin"),
+                            &format!(".mesh messaging send {to} --yes \"x\" --attach big.bin"),
                         )
                         .await
                         .unwrap();
@@ -47768,7 +48748,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
 
-                        let line = format!(".mesh message {to} --yes \"x\" --attach past.bin");
+                        let line =
+                            format!(".mesh messaging send {to} --yes \"x\" --attach past.bin");
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
@@ -47800,7 +48781,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let big = vec![0x5A; 1025];
                         write(&fx.root.path, "docs/private.md", &big);
                         write(&fx.root.path, ".env", &big);
-                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                        out_of(&mut fx.ctx, ".mesh files deny docs/private.md --yes")
                             .await
                             .unwrap();
                         let to = fx.stub.destination_hex();
@@ -47815,7 +48796,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "`.env` would travel as a reference, which this node would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
                             ),
                         ] {
-                            let line = format!(".mesh message {to} --yes \"x\" {args}");
+                            let line = format!(".mesh messaging send {to} --yes \"x\" {args}");
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
                             assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
@@ -47850,7 +48831,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(&locations.global, "version: 99\n").unwrap();
                         let to = fx.stub.destination_hex();
 
-                        let line = format!(".mesh message {to} --yes \"x\" --attach big.bin");
+                        let line =
+                            format!(".mesh messaging send {to} --yes \"x\" --attach big.bin");
                         let printed = stdout_lines().len();
                         let err = refusal(&mut fx.ctx, &line).await;
 
@@ -47866,7 +48848,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach docs/notes.md"),
+                            &format!(
+                                ".mesh messaging send {to} --yes \"x\" --attach docs/notes.md"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -47922,7 +48906,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh message {b_hex} --yes \"x\" --attach big.bin"),
+                            &format!(".mesh messaging send {b_hex} --yes \"x\" --attach big.bin"),
                         )
                         .await
                         .unwrap();
@@ -47972,7 +48956,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let out = out_of(
                             &mut fx.ctx,
                             &format!(
-                                ".mesh message {to} --yes \"at the limit\" --attach exact.bin"
+                                ".mesh messaging send {to} --yes \"at the limit\" --attach exact.bin"
                             ),
                         )
                         .await
@@ -47988,7 +48972,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let out = out_of(
                             &mut fx.ctx,
                             &format!(
-                                ".mesh message {to} --yes \"over the limit\" --attach over.bin"
+                                ".mesh messaging send {to} --yes \"over the limit\" --attach over.bin"
                             ),
                         )
                         .await
@@ -48032,7 +49016,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            ".mesh answer p1 \"see the attached\" --attach docs/big.md",
+                            ".mesh envoy answer p1 \"see the attached\" --attach docs/big.md",
                         )
                         .await
                         .unwrap();
@@ -48098,7 +49082,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "--attach inbox/peer1/x.txt",
                             "--attach inbox/peer1/x.txt --force",
                         ] {
-                            let line = format!(".mesh message {to} --yes \"x\" {args}");
+                            let line = format!(".mesh messaging send {to} --yes \"x\" {args}");
                             let err = refusal(&mut fx.ctx, &line).await;
                             assert!(
                                 err.contains("never shared") && err.contains("`--force`"),
@@ -48115,7 +49099,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         // inbox's, not the root's.
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach docs/notes.md"),
+                            &format!(
+                                ".mesh messaging send {to} --yes \"x\" --attach docs/notes.md"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -48160,8 +49146,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let expected = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer q-1 --attach <path>.";
 
                         for line in [
-                            ".mesh answer q-1 \"x\" --attach big.bin",
-                            ".mesh answer q-1 \"x\" --attach docs/notes.md",
+                            ".mesh envoy answer q-1 \"x\" --attach big.bin",
+                            ".mesh envoy answer q-1 \"x\" --attach docs/notes.md",
                         ] {
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
@@ -48188,9 +49174,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(ids, ["q-1", "q-2"]);
 
                         // Another question the run does not hold attaches as before.
-                        let out = out_of(&mut fx.ctx, ".mesh answer q-2 \"y\" --attach big.bin")
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh envoy answer q-2 \"y\" --attach big.bin")
+                                .await
+                                .unwrap();
                         assert!(
                             out.lines().any(|line| line
                                 == reference_line("big.bin", 1025, &fx.stub.destination_hex())),
@@ -48201,7 +49188,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // A plain answer on the held question is not refused by that
                         // sentence: it goes the envoy's way.
-                        let out = out_of(&mut fx.ctx, ".mesh answer q-1 \"plain\"")
+                        let out = out_of(&mut fx.ctx, ".mesh envoy answer q-1 \"plain\"")
                             .await
                             .unwrap();
                         assert!(!out.contains("being answered by the envoy"), "{out}");
@@ -48212,10 +49199,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // Once the hold lapses the same `--attach` line answers.
                         envoy.held.lock().take();
-                        let out =
-                            out_of(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach docs/notes.md")
-                                .await
-                                .unwrap();
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh envoy answer q-1 \"x\" --attach docs/notes.md",
+                        )
+                        .await
+                        .unwrap();
                         assert!(out.ends_with("Answered q-1."), "{out}");
                         assert!(fx.pending_ids().is_empty());
                         let seen = fx.stub.seen();
@@ -48288,8 +49277,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let to = fx.stub.destination_hex();
 
                         for line in [
-                            ".mesh answer q-1 \"x\" --attach big.bin".to_string(),
-                            format!(".mesh message {to} --yes \"x\" --attach big.bin"),
+                            ".mesh envoy answer q-1 \"x\" --attach big.bin".to_string(),
+                            format!(".mesh messaging send {to} --yes \"x\" --attach big.bin"),
                         ] {
                             let err = refusal(&mut fx.ctx, &line).await;
                             assert_eq!(err.lines().count(), 1, "{line}: {err}");
@@ -48312,9 +49301,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
 
                         gate.armed.store(false, Ordering::SeqCst);
-                        let out = out_of(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach big.bin")
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh envoy answer q-1 \"x\" --attach big.bin")
+                                .await
+                                .unwrap();
 
                         assert!(out.ends_with("Answered q-1."), "{out}");
                         assert_eq!(gate.heard.lock().as_slice(), ["x"]);
@@ -48350,14 +49340,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await;
                         write(&fx.root.path, "docs/private.md", NOTES);
                         write(&fx.root.path, "big.bin", &vec![0x5A; 1025]);
-                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                        out_of(&mut fx.ctx, ".mesh files deny docs/private.md --yes")
                             .await
                             .unwrap();
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
                         let to = fx.stub.destination_hex();
 
                         for args in ["--attach docs/private.md", "--attach big.bin"] {
-                            let line = format!(".mesh answer a-1 \"x\" {args}");
+                            let line = format!(".mesh envoy answer a-1 \"x\" {args}");
                             let printed = stdout_lines().len();
                             assert_eq!(
                                 refusal(&mut fx.ctx, &line).await,
@@ -48372,7 +49362,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach docs/private.md"),
+                            &format!(
+                                ".mesh messaging send {to} --yes \"x\" --attach docs/private.md"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -48415,8 +49407,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let to = fx.stub.destination_hex();
                         let shown_root = root.display().to_string();
 
-                        let line =
-                            format!(".mesh message {to} --yes \"x\" --attach escape/secret.txt");
+                        let line = format!(
+                            ".mesh messaging send {to} --yes \"x\" --attach escape/secret.txt"
+                        );
                         let printed = stdout_lines().len();
                         let err = refusal(&mut fx.ctx, &line).await;
                         assert_eq!(
@@ -48437,7 +49430,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh message {to} --yes \"x\" --attach alias/notes.md"),
+                            &format!(
+                                ".mesh messaging send {to} --yes \"x\" --attach alias/notes.md"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -48494,7 +49489,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh message {b_hex} --yes \"x\" --attach alias/big.bin"),
+                            &format!(
+                                ".mesh messaging send {b_hex} --yes \"x\" --attach alias/big.bin"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -48559,9 +49556,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let hold = "`q-1` is being answered by the envoy right now, so no file can go with an answer yet; answer without `--attach`, or wait for its hold to lapse, then .mesh answer q-1 --attach <path>.";
 
                         for line in [
-                            ".mesh answer q-1 \"x\" --attach big.bin",
-                            ".mesh answer q-1 \"x\" --attach docs/notes.md",
-                            ".mesh answer q-1 \"x\" --attach big.bin --force",
+                            ".mesh envoy answer q-1 \"x\" --attach big.bin",
+                            ".mesh envoy answer q-1 \"x\" --attach docs/notes.md",
+                            ".mesh envoy answer q-1 \"x\" --attach big.bin --force",
                         ] {
                             let printed = stdout_lines().len();
                             let err = refusal(&mut fx.ctx, line).await;
@@ -48578,7 +49575,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         *envoy.held.lock() = Some("a-1".to_string());
                         let printed = stdout_lines().len();
                         let err =
-                            refusal(&mut fx.ctx, ".mesh answer a-1 \"x\" --attach big.bin").await;
+                            refusal(&mut fx.ctx, ".mesh envoy answer a-1 \"x\" --attach big.bin")
+                                .await;
                         assert_eq!(
                             err,
                             "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`"
@@ -48629,8 +49627,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let to = fx.stub.destination_hex();
 
                         for line in [
-                            ".mesh answer q-1 \"x\" --attach docs/notes.md".to_string(),
-                            format!(".mesh message {to} --yes \"x\" --attach docs/notes.md"),
+                            ".mesh envoy answer q-1 \"x\" --attach docs/notes.md".to_string(),
+                            format!(".mesh messaging send {to} --yes \"x\" --attach docs/notes.md"),
                         ] {
                             let err = refusal(&mut fx.ctx, &line).await;
                             assert_eq!(err.lines().count(), 1, "{line}: {err}");
@@ -48652,10 +49650,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
 
                         gate.armed.store(false, Ordering::SeqCst);
-                        let out =
-                            out_of(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach docs/notes.md")
-                                .await
-                                .unwrap();
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh envoy answer q-1 \"x\" --attach docs/notes.md",
+                        )
+                        .await
+                        .unwrap();
 
                         assert!(out.ends_with("Answered q-1."), "{out}");
                         assert!(
@@ -48672,9 +49672,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         // The question is gone: the same line is now a teaching error, not
                         // a second send.
-                        let err =
-                            refusal(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach docs/notes.md")
-                                .await;
+                        let err = refusal(
+                            &mut fx.ctx,
+                            ".mesh envoy answer q-1 \"x\" --attach docs/notes.md",
+                        )
+                        .await;
                         assert!(err.contains("q-1"), "{err}");
                         assert_eq!(
                             gate.heard.lock().as_slice(),
@@ -48715,7 +49717,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let printed = stdout_lines().len();
                         let err =
-                            refusal(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach big.bin").await;
+                            refusal(&mut fx.ctx, ".mesh envoy answer q-1 \"x\" --attach big.bin")
+                                .await;
                         assert_eq!(
                             err,
                             "`big.bin` is 2 KB and this node serves at most 2048 bytes by reference; nothing was sent."
@@ -48723,7 +49726,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(&stdout_lines()[printed..], &[] as &[String]);
 
                         let err =
-                            refusal(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach mid.bin").await;
+                            refusal(&mut fx.ctx, ".mesh envoy answer q-1 \"x\" --attach mid.bin")
+                                .await;
                         assert!(
                             err.contains(&locations.global.display().to_string())
                                 && err.ends_with(" Nothing was sent."),
@@ -48789,7 +49793,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         pair.recorder_b.queue(Script::Acknowledge);
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh message {b_hex} --yes \"x\" --attach big.bin"),
+                            &format!(".mesh messaging send {b_hex} --yes \"x\" --attach big.bin"),
                         )
                         .await
                         .unwrap();
@@ -48843,7 +49847,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         pair.recorder_b.queue(Script::Acknowledge);
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh message {b_hex} --yes \"y\" --attach docs/notes.md"),
+                            &format!(
+                                ".mesh messaging send {b_hex} --yes \"y\" --attach docs/notes.md"
+                            ),
                         )
                         .await
                         .unwrap();
@@ -49055,7 +50061,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = FetchFixture::new("repl-mesh-fetch-staged", true).await;
                         let bytes = b"# a\n";
                         fx.queue("ok", ok_reply(bytes));
-                        let line = format!(".mesh fetch {} docs/a.md", fx.stub.destination_hex());
+                        let line =
+                            format!(".mesh files fetch {} docs/a.md", fx.stub.destination_hex());
 
                         let out = out_of(&mut fx.ctx, &line).await.unwrap();
 
@@ -49105,7 +50112,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             vec![("sha256", Value::Binary(digest.to_vec()))],
                         );
                         let line = format!(
-                            ".mesh fetch {} docs/a.md --if-sha256 {}",
+                            ".mesh files fetch {} docs/a.md --if-sha256 {}",
                             fx.stub.destination_hex(),
                             hex_lower(&digest).to_uppercase()
                         );
@@ -49144,7 +50151,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = FetchFixture::new("repl-mesh-fetch-refusals", true).await;
                         let dest = fx.stub.destination_hex();
-                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let line = format!(".mesh files fetch {dest} docs/a.md");
                         let printed = stdout_lines().len();
 
                         fx.queue("not_shared", vec![]);
@@ -49189,7 +50196,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fx.stop().await;
 
                         let mut bare = FetchFixture::new("repl-mesh-fetch-unserved", false).await;
-                        let line = format!(".mesh fetch {} docs/a.md", bare.stub.destination_hex());
+                        let line = format!(
+                            ".mesh files fetch {} docs/a.md",
+                            bare.stub.destination_hex()
+                        );
                         assert_eq!(
                             refusal(&mut bare.ctx, &line).await,
                             format!(
@@ -49215,7 +50225,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = FetchFixture::new("repl-mesh-fetch-old-ceiling", true).await;
                         let dest = fx.stub.destination_hex();
-                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let line = format!(".mesh files fetch {dest} docs/a.md");
                         let under_one_segment =
                             rns_transport::resource::MAX_EFFICIENT_SIZE as u64 - 128;
                         assert!(under_one_segment < 2 * 1024 * 1024);
@@ -49252,7 +50262,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             FetchFixture::new("repl-mesh-fetch-not-shared-known", true).await;
                         let dest = fx.stub.destination_hex();
                         let identity = fx.stub.identity_hex();
-                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let line = format!(".mesh files fetch {dest} docs/a.md");
                         let now = SystemTime::now();
                         let memory = fx.started.runtime.memory();
 
@@ -49346,7 +50356,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         fx.queue("not_shared", vec![]);
                         let sentence =
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} {raw}")).await;
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} {raw}")).await;
                         assert_eq!(
                             sentence,
                             format!(
@@ -49367,7 +50377,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let escaped = "docs/red\u{1b}[31malert.md";
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} {escaped}")).await,
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} {escaped}"))
+                                .await,
                             format!(
                                 "`docs/redalert.md` is not a path the mesh carries (rule `control`); pass the path exactly as `.mesh shares --peer {}` or mesh__list shows it.",
                                 fx.dest()
@@ -49401,7 +50412,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let memory = fx.started.runtime.memory();
                         let until = SystemTime::now() + Duration::from_secs(3600);
                         let rows = |ctx: &RequestContext| -> Vec<(String, Option<String>)> {
-                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                            ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
                         };
                         let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
                             rows.iter().map(|(value, _)| value.clone()).collect()
@@ -49433,7 +50444,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let bytes = b"# a\n";
                         fx.queue("ok", ok_reply(bytes));
-                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let line = format!(".mesh files fetch {dest} docs/a.md");
                         let out = out_of(&mut fx.ctx, &line).await.unwrap();
                         let staged_line = out
                             .lines()
@@ -49469,7 +50480,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         fx.queue("not_shared", vec![]);
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/b.md")).await,
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/b.md"))
+                                .await,
                             format!(
                                 "{} did not serve `docs/b.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/b.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
@@ -49508,7 +50520,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let memory = fx.started.runtime.memory();
                         let until = SystemTime::now() + Duration::from_secs(3600);
                         let rows = |ctx: &RequestContext| -> Vec<(String, Option<String>)> {
-                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                            ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
                         };
                         let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
                             rows.iter().map(|(value, _)| value.clone()).collect()
@@ -49525,7 +50537,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 vec![("sha256", Value::Binary(digest.to_vec()))],
                             );
                             format!(
-                                ".mesh fetch {dest} {path} --if-sha256 {}",
+                                ".mesh files fetch {dest} {path} --if-sha256 {}",
                                 hex_lower(&digest)
                             )
                         };
@@ -49590,7 +50602,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         fx.queue("not_shared", vec![]);
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
+                                .await,
                             format!(
                                 "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
@@ -49638,7 +50651,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_ne!(old.to_ascii_lowercase(), rotated);
                         let memory = fx.started.runtime.memory();
                         let rows = |ctx: &RequestContext| -> Vec<(String, Option<String>)> {
-                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                            ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
                         };
                         let values = |rows: &[(String, Option<String>)]| -> Vec<String> {
                             rows.iter().map(|(value, _)| value.clone()).collect()
@@ -49662,9 +50675,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         fx.queue("ok", ok_reply(b"# a\n"));
-                        let out = out_of(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md"))
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
+                                .await
+                                .unwrap();
                         assert!(out.contains("Staged `docs/a.md`"), "{out}");
                         assert_eq!(
                             values(&rows(&fx.ctx)),
@@ -49672,7 +50686,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh forget --identity {old} --dry-run"),
+                            &format!(".mesh access forget --identity {old} --dry-run"),
                         )
                         .await
                         .unwrap();
@@ -49714,7 +50728,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         fx.queue("not_shared", vec![]);
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
+                                .await,
                             format!(
                                 "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
@@ -49723,7 +50738,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh forget --identity {old} --dry-run"),
+                            &format!(".mesh access forget --identity {old} --dry-run"),
                         )
                         .await
                         .unwrap();
@@ -49755,7 +50770,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         fx.queue("not_shared", vec![]);
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
+                                .await,
                             format!(
                                 "{} did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. To get it, ask the person at that node to run .mesh allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
@@ -49765,7 +50781,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh forget --identity {old} --dry-run"),
+                            &format!(".mesh access forget --identity {old} --dry-run"),
                         )
                         .await
                         .unwrap();
@@ -49776,7 +50792,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let token = format!("forget-{}", short(&rotated));
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh forget --identity {rotated} --dry-run"),
+                            &format!(".mesh access forget --identity {rotated} --dry-run"),
                         )
                         .await
                         .unwrap();
@@ -49791,7 +50807,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh forget --identity {rotated} --confirm {token}"),
+                            &format!(".mesh access forget --identity {rotated} --confirm {token}"),
                         )
                         .await
                         .unwrap();
@@ -49836,7 +50852,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let memory = fx.started.runtime.memory();
                         let peers = fx.started.runtime.peers();
                         let rows = |ctx: &RequestContext| -> Vec<String> {
-                            ctx.repl_complete(".mesh", &["fetch", &dest, ""], "")
+                            ctx.repl_complete(".mesh", &["files", "fetch", &dest, ""], "")
                                 .into_iter()
                                 .map(|(value, _)| value)
                                 .collect()
@@ -49874,14 +50890,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "no identity is bound to the destination, so no claim is offered; the listing is the destination's"
                         );
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md")).await,
+                            refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
+                                .await,
                             answered_not_as_coyote(&dest),
                             "the verb asks for the swept destination, the stub answers without a Coyote announce, and it is refused before any request"
                         );
                         assert!(fx.heard().is_empty(), "nothing reached the peer");
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh forget --identity {id} --dry-run"),
+                            &format!(".mesh access forget --identity {id} --dry-run"),
                         )
                         .await
                         .unwrap();
@@ -49907,9 +50924,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
 
                         fx.queue("ok", ok_reply(b"# a\n"));
-                        let out = out_of(&mut fx.ctx, &format!(".mesh fetch {dest} docs/a.md"))
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
+                                .await
+                                .unwrap();
                         assert!(out.contains("Staged `docs/a.md`"), "{out}");
                         assert_eq!(
                             rows(&fx.ctx),
@@ -49930,7 +50948,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _script = prompt_script::install(&[]);
                     run_async(async {
                         let mut fx = FetchFixture::new("repl-mesh-fetch-invalid-path", true).await;
-                        let line = format!(".mesh fetch {} ../x", fx.stub.destination_hex());
+                        let line = format!(".mesh files fetch {} ../x", fx.stub.destination_hex());
                         let printed = stdout_lines().len();
 
                         assert_eq!(
@@ -49961,7 +50979,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             refusal(
                                 &mut off,
-                                ".mesh fetch 0123456789abcdef0123456789abcdef docs/a.md"
+                                ".mesh files fetch 0123456789abcdef0123456789abcdef docs/a.md"
                             )
                             .await,
                             MESH_OFF
@@ -49972,7 +50990,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let (untrusted, identity) = heard_peer(&runtime, "Uma", SystemTime::now());
                         let unheard = hex_lower(&[0x7e; 16]);
                         let trusted = fx.stub.destination_hex();
-                        let usage = render_verb_help("fetch");
+                        let usage = render_verb_help("files", "fetch");
                         let verdict = runtime.trust().authorize(&identity, &untrusted);
                         let standing = runtime.trust().identity_standing(&identity);
                         let untrusted_refusal =
@@ -49981,30 +50999,30 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(untrusted_refusal.ends_with(FETCH_REFUSAL_TAIL));
                         for (line, expected) in [
                             (
-                                format!(".mesh fetch {untrusted} docs/a.md"),
+                                format!(".mesh files fetch {untrusted} docs/a.md"),
                                 untrusted_refusal,
                             ),
                             (
-                                ".mesh fetch stub docs/a.md".to_string(),
+                                ".mesh files fetch stub docs/a.md".to_string(),
                                 "'stub' is not a destination hash: expected a destination hash or a unique prefix of one `.mesh peers` lists (8 or more characters)."
                                     .to_string(),
                             ),
                             (
-                                format!(".mesh fetch {trusted} docs/a.md --if-sha256 abc"),
+                                format!(".mesh files fetch {trusted} docs/a.md --if-sha256 abc"),
                                 format!(
                                     "`--if-sha256` takes the 64-hex sha256 `.mesh fetch` printed last time; 'abc' is not one. {usage}"
                                 ),
                             ),
                             (
-                                format!(".mesh fetch {trusted} docs/a.md --if-sha256"),
+                                format!(".mesh files fetch {trusted} docs/a.md --if-sha256"),
                                 format!("'--if-sha256' needs a value. {usage}"),
                             ),
                             (
-                                format!(".mesh fetch {trusted} docs/a.md docs/b.md"),
+                                format!(".mesh files fetch {trusted} docs/a.md docs/b.md"),
                                 format!("Unexpected 'docs/b.md'. {usage}"),
                             ),
                             (
-                                format!(".mesh fetch {trusted} docs/a.md --yes"),
+                                format!(".mesh files fetch {trusted} docs/a.md --yes"),
                                 format!("Unexpected '--yes'. {usage}"),
                             ),
                         ] {
@@ -50014,7 +51032,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         }
                         let printed = stdout_lines().len();
                         assert_eq!(
-                            refusal(&mut fx.ctx, &format!(".mesh fetch {unheard} docs/a.md")).await,
+                            refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh files fetch {unheard} docs/a.md")
+                            )
+                            .await,
                             unanswered_path_request(&unheard),
                             "an unheard destination is asked for, and nothing answers"
                         );
@@ -50041,16 +51063,16 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = FetchFixture::new("repl-mesh-fetch-usage", true).await;
                         for line in [
-                            ".mesh fetch".to_string(),
-                            format!(".mesh fetch {}", fx.stub.destination_hex()),
+                            ".mesh files fetch".to_string(),
+                            format!(".mesh files fetch {}", fx.stub.destination_hex()),
                             format!(
-                                ".mesh fetch {} --if-sha256 {}",
+                                ".mesh files fetch {} --if-sha256 {}",
                                 fx.stub.destination_hex(),
                                 hex_lower(&[0x11; 32])
                             ),
                         ] {
                             let out = out_of(&mut fx.ctx, &line).await.unwrap();
-                            assert_eq!(out, render_verb_help("fetch"), "{line}");
+                            assert_eq!(out, render_verb_help("files", "fetch"), "{line}");
                         }
                         assert!(fx.heard().is_empty(), "{:?}", fx.heard());
                         fx.stop().await;
@@ -50074,7 +51096,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let retry = format!(
                             "Try `.mesh fetch {peer} docs/a.md` again; if it repeats, the peer may run a different Coyote."
                         );
-                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let line = format!(".mesh files fetch {dest} docs/a.md");
                         let marker = b"MARKER-BYTES-NEVER-SHOWN";
 
                         // ok, but the bytes do not hash to the sha256 the peer sent.
@@ -50147,7 +51169,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = FetchFixture::new("repl-mesh-fetch-again", true).await;
                         let dest = fx.stub.destination_hex();
-                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let line = format!(".mesh files fetch {dest} docs/a.md");
                         let first = b"# a v1\n";
                         let second = b"# a v2\n";
 
@@ -50302,7 +51324,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PurgeFixture::new(ROOT_TAG).await;
                         let root = fx.root();
 
-                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files")
+                        let out = out_of(&mut fx.ctx, ".mesh messaging inbox --purge-files")
                             .await
                             .unwrap();
 
@@ -50329,7 +51351,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PurgeFixture::new(ROOT_TAG).await;
                         let root = fx.root();
 
-                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files --yes")
+                        let out = out_of(&mut fx.ctx, ".mesh messaging inbox --purge-files --yes")
                             .await
                             .unwrap();
 
@@ -50354,9 +51376,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PurgeFixture::new(ROOT_TAG).await;
                         let root = fx.root();
 
-                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files --dry-run")
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh messaging inbox --purge-files --dry-run")
+                                .await
+                                .unwrap();
 
                         let lines: Vec<&str> = out.lines().collect();
                         assert_eq!(
@@ -50388,7 +51411,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     run_async(async {
                         let mut fx = PurgeFixture::new(ROOT_TAG).await;
 
-                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files")
+                        let out = out_of(&mut fx.ctx, ".mesh messaging inbox --purge-files")
                             .await
                             .unwrap();
 
@@ -50409,7 +51432,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let mut fx = PurgeFixture::new(ROOT_TAG).await;
                         let root = fx.root();
 
-                        let err = refusal(&mut fx.ctx, ".mesh inbox --purge-files").await;
+                        let err = refusal(&mut fx.ctx, ".mesh messaging inbox --purge-files").await;
 
                         assert_eq!(
                             err,
@@ -50438,11 +51461,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let nothing = format!("Nothing is staged under {}.", root.display());
                         assert!(!root.exists());
 
-                        let out = out_of(&mut ctx, ".mesh inbox --purge-files").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh messaging inbox --purge-files")
+                            .await
+                            .unwrap();
                         assert_eq!(out, nothing);
 
                         fs::create_dir_all(&root).unwrap();
-                        let out = out_of(&mut ctx, ".mesh inbox --purge-files --yes")
+                        let out = out_of(&mut ctx, ".mesh messaging inbox --purge-files --yes")
                             .await
                             .unwrap();
                         assert_eq!(out, nothing);
@@ -50470,7 +51495,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(sibling.join("x.txt"), b"theirs").unwrap();
                         std::os::unix::fs::symlink("other-instance", &root).unwrap();
 
-                        let err = refusal(&mut ctx, ".mesh inbox --purge-files").await;
+                        let err = refusal(&mut ctx, ".mesh messaging inbox --purge-files").await;
 
                         assert_eq!(
                             err,
@@ -50504,32 +51529,50 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let _script = prompt_script::install(&[]);
                     let mut ctx = off_ctx();
 
-                    assert_eq!(err_of(&mut ctx, ".mesh inbox --purge-files"), MESH_OFF);
                     assert_eq!(
-                        err_of(&mut ctx, ".mesh inbox --purge-files --yes"),
+                        err_of(&mut ctx, ".mesh messaging inbox --purge-files"),
                         MESH_OFF
                     );
-                    for line in [".mesh inbox --yes", ".mesh inbox --dry-run"] {
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh messaging inbox --purge-files --yes"),
+                        MESH_OFF
+                    );
+                    for line in [
+                        ".mesh messaging inbox --yes",
+                        ".mesh messaging inbox --dry-run",
+                    ] {
                         assert_eq!(
                             err_of(&mut ctx, line),
                             format!(
                                 "`--yes` and `--dry-run` go with `--purge-files`; pass it or drop them. {}",
-                                render_verb_help("inbox")
+                                render_verb_help("messaging", "inbox")
                             ),
                             "{line}"
                         );
                     }
                     assert_eq!(
-                        err_of(&mut ctx, ".mesh inbox --purge-files --dry-run --yes"),
-                        format!("Unexpected '--yes'. {}", render_verb_help("inbox"))
+                        err_of(
+                            &mut ctx,
+                            ".mesh messaging inbox --purge-files --dry-run --yes"
+                        ),
+                        format!(
+                            "Unexpected '--yes'. {}",
+                            render_verb_help("messaging", "inbox")
+                        )
                     );
                     assert_eq!(
-                        err_of(&mut ctx, ".mesh inbox now"),
-                        format!("Unexpected 'now'. {}", render_verb_help("inbox"))
+                        err_of(&mut ctx, ".mesh messaging inbox now"),
+                        format!(
+                            "Unexpected 'now'. {}",
+                            render_verb_help("messaging", "inbox")
+                        )
                     );
                     assert_eq!(
-                        err_of(&mut ctx, ".mesh inbox --purge"),
-                        format!("Unexpected '--purge'. {}", render_verb_help("inbox"))
+                        err_of(&mut ctx, ".mesh messaging inbox --purge"),
+                        format!(
+                            "Unexpected '--purge'. {}",
+                            render_verb_help("messaging", "inbox")
+                        )
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
@@ -50563,7 +51606,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert!(instance_dir.join(PEER_DIR).join("a.md").exists());
 
                         let before = stdout_lines().len();
-                        let text = match run(&mut ctx, ".mesh inbox --purge-files --yes").await {
+                        let text = match run(&mut ctx, ".mesh messaging inbox --purge-files --yes")
+                            .await
+                        {
                             Ok(_) => stdout_lines()[before..].join("\n"),
                             Err(err) => format!("Err: {err}"),
                         };
@@ -50617,7 +51662,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         fs::write(peer_dir.join("b.bin"), b"1234567").unwrap();
                         std::os::unix::fs::symlink(&outside.path, peer_dir.join("docs")).unwrap();
 
-                        let dry = out_of(&mut ctx, ".mesh inbox --purge-files --dry-run")
+                        let dry = out_of(&mut ctx, ".mesh messaging inbox --purge-files --dry-run")
                             .await
                             .unwrap();
                         assert_eq!(
@@ -50636,7 +51681,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(fs::read(outside.path.join("big.txt")).unwrap().len(), 1000);
 
-                        let out = out_of(&mut ctx, ".mesh inbox --purge-files").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh messaging inbox --purge-files")
+                            .await
+                            .unwrap();
 
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         let question = asked.lock()[0].clone();
@@ -50753,17 +51800,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let _capture = capture::install();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
 
-                run_async(run(&mut ctx, ".mesh memory")).unwrap();
+                run_async(run(&mut ctx, ".mesh envoy memory")).unwrap();
                 assert_eq!(
                     stdout_lines().join("\n"),
-                    render_verb_help("memory"),
+                    render_verb_help("envoy", "memory"),
                     "the bare verb is its usage"
                 );
                 assert_eq!(
-                    err_of(&mut ctx, ".mesh memory list"),
+                    err_of(&mut ctx, ".mesh envoy memory list"),
                     format!(
                         "'list' is not a `.mesh memory` command; `forget` is the one it takes. {}",
-                        render_verb_help("memory")
+                        render_verb_help("envoy", "memory")
                     )
                 );
             }
@@ -50788,7 +51835,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let cache_dir = started.runtime.cache_dir().to_path_buf();
                         seed(&cache_dir);
 
-                        let out = out_of(&mut ctx, ".mesh memory forget all --dry-run")
+                        let out = out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")
                             .await
                             .unwrap();
 
@@ -50825,7 +51872,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let cache_dir = started.runtime.cache_dir().to_path_buf();
                         seed(&cache_dir);
 
-                        let err = refusal(&mut ctx, ".mesh memory forget all").await;
+                        let err = refusal(&mut ctx, ".mesh envoy memory forget all").await;
                         assert_eq!(
                             err,
                             format!(
@@ -50835,7 +51882,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                         assert_eq!(remembered(&cache_dir), seeded());
 
-                        let out = out_of(&mut ctx, ".mesh memory forget all --yes")
+                        let out = out_of(&mut ctx, ".mesh envoy memory forget all --yes")
                             .await
                             .unwrap();
 
@@ -50880,7 +51927,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let cache_dir = started.runtime.cache_dir().to_path_buf();
                         seed(&cache_dir);
 
-                        let out = out_of(&mut ctx, ".mesh memory forget all").await.unwrap();
+                        let out = out_of(&mut ctx, ".mesh envoy memory forget all")
+                            .await
+                            .unwrap();
 
                         assert_eq!(*asked.lock(), [all_question()]);
                         assert_eq!(out.lines().last(), Some(NOTHING_CHANGED), "{out}");
@@ -50907,7 +51956,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh memory forget {ID_A} a-first --dry-run"),
+                            &format!(".mesh envoy memory forget {ID_A} a-first --dry-run"),
                         )
                         .await
                         .unwrap();
@@ -50917,10 +51966,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                                 "Would forget the remembered thread 'a-first' of identity {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
                             )
                         );
-                        let out =
-                            out_of(&mut ctx, &format!(".mesh memory forget {ID_A} --dry-run"))
-                                .await
-                                .unwrap();
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh envoy memory forget {ID_A} --dry-run"),
+                        )
+                        .await
+                        .unwrap();
                         assert_eq!(
                             out,
                             format!(
@@ -50931,7 +51982,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = out_of(
                             &mut ctx,
-                            &format!(".mesh memory forget {} a-second --yes", ID_A.to_uppercase()),
+                            &format!(
+                                ".mesh envoy memory forget {} a-second --yes",
+                                ID_A.to_uppercase()
+                            ),
                         )
                         .await
                         .unwrap();
@@ -50950,9 +52004,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             ])
                         );
 
-                        let out = out_of(&mut ctx, &format!(".mesh memory forget {ID_A} --yes"))
-                            .await
-                            .unwrap();
+                        let out =
+                            out_of(&mut ctx, &format!(".mesh envoy memory forget {ID_A} --yes"))
+                                .await
+                                .unwrap();
                         assert_eq!(
                             out,
                             format!(
@@ -50987,7 +52042,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} --yes"),
+                    &format!(".mesh envoy memory forget {ID_A} --yes"),
                 ))
                 .unwrap();
 
@@ -51022,14 +52077,17 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let mut ctx = ctx_with(MeshConfig::default(), true);
                 assert!(ctx.app.mesh.get().is_none());
 
-                let err = err_of(&mut ctx, ".mesh memory forget 00000000 --yes");
+                let err = err_of(&mut ctx, ".mesh envoy memory forget 00000000 --yes");
                 assert_eq!(
                     err,
                     "Identity 00000000 has not been heard from: no identity this node knows starts with it. Give the whole hash, or check what `.mesh knocks` and `.mesh peers` list."
                 );
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {} --yes", ID_B[..8].to_uppercase()),
+                    &format!(
+                        ".mesh envoy memory forget {} --yes",
+                        ID_B[..8].to_uppercase()
+                    ),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51077,7 +52135,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
                 assert!(ctx.app.mesh.get().is_none());
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
 
                 let [row_a, row_b] = all_rows();
                 assert_eq!(
@@ -51105,15 +52164,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 for (line, expected) in [
                     (
-                        ".mesh memory forget all".to_string(),
+                        ".mesh envoy memory forget all".to_string(),
                         "The envoy remembers nothing.".to_string(),
                     ),
                     (
-                        format!(".mesh memory forget {ID_A}"),
+                        format!(".mesh envoy memory forget {ID_A}"),
                         format!("The envoy remembers nothing of identity {short_a}."),
                     ),
                     (
-                        format!(".mesh memory forget {ID_A} a-first"),
+                        format!(".mesh envoy memory forget {ID_A} a-first"),
                         format!("The envoy remembers no thread 'a-first' of identity {short_a}."),
                     ),
                 ] {
@@ -51129,41 +52188,44 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             fn forget_refuses_a_bad_identity_a_bad_thread_a_thread_with_all_and_both_flags() {
                 let _capture = capture::install();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
-                let usage = render_verb_help("memory");
+                let usage = render_verb_help("envoy", "memory");
 
                 assert_eq!(
-                    err_of(&mut ctx, ".mesh memory forget all --yes --dry-run"),
+                    err_of(&mut ctx, ".mesh envoy memory forget all --yes --dry-run"),
                     format!("Unexpected '--yes'. {usage}")
                 );
                 assert_eq!(
-                    err_of(&mut ctx, ".mesh memory forget all some-thread"),
+                    err_of(&mut ctx, ".mesh envoy memory forget all some-thread"),
                     format!("Unexpected 'some-thread'. {usage}")
                 );
                 assert_eq!(
                     err_of(
                         &mut ctx,
-                        &format!(".mesh memory forget {ID_A} a-first extra")
+                        &format!(".mesh envoy memory forget {ID_A} a-first extra")
                     ),
                     format!("Unexpected 'extra'. {usage}")
                 );
                 assert_eq!(
-                    err_of(&mut ctx, &format!(".mesh memory forget {ID_A} --prune")),
+                    err_of(
+                        &mut ctx,
+                        &format!(".mesh envoy memory forget {ID_A} --prune")
+                    ),
                     format!("Unexpected '--prune'. {usage}")
                 );
                 assert_eq!(
-                    err_of(&mut ctx, ".mesh memory forget nope"),
+                    err_of(&mut ctx, ".mesh envoy memory forget nope"),
                     "'nope' is not an identity hash: expected an identity hash or a unique prefix of one `.mesh knocks` and `.mesh peers` list (8 or more characters)."
                 );
                 assert_eq!(
                     err_of(
                         &mut ctx,
-                        &format!(".mesh memory forget {ID_A} \"bad thread!\"")
+                        &format!(".mesh envoy memory forget {ID_A} \"bad thread!\"")
                     ),
                     format!(
                         "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {usage}"
                     )
                 );
-                run_async(run(&mut ctx, ".mesh memory forget")).unwrap();
+                run_async(run(&mut ctx, ".mesh envoy memory forget")).unwrap();
                 assert_eq!(stdout_lines().join("\n"), usage, "no target is the usage");
             }
 
@@ -51184,9 +52246,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let mut ctx = ctx_with(MeshConfig::default(), true);
 
                 for line in [
-                    ".mesh memory forget all --yes".to_string(),
-                    ".mesh memory forget all --dry-run".to_string(),
-                    format!(".mesh memory forget {ID_A} --yes"),
+                    ".mesh envoy memory forget all --yes".to_string(),
+                    ".mesh envoy memory forget all --dry-run".to_string(),
+                    format!(".mesh envoy memory forget {ID_A} --yes"),
                 ] {
                     let printed = stdout_lines().len();
                     let err = err_of(&mut ctx, &line);
@@ -51219,7 +52281,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let mut ctx = ctx_with(MeshConfig::default(), true);
                 assert!(ctx.app.mesh.get().is_none());
 
-                let out = run_async(out_of(&mut ctx, ".mesh info")).unwrap();
+                let out = run_async(out_of(&mut ctx, ".mesh config show")).unwrap();
 
                 for key in [
                     "envoy_memory.enabled",
@@ -51290,15 +52352,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let before = warn_snapshot();
                 run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} a-second --yes"),
+                    &format!(".mesh envoy memory forget {ID_A} a-second --yes"),
                 ))
                 .unwrap();
                 run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_B} --yes"),
+                    &format!(".mesh envoy memory forget {ID_B} --yes"),
                 ))
                 .unwrap();
-                run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
                 assert_eq!(
                     emptied(&before),
                     Vec::<String>::new(),
@@ -51311,7 +52373,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 // `forget all` empties it and says so once, naming the directory.
                 let before = warn_snapshot();
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert!(out.contains("1 store whose index cannot be read"), "{out}");
                 let logged = emptied(&before);
                 assert_eq!(
@@ -51338,7 +52401,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 // Emptied, the directory is no longer a store: nothing more to warn of.
                 let before = warn_snapshot();
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert_eq!(out, "The envoy remembers nothing.");
                 assert_eq!(emptied(&before), Vec::<String>::new());
                 assert_eq!(prompt_script::prompts_asked(), 0);
@@ -51377,7 +52441,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = run_async(out_of(
                         &mut ctx,
-                        &format!(".mesh memory forget {ID_A} --yes"),
+                        &format!(".mesh envoy memory forget {ID_A} --yes"),
                     ))
                     .unwrap();
                     locked.restore();
@@ -51405,7 +52469,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // The remedy, now that the store can be written, clears what was kept.
                     let out = run_async(out_of(
                         &mut ctx,
-                        &format!(".mesh memory forget {ID_A} --yes"),
+                        &format!(".mesh envoy memory forget {ID_A} --yes"),
                     ))
                     .unwrap();
                     assert_eq!(
@@ -51458,7 +52522,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = run_async(out_of(
                         &mut ctx,
-                        &format!(".mesh memory forget {ID_A} a-first --dry-run"),
+                        &format!(".mesh envoy memory forget {ID_A} a-first --dry-run"),
                     ))
                     .unwrap();
                     assert_eq!(
@@ -51472,7 +52536,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     let out = run_async(out_of(
                         &mut ctx,
-                        &format!(".mesh memory forget {ID_A} a-first --yes"),
+                        &format!(".mesh envoy memory forget {ID_A} a-first --yes"),
                     ))
                     .unwrap();
                     assert_eq!(
@@ -51490,7 +52554,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let first = EnvoySessions::open(&cache_dir, "inst-a", &enabled()).unwrap();
                     assert_eq!(first.stats().unwrap(), (1, 1), "inst-a gave up a-first");
 
-                    let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                    let out =
+                        run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                     let [row_a, row_b] = all_rows();
                     assert_eq!(
                         out.lines().collect::<Vec<_>>(),
@@ -51512,7 +52577,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(first.stats().unwrap(), (0, 0));
                     locked.restore();
 
-                    let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                    let out =
+                        run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                     assert_eq!(
                         out.lines().last(),
                         Some("Forgot 2 remembered conversations of 2 identities."),
@@ -51543,7 +52609,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 fs::write(&notes, "keep").unwrap();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
                 assert_eq!(
                     out.lines().next(),
                     Some(
@@ -51555,7 +52622,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} --yes"),
+                    &format!(".mesh envoy memory forget {ID_A} --yes"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51574,7 +52641,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "one identity's scope reaches the records it is named on alone"
                 );
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert_eq!(
                     out.lines().last(),
                     Some(
@@ -51615,7 +52683,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 let short_a = short(ID_A);
                 let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
                 let [row_a, row_b] = all_rows();
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
@@ -51630,7 +52699,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} --dry-run"),
+                    &format!(".mesh envoy memory forget {ID_A} --dry-run"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51648,7 +52717,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} --yes"),
+                    &format!(".mesh envoy memory forget {ID_A} --yes"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51672,7 +52741,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
                 );
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert_eq!(
                     out.lines().last(),
                     Some(
@@ -51711,7 +52781,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} --dry-run"),
+                    &format!(".mesh envoy memory forget {ID_A} --dry-run"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51720,7 +52790,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "a record no index names is nobody's conversation"
                 );
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
@@ -51731,12 +52802,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
                 assert!(orphan.exists());
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert_eq!(out, "Forgot 1 record file that no index names.");
                 assert!(!orphan.exists());
                 assert!(notes.exists(), "only record files are swept");
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert_eq!(
                     out, "The envoy remembers nothing.",
                     "a directory with neither index nor record file is no store"
@@ -51765,7 +52838,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_B} --dry-run"),
+                    &format!(".mesh envoy memory forget {ID_B} --dry-run"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51777,7 +52850,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_B} x --yes"),
+                    &format!(".mesh envoy memory forget {ID_B} x --yes"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51815,7 +52888,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 fs::write(index_only.join("index.json"), "").unwrap();
                 let mut ctx = ctx_with(MeshConfig::default(), true);
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
@@ -51830,7 +52904,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "{not json"
                 );
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert!(
                     out.starts_with("Forgot 2 stores whose index cannot be read"),
                     "the result names the emptied stores, not `remembers nothing`: {out}"
@@ -51847,7 +52922,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     "the store directories themselves stay for the next write"
                 );
 
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 assert_eq!(
                     out, "The envoy remembers nothing.",
                     "an emptied directory is no longer a store"
@@ -51860,7 +52936,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .join(format!("{}.yaml", "de".repeat(16)));
                 fs::write(&orphan, "version: 1\n").unwrap();
                 fs::write(with_record.join("index.json"), "{not json").unwrap();
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run")).unwrap();
                 let [row_a, row_b] = all_rows();
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
@@ -51872,7 +52949,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ],
                     "{out}"
                 );
-                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let out =
+                    run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                 let last = out.lines().last().unwrap_or_default();
                 assert!(
                     last.starts_with(
@@ -51911,7 +52989,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} a-first --dry-run"),
+                    &format!(".mesh envoy memory forget {ID_A} a-first --dry-run"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -51929,7 +53007,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                 let out = run_async(out_of(
                     &mut ctx,
-                    &format!(".mesh memory forget {ID_A} a-first --yes"),
+                    &format!(".mesh envoy memory forget {ID_A} a-first --yes"),
                 ))
                 .unwrap();
                 assert_eq!(
@@ -52014,7 +53092,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let mut ctx = ctx_with(MeshConfig::default(), true);
 
                     let out =
-                        run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                        run_async(out_of(&mut ctx, ".mesh envoy memory forget all --dry-run"))
+                            .unwrap();
                     let [row_a, row_b] = all_rows();
                     assert_eq!(
                         out.lines().collect::<Vec<_>>(),
@@ -52027,7 +53106,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "nothing behind a link is listed, as a conversation or as an unreadable store: {out}"
                     );
 
-                    let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                    let out =
+                        run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                     assert_eq!(
                         out.lines().last(),
                         Some(
