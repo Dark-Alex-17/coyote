@@ -2987,11 +2987,14 @@ fn dot_install_of_a_builtin_category_asks_continue_in_the_confirm_modal() {
 
     let before = pty.raw().len();
     pty.send(b".install macros\r").unwrap();
-    let modal = wait_for_the_modal(
-        &mut pty,
-        before,
-        ".install macros",
-        &["Continue?", "Reinstallingbundledmacrosoverwrites", "y=yes"],
+    wait_for_the_modal(&mut pty, before, ".install macros", &["Continue?", "y=yes"]);
+    // The warning body is long enough to overlap the banner it is painted
+    // over, so the diff repaint skips the cells that already match; the
+    // help line is read off a forced full repaint instead.
+    let modal = repainted_frame(&mut pty, 58, 140);
+    assert!(
+        squeezed(&modal).contains("Reinstallingbundledmacrosoverwrites"),
+        "the overwrite warning is not the modal's help line:\n{modal}"
     );
     assert!(
         !squeezed(&modal).contains("[y/N]"),
@@ -3869,14 +3872,18 @@ fn dot_rag_chunk_size_typed_in_the_plain_repl_replaces_the_default() {
 
     let typed_at = pty.raw().len();
     pty.send(b"500\r").unwrap();
-    let since = pty
-        .wait_for_after("Set chunk overlay:", typed_at, PTY_DEADLINE)
+    pty.wait_for_after("Set chunk overlay:", typed_at, PTY_DEADLINE)
         .expect("the plain REPL wizard did not move on to `Set chunk overlay:`");
-    assert!(
-        since.contains("Set chunk overlay: (25)"),
-        "typing 500 at `Set chunk size: (1000)` did not make the chunk size 500 \
-         (the overlay default is 1/20th of it):\n{since}"
-    );
+    // The default is painted a moment after the label, so it is waited for
+    // rather than read off the first frame that shows the question.
+    let since = pty
+        .wait_for_after("Set chunk overlay: (25)", typed_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| {
+            panic!(
+                "typing 500 at `Set chunk size: (1000)` did not make the chunk size 500 \
+                 (the overlay default is 1/20th of it): {e:?}"
+            )
+        });
     assert!(
         find(pty.raw(), ENTER_ALT, 0).is_none(),
         "the plain REPL entered the alternate screen:\n{since}"
