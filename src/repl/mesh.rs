@@ -20712,6 +20712,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     run(&mut ctx, ".mesh on --yes").await.unwrap();
                     assert!(ctx.app.mesh.get().is_some());
+                    // `Repl::init` publishes an idle snapshot before the first command; a
+                    // card built before any snapshot carries no objective at all.
+                    crate::config::publish_mesh_snapshot(
+                        &ctx,
+                        crate::mesh::snapshot::TurnState::idle_now(),
+                    );
                     assert!(
                         !guard.path.join("config.yaml").exists(),
                         "`.mesh on` must not persist"
