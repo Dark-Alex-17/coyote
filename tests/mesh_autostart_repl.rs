@@ -86,7 +86,7 @@ const NEEDS_SESSION: &str = "Mesh needs a session";
 const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
 /// `MESH_OFF` as a regex, for waiting on it.
 const MESH_OFF_PATTERN: &str = r"Mesh is off\. Run `\.mesh on` first\.";
-/// What `.mesh peers` says on a node that is on but has heard nobody.
+/// What `.mesh people list` says on a node that is on but has heard nobody.
 const NO_PEERS_PATTERN: &str = r"No peers heard yet\.";
 
 type Target = Session<OsProcess, OsStream>;
@@ -676,10 +676,10 @@ fn command_row_and_transcript(
     (row, transcript)
 }
 
-/// The line `.mesh answer` prints when its prompt is left blank or cancelled.
+/// The line `.mesh envoy answer` prints when its prompt is left blank or cancelled.
 fn nothing_sent(id: &str) -> String {
     format!(
-        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh answer {id} \"<text>\"."
+        "Nothing was sent: the answer was left blank or cancelled. Answer later with .mesh envoy answer {id} \"<text>\"."
     )
 }
 
@@ -695,32 +695,71 @@ fn literally(text: &str) -> String {
     out
 }
 
-/// How `.mesh pending` opens its first section when one peer question waits.
+/// How `.mesh envoy questions` opens its section when one peer question waits.
 const WAITING_FOR_YOU_ONE: &str = "Waiting for YOU (1)";
 
-/// That section's whole header with the other two sections empty: the commands start
+/// That section's whole header with the other two lists empty: the commands start
 /// two columns past the longest counted title, `Asked by this node (0)`.
 fn waiting_for_you_header() -> String {
     format!(
-        "{WAITING_FOR_YOU_ONE}     answer: .mesh answer <id> \"<text>\" . dismiss: .mesh dismiss <id>"
+        "{WAITING_FOR_YOU_ONE}     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>"
     )
+}
+
+/// Each open list's command and the title its section starts with.
+const OPEN_LISTS: [(&str, &str); 3] = [
+    (".mesh envoy questions", "Waiting for YOU"),
+    (".mesh files requests", "Access requests"),
+    (".mesh messaging sent", "Asked by this node"),
+];
+
+/// Types the three list commands in turn and returns their sections one after another,
+/// each from its title through the indented entry rows under it, together with the
+/// whole transcript, which also holds whatever the sweep announced at the prompt.
+fn open_lists(session: &mut Target, prompt: &str) -> (String, String) {
+    let mut sections = Vec::new();
+    let mut transcript = String::new();
+    for (line, title) in OPEN_LISTS {
+        let (_, text) = command_row_and_transcript(
+            session,
+            line,
+            &format!(r"{title}(: none| \(\d+\))"),
+            prompt,
+        );
+        let lines = transcript_lines(&text);
+        let at = lines
+            .iter()
+            .position(|row| row.starts_with(title))
+            .unwrap_or_else(|| panic!("`{line}` prints its {title} section: {text:?}"));
+        sections.push(lines[at].to_string());
+        sections.extend(
+            lines[at + 1..]
+                .iter()
+                .take_while(|row| row.starts_with("  "))
+                .map(|row| row.to_string()),
+        );
+        transcript.push_str(&text);
+    }
+    (sections.join("\n"), transcript)
 }
 
 /// Cold start, mesh off, no session: the verbs renamed before the release answer
 /// at the first prompt with the words the docs quote, and the old spellings are
 /// refused outright rather than aliased. `.mesh reply` is an unknown verb whose
-/// error names `.mesh message` and nothing is previewed or sent; `.mesh brief
+/// error points at `.mesh help` and nothing is previewed or sent; `.mesh envoy brief
 /// note` sets and clears the note with the documented confirmations while `brief
 /// set` and `brief clear` are refused with the new spelling named; the `.mesh`
-/// help list carries the `message` row and no `reply` row. No node starts.
+/// help list carries the `messaging send` row and no `reply` row. No node starts.
 #[test]
 fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused() {
-    const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. To message a peer, use `.mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]`. Type `.mesh` for the list.";
-    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh brief` to see what your envoy answers from.";
-    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh brief note \"text\"` sets a new one.";
+    const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. Type `.mesh help` for the list.";
+    const SEND_USAGE: &str =
+        ".mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from.";
+    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one.";
     fn retired(word: &str) -> String {
         format!(
-            ".mesh envoy brief has no '{word}' argument. Set the note with `.mesh brief note \"text\"` and remove it with `.mesh brief note clear`."
+            ".mesh envoy brief has no '{word}' argument. Set the note with `.mesh envoy brief note \"text\"` and remove it with `.mesh envoy brief note clear`."
         )
     }
 
@@ -730,7 +769,7 @@ fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused()
     let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
     assert!(!startup.contains("joining the mesh"), "{startup:?}");
 
-    // The old verb is unknown on a cold node: the error alone names the new one.
+    // The old verb is unknown on a cold node, refused before any send path runs.
     let hash = "ab".repeat(16);
     let (row, transcript) = command_row_and_transcript(
         &mut session,
@@ -782,21 +821,19 @@ fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused()
     );
     assert_eq!(row.trim(), NOTE_CLEARED);
 
-    // The help list names `message`, with its usage line, and has no `reply` row.
+    // The help list names `messaging send`, with its usage line, and has no `reply` row.
     let (_, help) = command_row_and_transcript(
         &mut session,
         ".mesh",
-        r"\.mesh message\s+Send your own text to one peer, bypassing the model",
+        &format!(
+            r"{}\s+Send your own text to one peer, bypassing the model",
+            literally(SEND_USAGE)
+        ),
         BARE_PROMPT,
     );
+    assert!(help.contains(&format!("  {SEND_USAGE}")), "{help}");
     assert!(
-        help.contains(
-            "e.g. .mesh message <destination> [--yes] \"text\" [--attach <path> [--force]]"
-        ),
-        "{help}"
-    );
-    assert!(
-        help.contains("e.g. .mesh brief [note \"text\"|note clear|auto|manual|off]"),
+        help.contains("  .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"),
         "{help}"
     );
     assert!(
@@ -887,9 +924,9 @@ fn repl_with_mesh_disabled_never_mentions_joining() {
 }
 
 /// Under `command_prefix: slash` the mesh verbs answer to `/mesh` like every
-/// other built-in and the dot form is ordinary chat: `/mesh peers` is refused
-/// because the mesh is off, `.mesh peers` comes back from the dry-run model
-/// instead of the verb, and a `/mesh peers` after that chat turn is refused
+/// other built-in and the dot form is ordinary chat: `/mesh people list` is refused
+/// because the mesh is off, `.mesh people list` comes back from the dry-run model
+/// instead of the verb, and a `/mesh people list` after that chat turn is refused
 /// again. `/help` lists the mesh row under the configured sigil and never
 /// under the other, and `/exit` ends the run cleanly.
 #[test]
@@ -937,12 +974,12 @@ fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
         .expect("type the dot form, which is chat under slash");
     let (before, matched) = wait_for_match(
         &mut session,
-        r"\n(\x1b\[[0-9;?]*[A-Za-z])*\.mesh peers|Mesh is off\.",
+        r"\n(\x1b\[[0-9;?]*[A-Za-z])*\.mesh people list|Mesh is off\.",
     );
     let mut chat = strip_escapes(&before) + &strip_escapes(&matched);
     assert!(
         !chat.contains("Mesh is off"),
-        "`.mesh peers` reached the verb under slash instead of the model:\n{chat}"
+        "`.mesh people list` reached the verb under slash instead of the model:\n{chat}"
     );
     chat.push_str(&strip_escapes(&wait_for(&mut session, BARE_PROMPT)));
     assert!(
@@ -964,7 +1001,7 @@ fn repl_under_slash_dispatches_slash_mesh_and_sends_dot_mesh_to_chat() {
     let help = command_transcript(&mut session, "/help", r"/mesh ", BARE_PROMPT);
     assert!(
         !help.contains("Mesh is off"),
-        "`.mesh peers` reached the verb under slash; its refusal spilled into the help window:\n{help}"
+        "`.mesh people list` reached the verb under slash; its refusal spilled into the help window:\n{help}"
     );
     assert!(
         help.lines().any(|l| l.trim_start().starts_with("/mesh ")),
@@ -1634,7 +1671,7 @@ fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
 /// destination and an identity the node has never seen, write exactly the entry each
 /// one names into `trust.yaml` and say so in the documented words. `forget` is not an
 /// alias of `untrust` any more: its destination form is refused before anything is
-/// read or written, `block <destination>` works on a never-heard hash and `.mesh peers`
+/// read or written, `block <destination>` works on a never-heard hash and `.mesh people list`
 /// lists it as `blocked (instance)`, `untrust` on that deny-only hash names `unblock`, a second
 /// `block` changes nothing, `unblock` lifts the deny and trusts nothing (the `trust` it
 /// names is refused until the hash is heard), `block --identity` writes the block,
@@ -1673,7 +1710,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // `forget` takes `--identity` only; the destination form teaches the two verbs that
     // act on one and reaches neither the untrust path nor the file.
     let expected = format!(
-        ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh untrust {dest} or refused with .mesh block {dest}."
+        ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh access revoke {dest} or refused with .mesh access block {dest}."
     );
     let out = trust_verb(
         &mut session,
@@ -1683,13 +1720,13 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
     assert!(
         !out.contains("Untrust") && !out.contains("untrusts instance") && !out.contains("Forget "),
-        "`.mesh forget <destination>` must not act as untrust: {out:?}"
+        "`.mesh access forget <destination>` must not act as untrust: {out:?}"
     );
     no_entries("after forget <destination>");
 
     // `untrust` of a hash the list holds nothing of names both verbs that act on it.
     let expected = format!(
-        "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+        "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
     );
     let out = trust_verb(
         &mut session,
@@ -1701,8 +1738,9 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `block <destination>` works on a never-heard hash: the deny alone is written and
     // the result names `unblock`; with no identity to name, the clause is left out.
-    let expected =
-        format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it.");
+    let expected = format!(
+        "Blocked cdcdcdcd: it is refused without a knock. .mesh access unblock {dest} lifts it."
+    );
     let out = trust_verb(
         &mut session,
         &format!(".mesh access block {dest} --yes"),
@@ -1721,7 +1759,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(foreign_trust_file_keys(&dir, "identities", &own).is_empty());
     assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
 
-    // The deny-only row shows in `.mesh peers` as a blocked instance, never heard.
+    // The deny-only row shows in `.mesh people list` as a blocked instance, never heard.
     let peers = trust_verb(&mut session, ".mesh people list", "cdcdcdcd");
     let row = peers
         .lines()
@@ -1733,7 +1771,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `untrust` on the deny-only hash names the block and the verb that lifts it.
     let expected = format!(
-        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh unblock {dest} lifts the block."
+        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {dest} lifts the block."
     );
     let out = trust_verb(
         &mut session,
@@ -1759,7 +1797,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // peer row for the hash, nothing binds it to an identity, so what serves it is
     // known only once it announces or knocks.
     let standing = format!(
-        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {dest} does."
+        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh access trust {dest} does."
     );
     let expected = format!("Unblocked cdcdcdcd; {standing}");
     let out = trust_verb(
@@ -1778,7 +1816,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // The verb that line names asks the mesh for the unheard hash first; nothing on the
     // relay answers for it, so it is refused and writes nothing.
     let expected = format!(
-        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
+        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
         &dest[..8]
     );
     let out = trust_verb(
@@ -1792,7 +1830,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // Lifting a deny that is not there is refused, naming both next verbs, and nothing
     // is written.
     let expected = format!(
-        "Destination {dest} is not blocked, so there is nothing to unblock; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+        "Destination {dest} is not blocked, so there is nothing to unblock; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
     );
     let out = trust_verb(
         &mut session,
@@ -1804,7 +1842,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `untrust --identity` of an identity the list has never held writes nothing.
     let expected = format!(
-        "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+        "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh access trust --identity {id} grants it, .mesh access block --identity {id} silences it."
     );
     let out = trust_verb(
         &mut session,
@@ -1834,7 +1872,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // `untrust --identity` of the blocked identity names the unblock, the one verb that
     // applies while the block stands, and writes nothing.
     let expected = format!(
-        "Identity efefefef is blocked and holds no trust record, so there is nothing to untrust; .mesh unblock --identity {id} lifts the block."
+        "Identity efefefef is blocked and holds no trust record, so there is nothing to untrust; .mesh access unblock --identity {id} lifts the block."
     );
     let out = trust_verb(
         &mut session,
@@ -1850,7 +1888,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // `forget --identity` is a dry run first: it lists the block and prints its own
     // token; `--yes` is refused; nothing is written by either.
     let token_line = format!(
-        "This was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh forget --identity {id} --confirm forget-efefefef"
+        "This was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm forget-efefefef"
     );
     let out = trust_verb(
         &mut session,
@@ -1863,7 +1901,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     assert!(out.contains("  block on identity efefefef"), "{out:?}");
     assert!(!out.contains("Forgot identity"), "{out:?}");
-    let expected = "`.mesh forget --identity` takes `--confirm forget-<identity-short>` from a dry run, not `--yes`.";
+    let expected = "`.mesh access forget --identity` takes `--confirm forget-<identity-short>` from a dry run, not `--yes`.";
     let out = trust_verb(
         &mut session,
         &format!(".mesh access forget --identity {id} --yes"),
@@ -1877,7 +1915,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // A wrong token is refused and names the right one; the right one erases the block.
     let expected = format!(
-        "'forget-00000000' is not the token for identity efefefef; run .mesh forget --identity {id} --confirm forget-efefefef"
+        "'forget-00000000' is not the token for identity efefefef; run .mesh access forget --identity {id} --confirm forget-efefefef"
     );
     let out = trust_verb(
         &mut session,
@@ -1899,7 +1937,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // A stranger has nothing to forget.
     let expected = format!(
-        "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+        "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh envoy memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
     );
     let out = trust_verb(
         &mut session,
@@ -1908,26 +1946,27 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
 
-    // The verb list carries the split: `forget` takes `--identity` only, `block` and
-    // `unblock` take a destination or `--identity`.
+    // The verb list carries the split: `access forget` takes `--identity` only, `access
+    // block` and `access unblock` take a destination or `--identity`.
     let (_, help) = command_row_and_transcript(
         &mut session,
         ".mesh",
-        r"\.mesh forget\s+Erase everything this node knows of an identity",
+        &format!(
+            r"{}\s+Erase everything this node knows of an identity",
+            literally(
+                ".mesh access forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"
+            )
+        ),
         SESSION_PROMPT,
     );
     assert!(
+        help.contains("  .mesh access block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]"),
+        "{help}"
+    );
+    assert!(
         help.contains(
-            "e.g. .mesh forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"
+            "  .mesh access unblock <destination> [--yes] | --identity <identity> [--yes]"
         ),
-        "{help}"
-    );
-    assert!(
-        help.contains("e.g. .mesh block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]"),
-        "{help}"
-    );
-    assert!(
-        help.contains("e.g. .mesh unblock <destination> [--yes] | --identity <identity> [--yes]"),
         "{help}"
     );
     assert!(!help.contains("alias of"), "{help}");
@@ -1939,12 +1978,12 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 /// A row past `PENDING_TTL` that no heartbeat has swept yet, met at a cold prompt by the
 /// verbs that decide a row, through the real binary and a pty. The rows are planted in
 /// the instance's inbound store after the node started, so nothing has swept them.
-/// `.mesh dismiss <expired question>` is refused with the `No open question` line naming
-/// `.mesh pending`, prints no block or notice, and the question's one `[mesh:message]`
+/// `.mesh envoy dismiss <expired question>` is refused with the `No open question` line naming
+/// `.mesh envoy questions`, prints no block or notice, and the question's one `[mesh:message]`
 /// expiry line reaches the prompt while the store loses the row and keeps the fresh one.
-/// `.mesh refuse <expired access request>` is refused with the `No open access request`
-/// line, sends nothing, and its one access expiry line follows. `.mesh pending` then
-/// lists the fresh question alone and announces nothing more.
+/// `.mesh files refuse <expired access request>` is refused with the `No open access request`
+/// line, sends nothing, and its one access expiry line follows. The three open lists then
+/// hold the fresh question alone and announce nothing more.
 #[test]
 fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_a_cold_prompt() {
     let relay = SilentRelay::start();
@@ -2005,13 +2044,13 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
     )
     .unwrap();
 
-    // `.mesh dismiss` of the expired question: refused before any block, and the sweep
+    // `.mesh envoy dismiss` of the expired question: refused before any block, and the sweep
     // it ran first announces the expiry once at the prompt.
     let (_, refused) = command_row_and_transcript(
         &mut session,
         &format!(".mesh envoy dismiss {old_q}"),
         &literally(&format!(
-            "No open question has id {old_q}. `.mesh pending` lists the ones this node knows about."
+            "No open question has id {old_q}. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
         )),
         SESSION_PROMPT,
     );
@@ -2050,7 +2089,7 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
         "the sweep rewrote the store without the expired row: {filed:?}"
     );
 
-    // `.mesh refuse` of an expired access request planted since: refused, nothing sent,
+    // `.mesh files refuse` of an expired access request planted since: refused, nothing sent,
     // one access expiry line.
     fs::write(
         &store,
@@ -2064,7 +2103,7 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
         &mut session,
         &format!(".mesh files refuse {old_a}"),
         &literally(&format!(
-            "No open access request has id {old_a}. `.mesh pending` lists the ones this node knows about."
+            "No open access request has id {old_a}. `.mesh files requests` lists the ones this node knows about."
         )),
         SESSION_PROMPT,
     );
@@ -2096,19 +2135,15 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
     assert!(!filed.contains(&old_a) && filed.contains(&q1), "{filed:?}");
 
     // The listing afterwards: the fresh question alone, nothing more announced.
-    let pending = command_prints(
-        &mut session,
-        ".mesh pending",
-        "Asked by this node: none",
-        SESSION_PROMPT,
-    );
+    let (pending, transcript) = open_lists(&mut session, SESSION_PROMPT);
     assert!(
         pending.contains(&format!(" . expires in 6d . id {}", &q1[..8]))
             && pending.contains("Access requests: none")
-            && !pending.contains("expired")
-            && !pending.contains(&old_q[..8])
-            && !pending.contains(&old_a[..8]),
-        "{pending:?}"
+            && pending.contains("Asked by this node: none")
+            && !transcript.contains("expired")
+            && !transcript.contains(&old_q[..8])
+            && !transcript.contains(&old_a[..8]),
+        "{transcript:?}"
     );
 
     let status = exit_clean(&mut session);
@@ -2145,13 +2180,13 @@ fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
 }
 
 /// Cold start with a node on and nobody heard, through the real binary and a pty. With
-/// nothing filed `.mesh pending` prints its three sections as `<title>: none` and no
-/// commands, and `.mesh answer` with an unknown id and no text is refused naming
-/// `.mesh pending` without opening a prompt. A question planted in the instance's
+/// nothing filed the three open lists print their sections as `<title>: none` and no
+/// commands, and `.mesh envoy answer` with an unknown id and no text is refused naming
+/// the lists that hold questions without opening a prompt. A question planted in the instance's
 /// inbound store (read on every verb) is then listed under a `Waiting for YOU (1)`
 /// header painted in the tool-call name colour that names the commands, as one numbered
 /// entry ending `id <id8>`, the quoted body and `envoy asks:` on its own row.
-/// `.mesh answer <id>` with no text prints the question block with its `answer:`
+/// `.mesh envoy answer <id>` with no text prints the question block with its `answer:`
 /// footer carrying the full id and opens the `Your answer:` prompt: Esc cancels it to
 /// the `Nothing was sent:` line naming the one-line form, with nothing sent and the
 /// question still filed; a typed answer goes out as `Sending your answer to <dest8>`
@@ -2166,19 +2201,10 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     wait_for(&mut session, SESSION_PROMPT);
     probe.wait_for_marker("MESH_STARTED");
 
-    let (_, empty) = command_row_and_transcript(
-        &mut session,
-        ".mesh pending",
-        r"Asked by this node: none",
-        SESSION_PROMPT,
-    );
+    let (empty, _) = open_lists(&mut session, SESSION_PROMPT);
     let lines = transcript_lines(&empty);
-    let first = lines
-        .iter()
-        .position(|line| *line == "Waiting for YOU: none")
-        .unwrap_or_else(|| panic!("{empty:?}"));
     assert_eq!(
-        &lines[first..first + 3],
+        lines,
         [
             "Waiting for YOU: none",
             "Access requests: none",
@@ -2186,13 +2212,13 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         ],
         "{empty:?}"
     );
-    assert!(!empty.contains(".mesh answer <id>"), "{empty:?}");
+    assert!(!empty.contains(".mesh envoy answer <id>"), "{empty:?}");
 
     let (_, refused) = command_row_and_transcript(
         &mut session,
         ".mesh envoy answer nope",
         &literally(
-            "No open question has id nope. `.mesh pending` lists the ones this node knows about.",
+            "No open question has id nope. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.",
         ),
         SESSION_PROMPT,
     );
@@ -2223,7 +2249,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     .unwrap();
 
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
+    let footer = format!("  answer: .mesh envoy answer {id} \"<text>\"");
     let block_tail = [
         "  Please delete docs/notes.md.",
         "  envoy asks: Share the plan?",
@@ -2234,7 +2260,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         "     \"Please delete docs/notes.md.\"",
         "     envoy asks: Share the plan?",
     ];
-    session.send(".mesh pending\r").unwrap();
+    session.send(".mesh envoy questions\r").unwrap();
     let (before, matched) = wait_for_match(&mut session, &literally(WAITING_FOR_YOU_ONE));
     let opening = String::from_utf8_lossy(&before);
     let opening = opening.rsplit('\n').next().unwrap_or_default();
@@ -2256,7 +2282,16 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         "{listed:?}"
     );
     assert_eq!(&lines[at + 2..at + 4], entry_tail, "{listed:?}");
-    assert_eq!(lines[at + 4], "Access requests: none", "{listed:?}");
+    assert!(
+        lines.get(at + 4).is_none_or(|line| !line.starts_with("  ")),
+        "the entry is the section's last: {listed:?}"
+    );
+    command_prints(
+        &mut session,
+        ".mesh files requests",
+        "Access requests: none",
+        SESSION_PROMPT,
+    );
 
     // No text: the block, then the prompt; Esc cancels it and sends nothing.
     session.send(format!(".mesh envoy answer {id}\r")).unwrap();
@@ -2293,7 +2328,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     assert!(!sent.contains("Answered"), "{sent:?}");
     let again = command_prints(
         &mut session,
-        ".mesh pending",
+        ".mesh envoy questions",
         &literally(&entry_head),
         SESSION_PROMPT,
     );
@@ -2306,10 +2341,10 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
 }
 
 /// The same question blocks under `NO_COLOR=1`, through the real binary and a pty: the
-/// `.mesh pending` header and the `.mesh answer` block header arrive as bare bytes, no
-/// escape before or inside them. At the `Your answer:` prompt an empty Enter and a
+/// `.mesh envoy questions` header and the `.mesh envoy answer` block header arrive as
+/// bare bytes, no escape before or inside them. At the `Your answer:` prompt an empty Enter and a
 /// Ctrl-C each print the `Nothing was sent:` line, keep the REPL alive at its prompt,
-/// send nothing, and leave the question filed for the next `.mesh pending`.
+/// send nothing, and leave the question filed for the next `.mesh envoy questions`.
 #[test]
 fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     let relay = SilentRelay::start();
@@ -2345,7 +2380,7 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     .unwrap();
 
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let footer = format!("  answer: .mesh answer {id} \"<text>\"");
+    let footer = format!("  answer: .mesh envoy answer {id} \"<text>\"");
     let block_tail = [
         "  May I rename the branch?",
         "  envoy asks: Rename it now?",
@@ -2357,8 +2392,8 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
         "     envoy asks: Rename it now?",
     ];
 
-    // `.mesh pending`: the header row is plain bytes, nothing opens a colour before it.
-    session.send(".mesh pending\r").unwrap();
+    // `.mesh envoy questions`: the header row is plain bytes, nothing opens a colour before it.
+    session.send(".mesh envoy questions\r").unwrap();
     let (before, matched) = wait_for_match(&mut session, &literally(WAITING_FOR_YOU_ONE));
     assert!(
         !matched.contains(&0x1b),
@@ -2385,7 +2420,7 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     );
     assert_eq!(&lines[at + 2..at + 4], entry_tail, "{listed:?}");
 
-    // `.mesh answer <id>`: the plain block, then the prompt; an empty Enter sends nothing.
+    // `.mesh envoy answer <id>`: the plain block, then the prompt; an empty Enter sends nothing.
     session.send(format!(".mesh envoy answer {id}\r")).unwrap();
     let (before, matched) = wait_for_match(&mut session, "Your answer:");
     let raw = String::from_utf8_lossy(&before).into_owned();
@@ -2434,7 +2469,7 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
 
     let again = command_prints(
         &mut session,
-        ".mesh pending",
+        ".mesh envoy questions",
         &literally(&entry_head),
         SESSION_PROMPT,
     );
@@ -2450,12 +2485,12 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
 
 /// Cold start with a node on, through the real binary and a pty. Two questions are
 /// planted in the instance's inbound store, one with the envoy's framing and one without;
-/// `.mesh pending` lists them as two numbered entries under one `Waiting for YOU (2)`
+/// `.mesh envoy questions` lists them as two numbered entries under one `Waiting for YOU (2)`
 /// header, and the entry without framing has no `envoy asks:` row. Answering one with
 /// the text ON THE LINE prints its question block, opens no `Your answer:` prompt, then
 /// `Sending your answer to <dest8> over the mesh...`, one empty line, and the result
 /// (refused: the peer is untrusted). After a typed `.mesh off --yes` the bare
-/// `.mesh answer <id>` and the one-line form are both refused by the `.mesh on` teaching
+/// `.mesh envoy answer <id>` and the one-line form are both refused by the `.mesh on` teaching
 /// line before any block or prompt, nothing is sent, and the store file is
 /// byte-identical afterwards.
 #[test]
@@ -2502,17 +2537,13 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     .unwrap();
 
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let framed_footer = format!("  answer: .mesh answer {framed_id} \"<text>\"");
-    let bare_footer = format!("  answer: .mesh answer {bare_id} \"<text>\"");
+    let framed_footer = format!("  answer: .mesh envoy answer {framed_id} \"<text>\"");
+    let bare_footer = format!("  answer: .mesh envoy answer {bare_id} \"<text>\"");
 
     // Two numbered entries under one header, no `envoy asks:` row where the envoy added
     // no framing.
-    let (_, pending) = command_row_and_transcript(
-        &mut session,
-        ".mesh pending",
-        "Asked by this node: none",
-        SESSION_PROMPT,
-    );
+    let (pending, _) = open_lists(&mut session, SESSION_PROMPT);
+    assert!(pending.ends_with("Asked by this node: none"), "{pending:?}");
     let lines = transcript_lines(&pending);
     let at = lines
         .iter()
@@ -2797,18 +2828,18 @@ fn info_mesh_rows(info: &str) -> Vec<(String, String)> {
 }
 
 /// Cold start with a node on and nobody heard: the listings `.mesh` draws as tables and
-/// the lines it keeps plain, through the real binary and a pty. The bare `.mesh info` is
+/// the lines it keeps plain, through the real binary and a pty. The bare `.mesh config show` is
 /// ONE `key` / `value` table that holds every `mesh:` row `.info` prints (same names, same
 /// order, minus the `interfaces[i]` settings rows a running node replaces with its own),
 /// then `reach`, then the node facts from `identity` to the `propagation_nodes` rows, with
 /// the one `interfaces[0]` row carrying the relay's label and `connected`; `.info` itself
-/// keeps its padded `mesh:` rows. `.mesh peers` and `.mesh knocks` with nothing heard are
-/// plain sentences, not empty tables. `.mesh shares` prints its heading, then a
-/// `kind` / `pattern` / `layer` / `note` table; `--effective` prints its heading, then a
-/// `path` / `verdict` table with the verdict `shared` for a fetchable file and the three
-/// refusal words a real tree earns (`built-in deny`, `denied`, `protected`). `.mesh
-/// sync` prints its progress line, then an empty line, then its result (here the no-node
-/// refusal). Every table is narrower than the terminal.
+/// keeps its padded `mesh:` rows. `.mesh people list` and `.mesh access requests` with
+/// nothing heard are plain sentences, not empty tables. `.mesh files list` prints its
+/// heading, then a `kind` / `pattern` / `layer` / `note` table; `--effective` prints its
+/// heading, then a `path` / `verdict` table with the verdict `shared` for a fetchable file
+/// and the three refusal words a real tree earns (`built-in deny`, `denied`,
+/// `protected`). `.mesh messaging sync` prints its progress line, then an empty line,
+/// then its result (here the no-node refusal). Every table is narrower than the terminal.
 #[test]
 fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_line_is_followed_by_an_empty_line()
  {
@@ -2841,7 +2872,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
     probe.wait_for_marker("MESH_STARTED");
 
-    // `.mesh info`: one table, settings first, `reach`, then the node facts.
+    // `.mesh config show`: one table, settings first, `reach`, then the node facts.
     let info = command_text(&mut session, ".mesh config show", "└", SESSION_PROMPT);
     let table = boxed_table(".mesh config show", &info);
     assert!(
@@ -2906,7 +2937,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
         "the padded rows are gone and nothing says the node is off: {info}"
     );
 
-    // `.info` keeps its padded `mesh:` rows, and `.mesh info` carries the same rows in
+    // `.info` keeps its padded `mesh:` rows, and `.mesh config show` carries the same rows in
     // the same order ahead of `reach`.
     let dot_info = command_text(
         &mut session,
@@ -2938,7 +2969,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
         .collect();
     assert_eq!(
         settings_keys, padded_names,
-        "`.mesh info` holds every `mesh:` row of `.info`, in its order\n{info}\n{dot_info}"
+        "`.mesh config show` holds every `mesh:` row of `.info`, in its order\n{info}\n{dot_info}"
     );
     for (name, value) in &padded {
         if name.starts_with("interfaces[") {
@@ -2967,7 +2998,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     );
     assert!(!knocks.contains('┌'), "{knocks}");
 
-    // `.mesh shares`: heading, then the rules table.
+    // `.mesh files list`: heading, then the rules table.
     let shares = command_text(
         &mut session,
         ".mesh files list",
@@ -2999,7 +3030,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
         lines[top - 1]
     );
 
-    // `.mesh shares --effective`: heading, then the path / verdict table.
+    // `.mesh files list --effective`: heading, then the path / verdict table.
     let effective = command_text(
         &mut session,
         ".mesh files list --effective",
@@ -3028,7 +3059,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
         lines[top - 1]
     );
 
-    // `.mesh sync`: progress line, empty line, result.
+    // `.mesh messaging sync`: progress line, empty line, result.
     let sync = command_text(
         &mut session,
         ".mesh messaging sync",
@@ -3067,7 +3098,7 @@ fn spawn_repl_with_columns(command: Command, columns: u16) -> Target {
     session
 }
 
-/// Cold start with the node off in a 60-column terminal: the bare `.mesh info` table is
+/// Cold start with the node off in a 60-column terminal: the bare `.mesh config show` table is
 /// sized to the terminal, as the Commands page says, so a long value (a configured inbox
 /// path under the temp dir) wraps within its row instead of running past the window; the
 /// wrapped row still reads as one record; and with the node off the line that says so
@@ -3187,7 +3218,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     let own = probe.own_identity();
 
     let refusal = format!(
-        "Destination abababab belongs to identity 12121212, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh block {dest}. To stop trusting the whole identity, run .mesh untrust --identity {id}."
+        "Destination abababab belongs to identity 12121212, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {dest}. To stop trusting the whole identity, run .mesh access revoke --identity {id}."
     );
     for line in [
         format!(".mesh access revoke {dest}"),
@@ -3213,7 +3244,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     // `block <destination>` is the named remedy: the deny is written, the record goes,
     // the identity grant stands, and the line names the identity it leaves unchanged.
     let expected = format!(
-        "Blocked abababab: it is refused without a knock (identity 12121212 otherwise unchanged). .mesh unblock {dest} lifts it."
+        "Blocked abababab: it is refused without a knock (identity 12121212 otherwise unchanged). .mesh access unblock {dest} lifts it."
     );
     let out = trust_verb(
         &mut session,
@@ -3240,7 +3271,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     // returns, and with the record gone and the peer unheard nothing binds the hash to the
     // identity, so the line says the grant serves it once it announces or knocks.
     let expected = format!(
-        "Unblocked abababab; no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh trust {dest} does."
+        "Unblocked abababab; no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh access trust {dest} does."
     );
     let out = trust_verb(
         &mut session,
@@ -3258,7 +3289,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     // The verb that line names asks the mesh for the unheard hash first; nothing answers,
     // so the grant stands and no record is written.
     let expected = format!(
-        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh peers`).",
+        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
         &dest[..8]
     );
     let out = trust_verb(
@@ -3366,7 +3397,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     // The dry run (bare and `--dry-run`) previews the grant and the two instances that
     // stay, names the token, and writes nothing.
     let dry_tail = format!(
-        "This was a dry run; nothing changed. To withdraw the grant, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+        "This was a dry run; nothing changed. To withdraw the grant, run: .mesh access revoke --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id}."
     );
     for line in [
         format!(".mesh access revoke --identity {id}"),
@@ -3399,12 +3430,12 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     for (line, expected) in [
         (
             format!(".mesh access revoke --identity {id} --yes"),
-            "`.mesh untrust --identity` takes `--confirm untrust-<identity-short>` from a dry run, not `--yes`.".to_string(),
+            "`.mesh access revoke --identity` takes `--confirm untrust-<identity-short>` from a dry run, not `--yes`.".to_string(),
         ),
         (
             format!(".mesh access revoke --identity {id} --confirm untrust-nope"),
             format!(
-                "'untrust-nope' is not the token for identity 12121212; run .mesh untrust --identity {id} --confirm {token}"
+                "'untrust-nope' is not the token for identity 12121212; run .mesh access revoke --identity {id} --confirm {token}"
             ),
         ),
     ] {
@@ -3415,7 +3446,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
 
     // The token withdraws the grant alone.
     let expected = format!(
-        "Untrusted identity 12121212: its grant for all destinations is withdrawn; 2 instance(s) stay trusted on their own. .mesh forget --identity {id} erases them too."
+        "Untrusted identity 12121212: its grant for all destinations is withdrawn; 2 instance(s) stay trusted on their own. .mesh access forget --identity {id} erases them too."
     );
     let out = trust_verb(
         &mut session,
@@ -3435,7 +3466,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     // With no grant left, the identity-wide untrust is refused in the documented
     // sentence before any prompt, and the file is byte-identical afterwards.
     let refusal = format!(
-        "Identity {id} holds no grant for all destinations, so there is no grant to withdraw; its 2 instance(s) are trusted on their own. .mesh untrust <destination> stops serving one, .mesh forget --identity {id} erases them all."
+        "Identity {id} holds no grant for all destinations, so there is no grant to withdraw; its 2 instance(s) are trusted on their own. .mesh access revoke <destination> stops serving one, .mesh access forget --identity {id} erases them all."
     );
     for line in [
         format!(".mesh access revoke --identity {id}"),
@@ -3574,7 +3605,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         &mut session,
         &format!(".mesh access revoke {dest}"),
         &format!(
-            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh block {dest} refuses it, .mesh trust {dest} serves it."
+            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
@@ -3586,7 +3617,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         &mut session,
         &format!(".mesh access revoke --identity {id}"),
         &format!(
-            "This was a dry run; nothing changed. To remove the entry, run: .mesh untrust --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh forget --identity {id}."
+            "This was a dry run; nothing changed. To remove the entry, run: .mesh access revoke --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id}."
         ),
     );
     assert!(
@@ -3616,7 +3647,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         &mut session,
         &format!(".mesh access revoke --identity {id} --confirm {token}"),
         &format!(
-            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted. .mesh trust --identity {id} grants it again."
+            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted. .mesh access trust --identity {id} grants it again."
         ),
     );
     assert!(!out.contains("Error:"), "{out:?}");
@@ -3638,7 +3669,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         &mut session,
         &format!(".mesh access revoke --identity {id} --confirm {token}"),
         &format!(
-            "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh trust --identity {id} grants it, .mesh block --identity {id} silences it."
+            "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh access trust --identity {id} grants it, .mesh access block --identity {id} silences it."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
@@ -3653,7 +3684,7 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
 /// header that explains the file to whoever opens it; the header is comment lines only,
 /// says what each section holds, and the reader on the next start parses the file as if
 /// the header were not there: the blocked instance is still `blocked (instance)` in
-/// `.mesh peers`, under the trust legend that names the five standings, and the next
+/// `.mesh people list`, under the trust legend that names the five standings, and the next
 /// write keeps the header in place.
 #[test]
 fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
@@ -3661,7 +3692,7 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     let probe = Probe::new("trust-header-restart", true, &[relay.port]);
     let dest = "cd".repeat(16);
     let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
-    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh block <destination>; blocked (identity) = .mesh block --identity <identity>";
+    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>";
 
     let mut command = probe.command();
     command.args(["--session", "probe"]);
@@ -3672,7 +3703,9 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     trust_verb(
         &mut session,
         &format!(".mesh access block {dest} --yes"),
-        &format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it."),
+        &format!(
+            "Blocked cdcdcdcd: it is refused without a knock. .mesh access unblock {dest} lifts it."
+        ),
     );
     let written = fs::read_to_string(&trust_path).unwrap();
     let status = exit_clean(&mut session);
@@ -3744,9 +3777,9 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
 /// The upgrade path: a `trust.yaml` written by a build before the header existed is
 /// the same YAML with no comment lines in front (the header added no key). Planted
 /// before a cold start, it loads with the same standing (`blocked (instance)` in
-/// `.mesh peers`), starting the node does not rewrite it, and the first write after
+/// `.mesh people list`), starting the node does not rewrite it, and the first write after
 /// the upgrade puts the header in front while keeping every section the old file had.
-/// Along the way a cold `.mesh knocks` with nothing dropped prints no drop line.
+/// Along the way a cold `.mesh access requests` with nothing dropped prints no drop line.
 #[test]
 fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_its_first_write() {
     let relay = SilentRelay::start();
@@ -3765,7 +3798,9 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
     trust_verb(
         &mut session,
         &format!(".mesh access block {dest} --yes"),
-        &format!("Blocked cdcdcdcd: it is refused without a knock. .mesh unblock {dest} lifts it."),
+        &format!(
+            "Blocked cdcdcdcd: it is refused without a knock. .mesh access unblock {dest} lifts it."
+        ),
     );
     let current = fs::read_to_string(&trust_path).unwrap();
     let status = exit_clean(&mut session);
@@ -3788,7 +3823,7 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
     fs::write(&trust_path, &older).unwrap();
 
     // Second cold start over the older file: it loads, nothing is rewritten by
-    // reading, the block stands under the same label, and a cold `.mesh knocks`
+    // reading, the block stands under the same label, and a cold `.mesh access requests`
     // reports no drops.
     let mut command = probe.command();
     command.args(["--session", "probe"]);
@@ -3867,7 +3902,7 @@ fn seconds_of(text: &str) -> Option<u64> {
 }
 
 /// Cold start with `announce: true` and the node on, through the real binary and a pty:
-/// the bare `.mesh info` table reads `joined` as an age and `last announce` as the start
+/// the bare `.mesh config show` table reads `joined` as an age and `last announce` as the start
 /// announce's age with the heartbeat's first tick one period (61 minutes) away, so a fresh
 /// node reads `<n>s ago (next in 1h)`; a fresh identity with nothing marked shows no
 /// `identity predecessors` and no `key changes` row, and no `node` or `selection` row either,
@@ -4000,13 +4035,14 @@ fn an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
-/// `.mesh dismiss` at a cold prompt, through the real binary and a pty, with the asker
-/// never heard and untrusted. An unknown id is refused naming `.mesh pending` before any
-/// block. Two stale rows planted in the instance's inbound store (eight days old, one
-/// question and one access request) are swept at the top of the next `.mesh pending`:
+/// `.mesh envoy dismiss` at a cold prompt, through the real binary and a pty, with the asker
+/// never heard and untrusted. An unknown id is refused naming the lists that hold
+/// questions before any block. Two stale rows planted in the instance's inbound store
+/// (eight days old, one question and one access request) are swept at the top of the
+/// next `.mesh envoy questions`:
 /// neither renders, the store loses them, and one `[mesh:message]` idle line each
 /// reaches the prompt in the kind's shape, while the fresh rows end `expires in 6d`.
-/// An access id is sent to `grant`/`refuse`. The default dismissal prints the block,
+/// An access id is sent to `files grant`/`files refuse`. The default dismissal prints the block,
 /// `Telling <dest8> that you declined over the mesh...`, an empty line, and since the
 /// peer is untrusted the `Could not tell ... stays pending. Retry, or ... --silent.`
 /// line, with the question still filed; `--silent` then removes it with nothing sent.
@@ -4026,8 +4062,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     wait_for(&mut session, SESSION_PROMPT);
     probe.wait_for_marker("MESH_STARTED");
 
-    let unknown =
-        "No open question has id nope. `.mesh pending` lists the ones this node knows about.";
+    let unknown = "No open question has id nope. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.";
     let (_, refused) = command_row_and_transcript(
         &mut session,
         ".mesh envoy dismiss nope",
@@ -4109,41 +4144,42 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     )
     .unwrap();
 
-    // The sweep at the top of `.mesh pending`: the stale pair goes, one idle line each.
+    // The sweep at the top of `.mesh envoy questions`: the stale pair goes, one idle line
+    // each.
     let header_head = format!("awaiting your answer . {dest8} ({dest8}) . asked ");
-    let access_header =
-        "Access requests (1)     grant: .mesh grant <id> [--standing] . refuse: .mesh refuse <id>";
+    let access_header = "Access requests (1)     grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>";
     let entry_head = format!("{dest8} ({dest8}) asked ");
-    let (_, pending) = command_row_and_transcript(
+    let (_, escalated) = command_row_and_transcript(
         &mut session,
-        ".mesh pending",
-        &literally(access_header),
+        ".mesh envoy questions",
+        &literally("Waiting for YOU (2)"),
         SESSION_PROMPT,
     );
     assert!(
-        !pending.contains(&old_q[..8]) && !pending.contains(&old_a[..8]),
-        "an expired row never renders: {pending:?}"
+        !escalated.contains(&old_q[..8]) && !escalated.contains(&old_a[..8]),
+        "an expired row never renders: {escalated:?}"
     );
-    let lines = transcript_lines(&pending);
+    let lines = transcript_lines(&escalated);
     let waiting_at = lines
         .iter()
         .position(|line| line.starts_with("Waiting for YOU (2)"))
-        .unwrap_or_else(|| panic!("{pending:?}"));
-    let access_at = lines
+        .unwrap_or_else(|| panic!("{escalated:?}"));
+    let entries: Vec<&&str> = lines[waiting_at + 1..]
         .iter()
-        .position(|line| *line == access_header)
-        .unwrap_or_else(|| panic!("{pending:?}"));
-    let entries: Vec<&&str> = lines[waiting_at + 1..access_at]
-        .iter()
+        .take_while(|line| line.starts_with("  "))
         .filter(|line| line.contains(&entry_head))
         .collect();
-    assert_eq!(entries.len(), 2, "two fresh question entries: {pending:?}");
+    assert_eq!(
+        entries.len(),
+        2,
+        "two fresh question entries: {escalated:?}"
+    );
     let mut shown: Vec<String> = entries
         .iter()
         .map(|entry| {
             let (head, id8) = entry
                 .rsplit_once(" . id ")
-                .unwrap_or_else(|| panic!("{pending:?}"));
+                .unwrap_or_else(|| panic!("{escalated:?}"));
             assert!(
                 head.ends_with(" . expires in 6d") && id8.len() == 8,
                 "each fresh row carries its time left: {entry:?}"
@@ -4154,13 +4190,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     shown.sort_unstable();
     let mut fresh_ids = vec![q1[..8].to_string(), q2[..8].to_string()];
     fresh_ids.sort_unstable();
-    assert_eq!(shown, fresh_ids, "{pending:?}");
-    let access_entry = lines[access_at + 1];
-    assert!(
-        access_entry.starts_with(&format!("  1. {entry_head}"))
-            && access_entry.ends_with(&format!(" ago . expires in 6d . id {}", &acc[..8])),
-        "{pending:?}"
-    );
+    assert_eq!(shown, fresh_ids, "{escalated:?}");
     let expiry = format!(
         r"\[mesh:message\](\x1b\[[0-9;]*m)* (question {} from {dest8} expired unanswered|access request {} from {dest8} expired)",
         &old_q[..8],
@@ -4198,12 +4228,32 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     for id in [&q1, &q2, &acc] {
         assert!(filed.contains(id), "{filed:?}");
     }
-    // A second listing sweeps nothing more.
-    let again = command_prints(
+    let (_, requests) = command_row_and_transcript(
         &mut session,
-        ".mesh pending",
+        ".mesh files requests",
         &literally(access_header),
         SESSION_PROMPT,
+    );
+    assert!(
+        !requests.contains(&old_q[..8]) && !requests.contains(&old_a[..8]),
+        "an expired row never renders: {requests:?}"
+    );
+    let lines = transcript_lines(&requests);
+    let access_at = lines
+        .iter()
+        .position(|line| *line == access_header)
+        .unwrap_or_else(|| panic!("{requests:?}"));
+    let access_entry = lines[access_at + 1];
+    assert!(
+        access_entry.starts_with(&format!("  1. {entry_head}"))
+            && access_entry.ends_with(&format!(" ago . expires in 6d . id {}", &acc[..8])),
+        "{requests:?}"
+    );
+    // A second listing sweeps nothing more.
+    let (lists, again) = open_lists(&mut session, SESSION_PROMPT);
+    assert!(
+        transcript_lines(&lists).contains(&access_header),
+        "{lists:?}"
     );
     assert!(!again.contains("expired"), "{again:?}");
 
@@ -4212,7 +4262,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         &mut session,
         &format!(".mesh envoy dismiss {acc}"),
         &literally(&format!(
-            "`{acc}` is an access request, not a question; decide it with `.mesh grant {acc}` or `.mesh refuse {acc}`"
+            "`{acc}` is an access request, not a question; decide it with `.mesh files grant {acc}` or `.mesh files refuse {acc}`"
         )),
         SESSION_PROMPT,
     );
@@ -4245,7 +4295,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         &lines[header_at + 1..header_at + 3],
         [
             "  Can I archive the old branch?",
-            format!("  answer: .mesh answer {q1} \"<text>\"").as_str()
+            format!("  answer: .mesh envoy answer {q1} \"<text>\"").as_str()
         ],
         "{told:?}"
     );
@@ -4267,7 +4317,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         kept.contains(&format!("Could not tell {dest8} that you declined ("))
             && kept.contains("not trusted for messaging")
             && kept.ends_with(&format!(
-                "); {} stays pending. Retry, or remove it without a message with .mesh dismiss {q1} --silent.",
+                "); {} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {q1} --silent.",
                 &q1[..8]
             )),
         "{kept:?}"
@@ -4283,7 +4333,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         &mut session,
         &format!(".mesh envoy dismiss {q1} --silent"),
         &literally(&format!(
-            "Dismissed {} without telling {dest8}. .mesh pending shows what is still open.",
+            "Dismissed {} without telling {dest8}. .mesh envoy questions shows what is still open.",
             &q1[..8]
         )),
         SESSION_PROMPT,
@@ -4314,7 +4364,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     // retry; the store keeps it.
     let row_head = format!("  {q2} . {dest8} ({dest8}) . asked ");
     let all_stayed = format!(
-        "Dismissed 0; .mesh pending shows what is still open; 1 could not be told and stay pending: {q2}. Retry, or .mesh dismiss --all --silent."
+        "Dismissed 0; .mesh envoy questions shows what is still open; 1 could not be told and stay pending: {q2}. Retry, or .mesh envoy dismiss --all --silent."
     );
     let (row, told_none) = command_row_and_transcript(
         &mut session,
@@ -4341,7 +4391,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     assert!(
         kept.starts_with(&format!("Could not tell {dest8} that you declined ("))
             && kept.ends_with(&format!(
-                "); {} stays pending. Retry, or remove it without a message with .mesh dismiss {q2} --silent.",
+                "); {} stays pending. Retry, or remove it without a message with .mesh envoy dismiss {q2} --silent.",
                 &q2[..8]
             )),
         "{kept:?}"
@@ -4386,7 +4436,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         "a dry run changes nothing"
     );
 
-    let all_done = "Dismissed 1; .mesh pending shows what is still open.";
+    let all_done = "Dismissed 1; .mesh envoy questions shows what is still open.";
     let (row, all) = command_row_and_transcript(
         &mut session,
         ".mesh envoy dismiss --all --silent --yes",
@@ -4402,12 +4452,8 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     );
     let filed = fs::read_to_string(&store).unwrap();
     assert!(!filed.contains(&q2) && filed.contains(&acc), "{filed:?}");
-    let left = command_prints(
-        &mut session,
-        ".mesh pending",
-        "Asked by this node: none",
-        SESSION_PROMPT,
-    );
+    let (left, _) = open_lists(&mut session, SESSION_PROMPT);
+    assert!(left.ends_with("Asked by this node: none"), "{left:?}");
     let lines = transcript_lines(&left);
     let escalated = lines
         .iter()
@@ -4418,7 +4464,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         &mut session,
         ".mesh envoy dismiss --all --dry-run",
         &literally(
-            "No open questions to dismiss; `.mesh pending` lists what this node knows about.",
+            "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about.",
         ),
         SESSION_PROMPT,
     );
@@ -4462,9 +4508,9 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
-/// Cold start, mesh off, no session: `.mesh brief auto|manual|off` answer at the first
+/// Cold start, mesh off, no session: `.mesh envoy brief auto|manual|off` answer at the first
 /// prompt with the per-mode line (what the envoy answers peers from, config.yaml untouched,
-/// the next command), and bare `.mesh brief` right after leads with `brief mode: <mode>`
+/// the next command), and bare `.mesh envoy brief` right after leads with `brief mode: <mode>`
 /// and names every section the envoy sees, present or not: under auto the digest reads
 /// `none yet`, under manual `not used in manual mode`, the note names the command that
 /// sets it; under off no brief is assembled and the two commands that turn it back on are
@@ -4472,11 +4518,11 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
 /// the status card and the brief on two rows of their own.
 #[test]
 fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
-    const AUTO: &str = "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
-    const MANUAL: &str = "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh brief to see the sections.";
-    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh brief auto or .mesh brief manual turns the brief back on.";
-    const NOTE_LABEL: &str = "your note (none; .mesh brief note \"text\" sets it)";
-    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh brief auto or .mesh brief manual turns it back on.";
+    const AUTO: &str = "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.";
+    const MANUAL: &str = "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on.";
+    const NOTE_LABEL: &str = "your note (none; .mesh envoy brief note \"text\" sets it)";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on.";
 
     let relay = SilentRelay::start();
     let probe = Probe::new("brief-modes-cold", false, &[relay.port]);
@@ -4518,7 +4564,7 @@ fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
         let flat = transcript.replace("\r\n", "\n");
         assert!(
             flat.contains(&format!("\nbrief mode: {mode}\nsections: card . ")),
-            "bare .mesh brief under {mode} leads with the mode line, then the sections: {transcript:?}"
+            "bare .mesh envoy brief under {mode} leads with the mode line, then the sections: {transcript:?}"
         );
         assert!(
             flat.contains("\n## Status\n"),
@@ -4559,7 +4605,7 @@ fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
     // says no brief is assembled and names the commands that turn it on); the old
     // single `status card and brief` row is gone.
     const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
-    const BRIEF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh brief auto or .mesh brief manual turns it on";
+    const BRIEF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on";
     let prompt = session_prompt("work");
     session.send(".session work\r").expect("enter a session");
     let entered = strip_escapes(&wait_for(&mut session, &prompt));
@@ -4590,15 +4636,15 @@ fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
 
 /// Under `command_prefix: slash` every brief confirmation this release reworded names its
 /// next command under the configured sigil: the note confirmation, the mode lines, the
-/// off-mode bare brief and the retired-spelling refusal all read `/mesh brief ...` and none
+/// off-mode bare brief and the retired-spelling refusal all read `/mesh envoy brief ...` and none
 /// of them keeps a `.mesh` the user cannot type.
 #[test]
 fn brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil() {
-    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `/mesh brief` to see what your envoy answers from.";
-    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh brief auto or /mesh brief manual turns the brief back on.";
-    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. /mesh brief auto or /mesh brief manual turns it back on.";
-    const MANUAL_TAIL: &str = "Run /mesh brief to see the sections.";
-    const RETIRED: &str = "/mesh envoy brief has no 'set' argument. Set the note with `/mesh brief note \"text\"` and remove it with `/mesh brief note clear`.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `/mesh envoy brief` to see what your envoy answers from.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh envoy brief auto or /mesh envoy brief manual turns the brief back on.";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. /mesh envoy brief auto or /mesh envoy brief manual turns it back on.";
+    const MANUAL_TAIL: &str = "Run /mesh envoy brief to see the sections.";
+    const RETIRED: &str = "/mesh envoy brief has no 'set' argument. Set the note with `/mesh envoy brief note \"text\"` and remove it with `/mesh envoy brief note clear`.";
 
     let relay = SilentRelay::start();
     let probe = Probe::new("brief-slash-cold", false, &[relay.port]).with_command_prefix("slash");
@@ -4702,10 +4748,10 @@ impl LocalRnsd {
 }
 
 /// A `local`-only config through the real binary, as the shipped default is used: with
-/// nothing listening at the endpoint the bare `.mesh info` already shows the entry as
+/// nothing listening at the endpoint the bare `.mesh config show` already shows the entry as
 /// `local rnsd at <endpoint>` and keys `reach` on it, `.mesh on` is refused with the
 /// endpoint, the kind, the client's dial failure and the loopback hint, and nothing is started
-/// (no `mesh.started`, `.mesh peers` still says the mesh is off). Once a listener answers
+/// (no `mesh.started`, `.mesh people list` still says the mesh is off). Once a listener answers
 /// there the same `.mesh on` joins: the summary names the entry, the node's row reads
 /// `local rnsd at <endpoint>  connected`, `reach` keeps the endpoint, no WARNING is
 /// printed, and `.exit` stops the node once.
@@ -5044,7 +5090,7 @@ impl LocalDaemon {
     }
 }
 
-/// Asks `.mesh info` once a second until `interfaces[0]` reads `want`, or fails after
+/// Asks `.mesh config show` once a second until `interfaces[0]` reads `want`, or fails after
 /// `budget` with the last table seen.
 fn wait_for_local_row(session: &mut Target, want: &str, budget: Duration, what: &str) -> String {
     let deadline = Instant::now() + budget;
@@ -5065,7 +5111,7 @@ fn wait_for_local_row(session: &mut Target, want: &str, budget: Duration, what: 
 
 /// The `local` row's whole lifecycle through the real binary, as an operator who stops
 /// and restarts rnsd sees it: with rnsd (stood in for) listening, `.mesh on` joins with
-/// no WARNING and `.mesh info` reads `connected`; when rnsd goes away the row reads
+/// no WARNING and `.mesh config show` reads `connected`; when rnsd goes away the row reads
 /// `lost, retrying: rnsd closed the socket` (the fixed reason the client's drop sets,
 /// nothing from a probe) and the kind leaves the join; when rnsd is back the row is
 /// `connected` again. Through all of it nothing is printed between prompts: no WARNING,
@@ -5171,7 +5217,7 @@ fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary
 /// Through the real binary: a `local` entry nothing answers at, beside a relay that
 /// connects, does not refuse the start. `.mesh on` joins through the relay and warns
 /// that the local rnsd is not reachable yet, with the client's dial failure rendered as
-/// Coyote's sentence and the start-the-daemon tail; `.mesh info` lists the local row as
+/// Coyote's sentence and the start-the-daemon tail; `.mesh config show` lists the local row as
 /// `connecting, retrying: <that sentence>` and keeps it there while the client redials.
 /// Once a listener is up at the endpoint the background redial lands and the row reads
 /// `connected` with no second WARNING.
@@ -5209,7 +5255,7 @@ fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_
     assert!(
         warnings[0].starts_with(&warning_prefix)
             && warnings[0].ends_with(
-                "; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+                "; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects"
             ),
         "{joined:?}"
     );
@@ -5218,7 +5264,7 @@ fn a_local_entry_beside_a_relay_starts_dialing_and_flips_to_connected_when_rnsd_
     assert_eq!(
         warnings[0],
         format!(
-            "{warning_prefix}{reason}; start the local rnsd (`rnsd`), and `.mesh info` shows when it connects"
+            "{warning_prefix}{reason}; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects"
         ),
         "{joined:?}"
     );

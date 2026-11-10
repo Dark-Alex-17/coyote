@@ -1378,7 +1378,6 @@ const STALE_MESH_PATH_FILES: &[&str] = &[
     "src/render/mod.rs",
     "src/repl/mod.rs",
     "tests/macro_bracketing.rs",
-    "tests/mesh_autostart_repl.rs",
     "tests/propagation_node_image.rs",
 ];
 
