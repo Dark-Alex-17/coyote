@@ -2580,24 +2580,16 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
         .unwrap();
         // Seed the built-in assets first so the file walk below sees only
         // what the refused step leaves behind.
-        let mut seed = Command::new(built_binary());
-        base_env(&mut seed, &dir);
-        common::pty::detached(&mut seed)
-            .env("COYOTE_UI", "repl")
+        ttyless_command(built_binary(), &dir)
             .arg("--info")
-            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
         let files_before = walk(&dir);
 
-        let mut cmd = Command::new(built_binary());
-        base_env(&mut cmd, &dir);
-        common::pty::detached(&mut cmd)
-            .env("COYOTE_UI", "repl")
-            .args(["--macro", "asking"])
-            .stdin(std::process::Stdio::null())
+        let mut cmd = ttyless_command(built_binary(), &dir);
+        cmd.args(["--macro", "asking"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = cmd.spawn().unwrap();
@@ -3201,45 +3193,6 @@ fn dot_uninstall_asks_in_the_confirm_modal_and_a_modified_file_in_the_select_mod
         });
 
     assert_ui_alive_then_quit(&mut pty, "the uninstall");
-}
-
-/// Runs the binary with no terminal at all (detached, stdin /dev/null,
-/// pipes for stdout/stderr) and returns `(success, stdout+stderr)`,
-/// failing the test if it hangs on a prompt.
-fn run_ttyless(dir: &Path, args: &[&str], what: &str) -> (bool, String) {
-    run_ttyless_binary(built_binary(), dir, args, what)
-}
-
-/// [`run_ttyless`] for a copy of the binary living elsewhere (the
-/// self-update path classifies the install by where the executable is).
-fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) -> (bool, String) {
-    let mut cmd = Command::new(binary);
-    base_env(&mut cmd, dir);
-    common::pty::detached(&mut cmd)
-        .env("COYOTE_UI", "repl")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    while child.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!(
-                "{what}: `coyote {}` with no terminal hung on a prompt",
-                args.join(" ")
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let out = child.wait_with_output().unwrap();
-    let everything = format!(
-        "--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.success(), everything)
 }
 
 /// With no terminal, the no-tty silent paths keep their polarity and the

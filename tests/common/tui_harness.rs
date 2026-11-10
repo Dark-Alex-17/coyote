@@ -6,12 +6,12 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
 use super::fake_llm::{FakeLlm, Reply};
-use super::pty::{Pty, strip_ansi};
+use super::pty::{Pty, detached, strip_ansi};
 
 /// Covers the keyboard-enhancement probe, which waits two seconds for an
 /// answer a pseudo-terminal never gives.
@@ -128,7 +128,8 @@ pub const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}'{args} <{stdin}; rc=$?;
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";
 
-/// The build's own binary; every spawn goes through [`spawn_binary_under`].
+/// The build's own binary; every spawn goes through [`spawn_binary_under`]
+/// (on a pty) or [`ttyless_command`] (with no terminal at all).
 pub fn built_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_coyote"))
 }
@@ -187,6 +188,53 @@ pub fn base_env(cmd: &mut Command, dir: &Path) {
         .env_remove("IS_SANDBOX")
         .env_remove("COLORTERM")
         .env_remove("NO_COLOR");
+}
+
+/// The binary at `binary` set up to run with no terminal at all: the
+/// shared environment under `dir`, detached from the test runner's
+/// controlling tty, the plain REPL selected and stdin at /dev/null. The
+/// caller adds its arguments and chooses what to do with stdout and
+/// stderr.
+pub fn ttyless_command(binary: &Path, dir: &Path) -> Command {
+    let mut cmd = Command::new(binary);
+    base_env(&mut cmd, dir);
+    detached(&mut cmd)
+        .env("COYOTE_UI", "repl")
+        .stdin(Stdio::null());
+    cmd
+}
+
+/// Runs the binary with no terminal at all (detached, stdin /dev/null,
+/// pipes for stdout/stderr) and returns `(success, stdout+stderr)`,
+/// failing the test if it hangs on a prompt.
+pub fn run_ttyless(dir: &Path, args: &[&str], what: &str) -> (bool, String) {
+    run_ttyless_binary(built_binary(), dir, args, what)
+}
+
+/// [`run_ttyless`] for a copy of the binary living elsewhere (the
+/// self-update path classifies the install by where the executable is).
+pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) -> (bool, String) {
+    let mut cmd = ttyless_command(binary, dir);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!(
+                "{what}: `coyote {}` with no terminal hung on a prompt",
+                args.join(" ")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    let everything = format!(
+        "--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.success(), everything)
 }
 
 pub fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
