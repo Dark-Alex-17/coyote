@@ -420,7 +420,8 @@ impl DestinationCandidate {
 
     /// Whether the row's `<user> / <session>` carries a name rather than two short hashes.
     fn named(&self) -> bool {
-        // A row whose identity is not proven reads `unnamed`, whatever identity it claims.
+        // A row nothing names reads `unnamed / <dest8>` with no identity, else
+        // `<id8> / <dest8>`, whether its identity is proven or only claimed.
         let session = short(&self.destination).to_ascii_lowercase();
         let unnamed = format!("{UNNAMED} / {session}");
         let hashed = match self.identity.as_str() {
@@ -6967,7 +6968,7 @@ impl RequestContext {
 
     /// Identities for `.mesh access trust --identity <TAB>` (the peer table alone) and, with
     /// `include_knocks`, `.mesh access block --identity <TAB>` (knockers first, then peers):
-    /// each distinct identity described by its label or short hash, less the identities
+    /// each distinct identity described as its user reads in the people view, less the identities
     /// already blocked, which `trust` refuses and `block` has nothing left to do for. Empty
     /// while the mesh is off.
     fn mesh_completion_identities(&self, include_knocks: bool) -> Vec<(String, Option<String>)> {
@@ -6975,28 +6976,23 @@ impl RequestContext {
             return Vec::new();
         };
         let blocked = blocked_identities(&runtime);
+        let namer = runtime.namer();
         let mut values: Vec<(String, Option<String>)> = Vec::new();
         let knocks = if include_knocks {
             cached_knocks(&runtime, SystemTime::now())
         } else {
             Vec::new()
         };
-        let rows = knocks
-            .into_iter()
-            .map(|knock| (knock.identity_hash, knock.display_name))
-            .chain(
-                heard_peers(&runtime)
-                    .into_iter()
-                    .map(|peer| (peer.identity_hash, peer.display_name)),
-            );
-        for (identity, name) in rows {
+        let rows = knocks.into_iter().map(|knock| knock.identity_hash).chain(
+            heard_peers(&runtime)
+                .into_iter()
+                .map(|peer| peer.identity_hash),
+        );
+        for identity in rows {
             if blocked.contains(&identity) {
                 continue;
             }
-            let who = name
-                .as_deref()
-                .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
-                .unwrap_or_else(|| short(&identity).to_string());
+            let who = namer.user(Some(&identity));
             push_missing(&mut values, vec![(identity, Some(who))]);
         }
         values
@@ -7103,27 +7099,17 @@ impl RequestContext {
     }
 
     fn mesh_completion_remembered_identities(&self) -> Vec<(String, Option<String>)> {
+        // Each user reads as the people view names them, never by the name a session
+        // announces; with the mesh off, by the short hash.
         let runtime = self.app.mesh.get();
-        let mut names: HashMap<String, String> = HashMap::new();
-        if let Some(runtime) = &runtime {
-            for peer in heard_peers(runtime) {
-                let Some(name) = peer
-                    .display_name
-                    .as_deref()
-                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
-                else {
-                    continue;
-                };
-                names.entry(peer.identity_hash).or_insert(name);
-            }
-        }
+        let namer = runtime.as_ref().map(|runtime| runtime.namer());
         let mut values: Vec<(String, Option<String>)> = self
             .remembered_everywhere()
             .into_iter()
             .map(|(identity, threads)| {
-                let who = names
-                    .get(&identity)
-                    .cloned()
+                let who = namer
+                    .as_ref()
+                    .map(|namer| namer.user(Some(&identity)))
                     .unwrap_or_else(|| short(&identity).to_string());
                 let description = format!(
                     "{who} . {}",
@@ -38895,8 +38881,15 @@ mod tests {
     async fn repl_complete_mesh_trust_identity_offers_peer_table_identities_only_minus_blocked() {
         let _guard = HelperConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-trust-id").await;
+        fixture
+            .started
+            .runtime
+            .trust()
+            .set_person_alias(&fixture.trusted_peer_identity, Some("Bea"), &[])
+            .unwrap();
 
         let identities = fixture.complete(&["access", "trust", "--identity", ""]);
+        let hash = |identity: &str| Some(short(identity).to_string());
         assert_eq!(
             identities,
             [
@@ -38904,14 +38897,20 @@ mod tests {
                     fixture.trusted_peer_identity.clone(),
                     Some("Bea".to_string())
                 ),
-                (fixture.heard_identity.clone(), Some("Cal".to_string())),
+                (
+                    fixture.heard_identity.clone(),
+                    hash(&fixture.heard_identity)
+                ),
                 (
                     fixture.refused_peer_identity.clone(),
-                    Some("Eve".to_string())
+                    hash(&fixture.refused_peer_identity)
                 ),
-                (fixture.legacy_identity.clone(), Some("Fay".to_string())),
+                (
+                    fixture.legacy_identity.clone(),
+                    hash(&fixture.legacy_identity)
+                ),
             ],
-            "heard identities newest first, each named by its display name"
+            "heard identities newest first, each named as its user reads in the people view, never by an announced name"
         );
         assert!(
             !identities
@@ -39167,7 +39166,14 @@ mod tests {
             "a knocker without a name is named by both short hashes, and one without an intro ends at the age"
         );
 
+        fixture
+            .started
+            .runtime
+            .trust()
+            .set_person_alias(&fixture.trusted_peer_identity, Some("Bea"), &[])
+            .unwrap();
         let block = fixture.complete(&["access", "block", "--identity", ""]);
+        let hash = |identity: &str| Some(short(identity).to_string());
         assert_eq!(
             block,
             [
@@ -39177,20 +39183,26 @@ mod tests {
                 ),
                 (
                     fixture.provable_knock.identity_hash.clone(),
-                    Some("Kim".to_string())
+                    hash(&fixture.provable_knock.identity_hash)
                 ),
                 (
                     fixture.trusted_peer_identity.clone(),
                     Some("Bea".to_string())
                 ),
-                (fixture.heard_identity.clone(), Some("Cal".to_string())),
+                (
+                    fixture.heard_identity.clone(),
+                    hash(&fixture.heard_identity)
+                ),
                 (
                     fixture.refused_peer_identity.clone(),
-                    Some("Eve".to_string())
+                    hash(&fixture.refused_peer_identity)
                 ),
-                (fixture.legacy_identity.clone(), Some("Fay".to_string())),
+                (
+                    fixture.legacy_identity.clone(),
+                    hash(&fixture.legacy_identity)
+                ),
             ],
-            "knockers newest first, then heard peers newest first, named or by short hash"
+            "knockers newest first, then heard peers newest first, each as the people view names its user, else by short hash; an announced name names nobody"
         );
         assert!(
             !block
@@ -42283,6 +42295,12 @@ mod tests {
             )
             .unwrap();
 
+        fixture
+            .started
+            .runtime
+            .trust()
+            .set_person_alias(&fixture.trusted_peer_identity, Some("Bea"), &[])
+            .unwrap();
         let values = fixture.complete(&["envoy", "memory", "forget", ""]);
 
         let (remembered, rest) = values.split_at(2);
@@ -42301,7 +42319,7 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(
             remembered, expected,
-            "a remembered identity is named by its peer when the node knows one, else by its short hash: {values:?}"
+            "a remembered identity is named as the people view names its user, else by its short hash: {values:?}"
         );
         let (all, trusted) = rest.split_last().expect("`all` closes the list");
         assert_eq!(

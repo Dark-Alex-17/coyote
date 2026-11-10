@@ -5952,6 +5952,142 @@ fn a_colliding_advertised_name_is_dropped_and_hash_prefixes_must_be_unique() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// The naming lifecycle across a cold restart: the owner's alias
+/// beats the advertised one, `--clear` on a user falls back to the advertised name and
+/// then (none advertised) to the short hash, re-giving the same name changes nothing,
+/// an unknown address is refused without touching the people section, names given in
+/// one run read back after a restart, and a trust verb's line names the peer as
+/// `<user> / <session>`.
+#[test]
+fn people_names_survive_a_cold_restart_and_clear_falls_back_advertised_then_hash() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("people-lifecycle", true, &[relay.port]);
+    seed_people_trust_file(&probe.config_dir);
+    let dir = probe.config_dir.clone();
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+
+    {
+        let mut command = probe.command();
+        command.args(["--session", "probe"]);
+        let mut session = spawn_repl(command);
+        let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+        assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+        probe.wait_for_marker("MESH_STARTED");
+
+        // Owner alias beats the advertised user name.
+        let out = people_command(&mut session, ".mesh people name carol \"Caz\"");
+        check(
+            out.contains("is now Caz"),
+            "naming an advertised user",
+            &out,
+        );
+        let out = people_command(&mut session, ".mesh people info caz");
+        check(
+            out.contains("user: Caz (the name you gave)")
+                && out.contains(&format!("Caz / desk . {CAROL_ONE}")),
+            "owner alias wins over advertised",
+            &out,
+        );
+        // Clearing the alias falls back to the advertised name.
+        let out = people_command(&mut session, ".mesh people name caz --clear");
+        check(!out.contains("Error:"), "--clear on a user alias", &out);
+        let out = people_command(&mut session, ".mesh people info carol");
+        check(
+            out.contains("user: carol (the name they advertise)"),
+            "after --clear the advertised name shows again",
+            &out,
+        );
+
+        // Name maki; giving the same name again leaves the file as it was.
+        let out = people_command(&mut session, ".mesh people name a1b2c3d4 \"Maki\"");
+        check(out.contains("is now Maki"), "naming maki", &out);
+        let before = people_section(&dir);
+        let out = people_command(&mut session, ".mesh people name maki \"Maki\"");
+        check(
+            people_section(&dir) == before,
+            "re-giving the same name changes nothing",
+            &out,
+        );
+        let out = people_command(&mut session, ".mesh people name maki/2222bbbb \"tower\"");
+        check(
+            out.contains("Maki / 2222bbbb is now Maki / tower"),
+            "naming a session",
+            &out,
+        );
+
+        // An unknown address is refused and changes nothing.
+        let before = people_section(&dir);
+        for line in [
+            ".mesh people info nobody",
+            ".mesh people name nobody \"x\"",
+            ".mesh people name maki/nowhere \"x\"",
+            ".mesh people status nobody",
+        ] {
+            let out = people_command(&mut session, line);
+            check(out.contains("Error:"), &format!("{line} is refused"), &out);
+        }
+        check(
+            people_section(&dir) == before,
+            "refused addresses leave the people section",
+            "",
+        );
+
+        // A trust verb names the peer with the display helper.
+        let out = people_command(
+            &mut session,
+            &format!(".mesh access revoke {MAKI_TWO} --yes"),
+        );
+        check(
+            out.contains("Maki / tower"),
+            "a trust verb line reads <user> / <session>",
+            &out,
+        );
+
+        let status = exit_clean(&mut session);
+        assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    }
+
+    // Cold restart over the same config dir: the names read back.
+    {
+        let mut command = probe.command();
+        command.args(["--session", "probe"]);
+        let mut session = spawn_repl(command);
+        let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
+        assert!(startup.contains(MESH_ON_SUMMARY), "{startup:?}");
+        let out = people_command(&mut session, ".mesh people info maki");
+        check(
+            out.contains("user: Maki (the name you gave)")
+                && out.contains(&format!("Maki / 1111aaaa . {MAKI_ONE}")),
+            "a user name survives a cold restart",
+            &out,
+        );
+        let out = people_command(&mut session, ".mesh people info carol");
+        check(
+            out.contains("user: carol (the name they advertise)"),
+            "the cleared alias stays cleared after a restart",
+            &out,
+        );
+        // Clearing the only name left falls back to the short hash.
+        let out = people_command(&mut session, ".mesh people name maki --clear");
+        check(!out.contains("Error:"), "--clear of maki", &out);
+        let out = people_command(&mut session, ".mesh people info a1b2c3d4");
+        check(
+            out.contains("user: a1b2c3d4 (no name; "),
+            "with no alias and nothing advertised the user reads as its short hash",
+            &out,
+        );
+        let status = exit_clean(&mut session);
+        assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
 /// Two sessions of one config dir on a real rnsd, both announcing. Each
 /// hears the other as one of your own sessions, displayed `you / <session name>`, and
 /// the bare local session name addresses it.

@@ -1262,8 +1262,18 @@ impl MeshRuntime {
             .filter(|(_, session)| !session.trim().is_empty())
             .collect();
         sessions.sort_unstable();
+        let known = self.known_sessions();
+        // `you` stands for the same sessions `you/<session>` picks from: the ones running
+        // here and every proven session of this identity heard elsewhere.
         let mut own_destinations: Vec<String> = self.own_sessions().into_keys().collect();
+        own_destinations.extend(
+            known
+                .iter()
+                .filter(|(identity, _)| identity.eq_ignore_ascii_case(&self.fingerprint))
+                .map(|(_, destination)| destination.clone()),
+        );
         own_destinations.sort_unstable();
+        own_destinations.dedup();
         let mut names: Vec<AddressName> = sessions
             .into_iter()
             .map(|(destination, session)| AddressName {
@@ -1281,7 +1291,6 @@ impl MeshRuntime {
                 sessions: own_destinations,
             },
         });
-        let known = self.known_sessions();
         let namer = self.namer();
         let mut people: Vec<(&str, Option<&str>, &str)> = namer
             .people()
