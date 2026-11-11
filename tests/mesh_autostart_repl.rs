@@ -105,6 +105,9 @@ fn is_joined_line(line: &str, session: &str) -> bool {
         })
 }
 
+/// The joined line for the session `probe`, as a pattern to wait on.
+const JOINED_PROBE_PATTERN: &str = r"Joined the mesh as you / probe \([0-9a-f]{8}\); \.mesh help shows the commands and what they mean\.";
+
 fn fresh_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4265,7 +4268,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     // The sweep at the top of `.mesh envoy questions`: the stale pair goes, one idle line
     // each.
     let header_head = format!("awaiting your answer . {who} ({dest8}) . asked ");
-    let access_header = "Access requests (1)     grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>";
+    let access_header = "Access requests (1)         grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>";
     let entry_head = format!("{who} ({dest8}) asked ");
     let (_, escalated) = command_row_and_transcript(
         &mut session,
@@ -4946,17 +4949,12 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
 
     // rnsd (stood in for) comes up: the same command joins through it.
     rnsd.listen();
+    // Waiting on the whole joined line is the assertion that the join printed it.
     let joined = command_prints(
         &mut session,
         ".mesh on --yes",
-        MESH_ON_SUMMARY,
+        JOINED_PROBE_PATTERN,
         SESSION_PROMPT,
-    );
-    assert!(
-        joined
-            .lines()
-            .any(|line| is_joined_line(line.trim_end(), "probe")),
-        "the join prints its one line; `.mesh config show` below names the connected local entry: {joined:?}"
     );
     assert!(
         !joined.contains("WARNING") && !joined.contains("not reachable"),
@@ -5252,17 +5250,12 @@ fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary
     let mut session = spawn_repl(command);
     let mut transcript = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
 
+    // Waiting on the whole joined line is the assertion that the join printed it.
     let joined = command_prints(
         &mut session,
         ".mesh on --yes",
-        MESH_ON_SUMMARY,
+        JOINED_PROBE_PATTERN,
         SESSION_PROMPT,
-    );
-    assert!(
-        joined
-            .lines()
-            .any(|line| is_joined_line(line.trim_end(), "probe")),
-        "the join prints its one line; `.mesh config show` below names the connected local entry: {joined:?}"
     );
     transcript.push_str(&joined);
     probe.wait_for_marker("MESH_STARTED");

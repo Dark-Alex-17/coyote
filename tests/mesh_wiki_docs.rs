@@ -409,6 +409,8 @@ fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
             })
             .collect()
     };
+    // `.mesh <group> help` prints the group's help: dispatched, though not a COMMANDS row.
+    let group_helps: Vec<String> = groups.iter().map(|group| format!("{group} help")).collect();
     let unknown: Vec<String> = mesh_pages(&wiki)
         .iter()
         .flat_map(|page| {
@@ -423,8 +425,10 @@ fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
                         return None;
                     }
                     let (path, _) = mesh_path_of(rest, &groups)?;
-                    (!paths.contains(&path) && !groups.contains(&path))
-                        .then(|| format!("{label}: `{span}` names `{path}`"))
+                    (!paths.contains(&path)
+                        && !groups.contains(&path)
+                        && !group_helps.contains(&path))
+                    .then(|| format!("{label}: `{span}` names `{path}`"))
                 })
                 .collect::<Vec<_>>()
         })
@@ -436,6 +440,7 @@ fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
             mesh_command_samples(&read(page), &groups)
                 .into_iter()
                 .filter(|(_, path, _)| !paths.contains(path) && !groups.contains(path))
+                .filter(|(_, path, _)| !group_helps.contains(path))
                 .map(|(line, path, _)| format!("{label}:{line}: `.mesh {path}`"))
                 .collect::<Vec<_>>()
         })
@@ -1815,9 +1820,9 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
             .to_string()
     };
     let shared = [
-        "was heard under identity",
-        "is now presented under identity",
-        "no record carries the instance, so nothing is marked",
+        "was heard under the key of user",
+        "is now presented under the key of user",
+        "no record carries the session, so nothing is marked",
         "otherwise .mesh access block",
     ];
     let served = ["is served while it asks because collision_protection is off"];
@@ -1829,8 +1834,8 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
         );
     }
     for (lead, own, absent) in [
-        ("> warning: instance ", &served[..], &refused[..]),
-        ("> error: instance ", &refused[..], &served[..]),
+        ("> warning: session ", &served[..], &refused[..]),
+        ("> error: session ", &refused[..], &served[..]),
     ] {
         let line = quoted(lead);
         for fragment in shared.iter().chain(own) {
@@ -1998,14 +2003,16 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
         .find(note_lead)
         .expect("Mesh-Trust-Model.md has the identity-tier Note");
     let note = trust_model[note_at + 1..].split("\n\n").next().unwrap();
-    for lead in ["> warning: instance ", "> error: instance "] {
+    for lead in ["> warning: session ", "> error: session "] {
         let line = note
             .lines()
             .find(|line| line.starts_with(lead))
             .unwrap_or_else(|| panic!("the identity-tier Note quotes no {lead:?} line:\n{note}"));
         assert!(
-            line.starts_with(&format!("{lead}<dest8> was heard under identity <old>")),
-            "the quoted presence line does not name the instance as <dest8>: {line}"
+            line.starts_with(&format!(
+                "{lead}<user> / <session> (<dest8>) was heard under the key of user <old>"
+            )),
+            "the quoted presence line does not name the session as <user> / <session>: {line}"
         );
         assert!(
             !line.contains("<label or dest8>"),
@@ -2015,9 +2022,7 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
 
     let record_lines: Vec<&str> = trust_model[..note_at]
         .lines()
-        .filter(|line| {
-            line.starts_with("error: instance ") || line.starts_with("warning: instance ")
-        })
+        .filter(|line| line.starts_with("error: session ") || line.starts_with("warning: session "))
         .collect();
     assert!(
         !record_lines.is_empty(),
@@ -2025,10 +2030,12 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
     );
     for line in record_lines {
         assert!(
-            line.starts_with("error: instance <label or dest8> is bound to identity <old>")
-                || line
-                    .starts_with("warning: instance <label or dest8> is bound to identity <old>"),
-            "a record-collision line keeps its label: {line}"
+            line.starts_with(
+                "error: session <user> / <session> (<dest8>) is bound to the key of user <old>"
+            ) || line.starts_with(
+                "warning: session <user> / <session> (<dest8>) is bound to the key of user <old>"
+            ),
+            "a record-collision line names the session: {line}"
         );
     }
 
@@ -2041,13 +2048,14 @@ fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8()
         .next()
         .unwrap();
     assert!(
-        body.contains("let instance = short(old_destination);"),
-        "presence_collision_text no longer shortens the destination; re-read the wiki's <dest8>"
+        body.contains("let who = namer.who(Some(old_identity), old_destination);")
+            && body.contains("let dest8 = dest8_after(&who, old_destination);"),
+        "presence_collision_text no longer names the session `<user> / <session> (<dest8>)`; re-read the wiki"
     );
 }
 
 /// The `.mesh people list` section on `Mesh-Commands.md` lists the trust labels `trust_label`
-/// prints and reads `blocked (instance)` as the grant's standing, not as how the node
+/// prints and reads `blocked (session)` as the grant's standing, not as how the node
 /// answered the row: nothing there ties a label to `collision_protection` or to a served
 /// verdict.
 #[test]
@@ -2073,7 +2081,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     let sentence = section[sentence_at..].split(". ").next().unwrap();
     assert_eq!(
         sentence,
-        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (instance)`, `blocked (identity)`; `trusted` is a session you trust, `known` a session of a user you know (you trusted them, or another session of theirs, and have not forgotten them) that is not trusted itself and not covered by trust in every session of the user, `untrusted` one you know nothing of, `blocked (instance)` one `.mesh access block session <who>` refused, whatever its user's standing, and `blocked (identity)` one whose user `.mesh access block user <who>` refused"
+        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (session)`, `blocked (user)`; `trusted` is a session you trust, `known` a session of a user you know (you trusted them, or another session of theirs, and have not forgotten them) that is not trusted itself and not covered by trust in every session of the user, `untrusted` one you know nothing of, `blocked (session)` one `.mesh access block session <who>` refused, whatever its user's standing, and `blocked (user)` one whose user `.mesh access block user <who>` refused"
     );
     for phrase in [
         "collision_protection",
@@ -2117,13 +2125,13 @@ fn trust_labels() -> Vec<String> {
     labels
 }
 
-/// The `.mesh people list` section quotes the two footer legends as the code renders them: the
-/// sample's second-to-last line is `trust_legend`, its last line is `peers_legend`, and
-/// the prose repeats both. The marker legend's numbers come from the constants, so the
-/// expected line is built from `peers_legend`'s own format literal and the heartbeat,
-/// period, stale and age-out constants read from source; `hourly` is the word the code
-/// picks for a heartbeat of exactly one hour, and the age-out is rendered by the rule
-/// `period_text` applies, `about N h` when it runs past the hour.
+/// The `.mesh people list` section quotes the listing's end and the people help as the code
+/// renders them: the sample ends with the count and `help_pointer`'s line for the people
+/// help, and the prose quotes the help's `stale` row, whose numbers come from the
+/// constants: the expected row is built from `people_concepts`' own format literal and the
+/// heartbeat, period, stale and age-out constants read from source; `hourly` is the word
+/// the code picks for a heartbeat of exactly one hour, and the age-out is rendered by the
+/// rule `period_text` applies, `about N h` when it runs past the hour.
 #[test]
 fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
     let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
@@ -2161,24 +2169,31 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
     let ttl_secs = period * missed;
     let age_out = hours_text(ttl_secs);
 
-    let template = string_literals(&fn_body("src/repl/mesh.rs", "peers_legend"))
+    let template = string_literals(&fn_body("src/repl/mesh.rs", "people_concepts"))
         .into_iter()
-        .next()
-        .expect("peers_legend formats one literal");
+        .find(|literal| literal.starts_with("Silent for "))
+        .expect("people_concepts formats the stale row");
     let pieces: Vec<&str> = template.split("{}").collect();
     assert_eq!(
         pieces.len(),
         4,
-        "peers_legend fills three placeholders: {template:?}"
+        "the stale row fills three placeholders: {template:?}"
     );
     let legend = format!(
-        "{}{stale_heartbeats}{}hourly{}{age_out}{}",
+        "stale: {}{stale_heartbeats}{}hourly{}{age_out}{}",
         pieces[0], pieces[1], pieces[2], pieces[3]
     );
-    let trust_legend = string_literals(&fn_body("src/repl/mesh.rs", "trust_legend"))
+    let pointer = string_literals(&fn_body("src/repl/mesh.rs", "help_pointer"))
         .into_iter()
         .next()
-        .expect("trust_legend returns one literal");
+        .expect("help_pointer formats one literal")
+        .replace("{group}", "people")
+        .replace("{what}", "the columns, states and names");
+    let render = fn_body("src/repl/mesh.rs", "render_peers");
+    assert!(
+        render.contains("lines.push(help_pointer(\"people\", \"the columns, states and names\"));"),
+        "render_peers no longer ends on the people help pointer:\n{render}"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
@@ -2189,24 +2204,20 @@ fn the_mesh_peers_section_quotes_the_legend_as_the_code_renders_it() {
         .and_then(|block| block.split("\n```").next())
         .expect("the `.mesh people list` section opens with a text sample");
     let lines: Vec<&str> = sample.lines().collect();
-    assert_eq!(
-        lines[lines.len() - 2],
-        trust_legend,
-        "the `.mesh people list` sample does not carry the trust legend the code prints before the marker legend"
+    assert!(
+        lines[lines.len() - 2].ends_with(" sessions."),
+        "the `.mesh people list` sample does not carry the count before the pointer: {}",
+        lines[lines.len() - 2]
     );
     assert_eq!(
         lines[lines.len() - 1],
-        legend,
-        "the `.mesh people list` sample does not end with the legend the code prints"
+        pointer,
+        "the `.mesh people list` sample does not end with the pointer line the code prints"
     );
     let prose = flat(&prose_outside_fences(&peers_section));
     assert!(
-        prose.contains(&trust_legend),
-        "the `.mesh people list` prose does not quote the trust legend {trust_legend:?}:\n{prose}"
-    );
-    assert!(
         prose.contains(&legend),
-        "the `.mesh people list` prose does not quote the legend {legend:?}:\n{prose}"
+        "the `.mesh people list` prose does not quote the help's stale row {legend:?}:\n{prose}"
     );
 }
 
@@ -2346,22 +2357,26 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         .collect();
     let count_at = footer
         .iter()
-        .position(|line| line.contains(" sessions. A name a peer advertised is its own text"))
+        .position(|line| line.ends_with(" sessions."))
         .unwrap_or_else(|| panic!("the sample has no `N users and M sessions` line:\n{sample}"));
     assert_eq!(
         footer.len() - count_at,
-        4,
-        "the count line, the name-addressing line and the two legends close the sample:\n{sample}"
+        2,
+        "the count line and the help pointer close the sample:\n{sample}"
     );
     let name_line = repl
         .split_once("const NAME_ADDRESSING_LINE: &str =")
         .and_then(|(_, rest)| rest.split_once(";\n"))
         .and_then(|(value, _)| string_literals(value).into_iter().next())
         .expect("src/repl/mesh.rs defines NAME_ADDRESSING_LINE as one string literal");
-    assert_eq!(
-        footer[count_at + 1],
-        name_line,
-        "the line under the count is the name-addressing line the code prints:\n{sample}"
+    assert!(
+        fn_body("src/repl/mesh.rs", "people_concepts")
+            .contains("(\"addressing\", NAME_ADDRESSING_LINE.to_string())"),
+        "the people help no longer carries the name-addressing row"
+    );
+    assert!(
+        !footer.contains(&name_line.as_str()),
+        "the name-addressing line moved into the people help:\n{sample}"
     );
     for line in &footer[..count_at] {
         let (dest8, _) = line.split_once(" key changed: ").unwrap_or_else(|| {
@@ -5371,7 +5386,8 @@ fn the_commands_page_on_samples_name_the_local_default_and_the_connect_idle_line
     let on = section("Mesh-Commands.md", &page, "### `.mesh on`");
     for needle in [
         format!("  local rnsd at 127.0.0.1:37428: {local}"),
-        "  interfaces: local rnsd at 127.0.0.1:37428".to_string(),
+        "Joined the mesh as you / <session> (<dest8>); .mesh help shows the commands and what they mean."
+            .to_string(),
         "`[mesh] <label> connected`".to_string(),
     ] {
         assert!(
@@ -5920,12 +5936,11 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         .next()
         .expect("unreachable_cause formats one string literal");
     assert!(
-        cause_template
-            .starts_with("could not be reached: this node asked the network for a route to it"),
+        cause_template.starts_with("could not be reached: you asked the network for a route to it"),
         "src/mesh/message.rs's unreachable_cause no longer opens the way this test quotes: {cause_template:?}"
     );
     let cause = cause_template.replace("{}", &timeout.to_string());
-    let head = format!("Destination <hash> {cause}");
+    let head = format!("Session <hash> {cause}");
     let route_line_template = string_literals(&fn_body("src/repl/mesh.rs", "route_request_line"))
         .into_iter()
         .next()
@@ -5941,7 +5956,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
 
     let message_rs = read(repo_root().join("src").join("mesh").join("message.rs"));
     let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
-    let send_tail = "Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard.";
+    let send_tail = "Nothing was queued for it: you hold no key for that session yet, and a propagation node can hold a message for it only once its announce has brought the key. Try again after it announces; `.mesh people list` shows when it was last heard.";
     let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.";
     let knock_tail = "Try again in a minute; nothing was queued for it, because a request to be trusted can be held on a propagation node only after the session's announce has been heard. `.mesh people list` shows when it was last heard.";
     let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.";
@@ -6354,20 +6369,25 @@ fn no_mesh_doc_prose_spells_planning_vocabulary() {
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }
 
-/// The autostart notice is quoted as `autostart` prints it on the two pages that describe
-/// the join, and neither page carries the pointer the notice used to end with: the
-/// `.mesh on` summary's `Turn it off with .mesh off.` is the one pointer.
+/// A join prints one line, `joined_line`'s, and the two pages that describe the
+/// autostart join quote it with the session filled in; neither page quotes the retired
+/// autostart notice or the summary block that line replaced.
 #[test]
 fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_pointer() {
-    let literals = string_literals(&fn_body("src/repl/mesh.rs", "autostart"));
-    let notice = literals
+    let literals = string_literals(&fn_body("src/repl/mesh.rs", "joined_line"));
+    let template = literals
         .iter()
-        .find(|literal| literal.starts_with("mesh.enabled is true in config.yaml:"))
-        .unwrap_or_else(|| panic!("autostart prints no mesh.enabled notice: {literals:?}"));
-    assert!(
-        !notice.contains(".mesh off"),
-        "the notice points at .mesh off itself: {notice}"
+        .find(|literal| literal.starts_with("Joined the mesh as "))
+        .unwrap_or_else(|| panic!("joined_line formats no joined line: {literals:?}"));
+    assert_eq!(
+        template,
+        "Joined the mesh as {who} ({}){fresh}; .mesh help shows the commands and what they mean."
     );
+    assert!(
+        string_literals(&fn_body("src/repl/mesh.rs", "autostart")).is_empty(),
+        "autostart prints nothing of its own beside the joined line"
+    );
+    let notice = "Joined the mesh as you / <session> (<dest8>); .mesh help shows the commands and what they mean.";
 
     let Some(wiki) = wiki_dir() else { return };
     let configuration = read(wiki.join("Mesh-Configuration.md"));
@@ -6381,18 +6401,24 @@ fn the_autostart_notice_is_quoted_as_the_code_prints_it_without_a_second_off_poi
         ("Mesh-Deployment.md", deployment.as_str()),
     ] {
         assert!(
-            text.contains(notice.as_str()),
-            "{label} does not quote the autostart notice as the code prints it:\n{notice}"
+            text.contains(notice),
+            "{label} does not quote the joined line as the code prints it:\n{notice}"
         );
     }
     for (label, text) in [
         ("Mesh-Configuration.md", configuration.as_str()),
         ("Mesh-Deployment.md", deployment.as_str()),
     ] {
-        assert!(
-            !text.contains("`.mesh off` leaves it"),
-            "{label} still carries the notice's retired `.mesh off` pointer"
-        );
+        for retired in [
+            "`.mesh off` leaves it",
+            "mesh.enabled is true in config.yaml: joining",
+            "Mesh is on for this session",
+        ] {
+            assert!(
+                !text.contains(retired),
+                "{label} still quotes the retired {retired:?}"
+            );
+        }
     }
 }
 
@@ -7176,14 +7202,19 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
     assert_eq!(
         outbound,
-        [
-            "open",
-            "escalated: the peer's human has been asked",
-            "answered, awaiting collect",
-            "sent",
-        ],
+        ["open", "escalated: the peer's human has been asked", "sent",],
         "QuestionRow::outbound's state words and label moved"
     );
+    assert!(
+        method_body("src/repl/mesh.rs", "outbound")
+            .contains("PendingState::Answered => AWAITING_THE_MODEL,"),
+        "QuestionRow::outbound no longer reads an answered question as awaiting the model"
+    );
+    let awaiting = const_str("src/repl/mesh.rs", "AWAITING_THE_MODEL");
+    assert_eq!(awaiting, "answered, awaiting the model");
+    let outbound: Vec<String> = [outbound[0].clone(), outbound[1].clone(), awaiting]
+        .into_iter()
+        .collect();
     let inbound = string_literals(&method_body("src/repl/mesh.rs", "inbound"));
     assert_eq!(
         inbound,
@@ -7249,13 +7280,19 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             "answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
             "Access requests",
             "grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
-            "Asked by this node",
+            "Asked by your sessions",
             "collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
             "{title} ({})",
             "every list has a section",
             "{title}: none",
             "{:<column$}{commands}",
             "{title} ({})",
+            "envoy",
+            "escalated questions and their states",
+            "files",
+            "access requests and grants",
+            "messaging",
+            "the states of a question",
             "\n",
         ],
         "render_pending's titles, commands and header shapes moved"
@@ -7357,6 +7394,24 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         .and_then(|block| block.split("\n```").next())
         .expect("the pending-lists section opens with a text sample");
     let lines: Vec<&str> = sample.lines().collect();
+    let pointers: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| line.starts_with("`.mesh "))
+        .collect();
+    assert_eq!(
+        pointers,
+        [
+            "`.mesh envoy help` says what escalated questions and their states mean.",
+            "`.mesh files help` says what access requests and grants mean.",
+            "`.mesh messaging help` says what the states of a question mean.",
+        ],
+        "each section of the pending-lists sample ends on its help pointer:\n{sample}"
+    );
+    let lines: Vec<&str> = lines
+        .into_iter()
+        .filter(|line| !line.starts_with("`.mesh "))
+        .collect();
     let headers: Vec<&str> = lines
         .iter()
         .copied()
@@ -7631,7 +7686,7 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
     assert_eq!(left, "left on the node for another session");
     let render = fn_body("src/repl/mesh.rs", "render_sync");
     for needle in [
-        "\"Nothing new held for this node at {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.\"",
+        "\"Nothing new held for you at propagation node {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.\"",
         "format!(\"{processed} already processed, \")",
         "line.push_str(&format!(\" {left} {LEFT_FOR_ANOTHER_SESSION}.\"));",
     ] {
@@ -7677,10 +7732,10 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
     );
     for needle in [
         format!(
-            "`Fetched from <node8>: N listed, N wanted, N received, N delivered, N duplicates, N discarded, N deferred. N {left}.`"
+            "`Fetched from propagation node <node8>: N listed, N wanted, N received, N delivered, N duplicates, N discarded, N deferred. N {left}.`"
         ),
         format!(
-            "`Nothing new held for this node at <node8>: N listed, N already processed, N {left}.`"
+            "`Nothing new held for you at propagation node <node8>: N listed, N already processed, N {left}.`"
         ),
     ] {
         assert!(
@@ -8673,8 +8728,8 @@ fn quotes_verb_output(span: &str) -> bool {
         "blocked . <age>",
         "To remove the entry, run: ...",
         "all destinations",
-        "blocked (instance)",
-        "blocked (identity)",
+        "blocked (session)",
+        "blocked (user)",
     ];
     let command = [
         ".mesh ", "trust ", "revoke ", "block ", "unblock ", "forget ",
@@ -10171,32 +10226,23 @@ fn the_interfaces_twins_say_which_local_key_is_inert_where() {
 /// loopback, that sessions on this host do not need it, and that other hosts need a
 /// reachable `listen_ip`; the two-laptop walk says it is stage 1 of the mesh test plan,
 /// that both sessions attach over the shared instance with no `private` entry at 4242,
-/// its yaml block is the `local` entry under `enabled: true`, its
-/// `Mesh is on for this session.` block is `render_on_summary`'s shape with
-/// `local rnsd at 127.0.0.1:37428` on the `interfaces:` row, and the prose after it
-/// gives the `@rns/default` form. The source-side checks run on every run.
+/// its yaml block is the `local` entry under `enabled: true`, its text block is the one
+/// line `joined_line` prints, and the prose after it names `.mesh config show` for the
+/// interfaces with the `@rns/default` form. The source-side checks run on every run.
 #[test]
 fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local() {
-    let summary = string_literals(&fn_body("src/repl/mesh.rs", "render_on_summary"))
+    let joined = string_literals(&fn_body("src/repl/mesh.rs", "joined_line"))
         .into_iter()
-        .find(|literal| literal.starts_with("Mesh is on for this session"))
-        .expect("render_on_summary formats the `Mesh is on for this session` block");
-    let summary_lines: Vec<String> = summary
-        .replace("{suffix}", "")
-        .split('\n')
-        .map(|line| line.replace("{}", "<32 hex>"))
-        .collect();
-    assert_eq!(summary_lines.len(), 6, "{summary_lines:?}");
-    assert_eq!(summary_lines[5], "Turn it off with `.mesh off`.");
+        .find(|literal| literal.starts_with("Joined the mesh as "))
+        .expect("joined_line formats the joined line")
+        .replace("{who}", "you / <session>")
+        .replace("({})", "(<dest8>)")
+        .replace("{fresh}", "");
     let reach = string_literals(&fn_body("src/repl/mesh.rs", "reach_line"))
         .into_iter()
         .find(|literal| literal.starts_with("via rnsd at {}"))
         .expect("reach_line formats `via rnsd at {} - rnstatus shows what it reaches`")
         .replace("{}", "127.0.0.1:37428");
-    let autostart = string_literals(&fn_body("src/repl/mesh.rs", "autostart"))
-        .into_iter()
-        .find(|literal| literal.starts_with("mesh.enabled is true in config.yaml:"))
-        .expect("autostart prints the `mesh.enabled is true in config.yaml:` notice");
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Deployment.md"));
@@ -10229,8 +10275,8 @@ fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local()
     for needle in [
         "This walkthrough is stage 1 of the mesh test plan; re-run it after changing `mesh.interfaces`.",
         "Both sessions attach to their host's rnsd over its shared instance, so no `private` entry pointing at the daemon's 4242 listener is needed.",
-        &format!("printing `{autostart}` and then:"),
-        "On Linux and Android the `interfaces:` row reads `local rnsd at @rns/default`, the abstract socket, in place of the address.",
+        "With `enabled: true` the REPL joins by itself and prints one line:",
+        "`.mesh config show` lists the whole identity, destination and instance hashes and the interfaces that came up (`local rnsd at 127.0.0.1:37428 connected`; on Linux and Android `local rnsd at @rns/default`, the abstract socket, in place of the address).",
         "`Local rnsd at 127.0.0.1:37428 (type: local) is not reachable`",
     ] {
         assert!(
@@ -10254,20 +10300,8 @@ fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local()
     let block = fence("text");
     assert_eq!(
         block,
-        summary_lines
-            .iter()
-            .map(|line| line.trim().to_string())
-            .collect::<Vec<_>>()
-            .iter()
-            .map(|line| {
-                if line.starts_with("interfaces: ") {
-                    "interfaces: local rnsd at 127.0.0.1:37428".to_string()
-                } else {
-                    line.clone()
-                }
-            })
-            .collect::<Vec<_>>(),
-        "the two-laptop walk's `Mesh is on for this session.` block is not render_on_summary's shape with the local rnsd on its interfaces row"
+        [joined],
+        "the two-laptop walk's join block is not the one line joined_line prints"
     );
     assert!(
         !prose.contains("type: private") && !prose.contains("127.0.0.1:4242"),
