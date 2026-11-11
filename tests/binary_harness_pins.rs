@@ -4,9 +4,11 @@
 //!
 //! 1. The suites listed in `HARNESS_USERS` (the ones importing the shared
 //!    pty harness, `common::tui_harness`) spawn the binary and open ptys
-//!    only through `tests/common/`: no `Command::new(built_binary(`, no
-//!    `Command::new(binary`, no `env!("CARGO_BIN_EXE_...")`, no
-//!    `Pty::spawn(` of their own. The harness is the one audited place
+//!    only through `tests/common/`: every `Command::new(` they write names
+//!    its program as a string literal (`"git"`, `"bash"`), so no path to
+//!    the built binary can be smuggled in under another name; and they
+//!    carry no `env!("CARGO_BIN_EXE_...")` and no `Pty::spawn(` of their
+//!    own. The harness is the one audited place
 //!    that pins the config and cache dirs, detaches from the runner's tty
 //!    and selects the UI, so a spawn written around it is a spawn nobody
 //!    checked.
@@ -30,9 +32,8 @@ const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const CONFIG_ENV: &str = ".env(\"COYOTE_CONFIG_DIR\"";
 const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
 const HARNESS_IMPORT: &str = concat!("use common::", "tui_harness");
-const BARE_SPAWNS: [&str; 4] = [
-    concat!("Command::new(", "built_binary("),
-    concat!("Command::new(", "binary"),
+const COMMAND_NEW: &str = concat!("Command::", "new(");
+const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
     concat!("Pty::", "spawn("),
 ];
@@ -68,6 +69,17 @@ fn harness_users_spawn_only_through_the_harness_and_every_other_spawn_pins_both_
     for name in HARNESS_USERS {
         let path = tests_dir.join(name);
         let source = read(&path);
+        for (at, _) in source.match_indices(COMMAND_NEW) {
+            let argument = source[at + COMMAND_NEW.len()..].trim_start();
+            assert!(
+                argument.starts_with('"'),
+                "{}: `{COMMAND_NEW}{}` runs a program that is not a string literal; the \
+                 built binary is spawned only through the shared harness (`spawn_tui*`, \
+                 `spawn_binary_under`, `ttyless_command`, `run_ttyless*`)",
+                path.display(),
+                argument.split(')').next().unwrap_or_default()
+            );
+        }
         for needle in BARE_SPAWNS {
             assert!(
                 !source.contains(needle),
