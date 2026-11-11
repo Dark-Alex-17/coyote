@@ -6872,20 +6872,24 @@ fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
     }
     let header = fn_body("src/repl/mesh.rs", "inbox_header");
     assert!(
-        header.contains(" . from ") && header.contains(" . thread ") && header.contains("you -> "),
-        "inbox_header does not build the dot-separated peer header and the `you -> ` header:\n{header}"
+        header.contains(" . from ")
+            && header.contains(" . thread ")
+            && header.contains("you -> ")
+            && header.contains("\" . new\""),
+        "inbox_header does not build the dot-separated peer header, the `you -> ` header and the ` . new` mark:\n{header}"
     );
-    let drain = fn_body("src/repl/mesh.rs", "drain_inbox");
+    let show = fn_body("src/repl/mesh.rs", "show_inbox");
     assert!(
-        drain.contains("terminal_width()") && drain.contains("!*NO_COLOR"),
-        "drain_inbox does not pass the terminal width and the colour switch to render_inbox:\n{drain}"
+        show.contains("terminal_width()") && show.contains("!*NO_COLOR"),
+        "show_inbox does not pass the terminal width and the colour switch to render_inbox:\n{show}"
     );
 }
 
 /// The Commands page's `.mesh messaging inbox` sample shows the block shape the renderer prints: a
 /// dot-separated header naming the sender, route and thread, an indented `file:` line
-/// pointing at a home-relative staged path, a block this node sent and the
-/// `answered, awaiting collect` tail; the prose names every header segment and the
+/// pointing at a home-relative staged path, a block this node sent, a header marked
+/// ` . new` and the `answered, awaiting the model` tail; the prose names every header
+/// segment, the two readers and `clear`, and the
 /// `from_self` key `mesh__check_inbox` adds, and says a `this node ->` block is either
 /// the envoy's reply or one typed with `.mesh envoy answer`. The sibling pages that walk a
 /// first exchange quote the same shape, and no Mesh page still quotes the retired
@@ -6956,7 +6960,8 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         " . direct . ",
         " . store-and-forward . ",
         " . thread ",
-        "\n  answered, awaiting collect",
+        " . new\n",
+        "\n  answered, awaiting the model",
     ] {
         assert!(
             sample.contains(needle),
@@ -6986,7 +6991,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         !own_block.is_empty()
             && !own_block
                 .iter()
-                .any(|line| line.contains("answered, awaiting collect")),
+                .any(|line| line.contains("answered, awaiting the model")),
         "the sample's `you -> ` block answers this node's own question:\n{sample}"
     );
     let headers = lines
@@ -7019,9 +7024,15 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "continuation rows hanging under the label",
         "`disposition: <word> (<what it means>)`",
         "`retry after: N s`",
-        "`answered, awaiting collect`",
+        "`answered, awaiting the model`",
         "plain under `NO_COLOR`",
-        "`answered, awaiting collect: <id8>, ...`",
+        "`answered, awaiting the model: <id8>, ...`",
+        "ends its header with ` . new`",
+        "returns only the messages the model has not read yet",
+        "neither takes a message from the other",
+        "`.mesh messaging inbox clear` empties the list",
+        "`Inbox is empty; nothing to clear.`",
+        "were dropped before you read them because the inbox was full.`",
     ] {
         assert!(
             prose.contains(needle),

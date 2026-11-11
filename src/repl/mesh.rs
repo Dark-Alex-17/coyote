@@ -125,7 +125,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "",
         "status",
         ".mesh status [\"objective\"|clear]",
-        "Show this node's status card or set its objective",
+        "Show your session's status card or set its objective",
     ),
     ("", "help", ".mesh help", "List the mesh commands by group"),
     (
@@ -198,7 +198,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "messaging",
         "send",
         ".mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]",
-        "Send your own text to one peer, bypassing the model",
+        "Send your own text to one session, bypassing the model",
     ),
     (
         "messaging",
@@ -209,26 +209,26 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "messaging",
         "inbox",
-        ".mesh messaging inbox [--purge-files [--yes|--dry-run]]",
-        "Drain the peer messages waiting for this node",
+        ".mesh messaging inbox [clear [--yes] | --purge-files [--yes|--dry-run]]",
+        "Show the messages peers sent this session, the new ones marked; `clear` empties the list",
     ),
     (
         "messaging",
         "sync",
         ".mesh messaging sync",
-        "Sync the messages a propagation node holds for this node now",
+        "Fetch now the messages a propagation node holds for this session",
     ),
     (
         "messaging",
         "sent",
         ".mesh messaging sent",
-        "List the questions this node asked that are still open",
+        "List the questions your sessions asked, open or answered",
     ),
     (
         "messaging",
         "follow-up",
         ".mesh messaging follow-up <id> [\"text\"] [--attach <path> [--force]]",
-        "Follow up on a question this node asked",
+        "Follow up on a question you asked",
     ),
     (
         "envoy",
@@ -312,13 +312,13 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "files",
         "fetch",
         ".mesh files fetch <destination> <path> [--if-sha256 <hex>]",
-        "Fetch one file a trusted peer shares into this node's staging inbox",
+        "Fetch one file a trusted peer shares into your session's staging inbox",
     ),
     (
         "config",
         "show",
         ".mesh config show",
-        "Show the mesh settings and this node",
+        "Show the mesh settings and this session's place on the mesh",
     ),
     (
         "config",
@@ -1256,7 +1256,7 @@ fn brief_sections(brief: &Brief, mode: MeshBrief) -> String {
 
 fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        return drain_inbox(ctx);
+        return show_inbox(ctx);
     };
     let args = parse_mutation_args(
         rest,
@@ -1264,12 +1264,20 @@ fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         "inbox",
         &["--purge-files", "--yes", "--dry-run"],
     )?;
-    if let Some(token) = args.positional.first() {
-        return Err(unexpected(token, "messaging", "inbox"));
+    match args.positional.first().map(String::as_str) {
+        Some("clear") if args.purge_files => {
+            return Err(unexpected("--purge-files", "messaging", "inbox"));
+        }
+        Some("clear") if args.dry_run => {
+            return Err(unexpected("--dry-run", "messaging", "inbox"));
+        }
+        Some("clear") => return clear_inbox(ctx, args.yes),
+        Some(token) => return Err(unexpected(token, "messaging", "inbox")),
+        None => {}
     }
     if !args.purge_files {
         bail!(
-            "`--yes` and `--dry-run` go with `--purge-files`; pass it or drop them. {}",
+            "`--yes` goes with `clear` or `--purge-files`, and `--dry-run` with `--purge-files`; pass one or drop them. {}",
             render_verb_help("messaging", "inbox")
         );
     }
@@ -1279,11 +1287,14 @@ fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     purge_inbox_files(ctx, args.yes, args.dry_run)
 }
 
-fn drain_inbox(ctx: &RequestContext) -> Result<()> {
-    let (envelopes, dropped) = ctx.app.mesh.peer_inbox().drain();
-    let rows: Vec<InboxRow> = envelopes
+/// Everything the inbox holds for the person at the keyboard, oldest first, the entries
+/// they had not been shown marked new. Nothing is removed and the model's own reading
+/// position is left where it was.
+fn show_inbox(ctx: &RequestContext) -> Result<()> {
+    let (entries, dropped) = ctx.app.mesh.peer_inbox().read_for_human();
+    let rows: Vec<InboxRow> = entries
         .into_iter()
-        .filter_map(|envelope| match envelope.payload {
+        .filter_map(|entry| match entry.envelope.payload {
             EnvelopePayload::Peer(message) => {
                 let sender = if ctx.app.mesh.is_from_self(&message) {
                     InboxSender::ThisNode {
@@ -1294,7 +1305,8 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
                 };
                 Some(InboxRow {
                     sender,
-                    received: envelope.timestamp,
+                    received: entry.envelope.timestamp,
+                    new: entry.new,
                     message: *message,
                 })
             }
@@ -1320,6 +1332,45 @@ fn drain_inbox(ctx: &RequestContext) -> Result<()> {
         err_text(&dropped_warning(dropped));
     }
     Ok(())
+}
+
+/// Empties the human's view of the inbox once confirmed: what the model has read too
+/// leaves the inbox, and what it has not stays for `mesh__check_inbox`.
+fn clear_inbox(ctx: &RequestContext, yes: bool) -> Result<()> {
+    let inbox = ctx.app.mesh.peer_inbox();
+    let (shown, unread_by_model) = inbox.human_view_counts();
+    if shown == 0 {
+        out_text("Inbox is empty; nothing to clear.");
+        return Ok(());
+    }
+    let messages = plural(shown, "message", "messages");
+    let mut question = format!("Clear {messages} from your inbox?");
+    if unread_by_model > 0 {
+        question.push_str(&format!(" {}", kept_for_model_text(unread_by_model)));
+    }
+    question.push_str(" This cannot be undone.");
+    if !confirm_or_flag(&question, "--yes", yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    let kept = inbox.clear_for_human();
+    let mut done = format!("Cleared {messages} from your inbox.");
+    if kept > 0 {
+        done.push_str(&format!(" {}", kept_for_model_text(kept)));
+    }
+    out_text(&done);
+    Ok(())
+}
+
+fn kept_for_model_text(count: usize) -> String {
+    if count == 1 {
+        "The model has not read 1 message yet; it stays for the model, out of your view."
+            .to_string()
+    } else {
+        format!(
+            "The model has not read {count} messages yet; they stay for the model, out of your view."
+        )
+    }
 }
 
 /// How many staged paths a `--purge-files --dry-run` lists before counting the rest.
@@ -9198,7 +9249,9 @@ fn result_follows() {
 }
 
 fn dropped_warning(dropped: usize) -> String {
-    format!("WARNING: {dropped} peer message(s) were dropped because the inbox was full.")
+    format!(
+        "WARNING: {dropped} peer message(s) were dropped before you read them because the inbox was full."
+    )
 }
 
 /// Asks the human when nothing already said yes: `flag_given` skips the prompt, no
@@ -9625,8 +9678,25 @@ fn render_verb_help(group: &str, verb: &str) -> String {
         .iter()
         .find(|(g, v, _, _)| *g == group && *v == verb)
     {
-        Some((_, _, usage, summary)) => format!("Usage: {usage}\n  {summary}"),
+        Some((_, _, usage, summary)) => match verb_help_note(group, verb) {
+            Some(note) => format!("Usage: {usage}\n  {summary}\n  {note}"),
+            None => format!("Usage: {usage}\n  {summary}"),
+        },
         None => render_help(),
+    }
+}
+
+/// What a subcommand's `--help` says after its one-line summary, for the verbs whose
+/// summary alone would leave the reader guessing.
+fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
+    match (group, verb) {
+        ("messaging", "send") => Some(
+            "The session's envoy may reply on your behalf; the reply lands in your inbox (.mesh messaging inbox).",
+        ),
+        ("messaging", "inbox") => Some(
+            "Reading takes nothing away: the model reads the same messages with mesh__check_inbox and keeps its own place. `clear` removes what you and the model have both read and hides the rest from you; the model still gets them. The inbox lasts for this session only.",
+        ),
+        _ => None,
     }
 }
 
@@ -11025,10 +11095,12 @@ fn render_peer_detail(
     joined_text(lines, "\n")
 }
 
-/// One `.mesh messaging inbox` block: a peer message, who put it in the inbox and when it landed.
+/// One `.mesh messaging inbox` block: a peer message, who put it in the inbox, when it
+/// landed, and whether the person had not been shown it before.
 struct InboxRow {
     sender: InboxSender,
     received: DateTime<Utc>,
+    new: bool,
     message: PeerMessage,
 }
 
@@ -11040,7 +11112,7 @@ enum InboxSender {
     ThisNode { answered: String },
 }
 
-/// The inbox drain is destructive, so each message's content is rendered in full: it
+/// Each message's content is rendered in full: it
 /// was capped at `PEER_CONTENT_MAX_CHARS` on decode, is flattened to one line and
 /// word-wrapped under its header at `width`, breaking at spaces and never at a hyphen;
 /// a token wider than the line is still split. Only the header is painted, and every
@@ -11134,7 +11206,7 @@ fn render_inbox(
             InboxSender::ThisNode { .. } => None,
         };
         if let Some(id) = answered {
-            lines.push("  answered, awaiting collect".to_string());
+            lines.push(format!("  {AWAITING_THE_MODEL}"));
             unmatched.retain(|waiting| *waiting != id);
         }
         blocks.push(lines.join("\n"));
@@ -11144,10 +11216,14 @@ fn render_inbox(
     }
     if !unmatched.is_empty() {
         let ids: Vec<&str> = unmatched.iter().map(|id| short(id)).collect();
-        blocks.push(format!("answered, awaiting collect: {}", ids.join(", ")));
+        blocks.push(format!("{AWAITING_THE_MODEL}: {}", ids.join(", ")));
     }
     blocks.join("\n\n")
 }
+
+/// How the inbox labels a reply to a question the model asked, until the model
+/// collects it.
+const AWAITING_THE_MODEL: &str = "answered, awaiting the model";
 
 /// `text` as block rows no wider than `width`: the first opens with two spaces and
 /// `label`, the rest hang under it at the two-space indent. Breaks at spaces, never at
@@ -11169,12 +11245,13 @@ fn indented_rows(label: &str, text: &str, width: usize) -> Vec<String> {
 /// arrival time and thread, plus the id it answers when that is not the thread root;
 /// for a message you sent, the session it answered and the id of what it answered. The
 /// sender reads `<user> / <session>`, then its session's short hash; an empty name means
-/// there was no destination either and reads `unknown`.
+/// there was no destination either and reads `unknown`. A message the person had not
+/// been shown before ends with ` . new`.
 fn inbox_header(row: &InboxRow) -> String {
     let message = &row.message;
     let via = via_text(message.via);
     let time = row.received.format("%H:%M UTC");
-    match &row.sender {
+    let mut header = match &row.sender {
         InboxSender::Peer(name) => {
             let name = if name.is_empty() { "unknown" } else { name };
             let thread = short(message.thread());
@@ -11199,7 +11276,11 @@ fn inbox_header(row: &InboxRow) -> String {
                 short(&message.destination),
             )
         }
+    };
+    if row.new {
+        header.push_str(" . new");
     }
+    header
 }
 
 /// What a reply's disposition means for the reader, after its wire name: from the
@@ -12368,6 +12449,44 @@ mod tests {
         );
         assert_eq!(render_verb_help("", "nope"), render_help());
         assert_eq!(render_verb_help("people", "nope"), render_help());
+    }
+
+    /// The help speaks of you and your sessions, never of "this node", and the send
+    /// and inbox help say where a reply lands and that reading takes nothing away.
+    #[test]
+    fn help_lines_never_say_this_node_and_send_says_where_the_reply_lands() {
+        for (group, verb, usage, summary) in COMMANDS {
+            let help = render_verb_help(group, verb);
+            for text in [*usage, *summary, help.as_str()] {
+                assert!(
+                    !text.to_ascii_lowercase().contains("this node"),
+                    "{group} {verb}: {text}"
+                );
+            }
+        }
+        let send = render_verb_help("messaging", "send");
+        assert!(send.starts_with("Usage: .mesh messaging send "), "{send}");
+        assert!(
+            send.ends_with(
+                "\n  Send your own text to one session, bypassing the model\n  The session's envoy may reply on your behalf; the reply lands in your inbox (.mesh messaging inbox)."
+            ),
+            "{send}"
+        );
+        let inbox = render_verb_help("messaging", "inbox");
+        assert!(
+            inbox.starts_with(
+                "Usage: .mesh messaging inbox [clear [--yes] | --purge-files [--yes|--dry-run]]\n"
+            ),
+            "{inbox}"
+        );
+        for needle in [
+            "the new ones marked; `clear` empties the list",
+            "the model reads the same messages with mesh__check_inbox and keeps its own place",
+            "hides the rest from you; the model still gets them",
+            "for this session only",
+        ] {
+            assert!(inbox.contains(needle), "{needle}: {inbox}");
+        }
     }
 
     #[test]
@@ -15067,6 +15186,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         InboxRow {
             sender: InboxSender::Peer("Ann".to_string()),
             received: DateTime::from_timestamp(1_790_000_120, 0).unwrap(),
+            new: false,
             message,
         }
     }
@@ -15530,13 +15650,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(body.join(" "), long, "{text}");
         assert_eq!(
             indented_lines(blocks[1]),
-            ["done", "answered, awaiting collect"],
+            ["done", "answered, awaiting the model"],
             "{text}"
         );
         assert_eq!(indented_lines(blocks[2]), ["last"], "{text}");
         assert_eq!(
             blocks[3],
-            format!("answered, awaiting collect: {}", "q1".repeat(4)),
+            format!("answered, awaiting the model: {}", "q1".repeat(4)),
             "an id no block answered is still listed: {text}"
         );
 
@@ -15544,7 +15664,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             text,
             format!(
-                "Inbox is empty.\n\nanswered, awaiting collect: {}",
+                "Inbox is empty.\n\nanswered, awaiting the model: {}",
                 "q1".repeat(4)
             )
         );
@@ -15590,19 +15710,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(blocks.len(), 2, "{text}");
         assert_eq!(
             indented_lines(blocks[0]),
-            ["done", "answered, awaiting collect"],
+            ["done", "answered, awaiting the model"],
             "{text}"
         );
         assert_eq!(
             blocks[1],
-            format!("answered, awaiting collect: {}", "q1".repeat(4)),
+            format!("answered, awaiting the model: {}", "q1".repeat(4)),
             "the thread's id is answered by its block, not listed again: {text}"
         );
         assert!(!blocks[1].contains(&"77".repeat(4)), "{text}");
     }
 
     /// Only a peer answers this node's questions: a reply this node sent into a thread
-    /// it awaits a collect for carries no `answered, awaiting collect` line, and the id
+    /// it awaits a collect for carries no `answered, awaiting the model` line, and the id
     /// stays listed in the tail, whether the reply names the awaited id as what it
     /// answers or only as its thread.
     #[test]
@@ -15627,7 +15747,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(indented_lines(blocks[0]), ["a follow-up"], "{text}");
             assert_eq!(
                 blocks[1],
-                format!("answered, awaiting collect: {}", "77".repeat(4)),
+                format!("answered, awaiting the model: {}", "77".repeat(4)),
                 "{text}"
             );
         }
@@ -15739,7 +15859,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "the content is cut at the cap and kept whole across the wrap: {text}"
         );
         assert!(content.chars().all(|c| c == 'x'), "{text}");
-        assert_eq!(blocks[2], "answered, awaiting collect: q1");
+        assert_eq!(blocks[2], "answered, awaiting the model: q1");
     }
 
     #[test]
@@ -18591,11 +18711,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         }
 
         /// Full content means control sequences stripped and nothing truncated below the
-        /// peer content cap. Messages dropped past the inbox cap are reported as a stderr
+        /// peer content cap. Reading keeps the message, no longer marked new. Messages
+        /// dropped past the inbox cap before you read them are reported as a stderr
         /// warning, never in the results.
         #[test]
         #[serial]
-        fn inbox_with_the_mesh_off_renders_full_sanitised_content_then_drains() {
+        fn inbox_with_the_mesh_off_renders_full_sanitised_content_and_keeps_it() {
             use crate::mesh::message::{PEER_INBOX_CAPACITY, RawPeerMessage};
 
             let raw = |content: String, id: &str| {
@@ -18632,7 +18753,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             let out = stdout_lines().join("\n");
             let mut lines = out.lines();
-            assert!(lines.next().unwrap().starts_with("message . from"), "{out}");
+            let header = lines.next().unwrap();
+            assert!(header.starts_with("message . from"), "{out}");
+            assert!(header.ends_with(" . new"), "{out}");
             let body: String = lines
                 .map(|line| {
                     line.strip_prefix("  ")
@@ -18653,9 +18776,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let before = stdout_lines().len();
             run_async(run(&mut ctx, ".mesh messaging inbox")).unwrap();
             assert_eq!(
-                stdout_lines()[before..],
-                ["Inbox is empty.".to_string()],
-                "a drained inbox renders nothing twice"
+                stdout_lines()[before..].join("\n"),
+                out.replacen(" . new", "", 1),
+                "the message is still there, no longer new"
             );
 
             for i in 0..=PEER_INBOX_CAPACITY {
@@ -18690,6 +18813,172 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 warned[0].contains("1 peer message(s) were dropped"),
                 "{warned:?}"
             );
+        }
+
+        fn inbox_message(id: &str) -> PeerMessage {
+            PeerMessage::new(crate::mesh::message::RawPeerMessage {
+                source_identity: "cd".repeat(16),
+                source_destination: "ab".repeat(16),
+                destination: "01".repeat(16),
+                title: None,
+                content: format!("content of {id}"),
+                fields: None,
+                timestamp: 0.0,
+                message_id: id.repeat(16),
+                in_reply_to: None,
+                kind: PeerKind::Message,
+                via: PeerVia::Direct,
+                thread: None,
+                disposition: None,
+                retry_after: None,
+                parts: Vec::new(),
+                dropped_parts: 0,
+            })
+        }
+
+        /// The header lines of an inbox listing, one per block.
+        fn inbox_headers(out: &str) -> Vec<String> {
+            out.split("\n\n")
+                .filter_map(|block| block.lines().next())
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// The person and the model read the same inbox without taking from each other:
+        /// the model reading leaves every entry in the person's view, new until shown,
+        /// and the person looking leaves the model's unread entries for it.
+        #[test]
+        #[serial]
+        fn inbox_view_and_the_models_reading_never_take_from_each_other() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m1"));
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m2"));
+            assert_eq!(ctx.app.mesh.peer_inbox().read_for_model().0.len(), 2);
+
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            let headers = inbox_headers(&out);
+            assert_eq!(headers.len(), 2, "{out}");
+            assert!(headers.iter().all(|h| h.ends_with(" . new")), "{out}");
+
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m3"));
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            let headers = inbox_headers(&out);
+            assert_eq!(headers.len(), 3, "{out}");
+            assert!(!headers[0].ends_with(" . new"), "{out}");
+            assert!(!headers[1].ends_with(" . new"), "{out}");
+            assert!(headers[2].ends_with(" . new"), "only m3 is new: {out}");
+
+            let (model, dropped) = ctx.app.mesh.peer_inbox().read_for_model();
+            assert_eq!(model.len(), 1, "the person looking took nothing");
+            assert_eq!(dropped, 0);
+            assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
+        }
+
+        /// `clear` asks first and a no changes nothing; a yes empties the person's view,
+        /// says how many the model still has to read, and leaves those for it. Clearing
+        /// an empty view asks nothing, and what arrives afterwards is shown new.
+        #[test]
+        #[serial]
+        fn inbox_clear_asks_then_empties_the_view_and_leaves_the_model_its_unread() {
+            let _capture = capture::install();
+            let questions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asked = Arc::clone(&questions);
+            let answers = Arc::new(std::sync::Mutex::new(vec![true, false]));
+            let _script = prompt_script::install_answering(move |question| {
+                asked.lock().unwrap().push(question.to_string());
+                answers.lock().unwrap().pop().unwrap()
+            });
+            let mut ctx = off_ctx();
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m1"));
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m2"));
+            assert_eq!(ctx.app.mesh.peer_inbox().read_for_model().0.len(), 2);
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m3"));
+
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox clear")).unwrap();
+            assert_eq!(out, NOTHING_CHANGED);
+            assert_eq!(
+                questions.lock().unwrap().as_slice(),
+                [
+                    "Clear 3 messages from your inbox? The model has not read 1 message yet; it stays for the model, out of your view. This cannot be undone."
+                ]
+            );
+            assert_eq!(ctx.app.mesh.peer_inbox().len(), 3);
+
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox clear")).unwrap();
+            assert_eq!(
+                out,
+                "Cleared 3 messages from your inbox. The model has not read 1 message yet; it stays for the model, out of your view."
+            );
+            assert_eq!(
+                run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap(),
+                "Inbox is empty."
+            );
+            let (model, _) = ctx.app.mesh.peer_inbox().read_for_model();
+            assert_eq!(model.len(), 1, "the model still gets m3");
+
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox clear --yes")).unwrap();
+            assert_eq!(out, "Inbox is empty; nothing to clear.");
+            assert_eq!(prompt_script::prompts_asked(), 2);
+
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m4"));
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox clear --yes")).unwrap();
+            assert_eq!(
+                out,
+                "Cleared 1 message from your inbox. The model has not read 1 message yet; it stays for the model, out of your view."
+            );
+            assert_eq!(prompt_script::prompts_asked(), 2, "--yes asks nothing");
+            assert_eq!(
+                ctx.app.mesh.peer_inbox().len(),
+                1,
+                "the model has not read m4"
+            );
+            ctx.app.mesh.peer_inbox().read_for_model();
+            assert_eq!(
+                run_async(out_of(&mut ctx, ".mesh messaging inbox clear --yes")).unwrap(),
+                "Inbox is empty; nothing to clear.",
+                "m4 stays out of the person's view once the model has read it"
+            );
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m5"));
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            let headers = inbox_headers(&out);
+            assert_eq!(headers.len(), 1, "{out}");
+            assert!(headers[0].ends_with(" . new"), "{out}");
+            assert!(out.contains("content of m5"), "{out}");
+        }
+
+        /// `clear` takes `--yes` and nothing else, and with no terminal it names `--yes`
+        /// instead of waiting on a prompt.
+        #[test]
+        #[serial]
+        fn inbox_clear_refuses_other_flags_and_names_yes_without_a_terminal() {
+            let _capture = capture::install();
+            let _script = prompt_script::install_non_interactive();
+            let mut ctx = off_ctx();
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m1"));
+            for (line, token) in [
+                (".mesh messaging inbox clear --dry-run", "--dry-run"),
+                (".mesh messaging inbox clear --purge-files", "--purge-files"),
+                (
+                    ".mesh messaging inbox --purge-files clear --yes",
+                    "--purge-files",
+                ),
+                (".mesh messaging inbox clear now", "now"),
+            ] {
+                assert_eq!(
+                    err_of(&mut ctx, line),
+                    format!(
+                        "Unexpected '{token}'. {}",
+                        render_verb_help("messaging", "inbox")
+                    ),
+                    "{line}"
+                );
+            }
+            let err = err_of(&mut ctx, ".mesh messaging inbox clear");
+            assert!(err.starts_with("Clear 1 message from your inbox?"), "{err}");
+            assert!(err.ends_with("pass --yes to confirm."), "{err}");
+            assert_eq!(ctx.app.mesh.peer_inbox().len(), 1, "nothing was cleared");
+            assert_eq!(prompt_script::prompts_asked(), 0);
         }
 
         /// Messages delivered straight to the inbox, as a peer's arrive, were not filed
@@ -21345,7 +21634,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // The fixture's peer row does not derive its destination from the
                     // identity it claims, so the reply's recipient is named by hash alone.
                     let prefix = format!("you -> unnamed / {peer8} ({peer8}) . direct . ");
-                    let suffix = format!(" UTC . answering {}", short(&"m1".repeat(16)));
+                    let suffix = format!(" UTC . answering {} . new", short(&"m1".repeat(16)));
                     assert!(own_header.starts_with(&prefix), "{out}");
                     assert!(own_header.ends_with(&suffix), "{out}");
                     let time = &own_header[prefix.len()..own_header.len() - suffix.len()];
@@ -21359,7 +21648,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     assert_eq!(
                         out_of(&mut ctx, ".mesh messaging inbox").await.unwrap(),
-                        "Inbox is empty."
+                        out.replace(" . new\n", "\n"),
+                        "both entries stay, neither new any more"
                     );
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -21421,8 +21711,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
                     assert!(
-                        own_header
-                            .ends_with(&format!(" UTC . answering {}", short(&"a1".repeat(16)))),
+                        own_header.ends_with(&format!(
+                            " UTC . answering {} . new",
+                            short(&"a1".repeat(16))
+                        )),
                         "{out}"
                     );
                     assert_eq!(blocks[1].lines().nth(1), Some("  yes, green"), "{out}");
@@ -36874,7 +37166,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for absent in ["undeny", "files undeny", "untrust", "shares"] {
                         assert!(!listed.iter().any(|path| path == absent), "{absent}: {out}");
                     }
-                    assert!(out.contains("  .mesh messaging sync\n      Sync the messages a propagation node holds for this node now"), "{out}");
+                    assert!(out.contains("  .mesh messaging sync\n      Fetch now the messages a propagation node holds for this session"), "{out}");
                     assert!(
                         out.contains("      Erase everything you know about them, blocks included; they become a stranger"),
                         "{out}"
@@ -48534,7 +48826,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )),
                             "{out}"
                         );
-                        assert!(lines[0].ends_with(" UTC . answering p1"), "{out}");
+                        assert!(lines[0].ends_with(" UTC . answering p1 . new"), "{out}");
                         assert_eq!(lines[1], format!("  {HUMAN_DECLINED}"), "{out}");
                         let disposition_row = lines
                             .iter()
@@ -48547,13 +48839,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{out}"
                         );
                         assert!(
-                            !out.contains("answered, awaiting collect"),
+                            !out.contains("answered, awaiting the model"),
                             "a reply this node sent waits for nothing: {out}"
                         );
+                        let again = out_of(&mut fx.ctx, ".mesh messaging inbox").await.unwrap();
                         assert_eq!(
-                            out_of(&mut fx.ctx, ".mesh messaging inbox").await.unwrap(),
-                            "Inbox is empty.",
-                            "the copy is drained once read"
+                            again,
+                            out.replacen(" . answering p1 . new", " . answering p1", 1),
+                            "the copy stays once read, no longer new"
                         );
                         assert!(fx.pending_ids().is_empty());
                         fx.stop().await;
@@ -48587,7 +48880,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             )),
                             "{out}"
                         );
-                        assert!(lines[0].ends_with(" UTC . answering p1"), "{out}");
+                        assert!(lines[0].ends_with(" UTC . answering p1 . new"), "{out}");
                         assert_eq!(
                             &lines[1..],
                             [
@@ -53668,7 +53961,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err_of(&mut ctx, line),
                             format!(
-                                "`--yes` and `--dry-run` go with `--purge-files`; pass it or drop them. {}",
+                                "`--yes` goes with `clear` or `--purge-files`, and `--dry-run` with `--purge-files`; pass one or drop them. {}",
                                 render_verb_help("messaging", "inbox")
                             ),
                             "{line}"

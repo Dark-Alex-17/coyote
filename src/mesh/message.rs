@@ -32,7 +32,7 @@ use crate::mesh::wire_path::WirePath;
 use crate::mesh::{
     CappedText, age_text, canonical_hash, capped_peer_text, display_text, hex_lower,
 };
-use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
+use crate::supervisor::mailbox::{Envelope, EnvelopePayload};
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, fold_into, mesh_events_dropped,
 };
@@ -3045,12 +3045,49 @@ impl HoldPolicy for RepliesForOtherSessions {
     }
 }
 
-/// The peer channel of an `Inbox`: at `PEER_INBOX_CAPACITY` the oldest peer envelope
-/// makes room and the loss is counted until the next drain reports it.
+/// How far one reader of the peer inbox has read: every entry up to `seen` it has been
+/// shown, and `dropped` entries it never saw were evicted since it last read.
+#[derive(Default)]
+struct ReaderMark {
+    seen: u64,
+    dropped: usize,
+}
+
+impl ReaderMark {
+    fn read_through(&mut self, last: u64) -> usize {
+        self.seen = last;
+        std::mem::take(&mut self.dropped)
+    }
+}
+
+#[derive(Default)]
+struct PeerInboxState {
+    entries: VecDeque<(u64, Envelope)>,
+    last: u64,
+    human: ReaderMark,
+    model: ReaderMark,
+    /// Entries up to here are kept only for the model: `clear` took them out of the
+    /// human's view.
+    hidden_from_human: u64,
+}
+
+/// One entry of the human's inbox view; `new` when the human had not been shown it.
+pub(crate) struct InboxEntry {
+    pub(crate) envelope: Envelope,
+    pub(crate) new: bool,
+}
+
+/// The peer messages this session received, kept as a ring of `PEER_INBOX_CAPACITY`
+/// entries, each numbered in arrival order, and read by two readers that never take
+/// messages from each other: the person at the keyboard (`messaging inbox`) and the
+/// model (`mesh__check_inbox`). Each reader keeps how far it has read and how many
+/// entries were evicted before it saw them. Reading removes nothing; an entry leaves
+/// when the ring is full or when the human clears entries the model has also read.
+/// Both marks only move forward, so the oldest entry is always the one most read: the
+/// ring evicts it, and every reader that had not seen it counts the loss.
 #[derive(Default)]
 pub(crate) struct PeerInbox {
-    inbox: Inbox,
-    dropped: Mutex<usize>,
+    state: Mutex<PeerInboxState>,
 }
 
 impl PeerInbox {
@@ -3061,30 +3098,122 @@ impl PeerInbox {
             payload: EnvelopePayload::Peer(Box::new(message)),
             timestamp: chrono::Utc::now(),
         };
-        if self
-            .inbox
-            .deliver_bounded(envelope, PEER_INBOX_CAPACITY)
-            .is_some()
+        let mut state = self.state.lock();
+        if state.entries.len() >= PEER_INBOX_CAPACITY
+            && let Some((seq, _)) = state.entries.pop_front()
         {
-            let mut dropped = self.dropped.lock();
-            *dropped += 1;
-            debug!(
-                "Mesh peer inbox is at its {PEER_INBOX_CAPACITY}-message cap; dropped the oldest message ({} dropped since the last drain)",
-                *dropped
-            );
+            let unseen_by_human = seq > state.human.seen;
+            let unseen_by_model = seq > state.model.seen;
+            if unseen_by_human {
+                state.human.dropped += 1;
+            }
+            if unseen_by_model {
+                state.model.dropped += 1;
+            }
+            if unseen_by_human || unseen_by_model {
+                debug!(
+                    "Mesh peer inbox is at its {PEER_INBOX_CAPACITY}-message cap; dropped the oldest message before {} read it",
+                    match (unseen_by_human, unseen_by_model) {
+                        (true, true) => "you or the model",
+                        (true, false) => "you",
+                        _ => "the model",
+                    }
+                );
+            }
         }
+        state.last += 1;
+        let seq = state.last;
+        state.entries.push_back((seq, envelope));
     }
 
-    /// Everything waiting, in the inbox's priority order, and how many peer messages
-    /// were dropped since the last drain.
+    /// The human's view: every entry it has not cleared, oldest first, each marked new
+    /// when the human had not been shown it, and how many it never saw were dropped.
+    /// The human's mark moves to the newest entry; the model's is left alone.
+    pub(crate) fn read_for_human(&self) -> (Vec<InboxEntry>, usize) {
+        let mut state = self.state.lock();
+        let (seen, hidden) = (state.human.seen, state.hidden_from_human);
+        let entries = state
+            .entries
+            .iter()
+            .filter(|(seq, _)| *seq > hidden)
+            .map(|(seq, envelope)| InboxEntry {
+                envelope: envelope.clone(),
+                new: *seq > seen,
+            })
+            .collect();
+        let last = state.last;
+        let dropped = state.human.read_through(last);
+        (entries, dropped)
+    }
+
+    /// The entries the model has not read, oldest first, and how many it never saw were
+    /// dropped. The model's mark moves to the newest entry; the human's is left alone.
+    pub(crate) fn read_for_model(&self) -> (Vec<Envelope>, usize) {
+        let mut state = self.state.lock();
+        let seen = state.model.seen;
+        let envelopes = state
+            .entries
+            .iter()
+            .filter(|(seq, _)| *seq > seen)
+            .map(|(_, envelope)| envelope.clone())
+            .collect();
+        let last = state.last;
+        let dropped = state.model.read_through(last);
+        (envelopes, dropped)
+    }
+
+    /// How many entries the human's view holds and how many of those the model has not
+    /// read, for the question `clear` asks first.
+    pub(crate) fn human_view_counts(&self) -> (usize, usize) {
+        let state = self.state.lock();
+        let shown = state
+            .entries
+            .iter()
+            .filter(|(seq, _)| *seq > state.hidden_from_human);
+        let (mut total, mut unread_by_model) = (0, 0);
+        for (seq, _) in shown {
+            total += 1;
+            if *seq > state.model.seen {
+                unread_by_model += 1;
+            }
+        }
+        (total, unread_by_model)
+    }
+
+    /// Empties the human's view: entries the model has read leave the inbox, the rest
+    /// stay for the model and are hidden from the human. Everything here counts as seen
+    /// by the human. Returns how many entries stay for the model.
+    pub(crate) fn clear_for_human(&self) -> usize {
+        let mut state = self.state.lock();
+        let model_seen = state.model.seen;
+        state.entries.retain(|(seq, _)| *seq > model_seen);
+        let last = state.last;
+        state.human.seen = last;
+        state.hidden_from_human = last;
+        state.entries.len()
+    }
+
+    /// Every retained entry, oldest first, emptying the inbox for both readers, and the
+    /// model's dropped count; both counts reset. The tests that file messages and read
+    /// them back use it.
+    #[cfg(test)]
     pub(crate) fn drain(&self) -> (Vec<Envelope>, usize) {
-        let dropped = std::mem::take(&mut *self.dropped.lock());
-        (self.inbox.drain(), dropped)
+        let mut state = self.state.lock();
+        let envelopes = state
+            .entries
+            .drain(..)
+            .map(|(_, envelope)| envelope)
+            .collect();
+        let last = state.last;
+        state.human.read_through(last);
+        state.hidden_from_human = last;
+        let dropped = state.model.read_through(last);
+        (envelopes, dropped)
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.inbox.len()
+        self.state.lock().entries.len()
     }
 }
 
@@ -4390,43 +4519,19 @@ mod tests {
     #[test]
     fn peer_inbox_evicts_the_oldest_peer_at_capacity_and_counts_it() {
         let inbox = PeerInbox::default();
-        inbox.inbox.deliver(Envelope {
-            from: "local".into(),
-            to: "me".into(),
-            payload: EnvelopePayload::Text {
-                content: "keep me".into(),
-            },
-            timestamp: chrono::Utc::now(),
-        });
         for n in 0..PEER_INBOX_CAPACITY + 2 {
-            inbox.deliver(PeerMessage::new(RawPeerMessage {
-                message_id: format!("m{n}"),
-                ..raw("hello")
-            }));
+            inbox.deliver(numbered(n));
         }
 
-        assert_eq!(inbox.len(), PEER_INBOX_CAPACITY + 1);
+        assert_eq!(inbox.len(), PEER_INBOX_CAPACITY);
         let (envelopes, dropped) = inbox.drain();
-        assert_eq!(
-            dropped, 2,
-            "the local envelope takes no peer slot, so two peers went"
-        );
-        assert_eq!(envelopes.len(), PEER_INBOX_CAPACITY + 1);
-        let ids: Vec<&str> = envelopes
-            .iter()
-            .filter_map(|e| match &e.payload {
-                EnvelopePayload::Peer(message) => Some(message.message_id.as_str()),
-                _ => None,
-            })
-            .collect();
+        assert_eq!(dropped, 2);
+        assert_eq!(envelopes.len(), PEER_INBOX_CAPACITY);
+        let ids = envelope_ids(&envelopes);
         assert_eq!(ids[0], "m2", "the oldest peer envelopes went first");
-        assert_eq!(ids.len(), PEER_INBOX_CAPACITY);
-        assert!(
-            matches!(
-                envelopes.last().unwrap().payload,
-                EnvelopePayload::Text { .. }
-            ),
-            "peers sort before text"
+        assert_eq!(
+            ids.last().map(String::as_str),
+            Some(format!("m{}", PEER_INBOX_CAPACITY + 1).as_str())
         );
         assert_eq!(envelopes[0].from, hash_of("instance"));
         assert_eq!(envelopes[0].to, hash_of("me"));
@@ -4434,6 +4539,193 @@ mod tests {
         assert!(rest.is_empty());
         assert_eq!(dropped, 0, "the count resets on drain");
         assert_eq!(inbox.len(), 0);
+    }
+
+    fn numbered(n: usize) -> PeerMessage {
+        PeerMessage::new(RawPeerMessage {
+            message_id: format!("m{n}"),
+            ..raw("hello")
+        })
+    }
+
+    fn envelope_ids(envelopes: &[Envelope]) -> Vec<String> {
+        envelopes
+            .iter()
+            .map(|envelope| match &envelope.payload {
+                EnvelopePayload::Peer(message) => message.message_id.clone(),
+                other => panic!("the peer inbox holds only peer envelopes: {other:?}"),
+            })
+            .collect()
+    }
+
+    fn entry_ids(entries: &[InboxEntry]) -> Vec<(String, bool)> {
+        entries
+            .iter()
+            .map(|entry| {
+                let id = envelope_ids(std::slice::from_ref(&entry.envelope)).remove(0);
+                (id, entry.new)
+            })
+            .collect()
+    }
+
+    /// Reading removes nothing, and neither reader's read moves the other's mark: the
+    /// model still gets every message after the human looked, and the human still sees
+    /// them all after the model read them.
+    #[test]
+    fn peer_inbox_human_and_model_never_take_messages_from_each_other() {
+        let inbox = PeerInbox::default();
+        inbox.deliver(numbered(0));
+        inbox.deliver(numbered(1));
+
+        let (human, _) = inbox.read_for_human();
+        assert_eq!(
+            entry_ids(&human),
+            [("m0".to_string(), true), ("m1".to_string(), true)]
+        );
+        let (model, dropped) = inbox.read_for_model();
+        assert_eq!(envelope_ids(&model), ["m0", "m1"], "the human took nothing");
+        assert_eq!(dropped, 0);
+
+        inbox.deliver(numbered(2));
+        let (model, _) = inbox.read_for_model();
+        assert_eq!(
+            envelope_ids(&model),
+            ["m2"],
+            "only what the model has not read"
+        );
+        assert!(
+            inbox.read_for_model().0.is_empty(),
+            "the model's mark moved"
+        );
+
+        let (human, _) = inbox.read_for_human();
+        assert_eq!(
+            entry_ids(&human),
+            [
+                ("m0".to_string(), false),
+                ("m1".to_string(), false),
+                ("m2".to_string(), true),
+            ],
+            "the model took nothing and only m2 is new to the human"
+        );
+        assert_eq!(inbox.len(), 3, "reading removes nothing");
+    }
+
+    /// An entry is new to the human only until the human has been shown it once.
+    #[test]
+    fn peer_inbox_marks_entries_new_since_the_human_last_looked() {
+        let inbox = PeerInbox::default();
+        assert!(inbox.read_for_human().0.is_empty());
+        inbox.deliver(numbered(0));
+        assert_eq!(
+            entry_ids(&inbox.read_for_human().0),
+            [("m0".to_string(), true)]
+        );
+        assert_eq!(
+            entry_ids(&inbox.read_for_human().0),
+            [("m0".to_string(), false)]
+        );
+        inbox.deliver(numbered(1));
+        assert_eq!(
+            entry_ids(&inbox.read_for_human().0),
+            [("m0".to_string(), false), ("m1".to_string(), true)]
+        );
+    }
+
+    /// `clear` takes out what both readers have seen, hides what the model has not read
+    /// from the human, and leaves the model's unread entries for the model.
+    #[test]
+    fn peer_inbox_clear_removes_what_both_saw_and_hides_the_rest_from_the_human() {
+        let inbox = PeerInbox::default();
+        inbox.deliver(numbered(0));
+        inbox.deliver(numbered(1));
+        assert_eq!(envelope_ids(&inbox.read_for_model().0), ["m0", "m1"]);
+        inbox.deliver(numbered(2));
+        assert_eq!(inbox.human_view_counts(), (3, 1));
+
+        assert_eq!(inbox.clear_for_human(), 1, "m2 stays for the model");
+        assert_eq!(inbox.len(), 1, "m0 and m1, read by both, are gone");
+        assert!(
+            inbox.read_for_human().0.is_empty(),
+            "the human view is empty"
+        );
+        assert_eq!(inbox.human_view_counts(), (0, 0));
+        assert_eq!(
+            envelope_ids(&inbox.read_for_model().0),
+            ["m2"],
+            "the model still gets the one it had not read"
+        );
+
+        inbox.deliver(numbered(3));
+        assert_eq!(
+            entry_ids(&inbox.read_for_human().0),
+            [("m3".to_string(), true)],
+            "what arrives after a clear is shown, and only that"
+        );
+        assert_eq!(
+            inbox.clear_for_human(),
+            1,
+            "m2 the model has now read goes; m3 it has not stays"
+        );
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(envelope_ids(&inbox.read_for_model().0), ["m3"]);
+        assert!(inbox.read_for_human().0.is_empty());
+    }
+
+    /// At the cap the oldest entry goes. When both readers had seen it nobody counts a
+    /// loss; when the ring holds only entries a reader has not seen, the oldest goes
+    /// anyway and that reader's count rises, reported once on its next read.
+    #[test]
+    fn peer_inbox_evicts_seen_entries_first_and_counts_drops_per_reader() {
+        let inbox = PeerInbox::default();
+        for n in 0..PEER_INBOX_CAPACITY {
+            inbox.deliver(numbered(n));
+        }
+        inbox.read_for_human();
+        inbox.read_for_model();
+        inbox.deliver(numbered(PEER_INBOX_CAPACITY));
+        assert_eq!(inbox.len(), PEER_INBOX_CAPACITY);
+        let (human, human_dropped) = inbox.read_for_human();
+        assert_eq!(human_dropped, 0, "both had seen the entry that went");
+        assert_eq!(entry_ids(&human)[0].0, "m1");
+        let (model, model_dropped) = inbox.read_for_model();
+        assert_eq!(model_dropped, 0);
+        assert_eq!(envelope_ids(&model), [format!("m{PEER_INBOX_CAPACITY}")]);
+
+        let first_unseen = PEER_INBOX_CAPACITY + 1;
+        for n in first_unseen..first_unseen + PEER_INBOX_CAPACITY + 3 {
+            inbox.deliver(numbered(n));
+        }
+        assert_eq!(inbox.len(), PEER_INBOX_CAPACITY);
+        let (model, model_dropped) = inbox.read_for_model();
+        assert_eq!(model_dropped, 3, "three the model never saw went");
+        assert_eq!(envelope_ids(&model)[0], format!("m{}", first_unseen + 3));
+        let (human, human_dropped) = inbox.read_for_human();
+        assert_eq!(human_dropped, 3, "and the human never saw them either");
+        assert!(human.iter().all(|entry| entry.new));
+        assert_eq!(inbox.read_for_model().1, 0, "the count resets once read");
+        assert_eq!(inbox.read_for_human().1, 0);
+
+        inbox.deliver(numbered(1_000));
+        assert_eq!(inbox.read_for_human().1, 0, "both had seen the evicted one");
+        assert_eq!(inbox.read_for_model().1, 0);
+        for n in 2_000..2_000 + PEER_INBOX_CAPACITY {
+            inbox.deliver(numbered(n));
+        }
+        assert_eq!(inbox.read_for_model().1, 0);
+        for n in 3_000..3_000 + PEER_INBOX_CAPACITY {
+            inbox.deliver(numbered(n));
+        }
+        assert_eq!(
+            inbox.read_for_model().1,
+            0,
+            "the model had read every evicted entry"
+        );
+        assert_eq!(
+            inbox.read_for_human().1,
+            PEER_INBOX_CAPACITY,
+            "the human had read none of the batch that went"
+        );
     }
 
     #[test]

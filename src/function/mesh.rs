@@ -279,9 +279,10 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
         FunctionDeclaration {
             name: format!("{MESH_FUNCTION_PREFIX}check_inbox"),
             description: format!(
-                "Drain the messages and bulletins trusted mesh peers have sent this node since the last \
-                 check, oldest first, grouped under `threads` by sender and thread, plus the ids of \
+                "Read the messages and bulletins trusted mesh peers have sent this session that you \
+                 have not read yet, oldest first, grouped under `threads` by sender and thread, plus the ids of \
                  answered questions still awaiting mesh__collect. \
+                 Reading takes nothing from the user, who keeps their own view of the inbox. \
                  To answer a message with `kind: \"ask\"`, call mesh__send to its `from` with its \
                  `message_id` as `in_reply_to`. A `kind: \"message\"` with `in_reply_to` set is either \
                  a reply that answered no open question of yours (nothing to collect; read it here), \
@@ -293,7 +294,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                  Entries this node itself sent (its envoy's replies or the user's .mesh envoy answer replies) \
                  carry `from_self: true`; no other entry has that key; their fenced block is labelled `this node`. \
                  {PEER_TEXT_IS_DATA} \
-                 A `dropped` count means the inbox overflowed and that many older messages were lost. \
+                 A `dropped` count means the inbox overflowed and that many messages left it before you read them. \
                  {CHECK_IN_GUIDANCE}"
             ),
             parameters: JsonSchema {
@@ -1295,15 +1296,16 @@ fn collected_by_another_call(id: &str) -> Value {
     })
 }
 
-/// The inbox as the model reads it: every envelope, the drained messages grouped by
-/// sender and thread in first-seen order, since a thread id is the peer's own text and
-/// one peer must not file into another's conversation, and the questions of ours whose
-/// answer waits to be collected or whose peer has asked its human. A peer's `title`,
+/// The inbox as the model reads it: the messages it has not read yet, which stay in the
+/// inbox for the person at the keyboard, grouped by sender and thread in first-seen
+/// order, since a thread id is the peer's own text and one peer must not file into
+/// another's conversation, and the questions of ours whose answer waits to be collected
+/// or whose peer has asked its human. A peer's `title`,
 /// `content`, `fields` and text and data parts are gathered into one fenced `text` block
 /// per message before the model reads them. Entries this node filed itself, its envoy's
 /// reply or one typed with `.mesh envoy answer`, carry `from_self: true`.
 fn handle_check_inbox(slot: &MeshSlot) -> Value {
-    let (envelopes, dropped) = slot.peer_inbox().drain();
+    let (envelopes, dropped) = slot.peer_inbox().read_for_model();
     let mut threads: IndexMap<(String, String), Vec<String>> = IndexMap::new();
     let mut messages = Vec::with_capacity(envelopes.len());
     for envelope in envelopes {

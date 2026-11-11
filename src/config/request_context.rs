@@ -310,17 +310,19 @@ fn access_reach_values(verb: &str) -> Vec<(String, Option<String>)> {
     }
 }
 
-/// Flags for `.mesh messaging inbox`, `rest` being everything after the verb: `--purge-files`
-/// until it is given, then `--yes` and `--dry-run`, each dropping once its partner is
-/// present.
+/// Words for `.mesh messaging inbox`, `rest` being everything after the verb: `clear` and
+/// `--purge-files` until one is given; after `clear`, `--yes`; after `--purge-files`,
+/// `--yes` and `--dry-run`, each dropping once its partner is present.
 fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
     let Some((_, prior)) = rest.split_last() else {
         return Vec::new();
     };
-    let flags: &[&str] = if prior.contains(&"--purge-files") {
+    let flags: &[&str] = if prior.contains(&"clear") {
+        &["--yes"]
+    } else if prior.contains(&"--purge-files") {
         &["--yes", "--dry-run"]
     } else {
-        &["--purge-files"]
+        &["clear", "--purge-files"]
     };
     let excluded = |flag: &str| match flag {
         "--yes" => prior.contains(&"--dry-run"),
@@ -42158,7 +42160,10 @@ mod tests {
 
         assert_eq!(
             complete(&["messaging", "inbox", ""]),
-            [("--purge-files".to_string(), None)]
+            [
+                ("clear".to_string(), None),
+                ("--purge-files".to_string(), None)
+            ]
         );
         assert_eq!(
             complete(&["messaging", "inbox", "--purge-files", ""]),
@@ -42166,6 +42171,11 @@ mod tests {
         );
         assert!(complete(&["messaging", "inbox", "--purge-files", "--dry-run", ""]).is_empty());
         assert!(complete(&["messaging", "inbox", "--purge-files", "--yes", ""]).is_empty());
+        assert_eq!(
+            complete(&["messaging", "inbox", "clear", ""]),
+            [("--yes".to_string(), None)]
+        );
+        assert!(complete(&["messaging", "inbox", "clear", "--yes", ""]).is_empty());
     }
 
     const REMEMBERED_IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";

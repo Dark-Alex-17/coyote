@@ -9424,18 +9424,13 @@ mod tests {
         })
         .await;
         // The inbox carries the escalated notice first, then the escalation message.
-        let waited = std::time::Instant::now();
-        let mut inbox = loop {
-            let inbox = peer.tool("check_inbox", json!({})).await;
-            if inbox["count"] == 2 {
-                break inbox;
-            }
-            assert!(
-                waited.elapsed() < Duration::from_secs(10),
-                "the escalation message never reached the asker: {inbox}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
+        // Reading moves the model's place, so both are awaited before the one read.
+        wait_until("the escalation message to reach the asker", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 2
+        })
+        .await;
+        let mut inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["count"], 2, "{inbox}");
         let notice = &inbox["messages"][0]["payload"];
         assert_eq!(notice["kind"], "reply", "{inbox}");
         assert_eq!(notice["disposition"], "escalated", "{inbox}");
@@ -9479,8 +9474,9 @@ mod tests {
         assert_collected(&replied, &id, &peer.to_b, "answered", "yes, merge it");
         runner.stop().await;
         assert!(store_b.get(&id).unwrap().is_none());
+        // The two messages the model already read stay in the inbox beside it.
         wait_until("the notice to reach A's inbox", || {
-            peer.ctx.app.mesh.peer_inbox().len() == 1
+            peer.ctx.app.mesh.peer_inbox().len() == 3
         })
         .await;
         inbox = peer.tool("check_inbox", json!({})).await;

@@ -226,7 +226,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh status",
-            "Show this node's status card or set its objective",
+            "Show your session's status card or set its objective",
             AssertState::pass(),
         ),
         ReplCommand::new(

@@ -47,31 +47,6 @@ impl Inbox {
         self.messages.lock().push(envelope);
     }
 
-    /// `deliver` for a peer channel that must not hold more than `cap` `Peer` envelopes:
-    /// at the cap, the oldest makes room and is returned so the caller can count the
-    /// loss. Local envelopes neither count toward the cap nor get evicted. `cap` is at
-    /// least one: a bound of zero would evict on every delivery and hold nothing.
-    pub fn deliver_bounded(&self, envelope: Envelope, cap: usize) -> Option<Envelope> {
-        debug_assert!(cap > 0, "a bounded inbox holds at least one envelope");
-        let mut messages = self.messages.lock();
-        let is_peer = |e: &Envelope| matches!(e.payload, EnvelopePayload::Peer(_));
-        let evicted = if messages.iter().filter(|e| is_peer(e)).count() >= cap {
-            messages
-                .iter()
-                .position(is_peer)
-                .map(|index| messages.remove(index))
-        } else {
-            None
-        };
-        messages.push(envelope);
-        evicted
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.messages.lock().len()
-    }
-
     pub fn drain(&self) -> Vec<Envelope> {
         let mut msgs = {
             let mut guard = self.messages.lock();
@@ -301,32 +276,6 @@ mod tests {
             EnvelopePayload::TaskCompleted { .. }
         ));
         assert!(matches!(&msgs[1].payload, EnvelopePayload::Peer(m) if m.message_id == "m-1"));
-        assert!(matches!(msgs[2].payload, EnvelopePayload::Text { .. }));
-    }
-
-    #[test]
-    fn deliver_bounded_evicts_the_oldest_peer_and_leaves_local_envelopes_alone() {
-        let inbox = Inbox::new();
-        inbox.deliver(text_envelope("a", "b", "keep"));
-        assert!(
-            inbox
-                .deliver_bounded(peer_envelope("p", "b", "m-1"), 2)
-                .is_none()
-        );
-        assert!(
-            inbox
-                .deliver_bounded(peer_envelope("p", "b", "m-2"), 2)
-                .is_none()
-        );
-        let evicted = inbox
-            .deliver_bounded(peer_envelope("p", "b", "m-3"), 2)
-            .expect("the cap is on peer envelopes, and the text one does not count");
-        assert!(matches!(&evicted.payload, EnvelopePayload::Peer(m) if m.message_id == "m-1"));
-        assert_eq!(inbox.len(), 3);
-
-        let msgs = inbox.drain();
-        assert!(matches!(&msgs[0].payload, EnvelopePayload::Peer(m) if m.message_id == "m-2"));
-        assert!(matches!(&msgs[1].payload, EnvelopePayload::Peer(m) if m.message_id == "m-3"));
         assert!(matches!(msgs[2].payload, EnvelopePayload::Text { .. }));
     }
 

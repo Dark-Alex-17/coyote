@@ -826,7 +826,7 @@ fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused()
         &mut session,
         ".mesh",
         &format!(
-            r"{}\s+Send your own text to one peer, bypassing the model",
+            r"{}\s+Send your own text to one session, bypassing the model",
             literally(SEND_USAGE)
         ),
         BARE_PROMPT,
