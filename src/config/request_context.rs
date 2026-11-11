@@ -7046,7 +7046,7 @@ impl RequestContext {
         let records = runtime.trust().records();
         let bound: HashSet<String> = records
             .iter()
-            .filter(|record| record.tier == Tier::Destination)
+            .filter(|record| record.tier == Tier::Destination && !record.denied)
             .filter_map(|record| record.identity.clone())
             .collect();
         trusted_rows(records, SystemTime::now(), |record| {

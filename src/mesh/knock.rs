@@ -228,10 +228,10 @@ pub(crate) enum KnockError {
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
     Direct(RequestError),
-    /// The link to `dest8` came up and the knock drew no reply within the timeout, and no
-    /// propagation node is known to hold it.
+    /// The link to the session `who` names (`<user> / <session>`) came up and the request
+    /// drew no reply within the timeout, and no propagation node is known to hold it.
     Unanswered {
-        dest8: String,
+        who: String,
     },
     /// The link never came up and no propagation node is known to hold the knock.
     NoPropagationNode,
@@ -259,9 +259,9 @@ impl fmt::Display for KnockError {
                 "The request to be trusted could not be sent: {err}. {}",
                 request_remedy(err)
             ),
-            Self::Unanswered { dest8 } => write!(
+            Self::Unanswered { who } => write!(
                 f,
-                "Asked {dest8} to trust you; no answer. {KNOCK_IS_NOT_FIRST_CONTACT} No propagation node is known yet to hold the request for it."
+                "Asked {who} to trust you; no answer. {KNOCK_IS_NOT_FIRST_CONTACT} No propagation node is known yet to hold the request for it."
             ),
             Self::NoPropagationNode => write!(
                 f,
@@ -299,6 +299,15 @@ impl KnockError {
     /// in it keeps its dot while the hints around it follow the prefix.
     pub(crate) fn notice(&self) -> NoticeText {
         let whole = self.to_string();
+        if let Self::Unanswered { who } = self {
+            // The names are what the people view holds, which a peer may have advertised.
+            return NoticeText::from("Asked ").peer(who.as_str()).frame(
+                whole
+                    .strip_prefix(&format!("Asked {who}"))
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
         let request = match self {
             Self::Direct(request)
             | Self::Propagation {
@@ -448,6 +457,13 @@ impl KnockSink for ChannelKnockSink {
 /// identity's next knock instead.
 pub(crate) trait KnockSurface: Send + Sync {
     fn surface(&self, note: IdleNotify) -> bool;
+
+    /// What the request line names peers by: the running node's people view, so it reads
+    /// as `access requests` does, `you` included. `None` falls back to the trust list's
+    /// people section alone.
+    fn namer(&self) -> Option<Namer> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -755,7 +771,9 @@ impl KnockGate {
             origin: Origin::Peer(id8.to_string()),
             text: knock_text(
                 &knock,
-                &Namer::new(self.trust.people(&[]), None, HashMap::new()),
+                &surface
+                    .namer()
+                    .unwrap_or_else(|| Namer::new(self.trust.people(&[]), None, HashMap::new())),
                 display_name.as_deref(),
                 cached,
             ),
@@ -977,6 +995,26 @@ mod peer_text_prefix_tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_request_from_your_own_identity_reads_you_through_the_nodes_namer() {
+        let identity = "cd".repeat(16);
+        let destination = "ab".repeat(16);
+        let knock = InboundKnock {
+            identity_hash: identity.clone(),
+            destination_hash: destination.clone(),
+            name_hash: "ef".repeat(16),
+            via: KnockVia::Direct,
+            intro: None,
+        };
+        let mut own = HashMap::new();
+        own.insert(destination.clone(), "review".to_string());
+        let namer = Namer::new(Default::default(), Some(&identity), own);
+        let lines = Notification::new(Source::Knock, knock_text(&knock, &namer, None, true))
+            .render()
+            .render_notification_lines(CommandPrefix::Dot);
+        assert_eq!(lines[0], "[mesh:knock] you / review asks you to trust them");
     }
 }
 

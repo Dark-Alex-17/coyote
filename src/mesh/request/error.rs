@@ -275,7 +275,7 @@ pub(crate) fn refusal_remedy(code: RefusalCode) -> &'static str {
         RefusalCode::Throttled => "Wait a minute and try again",
         RefusalCode::Timeout => "Try again in a minute",
         RefusalCode::NoIdentity | RefusalCode::NoAccess => {
-            "The peer has not trusted this instance; nothing on this side lifts that"
+            "The peer has not trusted this session; nothing on your side lifts that"
         }
         RefusalCode::InvalidKey | RefusalCode::InvalidData | RefusalCode::InvalidStamp => {
             "The peer could not read what was sent, so sending it again meets the same answer; report it"
@@ -327,15 +327,25 @@ impl RemoteRefusal {
     }
 
     /// What the model can still do about it, for a tool result's `next_action`. A
-    /// default-closed refusal already filed the request as a knock on the peer, so nothing
-    /// here is left to send; a peer that blocked this instance, or one that saw this
-    /// identity's key change, filed none, and the wire does not say which it was.
+    /// default-closed refusal already filed the request as a request to be trusted on the
+    /// peer, so nothing here is left to send; a peer that blocked this session, or one
+    /// that saw your key change, filed none, and the wire does not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node unblocks it: ask the person at {} to run .mesh access trust session {}; unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
-            short(&self.destination),
+            "Nothing on your side unblocks it: ask the person at {} to run .mesh access trust session {}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
+            self.named(),
             self.own_destination
         )
+    }
+
+    /// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, or the short
+    /// hash alone when no name was given.
+    fn named(&self) -> String {
+        let dest8 = short(&self.destination);
+        match &self.display_name {
+            Some(name) => format!("\"{}\" ({dest8})", name.replace('"', "'")),
+            None => dest8.to_string(),
+        }
     }
 }
 
@@ -363,7 +373,7 @@ impl fmt::Display for RemoteRefusal {
         }
         write!(
             f,
-            " refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {dest8}.)",
+            " refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)",
             own = self.own_destination
         )
     }

@@ -5837,7 +5837,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
         "Asked {{who}} to trust you{}",
         stored_tail.replace("{KNOCK_IS_NOT_FIRST_CONTACT}", &first_contact)
     );
-    let unanswered_template = "Asked {dest8} to trust you; no answer. {KNOCK_IS_NOT_FIRST_CONTACT} No propagation node is known yet to hold the request for it.";
+    let unanswered_template = "Asked {who} to trust you; no answer. {KNOCK_IS_NOT_FIRST_CONTACT} No propagation node is known yet to hold the request for it.";
     let unanswered = unanswered_template.replace("{KNOCK_IS_NOT_FIRST_CONTACT}", &first_contact);
     let unreachable = "The session is unreachable and no propagation node is known yet to hold the request for it. Run `.mesh people list` to see which sessions you have heard from.";
     let preview_tail = "Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides.";
@@ -5878,7 +5878,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
         "A request to be trusted is not first contact".to_string(),
         preview_tail.to_string(),
         stored.replace("{who}", "<who>"),
-        unanswered.replace("{dest8}", "<dest8>"),
+        unanswered.replace("{who}", "<who>"),
         unreachable.to_string(),
         "(Mesh-Deployment#two-laptops-on-one-network)".to_string(),
     ] {
@@ -8532,7 +8532,8 @@ fn printed_from(span: &str, pool: &[String]) -> bool {
 
 /// Every string literal the trust verbs `untrust`, `forget`, `block` and `unblock` print
 /// or bail with, placeholders blanked: the REPL emitters in src/repl/mesh.rs, the refusals
-/// in src/mesh/trust.rs, the two confirmation constants and `plural`.
+/// in src/mesh/trust.rs, the words `UserWords` names a user with, the two confirmation
+/// constants and `plural`.
 fn trust_verb_fragments() -> Vec<String> {
     let repl = "src/repl/mesh.rs";
     let trust = "src/mesh/trust.rs";
@@ -8566,6 +8567,16 @@ fn trust_verb_fragments() -> Vec<String> {
     );
     sources.push(fn_body(trust, "nothing_to_untrust"));
     sources.push(fn_body(trust, "nothing_to_untrust_identity"));
+    sources.push(
+        read(repo_root().join(repl))
+            .split("\nimpl UserWords {")
+            .nth(1)
+            .expect("src/repl/mesh.rs implements UserWords")
+            .split("\n}\n")
+            .next()
+            .unwrap()
+            .to_string(),
+    );
     sources.push(fn_body("src/mesh/idle.rs", "plural"));
     let mut fragments: Vec<String> = sources
         .iter()
@@ -8612,8 +8623,8 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     let pool = trust_verb_fragments();
     for (span, fragment) in [
         (
-            "Session <dest8> belongs to user <id8>, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session <destination>. To take back the trust in the user and every session of theirs, run .mesh access revoke user <identity>.",
-            "Session <> belongs to user <>, whom you trust for every session",
+            "<who> belongs to <user>, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session <destination>. To take back the trust in the user and every session of theirs, run .mesh access revoke user <identity>.",
+            "<> belongs to <>, whom you trust for every session",
         ),
         (
             "This revokes <who>: it can no longer message you, ask your envoy or fetch your files; <user> stays known, so they can ask again and you will see the request. A request from it to be trusted is listed by .mesh access requests again.",
@@ -8683,7 +8694,7 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
         "code spans no trust verb prints (placeholders aside):\n{}",
         misquoted.join("\n")
     );
-    let headline = "Session <dest8> belongs to user <id8>";
+    let headline = "<who> belongs to <user>";
     for (label, page, heading) in [
         ("Mesh-Commands.md", &commands, "### `.mesh access revoke`"),
         (
@@ -9520,14 +9531,14 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         "the refusal no longer names the trust command: {literal:?}"
     );
     assert!(
-        literal.ends_with("(You do trust {dest8}.)"),
+        literal.ends_with("(You do trust them.)"),
         "the refusal no longer closes on the trust fact: {literal:?}"
     );
     let next_action = string_literals(&method_body("src/mesh/request/error.rs", "next_action"));
     let action_fragments = format_fragments(&next_action[0]);
     assert!(
         action_fragments.iter().any(|piece| piece.contains(
-            "unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted"
+            "unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted"
         )),
         "next_action no longer says a default-closed refusal filed the request as a request to be trusted, or no longer hedges that for a block or a key change: {next_action:?}"
     );
@@ -9600,7 +9611,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
             );
         }
     }
-    let with_tail = format!("(You do trust <dest8>.) {tail}");
+    let with_tail = format!("(You do trust them.) {tail}");
     assert!(
         status.contains(&with_tail),
         "Mesh-Commands.md's `.mesh status` quote does not end with the live-only tail: {with_tail:?}"

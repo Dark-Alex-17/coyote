@@ -4923,7 +4923,7 @@ mod tests {
         let refusal =
             RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some("Bea"), hex_lower(&[0xaa; 16]));
         let expected_action = format!(
-            "Nothing on this node unblocks it: ask the person at bbbbbbbb to run .mesh access trust session {}; unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
+            "Nothing on your side unblocks it: ask the person at \"Bea\" (bbbbbbbb) to run .mesh access trust session {}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
             "aa".repeat(16)
         );
         let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
@@ -4943,7 +4943,7 @@ mod tests {
                 )),
                 "{message}"
             );
-            assert!(message.ends_with("(You do trust bbbbbbbb.)"), "{message}");
+            assert!(message.ends_with("(You do trust them.)"), "{message}");
             assert!(!message.contains("0xf1"), "{message}");
             assert_eq!(result["next_action"], expected_action, "{result}");
         }
@@ -8707,10 +8707,10 @@ mod tests {
 
             let i8 = short(&live.stub.identity_hex()).to_string();
             let refusal = format!(
-                "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {d8}.)"
+                "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: ask the person at {d8} to run .mesh access trust session {own}; unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
+                "Nothing on your side unblocks it: ask the person at \"{i8} / {d8}\" ({d8}) to run .mesh access trust session {own}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
             );
 
             let calls = [
@@ -8877,10 +8877,10 @@ mod tests {
             let cee_d8 = short(&cee.destination_hex()).to_string();
             let cee_i8 = short(&cee.identity_hex()).to_string();
             let refusal = format!(
-                "\"{cee_i8} / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {cee_d8}.)"
+                "\"{cee_i8} / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
             );
             let next_action = format!(
-                "Nothing on this node unblocks it: ask the person at {cee_d8} to run .mesh access trust session {own}; unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
+                "Nothing on your side unblocks it: ask the person at \"{cee_i8} / {cee_d8}\" ({cee_d8}) to run .mesh access trust session {own}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
             );
 
             let result = handle_mesh_tool(

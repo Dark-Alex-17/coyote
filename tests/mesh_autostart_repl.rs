@@ -1746,7 +1746,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `revoke` of a hash the list holds nothing of names both verbs that act on it.
     let expected = format!(
-        "Session cdcdcdcd is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
+        "unnamed / cdcdcdcd is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
     );
     let out = trust_verb(
         &mut session,
@@ -1794,7 +1794,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `revoke` on the deny-only hash names the block and the verb that lifts it.
     let expected = format!(
-        "Session cdcdcdcd is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block."
+        "unnamed / cdcdcdcd is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block."
     );
     let out = trust_verb(
         &mut session,
@@ -1853,7 +1853,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // Lifting a deny that is not there is refused, naming both next verbs, and nothing
     // is written.
     let expected = format!(
-        "Session cdcdcdcd is not blocked, so there is nothing to unblock; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
+        "unnamed / cdcdcdcd is not blocked, so there is nothing to unblock; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
     );
     let out = trust_verb(
         &mut session,
@@ -1865,7 +1865,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // `revoke user` of a user the list has never held writes nothing.
     let expected = format!(
-        "User efefefef is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them."
+        "efefefef is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them."
     );
     let out = trust_verb(
         &mut session,
@@ -1897,7 +1897,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // `revoke user` of the blocked user names the unblock, the one verb that applies
     // while the block stands, and writes nothing.
     let expected = format!(
-        "User efefefef is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block."
+        "efefefef is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block."
     );
     let out = trust_verb(
         &mut session,
@@ -3242,7 +3242,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     let own = probe.own_identity();
 
     let refusal = format!(
-        "Session abababab belongs to user 12121212, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}."
+        "Ida / abababab belongs to Ida, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}."
     );
     for line in [
         format!(".mesh access revoke session {dest}"),
@@ -3503,7 +3503,7 @@ fn revoke_user_at_a_cold_prompt_takes_the_grant_and_the_bound_records_and_keeps_
     // With nothing left to take back, `revoke user` is refused in the documented
     // sentence before any prompt, and the file is byte-identical afterwards.
     let refusal = format!(
-        "User 12121212 is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
+        "Ida is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
     );
     for line in [
         format!(".mesh access revoke user {id}"),
@@ -3639,7 +3639,7 @@ fn revoke_of_the_last_session_keeps_the_user_known_and_revoke_user_has_nothing_l
         &mut session,
         &format!(".mesh access revoke session {dest}"),
         &format!(
-            "Session abababab is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
+            "unnamed / abababab is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
@@ -3651,7 +3651,7 @@ fn revoke_of_the_last_session_keeps_the_user_known_and_revoke_user_has_nothing_l
         &mut session,
         &format!(".mesh access revoke user {id}"),
         &format!(
-            "User 12121212 is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
+            "Ida is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
@@ -3683,7 +3683,7 @@ fn revoke_of_the_last_session_keeps_the_user_known_and_revoke_user_has_nothing_l
         &mut session,
         &format!(".mesh access revoke user {id} --confirm revoke-12121212"),
         &format!(
-            "User 12121212 is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them."
+            "12121212 is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
@@ -6284,6 +6284,229 @@ fn lines_about_a_heard_named_session_name_it_user_slash_session() {
     );
 
     let _ = exit_clean(&mut solo);
+    let status = exit_clean(&mut mine);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The words a user-facing access line must not use; help defines them once, under
+/// the hood, after its guide.
+const UNDER_THE_HOOD_WORDS: [&str; 4] = ["identity", "destination", "instance", "knock"];
+
+/// Cold start with a node on and nobody heard: `.mesh access`, `.mesh access help` and
+/// `.mesh help access` open with the "which one do I want?" guide and the state line,
+/// and the guide uses only people and session words; the retired spellings
+/// (`knocks`, `knock`, `untrust`, `--identity`) are refused, never aliased, and write
+/// nothing; `access requests` with nothing filed says so; `access revoke --stale` with
+/// nothing stale says so and keeps refusing `--yes` in favour of its prune token.
+#[test]
+fn access_help_opens_with_the_guide_and_the_retired_access_spellings_are_refused() {
+    const STATE_LINE: &str =
+        "stranger -trust-> trusted -revoke-> known -block-> blocked; forget -> stranger";
+    let relay = SilentRelay::start();
+    let probe = Probe::new("access-guide", true, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let own = probe.own_identity();
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+
+    for line in [".mesh access", ".mesh access help", ".mesh help access"] {
+        let out = people_command(&mut session, line);
+        let first = out.lines().map(str::trim).find(|row| !row.is_empty());
+        check(
+            first == Some("Which one do I want?"),
+            &format!("`{line}` opens with the guide"),
+            &out,
+        );
+        let guide = out.split(STATE_LINE).next().unwrap_or_default();
+        check(
+            out.lines().any(|row| row.trim() == STATE_LINE),
+            &format!("`{line}` carries the state line"),
+            &out,
+        );
+        for word in UNDER_THE_HOOD_WORDS {
+            check(
+                !guide.to_lowercase().contains(word),
+                &format!("`{line}`'s guide says {word:?}"),
+                guide,
+            );
+        }
+    }
+
+    let id = "ef".repeat(16);
+    for line in [
+        ".mesh access knocks".to_string(),
+        format!(".mesh access knock {id} --yes"),
+        format!(".mesh access untrust user {id}"),
+        format!(".mesh access trust --identity {id} --yes"),
+    ] {
+        let out = people_command(&mut session, &line);
+        check(
+            out.contains("Error: "),
+            &format!("`{line}` is refused"),
+            &out,
+        );
+        check(
+            !out.contains("No requests to be trusted") && !out.contains("Trusted "),
+            &format!("`{line}` is no alias"),
+            &out,
+        );
+    }
+    check(
+        foreign_trust_file_keys(&dir, "identities", &own).is_empty(),
+        "the refused spellings wrote no grant",
+        "",
+    );
+
+    let out = people_command(&mut session, ".mesh access requests");
+    check(
+        out.contains(
+            "No requests to be trusted. A session that asks you to trust it appears here.",
+        ),
+        "an empty `access requests`",
+        &out,
+    );
+    let out = people_command(&mut session, ".mesh access revoke --stale");
+    check(
+        out.contains("No trusted session has gone unheard for 30d; nothing to drop."),
+        "`revoke --stale` with nothing stale",
+        &out,
+    );
+    let out = people_command(&mut session, ".mesh access revoke --stale --yes");
+    check(
+        out.contains(
+            "`.mesh access revoke --stale` takes `--confirm prune-<N>` from a dry run, not `--yes`.",
+        ),
+        "`revoke --stale --yes` keeps the token flow",
+        &out,
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Two nodes on one real rnsd, both announcing. The owner names the other user, trusts
+/// every session of theirs (the confirmation says so, now and later), revokes the user
+/// with the dry-run token, and the user stays known: the request to be trusted the
+/// other side then sends with `.mesh access ask` is announced at the idle prompt and
+/// listed by `.mesh access requests`, both naming the asker `<user> / <session>` and
+/// never by the under-the-hood words. `.mesh people name <TAB>` offers the named user.
+#[test]
+fn a_revoked_user_stays_known_and_their_request_to_be_trusted_reads_user_slash_session() {
+    let Some(relay) = RnsdRelay::start("access-ask") else {
+        eprintln!("skipped: no rnsd on the PATH");
+        return;
+    };
+    let me = Probe::new("access-ask-me", true, &[relay.port]).with_announce();
+    let mut command = me.command();
+    command.args(["--session", "probe"]);
+    let mut mine = spawn_repl(command);
+    wait_for(&mut mine, SESSION_PROMPT);
+    me.wait_for_marker("MESH_STARTED");
+    let other = Probe::new("access-ask-other", true, &[relay.port]).with_announce();
+    let mut command = other.command();
+    command.args(["--session", "probe"]);
+    let mut theirs = spawn_repl(command);
+    wait_for(&mut theirs, SESSION_PROMPT);
+    other.wait_for_marker("MESH_STARTED");
+    let carol8 = other.own_identity()[..8].to_string();
+    let me8 = me.own_identity()[..8].to_string();
+
+    let heard = |session: &mut Target, user8: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let list = people_command(session, ".mesh people list");
+            if let Some(dest8) = sessions_of(&list, user8).into_iter().next() {
+                return dest8;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the announce never arrived: {list:?}"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+    };
+    let dest8 = heard(&mut mine, &carol8);
+    let my_dest8 = heard(&mut theirs, &me8);
+
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+    let out = people_command(&mut mine, &format!(".mesh people name {carol8} \"carol\""));
+    check(out.contains("is now carol"), "name the user", &out);
+
+    let out = people_command(&mut mine, ".mesh access trust user carol --yes");
+    check(
+        out.contains("Trusted carol, every session of theirs, now and later - added."),
+        "the user grant says it covers every session, now and later",
+        &out,
+    );
+    let out = people_command(&mut mine, ".mesh access revoke user carol");
+    check(
+        out.contains(&format!("--confirm revoke-{carol8}")),
+        "revoke user is a dry run naming its token",
+        &out,
+    );
+    let out = people_command(
+        &mut mine,
+        &format!(".mesh access revoke user carol --confirm revoke-{carol8}"),
+    );
+    check(
+        out.contains("Revoked carol: the trust in every session of theirs is gone. carol stays known but not trusted"),
+        "revoke user keeps the user known",
+        &out,
+    );
+
+    let out = people_command(
+        &mut theirs,
+        &format!(".mesh access ask {my_dest8} --yes --intro \"hello again\""),
+    );
+    check(
+        out.contains("Asked "),
+        "the other side asks to be trusted",
+        &out,
+    );
+
+    let who = format!("carol / {dest8}");
+    let idle = strip_escapes(&wait_for(&mut mine, "asks you to trust them"));
+    let idle_row = idle.rsplit('\n').next().unwrap_or_default().to_string();
+    check(
+        idle_row.contains("[mesh:knock]") && idle_row.contains(&who),
+        "the idle request line names the asker <user> / <session>",
+        &idle,
+    );
+    check(!idle.contains("knocks from"), "no knock wording", &idle);
+    // The two-line announcement ends on its block hint; the prompt is painted again after.
+    wait_for(&mut mine, &format!("block user {}", other.own_identity()));
+    wait_for(&mut mine, SESSION_PROMPT);
+    let out = people_command(&mut mine, ".mesh access requests");
+    check(
+        out.contains(&who),
+        "a revoked user's request is listed, named <user> / <session>",
+        &out,
+    );
+
+    // `people name <TAB>` offers the users and sessions by the names the people view
+    // uses; the wait fails the test when no completion naming carol is painted.
+    mine.send(".mesh people name \t").unwrap();
+    wait_for(&mut mine, "carol");
+    mine.send("\x1b").unwrap();
+    mine.send("\x7f".repeat(40)).unwrap();
+
+    let _ = exit_clean(&mut theirs);
     let status = exit_clean(&mut mine);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));

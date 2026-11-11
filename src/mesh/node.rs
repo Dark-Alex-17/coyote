@@ -1911,7 +1911,7 @@ impl MeshRuntime {
             .select_for_posting()
             .map_err(|_| match fallback {
                 KnockFallback::Unanswered => KnockError::Unanswered {
-                    dest8: dest8.to_string(),
+                    who: self.who_at(&dest_hex).to_string(),
                 },
                 KnockFallback::Unreachable => KnockError::NoPropagationNode,
             })?;
@@ -2480,7 +2480,7 @@ fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust user you`.",
+                "The mesh is on, but your user ({}) could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like a stranger until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust user you`.",
                 short(fingerprint),
                 redact_hashes(&format!("{err:#}")),
                 trust.path().display()
@@ -6451,6 +6451,10 @@ fn reopen_pending(store: &PendingStore) -> Vec<PendingRecord> {
 impl KnockSurface for MeshSlot {
     fn surface(&self, note: IdleNotify) -> bool {
         self.push_idle(note)
+    }
+
+    fn namer(&self) -> Option<Namer> {
+        self.get().map(|runtime| runtime.namer())
     }
 }
 
@@ -19139,8 +19143,10 @@ mod tests {
             let warned = warn_snapshot();
             assert!(
                 warned.iter().any(|line| {
-                    line.contains(&format!("own identity {} could not be trusted", short(OWN)))
-                        && line.contains(&remedy)
+                    line.contains(&format!(
+                        "your user ({}) could not be trusted for your other sessions",
+                        short(OWN)
+                    )) && line.contains(&remedy)
                         && !line.contains(OWN)
                 }),
                 "{warned:#?}"

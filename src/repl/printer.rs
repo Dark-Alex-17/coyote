@@ -745,18 +745,16 @@ mod tests {
             let identity = "cd".repeat(16);
             let destination = "ab".repeat(16);
             let text = format!(
-                "\"Tia\" (identity {identity}) knocks from instance {destination}\ntrust: .mesh access trust {destination} | who: .mesh people info {destination} | silence: .mesh access block --identity {identity}"
+                "cdcdcdcd / abababab (\"Tia\") asks you to trust them\ntrust: .mesh access trust session {destination} | who: .mesh people info {destination} | block: .mesh access block user {identity}"
             );
             let prefix = Source::Knock.prefix();
             let rows = rendered_rows(Source::Knock, &text, 240);
             assert_eq!(
                 rows,
                 vec![
+                    format!("{prefix} cdcdcdcd / abababab (\"Tia\") asks you to trust them"),
                     format!(
-                        "{prefix} \"Tia\" (identity {identity}) knocks from instance {destination}"
-                    ),
-                    format!(
-                        "{} trust: .mesh access trust {destination} | who: .mesh people info {destination} | silence: .mesh access block --identity {identity}",
+                        "{} trust: .mesh access trust session {destination} | who: .mesh people info {destination} | block: .mesh access block user {identity}",
                         " ".repeat(display_width(prefix))
                     ),
                 ]

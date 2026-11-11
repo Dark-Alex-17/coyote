@@ -332,11 +332,11 @@ pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
 const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
 const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a session you do not trust.";
-const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
+const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a session you do not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from sessions you trust.";
 const KNOCK_REFUSAL_TAIL: &str = "No request to be trusted is sent to a session you blocked or to a user you blocked; `.mesh access unblock session <who>` or `.mesh access trust session <who>` lifts the one, `.mesh access unblock user <who>` the other.";
 const UNHEARD_KNOCK_REFUSAL_TAIL: &str = "No request to be trusted is sent to a session you blocked, and the mesh is not asked about one you have not heard; `.mesh access unblock session <who>` lifts the block.";
-const INFO_REFUSAL_TAIL: &str = "This node does not ask the mesh about a destination it has blocked and not heard; `.mesh access unblock session <who>` lifts the block.";
+const INFO_REFUSAL_TAIL: &str = "You are not asking the mesh about a session you blocked and have not heard; `.mesh access unblock session <who>` lifts the block.";
 const TRUST_REFUSAL_TAIL: &str = "You are not asking the mesh about a session you blocked and have not heard; run `.mesh access unblock session <who>`, then `.mesh access trust session <who>` again.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
@@ -4195,26 +4195,32 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             let (identity, via) = user_target(ctx, &target)?;
             let own_identity = live(ctx)?.fingerprint() == identity;
             let namer = trust_namer(ctx, &store);
-            let user = namer.user(Some(&identity));
+            let words = UserWords::of(&namer, &identity);
+            let UserWords {
+                user,
+                every_session,
+                theirs,
+                ..
+            } = &words;
             if own_identity && grants_all(&store, &identity) {
                 out_text(&format!(
-                    "{OWN_IDENTITY_TRUSTED} Every session of yours is trusted already, so nothing was changed; .mesh access revoke user {identity} takes that back."
+                    "This is you, and every session of yours is trusted already, so nothing was changed; .mesh access revoke user {identity} takes that back."
                 ));
                 return Ok(());
             }
             let mut preview = via_session_clause(&namer, &identity, via.as_deref());
             preview.push_str(&format!(
-                "This trusts {user}, covering every session of {user}, now and later: each can message you, ask your envoy and fetch the files you share. Should {user} ever change keys, you are told when a session is heard under the new one, but nothing is marked; .mesh access trust session <who> is the grant that keeps a mark."
+                "This trusts {user}, covering {every_session}, now and later: each can message you, ask your envoy and fetch the files you share. Should {user} ever change keys, you are told when a session is heard under the new one, but nothing is marked; .mesh access trust session <who> is the grant that keeps a mark."
             ));
             let refused = store.denied_destinations_of(mesh, &identity)?.len();
             if refused > 0 {
                 preview.push_str(&format!(
-                    " {} of theirs stay blocked; .mesh access unblock session <who> lifts each.",
+                    " {} of {theirs} stay blocked; .mesh access unblock session <who> lifts each.",
                     plural(refused, "session", "sessions")
                 ));
             }
             out_text(&preview);
-            let question = format!("Trust every session of {user}, now and later?");
+            let question = format!("Trust {every_session}, now and later?");
             if !confirm_or_flag(&question, "--yes", yes)? {
                 out_text(NOTHING_CHANGED);
                 return Ok(());
@@ -4222,7 +4228,7 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             let change = store.trust_identity(mesh, &identity, TrustOptions::default(), now)?;
             reset_knock_surfacing(ctx, &identity);
             let mut lines = vec![format!(
-                "Trusted {user}, every session of theirs, now and later - {}.",
+                "Trusted {user}, every session of {theirs}, now and later - {}.",
                 change_text(change)
             )];
             if own_identity {
@@ -4474,7 +4480,13 @@ fn untrust_identity(
     now: SystemTime,
 ) -> Result<()> {
     let preview = store.untrust_identity(mesh, identity, true)?;
-    let user = namer.user(Some(identity));
+    let words = UserWords::of(namer, identity);
+    let UserWords {
+        user,
+        every_session,
+        theirs,
+        ..
+    } = &words;
     let expected = format!("revoke-{}", short(identity));
     if let Some(token) = &confirm
         && *token != expected
@@ -4483,9 +4495,13 @@ fn untrust_identity(
             "'{token}' is not the token for {user}; run .mesh access revoke user {identity} --confirm {expected}"
         );
     }
-    let known_tail = format!(
-        "{user} stays known but not trusted: they cannot message you or use anything you share, and when they ask to be trusted again, .mesh access requests lists it. Their name and what your envoy remembers of them stay; .mesh access forget user {identity} erases those too."
-    );
+    let known_tail = if namer.is_you(identity) {
+        "Your other sessions on this config dir can no longer message this one.".to_string()
+    } else {
+        format!(
+            "{user} stays known but not trusted: they cannot message you or use anything you share, and when they ask to be trusted again, .mesh access requests lists it. Their name and what your envoy remembers of them stay; .mesh access forget user {identity} erases those too."
+        )
+    };
     match confirm {
         None => {
             let records = store.records();
@@ -4494,9 +4510,7 @@ fn untrust_identity(
                 via_session_clause(namer, identity, via)
             )];
             if preview.was_granting {
-                lines.push(format!(
-                    "  the trust in every session of {user}, now and later"
-                ));
+                lines.push(format!("  the trust in {every_session}, now and later"));
             }
             for hash in &preview.removed {
                 let record = records.iter().find(|record| record.hash == *hash);
@@ -4519,9 +4533,11 @@ fn untrust_identity(
                 .count();
             match blocked {
                 0 => {}
-                1 => lines.push("  (1 session of theirs is blocked, and stays so)".to_string()),
+                1 => lines.push(format!(
+                    "  (1 session of {theirs} is blocked, and stays so)"
+                )),
                 n => lines.push(format!(
-                    "  ({n} sessions of theirs are blocked, and stay so)"
+                    "  ({n} sessions of {theirs} are blocked, and stay so)"
                 )),
             }
             lines.push(known_tail);
@@ -4533,14 +4549,14 @@ fn untrust_identity(
         Some(_) => {
             let revoked = store.untrust_identity(mesh, identity, false)?;
             let what = match (revoked.was_granting, revoked.removed.len()) {
-                (true, 0) => "the trust in every session of theirs is gone".to_string(),
+                (true, 0) => format!("the trust in every session of {theirs} is gone"),
                 (true, n) => format!(
-                    "the trust in every session of theirs and in {} is gone",
+                    "the trust in every session of {theirs} and in {} is gone",
                     plural(n, "session on its own", "sessions on their own")
                 ),
                 (false, n) => format!(
-                    "the trust in {} is gone",
-                    plural(n, "session of theirs", "sessions of theirs")
+                    "the trust in {} of {theirs} is gone",
+                    plural(n, "session", "sessions")
                 ),
             };
             out_text(&format!(
@@ -4861,7 +4877,13 @@ fn block_identity(
     now: SystemTime,
 ) -> Result<bool> {
     let identity = target.identity;
-    let user = namer.user(Some(identity));
+    let words = UserWords::of(namer, identity);
+    let UserWords {
+        user,
+        theirs,
+        their,
+        ..
+    } = &words;
     // A note is the one thing a repeat block changes; without one there is nothing to ask.
     if note.is_none() && store.is_blocked_identity(identity) {
         out_text(&format!("{user} is already blocked."));
@@ -4891,11 +4913,16 @@ fn block_identity(
         memory_clause.push_str(&format!(" {stores}."));
     }
     out_text(&format!(
-        "{}This blocks {user}: every session of theirs, now and later, is refused, their requests to be trusted are dropped without a word, and any trust you gave them or their sessions goes{memory_clause}",
-        via_session_clause(namer, identity, target.via)
+        "{}This blocks {user}: every session of {theirs}, now and later, is refused, {their} requests to be trusted are dropped without a word, and any trust you gave {} goes{memory_clause}",
+        via_session_clause(namer, identity, target.via),
+        if namer.is_you(identity) {
+            "your sessions"
+        } else {
+            "them or their sessions"
+        }
     ));
     if !confirm_or_flag(
-        &format!("Block {user} and every session of theirs, now and later?"),
+        &format!("Block {user} and every session of {theirs}, now and later?"),
         "--yes",
         yes,
     )? {
@@ -4904,12 +4931,12 @@ fn block_identity(
     }
     let removed = store.block_identity(mesh, identity, note, now)?;
     let mut lines = vec![format!(
-        "Blocked {user}: every session of theirs is refused. .mesh access unblock user {identity} lifts it."
+        "Blocked {user}: every session of {theirs} is refused. .mesh access unblock user {identity} lifts it."
     )];
     if !removed.is_empty() {
         lines.push(format!(
-            "Took back the trust in {}:",
-            plural(removed.len(), "session of theirs", "sessions of theirs")
+            "Took back the trust in {} of {theirs}:",
+            plural(removed.len(), "session", "sessions")
         ));
         lines.extend(
             removed
@@ -4964,8 +4991,9 @@ fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let user = namer.user(Some(&identity));
             store.unblock_identity(mesh, &identity, true)?;
             out_text(&format!(
-                "{}This lifts the block on {user}, so they may ask to be trusted again; trust is not restored.",
-                via_session_clause(&namer, &identity, via.as_deref())
+                "{}This lifts the block on {user}, so {} may ask to be trusted again; trust is not restored.",
+                via_session_clause(&namer, &identity, via.as_deref()),
+                UserWords::of(&namer, &identity).they
             ));
             if !confirm_or_flag(&format!("Unblock {user}?"), "--yes", yes)? {
                 out_text(NOTHING_CHANGED);
@@ -8523,16 +8551,16 @@ fn user_target(ctx: &RequestContext, token: &str) -> Result<(String, Option<Stri
     let Ok(destination) = destination_hash(ctx, token) else {
         return as_user.map(|identity| (identity, None));
     };
-    match identity_of_session(ctx, &destination) {
+    match proven_identity_of_session(ctx, &destination) {
         Some(identity) => Ok((identity, Some(destination))),
         None => as_user.map(|identity| (identity, None)),
     }
 }
 
-/// The identity of the session at `destination`: a peer row it re-derives from, the
-/// trust record it is bound to, the request to be trusted it sent, or, for naming only,
-/// the user the people section files the session's name under.
-fn identity_of_session(ctx: &RequestContext, destination: &str) -> Option<String> {
+/// The proven identity of the session at `destination`, the only kind a user-wide verb
+/// may act on: a peer row the destination re-derives from, the trust record it is bound
+/// to, or one of the sessions `<user>/<session>` picks from.
+fn proven_identity_of_session(ctx: &RequestContext, destination: &str) -> Option<String> {
     let runtime = ctx.app.mesh.get()?;
     if let Some(identity) = runtime.identity_at(destination) {
         return Some(identity);
@@ -8542,6 +8570,14 @@ fn identity_of_session(ctx: &RequestContext, destination: &str) -> Option<String
         .into_iter()
         .find(|(_, at)| same_hash(at, destination))
         .map(|(identity, _)| identity)
+}
+
+/// The identity a line names the session at `destination` under: the proven one, else
+/// the one its request to be trusted claims, else the user the people section files the
+/// session's name under. For naming only; no verb acts on it.
+fn named_identity_of_session(ctx: &RequestContext, destination: &str) -> Option<String> {
+    let runtime = ctx.app.mesh.get()?;
+    proven_identity_of_session(ctx, destination)
         .or_else(|| {
             ctx.app
                 .mesh
@@ -8569,11 +8605,48 @@ fn via_session_clause(namer: &Namer, identity: &str, via: Option<&str>) -> Strin
     }
 }
 
-/// `<user> / <session>` for the session at `destination`, its user read from a proven
-/// peer row or its trust record.
+/// How a user-wide line speaks of a user: in the third person, or in the second for your
+/// own identity, which reads `you`.
+struct UserWords {
+    /// The user as a subject or object: their name, or `you`.
+    user: String,
+    /// `every session of <user>`, or `every session of yours`.
+    every_session: String,
+    /// `theirs`, or `yours`.
+    theirs: &'static str,
+    /// `they`, or `you`.
+    they: &'static str,
+    /// `their`, or `your`.
+    their: &'static str,
+}
+
+impl UserWords {
+    fn of(namer: &Namer, identity: &str) -> Self {
+        if namer.is_you(identity) {
+            return Self {
+                user: YOU.to_string(),
+                every_session: "every session of yours".to_string(),
+                theirs: "yours",
+                they: "you",
+                their: "your",
+            };
+        }
+        let user = namer.user(Some(identity));
+        Self {
+            every_session: format!("every session of {user}"),
+            user,
+            theirs: "theirs",
+            they: "they",
+            their: "their",
+        }
+    }
+}
+
+/// `<user> / <session>` for the session at `destination`, its user read as
+/// `named_identity_of_session` reads it.
 fn session_who(ctx: &RequestContext, store: &TrustStore, destination: &str) -> Who {
     trust_namer(ctx, store).who(
-        identity_of_session(ctx, destination).as_deref(),
+        named_identity_of_session(ctx, destination).as_deref(),
         destination,
     )
 }
@@ -12143,12 +12216,12 @@ mod tests {
             "The session is unreachable and no propagation node is known yet to hold the request for it. Run `.mesh people list` to see which sessions you have heard from."
         );
         let unanswered = crate::mesh::knock::KnockError::Unanswered {
-            dest8: "abcd1234".to_string(),
+            who: "Ida / abcd1234".to_string(),
         }
         .to_string();
         assert_eq!(
             unanswered,
-            "Asked abcd1234 to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
+            "Asked Ida / abcd1234 to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
         );
         assert!(!unanswered.contains("unreachable"));
     }
@@ -26074,7 +26147,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({a_instance}). Its owner can run .mesh access trust session {a_instance} (or .mesh access unblock session {a_instance} if they blocked this session). (You do trust {d8}.) A status request is answered live or not at all; nothing queues it for later.",
+                            "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({a_instance}). Its owner can run .mesh access trust session {a_instance} (or .mesh access unblock session {a_instance} if they blocked this session). (You do trust them.) A status request is answered live or not at all; nothing queues it for later.",
                             d8 = short(&b_hex),
                             i8 = short(&pair.responder.desc.identity.address_hash.to_hex_string())
                         )
@@ -27604,7 +27677,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
                         assert!(
                             withdrawn.contains(
-                                "Revoked you: the trust in every session of theirs is gone."
+                                "Revoked you: the trust in every session of yours is gone."
                             ),
                             "{withdrawn}"
                         );
@@ -27625,7 +27698,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             .unwrap();
                         assert!(
                             first.contains(
-                                "Trusted you, every session of theirs, now and later - updated."
+                                "Trusted you, every session of yours, now and later - updated."
                             ),
                             "the record that kept the user known is updated, not added: {first}"
                         );
@@ -27642,14 +27715,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         let second = out_of(&mut ctx, &format!(".mesh access trust user {own}"))
                             .await
                             .unwrap();
-                        assert!(second.contains(sentence), "{second}");
-                        assert!(
-                            second.contains(
-                                "Every session of yours is trusted already, so nothing was changed"
-                            ),
-                            "{second}"
+                        assert_eq!(
+                            second.trim_end(),
+                            format!(
+                                "This is you, and every session of yours is trusted already, so nothing was changed; .mesh access revoke user {own} takes that back."
+                            )
                         );
-                        assert!(!second.contains("Trust every session"), "{second}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         assert_eq!(fs::read(trust.path()).unwrap(), before);
 
@@ -27948,8 +28019,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let err = refusal(&mut ctx, &format!(".mesh access revoke user {id}")).await;
                     assert!(
                         err.contains(&format!(
-                            "User {} is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them.",
-                            short(&id)
+                            "Tia is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
                         )),
                         "{err}"
                     );
@@ -27959,7 +28029,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         refusal(&mut ctx, &format!(".mesh access revoke user {unknown}")).await;
                     assert!(
                         err.contains(&format!(
-                            "User {} is not trusted, so there is nothing to revoke",
+                            "{} is not trusted, so there is nothing to revoke",
                             short(&unknown)
                         )),
                         "{err}"
@@ -27971,7 +28041,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .await;
                     assert!(
                         err.contains(&format!(
-                            "Session {} is not trusted, so there is nothing to revoke",
+                            "Tia / {} is not trusted, so there is nothing to revoke",
                             short(&dest)
                         )),
                         "{err}"
@@ -28254,9 +28324,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Session {} belongs to user {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}.",
-                            short(&dest),
-                            short(&id)
+                            "Tia / {} belongs to Tia, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}.",
+                            short(&dest)
                         )
                     );
                     assert_eq!(
@@ -28369,7 +28438,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block.",
+                            "Tia / {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block.",
                             short(&dest)
                         )
                     );
@@ -28550,9 +28619,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(before.is_some());
 
                     let sentence = format!(
-                        "Session {} belongs to user {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}.",
-                        short(&dest),
-                        short(&id)
+                        "Tia / {} belongs to Tia, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}.",
+                        short(&dest)
                     );
                     let printed = stdout_lines().len();
                     for flag in ["--dry-run", "--yes"] {
@@ -28978,9 +29046,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Session {} is not blocked, so there is nothing to unblock; its user {} is blocked: .mesh access unblock user {blocked_id} first, then .mesh access trust session {blocked} trusts it.",
-                            short(&blocked),
-                            short(&blocked_id)
+                            "Dee / {} is not blocked, so there is nothing to unblock; its user Dee is blocked: .mesh access unblock user {blocked_id} first, then .mesh access trust session {blocked} trusts it.",
+                            short(&blocked)
                         )
                     );
 
@@ -29061,8 +29128,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "User {} is not blocked, so there is nothing to unblock; .mesh access block user {id} blocks them, .mesh access trust user {id} trusts every session of theirs.",
-                                short(&id)
+                                "Tia is not blocked, so there is nothing to unblock; .mesh access block user {id} blocks them, .mesh access trust user {id} trusts every session of theirs."
                             ),
                             "{flag}"
                         );
@@ -29108,8 +29174,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "User {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block.",
-                            short(&id)
+                            "Tia is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block."
                         )
                     );
                     assert_eq!(stdout_lines().len(), printed, "a refusal prints no preview");
@@ -29154,7 +29219,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(trusted_hashes(&trust).contains(&trusted));
 
                     let printed = stdout_lines().len();
-                    for dest in [&trusted, &heard] {
+                    for (name, dest) in [("Tia", &trusted), ("Bea", &heard)] {
                         for flag in ["", " --yes"] {
                             let err = refusal(
                                 &mut ctx,
@@ -29164,7 +29229,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(
                                 err,
                                 format!(
-                                    "Session {} is not blocked, so there is nothing to unblock; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
+                                    "{name} / {} is not blocked, so there is nothing to unblock; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
                                     short(dest)
                                 ),
                                 "{flag}"
@@ -30037,6 +30102,102 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(rows.len(), 1, "{out}");
                     assert_eq!(rows[0][0], format!("Tia / {}", short(&dest)), "{out}");
                     assert_eq!(rows[0][5], short(&dest), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `access trust user` named by a heard session whose row proves its user says
+            /// it acts on that user and grants every session of theirs.
+            #[test]
+            #[serial]
+            fn trust_user_by_a_proven_session_names_the_user_and_trusts_every_session() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-user-by-session");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-user-by-session").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let out = out_of(&mut ctx, &format!(".mesh access trust user {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.starts_with(&format!(
+                            "Tia / {} is a session of Tia, so this acts on Tia and every session of theirs. ",
+                            short(&dest)
+                        )),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        trust.identity_standing(&id),
+                        IdentityStanding::Trusted {
+                            all_destinations: true
+                        }
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A request to be trusted only claims its user, so `access trust user` of a
+            /// session known from the knock cache alone never acts on the claimed user: the
+            /// token is read as a user hash instead.
+            #[test]
+            #[serial]
+            fn trust_user_by_a_session_known_only_from_a_knock_leaves_the_knocks_user_alone() {
+                use crate::mesh::knocks::KNOCK_RECORD_VERSION;
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-user-by-knock");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-user-by-knock").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let (dest, id, name_hash) = announced_peer();
+                    started
+                        .runtime
+                        .knock_gate()
+                        .cache()
+                        .append(
+                            KnockRecord {
+                                version: KNOCK_RECORD_VERSION,
+                                received_at: rfc3339_utc(now),
+                                identity_hash: id.clone(),
+                                destination_hash: dest.clone(),
+                                name_hash,
+                                display_name: Some("Kip".to_string()),
+                                intro: None,
+                                hops: 1,
+                            },
+                            now,
+                        )
+                        .unwrap();
+                    assert_eq!(trust.identity_standing(&id), IdentityStanding::Unknown);
+
+                    let out = out_of(&mut ctx, &format!(".mesh access trust user {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(!out.contains("is a session of"), "{out}");
+                    assert_eq!(trust.identity_standing(&id), IdentityStanding::Unknown);
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
+                    assert_eq!(
+                        trust.identity_standing(&dest),
+                        IdentityStanding::Trusted {
+                            all_destinations: true
+                        },
+                        "the grant goes to the token read as a user hash"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -32100,7 +32261,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Session {} is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
+                            "{} / {} is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
+                            short(&id),
                             short(&dest)
                         )
                     );
@@ -32297,7 +32459,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         err,
                         format!(
-                            "Session {} is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
+                            "unnamed / {} is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
                             short(&dest)
                         )
                     );
@@ -32594,7 +32756,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let before = trust_file(&trust);
                     let teaching = format!(
-                        "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block.",
+                        "Tia / {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block.",
                         short(&dest)
                     );
 
@@ -32926,7 +33088,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         refusal(&mut ctx, &format!(".mesh access revoke session {dest}")).await,
                         format!(
-                            "Session {} is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
+                            "{} / {} is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it.",
+                            short(&id),
                             short(&dest)
                         )
                     );
@@ -33169,7 +33332,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(
                         refusal(&mut ctx, &format!(".mesh access revoke session {dest}")).await,
                         format!(
-                            "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block.",
+                            "Tia / {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block.",
                             short(&dest)
                         )
                     );
@@ -33336,7 +33499,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         )
                         .await,
                         format!(
-                            "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {session_dest} lifts the block.",
+                            "Bea / {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {session_dest} lifts the block.",
                             short(&session_dest)
                         )
                     );
@@ -34765,7 +34928,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {d8}.)"
+                        "\"Tia / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(
@@ -35018,7 +35181,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {cee_d8}.)"
+                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
@@ -36573,9 +36736,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(
                             err,
                             format!(
-                                "Session {} belongs to user {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}.",
-                                short(&dest),
-                                short(&id)
+                                "Tia / {} belongs to Tia, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}.",
+                                short(&dest)
                             )
                         );
                         assert_eq!(
@@ -36999,7 +37161,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(trust.authorize(&id, &refused).rule, Rule::DestinationDenied);
                     assert_eq!(trust.denied().len(), 1);
                     let teaching = format!(
-                        "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {refused} lifts the block.",
+                        "Tia / {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {refused} lifts the block.",
                         short(&refused)
                     );
                     for flag in ["", " --dry-run", " --yes"] {

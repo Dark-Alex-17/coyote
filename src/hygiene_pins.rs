@@ -1353,6 +1353,9 @@ const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
     ("src/repl/mesh.rs", "files undeny"),
     ("src/repl/mesh.rs", "reply"),
     ("src/repl/mesh.rs", "undeny"),
+    ("tests/mesh_autostart_repl.rs", "access knock"),
+    ("tests/mesh_autostart_repl.rs", "access knocks"),
+    ("tests/mesh_autostart_repl.rs", "access untrust"),
     ("tests/mesh_autostart_repl.rs", "reply"),
     ("tests/mesh_wiki_docs.rs", "reply"),
     ("tests/mesh_wiki_docs.rs", "replying"),
@@ -1420,8 +1423,8 @@ fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
     out
 }
 
-/// Whether the `.mesh` table dispatches `path`: a top-level verb, a group, or a group and
-/// one of its verbs.
+/// Whether the `.mesh` table dispatches `path`: a top-level verb, a group, a group and
+/// one of its verbs, or a group and `help`, which lists the group.
 fn mesh_table_dispatches(path: &str) -> bool {
     let has_row = |group: &str, verb: &str| {
         crate::repl::mesh::COMMANDS
@@ -1429,7 +1432,7 @@ fn mesh_table_dispatches(path: &str) -> bool {
             .any(|row| row.0 == group && row.1 == verb)
     };
     match path.split_once(' ') {
-        Some((group, verb)) => is_mesh_group(group) && has_row(group, verb),
+        Some((group, verb)) => is_mesh_group(group) && (verb == "help" || has_row(group, verb)),
         None => is_mesh_group(path) || has_row("", path),
     }
 }
@@ -1456,7 +1459,14 @@ fn mesh_path_scanner_reads_paths_at_token_boundaries() {
 
 #[test]
 fn mesh_table_dispatches_groups_their_verbs_and_top_level_verbs_only() {
-    for path in ["status", "people", "people list", "on", "help"] {
+    for path in [
+        "status",
+        "people",
+        "people list",
+        "on",
+        "help",
+        "access help",
+    ] {
         assert!(mesh_table_dispatches(path), "{path}");
     }
     for path in [

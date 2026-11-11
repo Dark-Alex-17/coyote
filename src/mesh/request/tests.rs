@@ -7941,8 +7941,10 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
-        assert_eq!(err, KnockError::Unanswered { dest8 });
+        let dest = pair.responder.desc.address_hash.to_hex_string();
+        let who = pair.node_a.who_at(&dest).to_string();
+        assert!(who.ends_with(&format!(" / {}", &dest[..8])), "{who}");
+        assert_eq!(err, KnockError::Unanswered { who });
         assert!(!err.to_string().contains("unreachable"), "{err}");
         assert_eq!(pair.responder.adapter.admitted_count(), 0);
         assert_eq!(surface.count(), 0);
@@ -7980,17 +7982,14 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        let dest8 = pair.responder.desc.address_hash.to_hex_string()[..8].to_string();
-        assert_eq!(
-            err,
-            KnockError::Unanswered {
-                dest8: dest8.clone()
-            }
-        );
+        let dest = pair.responder.desc.address_hash.to_hex_string();
+        let who = pair.node_a.who_at(&dest).to_string();
+        assert!(who.ends_with(&format!(" / {}", &dest[..8])), "{who}");
+        assert_eq!(err, KnockError::Unanswered { who: who.clone() });
         assert_eq!(
             err.to_string(),
             format!(
-                "Asked {dest8} to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
+                "Asked {who} to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
             )
         );
         assert_eq!(pair.responder.adapter.admitted_count(), 0);
@@ -9328,10 +9327,7 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(
-                "(You do trust {b8}.) A status request",
-                b8 = short(&b_instance)
-            )),
+            text.contains("(You do trust them.) A status request"),
             "{text}"
         );
         assert!(
@@ -11324,7 +11320,10 @@ pub(crate) mod network {
             assert_eq!(
                 err,
                 KnockError::Unanswered {
-                    dest8: short(&ghost_desc.address_hash.to_hex_string()).to_string(),
+                    who: pair
+                        .node_a
+                        .who_at(&ghost_desc.address_hash.to_hex_string())
+                        .to_string(),
                 }
             );
             pair.stop_node_a().await;
@@ -11633,10 +11632,7 @@ pub(crate) mod network {
             text.contains(&format!(".mesh access trust session {a_instance}")),
             "{text}"
         );
-        assert!(
-            text.contains(&format!("(You do trust {}.)", short(&b_instance))),
-            "{text}"
-        );
+        assert!(text.ends_with("(You do trust them.)"), "{text}");
         assert!(!text.contains("0xf1"), "{text}");
         assert!(!text.contains("no access"), "{text}");
         sleep(Duration::from_millis(500)).await;

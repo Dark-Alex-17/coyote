@@ -4581,7 +4581,7 @@ mod tests {
         assert_eq!(
             named,
             format!(
-                "\"Bea\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {d8}.)",
+                "\"Bea\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)",
                 d8 = short(&destination)
             )
         );

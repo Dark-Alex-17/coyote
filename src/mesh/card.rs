@@ -1969,7 +1969,7 @@ mod tests {
             )),
             "{text}"
         );
-        assert!(text.ends_with(". (You do trust bbbbbbbb.) A status request is answered live or not at all; nothing queues it for later."), "{text}");
+        assert!(text.ends_with(". (You do trust them.) A status request is answered live or not at all; nothing queues it for later."), "{text}");
         assert!(!text.contains("0xf1"), "{text}");
     }
 

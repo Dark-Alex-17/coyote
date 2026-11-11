@@ -79,7 +79,7 @@ use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::peers::{PeerRecord, PeerTable};
-use crate::mesh::people::{self, People, PersonEntry, Slot};
+use crate::mesh::people::{self, Namer, People, PersonEntry, Slot};
 use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{
@@ -2398,17 +2398,26 @@ impl TrustStore {
                 .get(identity)
                 .is_some_and(|entry| entry.all_destinations)
         {
+            let namer = namer_of(&file, state.own_identity.as_deref());
             bail!(
-                "Session {} belongs to user {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {destination}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {identity}.",
-                short(&destination),
-                short(identity)
+                "{} belongs to {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {destination}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {identity}.",
+                namer.who(Some(identity), &destination),
+                namer.user(Some(identity))
             );
         }
         let on_disk = file.destinations.remove(&destination);
         let in_session = state.session_destinations.contains_key(&destination);
         let identity = match resolved {
             Some(identity) if on_disk.is_some() || in_session => identity,
-            unbound => return Err(nothing_to_untrust(&file, &destination, unbound.as_deref())),
+            unbound => {
+                let namer = namer_of(&file, state.own_identity.as_deref());
+                return Err(nothing_to_untrust(
+                    &file,
+                    &namer,
+                    &destination,
+                    unbound.as_deref(),
+                ));
+            }
         };
         let deny_stays = file.denied_destinations.contains_key(&destination);
         if dry_run {
@@ -2485,14 +2494,15 @@ impl TrustStore {
         // record has its session twin, so no record means nothing is bound either.
         if !on_disk && !in_session {
             return Err(nothing_to_untrust_identity(
+                &namer_of(&file, state.own_identity.as_deref()),
                 &identity,
                 file.blocked_identities.contains_key(&identity),
             ));
         }
         if !was_granting && removed.is_empty() {
             bail!(
-                "User {} is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {identity} trusts them, .mesh access forget user {identity} erases them.",
-                short(&identity)
+                "{} is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {identity} trusts them, .mesh access forget user {identity} erases them.",
+                namer_of(&file, state.own_identity.as_deref()).user(Some(&identity))
             );
         }
         let outcome = RevokedUser {
@@ -2582,8 +2592,8 @@ impl TrustStore {
         let mut file = state.file.clone();
         if file.blocked_identities.remove(&identity).is_none() {
             bail!(
-                "User {} is not blocked, so there is nothing to unblock; .mesh access block user {identity} blocks them, .mesh access trust user {identity} trusts every session of theirs.",
-                short(&identity)
+                "{} is not blocked, so there is nothing to unblock; .mesh access block user {identity} blocks them, .mesh access trust user {identity} trusts every session of theirs.",
+                namer_of(&file, state.own_identity.as_deref()).user(Some(&identity))
             );
         }
         if dry_run {
@@ -2693,18 +2703,18 @@ impl TrustStore {
         let mut file = state.file.clone();
         let resolved = resolve_identity(&file, &state, &peers, &destination);
         if file.denied_destinations.remove(&destination).is_none() {
+            let namer = namer_of(&file, state.own_identity.as_deref());
+            let who = namer.who(resolved.as_deref(), &destination);
             if let Some(identity) =
                 resolved.filter(|identity| file.blocked_identities.contains_key(identity))
             {
                 bail!(
-                    "Session {} is not blocked, so there is nothing to unblock; its user {} is blocked: .mesh access unblock user {identity} first, then .mesh access trust session {destination} trusts it.",
-                    short(&destination),
-                    short(&identity)
+                    "{who} is not blocked, so there is nothing to unblock; its user {} is blocked: .mesh access unblock user {identity} first, then .mesh access trust session {destination} trusts it.",
+                    namer.user(Some(&identity))
                 );
             }
             bail!(
-                "Session {} is not blocked, so there is nothing to unblock; .mesh access block session {destination} blocks it, .mesh access trust session {destination} trusts it.",
-                short(&destination)
+                "{who} is not blocked, so there is nothing to unblock; .mesh access block session {destination} blocks it, .mesh access trust session {destination} trusts it."
             );
         }
         let served_by = match resolved {
@@ -3481,36 +3491,41 @@ fn check_text(field: &str, text: Option<&str>) -> Result<()> {
 fn refuse_if_blocked(file: &TrustFile, identity: &str) -> Result<()> {
     if file.blocked_identities.contains_key(identity) {
         bail!(
-            "User {} is blocked. Run `.mesh access unblock user {identity}` first if you want to trust them.",
-            short(identity)
+            "{} is blocked. Run `.mesh access unblock user {identity}` first if you want to trust them.",
+            namer_of(file, None).user(Some(identity))
         );
     }
     Ok(())
 }
 
+/// The namer the store's refusals name peers with: the people section alone, with `you`
+/// for this node's own identity when it is known.
+fn namer_of(file: &TrustFile, own_identity: Option<&str>) -> Namer {
+    Namer::new(People::new(&file.people, &[]), own_identity, HashMap::new())
+}
+
 fn nothing_to_untrust(
     file: &TrustFile,
+    namer: &Namer,
     destination: &str,
     identity: Option<&str>,
 ) -> anyhow::Error {
+    let who = namer.who(identity, destination);
     if file.denied_destinations.contains_key(destination) {
         return anyhow!(
-            "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {destination} lifts the block.",
-            short(destination)
+            "{who} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {destination} lifts the block."
         );
     }
     if let Some(identity) =
         identity.filter(|identity| file.blocked_identities.contains_key(*identity))
     {
         return anyhow!(
-            "Session {} is not trusted, so there is nothing to revoke; its user {} is blocked: .mesh access unblock user {identity} first, then .mesh access trust session {destination} trusts it.",
-            short(destination),
-            short(identity)
+            "{who} is not trusted, so there is nothing to revoke; its user {} is blocked: .mesh access unblock user {identity} first, then .mesh access trust session {destination} trusts it.",
+            namer.user(Some(identity))
         );
     }
     anyhow!(
-        "Session {} is not trusted, so there is nothing to revoke; .mesh access block session {destination} blocks it, .mesh access trust session {destination} trusts it.",
-        short(destination)
+        "{who} is not trusted, so there is nothing to revoke; .mesh access block session {destination} blocks it, .mesh access trust session {destination} trusts it."
     )
 }
 
@@ -3518,16 +3533,19 @@ fn nothing_to_untrust(
 /// store's dry run and its write. A blocked identity holds no record by construction, so
 /// the verbs the plain refusal names would both be wrong for it: `access trust user` is
 /// refused while the block stands and `access block user` is already in effect.
-pub(crate) fn nothing_to_untrust_identity(identity: &str, blocked: bool) -> anyhow::Error {
+pub(crate) fn nothing_to_untrust_identity(
+    namer: &Namer,
+    identity: &str,
+    blocked: bool,
+) -> anyhow::Error {
+    let user = namer.user(Some(identity));
     if blocked {
         return anyhow!(
-            "User {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {identity} lifts the block.",
-            short(identity)
+            "{user} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {identity} lifts the block."
         );
     }
     anyhow!(
-        "User {} is not trusted, so there is nothing to revoke; .mesh access trust user {identity} trusts every session of theirs, .mesh access block user {identity} blocks them.",
-        short(identity)
+        "{user} is not trusted, so there is nothing to revoke; .mesh access trust user {identity} trusts every session of theirs, .mesh access block user {identity} blocks them."
     )
 }
 
@@ -6553,7 +6571,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "User {} is not blocked, so there is nothing to unblock; .mesh access block user {} blocks them, .mesh access trust user {} trusts every session of theirs.",
+                "{} is not blocked, so there is nothing to unblock; .mesh access block user {} blocks them, .mesh access trust user {} trusts every session of theirs.",
                 short(&peer.identity_hash),
                 peer.identity_hash,
                 peer.identity_hash
@@ -6736,7 +6754,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "User {} is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {} trusts them, .mesh access forget user {} erases them.",
+                "{} is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {} trusts them, .mesh access forget user {} erases them.",
                 short(&first.identity_hash),
                 first.identity_hash,
                 first.identity_hash
@@ -8594,7 +8612,8 @@ mod tests {
         let sink = fx.observed();
         let before = fx.file_bytes();
         let expected = format!(
-            "Session {} belongs to user {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {}.",
+            "{} / {} belongs to {}, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {}.",
+            short(&peer.identity_hash),
             short(&peer.destination_hash),
             short(&peer.identity_hash),
             peer.destination_hash,
@@ -9088,7 +9107,8 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "Session {} is not blocked, so there is nothing to unblock; .mesh access block session {} blocks it, .mesh access trust session {} trusts it.",
+                    "{} / {} is not blocked, so there is nothing to unblock; .mesh access block session {} blocks it, .mesh access trust session {} trusts it.",
+                    short(&peer.identity_hash),
                     short(&peer.destination_hash),
                     peer.destination_hash,
                     peer.destination_hash
@@ -9206,7 +9226,8 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Session {} is not blocked, so there is nothing to unblock; {blocked_tail}",
+                "{} / {} is not blocked, so there is nothing to unblock; {blocked_tail}",
+                short(&blocked.identity_hash),
                 short(&blocked.destination_hash)
             )
         );
@@ -9218,7 +9239,8 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Session {} is not trusted, so there is nothing to revoke; {blocked_tail}",
+                "{} / {} is not trusted, so there is nothing to revoke; {blocked_tail}",
+                short(&blocked.identity_hash),
                 short(&blocked.destination_hash)
             )
         );
@@ -9297,7 +9319,10 @@ mod tests {
         let stranger = fake_hash(0xdd);
         let before = fx.file_bytes();
 
-        for destination in [&unheard, &heard.destination_hash] {
+        for (destination, user) in [
+            (&unheard, people::UNNAMED),
+            (&heard.destination_hash, short(&heard.identity_hash)),
+        ] {
             let err = fx
                 .store
                 .untrust_destination(&fx.mesh, destination, false)
@@ -9306,7 +9331,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "Session {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {destination} lifts the block.",
+                    "{user} / {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {destination} lifts the block.",
                     short(destination)
                 )
             );
@@ -9319,7 +9344,8 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "Session {} is not trusted, so there is nothing to revoke; .mesh access block session {stranger} blocks it, .mesh access trust session {stranger} trusts it.",
+                "{} / {} is not trusted, so there is nothing to revoke; .mesh access block session {stranger} blocks it, .mesh access trust session {stranger} trusts it.",
+                people::UNNAMED,
                 short(&stranger)
             )
         );
@@ -9348,7 +9374,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "User {} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block.",
+                    "{} is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block.",
                     short(&id)
                 ),
                 "{dry_run}"
@@ -9367,7 +9393,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "User {} is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them.",
+                "{} is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them.",
                 short(&id)
             )
         );
