@@ -12,12 +12,12 @@ fi
 complexity=$(echo "$state" | jq -r '.complexity_score // 0')
 
 if [[ "${CODER_AUTOAPPROVE:-0}" == "1" ]]; then
-  jq -nc '{"_next": "implement"}'
+  jq -nc '{"_next": "baseline_tests"}'
   exit 0
 fi
 
 if (( complexity >= 7 )); then
   jq -nc '{"_next": "gate_approval"}'
 else
-  jq -nc '{"_next": "implement"}'
+  jq -nc '{"_next": "baseline_tests"}'
 fi
