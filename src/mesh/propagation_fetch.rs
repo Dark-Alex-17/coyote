@@ -570,7 +570,7 @@ pub(crate) struct FetchReport {
 
 /// Why a body was deferred after this node asked the mesh for its sender's announce.
 pub(crate) const ASKED_FOR_SOURCE: &str =
-    "source identity not yet known; asked the mesh for its announce";
+    "the sender is not known yet; asked the mesh for its announce";
 
 impl FetchReport {
     fn new(node: String) -> Self {

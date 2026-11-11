@@ -1796,11 +1796,18 @@ mod no_answer_tests {
         let FetchError::NoAnswer(no_answer) = &silent else {
             panic!("{silent:?}");
         };
-        assert_eq!(*no_answer, NoAnswer::new(&to, own.clone()));
+        let who = runtime
+            .owner_namer()
+            .who(runtime.identity_at(&to).as_deref(), &to)
+            .to_string();
+        assert_eq!(
+            *no_answer,
+            NoAnswer::new(&to, own.clone()).named(Some(&who))
+        );
         assert_eq!(
             silent.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
+                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
                 short(&to)
             )
         );

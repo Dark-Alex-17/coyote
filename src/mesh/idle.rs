@@ -590,7 +590,7 @@ mod synced_ask_line_tests {
         report.deferred_after_ask = 1;
         assert_eq!(
             synced_line(&report),
-            "synced 2 messages from deadbeef: 1 delivered, 1 deferred (source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute)"
+            "synced 2 messages from deadbeef: 1 delivered, 1 deferred (the sender is not known yet; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute)"
         );
     }
 
@@ -611,17 +611,17 @@ mod synced_ask_line_tests {
         };
         assert_eq!(
             synced_line(&report),
-            "synced 3 messages from deadbeef: 3 deferred (for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute)"
+            "synced 3 messages from deadbeef: 3 deferred (for 1 of 3, the sender is not known yet; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute)"
         );
         report.deferred_after_ask = 2;
         assert_eq!(
             synced_line(&report),
-            "synced 3 messages from deadbeef: 3 deferred (for 2 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute)"
+            "synced 3 messages from deadbeef: 3 deferred (for 2 of 3, the sender is not known yet; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute)"
         );
         report.deferred_after_ask = 3;
         assert_eq!(
             synced_line(&report),
-            "synced 3 messages from deadbeef: 3 deferred (source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute)"
+            "synced 3 messages from deadbeef: 3 deferred (the sender is not known yet; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute)"
         );
     }
 

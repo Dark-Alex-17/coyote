@@ -70,10 +70,10 @@ fn agent_prompt(agent: &str) -> String {
     format!(r"dry-model\)(\x1b\[[0-9;]*m)*{agent}>(\x1b\[[0-9;]*m)*>")
 }
 
-/// The one line `mesh::autostart` adds over `.mesh on --yes`.
-const AUTOSTART_NOTICE: &str =
-    "mesh.enabled is true in config.yaml: joining the mesh for this session";
-const MESH_ON_SUMMARY: &str = "Mesh is on for this session";
+/// The one line every join prints once the node is up.
+const MESH_ON_SUMMARY: &str = "Joined the mesh as ";
+/// The first line of the preview a typed `.mesh on` prints; autostart prints none.
+const ON_PREVIEW: &str = "Joining the mesh for session";
 /// The clause a typed `.mesh off` adds under `mesh.enabled: true`.
 const STAYS_OFF: &str = "it stays off for the rest of this run";
 const STAYS_OFF_PATTERN: &str = r"it stays off for the rest of this run";
@@ -90,6 +90,20 @@ const MESH_OFF_PATTERN: &str = r"Mesh is off\. Run `\.mesh on` first\.";
 const NO_PEERS_PATTERN: &str = r"No users or sessions heard yet\.";
 
 type Target = Session<OsProcess, OsStream>;
+
+/// Whether `line` is the one line a join prints for your session `session`:
+/// `Joined the mesh as you / <session> (<dest8>); .mesh help shows the commands
+/// and what they mean.`
+fn is_joined_line(line: &str, session: &str) -> bool {
+    line.strip_prefix(&format!("{MESH_ON_SUMMARY}you / {session} ("))
+        .and_then(|rest| rest.split_at_checked(8))
+        .is_some_and(|(dest8, tail)| {
+            dest8
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                && tail == "); .mesh help shows the commands and what they mean."
+        })
+}
 
 fn fresh_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -591,9 +605,9 @@ fn a_read_holding_the_needle_on_two_rows_keeps_the_rows_between_the_matches() {
 }
 
 /// Positive: with a session held, `mesh.enabled: true` joins before the
-/// first prompt with the autostart notice and the `.mesh on` summary, asks
-/// nothing, fires `mesh.started`, and a node verb works at the first prompt.
-/// `.exit` stops the node (`mesh.stopped`) and exits clean.
+/// first prompt with the one joined line and no preview, asks nothing, fires
+/// `mesh.started`, and a node verb works at the first prompt. `.exit` stops the
+/// node (`mesh.stopped`) and exits clean.
 #[test]
 fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     let relay = SilentRelay::start();
@@ -603,24 +617,18 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     let mut session = spawn_repl(command);
 
     let startup = strip_escapes(&wait_for(&mut session, SESSION_PROMPT));
-    let notice_at = startup
-        .find(AUTOSTART_NOTICE)
-        .unwrap_or_else(|| panic!("autostart notice missing before the first prompt: {startup:?}"));
-    let summary_at = startup.find(MESH_ON_SUMMARY).unwrap_or_else(|| {
-        panic!("`.mesh on` summary missing before the first prompt: {startup:?}")
-    });
-    assert!(notice_at < summary_at, "{startup:?}");
-    let notice_line = startup
+    let joined: Vec<&str> = startup
         .lines()
-        .find(|line| line.contains(AUTOSTART_NOTICE))
-        .unwrap();
+        .map(str::trim_end)
+        .filter(|line| line.contains(MESH_ON_SUMMARY))
+        .collect();
     assert!(
-        !notice_line.contains(".mesh off"),
-        "the notice carries no pointer of its own; the summary's `.mesh off` is the one: {notice_line:?}"
+        joined.len() == 1 && is_joined_line(joined[0], "probe"),
+        "autostart prints the one joined line before the first prompt: {startup:?}"
     );
     assert!(
-        startup.contains("Turn it off with `.mesh off`."),
-        "the summary names the off command once the notice no longer does: {startup:?}"
+        !startup.contains(ON_PREVIEW) && !startup.contains("What leaves this machine"),
+        "autostart prints no preview: {startup:?}"
     );
     assert!(
         !startup.contains("Join the mesh on")
@@ -699,10 +707,10 @@ fn literally(text: &str) -> String {
 const WAITING_FOR_YOU_ONE: &str = "Waiting for YOU (1)";
 
 /// That section's whole header with the other two lists empty: the commands start
-/// two columns past the longest counted title, `Asked by this node (0)`.
+/// two columns past the longest counted title, `Asked by your sessions (0)`.
 fn waiting_for_you_header() -> String {
     format!(
-        "{WAITING_FOR_YOU_ONE}     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>"
+        "{WAITING_FOR_YOU_ONE}         answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>"
     )
 }
 
@@ -710,7 +718,7 @@ fn waiting_for_you_header() -> String {
 const OPEN_LISTS: [(&str, &str); 3] = [
     (".mesh envoy questions", "Waiting for YOU"),
     (".mesh files requests", "Access requests"),
-    (".mesh messaging sent", "Asked by this node"),
+    (".mesh messaging sent", "Asked by your sessions"),
 ];
 
 /// Types the three list commands in turn and returns their sections one after another,
@@ -754,7 +762,7 @@ fn open_lists(session: &mut Target, prompt: &str) -> (String, String) {
 fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused() {
     const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. Type `.mesh help` for the list.";
     const SEND_USAGE: &str =
-        ".mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]";
+        ".mesh messaging send <session> [--yes] \"text\" [--attach <path> [--force]]";
     const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from.";
     const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one.";
     fn retired(word: &str) -> String {
@@ -821,25 +829,33 @@ fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused()
     );
     assert_eq!(row.trim(), NOTE_CLEARED);
 
-    // The help list names `messaging send`, with its usage line, and has no `reply` row.
+    // The messaging listing names `messaging send`, its `--help` the usage line, and no
+    // listing has a `reply` row.
     let (_, help) = command_row_and_transcript(
         &mut session,
-        ".mesh",
-        &format!(
-            r"{}\s+Send your own text to one session, bypassing the model",
-            literally(SEND_USAGE)
-        ),
+        ".mesh messaging",
+        r"\.mesh messaging send\s+┆ Send your own text to one session, bypassing the model",
         BARE_PROMPT,
     );
-    assert!(help.contains(&format!("  {SEND_USAGE}")), "{help}");
-    assert!(
-        help.contains("  .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"),
-        "{help}"
+    let (_, send) = command_row_and_transcript(
+        &mut session,
+        ".mesh messaging send --help",
+        &literally(&format!("Usage: {SEND_USAGE}")),
+        BARE_PROMPT,
+    );
+    assert!(send.contains(&format!("Usage: {SEND_USAGE}")), "{send}");
+    let (_, brief) = command_row_and_transcript(
+        &mut session,
+        ".mesh envoy brief --help",
+        &literally("Usage: .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"),
+        BARE_PROMPT,
     );
     assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with(".mesh reply")),
+        brief.contains("Usage: .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"),
+        "{brief}"
+    );
+    assert!(
+        !help.contains("messaging reply") && !help.contains(".mesh reply"),
         "the help list must not carry a reply row:\n{help}"
     );
     assert!(
@@ -925,9 +941,9 @@ fn the_inbox_reads_and_clears_at_a_cold_prompt_and_the_help_says_where_replies_l
     assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
 }
 
-/// Failed precondition: `mesh.enabled: true` with no session prints the
-/// autostart notice and the very `.mesh on` refusal, then goes on to a usable
-/// prompt with the mesh off; no node is started (no `mesh.started`).
+/// Failed precondition: `mesh.enabled: true` with no session prints the very
+/// `.mesh on` refusal and no preview, then goes on to a usable prompt with the
+/// mesh off; no node is started (no `mesh.started`).
 #[test]
 fn repl_with_mesh_enabled_but_no_session_prints_the_mesh_on_refusal_and_stays_off() {
     let relay = SilentRelay::start();
@@ -935,13 +951,11 @@ fn repl_with_mesh_enabled_but_no_session_prints_the_mesh_on_refusal_and_stays_of
     let mut session = spawn_repl(probe.command());
 
     let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
-    let notice_at = startup
-        .find(AUTOSTART_NOTICE)
-        .unwrap_or_else(|| panic!("autostart notice missing: {startup:?}"));
-    let refusal_at = startup
-        .find(NEEDS_SESSION)
-        .unwrap_or_else(|| panic!("the `.mesh on` refusal must be printed: {startup:?}"));
-    assert!(notice_at < refusal_at, "{startup:?}");
+    assert!(
+        startup.contains(NEEDS_SESSION),
+        "the `.mesh on` refusal must be printed: {startup:?}"
+    );
+    assert!(!startup.contains(ON_PREVIEW), "{startup:?}");
     assert!(
         startup.contains("Run `.session <name>` first."),
         "the refusal teaches the fix: {startup:?}"
@@ -1115,14 +1129,14 @@ fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_
 
     let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
     assert!(
-        startup.contains(AUTOSTART_NOTICE) && startup.contains(NEEDS_SESSION),
+        startup.contains(NEEDS_SESSION) && !startup.contains(ON_PREVIEW),
         "{startup:?}"
     );
     assert_eq!(probe.marker_count("MESH_STARTED"), 0);
 
     // `.session a` joins by itself: the notice, the summary, no question.
     let entered = command_prints(&mut session, ".session a", MESH_ON_SUMMARY, &prompt_a);
-    assert!(entered.contains(AUTOSTART_NOTICE), "{entered:?}");
+    assert!(!entered.contains(ON_PREVIEW), "{entered:?}");
     assert!(
         !entered.contains("Join the mesh on")
             && !entered.contains("Join anyway?")
@@ -1160,7 +1174,7 @@ fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_
     session.send(".session b\r").expect("enter session b");
     let entered_b = strip_escapes(&wait_for(&mut session, &prompt_b));
     assert!(
-        !entered_b.contains(AUTOSTART_NOTICE) && !entered_b.contains(MESH_ON_SUMMARY),
+        !entered_b.contains(ON_PREVIEW) && !entered_b.contains(MESH_ON_SUMMARY),
         "a typed `.mesh off` keeps the next session off: {entered_b:?}"
     );
     let peers = command_prints(
@@ -1170,7 +1184,7 @@ fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_
         &prompt_b,
     );
     assert!(
-        !peers.contains(AUTOSTART_NOTICE) && !peers.contains(MESH_ON_SUMMARY),
+        !peers.contains(ON_PREVIEW) && !peers.contains(MESH_ON_SUMMARY),
         "{peers:?}"
     );
     assert_eq!(
@@ -1181,7 +1195,10 @@ fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_
 
     // `.mesh on` lifts the decision ...
     let on = command_prints(&mut session, ".mesh on --yes", MESH_ON_SUMMARY, &prompt_b);
-    assert!(!on.contains(AUTOSTART_NOTICE), "{on:?}");
+    assert!(
+        on.contains(ON_PREVIEW),
+        "a typed `.mesh on` prints the preview autostart leaves out: {on:?}"
+    );
     probe.wait_for_marker_count("MESH_STARTED", 2);
 
     // ... and `.exit session` while on leaves the mesh without taking it again.
@@ -1201,7 +1218,7 @@ fn entering_a_session_joins_and_mesh_off_holds_until_mesh_on_while_exit_session_
 
     // `.session c` joins again.
     let entered_c = command_prints(&mut session, ".session c", MESH_ON_SUMMARY, &prompt_c);
-    assert!(entered_c.contains(AUTOSTART_NOTICE), "{entered_c:?}");
+    assert!(!entered_c.contains(ON_PREVIEW), "{entered_c:?}");
     probe.wait_for_marker_count("MESH_STARTED", 3);
     let peers = command_prints(
         &mut session,
@@ -1279,7 +1296,7 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
 
     let startup = strip_escapes(&wait_for(&mut session, BARE_PROMPT));
     assert!(
-        startup.contains(AUTOSTART_NOTICE) && startup.contains(NEEDS_SESSION),
+        startup.contains(NEEDS_SESSION) && !startup.contains(ON_PREVIEW),
         "{startup:?}"
     );
     assert_eq!(probe.marker_count("MESH_STARTED"), 0);
@@ -1291,7 +1308,7 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
         MESH_ON_SUMMARY,
         &prompt_plain_a,
     );
-    assert!(entered.contains(AUTOSTART_NOTICE), "{entered:?}");
+    assert!(!entered.contains(ON_PREVIEW), "{entered:?}");
     assert!(
         !entered.contains("Join the mesh on")
             && !entered.contains("Join anyway?")
@@ -1318,7 +1335,7 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
 
     // `.session b` joins again: the leave took no decision for the run.
     let entered_b = command_prints(&mut session, ".session b", MESH_ON_SUMMARY, &prompt_b);
-    assert!(entered_b.contains(AUTOSTART_NOTICE), "{entered_b:?}");
+    assert!(!entered_b.contains(ON_PREVIEW), "{entered_b:?}");
     probe.wait_for_marker_count("MESH_STARTED", 2);
 
     // A typed `.mesh off` holds for the run ...
@@ -1340,7 +1357,7 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
         .expect("enter agent session c");
     let entered_c = strip_escapes(&wait_for(&mut session, &prompt_plain_c));
     assert!(
-        !entered_c.contains(AUTOSTART_NOTICE) && !entered_c.contains(MESH_ON_SUMMARY),
+        !entered_c.contains(ON_PREVIEW) && !entered_c.contains(MESH_ON_SUMMARY),
         "a typed `.mesh off` keeps the next agent session off: {entered_c:?}"
     );
     let peers = command_prints(
@@ -1349,7 +1366,7 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
         MESH_OFF_PATTERN,
         &prompt_plain_c,
     );
-    assert!(!peers.contains(AUTOSTART_NOTICE), "{peers:?}");
+    assert!(!peers.contains(MESH_ON_SUMMARY), "{peers:?}");
     assert_eq!(
         probe.marker_count("MESH_STARTED"),
         2,
@@ -1363,7 +1380,10 @@ fn entering_an_agent_session_joins_and_leaving_it_by_any_path_leaves_the_mesh() 
         MESH_ON_SUMMARY,
         &prompt_plain_c,
     );
-    assert!(!on.contains(AUTOSTART_NOTICE), "{on:?}");
+    assert!(
+        on.contains(ON_PREVIEW),
+        "a typed `.mesh on` prints the preview autostart leaves out: {on:?}"
+    );
     probe.wait_for_marker_count("MESH_STARTED", 3);
 
     // ... and `.exit session` inside the agent leaves the mesh while the agent stays.
@@ -1745,7 +1765,7 @@ fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
 /// `trust.yaml` and say so in the documented words. `forget` acts on a user only: its
 /// session form is refused before anything is read or written, as is an address with no
 /// `user` or `session` word. `block session` works on a never-heard hash and `.mesh people
-/// list` lists it as `blocked (instance)`, `revoke session` on that deny-only hash names
+/// list` lists it as `blocked (session)`, `revoke session` on that deny-only hash names
 /// `unblock`, a second `block` changes nothing, `unblock` lifts the deny and trusts
 /// nothing (the `trust` it names is refused until the hash is heard), `block user` writes
 /// the block, `revoke user` on the blocked user names `unblock` and writes nothing,
@@ -1858,7 +1878,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         .lines()
         .find(|line| line.contains("cdcdcdcd"))
         .unwrap_or_else(|| panic!("no peers row for the denied destination: {peers:?}"));
-    assert!(row.contains("blocked (instance)"), "{row:?}");
+    assert!(row.contains("blocked (session)"), "{row:?}");
     assert!(row.contains("never"), "{row:?}");
     assert!(
         !peers.contains("No users or sessions heard yet"),
@@ -2041,25 +2061,28 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
 
-    // The verb list carries the split: `access forget` takes a user only, `access block`
+    // The usages carry the split: `access forget` takes a user only, `access block`
     // and `access unblock` take a user or a session.
-    let (_, help) = command_row_and_transcript(
-        &mut session,
-        ".mesh",
-        &format!(
-            r"{}\s+Erase everything you know about them",
-            literally(".mesh access forget user <who> [--dry-run|--confirm forget-<user-short>]")
+    let mut help = String::new();
+    for (line, usage) in [
+        (
+            ".mesh access forget --help",
+            "Usage: .mesh access forget user <who> [--dry-run|--confirm forget-<user-short>]",
         ),
-        SESSION_PROMPT,
-    );
-    assert!(
-        help.contains("  .mesh access block user <who> [--yes] [--note \"text\"] | session <who> [--yes] [--note \"text\"]"),
-        "{help}"
-    );
-    assert!(
-        help.contains("  .mesh access unblock user <who> [--yes] | session <who> [--yes]"),
-        "{help}"
-    );
+        (
+            ".mesh access block --help",
+            "Usage: .mesh access block user <who> [--yes] [--note \"text\"] | session <who> [--yes] [--note \"text\"]",
+        ),
+        (
+            ".mesh access unblock --help",
+            "Usage: .mesh access unblock user <who> [--yes] | session <who> [--yes]",
+        ),
+    ] {
+        let (_, out) =
+            command_row_and_transcript(&mut session, line, &literally(usage), SESSION_PROMPT);
+        assert!(out.contains(usage), "{out}");
+        help.push_str(&out);
+    }
     assert!(!help.contains("alias of"), "{help}");
 
     let status = exit_clean(&mut session);
@@ -2231,7 +2254,7 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
     assert!(
         pending.contains(&format!(" . expires in 6d . id {}", &q1[..8]))
             && pending.contains("Access requests: none")
-            && pending.contains("Asked by this node: none")
+            && pending.contains("Asked by your sessions: none")
             && !transcript.contains("expired")
             && !transcript.contains(&old_q[..8])
             && !transcript.contains(&old_a[..8]),
@@ -2300,7 +2323,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         [
             "Waiting for YOU: none",
             "Access requests: none",
-            "Asked by this node: none",
+            "Asked by your sessions: none",
         ],
         "{empty:?}"
     );
@@ -2640,7 +2663,10 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     // Two numbered entries under one header, no `envoy asks:` row where the envoy added
     // no framing.
     let (pending, _) = open_lists(&mut session, SESSION_PROMPT);
-    assert!(pending.ends_with("Asked by this node: none"), "{pending:?}");
+    assert!(
+        pending.ends_with("Asked by your sessions: none"),
+        "{pending:?}"
+    );
     let lines = transcript_lines(&pending);
     let at = lines
         .iter()
@@ -3770,16 +3796,16 @@ fn revoke_of_the_last_session_keeps_the_user_known_and_revoke_user_has_nothing_l
 /// start over the same directory reads the file back. The writer prepends a comment
 /// header that explains the file to whoever opens it; the header is comment lines only,
 /// says what each section holds, and the reader on the next start parses the file as if
-/// the header were not there: the blocked instance is still `blocked (instance)` in
-/// `.mesh people list`, under the trust legend that names the five standings, and the next
-/// write keeps the header in place.
+/// the header were not there: the blocked instance is still `blocked (session)` in
+/// `.mesh people list`, which ends on the line pointing at the people help that names
+/// the five standings, and the next write keeps the header in place.
 #[test]
 fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     let relay = SilentRelay::start();
     let probe = Probe::new("trust-header-restart", true, &[relay.port]);
     let dest = "cd".repeat(16);
     let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
-    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block session <who>; blocked (identity) = .mesh access block user <who>";
+    let legend = "`.mesh people help` says what the columns, states and names mean.";
 
     let mut command = probe.command();
     command.args(["--session", "probe"]);
@@ -3843,7 +3869,7 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
         .lines()
         .find(|line| line.contains("cdcdcdcd"))
         .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
-    assert!(row.contains("blocked (instance)"), "{row:?}");
+    assert!(row.contains("blocked (session)"), "{row:?}");
     assert!(!row.contains("denied"), "{row:?}");
     assert!(peers.contains(legend), "{peers:?}");
 
@@ -3863,7 +3889,7 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
 
 /// The upgrade path: a `trust.yaml` written by a build before the header existed is
 /// the same YAML with no comment lines in front (the header added no key). Planted
-/// before a cold start, it loads with the same standing (`blocked (instance)` in
+/// before a cold start, it loads with the same standing (`blocked (session)` in
 /// `.mesh people list`), starting the node does not rewrite it, and the first write after
 /// the upgrade puts the header in front while keeping every section the old file had.
 /// Along the way a cold `.mesh access requests` with nothing dropped prints no drop line.
@@ -3932,7 +3958,7 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
         .lines()
         .find(|line| line.contains("cdcdcdcd"))
         .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
-    assert!(row.contains("blocked (instance)"), "{row:?}");
+    assert!(row.contains("blocked (session)"), "{row:?}");
     let knocks = trust_verb(
         &mut session,
         ".mesh access requests",
@@ -4545,7 +4571,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     let filed = fs::read_to_string(&store).unwrap();
     assert!(!filed.contains(&q2) && filed.contains(&acc), "{filed:?}");
     let (left, _) = open_lists(&mut session, SESSION_PROMPT);
-    assert!(left.ends_with("Asked by this node: none"), "{left:?}");
+    assert!(left.ends_with("Asked by your sessions: none"), "{left:?}");
     let lines = transcript_lines(&left);
     let escalated = lines
         .iter()
@@ -4927,8 +4953,10 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
         SESSION_PROMPT,
     );
     assert!(
-        joined.contains(&format!("  interfaces: {label}")),
-        "the summary names the connected local entry: {joined:?}"
+        joined
+            .lines()
+            .any(|line| is_joined_line(line.trim_end(), "probe")),
+        "the join prints its one line; `.mesh config show` below names the connected local entry: {joined:?}"
     );
     assert!(
         !joined.contains("WARNING") && !joined.contains("not reachable"),
@@ -5231,8 +5259,10 @@ fn the_local_row_reports_rnsd_going_away_and_coming_back_through_the_real_binary
         SESSION_PROMPT,
     );
     assert!(
-        joined.contains(&format!("  interfaces: {label}")),
-        "the summary names the connected local entry: {joined:?}"
+        joined
+            .lines()
+            .any(|line| is_joined_line(line.trim_end(), "probe")),
+        "the join prints its one line; `.mesh config show` below names the connected local entry: {joined:?}"
     );
     transcript.push_str(&joined);
     probe.wait_for_marker("MESH_STARTED");
@@ -6557,7 +6587,7 @@ fn a_revoked_user_stays_known_and_their_request_to_be_trusted_reads_user_slash_s
     let idle = strip_escapes(&wait_for(&mut mine, "asks you to trust them"));
     let idle_row = idle.rsplit('\n').next().unwrap_or_default().to_string();
     check(
-        idle_row.contains("[mesh:knock]") && idle_row.contains(&who),
+        idle_row.contains("[mesh:request]") && idle_row.contains(&who),
         "the idle request line names the asker <user> / <session>",
         &idle,
     );

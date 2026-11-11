@@ -120,8 +120,8 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             name: format!("{MESH_FUNCTION_PREFIX}peers"),
             description: format!(
                 "List the Coyote instances this node has heard announce on the mesh: destination, identity, \
-                 display name, trust standing (`trusted`, `known`, `untrusted`, `blocked (instance)`, \
-                 `blocked (identity)`), protocol compatibility \
+                 display name, trust standing (`trusted`, `known`, `untrusted`, `blocked (session)`, \
+                 `blocked (user)`), protocol compatibility \
                  (`compatible`, or `incompatible` with a `compatibility_note`), when each was last seen and \
                  whether it is `reachable` right now (`false` when no path to it is known, its last link \
                  failed, it said it was leaving the mesh, or it is a session of yours that has ended). A row \
@@ -811,8 +811,8 @@ pub(crate) const TRUST_LABELS: [&str; 5] = [
     "trusted",
     "known",
     "untrusted",
-    "blocked (instance)",
-    "blocked (identity)",
+    "blocked (session)",
+    "blocked (user)",
 ];
 
 /// The trust column's word for one instance. `known` is the standing a refused instance
@@ -5230,19 +5230,19 @@ mod tests {
                 verdict(Decision::Refuse, Rule::DestinationDenied),
                 IdentityStanding::Unknown
             ),
-            "blocked (instance)"
+            "blocked (session)"
         );
         assert_eq!(
             trust_label(verdict(Decision::Refuse, Rule::DestinationDenied), known),
-            "blocked (instance)",
-            "a blocked instance of a known identity is blocked, not known"
+            "blocked (session)",
+            "a blocked session of a known user is blocked, not known"
         );
         assert_eq!(
             trust_label(
                 verdict(Decision::Refuse, Rule::IdentityBlocked),
                 IdentityStanding::Blocked
             ),
-            "blocked (identity)"
+            "blocked (user)"
         );
     }
 
@@ -6663,7 +6663,8 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("no status_error: {row}"));
             assert!(
-                error.starts_with(&format!("no answer from {}:", short(&to))),
+                error.starts_with("no answer from \"")
+                    && error.contains(&format!("\" ({}): ", short(&to))),
                 "{error}"
             );
             assert!(
@@ -7514,7 +7515,7 @@ mod tests {
             assert_eq!(
                 result["message"],
                 format!(
-                    "Destination {to} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard."
+                    "Session {to} could not be reached: you asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). It may be offline or on a network you cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. A list or fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard."
                 ),
                 "{result}"
             );

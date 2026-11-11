@@ -82,7 +82,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub(crate) const GROUPS: &[(&str, &str)] = &[
     (
         "people",
-        "See the people and sessions you have heard from, and what one session is doing",
+        "See the users and sessions you have heard from, and what one session is doing",
     ),
     (
         "access",
@@ -102,7 +102,7 @@ pub(crate) const GROUPS: &[(&str, &str)] = &[
     ),
     (
         "config",
-        "Show your mesh settings and rotate your mesh identity",
+        "Show your mesh settings and replace your mesh key",
     ),
 ];
 
@@ -197,7 +197,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "messaging",
         "send",
-        ".mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]",
+        ".mesh messaging send <session> [--yes] \"text\" [--attach <path> [--force]]",
         "Send your own text to one session, bypassing the model",
     ),
     (
@@ -239,8 +239,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "envoy",
         "memory",
-        ".mesh envoy memory forget <identity|all> [thread] [--yes|--dry-run]",
-        "Forget what the envoy remembers of a peer's threads: one identity, one of its threads, or everything",
+        ".mesh envoy memory forget <user|all> [thread] [--yes|--dry-run]",
+        "Forget what the envoy remembers of a peer's threads: one user, one of their threads, or everything",
     ),
     (
         "envoy",
@@ -263,13 +263,13 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "files",
         "list",
-        ".mesh files list [--peer <identity|destination>] [--effective [--all]]",
+        ".mesh files list [--peer <who>] [--effective [--all]]",
         "List the share rules and the file each came from, or the files a peer can fetch",
     ),
     (
         "files",
         "allow",
-        ".mesh files allow docs/** [--peer <identity|destination>] [--force] [--global|--workspace] [--yes|--dry-run]",
+        ".mesh files allow docs/** [--peer <who>] [--force] [--global|--workspace] [--yes|--dry-run]",
         "Share files matching a pattern with every trusted peer, or with one peer",
     ),
     (
@@ -305,13 +305,13 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "files",
         "request",
-        ".mesh files request <destination> <path>... [--reason \"text\"] [--yes]",
+        ".mesh files request <session> <path>... [--reason \"text\"] [--yes]",
         "Ask a trusted peer's human for access to files it does not share yet",
     ),
     (
         "files",
         "fetch",
-        ".mesh files fetch <destination> <path> [--if-sha256 <hex>]",
+        ".mesh files fetch <session> <path> [--if-sha256 <hex>]",
         "Fetch one file a trusted peer shares into your session's staging inbox",
     ),
     (
@@ -324,7 +324,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "config",
         "rotate-identity",
         ".mesh config rotate-identity [--dry-run|--confirm rotate-<identity-short>]",
-        "Mint a new mesh identity while the node is off; peers must re-trust the new one",
+        "Mint a new mesh key while the mesh is off; everyone who trusted you must trust the new one",
     ),
 ];
 
@@ -463,6 +463,7 @@ async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         JoinOptions {
             yes: args.has("--yes"),
             fresh: args.has("--fresh"),
+            preview: true,
         },
     )
     .await
@@ -482,15 +483,15 @@ pub(crate) fn autostart_wanted(ctx: &RequestContext) -> bool {
         && ctx.app.mesh.get().is_none()
 }
 
-/// Joins the mesh for this session because config.yaml asked for it; the only
-/// difference from `.mesh on --yes` is the line saying where the decision came from.
+/// Joins the mesh for this session because config.yaml asked for it: `.mesh on --yes`
+/// without the preview, so a session start prints the one joined line and any warning.
 pub(crate) async fn autostart(ctx: &mut RequestContext) -> Result<()> {
-    out_text("mesh.enabled is true in config.yaml: joining the mesh for this session.");
     join(
         ctx,
         JoinOptions {
             yes: true,
             fresh: false,
+            preview: false,
         },
     )
     .await
@@ -520,10 +521,17 @@ pub(crate) async fn after_session_entered(ctx: &mut RequestContext) {
 struct JoinOptions {
     yes: bool,
     fresh: bool,
+    /// Whether the preview of what leaves the machine is printed; a typed `.mesh on`
+    /// prints it, autostart does not, since config.yaml already decided.
+    preview: bool,
 }
 
 async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
-    let JoinOptions { yes, fresh } = options;
+    let JoinOptions {
+        yes,
+        fresh,
+        preview,
+    } = options;
     if ctx.app.mesh.get().is_some() {
         bail!(MESH_ALREADY_ON);
     }
@@ -542,12 +550,14 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
         );
     };
     let cwd = env::current_dir()?;
-    out_text(&render_on_preview(
-        &config,
-        &session_name,
-        fresh,
-        shared_count(ctx),
-    ));
+    if preview {
+        out_text(&render_on_preview(
+            &config,
+            &session_name,
+            fresh,
+            shared_count(ctx),
+        ));
+    }
     if let Some(warning) = cwd_warning(&cwd, dirs::home_dir().as_deref()) {
         err_text(&warning);
     }
@@ -585,7 +595,11 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
     ctx.set_mesh_enabled_for_session(true);
     let app = Arc::clone(&ctx.app.config);
     ctx.refresh_mesh_tools(&app);
-    out_text(&render_on_summary(&runtime, fresh));
+    out_text(&joined_line(
+        &session_name,
+        &runtime.current_destination_hash(),
+        fresh,
+    ));
     if runtime.self_trust_seeded_on_upgrade() {
         out_text(&self_trust_notice(runtime.fingerprint()));
     }
@@ -729,7 +743,7 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
 
 /// The trust column for a record no heard peer announces from: the store's verdict for the
 /// identity it is bound to, so a stale record of a since-blocked identity reads
-/// `blocked (identity)`.
+/// `blocked (user)`.
 fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
     let identity = record.identity.as_deref().unwrap_or_default();
     trust_label(
@@ -1744,7 +1758,9 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
             let outcome = runtime
                 .send_peer_lending_reference(destination, &out)
                 .await
-                .map_err(quoted_send_failure)?;
+                .map_err(|err| {
+                    quoted_send_failure(err, &runtime.who_at(destination).to_string())
+                })?;
             out_path_text(
                 &own_reply_sent_line(&outcome, destination, id, SystemTime::now())
                     .render(live_prefix()),
@@ -2276,7 +2292,7 @@ async fn message(
     let outcome = runtime
         .send_peer_lending_reference(&destination, &out)
         .await
-        .map_err(quoted_send_failure)?;
+        .map_err(|err| quoted_send_failure(err, &name))?;
     out_path_text(
         &sent_line(&outcome, &destination, &name, &who.user, SystemTime::now())
             .render(live_prefix()),
@@ -2339,11 +2355,45 @@ fn quoted_status_failure(err: StatusError) -> anyhow::Error {
     }
 }
 
-fn quoted_send_failure(err: anyhow::Error) -> anyhow::Error {
-    match err.downcast_ref::<SendError>() {
-        Some(send @ SendError::NotTrustedByPeer(refusal)) => quoted_peer_side(send, refusal),
-        Some(send @ SendError::NoAnswer(no_answer)) => quoted_peer_side(send, no_answer),
-        _ => err,
+/// A send failure as the REPL shows it: a peer-side refusal quoted as `quoted_peer_side`
+/// quotes it, and a line that opens on the session's hash (busy, unreachable, not
+/// trusted) opened on `who`, its `<user> / <session>` name, quoted as it stands, with the
+/// short hash after it.
+fn quoted_send_failure(err: anyhow::Error, who: &str) -> anyhow::Error {
+    let (word, lead, destination) = match err.downcast_ref::<SendError>() {
+        Some(send @ SendError::NotTrustedByPeer(refusal)) => {
+            return quoted_peer_side(send, refusal);
+        }
+        Some(send @ SendError::NoAnswer(no_answer)) => return quoted_peer_side(send, no_answer),
+        Some(SendError::Throttled { destination }) => {
+            ("", short(destination).to_string(), destination.clone())
+        }
+        Some(
+            SendError::UnknownDestination { destination, .. }
+            | SendError::NotTrusted { destination },
+        ) => (
+            "Session ",
+            format!("Session {destination}"),
+            destination.clone(),
+        ),
+        _ => return err,
+    };
+    let text = err.to_string();
+    match text.strip_prefix(lead.as_str()) {
+        Some(tail) => {
+            let dest8 = short(&destination);
+            let hash = if who.ends_with(&format!("/ {dest8}")) {
+                String::new()
+            } else {
+                format!(" ({dest8})")
+            };
+            QuotingError::wrap(
+                NoticeText::from(word)
+                    .peer(who)
+                    .frame(format!("{hash}{tail}")),
+            )
+        }
+        None => err,
     }
 }
 
@@ -2369,6 +2419,55 @@ mod peer_side_refusal_tests {
     use crate::mesh::request::{NoAnswer, RemoteRefusal};
     use crate::render::{MeshVerbError, command_error_text};
 
+    /// A session that is busy, unreachable or not trusted is named the way the send
+    /// named it, `<user> / <session>` with its short hash, never by its bare hash.
+    #[test]
+    fn a_busy_unreachable_or_untrusted_session_is_named_by_user_and_session() {
+        let destination = "ab".repeat(16);
+        let busy = quoted_send_failure(
+            SendError::Throttled {
+                destination: destination.clone(),
+            }
+            .into(),
+            "Ann / laptop",
+        );
+        assert_eq!(
+            busy.to_string(),
+            "Ann / laptop (abababab) refused it: it is already answering a message from you (one at a time per user). Try again in a minute."
+        );
+        let untrusted = quoted_send_failure(
+            SendError::NotTrusted {
+                destination: destination.clone(),
+            }
+            .into(),
+            "Ann / laptop",
+        );
+        assert_eq!(
+            untrusted.to_string(),
+            format!(
+                "Session Ann / laptop (abababab) is not trusted for messaging. Trust it first with `.mesh access trust session {destination}`; `.mesh people list` lists the sessions you have heard."
+            )
+        );
+        let unreachable = quoted_send_failure(
+            SendError::UnknownDestination {
+                destination: destination.clone(),
+                recently_seen: false,
+            }
+            .into(),
+            "unnamed / abababab",
+        );
+        let text = unreachable.to_string();
+        assert!(
+            text.starts_with(
+                "Session unnamed / abababab could not be reached: you asked the network"
+            ),
+            "a session named by its hash is not named twice: {text}"
+        );
+        assert!(!text.contains(&destination), "{text}");
+        let other = quoted_send_failure(SendError::NotRunning.into(), "Ann / laptop");
+        assert_eq!(other.to_string(), SendError::NotRunning.to_string());
+    }
+
     fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
         command_error_text(
             &MeshVerbError::wrap(err.context("`.mesh files fetch` failed")),
@@ -2393,7 +2492,7 @@ mod peer_side_refusal_tests {
                 refused.clone(),
             ),
             (
-                || quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into()),
+                || quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into(), "unused"),
                 refused.clone(),
             ),
             (
@@ -4037,18 +4136,18 @@ fn render_sync(report: &FetchReport) -> String {
                 String::new()
             };
             return format!(
-                "Nothing new held for this node at {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.",
+                "Nothing new held for you at propagation node {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.",
                 report.listed
             );
         }
         return format!(
-            "Nothing new held for this node at {node}: {} listed, all already processed.",
+            "Nothing new held for you at propagation node {node}: {} listed, all already processed.",
             report.listed
         );
     }
     if report.wanted > 0 && report.received == 0 {
         let mut line = format!(
-            "{node} lists {} for this node and {} were asked for, but none were served; run .mesh messaging sync again or check the node's logs.",
+            "Propagation node {node} lists {} for you and {} were asked for, but none were served; run .mesh messaging sync again or check that node's logs.",
             plural(report.listed, "message", "messages"),
             report.wanted
         );
@@ -4061,10 +4160,10 @@ fn render_sync(report: &FetchReport) -> String {
         return line;
     }
     if report.received == 0 {
-        return format!("Nothing held for this node at {node}.");
+        return format!("Nothing held for you at propagation node {node}.");
     }
     let mut line = format!(
-        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
+        "Fetched from propagation node {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
         report.listed,
         report.wanted,
         report.received,
@@ -4083,7 +4182,7 @@ fn render_sync(report: &FetchReport) -> String {
     if report.wanted == MAX_WANTS_PER_FETCH {
         line.push_str(" More may be held; run .mesh messaging sync again.");
     }
-    line
+    format!("{line}\n{}", help_pointer("messaging", "the sync counts"))
 }
 
 #[cfg(test)]
@@ -4107,7 +4206,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute."
+            "Fetched from propagation node deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 0 duplicates, 0 discarded, 1 deferred: the sender is not known yet; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute.\n`.mesh messaging help` says what the sync counts mean."
         );
     }
 
@@ -4128,12 +4227,12 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: for 1 of 3, source identity not yet known; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute."
+            "Fetched from propagation node deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: for 1 of 3, the sender is not known yet; asked the mesh for its announce; the next sync delivers it once the announce arrives, or run .mesh messaging sync in a minute.\n`.mesh messaging help` says what the sync counts mean."
         );
         report.deferred_after_ask = 3;
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: source identity not yet known; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute."
+            "Fetched from propagation node deadbeef: 3 listed, 3 wanted, 3 received, 0 delivered, 0 duplicates, 0 discarded, 3 deferred: the sender is not known yet; asked the mesh for its announce; the next sync delivers them once the announces arrive, or run .mesh messaging sync in a minute.\n`.mesh messaging help` says what the sync counts mean."
         );
     }
 
@@ -4156,7 +4255,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&report),
-            "Fetched from deadbeef: 2 listed, 2 wanted, 2 received, 1 delivered, 0 duplicates, 0 discarded, 0 deferred. 1 left on the node for another session."
+            "Fetched from propagation node deadbeef: 2 listed, 2 wanted, 2 received, 1 delivered, 0 duplicates, 0 discarded, 0 deferred. 1 left on the node for another session.\n`.mesh messaging help` says what the sync counts mean."
         );
         let not_asked_again = FetchReport {
             wanted: 0,
@@ -4167,7 +4266,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&not_asked_again),
-            "Nothing new held for this node at deadbeef: 2 listed, 1 already processed, 1 left on the node for another session."
+            "Nothing new held for you at propagation node deadbeef: 2 listed, 1 already processed, 1 left on the node for another session."
         );
         let only_left = FetchReport {
             listed: 1,
@@ -4175,7 +4274,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&only_left),
-            "Nothing new held for this node at deadbeef: 1 listed, 1 left on the node for another session."
+            "Nothing new held for you at propagation node deadbeef: 1 listed, 1 left on the node for another session."
         );
         let none_served = FetchReport {
             listed: 3,
@@ -4184,7 +4283,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&none_served),
-            "deadbeef lists 3 messages for this node and 2 were asked for, but none were served; run .mesh messaging sync again or check the node's logs. 1 left on the node for another session."
+            "Propagation node deadbeef lists 3 messages for you and 2 were asked for, but none were served; run .mesh messaging sync again or check that node's logs. 1 left on the node for another session."
         );
     }
 }
@@ -6419,9 +6518,6 @@ fn render_effective_shares(
             "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
         ));
     }
-    if all {
-        lines.push("shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it.".to_string());
-    }
     if all && resolved.capped {
         let at_least = if resolved.truncated { "at least " } else { "" };
         let more = resolved.total - resolved.entries.len();
@@ -6431,6 +6527,13 @@ fn render_effective_shares(
     }
     if resolved.truncated {
         lines.push("The walk stopped at its bound, so files may be missing.".to_string());
+    }
+    if all {
+        lines.push(
+            live_prefix()
+                .render_hints(&help_pointer("files", "the verdicts"))
+                .into_owned(),
+        );
     }
     lines.join("\n")
 }
@@ -8391,8 +8494,11 @@ mod name_addressing_tests {
                 "hashes"
             ]
         );
-        assert!(text.contains("\n3 users and 4 sessions. "), "{text}");
-        assert!(text.contains(NAME_ADDRESSING_LINE), "{text}");
+        assert!(text.contains("\n3 users and 4 sessions.\n"), "{text}");
+        assert!(
+            render_group_help("people").contains(NAME_ADDRESSING_LINE),
+            "the people help teaches the addressing"
+        );
     }
 
     /// A name is quoted as you spelled it in a `.mesh envoy questions` entry and a `.mesh envoy answer`
@@ -9616,24 +9722,628 @@ pub(crate) mod capture {
     }
 }
 
+/// `.mesh help`: the top-level commands and the groups, one row each, then the words
+/// every group uses.
 fn render_help() -> String {
-    let mut blocks = vec![format!(
-        "Mesh commands (nothing here writes config.yaml; trust, rotate and share rules persist under the mesh/ directory, share rules also in the workspace file):\n{}",
-        render_verb_rows("")
-    )];
-    blocks.extend(GROUPS.iter().map(|(group, _)| render_group_listing(group)));
+    let mut table = mesh_table(&["command", "what it does"]);
+    for (_, verb, _, summary) in COMMANDS.iter().filter(|(group, ..)| group.is_empty()) {
+        table.add_row([format!(".mesh {verb}"), summary.to_string()]);
+    }
+    for (group, summary) in GROUPS {
+        table.add_row([format!(".mesh {group}"), summary.to_string()]);
+    }
+    format!(
+        "Mesh commands. `.mesh <group>` lists a group's commands and what its words mean; `--help` after a command shows its usage.\n{table}\n\nWhat the words mean:\n{}",
+        concepts_table(
+            &MESH_CONCEPTS.map(|(word, meaning)| (word.to_string(), meaning.to_string()))
+        )
+    )
+}
+
+/// The words of `.mesh help`, one row each.
+const MESH_CONCEPTS: [(&str, &str); 5] = [
+    (
+        "user",
+        "A person or an installation on the mesh; one user can run several sessions. You are `you`.",
+    ),
+    (
+        "session",
+        "One running Coyote session of a user; you reach a user through their sessions.",
+    ),
+    (
+        "envoy",
+        "The agent that answers other sessions for yours from your brief, so they do not interrupt you.",
+    ),
+    (
+        "trust",
+        "Only sessions you trust can message you, ask your envoy or fetch the files you share; `.mesh access` manages it.",
+    ),
+    (
+        "propagation node",
+        "Where messages wait while a session is away; `.mesh messaging sync` fetches them now.",
+    ),
+];
+
+/// A two-column table of words and what they mean.
+fn concepts_table(rows: &[(String, String)]) -> comfy_table::Table {
+    let mut table = mesh_table(&["word", "meaning"]);
+    for (word, meaning) in rows {
+        table.add_row([word.as_str(), meaning.as_str()]);
+    }
+    table
+}
+
+/// `.mesh <group>`, `.mesh <group> help` and `.mesh <group> --help`: the group's
+/// commands as a table and its words, `access` opening with the guide to picking a
+/// verb, then the one paragraph saying what the words stand for under the hood.
+fn render_group_help(group: &str) -> String {
+    let mut blocks = Vec::new();
+    if group == "access" {
+        blocks.push(ACCESS_GUIDE.to_string());
+    }
+    blocks.push(render_group_listing(group));
+    blocks.push(format!(
+        "What the words mean:\n{}",
+        concepts_table(&group_concepts(group))
+    ));
+    blocks.push(group_under_the_hood(group).to_string());
     blocks.join("\n\n")
 }
 
-/// `.mesh <group>` and `.mesh <group> help`: the group's listing, opened for `access` by
-/// the guide to picking a verb and closed by what its words stand for under the hood.
-fn render_group_help(group: &str) -> String {
+/// The words one group's help defines, in reading order.
+fn group_concepts(group: &str) -> Vec<(String, String)> {
+    let fixed: &[(&str, &str)] = match group {
+        "people" => return people_concepts(),
+        "access" => &[
+            (
+                "stranger",
+                "Someone you know nothing about; their messages are dropped unread.",
+            ),
+            (
+                "trusted",
+                "May message you, ask your envoy and fetch your shared files.",
+            ),
+            (
+                "known",
+                "You keep a record of the user that grants nothing; they are refused, but their requests to be trusted are listed.",
+            ),
+            (
+                "blocked",
+                "Refused, and their requests to be trusted are dropped without a word.",
+            ),
+            (
+                "request",
+                "A session asking you to trust it, with an optional intro; `.mesh access requests` lists them.",
+            ),
+        ],
+        "messaging" => &[
+            (
+                "inbox",
+                "The messages other sessions sent this one; reading it takes nothing away.",
+            ),
+            (
+                "sent",
+                "The questions your sessions asked and whether an answer came back.",
+            ),
+            ("open", "Asked; no answer yet."),
+            (
+                "escalated",
+                "The other session's envoy passed your question to its user.",
+            ),
+            (
+                "answered, awaiting the model",
+                "The answer arrived; the model picks it up with mesh__collect.",
+            ),
+            (
+                "bulletin",
+                "One text sent to every trusted session at once with `.mesh messaging broadcast`.",
+            ),
+            (
+                "propagation node",
+                "Where messages wait while a session is away; `.mesh messaging sync` fetches them now.",
+            ),
+            (
+                "sync counts",
+                "listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the node: for another of your sessions.",
+            ),
+        ],
+        "envoy" => &[
+            (
+                "envoy",
+                "The agent that answers other sessions for yours, so they do not interrupt you.",
+            ),
+            (
+                "brief",
+                "What your envoy may tell other sessions about this one: the objective, the status card and your note.",
+            ),
+            (
+                "auto / manual / off",
+                "The brief's mode: auto adds the session digest, manual keeps to the card and your note, off tells nothing.",
+            ),
+            (
+                "escalated question",
+                "A question your envoy could not answer from the brief and passed to you.",
+            ),
+            (
+                "awaiting your answer",
+                "An escalated question nobody has answered or dismissed yet; it expires after a while.",
+            ),
+            (
+                "memory",
+                "What your envoy remembers of its threads with each user, so a follow-up makes sense.",
+            ),
+        ],
+        "files" => &[
+            (
+                "share rule",
+                "An allow or deny pattern; a deny and the built-in deny list always win.",
+            ),
+            (
+                "effective",
+                "The files your rules actually share, as `.mesh files list --effective` lists them.",
+            ),
+            (
+                "kind / layer",
+                "allow, deny or override (lifts the built-in deny for one file); global is your config dir's file, workspace the project's.",
+            ),
+            ("shared", "A trusted session can fetch it."),
+            ("denied", "A deny rule holds it back."),
+            (
+                "built-in deny",
+                "A secret's name; nothing serves it unless an override names the file.",
+            ),
+            (
+                "protected",
+                "Inside .git or a config directory; never served.",
+            ),
+            ("not allowed", "No allow rule names it."),
+            (
+                "access request",
+                "A trusted session asking for files you do not share yet.",
+            ),
+            (
+                "grant",
+                "A yes to a request: for a while with --for, or a standing allow rule with --standing.",
+            ),
+            (
+                "staging inbox",
+                "Where fetched files land, outside your project, until you move them.",
+            ),
+        ],
+        "config" => &[
+            (
+                "settings",
+                "The mesh section of config.yaml; nothing under `.mesh` changes it.",
+            ),
+            (
+                "reach",
+                "How far your sessions are visible: this network, a relay, or the internet.",
+            ),
+            (
+                "key",
+                "What every user who trusts you knows you by; rotating it means they trust you again.",
+            ),
+        ],
+        _ => &[],
+    };
+    fixed
+        .iter()
+        .map(|(word, meaning)| (word.to_string(), meaning.to_string()))
+        .collect()
+}
+
+/// The one paragraph per group that names the protocol words behind its own.
+fn group_under_the_hood(group: &str) -> &'static str {
     match group {
-        "access" => format!(
-            "{ACCESS_GUIDE}\n\n{}\n\n{ACCESS_UNDER_THE_HOOD}",
-            render_group_listing(group)
-        ),
-        _ => render_group_listing(group),
+        "people" => PEOPLE_UNDER_THE_HOOD,
+        "access" => ACCESS_UNDER_THE_HOOD,
+        "messaging" => {
+            "Under the hood: messages travel over Reticulum as LXMF, addressed to the destination a session announces. A propagation node is an LXMF store-and-forward node; your session identifies itself to the nearest one heard when it joins and on a timer, and `.mesh messaging sync` asks it now."
+        }
+        "envoy" => {
+            "Under the hood: the envoy is a built-in agent that answers a trusted destination's questions with read-only tools confined to this session's working directory; its memory is kept per identity under the mesh/ directory."
+        }
+        "files" => {
+            "Under the hood: share rules live in two files, a global one and one per workspace, which `.mesh files list` names; a fetch runs over a Reticulum link to the destination that shares the file, which checks its trust list first."
+        }
+        "config" => {
+            "Under the hood: your key is the Reticulum identity under the mesh/ directory, and each session's address is a destination derived from it, so rotating the identity changes every destination."
+        }
+        _ => "",
+    }
+}
+
+/// What `people help` says about users, sessions and names.
+const PEOPLE_UNDER_THE_HOOD: &str = "Under the hood: a user is a Reticulum identity (one key pair; its hash is the user hash) and a session is a destination, the address one running instance announces (its hash is the session hash). A name is shown in place of a hash and never sent to identify anyone.";
+
+/// The pointer line a long listing ends with, naming the group help that explains it.
+fn help_pointer(group: &str, what: &str) -> String {
+    format!("`.mesh {group} help` says what {what} mean.")
+}
+
+#[cfg(test)]
+mod help_output_tests {
+    //! The help text line for line. A table is read back as one `cell | cell` line per
+    //! row with its borders dropped (`mesh_table_shares_the_asset_table_preset` pins the
+    //! borders), and blank lines are dropped (`blocks_are_separated_by_one_blank_line`
+    //! pins where they go).
+    use super::*;
+
+    fn flat(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.starts_with(['┌', '├', '╞', '└']))
+            .map(|line| match line.strip_prefix('│') {
+                Some(row) => row
+                    .trim_end_matches('│')
+                    .split('┆')
+                    .map(str::trim)
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+                None => line.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mesh_help_is_the_groups_and_the_words() {
+        assert_eq!(
+            flat(&render_help()),
+            [
+                "Mesh commands. `.mesh <group>` lists a group's commands and what its words mean; `--help` after a command shows its usage.",
+                "command | what it does",
+                ".mesh on | Join the mesh for this session only; config.yaml is not changed",
+                ".mesh off | Leave the mesh and drop the mesh__* tools",
+                ".mesh status | Show your session's status card or set its objective",
+                ".mesh help | List the mesh commands by group",
+                ".mesh people | See the users and sessions you have heard from, and what one session is doing",
+                ".mesh access | Decide whom you trust, block or forget, and answer requests to be trusted",
+                ".mesh messaging | Send to people's sessions, read your inbox and follow up on what you asked",
+                ".mesh envoy | Shape what your envoy tells other sessions and handle what it escalates to you",
+                ".mesh files | Share files, decide requests for them and fetch other sessions' files",
+                ".mesh config | Show your mesh settings and replace your mesh key",
+                "What the words mean:",
+                "word | meaning",
+                "user | A person or an installation on the mesh; one user can run several sessions. You are `you`.",
+                "session | One running Coyote session of a user; you reach a user through their sessions.",
+                "envoy | The agent that answers other sessions for yours from your brief, so they do not interrupt you.",
+                "trust | Only sessions you trust can message you, ask your envoy or fetch the files you share; `.mesh access` manages it.",
+                "propagation node | Where messages wait while a session is away; `.mesh messaging sync` fetches them now.",
+            ]
+        );
+    }
+
+    #[test]
+    fn people_help_carries_the_list_legend_and_the_state_meanings() {
+        assert_eq!(
+            flat(&render_group_help("people")),
+            [
+                "people: See the users and sessions you have heard from, and what one session is doing",
+                "command | what it does",
+                ".mesh people list | List the users and sessions you have heard, you first",
+                ".mesh people name | Give a user or one of their sessions the name you call them, or clear it",
+                ".mesh people info | Show what you know of one user or session, with its hashes",
+                ".mesh people status | Fetch a trusted session's status card",
+                "`.mesh people <command> --help` shows a command's usage.",
+                "What the words mean:",
+                "word | meaning",
+                "user | A person or an installation, which can run several sessions.",
+                "session | One running session of a user; each row of `.mesh people list` is one.",
+                "you | Your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped.",
+                "names | A user or session shows the name you gave it, else the one it advertised (its own text), else its short hash.",
+                "trusted | This session may message you, ask your envoy and fetch your shared files.",
+                "known | You know its user, but this session is not trusted.",
+                "untrusted | Nothing is known about it.",
+                "blocked (session) | You refused this session with `.mesh access block session <who>`.",
+                "blocked (user) | You refused its user with `.mesh access block user <who>`.",
+                "stale | Silent for 2+ hourly heartbeats; dropped after about 3 h.",
+                "superseded | This user moved to the session named.",
+                "left | The session said it was leaving the mesh, until it announces again or is heard over a link.",
+                "no route | You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.",
+                "hashes | <user hash> / <session hash>, shortened; `.mesh people info <who>` shows them whole.",
+                "addressing | Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh people name <user>/<session> \"name\"` one of their sessions.",
+                "Under the hood: a user is a Reticulum identity (one key pair; its hash is the user hash) and a session is a destination, the address one running instance announces (its hash is the session hash). A name is shown in place of a hash and never sent to identify anyone.",
+            ]
+        );
+    }
+
+    #[test]
+    fn access_help_opens_with_the_guide_then_the_commands_and_the_words() {
+        let mut expected: Vec<String> = ACCESS_GUIDE
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        expected.extend(
+            [
+                "access: Decide whom you trust, block or forget, and answer requests to be trusted",
+                "command | what it does",
+                ".mesh access trust | Let them message you, ask your envoy and fetch your shared files: every session of a user, or one session",
+                ".mesh access revoke | Take that back; they can ask again and you will see the request. `--stale` drops the trusted sessions not heard from lately",
+                ".mesh access block | Refuse them and ignore their requests to be trusted; works before you have heard from them",
+                ".mesh access unblock | Lift a block; it grants nothing",
+                ".mesh access forget | Erase everything you know about them, blocks included; they become a stranger",
+                ".mesh access requests | People asking you to trust them",
+                ".mesh access ask | Ask a session to trust you, with an optional intro",
+                "`.mesh access <command> --help` shows a command's usage.",
+                "What the words mean:",
+                "word | meaning",
+                "stranger | Someone you know nothing about; their messages are dropped unread.",
+                "trusted | May message you, ask your envoy and fetch your shared files.",
+                "known | You keep a record of the user that grants nothing; they are refused, but their requests to be trusted are listed.",
+                "blocked | Refused, and their requests to be trusted are dropped without a word.",
+                "request | A session asking you to trust it, with an optional intro; `.mesh access requests` lists them.",
+                ACCESS_UNDER_THE_HOOD,
+            ]
+            .map(str::to_string),
+        );
+        assert_eq!(flat(&render_group_help("access")), expected);
+        assert!(ACCESS_GUIDE.starts_with("Which one do I want?\n"));
+        assert!(ACCESS_UNDER_THE_HOOD.starts_with("Under the hood: "));
+    }
+
+    #[test]
+    fn messaging_help_explains_the_states_and_the_sync_counts() {
+        assert_eq!(
+            flat(&render_group_help("messaging")),
+            [
+                "messaging: Send to people's sessions, read your inbox and follow up on what you asked",
+                "command | what it does",
+                ".mesh messaging send | Send your own text to one session, bypassing the model",
+                ".mesh messaging broadcast | Send a bulletin to every trusted peer with a known path",
+                ".mesh messaging inbox | Show the messages peers sent this session, the new ones marked; `clear` empties the list",
+                ".mesh messaging sync | Fetch now the messages a propagation node holds for this session",
+                ".mesh messaging sent | List the questions your sessions asked, open or answered",
+                ".mesh messaging follow-up | Follow up on a question you asked",
+                "`.mesh messaging <command> --help` shows a command's usage.",
+                "What the words mean:",
+                "word | meaning",
+                "inbox | The messages other sessions sent this one; reading it takes nothing away.",
+                "sent | The questions your sessions asked and whether an answer came back.",
+                "open | Asked; no answer yet.",
+                "escalated | The other session's envoy passed your question to its user.",
+                "answered, awaiting the model | The answer arrived; the model picks it up with mesh__collect.",
+                "bulletin | One text sent to every trusted session at once with `.mesh messaging broadcast`.",
+                "propagation node | Where messages wait while a session is away; `.mesh messaging sync` fetches them now.",
+                "sync counts | listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the node: for another of your sessions.",
+                "Under the hood: messages travel over Reticulum as LXMF, addressed to the destination a session announces. A propagation node is an LXMF store-and-forward node; your session identifies itself to the nearest one heard when it joins and on a timer, and `.mesh messaging sync` asks it now.",
+            ]
+        );
+    }
+
+    #[test]
+    fn envoy_help_explains_the_brief_and_what_it_escalates() {
+        assert_eq!(
+            flat(&render_group_help("envoy")),
+            [
+                "envoy: Shape what your envoy tells other sessions and handle what it escalates to you",
+                "command | what it does",
+                ".mesh envoy brief | Show the brief your envoy answers peers with, or set its note or mode",
+                ".mesh envoy memory | Forget what the envoy remembers of a peer's threads: one user, one of their threads, or everything",
+                ".mesh envoy questions | List the questions peers escalated to you",
+                ".mesh envoy answer | Answer a question a peer escalated to you",
+                ".mesh envoy dismiss | Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
+                "`.mesh envoy <command> --help` shows a command's usage.",
+                "What the words mean:",
+                "word | meaning",
+                "envoy | The agent that answers other sessions for yours, so they do not interrupt you.",
+                "brief | What your envoy may tell other sessions about this one: the objective, the status card and your note.",
+                "auto / manual / off | The brief's mode: auto adds the session digest, manual keeps to the card and your note, off tells nothing.",
+                "escalated question | A question your envoy could not answer from the brief and passed to you.",
+                "awaiting your answer | An escalated question nobody has answered or dismissed yet; it expires after a while.",
+                "memory | What your envoy remembers of its threads with each user, so a follow-up makes sense.",
+                "Under the hood: the envoy is a built-in agent that answers a trusted destination's questions with read-only tools confined to this session's working directory; its memory is kept per identity under the mesh/ directory.",
+            ]
+        );
+    }
+
+    #[test]
+    fn files_help_explains_the_rules_and_the_verdicts() {
+        assert_eq!(
+            flat(&render_group_help("files")),
+            [
+                "files: Share files, decide requests for them and fetch other sessions' files",
+                "command | what it does",
+                ".mesh files list | List the share rules and the file each came from, or the files a peer can fetch",
+                ".mesh files allow | Share files matching a pattern with every trusted peer, or with one peer",
+                ".mesh files deny | Never share files matching a pattern, whatever `files allow` says; a share rule, not a peer refusal (that is `access block`)",
+                ".mesh files unshare | Remove the allow or deny share rule that holds a pattern",
+                ".mesh files requests | List the access requests peers sent",
+                ".mesh files grant | Grant a peer's access request: once for a while, or standing in the share list",
+                ".mesh files refuse | Refuse a peer's access request",
+                ".mesh files request | Ask a trusted peer's human for access to files it does not share yet",
+                ".mesh files fetch | Fetch one file a trusted peer shares into your session's staging inbox",
+                "`.mesh files <command> --help` shows a command's usage.",
+                "What the words mean:",
+                "word | meaning",
+                "share rule | An allow or deny pattern; a deny and the built-in deny list always win.",
+                "effective | The files your rules actually share, as `.mesh files list --effective` lists them.",
+                "kind / layer | allow, deny or override (lifts the built-in deny for one file); global is your config dir's file, workspace the project's.",
+                "shared | A trusted session can fetch it.",
+                "denied | A deny rule holds it back.",
+                "built-in deny | A secret's name; nothing serves it unless an override names the file.",
+                "protected | Inside .git or a config directory; never served.",
+                "not allowed | No allow rule names it.",
+                "access request | A trusted session asking for files you do not share yet.",
+                "grant | A yes to a request: for a while with --for, or a standing allow rule with --standing.",
+                "staging inbox | Where fetched files land, outside your project, until you move them.",
+                "Under the hood: share rules live in two files, a global one and one per workspace, which `.mesh files list` names; a fetch runs over a Reticulum link to the destination that shares the file, which checks its trust list first.",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_help_explains_the_settings_and_the_key() {
+        assert_eq!(
+            flat(&render_group_help("config")),
+            [
+                "config: Show your mesh settings and replace your mesh key",
+                "command | what it does",
+                ".mesh config show | Show the mesh settings and this session's place on the mesh",
+                ".mesh config rotate-identity | Mint a new mesh key while the mesh is off; everyone who trusted you must trust the new one",
+                "`.mesh config <command> --help` shows a command's usage.",
+                "What the words mean:",
+                "word | meaning",
+                "settings | The mesh section of config.yaml; nothing under `.mesh` changes it.",
+                "reach | How far your sessions are visible: this network, a relay, or the internet.",
+                "key | What every user who trusts you knows you by; rotating it means they trust you again.",
+                "Under the hood: your key is the Reticulum identity under the mesh/ directory, and each session's address is a destination derived from it, so rotating the identity changes every destination.",
+            ]
+        );
+    }
+
+    /// Each block of a help stands apart by one blank line: the listing, the words and the
+    /// under-the-hood paragraph, after the access guide's own three paragraphs.
+    #[test]
+    fn blocks_are_separated_by_one_blank_line() {
+        let help = render_help();
+        assert_eq!(help.matches("\n\n").count(), 1, "{help}");
+        assert!(help.contains("┘\n\nWhat the words mean:\n┌"), "{help}");
+        for (group, _) in GROUPS {
+            let text = render_group_help(group);
+            let breaks = if *group == "access" { 5 } else { 2 };
+            assert_eq!(text.matches("\n\n").count(), breaks, "{group}: {text}");
+            assert!(text.contains("usage.\n\nWhat the words mean:\n┌"), "{text}");
+            assert!(text.contains("┘\n\nUnder the hood: "), "{text}");
+            assert!(!text.contains("\n\n\n"), "{text}");
+        }
+    }
+
+    /// A sample of `--help`, whole: the usage, then two or three plain sentences.
+    #[test]
+    fn verb_help_is_the_usage_and_a_few_plain_sentences() {
+        assert_eq!(
+            render_verb_help("envoy", "brief"),
+            "Usage: .mesh envoy brief [note \"text\"|note clear|auto|manual|off]\n  Show the brief your envoy answers peers with, or set its note or mode\n  The brief is what your envoy may tell other sessions about this one: the objective, the status card and your note. Peers asking \"what are you working on?\" get answers from it without interrupting you; set it to share more or less."
+        );
+        assert_eq!(
+            render_verb_help("messaging", "send"),
+            "Usage: .mesh messaging send <session> [--yes] \"text\" [--attach <path> [--force]]\n  Send your own text to one session, bypassing the model\n  The receiving session's envoy may answer for its user; the reply lands in your inbox (.mesh messaging inbox)."
+        );
+        assert_eq!(
+            render_verb_help("people", "list"),
+            "Usage: .mesh people list\n  List the users and sessions you have heard, you first\n  Each row is one session, grouped by user; the trust and state columns say whether it may reach you and whether it is still around. `.mesh people help` says what each word in them means."
+        );
+        assert_eq!(
+            render_verb_help("access", "block"),
+            "Usage: .mesh access block user <who> [--yes] [--note \"text\"] | session <who> [--yes] [--note \"text\"]\n  Refuse them and ignore their requests to be trusted; works before you have heard from them\n  Their requests to be trusted are dropped without a word. A blocked session stays refused whatever its user's standing."
+        );
+        assert_eq!(
+            render_verb_help("", "help"),
+            "Usage: .mesh help\n  List the mesh commands by group\n  `.mesh <group>` lists one group's commands and what its words mean; `--help` after any command shows its usage."
+        );
+        for (group, verb, _, summary) in COMMANDS {
+            let note = verb_help_note(group, verb)
+                .unwrap_or_else(|| panic!("{group} {verb} has no --help sentences"));
+            let sentences = format!("{summary}. {note}").matches(['.', '?']).count();
+            assert!(note.ends_with('.'), "{group} {verb}: {note}");
+            assert!(!note.is_empty() && sentences >= 2, "{group} {verb}: {note}");
+        }
+    }
+
+    /// The help lines speak of users, sessions and envoys; the protocol words appear only
+    /// in each group's one under-the-hood paragraph, and the one verb named after the key.
+    #[test]
+    fn no_help_line_says_this_node_identity_destination_instance_or_knock() {
+        let mut texts = vec![render_help()];
+        for (group, _) in GROUPS {
+            let help = render_group_help(group);
+            let (before, hood) = help
+                .split_once("\n\nUnder the hood: ")
+                .unwrap_or_else(|| panic!("{group} has no under-the-hood paragraph: {help}"));
+            assert!(
+                !hood.contains('\n'),
+                "{group}: the paragraph is one line: {hood}"
+            );
+            texts.push(before.to_string());
+        }
+        for (group, verb, _, _) in COMMANDS {
+            texts.push(render_verb_help(group, verb));
+        }
+        texts.push(joined_line("review", &"ab".repeat(16), true));
+        for text in texts {
+            let text = text
+                .replace("rotate-identity", "")
+                .replace("rotate-<identity-short>", "")
+                .to_ascii_lowercase();
+            for word in ["this node", "identity", "destination", "instance", "knock"] {
+                assert!(!text.contains(word), "{word:?} in a help line: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_join_prints_one_line_naming_you_and_the_help() {
+        let destination = "ab".repeat(16);
+        assert_eq!(
+            joined_line("review", &destination, false),
+            "Joined the mesh as you / review (abababab); .mesh help shows the commands and what they mean."
+        );
+        assert_eq!(
+            joined_line("review", &destination, true),
+            "Joined the mesh as you / review (abababab) with a new address; .mesh help shows the commands and what they mean."
+        );
+        assert_eq!(
+            joined_line("", &destination, false),
+            "Joined the mesh as you (abababab); .mesh help shows the commands and what they mean."
+        );
+        assert_eq!(
+            CommandPrefix::Slash.render_hints(&joined_line("review", &destination, false)),
+            "Joined the mesh as you / review (abababab); /mesh help shows the commands and what they mean."
+        );
+    }
+
+    /// Every pointer line a long listing ends with, word for word, and each names a group
+    /// whose help explains what it says it does.
+    #[test]
+    fn each_pointer_line_names_the_help_that_explains_it() {
+        let pointers = [
+            (
+                "people",
+                "the columns, states and names",
+                "`.mesh people help` says what the columns, states and names mean.",
+                "no route",
+            ),
+            (
+                "messaging",
+                "the states of a question",
+                "`.mesh messaging help` says what the states of a question mean.",
+                "answered, awaiting the model",
+            ),
+            (
+                "messaging",
+                "the sync counts",
+                "`.mesh messaging help` says what the sync counts mean.",
+                "sync counts",
+            ),
+            (
+                "envoy",
+                "escalated questions and their states",
+                "`.mesh envoy help` says what escalated questions and their states mean.",
+                "awaiting your answer",
+            ),
+            (
+                "files",
+                "access requests and grants",
+                "`.mesh files help` says what access requests and grants mean.",
+                "access request",
+            ),
+            (
+                "files",
+                "the verdicts",
+                "`.mesh files help` says what the verdicts mean.",
+                "built-in deny",
+            ),
+        ];
+        for (group, what, line, word) in pointers {
+            assert_eq!(help_pointer(group, what), line);
+            assert!(
+                flat(&render_group_help(group))
+                    .iter()
+                    .any(|row| row.starts_with(&format!("{word} | "))),
+                "{group} help explains {word}"
+            );
+        }
     }
 }
 
@@ -9668,20 +10378,21 @@ fn group_heading(group: &str) -> String {
     format!("{group}: {summary}")
 }
 
-/// `group`'s name and summary, then each of its verbs: the usage, and under it the summary.
+/// `group`'s name and summary, then its commands as a table, each with its summary, and
+/// the line naming `--help` for the usage.
 fn render_group_listing(group: &str) -> String {
-    format!("{}\n{}", group_heading(group), render_verb_rows(group))
+    let mut table = mesh_table(&["command", "what it does"]);
+    for (_, verb, _, summary) in COMMANDS.iter().filter(|(name, ..)| *name == group) {
+        table.add_row([format!(".mesh {group} {verb}"), summary.to_string()]);
+    }
+    format!(
+        "{}\n{table}\n`.mesh {group} <command> --help` shows a command's usage.",
+        group_heading(group)
+    )
 }
 
-fn render_verb_rows(group: &str) -> String {
-    COMMANDS
-        .iter()
-        .filter(|(name, ..)| *name == group)
-        .map(|(_, _, usage, summary)| format!("  {usage}\n      {summary}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
+/// A command's `--help`, also printed when it is typed without what it needs: the usage,
+/// then its summary and what `verb_help_note` adds.
 fn render_verb_help(group: &str, verb: &str) -> String {
     match COMMANDS
         .iter()
@@ -9695,18 +10406,119 @@ fn render_verb_help(group: &str, verb: &str) -> String {
     }
 }
 
-/// What a subcommand's `--help` says after its one-line summary, for the verbs whose
-/// summary alone would leave the reader guessing.
+/// What a command's `--help` says after its one-line summary: one or two plain
+/// sentences on what it does for you and what comes next.
 fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
-    match (group, verb) {
-        ("messaging", "send") => Some(
-            "The receiving session's envoy may answer for its user; the reply lands in your inbox (.mesh messaging inbox).",
-        ),
-        ("messaging", "inbox") => Some(
-            "Reading takes nothing away: the model reads the same messages with mesh__check_inbox and keeps its own place. `clear` removes what you and the model have both read and hides the rest from you; the model still gets them. The inbox lasts for this session only.",
-        ),
-        _ => None,
-    }
+    Some(match (group, verb) {
+        ("", "on") => {
+            "It shows what leaves this machine and to whom, then asks. `--fresh` gives this session a new address, so whoever trusted the old one must trust it again."
+        }
+        ("", "off") => {
+            "Other sessions stop hearing this one until you join again; nothing you trusted or shared is forgotten."
+        }
+        ("", "status") => {
+            "Bare, it shows the card trusted sessions get when they ask what you are doing. A quoted objective replaces the card's for this session; `clear` goes back to the session's own."
+        }
+        ("", "help") => {
+            "`.mesh <group>` lists one group's commands and what its words mean; `--help` after any command shows its usage."
+        }
+        ("people", "list") => {
+            "Each row is one session, grouped by user; the trust and state columns say whether it may reach you and whether it is still around. `.mesh people help` says what each word in them means."
+        }
+        ("people", "name") => {
+            "The name is yours alone: it is never sent, and it replaces the name they advertised in every line you see. Naming someone grants them nothing."
+        }
+        ("people", "info") => {
+            "It works for anyone you have heard of, trusted or not, and shows the whole hashes you can type in place of a name."
+        }
+        ("people", "status") => {
+            "The card says what that session is doing: its objective, state, repo and todo. Only a session you trust is asked, and it answers only if it trusts you too."
+        }
+        ("access", "trust") => {
+            "`user <who>` covers every session of theirs, now and later; `session <who>` that one session. `.mesh access help` shows which access command fits."
+        }
+        ("access", "revoke") => {
+            "They are refused from then on, and a request they send shows in `.mesh access requests`. Revoking a user prints a token first, which you pass back with --confirm."
+        }
+        ("access", "block") => {
+            "Their requests to be trusted are dropped without a word. A blocked session stays refused whatever its user's standing."
+        }
+        ("access", "unblock") => {
+            "They can ask to be trusted again; to let them in, trust them as well."
+        }
+        ("access", "forget") => {
+            "Their names, trust records, blocks, requests and your envoy's memory of them go. It prints a token first, which you pass back with --confirm."
+        }
+        ("access", "requests") => {
+            "Each row shows who asked, when, and their intro; `.mesh access trust session <who>` lets one in."
+        }
+        ("access", "ask") => {
+            "Use it when a session you want to reach does not trust you yet; its user sees your request and intro, and decides."
+        }
+        ("messaging", "send") => {
+            "The receiving session's envoy may answer for its user; the reply lands in your inbox (.mesh messaging inbox)."
+        }
+        ("messaging", "broadcast") => {
+            "Each trusted session gets the same text; sessions you have not trusted get nothing. Replies land in your inbox."
+        }
+        ("messaging", "inbox") => {
+            "Reading takes nothing away: the model reads the same messages with mesh__check_inbox and keeps its own place. `clear` removes what you and the model have both read and hides the rest from you; the model still gets them. The inbox lasts for this session only."
+        }
+        ("messaging", "sync") => {
+            "Messages sent while this session was away wait on a propagation node until it is asked. Joining asks once and a timer asks again; this asks now."
+        }
+        ("messaging", "sent") => {
+            "Each entry shows whom you asked and whether an answer came back; the model collects answers with mesh__collect, and `.mesh messaging follow-up <id>` continues one."
+        }
+        ("messaging", "follow-up") => {
+            "The text goes to the session you asked, in the same thread; without text you are asked for it."
+        }
+        ("envoy", "brief") => {
+            "The brief is what your envoy may tell other sessions about this one: the objective, the status card and your note. Peers asking \"what are you working on?\" get answers from it without interrupting you; set it to share more or less."
+        }
+        ("envoy", "memory") => {
+            "Your envoy remembers its threads with each user so a follow-up makes sense; this erases that memory and nothing else."
+        }
+        ("envoy", "questions") => {
+            "Your envoy passes you a question it cannot answer from the brief; answer it with `.mesh envoy answer <id>` or turn it down with `.mesh envoy dismiss <id>`."
+        }
+        ("envoy", "answer") => {
+            "Your answer goes back to the session that asked; without text you are asked for it."
+        }
+        ("envoy", "dismiss") => "`--all` dismisses every open question at once, after asking.",
+        ("files", "list") => {
+            "Bare, it lists your allow and deny rules; `--effective` lists the files they share, and `--peer <who>` narrows that to one user or session."
+        }
+        ("files", "allow") => {
+            "Only trusted sessions can fetch what you share, and a deny rule or the built-in deny list still wins. A pattern that matches many files is confirmed first."
+        }
+        ("files", "deny") => {
+            "Use it to hold secrets back under a broad allow; `.mesh files unshare` removes the rule."
+        }
+        ("files", "unshare") => {
+            "Files an allow rule shared stop being fetchable; files a deny rule held back may be shared again."
+        }
+        ("files", "requests") => {
+            "Each request lists the paths a trusted session asked for; `.mesh files grant <id>` or `.mesh files refuse <id>` decides it."
+        }
+        ("files", "grant") => {
+            "`--for` lets them fetch the paths for a while; `--standing` adds an allow rule that lasts until you unshare it."
+        }
+        ("files", "refuse") => "The asker hears that you refused, and nothing is shared.",
+        ("files", "request") => {
+            "Their user sees the paths and your reason and decides; once granted, `.mesh files fetch` gets them."
+        }
+        ("files", "fetch") => {
+            "The file lands in this session's staging inbox, never in your project; `--if-sha256` refuses a file whose content changed."
+        }
+        ("config", "show") => {
+            "It lists every mesh setting, your interfaces and how far you are visible; config.yaml is where they change."
+        }
+        ("config", "rotate-identity") => {
+            "Everyone who trusted you must trust the new key, and your sessions get new addresses. It prints a token first, which you pass back with --confirm."
+        }
+        _ => return None,
+    })
 }
 
 fn is_public(config: &MeshConfig) -> bool {
@@ -9965,14 +10777,18 @@ fn cwd_warning(cwd: &Path, home: Option<&Path>) -> Option<String> {
     }
 }
 
-fn render_on_summary(runtime: &MeshRuntime, fresh: bool) -> String {
-    let suffix = if fresh { " (fresh id)" } else { "" };
+/// The one line a join prints once the node is up: who you are on the mesh and where
+/// the help is. `.mesh config show` carries what the line leaves out.
+fn joined_line(session_name: &str, destination: &str, fresh: bool) -> String {
+    let who = if session_name.trim().is_empty() {
+        YOU.to_string()
+    } else {
+        own_session_name(session_name)
+    };
+    let fresh = if fresh { " with a new address" } else { "" };
     format!(
-        "Mesh is on for this session{suffix}.\n  identity: {}\n  destination: {}\n  instance: {}\n  interfaces: {}\nTurn it off with `.mesh off`.",
-        runtime.fingerprint(),
-        runtime.current_destination_hash(),
-        runtime.current_instance_id(),
-        runtime.interfaces().join(", ")
+        "Joined the mesh as {who} ({}){fresh}; .mesh help shows the commands and what they mean.",
+        short(destination)
     )
 }
 
@@ -10301,19 +11117,27 @@ fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText 
     }
     let mut lines = key_changes;
     lines.push(format!(
-        "{} and {}. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
+        "{} and {}.",
         plural(users, "user", "users"),
         plural(rows.len(), "session", "sessions")
     ));
-    lines.push(NAME_ADDRESSING_LINE.to_string());
-    lines.push(trust_legend().to_string());
-    lines.push(peers_legend());
+    lines.push(help_pointer("people", "the columns, states and names"));
     NoticeText::default()
         .peer(table.to_string())
         .frame(format!("\n{}", lines.join("\n")))
 }
 
-/// The `.mesh people list` line under the count that teaches typing a name in place of a hash.
+/// What `people help` says `word` means.
+#[cfg(test)]
+fn people_meaning(word: &str) -> String {
+    people_concepts()
+        .into_iter()
+        .find(|(name, _)| name == word)
+        .map(|(_, meaning)| meaning)
+        .unwrap_or_else(|| panic!("people help has no `{word}` row"))
+}
+
+/// The `people help` row that teaches typing a name in place of a hash.
 const NAME_ADDRESSING_LINE: &str = "Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh people name <user>/<session> \"name\"` one of their sessions.";
 
 #[cfg(test)]
@@ -10358,12 +11182,19 @@ mod peers_route_tests {
         assert_eq!(cells[0][5], NO_ROUTE_STATE, "{text}");
         assert_eq!(cells[1][5], "", "{text}");
         assert!(
-            peers_legend().contains(
-                "no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"
+            people_meaning("no route").contains(
+                "You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again."
             ),
             "{text}"
         );
-        assert!(text.ends_with(&peers_legend()), "{text}");
+        assert!(
+            render_group_help("people").contains(&people_meaning("no route")),
+            "the people help explains no route"
+        );
+        assert!(
+            text.ends_with("\n`.mesh people help` says what the columns, states and names mean."),
+            "{text}"
+        );
     }
 
     /// A stale row with no path shows `no route` alone: the missing path is the stronger
@@ -10433,8 +11264,8 @@ mod peers_route_tests {
             "{text}"
         );
         assert!(
-            peers_legend().contains(
-                "left = the session said it was leaving the mesh, until it announces again or is heard over a link"
+            people_meaning("left").contains(
+                "The session said it was leaving the mesh, until it announces again or is heard over a link"
             ),
             "{text}"
         );
@@ -10539,7 +11370,7 @@ mod peers_you_tests {
             "an announced name is not a user's name: {text}"
         );
         assert!(
-            peers_legend().contains("you = your own sessions on this config dir"),
+            people_meaning("you").starts_with("Your own sessions on this config dir"),
             "{text}"
         );
     }
@@ -10586,16 +11417,17 @@ mod peers_you_tests {
             "{text}"
         );
         assert_eq!(cells[1][5], "", "{text}");
-        let legend = peers_legend();
+        let you = people_meaning("you");
         assert!(
-            legend.contains(
-                "you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped"
+            you.contains(
+                "Your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped"
             ),
-            "{legend}"
+            "{you}"
         );
+        let no_route = people_meaning("no route");
         assert!(
-            legend.contains("no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again;"),
-            "{legend}"
+            no_route.contains("You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again."),
+            "{no_route}"
         );
     }
 }
@@ -10660,19 +11492,92 @@ fn deny_only_label() -> &'static str {
     )
 }
 
-/// The second-to-last line of a non-empty `.mesh people list`, reading the trust column.
-fn trust_legend() -> &'static str {
-    "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block session <who>; blocked (identity) = .mesh access block user <who>"
+/// What each word of the `.mesh people list` trust column means, in `TRUST_LABELS` order.
+fn trust_concepts() -> [(&'static str, &'static str); 5] {
+    let [trusted, known, untrusted, blocked_session, blocked_user] =
+        crate::function::mesh::TRUST_LABELS;
+    [
+        (
+            trusted,
+            "This session may message you, ask your envoy and fetch your shared files.",
+        ),
+        (known, "You know its user, but this session is not trusted."),
+        (untrusted, "Nothing is known about it."),
+        (
+            blocked_session,
+            "You refused this session with `.mesh access block session <who>`.",
+        ),
+        (
+            blocked_user,
+            "You refused its user with `.mesh access block user <who>`.",
+        ),
+    ]
 }
 
-/// The last line of a non-empty `.mesh people list`, reading the row markers and the `(you)` names.
-fn peers_legend() -> String {
-    format!(
-        "stale = silent for {}+ {} heartbeats, dropped after {}; superseded = this user moved to the session named; left = the session said it was leaving the mesh, until it announces again or is heard over a link; no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped; a user or session shows the name you gave it, else the one it advertised, else its short hash; user = a person or an installation, which can run several sessions",
-        PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
-        heartbeat_cadence(),
-        period_text(PEER_TTL)
-    )
+/// What `people help` explains: who a row is, the trust column, the state markers, the
+/// names and the hashes.
+fn people_concepts() -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = [
+        (
+            "user",
+            "A person or an installation, which can run several sessions.".to_string(),
+        ),
+        (
+            "session",
+            "One running session of a user; each row of `.mesh people list` is one.".to_string(),
+        ),
+        (
+            YOU,
+            format!(
+                "Your own sessions on this config dir, by session name when it runs on this computer,{ENDED_SESSION_MARK} once it has stopped."
+            ),
+        ),
+        (
+            "names",
+            "A user or session shows the name you gave it, else the one it advertised (its own text), else its short hash.".to_string(),
+        ),
+    ]
+    .into_iter()
+    .map(|(word, meaning)| (word.to_string(), meaning))
+    .collect();
+    rows.extend(
+        trust_concepts()
+            .into_iter()
+            .map(|(word, meaning)| (word.to_string(), meaning.to_string())),
+    );
+    rows.extend(
+        [
+            (
+                "stale",
+                format!(
+                    "Silent for {}+ {} heartbeats; dropped after {}.",
+                    PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
+                    heartbeat_cadence(),
+                    period_text(PEER_TTL)
+                ),
+            ),
+            (
+                "superseded",
+                "This user moved to the session named.".to_string(),
+            ),
+            (
+                "left",
+                "The session said it was leaving the mesh, until it announces again or is heard over a link.".to_string(),
+            ),
+            (
+                "no route",
+                "You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.".to_string(),
+            ),
+            (
+                "hashes",
+                "<user hash> / <session hash>, shortened; `.mesh people info <who>` shows them whole.".to_string(),
+            ),
+            ("addressing", NAME_ADDRESSING_LINE.to_string()),
+        ]
+        .into_iter()
+        .map(|(word, meaning)| (word.to_string(), meaning)),
+    );
+    rows
 }
 
 /// The heartbeat period as the adjective before `heartbeats` in the legend: `hourly` at
@@ -10777,17 +11682,17 @@ fn key_change_line(
     };
     let (standing, old_key) = if mark.denied {
         (
-            "the old key stays refused under",
+            "the old key stays refused under user",
             denied_remedy(old_destination, bound_identity),
         )
     } else {
         (
-            "the grant stays with",
+            "the grant stays with user",
             trusted_remedy(old_destination, bound_identity, mark.identity_grants_all),
         )
     };
     format!(
-        "key changed: announced under identity {} {}; {standing} {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh access block user {}; {old_key}",
+        "key changed: announced under the key of user {} {}; {standing} {}. If they changed their key, verify out of band, then {trust}; otherwise .mesh access block user {}; {old_key}",
         short(&mark.change.seen_identity),
         age_text(now, mark.change.at),
         short(bound_identity),
@@ -11372,7 +12277,7 @@ impl QuestionRow {
         let state = match record.state {
             PendingState::Open => "open",
             PendingState::Escalated => "escalated: the peer's human has been asked",
-            PendingState::Answered => "answered, awaiting collect",
+            PendingState::Answered => AWAITING_THE_MODEL,
         };
         Self {
             state,
@@ -11598,7 +12503,7 @@ fn render_pending(
         ),
         (
             PendingList::Asked,
-            "Asked by this node",
+            "Asked by your sessions",
             "collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
             asked,
             true,
@@ -11631,6 +12536,13 @@ fn render_pending(
     for (index, row) in rows.iter().enumerate() {
         let id_len = shown_id_len(&row.id, &ids);
         lines.extend(pending_entry(index + 1, row, outbound, id_len, now, width));
+    }
+    if !rows.is_empty() {
+        lines.push(NoticeText::from(match list {
+            PendingList::Escalated => help_pointer("envoy", "escalated questions and their states"),
+            PendingList::Access => help_pointer("files", "access requests and grants"),
+            PendingList::Asked => help_pointer("messaging", "the states of a question"),
+        }));
     }
     joined_text(lines, "\n")
 }
@@ -12434,16 +13346,35 @@ mod tests {
     fn help_lists_every_verb_with_an_example() {
         let help = render_help();
         for (group, verb, usage, summary) in COMMANDS {
-            let path = format!("{group} {verb}");
+            let verb_help = render_verb_help(group, verb);
             assert!(
-                help.contains(&format!(".mesh {}", path.trim_start())),
-                "{help}"
+                verb_help.starts_with(&format!("Usage: {usage}\n  {summary}\n  ")),
+                "every command's --help is its usage, its summary and what it adds: {verb_help}"
             );
-            assert!(help.contains(summary), "{help}");
-            assert!(help.contains(usage), "{help}");
+            if group.is_empty() {
+                assert!(help.contains(&format!("│ .mesh {verb} ")), "{help}");
+                assert!(help.contains(summary), "{help}");
+                continue;
+            }
+            let group_help = render_group_help(group);
+            assert!(
+                group_help.contains(&format!("│ .mesh {group} {verb} ")),
+                "{group_help}"
+            );
+            assert!(group_help.contains(summary), "{group_help}");
+            assert!(
+                !help.contains(&format!("│ .mesh {group} {verb} ")),
+                "the top help lists groups, not their commands: {help}"
+            );
         }
         for (group, summary) in GROUPS {
-            assert!(help.contains(&format!("{group}: {summary}")), "{help}");
+            assert!(help.contains(&format!("│ .mesh {group} ")), "{help}");
+            assert!(help.contains(summary), "{help}");
+            assert!(
+                render_group_help(group).starts_with(&format!("{group}: {summary}\n"))
+                    || *group == "access",
+                "{group}"
+            );
         }
         assert!(help.contains("config.yaml"), "{help}");
     }
@@ -12571,7 +13502,13 @@ mod tests {
             render_verb_help("access", "forget")
         );
 
-        let help = render_help();
+        let help = [
+            render_help(),
+            render_group_help("messaging"),
+            render_group_help("access"),
+            render_group_help("files"),
+        ]
+        .join("\n");
         for present in [
             ".mesh messaging sync",
             ".mesh access forget ",
@@ -13525,7 +14462,7 @@ mod tests {
                 None,
                 HeardFacts::default(),
             ),
-            PeerRow::Heard(old, "blocked (instance)", None, HeardFacts::default()),
+            PeerRow::Heard(old, "blocked (session)", None, HeardFacts::default()),
             PeerRow::Heard(
                 peer(None, 30, now),
                 "untrusted",
@@ -13558,7 +14495,7 @@ mod tests {
         assert_eq!(rows[0][5], "", "a current row has no state: {text}");
         assert_eq!(rows[0][6], "cdcdcdcd / abababab", "{text}");
         let stale = "(stale: no announce for 2 heartbeats; forgotten after about 3 h)";
-        assert_eq!(rows[2][2], "blocked (instance)", "{text}");
+        assert_eq!(rows[2][2], "blocked (session)", "{text}");
         assert_eq!(rows[2][4], "2h ago", "{text}");
         assert_eq!(
             rows[2][5],
@@ -13572,12 +14509,15 @@ mod tests {
         assert_eq!(
             table_footer(&text),
             [
-                "2 users and 3 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
-                NAME_ADDRESSING_LINE,
-                "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block session <who>; blocked (identity) = .mesh access block user <who>",
-                "stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this user moved to the session named; left = the session said it was leaving the mesh, until it announces again or is heard over a link; no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped; a user or session shows the name you gave it, else the one it advertised, else its short hash; user = a person or an installation, which can run several sessions",
+                "2 users and 3 sessions.",
+                "`.mesh people help` says what the columns, states and names mean.",
             ],
             "{text}"
+        );
+        assert_eq!(
+            people_meaning("stale"),
+            "Silent for 2+ hourly heartbeats; dropped after about 3 h.",
+            "the people help counts heartbeats from the constants"
         );
         assert_eq!(
             PEER_STALE_AFTER.as_secs() / HEARTBEAT_PERIOD_SECS,
@@ -13754,11 +14694,9 @@ mod tests {
 {row separator}
 │ 0c1d2e3f   ┆ 5e6f7a8b       ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                ┆ 0c1d2e3f / 5e6f7a8b │
 └────────────┴────────────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────┘
-1a2b3c4d key changed: announced under identity 2b3c4d5e 5m ago; the grant stays with 9f8e7d6c. If the peer rotated, verify out of band, then .mesh access trust session 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh access block user 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh access revoke session 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
-4 users and 6 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.
-Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> "name"` names a user and `.mesh people name <user>/<session> "name"` one of their sessions.
-trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block session <who>; blocked (identity) = .mesh access block user <who>
-stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = this user moved to the session named; left = the session said it was leaving the mesh, until it announces again or is heard over a link; no route = you have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended, and it may have left the mesh, so wait for its next announce and run .mesh people list again; you = your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped; a user or session shows the name you gave it, else the one it advertised, else its short hash; user = a person or an installation, which can run several sessions"#;
+1a2b3c4d key changed: announced under the key of user 2b3c4d5e 5m ago; the grant stays with user 9f8e7d6c. If they changed their key, verify out of band, then .mesh access trust session 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh access block user 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh access revoke session 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
+4 users and 6 sessions.
+`.mesh people help` says what the columns, states and names mean."#;
 
     /// The whole `.mesh access requests` text for two cached knocks and one identity's dropped knocks.
     #[test]
@@ -13966,7 +14904,7 @@ stale = silent for 2+ hourly heartbeats, dropped after about 3 h; superseded = t
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ src/main.rs ┆ not allowed   │
 └─────────────┴───────────────┘
-shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it."#;
+`.mesh files help` says what the verdicts mean."#;
 
         /// A walk that stops at its bound past the row cap can only say how many more
         /// it saw, so the count reads `at least` and the bound line follows it. The bound
@@ -13986,13 +14924,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(table_rows(&text).len(), ALL_LIST_ROWS, "{text}");
             let footer = table_footer(&text);
             assert_eq!(
-                footer[1..],
+                footer[..],
                 [
                     format!(
                         "... and at least {} more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names.",
                         seen - ALL_LIST_ROWS
                     ),
                     "The walk stopped at its bound, so files may be missing.".to_string(),
+                    "`.mesh files help` says what the verdicts mean.".to_string(),
                 ],
                 "{footer:?}"
             );
@@ -14089,31 +15028,25 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(mesh, asset.to_string());
     }
 
-    /// The trust legend and the deny-only row spell their standings from `TRUST_LABELS`:
-    /// every `word = meaning` entry in the legend is one of the five, each of the five is
-    /// in the legend, and a deny-only row carries the blocked-instance word and no other.
+    /// The people help and the deny-only row spell the standings from `TRUST_LABELS`:
+    /// the trust rows of the people help are the five, in order, each with its meaning in
+    /// the help, and a deny-only row carries the blocked-session word and no other.
     #[test]
     fn the_trust_legend_and_the_deny_only_row_use_only_the_trust_label_words() {
         use crate::function::mesh::TRUST_LABELS;
 
-        let legend = trust_legend()
-            .strip_prefix("trust: ")
-            .expect("the legend opens with the column name");
-        let words: Vec<&str> = legend
-            .split("; ")
-            .map(|entry| {
-                entry
-                    .split_once(" = ")
-                    .expect("each entry reads `word = meaning`")
-                    .0
-            })
-            .collect();
-        assert_eq!(words, TRUST_LABELS, "{legend}");
+        let words: Vec<&str> = trust_concepts().iter().map(|(word, _)| *word).collect();
+        assert_eq!(words, TRUST_LABELS);
+        let help = render_group_help("people");
+        for (word, meaning) in trust_concepts() {
+            assert_eq!(people_meaning(word), meaning);
+            assert!(help.contains(meaning), "{word}: {help}");
+        }
 
         let record = deny_record(&"ab".repeat(16), Some(&"cd".repeat(16)));
         let text = render_peers(&[PeerRow::DenyOnly(record, None)], SystemTime::now()).plain();
         let row = &table_rows(&text)[0];
-        assert_eq!(deny_only_label(), "blocked (instance)");
+        assert_eq!(deny_only_label(), "blocked (session)");
         assert_eq!(row[2], deny_only_label(), "{text}");
         let found: Vec<&&str> = TRUST_LABELS
             .iter()
@@ -14310,7 +15243,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let rows = table_rows(&text);
         assert_eq!(rows[1][0], crate::mesh::people::UNNAMED, "{text}");
         assert_eq!(rows[1][1], "77".repeat(4), "{text}");
-        assert_eq!(rows[1][2], "blocked (instance)", "{text}");
+        assert_eq!(rows[1][2], "blocked (session)", "{text}");
         assert_eq!(rows[1][4], "never", "{text}");
         assert_eq!(rows[1][6], format!("- / {}", "77".repeat(4)), "{text}");
         assert!(!rows[1].concat().contains("trusted"), "{text}");
@@ -14323,10 +15256,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             table_footer(&text),
             [
-                "3 users and 3 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
-                NAME_ADDRESSING_LINE,
-                trust_legend(),
-                peers_legend().as_str(),
+                "3 users and 3 sessions.",
+                "`.mesh people help` says what the columns, states and names mean.",
             ],
             "{text}"
         );
@@ -14359,7 +15290,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ),
             PeerRow::Heard(
                 peer(Some("Bob"), 5, now),
-                "blocked (instance)",
+                "blocked (session)",
                 Some(KeyChangeMark {
                     change: KeyChange {
                         seen_identity: seen_identity.clone(),
@@ -14407,13 +15338,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let ann = &marks[0];
         assert!(
             ann.starts_with(&format!(
-                "{dest8} key changed: announced under identity {} 2m ago",
+                "{dest8} key changed: announced under the key of user {} 2m ago",
                 short(&seen_identity)
             )),
             "{text}"
         );
         assert!(
-            ann.contains(&format!("the grant stays with {}", "cd".repeat(4))),
+            ann.contains(&format!("the grant stays with user {}", "cd".repeat(4))),
             "{text}"
         );
         assert!(
@@ -14441,7 +15372,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert!(bob.starts_with(&format!("{dest8} key changed: ")), "{text}");
         assert!(
             bob.contains(&format!(
-                "; the old key stays refused under {}. If the peer rotated",
+                "; the old key stays refused under user {}. If they changed their key",
                 "cd".repeat(4)
             )),
             "a heard denied row says the old key keeps a refusal, not a grant: {text}"
@@ -14461,7 +15392,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let dee = &marks[2];
         assert!(dee.starts_with(&format!("{dest8} key changed: ")), "{text}");
         assert!(
-            dee.contains(&format!("the grant stays with {}", "cd".repeat(4))),
+            dee.contains(&format!("the grant stays with user {}", "cd".repeat(4))),
             "{text}"
         );
         assert!(
@@ -14475,8 +15406,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let footer = table_footer(&text);
         assert_eq!(
             footer.len(),
-            7,
-            "three mark lines, then the count, the name line and the two legend lines: {text}"
+            5,
+            "three mark lines, then the count and the help pointer: {text}"
         );
         assert!(footer[3].starts_with("1 user and 4 sessions."), "{text}");
     }
@@ -14540,7 +15471,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(marks.len(), 2, "{text}");
         assert!(
             marks[0].starts_with(&format!(
-                "{} key changed: announced under identity {} 1h ago; the grant stays with {}",
+                "{} key changed: announced under the key of user {} 1h ago; the grant stays with user {}",
                 short(&old_destination),
                 short(&seen_identity),
                 short(&bound_identity)
@@ -14616,7 +15547,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text}");
         assert_eq!(rows[0][1], "77".repeat(4), "{text}");
-        assert_eq!(rows[0][2], "blocked (identity)", "{text}");
+        assert_eq!(rows[0][2], "blocked (user)", "{text}");
         assert!(
             !rows[0].concat().contains("trusted"),
             "the row is labelled by the store's verdict, not by the record's existence: {text}"
@@ -14711,13 +15642,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "88".repeat(4),
             "the user the deny is bound to: {text}"
         );
-        assert_eq!(rows[0][2], "blocked (instance)", "{text}");
+        assert_eq!(rows[0][2], "blocked (session)", "{text}");
         assert!(!rows[0].concat().contains("trusted"), "{text}");
         assert_eq!(rows[0][5], "", "{text}");
         let mark = key_change_line_of(&text);
         assert!(
             mark.starts_with(&format!(
-                "{} key changed: announced under identity {} 2m ago; the old key stays refused under {}",
+                "{} key changed: announced under the key of user {} 2m ago; the old key stays refused under user {}",
                 short(&old_destination),
                 short(&seen_identity),
                 "88".repeat(4)
@@ -14793,11 +15724,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             "one line per marked row, in row order, each led by the row's dest: {text}"
         );
         let footer = table_footer(&text);
-        assert_eq!(footer.len(), 7, "{text}");
-        assert!(footer[3].starts_with("3 users and 4 sessions."), "{text}");
-        assert_eq!(footer[4], NAME_ADDRESSING_LINE, "{text}");
-        assert_eq!(footer[5], trust_legend(), "{text}");
-        assert_eq!(footer[6], peers_legend(), "{text}");
+        assert_eq!(footer.len(), 5, "{text}");
+        assert_eq!(footer[3], "3 users and 4 sessions.", "{text}");
+        assert_eq!(
+            footer[4],
+            help_pointer("people", "the columns, states and names"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -16025,7 +16958,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             [
                 "Waiting for YOU: none",
                 "Access requests: none",
-                "Asked by this node: none",
+                "Asked by your sessions: none",
             ]
         );
 
@@ -16042,18 +16975,20 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         assert_eq!(
             lines,
             [
-                "Waiting for YOU (2)     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
+                "Waiting for YOU (2)         answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
                 "  1. alice (12121212) asked 3m ago . expires in 6d . id p1",
                 "     \"may I read the plan?\"",
                 "     envoy asks: Share the plan?",
                 "  2. alice (12121212) asked 3m ago . expires in 6d . id p2",
                 "     \"may I read the plan?\"",
+                "`.mesh envoy help` says what escalated questions and their states mean.",
                 "Access requests: none",
-                "Asked by this node (2)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
+                "Asked by your sessions (2)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
                 "  1. -> bob (abababab) 3m ago . open . id q1",
                 "     \"what now?\"",
-                "  2. -> bob (abababab) 3m ago . answered, awaiting collect . id q2",
+                "  2. -> bob (abababab) 3m ago . answered, awaiting the model . id q2",
                 "     \"what now?\"",
+                "`.mesh messaging help` says what the states of a question mean.",
             ],
             "{text}"
         );
@@ -16075,7 +17010,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             [
                 "open",
                 "escalated: the peer's human has been asked",
-                "answered, awaiting collect"
+                "answered, awaiting the model"
             ]
         );
         assert_eq!(open.when_label, "sent");
@@ -16246,8 +17181,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let plain_pending =
             render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false).plain();
         for (painted, plain) in pending.lines().zip(plain_pending.lines()) {
-            if plain.starts_with("  ") {
-                assert_eq!(painted, plain, "entries stay plain: {pending:?}");
+            if plain.starts_with("  ") || plain.starts_with("`.mesh ") {
+                assert_eq!(
+                    painted, plain,
+                    "entries and the help pointer stay plain: {pending:?}"
+                );
             } else {
                 assert_eq!(painted, tool_name_text_forced(plain), "{pending:?}");
             }
@@ -16320,7 +17258,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             [
                 "  1. carol (12121212) asked 3m ago . expires in 6d . id acc-1",
                 "     2 paths",
-                "Asked by this node: none",
+                "`.mesh files help` says what access requests and grants mean.",
+                "Asked by your sessions: none",
             ],
             "{text}"
         );
@@ -16396,18 +17335,21 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(
                 text.lines().collect::<Vec<_>>(),
                 [
-                    "Waiting for YOU (2)     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
+                    "Waiting for YOU (2)         answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
                     "  1. alice (12121212) asked 3m ago . expires in 6d . id 320b8f7b",
                     "     \"may I read the plan?\"",
                     "     envoy asks: Do you want this rename done here?",
                     "  2. alice (12121212) asked 3m ago . expires in 6d . id 7c9d2e1f",
                     "     \"Please delete docs/notes.md.\"",
-                    "Access requests (1)     grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
+                    "`.mesh envoy help` says what escalated questions and their states mean.",
+                    "Access requests (1)         grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
                     "  1. carol (12121212) asked 3m ago . expires in 6d . id 1046c2c6",
                     "     2 paths",
-                    "Asked by this node (1)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
-                    "  1. -> bob (abababab) 3m ago . answered, awaiting collect . id 9e519dff",
+                    "`.mesh files help` says what access requests and grants mean.",
+                    "Asked by your sessions (1)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
+                    "  1. -> bob (abababab) 3m ago . answered, awaiting the model . id 9e519dff",
                     "     \"what now?\"",
+                    "`.mesh messaging help` says what the states of a question mean.",
                 ],
                 "{text}"
             );
@@ -16417,7 +17359,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         fn pending_shows_every_section_as_none_when_nothing_waits() {
             assert_eq!(
                 render_pending_lists(&[], &[], &[], pending_now(), 80, false).plain(),
-                "Waiting for YOU: none\nAccess requests: none\nAsked by this node: none"
+                "Waiting for YOU: none\nAccess requests: none\nAsked by your sessions: none"
             );
         }
 
@@ -16537,11 +17479,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 render_pending_lists(&[], &[command_shaped_row()], &[], pending_now(), 80, false);
             assert_eq!(
                 listing.render(CommandPrefix::Dot),
-                "Waiting for YOU (1)     answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh access trust x\"\nAccess requests: none\nAsked by this node: none"
+                "Waiting for YOU (1)         answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh access trust x\"\n`.mesh envoy help` says what escalated questions and their states mean.\nAccess requests: none\nAsked by your sessions: none"
             );
             assert_eq!(
                 listing.render(CommandPrefix::Slash),
-                "Waiting for YOU (1)     answer: /mesh envoy answer <id> \"<text>\" . dismiss: /mesh envoy dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh access trust x\"\nAccess requests: none\nAsked by this node: none"
+                "Waiting for YOU (1)         answer: /mesh envoy answer <id> \"<text>\" . dismiss: /mesh envoy dismiss <id>\n  1. .session (12121212) asked 3m ago . expires in 6d . id .vault\n     \".mesh access trust x\"\n`/mesh envoy help` says what escalated questions and their states mean.\nAccess requests: none\nAsked by your sessions: none"
             );
         }
 
@@ -17343,19 +18285,19 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             ..peer(Some("Bad"), 2, now)
         };
         let rows = vec![
-            PeerRow::Heard(old, "blocked (instance)", None, HeardFacts::default()),
+            PeerRow::Heard(old, "blocked (session)", None, HeardFacts::default()),
             PeerRow::Heard(
                 peer(Some("Bad"), PEER_STALE_AFTER.as_secs(), now),
-                "blocked (identity)",
+                "blocked (user)",
                 None,
                 HeardFacts::default(),
             ),
-            PeerRow::Heard(moved, "blocked (identity)", None, HeardFacts::default()),
+            PeerRow::Heard(moved, "blocked (user)", None, HeardFacts::default()),
         ];
         let text = render_peers(&rows, now).plain();
         for marker in [
-            "blocked (instance)",
-            "blocked (identity)",
+            "blocked (session)",
+            "blocked (user)",
             "(stale: ",
             "(superseded by ",
             "incompatible",
@@ -17404,8 +18346,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines.len(),
-            8,
-            "one escalated record is an entry line, one body row and one envoy row, under its section header: {text}"
+            10,
+            "one escalated record is an entry line, one body row and one envoy row, under its section header and over its help pointer: {text}"
         );
         assert!(lines[1].ends_with(" . expires in 6d . id p1"), "{text}");
         assert!(
@@ -17468,8 +18410,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
         );
         assert_eq!(
             text.lines().count(),
-            4,
-            "three section headers and one entry line, no body row for blank text: {text}"
+            5,
+            "three section headers, one entry line and its help pointer, no body row for blank text: {text}"
         );
     }
 
@@ -17691,7 +18633,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         );
                     }
                     assert!(
-                        people.contains(&format!("\n  {mesh} people list\n")),
+                        people.contains(&format!("│ {mesh} people list ")),
                         "{people}"
                     );
                     if prefix == CommandPrefix::Slash {
@@ -17748,7 +18690,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 for mesh in [".mesh", "/mesh"] {
                     assert_eq!(
                         attached.get_line(),
-                        Some(format!("[mesh:knock] `{mesh} access trust 1a2b`"))
+                        Some(format!("[mesh:request] `{mesh} access trust 1a2b`"))
                     );
                 }
             }
@@ -17984,7 +18926,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let out = stdout_lines().join("\n");
             for example in [
                 ".mesh envoy answer <id>",
-                ".mesh messaging send <destination>",
+                ".mesh messaging send <session>",
                 ".mesh messaging broadcast",
                 ".mesh access trust user <who> [--yes] | session <who>",
                 ".mesh access revoke user <who>",
@@ -18144,7 +19086,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             let line = render_sync(&report);
             assert_eq!(
                 line,
-                "Fetched from deadbeef: 7 listed, 6 wanted, 5 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred."
+                "Fetched from propagation node deadbeef: 7 listed, 6 wanted, 5 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred.\n`.mesh messaging help` says what the sync counts mean."
             );
             assert!(
                 !line.contains(&node),
@@ -18158,7 +19100,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert_eq!(
                 render_sync(&empty),
-                "Nothing held for this node at deadbeef."
+                "Nothing held for you at propagation node deadbeef."
             );
             let none_served = FetchReport {
                 listed: 7,
@@ -18168,7 +19110,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert_eq!(
                 render_sync(&none_served),
-                "deadbeef lists 7 messages for this node and 3 were asked for, but none were served; run .mesh messaging sync again or check the node's logs."
+                "Propagation node deadbeef lists 7 messages for you and 3 were asked for, but none were served; run .mesh messaging sync again or check that node's logs."
             );
             let full_page_none_served = FetchReport {
                 listed: 100,
@@ -18178,7 +19120,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert!(
                 render_sync(&full_page_none_served)
-                    .ends_with("check the node's logs. More may be held.")
+                    .ends_with("check that node's logs. More may be held.")
             );
             let all_known = FetchReport {
                 wanted: 0,
@@ -18187,7 +19129,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert_eq!(
                 render_sync(&all_known),
-                "Nothing new held for this node at deadbeef: 7 listed, all already processed."
+                "Nothing new held for you at propagation node deadbeef: 7 listed, all already processed."
             );
             let full_page = FetchReport {
                 listed: 100,
@@ -18197,7 +19139,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             };
             assert_eq!(
                 render_sync(&full_page),
-                "Fetched from deadbeef: 100 listed, 64 wanted, 64 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred. More may be held; run .mesh messaging sync again."
+                "Fetched from propagation node deadbeef: 100 listed, 64 wanted, 64 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred. More may be held; run .mesh messaging sync again.\n`.mesh messaging help` says what the sync counts mean."
             );
         }
 
@@ -19758,7 +20700,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             let out = run_async(out_of(&mut ctx, ".mesh messaging send")).unwrap();
             assert!(
-                out.starts_with("Usage: .mesh messaging send <destination>"),
+                out.starts_with("Usage: .mesh messaging send <session>"),
                 "{out}"
             );
         }
@@ -19788,30 +20730,40 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 );
             }
 
-            let list = run_async(out_of(&mut ctx, ".mesh")).unwrap();
+            let mut list = run_async(out_of(&mut ctx, ".mesh")).unwrap();
+            for (group, _) in GROUPS {
+                list.push('\n');
+                list.push_str(&run_async(out_of(&mut ctx, &format!(".mesh {group}"))).unwrap());
+            }
             let rows: Vec<&str> = list
                 .lines()
-                .filter(|line| line.trim_start().starts_with(".mesh "))
+                .filter_map(|line| line.strip_prefix("│ "))
+                .filter(|cell| cell.starts_with(".mesh "))
                 .collect();
-            assert_eq!(rows.len(), COMMANDS.len(), "{list}");
+            assert_eq!(
+                rows.len(),
+                COMMANDS.len() + GROUPS.len(),
+                "one row per command, and one per group in the top help: {list}"
+            );
             assert!(
                 rows.iter()
-                    .any(|row| row.trim_start().starts_with(".mesh messaging send ")),
+                    .any(|row| row.starts_with(".mesh messaging send ")),
                 "{list}"
             );
+            assert!(!rows.iter().any(|row| row.contains(" reply")), "{list}");
+            let send = run_async(out_of(&mut ctx, ".mesh messaging send --help")).unwrap();
             assert!(
-                !rows.iter().any(|row| row.trim_start().contains(" reply")),
-                "{list}"
-            );
-            assert!(
-                list.contains(
-                    "  .mesh messaging send <destination> [--yes] \"text\" [--attach <path> [--force]]"
+                send.starts_with(
+                    "Usage: .mesh messaging send <session> [--yes] \"text\" [--attach <path> [--force]]"
                 ),
-                "{list}"
+                "{send}"
             );
+            let brief = run_async(out_of(&mut ctx, ".mesh envoy brief --help")).unwrap();
             assert!(
-                list.contains("  .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"),
-                "{list}"
+                brief.starts_with(
+                    "Usage: .mesh envoy brief [note \"text\"|note clear|auto|manual|off]"
+                ),
+                "{brief}"
             );
             for retired in [
                 "brief set",
@@ -20213,7 +21165,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let summary = out
                         .iter()
-                        .position(|line| line.starts_with("Mesh is on for this session"))
+                        .position(|line| line.starts_with("Joined the mesh as "))
                         .unwrap();
                     assert_eq!(out[summary + 1], notice, "{out:?}");
 
@@ -20789,9 +21741,21 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.get().is_some());
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     let out = stdout_lines();
-                    let notice = index_of(&out, "mesh.enabled is true in config.yaml");
-                    let summary = index_of(&out, "Mesh is on for this session");
-                    assert!(notice < summary, "{out:?}");
+                    let summary = index_of(&out, "Joined the mesh as ");
+                    assert_eq!(
+                        out[summary],
+                        joined_line(
+                            "",
+                            &ctx.app.mesh.get().unwrap().current_destination_hash(),
+                            false
+                        ),
+                        "{out:?}"
+                    );
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("What leaves this machine")),
+                        "entering a session joins without the preview: {out:?}"
+                    );
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
                     assert!(ctx.app.mesh.get().is_none());
@@ -20991,7 +21955,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         assert_eq!(row(&unrouted)[0], "Tia", "{out}");
                         assert!(row(&unrouted)[5].starts_with("(no route:"), "{out}");
                         assert_eq!(row(&other_session)[0], YOU, "{out}");
-                        assert!(out.contains("no route = "), "{out}");
+                        assert!(
+                            out.ends_with(
+                                "`.mesh people help` says what the columns, states and names mean."
+                            ),
+                            "{out}"
+                        );
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         started.relay_handle.abort();
@@ -21085,8 +22054,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (YOU, short(&gone_session))
                         );
                         assert!(
-                            out.contains(
-                                "you = your own sessions on this config dir, by session name"
+                            out.ends_with(
+                                "`.mesh people help` says what the columns, states and names mean."
+                            ) && people_meaning("you").starts_with(
+                                "Your own sessions on this config dir, by session name"
                             ),
                             "{out}"
                         );
@@ -21190,7 +22161,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             "{out}"
                         );
                         assert_eq!(row[5], NO_ROUTE_STATE, "{out}");
-                        assert!(out.contains("(ended) once it has stopped"), "{out}");
+                        assert!(
+                            people_meaning("you").contains("(ended) once it has stopped")
+                                && out.ends_with(
+                                    "`.mesh people help` says what the columns, states and names mean."
+                                ),
+                            "{out}"
+                        );
 
                         let result =
                             handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
@@ -21253,7 +22230,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 }
 
                 /// `a`'s `.mesh messaging sent` lists the questions every other session on the
-                /// cache dir asked under `Asked by this node`, each naming the session
+                /// cache dir asked under `Asked by your sessions`, each naming the session
                 /// that asked it (running, ended, or no longer in the registry) and
                 /// saying to collect it there; `.mesh messaging follow-up` on one is refused with
                 /// the same name and the command to run in that session, and nothing
@@ -21315,7 +22292,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                         let out = pending_out(&mut ctx, ".").await.unwrap();
 
-                        assert!(out.contains("Asked by this node (3)"), "{out}");
+                        assert!(out.contains("Asked by your sessions (3)"), "{out}");
                         for line in [
                             "asked by you / temp . collect it from that session",
                             "asked by you / old (ended) . collect it from that session",
@@ -21632,21 +22609,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         "the newer row of the pair is not superseded: {first}"
                     );
                     let footer = table_footer(&first);
-                    assert_eq!(footer.len(), 4, "{first}");
                     assert_eq!(
-                        footer[0],
-                        "4 users and 5 sessions. A name a peer advertised is its own text; hashes reads <user hash> / <session hash>, and `.mesh people info <who>` shows them whole.",
-                        "{first}"
-                    );
-                    assert_eq!(
-                        footer[2],
-                        trust_legend(),
-                        "the trust legend comes before the marker legend: {first}"
-                    );
-                    assert_eq!(
-                        footer[3],
-                        peers_legend(),
-                        "the legend is the last line: {first}"
+                        footer,
+                        [
+                            "4 users and 5 sessions.",
+                            "`.mesh people help` says what the columns, states and names mean.",
+                        ],
+                        "the count, then the one pointer line: {first}"
                     );
 
                     let second = out_of(&mut ctx, ".mesh people list").await.unwrap();
@@ -22104,24 +23073,15 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.config.mesh.enabled);
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     let out = stdout_lines();
-                    let notice = index_of(&out, "mesh.enabled is true in config.yaml");
-                    let preview = index_of(&out, "What leaves this machine");
-                    let summary = index_of(&out, "Mesh is on for this session");
-                    assert!(notice < preview && preview < summary, "{out:?}");
+                    // Autostart prints the one joined line and nothing else: no preview,
+                    // no notice, no summary block.
+                    let destination = ctx.app.mesh.get().unwrap().current_destination_hash();
                     assert_eq!(
-                        out[notice],
-                        "mesh.enabled is true in config.yaml: joining the mesh for this session."
-                    );
-                    // The notice adds no pointer of its own: `.mesh off` is named by the
-                    // preview and the summary, the same as a typed `.mesh on --yes`.
-                    assert!(
-                        out[summary].ends_with("Turn it off with `.mesh off`."),
-                        "{out:?}"
-                    );
-                    assert_eq!(
-                        out.join("\n").matches(".mesh off").count(),
-                        out[preview].matches(".mesh off").count()
-                            + out[summary].matches(".mesh off").count(),
+                        out,
+                        [format!(
+                            "Joined the mesh as you ({}); .mesh help shows the commands and what they mean.",
+                            short(&destination)
+                        )],
                         "{out:?}"
                     );
 
@@ -22345,7 +23305,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.correlations().list().is_empty());
                     let out = stdout_lines().join("\n");
                     for usage in [
-                        "Usage: .mesh messaging send <destination>",
+                        "Usage: .mesh messaging send <session>",
                         "Usage: .mesh envoy answer <id>",
                         "Usage: .mesh messaging broadcast",
                         "Usage: .mesh envoy brief [",
@@ -23215,7 +24175,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         marker.contains(&format!(
-                            "the old key stays refused under {}",
+                            "the old key stays refused under user {}",
                             short(&old_identity)
                         )),
                         "{out}"
@@ -23542,7 +24502,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The same aged-out record, denied rather than trusted (the record-plus-deny
-            /// shape an older release wrote): its one row reads `blocked (instance)`, and
+            /// shape an older release wrote): its one row reads `blocked (session)`, and
             /// the marker still names the heard successor.
             #[test]
             #[serial]
@@ -23584,7 +24544,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .filter(|row| row[6].ends_with(&format!(" / {}", short(&old_dest))))
                         .collect();
                     assert_eq!(rows.len(), 1, "one row for the denied record: {out}");
-                    assert_eq!(rows[0][2], "blocked (instance)", "{out}");
+                    assert_eq!(rows[0][2], "blocked (session)", "{out}");
                     assert_eq!(rows[0][5], "", "{out}");
                     let marker = key_change_line_of(&out);
                     assert!(
@@ -23593,7 +24553,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     assert!(
                         marker.contains(&format!(
-                            "the old key stays refused under {}",
+                            "the old key stays refused under user {}",
                             short(&old_identity)
                         )),
                         "{out}"
@@ -24113,7 +25073,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// No label moves with `mesh.collision_protection`: the identity trusted for all
             /// destinations over another identity's recorded instance, the record's own row,
             /// a destination-trusted peer under its own instance, a blocked identity and a
-            /// stranger read `trusted`, `trusted`, `trusted`, `blocked (identity)` and
+            /// stranger read `trusted`, `trusted`, `trusted`, `blocked (user)` and
             /// `untrusted` in both modes, while the node serves the colliding row only with
             /// protection off.
             /// Describing reads only: `trust.yaml` is byte-identical, no record is marked and
@@ -24166,7 +25126,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             (&new_dest, "trusted"),
                             (&old_dest, "trusted"),
                             (&other_dest, "trusted"),
-                            (&blocked_dest, "blocked (identity)"),
+                            (&blocked_dest, "blocked (user)"),
                             (&stranger_dest, "untrusted"),
                         ] {
                             let out = out_of(&mut ctx, &format!(".mesh people info {dest}"))
@@ -24316,7 +25276,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(prompt_script::prompts_asked(), 1);
                     let out = stdout_lines();
                     let preview = index_of(&out, "What leaves this machine");
-                    let summary = index_of(&out, "Mesh is on for this session");
+                    let summary = index_of(&out, "Joined the mesh as ");
                     assert!(preview < summary, "{out:?}");
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
@@ -24386,17 +25346,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     assert!(ctx.app.mesh.get().is_some());
                     let out = stdout_lines();
-                    let summary = &out[index_of(&out, "Mesh is on for this session")];
-                    let interfaces = summary
-                        .lines()
-                        .find(|line| line.starts_with("  interfaces: "))
-                        .unwrap_or_else(|| panic!("no interfaces line in {summary}"));
-                    assert_eq!(
-                        interfaces,
-                        format!("  interfaces: private 127.0.0.1:{}", relay.port),
-                        "{summary}"
-                    );
+                    index_of(&out, "Joined the mesh as ");
                     let runtime = ctx.app.mesh.get().unwrap();
+                    assert_eq!(
+                        runtime.interfaces(),
+                        vec![format!("private 127.0.0.1:{}", relay.port)],
+                        "the node came up on the reachable relay only"
+                    );
                     let reason = recorded_reason(&runtime, &format!("private 127.0.0.1:{closed}"));
                     assert_eq!(
                         warnings(),
@@ -24463,7 +25419,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(ctx.app.mesh.get().is_some());
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     let out = stdout_lines();
-                    index_of(&out, "Mesh is on for this session");
+                    index_of(&out, "Joined the mesh as ");
                     let runtime = ctx.app.mesh.get().unwrap();
                     let reason = recorded_reason(&runtime, &format!("private 127.0.0.1:{closed}"));
                     assert_eq!(
@@ -24513,15 +25469,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     assert!(ctx.app.mesh.get().is_some());
                     let out = stdout_lines();
-                    let summary = &out[index_of(&out, "Mesh is on for this session")];
-                    let interfaces = summary
-                        .lines()
-                        .find(|line| line.starts_with("  interfaces: "))
-                        .unwrap_or_else(|| panic!("no interfaces line in {summary}"));
+                    index_of(&out, "Joined the mesh as ");
                     assert_eq!(
-                        interfaces,
-                        format!("  interfaces: private 127.0.0.1:{}", addr.port()),
-                        "{summary}"
+                        ctx.app.mesh.get().unwrap().interfaces(),
+                        vec![format!("private 127.0.0.1:{}", addr.port())],
+                        "the node came up on the reachable relay only"
                     );
                     let warnings = warnings();
                     assert_eq!(warnings.len(), 1, "{:?}", stderr_lines());
@@ -24592,7 +25544,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(
                         !stdout_lines()
                             .iter()
-                            .any(|line| line.contains("Mesh is on for this session")),
+                            .any(|line| line.contains("Joined the mesh as ")),
                         "{:?}",
                         stdout_lines()
                     );
@@ -24798,13 +25750,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         stderr_lines()
                     );
                     let out = stdout_lines();
-                    let summary = &out[index_of(&out, "Mesh is on for this session")];
-                    assert!(
-                        summary
-                            .contains(&format!("  interfaces: private 127.0.0.1:{}", addr.port())),
-                        "{summary}"
+                    index_of(&out, "Joined the mesh as ");
+                    assert_eq!(
+                        ctx.app.mesh.get().unwrap().interfaces(),
+                        vec![format!("private 127.0.0.1:{}", addr.port())],
+                        "the unreachable loopback relay is not among the connected interfaces"
                     );
-                    assert!(!summary.contains("127.0.0.2"), "{summary}");
                     let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[0]"),
@@ -24979,12 +25930,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         stderr_lines()
                     );
                     let out = stdout_lines();
-                    let summary = &out[index_of(&out, "Mesh is on for this session")];
-                    assert!(
-                        summary.contains(&format!("  interfaces: {relay_label}")),
-                        "{summary}"
+                    index_of(&out, "Joined the mesh as ");
+                    assert_eq!(
+                        runtime.interfaces(),
+                        vec![relay_label.to_string()],
+                        "the dialing local rnsd is not among the connected interfaces"
                     );
-                    assert!(!summary.contains("local rnsd"), "{summary}");
                     let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[1]"),
@@ -25119,12 +26070,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         stderr_lines()
                     );
                     let out = stdout_lines()[stdout_before..].to_vec();
-                    let summary = &out[index_of(&out, "Mesh is on for this session")];
-                    assert!(
-                        summary.contains(&format!("  interfaces: {relay_label}")),
-                        "{summary}"
+                    index_of(&out, "Joined the mesh as ");
+                    assert_eq!(
+                        runtime.interfaces(),
+                        vec![relay_label.to_string()],
+                        "the dialing local rnsd is not among the connected interfaces"
                     );
-                    assert!(!summary.contains("local rnsd"), "{summary}");
                     let info = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&info, "interfaces[1]"),
@@ -25564,7 +26515,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     .unwrap_err()
                     .to_string();
                     assert!(
-                        err.contains(&hash),
+                        err.contains(short(&hash)),
                         "a leading --yes consents and the send reaches trust: {err}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -26140,7 +27091,11 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert!(header.ends_with(" . expires in 6d . id acc-1"), "{text}");
                     assert_eq!(
                         &out[access_title + 2..],
-                        ["     2 paths", "Asked by this node: none"],
+                        [
+                            "     2 paths",
+                            "`.mesh files help` says what access requests and grants mean.",
+                            "Asked by your sessions: none",
+                        ],
                         "{text}"
                     );
 
@@ -26262,8 +27217,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     index_of(&out, "What leaves this machine");
                     index_of(&out, "fresh id");
                     assert!(
-                        !out.iter()
-                            .any(|line| line.contains("Mesh is on for this session")),
+                        !out.iter().any(|line| line.contains("Joined the mesh as ")),
                         "{out:?}"
                     );
                 });
@@ -26715,9 +27669,9 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// `.mesh status <dest>` on a peer that is in the table but not trusted is
             /// refused by trust standing before any link is opened, naming the same
-            /// standing `.mesh people list` lists (`untrusted` / `blocked (instance)` /
-            /// `blocked (identity)`); a denied destination the node has never heard is
-            /// likewise never linked, and its deny-only row reads `blocked (instance)`,
+            /// standing `.mesh people list` lists (`untrusted` / `blocked (session)` /
+            /// `blocked (user)`); a denied destination the node has never heard is
+            /// likewise never linked, and its deny-only row reads `blocked (session)`,
             /// never `trusted`.
             #[test]
             #[serial]
@@ -26765,8 +27719,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for (destination, standing) in [
                         (&untrusted, "untrusted"),
-                        (&denied, "blocked (instance)"),
-                        (&blocked, "blocked (identity)"),
+                        (&denied, "blocked (session)"),
+                        (&blocked, "blocked (user)"),
                     ] {
                         let err = run(&mut ctx, &format!(".mesh people status {destination}"))
                             .await
@@ -26800,18 +27754,18 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     };
                     assert!(row(&untrusted).contains("untrusted"), "{}", row(&untrusted));
                     assert!(
-                        row(&denied).contains(" blocked (instance) "),
+                        row(&denied).contains(" blocked (session) "),
                         "{}",
                         row(&denied)
                     );
                     assert!(!row(&denied).contains(" trusted "), "{}", row(&denied));
                     assert!(
-                        row(&blocked).contains(" blocked (identity) "),
+                        row(&blocked).contains(" blocked (user) "),
                         "{}",
                         row(&blocked)
                     );
                     assert!(
-                        row(&deny_only).contains(" blocked (instance) "),
+                        row(&deny_only).contains(" blocked (session) "),
                         "{}",
                         row(&deny_only)
                     );
@@ -27002,9 +27956,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         assert!(
-                            err.starts_with(&format!(
-                                "Destination {destination} could not be reached"
-                            )),
+                            err.starts_with(&format!("Session {destination} could not be reached")),
                             "{line}: {err}"
                         );
                     }
@@ -27328,8 +28280,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // and `--yes` changes nothing about that.
                     for (destination, standing) in [
                         (&untrusted, "untrusted"),
-                        (&denied, "blocked (instance)"),
-                        (&blocked, "blocked (identity)"),
+                        (&denied, "blocked (session)"),
+                        (&blocked, "blocked (user)"),
                     ] {
                         for line in [
                             format!(".mesh messaging send {destination} hello"),
@@ -27390,7 +28342,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let out = stdout_lines()[before..].to_vec();
                     assert!(!out.iter().any(|text| text.starts_with("Sent ")), "{out:?}");
                     assert!(
-                        err.contains(&deny_only) || err.contains("blocked (instance)"),
+                        err.contains(&deny_only) || err.contains("blocked (session)"),
                         "{err}"
                     );
                     assert!(
@@ -27656,8 +28608,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
             /// the same way: plain unheard -> not-heard once the path request goes
             /// unanswered; unheard but denied at the
-            /// destination tier -> blocked (instance); heard untrusted, blocked (instance)
-            /// or blocked (identity) -> that standing.
+            /// destination tier -> blocked (session); heard untrusted, blocked (session)
+            /// or blocked (user) -> that standing.
             #[test]
             #[serial]
             fn message_and_status_classify_the_same_destination_the_same_way() {
@@ -27704,10 +28656,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
 
                     let classify = |err: &str| -> &'static str {
-                        if err.contains(" is blocked (instance) ") {
-                            "blocked (instance)"
-                        } else if err.contains(" is blocked (identity) ") {
-                            "blocked (identity)"
+                        if err.contains(" is blocked (session) ") {
+                            "blocked (session)"
+                        } else if err.contains(" is blocked (user) ") {
+                            "blocked (user)"
                         } else if err.contains(" is untrusted ") {
                             "untrusted"
                         } else if err.contains("did not answer a path request") {
@@ -27719,10 +28671,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                     for (destination, expected) in [
                         (&unheard, "not-heard"),
-                        (&unheard_denied, "blocked (instance)"),
+                        (&unheard_denied, "blocked (session)"),
                         (&untrusted, "untrusted"),
-                        (&denied, "blocked (instance)"),
-                        (&blocked, "blocked (identity)"),
+                        (&denied, "blocked (session)"),
+                        (&blocked, "blocked (user)"),
                     ] {
                         let asked_before = prompt_script::prompts_asked();
                         let status_err =
@@ -32256,7 +33208,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     // Verb help for a withdrawn word falls back to the full list, which
                     // names the verbs that replaced them and none of the withdrawn ones.
                     assert_eq!(render_verb_help("", "undeny"), render_help());
-                    let help = render_help();
+                    let help = [
+                        render_help(),
+                        render_group_help("messaging"),
+                        render_group_help("access"),
+                    ]
+                    .join("\n");
                     for present in [
                         ".mesh messaging sync",
                         ".mesh access forget",
@@ -32907,7 +33864,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             /// An instance known from the peer table alone is never under `access revoke session <TAB>`
             /// (no record) and stays out while blocked; `access trust session <TAB>` keeps offering it,
             /// `access revoke user <TAB>` still offers the identity, `.mesh people list` labels
-            /// the row `blocked (instance)`; `access revoke` of the record-less instance is refused
+            /// the row `blocked (session)`; `access revoke` of the record-less instance is refused
             /// by the identity grant and writes nothing. After `access trust session` lifts the block,
             /// `.mesh people list` says `trusted`, `access block session <TAB>` offers the (unlabelled) record as
             /// `trusted`, and `access revoke session <TAB>` still leaves it out: the identity grant covers
@@ -32990,7 +33947,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     assert_eq!(row.label, None);
 
                     let trust_cell = peers_trust(&mut ctx).await;
-                    assert_eq!(trust_cell, "blocked (instance)", "{trust_cell}");
+                    assert_eq!(trust_cell, "blocked (session)", "{trust_cell}");
                     assert!(!offers(&ctx, &["access", "revoke", "session", ""]).contains(&dest));
                     assert!(offers(&ctx, &["access", "trust", "session", ""]).contains(&dest));
                     assert!(
@@ -34082,7 +35039,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let nothing = index_of(
                         &lines,
-                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                        &format!(
+                            "Nothing held for you at propagation node {}.",
+                            short(&fake.hex())
+                        ),
                     );
                     assert!(asking < nothing, "{lines:?}");
                     assert_eq!(fake.script.seen().len(), 1);
@@ -34171,7 +35131,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let lines = stdout_lines();
                     index_of(
                         &lines,
-                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                        &format!(
+                            "Nothing held for you at propagation node {}.",
+                            short(&fake.hex())
+                        ),
                     );
                     assert_eq!(fake.script.seen().len(), 1, "one fetch went to the node");
 
@@ -34204,7 +35167,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let lines = stdout_lines();
                     index_of(
                         &lines,
-                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                        &format!(
+                            "Nothing held for you at propagation node {}.",
+                            short(&fake.hex())
+                        ),
                     );
                     assert_eq!(fake.script.seen().len(), 1, "one fetch went to the node");
 
@@ -34263,7 +35229,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let lines = stdout_lines();
                     index_of(
                         &lines,
-                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                        &format!(
+                            "Nothing held for you at propagation node {}.",
+                            short(&fake.hex())
+                        ),
                     );
                     assert_eq!(fake.script.seen().len(), 1);
 
@@ -34408,13 +35377,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .unwrap();
 
                     for (destination, standing, tail) in [
-                        (&denied, "blocked (instance)", KNOCK_REFUSAL_TAIL),
+                        (&denied, "blocked (session)", KNOCK_REFUSAL_TAIL),
                         (
                             &unheard_denied,
-                            "blocked (instance)",
+                            "blocked (session)",
                             UNHEARD_KNOCK_REFUSAL_TAIL,
                         ),
-                        (&blocked, "blocked (identity)", KNOCK_REFUSAL_TAIL),
+                        (&blocked, "blocked (user)", KNOCK_REFUSAL_TAIL),
                     ] {
                         let before = stdout_lines().len();
                         let err =
@@ -35414,8 +36383,13 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .await
                         .unwrap();
                         let own = started.runtime.current_destination_hash();
+                        let who = started
+                            .runtime
+                            .owner_namer()
+                            .who(started.runtime.identity_at(&peer).as_deref(), &peer)
+                            .to_string();
                         let no_answer = format!(
-                            "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
+                            "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
                             short(&peer)
                         );
 
@@ -36838,8 +37812,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     );
                     let out = stdout_lines();
                     assert!(
-                        !out.iter()
-                            .any(|line| line.contains("Mesh is on for this session")),
+                        !out.iter().any(|line| line.contains("Joined the mesh as ")),
                         "{out:?}"
                     );
                 });
@@ -37252,14 +38225,35 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     let before = trust_file(&trust).expect("the record is on disk");
 
                     let out = out_of(&mut ctx, ".mesh").await.unwrap();
-                    let usages: Vec<&str> = out
+                    let mut listing = out.clone();
+                    for (group, _) in GROUPS {
+                        listing.push('\n');
+                        listing
+                            .push_str(&out_of(&mut ctx, &format!(".mesh {group}")).await.unwrap());
+                    }
+                    let paths: Vec<String> = listing
                         .lines()
-                        .filter_map(|line| line.strip_prefix("  "))
-                        .filter(|line| line.starts_with(".mesh "))
+                        .filter_map(|line| line.strip_prefix("│ "))
+                        .filter_map(|cells| cells.split(" ┆").next())
+                        .map(str::trim_end)
+                        .filter(|cell| cell.starts_with(".mesh "))
+                        .filter(|cell| {
+                            !GROUPS
+                                .iter()
+                                .any(|(group, _)| *cell == format!(".mesh {group}"))
+                        })
+                        .map(str::to_string)
                         .collect();
-                    let expected: Vec<&str> =
-                        COMMANDS.iter().map(|(_, _, usage, _)| *usage).collect();
-                    assert_eq!(usages, expected, "{out}");
+                    let expected: Vec<String> = COMMANDS
+                        .iter()
+                        .map(|(group, verb, _, _)| {
+                            format!(".mesh {group} {verb}").replace("  ", " ")
+                        })
+                        .collect();
+                    assert_eq!(
+                        paths, expected,
+                        "every command once, in table order: {listing}"
+                    );
                     let listed: Vec<String> = COMMANDS
                         .iter()
                         .map(|(group, verb, _, _)| {
@@ -37290,10 +38284,14 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     for absent in ["undeny", "files undeny", "untrust", "shares"] {
                         assert!(!listed.iter().any(|path| path == absent), "{absent}: {out}");
                     }
-                    assert!(out.contains("  .mesh messaging sync\n      Fetch now the messages a propagation node holds for this session"), "{out}");
                     assert!(
-                        out.contains("      Erase everything you know about them, blocks included; they become a stranger"),
-                        "{out}"
+                        listing.lines().any(|line| line.starts_with("│ .mesh messaging sync ")
+                            && line.contains("Fetch now the messages a propagation node holds for this session")),
+                        "{listing}"
+                    );
+                    assert!(
+                        listing.contains("Erase everything you know about them, blocks included; they become a stranger"),
+                        "{listing}"
                     );
                     assert_eq!(out_of(&mut ctx, ".mesh help").await.unwrap(), out);
 
@@ -37492,7 +38490,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// With an instance blocked in place, `access revoke --stale --confirm` for an
             /// ancient horizon sweeps a stale sibling but leaves the block where it is,
-            /// `.mesh people list` shows the instance as `blocked (instance)`,
+            /// `.mesh people list` shows the instance as `blocked (session)`,
             /// `access block` then `access unblock` of its identity leaves the deny
             /// standing, and the verb error after that spells the full destination twice.
             #[test]
@@ -37566,7 +38564,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                         .into_iter()
                         .find(|row| row[0] == "Tia")
                         .unwrap_or_else(|| panic!("no Tia row in {peers}"));
-                    assert_eq!(tia[2], "blocked (instance)", "{tia:?}");
+                    assert_eq!(tia[2], "blocked (session)", "{tia:?}");
 
                     for line in [
                         format!(".mesh access block user {id} --yes"),
@@ -40275,7 +41273,8 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 mod effective_all {
                     use super::*;
 
-                    const LEGEND: &str = "shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in deny: a secret name nothing serves unless an override names the file; protected: inside .git or a config directory, never served; not allowed: no allow rule names it.";
+                    /// The line `--all` ends on; the verdicts are explained in `files help`.
+                    const LEGEND: &str = "`.mesh files help` says what the verdicts mean.";
 
                     /// With no allow rule, `--all` still lists every file under the root
                     /// with what it is, where plain `--effective` has nothing to resolve.
@@ -40345,10 +41344,10 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                             assert_eq!(
                                 table_footer(&out),
                                 [
-                                    LEGEND.to_string(),
                                     format!(
                                         "... and 5 more rows not shown (--all stops at {ALL_LIST_ROWS} rows); drop --all to see only the files an allow rule names."
                                     ),
+                                    LEGEND.to_string(),
                                 ],
                                 "{out}"
                             );
@@ -45741,7 +46740,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
                             assert!(
                                 out.lines().any(|line| line
-                                    == "Access requests (1)     grant: /mesh files grant <id> [--standing] . refuse: /mesh files refuse <id>"),
+                                    == "Access requests (1)         grant: /mesh files grant <id> [--standing] . refuse: /mesh files refuse <id>"),
                                 "{out}"
                             );
                             assert!(!out.contains(".mesh"), "{out}");

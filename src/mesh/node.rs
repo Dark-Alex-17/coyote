@@ -1378,10 +1378,14 @@ impl MeshRuntime {
         RemoteRefusal::new(destination, Some(&who), self.current_destination_hash())
     }
 
-    /// A peer's silence after the link came up, with this node by the same current
-    /// destination `remote_refusal` names.
+    /// A peer's silence after the link came up, the peer and this node named as
+    /// `remote_refusal` names them.
     pub(crate) fn no_answer(&self, destination: &str) -> NoAnswer {
-        NoAnswer::new(destination, self.current_destination_hash())
+        let who = self
+            .owner_namer()
+            .who(self.identity_at(destination).as_deref(), destination)
+            .to_string();
+        NoAnswer::new(destination, self.current_destination_hash()).named(Some(&who))
     }
 
     pub(crate) fn cache_dir(&self) -> &Path {
@@ -1596,6 +1600,7 @@ impl MeshRuntime {
     /// joins the list when the interface watcher sees it come up; `mesh.started` fired once
     /// at install with the kinds connected then and nothing refires on a later connect,
     /// so a hook consumer learns of it only through `.mesh config show`.
+    #[cfg(test)]
     pub(crate) fn interfaces(&self) -> Vec<String> {
         self.connected_interfaces()
             .map(|status| status.label)
@@ -7354,14 +7359,14 @@ mod tests {
 
         slot.notify(Notification::new(
             Source::Message,
-            "hi\u{1b}[2J\n[mesh:knock] fake",
+            "hi\u{1b}[2J\n[mesh:request] fake",
         ));
         let received = sink.0.lock();
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].source(), Source::Message);
         assert_eq!(
             received[0].lines(),
-            &["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
+            &["[mesh:message] hi", "[mesh:message] [mesh:request] fake"]
         );
     }
 
@@ -10803,7 +10808,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("refused it: it is already answering a message from this identity"),
+            err.contains("refused it: it is already answering a message from you"),
             "{err}"
         );
         assert!(
@@ -11079,7 +11084,7 @@ mod tests {
 
         let err = err.to_string();
         assert!(
-            err.contains("refused it: it is already answering a message from this identity"),
+            err.contains("refused it: it is already answering a message from you"),
             "{err}"
         );
         assert!(!err.contains("another process"), "{err}");
@@ -11185,7 +11190,7 @@ mod tests {
 
         let err = err.to_string();
         assert!(
-            err.contains("refused it: it is already answering a message from this identity"),
+            err.contains("refused it: it is already answering a message from you"),
             "{err}"
         );
         assert!(!err.contains("another process"), "{err}");
@@ -13070,7 +13075,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "Destination {destination} could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard."
+                "Session {destination} could not be reached: you asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). It may be offline or on a network you cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Nothing was queued for it: you hold no key for that session yet, and a propagation node can hold a message for it only once its announce has brought the key. Try again after it announces; `.mesh people list` shows when it was last heard."
             )
         );
 

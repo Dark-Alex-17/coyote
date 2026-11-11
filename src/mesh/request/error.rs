@@ -387,6 +387,7 @@ impl fmt::Display for RemoteRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NoAnswer {
     destination: String,
+    display_name: Option<String>,
     own_destination: String,
 }
 
@@ -394,7 +395,25 @@ impl NoAnswer {
     pub(crate) fn new(destination: &str, own_destination: String) -> Self {
         Self {
             destination: destination.to_string(),
+            display_name: None,
             own_destination,
+        }
+    }
+
+    /// The same silence with the peer named `<user> / <session>`, as `RemoteRefusal`
+    /// names it.
+    pub(crate) fn named(mut self, display_name: Option<&str>) -> Self {
+        self.display_name = display_name.and_then(|name| display_text(name, WHO_MAX_CHARS));
+        self
+    }
+
+    /// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, or the short
+    /// hash alone when no name was given.
+    fn named_peer(&self) -> String {
+        let dest8 = short(&self.destination);
+        match &self.display_name {
+            Some(name) => format!("\"{}\" ({dest8})", name.replace('"', "'")),
+            None => dest8.to_string(),
         }
     }
 
@@ -402,8 +421,8 @@ impl NoAnswer {
     /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node lifts it: ask the person at {} to run .mesh access trust session {} (or .mesh access unblock session {} if they blocked this session); the peer did not answer, so nothing reached them.",
-            short(&self.destination),
+            "Nothing on your side lifts it: ask the person at {} to run .mesh access trust session {} (or .mesh access unblock session {} if they blocked this session); the peer did not answer, so nothing reached them.",
+            self.named_peer(),
             self.own_destination,
             self.own_destination
         )
@@ -426,7 +445,7 @@ impl fmt::Display for NoAnswer {
         write!(
             f,
             "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
-            short(&self.destination),
+            self.named_peer(),
             own = self.own_destination
         )
     }

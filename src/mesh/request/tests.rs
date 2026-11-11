@@ -4054,7 +4054,10 @@ pub(crate) mod network {
         assert_eq!(source, Source::Mesh);
         assert_eq!(from, Origin::Peer(presenter_hex[..8].to_string()));
         assert!(text.starts_with("error: "), "{text}");
-        assert!(text.contains("is now presented under identity"), "{text}");
+        assert!(
+            text.contains("is now presented under the key of user"),
+            "{text}"
+        );
         assert!(text.contains("is refused when it asks"), "{text}");
 
         // The row has aged out: the memory refuses, silently, and the handler still never runs.
@@ -8431,7 +8434,7 @@ pub(crate) mod network {
         assert_eq!(
             err.to_string(),
             format!(
-                "{} refused it: it is busy with a request from this identity (one at a time per identity). Try again in a minute.",
+                "{} refused it: it is busy with a request from you (one at a time per user). Try again in a minute.",
                 &destination[..8]
             )
         );

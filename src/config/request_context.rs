@@ -37301,7 +37301,7 @@ mod tests {
         assert_eq!(
             destination_row(&record_less_deny).1.unwrap(),
             format!(
-                "{} . {} . blocked (instance) . heard never",
+                "{} . {} . blocked (session) . heard never",
                 short(&destination),
                 short(&destination)
             ),
@@ -38545,7 +38545,7 @@ mod tests {
         assert_eq!(
             completion_description(&trust, &fixture.refused_destination),
             format!(
-                "{} / {1} . {1} . blocked (instance) . 1 hops . heard 4m ago",
+                "{} / {1} . {1} . blocked (session) . 1 hops . heard 4m ago",
                 short(&fixture.refused_peer_identity),
                 short(&fixture.refused_destination)
             ),
@@ -38626,7 +38626,7 @@ mod tests {
                 &fixture.blocked_knock.destination_hash
             ),
             format!(
-                "{} / {1} . {1} . blocked (identity) . 1 hops . heard 3m ago",
+                "{} / {1} . {1} . blocked (user) . 1 hops . heard 3m ago",
                 short(&fixture.blocked_knock.identity_hash),
                 short(&fixture.blocked_knock.destination_hash)
             )
@@ -39340,7 +39340,7 @@ mod tests {
         assert_eq!(
             completion_description(&destinations, &fixture.refused_destination),
             format!(
-                "{} / {1} . {1} . blocked (instance) . 1 hops . heard 4m ago",
+                "{} / {1} . {1} . blocked (session) . 1 hops . heard 4m ago",
                 short(&fixture.refused_peer_identity),
                 short(&fixture.refused_destination)
             )
@@ -39348,7 +39348,7 @@ mod tests {
         assert_eq!(
             completion_description(&destinations, &unheard),
             format!(
-                "unnamed / {} . {} . blocked (instance) . heard never",
+                "unnamed / {} . {} . blocked (session) . heard never",
                 short(&unheard),
                 short(&unheard)
             ),
@@ -39438,7 +39438,7 @@ mod tests {
         assert_eq!(
             completion_description(&unblock_rows, &dest),
             format!(
-                "{} / Bea Lab . {} . blocked (instance) . 1 hops . heard 1m ago",
+                "{} / Bea Lab . {} . blocked (session) . 1 hops . heard 1m ago",
                 short(&identity),
                 short(&dest)
             ),

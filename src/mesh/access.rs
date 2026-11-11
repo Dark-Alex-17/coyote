@@ -394,7 +394,7 @@ impl fmt::Display for AccessError {
             ),
             Self::UnknownDestination { recently_seen } => write!(
                 f,
-                "The destination {}{} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard.",
+                "The session {}{} Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the session's announce has been heard. `.mesh people list` shows when it was last heard.",
                 unreachable_cause(),
                 left_mesh_hint_when(*recently_seen)
             ),
@@ -415,7 +415,7 @@ impl fmt::Display for AccessError {
             ),
             Self::Throttled { destination } => write!(
                 f,
-                "{} refused it: it is busy with a request from this identity (one at a time per identity). Try again in a minute.",
+                "{} refused it: it is busy with a request from you (one at a time per user). Try again in a minute.",
                 short(destination)
             ),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
@@ -1832,11 +1832,18 @@ mod no_answer_tests {
             .unwrap_err();
 
         let own = runtime.current_destination_hash();
-        assert_eq!(err, AccessError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        let who = runtime
+            .owner_namer()
+            .who(runtime.identity_at(&to).as_deref(), &to)
+            .to_string();
+        assert_eq!(
+            err,
+            AccessError::NoAnswer(NoAnswer::new(&to, own.clone()).named(Some(&who)))
+        );
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from.",
+                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );
@@ -4304,7 +4311,7 @@ mod tests {
             .to_string();
 
         assert!(
-            err.contains("refused it: it is already answering a message from this identity"),
+            err.contains("refused it: it is already answering a message from you"),
             "{err}"
         );
         assert!(!err.contains("already closed"), "{err}");
@@ -6121,7 +6128,7 @@ mod tests {
             let destination = "0123456789abcdef".repeat(2);
             assert_eq!(
                 AccessError::Throttled { destination }.to_string(),
-                "01234567 refused it: it is busy with a request from this identity (one at a time per identity). Try again in a minute."
+                "01234567 refused it: it is busy with a request from you (one at a time per user). Try again in a minute."
             );
         }
     }
@@ -6471,7 +6478,7 @@ mod tests {
         let text = unannounced.to_string();
         assert_eq!(
             text,
-            "The destination could not be reached: this node asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard."
+            "The session could not be reached: you asked the network for a route to it and got no answer within 5 s (a relay that restarted has no path to it until it announces again). It may be offline or on a network you cannot reach. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; nothing was queued for it, because a request can be held on a propagation node only after the session's announce has been heard. `.mesh people list` shows when it was last heard."
         );
         assert!(
             !text.contains("since this node started") && !text.contains("sync"),

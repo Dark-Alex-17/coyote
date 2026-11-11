@@ -1436,14 +1436,14 @@ impl fmt::Display for SendError {
         match self {
             Self::NotTrusted { destination } => write!(
                 f,
-                "Session {destination} is not trusted for messaging. Trust it first with `.mesh access trust session {destination}`; `.mesh people list` lists what this Coyote has heard from."
+                "Session {destination} is not trusted for messaging. Trust it first with `.mesh access trust session {destination}`; `.mesh people list` lists the sessions you have heard."
             ),
             Self::UnknownDestination {
                 destination,
                 recently_seen,
             } => write!(
                 f,
-                "{}{} Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard.",
+                "{}{} Nothing was queued for it: you hold no key for that session yet, and a propagation node can hold a message for it only once its announce has brought the key. Try again after it announces; `.mesh people list` shows when it was last heard.",
                 unreachable_head(destination),
                 left_mesh_hint_when(*recently_seen)
             ),
@@ -1480,7 +1480,7 @@ impl fmt::Display for SendError {
             ),
             Self::Throttled { destination } => write!(
                 f,
-                "{} refused it: it is already answering a message from this identity (one at a time per identity). Try again in a minute.",
+                "{} refused it: it is already answering a message from you (one at a time per user). Try again in a minute.",
                 short(destination)
             ),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
@@ -2559,7 +2559,7 @@ impl MeshRuntime {
 /// The first sentences of every refusal for a destination the table knows but the network
 /// could not route to; each surface adds what, if anything, was queued for it.
 pub(crate) fn unreachable_head(destination: &str) -> String {
-    format!("Destination {destination} {}", unreachable_cause())
+    format!("Session {destination} {}", unreachable_cause())
 }
 
 /// The sentence a "no answer" refusal adds after `unreachable_head` or `unreachable_cause`
@@ -2683,7 +2683,7 @@ pub(crate) fn answered_not_as_coyote(destination: &str) -> String {
 /// The cause part of `unreachable_head`, for a refusal that does not name the destination.
 pub(crate) fn unreachable_cause() -> String {
     format!(
-        "could not be reached: this node asked the network for a route to it and got no answer within {} s (a relay that restarted has no path to it until it announces again). The peer may be offline or on a network this node cannot reach.",
+        "could not be reached: you asked the network for a route to it and got no answer within {} s (a relay that restarted has no path to it until it announces again). It may be offline or on a network you cannot reach.",
         PATH_REQUEST_TIMEOUT.as_secs()
     )
 }
@@ -3357,11 +3357,18 @@ mod no_answer_tests {
             .unwrap_err();
 
         let own = runtime.current_destination_hash();
-        assert_eq!(err, SendError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        let who = runtime
+            .owner_namer()
+            .who(runtime.identity_at(&to).as_deref(), &to)
+            .to_string();
+        assert_eq!(
+            err,
+            SendError::NoAnswer(NoAnswer::new(&to, own.clone()).named(Some(&who)))
+        );
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from.",
+                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );
@@ -3752,7 +3759,7 @@ mod tests {
                 }
                 .to_string(),
                 format!(
-                    "{} refused it: it is already answering a message from this identity (one at a time per identity). Try again in a minute.",
+                    "{} refused it: it is already answering a message from you (one at a time per user). Try again in a minute.",
                     &destination[..8]
                 )
             );

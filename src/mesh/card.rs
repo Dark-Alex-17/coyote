@@ -817,11 +817,18 @@ mod no_answer_tests {
             .unwrap_err();
 
         let own = runtime.current_destination_hash();
-        assert_eq!(err, StatusError::NoAnswer(NoAnswer::new(&to, own.clone())));
+        let who = runtime
+            .owner_namer()
+            .who(runtime.identity_at(&to).as_deref(), &to)
+            .to_string();
+        assert_eq!(
+            err,
+            StatusError::NoAnswer(NoAnswer::new(&to, own.clone()).named(Some(&who)))
+        );
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). A status request is answered live or not at all; nothing queues it for later.",
+                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). A status request is answered live or not at all; nothing queues it for later.",
                 short(&to)
             )
         );

@@ -236,7 +236,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh people",
-            "See the people and sessions you have heard from, and what one session is doing",
+            "See the users and sessions you have heard from, and what one session is doing",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -261,7 +261,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh config",
-            "Show your mesh settings and rotate your mesh identity",
+            "Show your mesh settings and replace your mesh key",
             AssertState::pass(),
         ),
         ReplCommand::new(

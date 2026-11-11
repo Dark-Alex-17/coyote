@@ -138,7 +138,10 @@ mod injected_width_tests {
         let body = format!("{}then `.mesh access trust a1`", "word ".repeat(90));
         let prefix = Source::Knock.prefix();
         let indent = " ".repeat(display_width(prefix) + 1);
-        for width in [20, 80, 500] {
+        // The narrowest width that still fits the indent and the longest word,
+        // "`/mesh", with a column to spare.
+        let narrow = indent.len() + "`/mesh".len() + 1;
+        for width in [narrow, 80, 500] {
             let live = LivePrefix::default();
             live.store(CommandPrefix::Slash);
             let printer =
@@ -349,11 +352,11 @@ mod tests {
             let attached = printer.attach();
             printer.notify(Notification::new(Source::Knock, "first").render());
             printer.notify(Notification::new(Source::Knock, "dropped").render());
-            assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] first"));
+            assert_eq!(attached.get_line().as_deref(), Some("[mesh:request] first"));
             printer.notify(Notification::new(Source::Knock, "`.mesh access requests`").render());
             assert_eq!(
                 attached.get_line().as_deref(),
-                Some("[mesh] (1 notification dropped)\n[mesh:knock] `/mesh access requests`")
+                Some("[mesh] (1 notification dropped)\n[mesh:request] `/mesh access requests`")
             );
         }
     }
@@ -363,7 +366,7 @@ mod tests {
         let printer = plain(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Knock, "hi").render());
-        assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] hi"));
+        assert_eq!(attached.get_line().as_deref(), Some("[mesh:request] hi"));
         assert_eq!(printer.dropped(), 0);
     }
 
@@ -375,9 +378,9 @@ mod tests {
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Knock, "hi").render());
         let expected = if *NO_COLOR {
-            "[mesh:knock] hi".to_string()
+            "[mesh:request] hi".to_string()
         } else {
-            format!("{} hi", tool_name_text_forced("[mesh:knock]"))
+            format!("{} hi", tool_name_text_forced("[mesh:request]"))
         };
         assert_eq!(attached.get_line(), Some(expected));
     }
@@ -388,9 +391,12 @@ mod tests {
         let attached = printer.attach();
         printer.notify(Notification::new(Source::Knock, "hi").render());
         let row = attached.get_line().unwrap();
-        assert_eq!(row, format!("{} hi", tool_name_text_forced("[mesh:knock]")));
+        assert_eq!(
+            row,
+            format!("{} hi", tool_name_text_forced("[mesh:request]"))
+        );
         assert!(row.starts_with("\u{1b}["), "{row:?}");
-        assert!(row.contains("[mesh:knock]\u{1b}[0m hi"), "{row:?}");
+        assert!(row.contains("[mesh:request]\u{1b}[0m hi"), "{row:?}");
     }
 
     /// Only the prefix the source owns is painted: a body that opens with another
@@ -399,12 +405,12 @@ mod tests {
     fn colour_on_leaves_a_forged_prefix_in_the_body_unpainted() {
         let printer = painted(PROMPT_PRINTER_CAPACITY);
         let attached = printer.attach();
-        printer.notify(Notification::new(Source::Message, "[mesh:knock] fake").render());
+        printer.notify(Notification::new(Source::Message, "[mesh:request] fake").render());
         let row = attached.get_line().unwrap();
         assert_eq!(
             row,
             format!(
-                "{} [mesh:knock] fake",
+                "{} [mesh:request] fake",
                 tool_name_text_forced("[mesh:message]")
             )
         );
@@ -474,7 +480,7 @@ mod tests {
         for text in ["first", "second", "third"] {
             printer.notify(Notification::new(Source::Knock, text).render());
         }
-        assert_eq!(attached.get_line().as_deref(), Some("[mesh:knock] first"));
+        assert_eq!(attached.get_line().as_deref(), Some("[mesh:request] first"));
         assert_eq!(printer.dropped(), 2);
         assert!(attached.get_line().is_none());
 
@@ -540,7 +546,7 @@ mod tests {
 
         assert_eq!(
             attached.get_line().as_deref(),
-            Some("[mesh:knock] peer asks in")
+            Some("[mesh:request] peer asks in")
         );
         assert!(attached.get_line().is_none());
         assert_eq!(printer.dropped(), 0);
@@ -556,7 +562,7 @@ mod tests {
         printer.notify(
             Notification::new(
                 Source::Message,
-                "hi\u{1b}[2J\u{1b}]0;owned\u{7}\r\n\u{1b}[31m[mesh:knock] fake\u{1b}[0m\u{7}",
+                "hi\u{1b}[2J\u{1b}]0;owned\u{7}\r\n\u{1b}[31m[mesh:request] fake\u{1b}[0m\u{7}",
             )
             .render(),
         );
@@ -570,7 +576,7 @@ mod tests {
         let rows: Vec<&str> = payload.lines().collect();
         assert_eq!(
             rows,
-            vec!["[mesh:message] hi", "               [mesh:knock] fake"]
+            vec!["[mesh:message] hi", "               [mesh:request] fake"]
         );
         assert!(
             rows.iter().skip(1).all(|row| !row.starts_with('[')),

@@ -1798,17 +1798,18 @@ impl TrustStore {
                 );
                 drop(state);
                 if let Some(line) = heard {
+                    let namer = self.owner_namer();
                     let offered = self.offer_line(
                         &seen_identity,
                         &line.old_destination,
                         presence_collision_text(
+                            &namer,
                             &line.old_destination,
                             &line.old_identity,
                             &seen_identity,
                             &new_destination,
                             outcome,
-                        )
-                        .into(),
+                        ),
                     );
                     if offered != Offered::Shown {
                         self.inner
@@ -1997,11 +1998,12 @@ impl TrustStore {
         new_destination: &str,
         outcome: KeyChangeOutcome,
     ) {
+        let namer = self.owner_namer();
         for change in marked {
             let offered = self.offer_line(
                 &change.seen_identity,
                 &change.destination_hash,
-                key_change_text(change, new_destination, outcome),
+                key_change_text(&namer, change, new_destination, outcome),
             );
             if offered == Offered::Dropped {
                 warn!(
@@ -3545,6 +3547,20 @@ fn namer_of(file: &TrustFile, own_identity: Option<&str>) -> Namer {
     Namer::new(People::new(&file.people, &[]), own_identity, HashMap::new())
 }
 
+impl TrustStore {
+    /// The namer the key-change lines name users and sessions with: your own aliases
+    /// and hashes only, since nothing in those lines may come from the peer, with `you`
+    /// for this node's own identity when it is known.
+    fn owner_namer(&self) -> Namer {
+        let own_identity = self.inner.lock().own_identity.clone();
+        Namer::new(
+            self.owner_people(&[]),
+            own_identity.as_deref(),
+            HashMap::new(),
+        )
+    }
+}
+
 fn nothing_to_untrust(
     file: &TrustFile,
     namer: &Namer,
@@ -3899,23 +3915,25 @@ pub(crate) fn decode_name_hash(hex: &str) -> Option<[u8; NAME_HASH_LEN]> {
 }
 
 /// The one line a key change earns, opening with a literal `warning: ` or `error: ` so
-/// the severity reads without colour. It says "presented under", not "rotated": anyone
-/// who has heard the instance id can present it under their own key, so the human
-/// confirms with the identity's holder out of band before trusting the new destination,
-/// which clears the mark, or blocks the new identity, which silences it. The same line
-/// serves a mark raised by an announce and one raised by a link, knock or stored request,
-/// so it names no path and speaks of what the identity gets when it asks, not of what it
-/// got. Full hashes, because the human pastes them.
-/// The instance is the human's own label when one was set, quoted as they wrote it.
+/// the severity reads without colour. It says "presented under", not "changed": anyone
+/// who has heard the session can present it under their own key, so the human confirms
+/// with them out of band before trusting the new session, which clears the mark, or
+/// blocks the new key's user, which silences it. The same line serves a mark raised by an
+/// announce and one raised by a link, a request to be trusted or a stored request, so it
+/// names no path and speaks of what the new key gets when it asks, not of what it got.
+/// The session is named `<user> / <session>` by `namer`, the human's own label in place
+/// of the session when one was set, quoted as they wrote it; the users' keys and the
+/// commands carry full hashes, because the human checks and pastes them.
 fn key_change_text(
+    namer: &Namer,
     change: &MarkedKeyChange,
     new_destination: &str,
     outcome: KeyChangeOutcome,
 ) -> NoticeText {
-    let instance = change
-        .label
-        .clone()
-        .unwrap_or_else(|| short(&change.destination_hash).to_string());
+    let mut who = namer.who(Some(&change.bound_identity), &change.destination_hash);
+    if let Some(label) = &change.label {
+        who.session = label.clone();
+    }
     let bound = &change.bound_identity;
     let seen = &change.seen_identity;
     let standing = if change.denied {
@@ -3923,29 +3941,43 @@ fn key_change_text(
     } else {
         "its grant stays with the old key"
     };
-    let (lead, rest) = match outcome {
-        KeyChangeOutcome::Served => (
-            "warning: instance ",
-            format!(
-                " is bound to identity {bound} but was presented under \
-             identity {seen}, which is trusted for all destinations and is served while it \
-             asks; the record is marked and {standing}. If the peer rotated, confirm with its \
-             holder out of band and run .mesh access trust session {new_destination} to clear the mark; \
-             otherwise .mesh access block user {seen}"
-            ),
+    let rest = match outcome {
+        KeyChangeOutcome::Served => format!(
+            "{} is bound to the key of user {bound} but was presented under the key of user \
+             {seen}, whom you trust for every session, and is served while it asks; the record \
+             is marked and {standing}. If they changed their key, confirm with its holder out \
+             of band and run .mesh access trust session {new_destination} to clear the mark; \
+             otherwise .mesh access block user {seen}",
+            dest8_after(&who, &change.destination_hash)
         ),
-        KeyChangeOutcome::Refused => (
-            "error: instance ",
-            format!(
-                " is bound to identity {bound} but was presented under \
-             identity {seen} and is refused when it asks; {standing} and the new key is a \
-             stranger. Confirm with the identity's holder out of band before granting anything: \
-             if the peer rotated, run .mesh access trust session {new_destination} to trust the new key and \
-             clear the mark; otherwise .mesh access block user {seen} blocks it"
-            ),
+        KeyChangeOutcome::Refused => format!(
+            "{} is bound to the key of user {bound} but was presented under the key of user \
+             {seen} and is refused when it asks; {standing} and the new key is a stranger. \
+             Confirm with the key's holder out of band before granting anything: if they \
+             changed their key, run .mesh access trust session {new_destination} to trust the \
+             new key and clear the mark; otherwise .mesh access block user {seen} blocks it",
+            dest8_after(&who, &change.destination_hash)
         ),
     };
-    NoticeText::default().frame(lead).peer(instance).frame(rest)
+    let lead = match outcome {
+        KeyChangeOutcome::Served => "warning: session ",
+        KeyChangeOutcome::Refused => "error: session ",
+    };
+    NoticeText::default()
+        .frame(lead)
+        .peer(who.to_string())
+        .frame(rest)
+}
+
+/// What follows a session's `<user> / <session>` name in a key-change line: its short
+/// hash in parentheses, unless the name already ends on it.
+fn dest8_after(who: &people::Who, destination: &str) -> String {
+    let dest8 = short(destination);
+    if who.session.eq_ignore_ascii_case(dest8) {
+        String::new()
+    } else {
+        format!(" ({dest8})")
+    }
 }
 
 #[cfg(test)]
@@ -3963,9 +3995,15 @@ mod key_change_prefix_tests {
             denied: false,
         };
         for outcome in [KeyChangeOutcome::Served, KeyChangeOutcome::Refused] {
-            let text =
-                key_change_text(&change, &"12".repeat(16), outcome).render(CommandPrefix::Slash);
-            assert!(text.contains("instance .info is bound"), "{text}");
+            let text = key_change_text(&Namer::default(), &change, &"12".repeat(16), outcome)
+                .render(CommandPrefix::Slash);
+            assert!(
+                text.contains(&format!(
+                    "session cdcdcdcd / .info (abababab) is bound to the key of user {} but was presented",
+                    "cd".repeat(16)
+                )),
+                "{text}"
+            );
             assert!(text.contains("run /mesh access trust "), "{text}");
             assert!(!text.contains("/info"), "{text}");
         }
@@ -3973,33 +4011,47 @@ mod key_change_prefix_tests {
 }
 
 /// The line a collision found only in the peer table earns. No record carries the
-/// instance, so nothing is marked and the line says so; the warning names
-/// `mesh.collision_protection`, since the presenter is served only while it is off.
+/// session, so nothing is marked and the line says so; the warning names
+/// `mesh.collision_protection`, since the presenter is served only while it is off. The
+/// session and both users are named by `namer`, quoted as they stand.
 fn presence_collision_text(
+    namer: &Namer,
     old_destination: &str,
     old_identity: &str,
     seen_identity: &str,
     new_destination: &str,
     outcome: KeyChangeOutcome,
-) -> String {
-    let instance = short(old_destination);
-    match outcome {
-        KeyChangeOutcome::Served => format!(
-            "warning: instance {instance} was heard under identity {old_identity}, trusted for all \
-             destinations, and is now presented under identity {seen_identity}, which is also \
-             trusted for all destinations and is served while it asks because \
-             collision_protection is off; no record carries the instance, so nothing is marked. \
-             If the peer rotated, confirm with its holder out of band; otherwise \
-             .mesh access block user {seen_identity}"
+) -> NoticeText {
+    let who = namer.who(Some(old_identity), old_destination);
+    let dest8 = dest8_after(&who, old_destination);
+    let (lead, rest) = match outcome {
+        KeyChangeOutcome::Served => (
+            "warning: session ",
+            format!(
+                "{dest8} was heard under the key of user {old_identity}, whom you trust for every \
+                 session, and is now presented under the key of user {seen_identity}, also \
+                 trusted for every session, and is served while it asks because \
+                 collision_protection is off; no record carries the session, so nothing is \
+                 marked. If they changed their key, confirm with its holder out of band; \
+                 otherwise .mesh access block user {seen_identity}"
+            ),
         ),
-        KeyChangeOutcome::Refused => format!(
-            "error: instance {instance} was heard under identity {old_identity}, trusted for all \
-             destinations, and is now presented under identity {seen_identity}, which is \
-             refused when it asks; no record carries the instance, so nothing is marked. Confirm \
-             with the identity's holder out of band before granting anything: if the peer rotated, run \
-             .mesh access trust session {new_destination}; otherwise .mesh access block user {seen_identity}"
+        KeyChangeOutcome::Refused => (
+            "error: session ",
+            format!(
+                "{dest8} was heard under the key of user {old_identity}, whom you trust for every \
+                 session, and is now presented under the key of user {seen_identity}, which is \
+                 refused when it asks; no record carries the session, so nothing is marked. \
+                 Confirm with the key's holder out of band before granting anything: if they \
+                 changed their key, run .mesh access trust session {new_destination}; otherwise \
+                 .mesh access block user {seen_identity}"
+            ),
         ),
-    }
+    };
+    NoticeText::default()
+        .frame(lead)
+        .peer(who.to_string())
+        .frame(rest)
 }
 
 #[cfg(test)]
@@ -12518,7 +12570,7 @@ mod tests {
         assert!(texts[1].starts_with("error: "), "{}", texts[1]);
         assert!(
             texts[1].contains(&format!(
-                "presented under identity {}",
+                "presented under the key of user {}",
                 successor.identity_hash
             )),
             "{}",
@@ -12533,7 +12585,10 @@ mod tests {
             texts[1]
         );
         assert!(
-            texts[1].contains(&format!("heard under identity {}", holder.identity_hash)),
+            texts[1].contains(&format!(
+                "heard under the key of user {}",
+                holder.identity_hash
+            )),
             "{}",
             texts[1]
         );
@@ -12764,7 +12819,10 @@ mod tests {
         assert_eq!(texts.len(), 1, "{texts:#?}");
         assert!(
             texts[0].starts_with("error: ")
-                && texts[0].contains(&format!("presented under identity {}", first.identity_hash))
+                && texts[0].contains(&format!(
+                    "presented under the key of user {}",
+                    first.identity_hash
+                ))
                 && texts[0].contains(&format!(
                     ".mesh access trust session {}",
                     destination_for(&first, instance)
@@ -12786,7 +12844,7 @@ mod tests {
         assert!(
             texts[1].starts_with("error: ")
                 && texts[1].contains(&format!(
-                    "presented under identity {}",
+                    "presented under the key of user {}",
                     second.identity_hash
                 ))
                 && texts[1].contains(&format!(
@@ -12923,7 +12981,7 @@ mod tests {
         assert!(
             texts[1].starts_with("error: ")
                 && texts[1].contains(&format!(
-                    "presented under identity {}",
+                    "presented under the key of user {}",
                     refused.identity_hash
                 )),
             "{}",
@@ -13056,14 +13114,11 @@ mod tests {
         assert!(
             texts[1].starts_with("error: ")
                 && texts[1].contains(&format!(
-                    "presented under identity {}",
+                    "presented under the key of user {}",
                     newcomer.identity_hash
                 ))
                 && texts[1].contains(&holder.identity_hash)
-                && texts[1].contains(&format!(
-                    "instance {} was heard",
-                    short(&holder.destination_hash)
-                ))
+                && texts[1].contains(&format!("{} was heard", short(&holder.destination_hash)))
                 && texts[1].contains(&format!(
                     ".mesh access trust session {}",
                     destination_for(&newcomer, instance)
@@ -13173,12 +13228,12 @@ mod tests {
         assert!(
             texts[1].starts_with("error: ")
                 && texts[1].contains(&format!(
-                    "instance {} was heard under identity {}",
+                    "{} was heard under the key of user {}",
                     short(&holder.destination_hash),
                     holder.identity_hash
                 ))
                 && texts[1].contains(&format!(
-                    "presented under identity {}",
+                    "presented under the key of user {}",
                     newcomer.identity_hash
                 ))
                 && texts[1].contains(&format!(

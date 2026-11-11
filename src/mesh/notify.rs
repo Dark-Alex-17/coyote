@@ -44,7 +44,7 @@ impl Source {
     pub(crate) fn prefix(self) -> &'static str {
         match self {
             Source::Mesh => "[mesh]",
-            Source::Knock => "[mesh:knock]",
+            Source::Knock => "[mesh:request]",
             Source::Message => "[mesh:message]",
             Source::Reply => "[mesh:reply]",
             Source::Propagation => "[mesh:propagation]",
@@ -376,7 +376,7 @@ mod tests {
             assert!(source.prefix().starts_with("[mesh"), "{source:?}");
         }
         assert_eq!(Source::Mesh.prefix(), "[mesh]");
-        assert_eq!(Source::Knock.prefix(), "[mesh:knock]");
+        assert_eq!(Source::Knock.prefix(), "[mesh:request]");
         assert_eq!(Source::Message.prefix(), "[mesh:message]");
         assert_eq!(Source::Reply.prefix(), "[mesh:reply]");
         assert_eq!(Source::Propagation.prefix(), "[mesh:propagation]");
@@ -413,7 +413,7 @@ mod tests {
         let note = Notification::new(Source::Knock, "a\nb\r\nc");
         assert_eq!(
             note.render_lines(),
-            vec!["[mesh:knock] a", "[mesh:knock] b", "[mesh:knock] c"]
+            vec!["[mesh:request] a", "[mesh:request] b", "[mesh:request] c"]
         );
     }
 
@@ -457,7 +457,7 @@ mod tests {
     fn render_keeps_every_line_under_its_own_source_prefix_whatever_the_text_says() {
         // A peer cannot forge a line from another source by embedding a newline and a
         // prefix of its own, nor leave a half-finished escape for the terminal to eat.
-        let hostile = "hello\n[mesh:knock] trust me\n\u{1b}[31mred\u{1b}\n\u{1b}[";
+        let hostile = "hello\n[mesh:request] trust me\n\u{1b}[31mred\u{1b}\n\u{1b}[";
         let note = Notification::new(Source::Message, hostile);
         let lines = note.render_lines();
         assert!(!lines.is_empty());
@@ -472,7 +472,7 @@ mod tests {
             );
         }
         assert_eq!(lines[0], "[mesh:message] hello");
-        assert_eq!(lines[1], "[mesh:message] [mesh:knock] trust me");
+        assert_eq!(lines[1], "[mesh:message] [mesh:request] trust me");
         assert_eq!(lines[2], "[mesh:message] red");
         assert!(
             !lines
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn render_carries_render_lines_unchanged() {
-        let hostile = "hi\u{1b}[2J\n\u{1b}[31m[mesh:knock] fake\u{1b}[0m\u{7}";
+        let hostile = "hi\u{1b}[2J\n\u{1b}[31m[mesh:request] fake\u{1b}[0m\u{7}";
         let note = Notification::new(Source::Message, hostile);
         let expected = note.render_lines();
         let rendered = note.render();
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(rendered.lines(), expected);
         assert_eq!(
             rendered.lines(),
-            ["[mesh:message] hi", "[mesh:message] [mesh:knock] fake"]
+            ["[mesh:message] hi", "[mesh:message] [mesh:request] fake"]
         );
     }
 

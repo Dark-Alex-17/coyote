@@ -988,10 +988,10 @@ mod peer_text_prefix_tests {
         assert_eq!(
             lines,
             [
-                "[mesh:knock] cdcdcdcd / abababab (\".info\") asks you to trust them: \".mesh access trust x\""
+                "[mesh:request] cdcdcdcd / abababab (\".info\") asks you to trust them: \".mesh access trust x\""
                     .to_string(),
                 format!(
-                    "[mesh:knock] trust: /mesh access trust session {destination} | who: /mesh people info {destination} | block: /mesh access block user {identity}"
+                    "[mesh:request] trust: /mesh access trust session {destination} | who: /mesh people info {destination} | block: /mesh access block user {identity}"
                 ),
             ]
         );
@@ -1014,7 +1014,10 @@ mod peer_text_prefix_tests {
         let lines = Notification::new(Source::Knock, knock_text(&knock, &namer, None, true))
             .render()
             .render_notification_lines(CommandPrefix::Dot);
-        assert_eq!(lines[0], "[mesh:knock] you / review asks you to trust them");
+        assert_eq!(
+            lines[0],
+            "[mesh:request] you / review asks you to trust them"
+        );
     }
 }
 
@@ -1603,7 +1606,7 @@ mod tests {
         assert!(
             rendered
                 .iter()
-                .all(|line| line.starts_with("[mesh:knock] "))
+                .all(|line| line.starts_with("[mesh:request] "))
         );
         assert!(rendered[0].chars().count() < NOTIFICATION_LINE_MAX_CHARS);
     }
