@@ -710,6 +710,8 @@ pub(crate) struct MeshRuntime {
     announce: bool,
     display_name: Option<String>,
     about: Option<String>,
+    person_name: Option<String>,
+    share_session_name: bool,
     peer_limits: PeerLimitConfig,
     request_timeouts: RequestTimeouts,
     inline_max_bytes: u64,
@@ -1016,6 +1018,8 @@ impl MeshRuntime {
             announce: config.announce,
             display_name: config.display_name.clone(),
             about: config.about.clone(),
+            person_name: config.person_name.clone(),
+            share_session_name: config.share_session_name,
             peer_limits: PeerLimitConfig::from(config),
             request_timeouts: RequestTimeouts::from(config),
             inline_max_bytes: config.fetch.inline_max_bytes,
@@ -1448,6 +1452,18 @@ impl MeshRuntime {
     /// The configured `mesh.about` line, carried on the status card and nowhere else.
     pub(crate) fn about(&self) -> Option<&str> {
         self.about.as_deref()
+    }
+
+    /// The configured `mesh.person_name`, carried on the status card and nowhere else.
+    pub(crate) fn person_name(&self) -> Option<&str> {
+        self.person_name.as_deref()
+    }
+
+    /// The name the session this node serves goes by, while `mesh.share_session_name` is
+    /// on; the status card is the only place it goes.
+    pub(crate) fn shared_session_name(&self) -> Option<String> {
+        self.share_session_name
+            .then(|| self.instance_row.lock().session.clone())
     }
 
     /// The per-peer ceilings the node was started with, for the slot that installs it.

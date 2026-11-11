@@ -504,6 +504,8 @@ mod tests {
         session.set_name("secret-session-name".to_string());
         let config = MeshConfig {
             display_name: Some("Alex".to_string()),
+            person_name: Some("secret-person-name".to_string()),
+            share_session_name: true,
             ..MeshConfig::default()
         };
 
@@ -513,6 +515,7 @@ mod tests {
         assert!(contains(b"Alex"), "the probe must be able to match");
         for secret in [
             b"secret-session-name".as_slice(),
+            b"secret-person-name",
             b"secret objective text",
             b"roadmap",
             b"/Users/aclarke/code/coyote",

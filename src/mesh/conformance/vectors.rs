@@ -23,8 +23,9 @@ use crate::mesh::announce::{
 };
 use crate::mesh::card::{
     ABOUT_MAX_CHARS, BRANCH_MAX_CHARS, CardRepo, CardSource, CardState, CardTodo,
-    DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN,
-    STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError, TODO_GOAL_MAX_CHARS,
+    DISPLAY_NAME_MAX_CHARS, NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE,
+    STATE_UNKNOWN, STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError,
+    TODO_GOAL_MAX_CHARS,
 };
 use crate::mesh::events::AccessDecision;
 use crate::mesh::grants::GRANT_RECORD_VERSION;
@@ -703,6 +704,8 @@ fn card_sub(sub: &str, entries: Vec<(&str, Value)>) -> Value {
 fn minimal_card() -> StatusCard {
     StatusCard {
         display_name: None,
+        session: None,
+        person_name: None,
         objective: None,
         state: CardState {
             code: STATE_IDLE,
@@ -720,6 +723,8 @@ fn minimal_card() -> StatusCard {
 fn maximal_card() -> StatusCard {
     StatusCard {
         display_name: Some(text(DISPLAY_NAME_MAX_CHARS)),
+        session: Some(text(NAME_MAX_CHARS)),
+        person_name: Some(text(NAME_MAX_CHARS)),
         objective: Some(text(OBJECTIVE_MAX_CHARS)),
         state: CardState {
             code: STATE_WORKING,
@@ -3033,6 +3038,8 @@ fn canon_vectors() -> Vec<Vector> {
                 expect: map(vec![
                     ("v", Value::from(1u64)),
                     ("display_name", Value::from(text(DISPLAY_NAME_MAX_CHARS))),
+                    ("session", Value::from(text(NAME_MAX_CHARS))),
+                    ("person_name", Value::from(text(NAME_MAX_CHARS))),
                     ("objective", Value::from(text(OBJECTIVE_MAX_CHARS))),
                     (
                         "state",
@@ -3808,6 +3815,8 @@ fn code_vectors() -> Vec<Vector> {
                     vec![
                         "v",
                         "display_name",
+                        "session",
+                        "person_name",
                         "objective",
                         "state",
                         "repo",
@@ -5063,6 +5072,114 @@ fn status_vectors() -> Vec<Vector> {
             }),
         ),
         card(
+            "card-session-and-person-name-are-kept",
+            Kind::Valid,
+            set(
+                set(card_value(), "session", Value::from("review")),
+                "person_name",
+                Value::from("Alexandra"),
+            ),
+            accepted(StatusCard {
+                session: Some("review".to_string()),
+                person_name: Some("Alexandra".to_string()),
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "card-integer-session-is-treated-as-absent",
+            Kind::Invalid,
+            set(card_value(), "session", Value::from(7)),
+            accepted(minimal_card()),
+        ),
+        card(
+            "card-binary-session-is-treated-as-absent",
+            Kind::Invalid,
+            set(card_value(), "session", Value::Binary(b"review".to_vec())),
+            accepted(minimal_card()),
+        ),
+        card(
+            "card-array-person-name-is-treated-as-absent",
+            Kind::Invalid,
+            set(card_value(), "person_name", Value::Array(vec![])),
+            accepted(minimal_card()),
+        ),
+        card(
+            "card-map-person-name-is-treated-as-absent",
+            Kind::Invalid,
+            set(
+                card_value(),
+                "person_name",
+                map(vec![("name", Value::from("x"))]),
+            ),
+            accepted(minimal_card()),
+        ),
+        card(
+            "card-nil-session-and-person-name-are-treated-as-absent",
+            Kind::Valid,
+            set(
+                set(card_value(), "session", Value::Nil),
+                "person_name",
+                Value::Nil,
+            ),
+            accepted(minimal_card()),
+        ),
+        card(
+            "card-whitespace-session-and-person-name-are-treated-as-absent",
+            Kind::Valid,
+            set(
+                set(card_value(), "session", Value::from(" \u{200B} ")),
+                "person_name",
+                Value::from("\u{1b}[0m"),
+            ),
+            accepted(minimal_card()),
+        ),
+        card(
+            "card-session-and-person-name-at-64-chars-are-kept",
+            Kind::Boundary,
+            set(
+                set(card_value(), "session", name(NAME_MAX_CHARS)),
+                "person_name",
+                name(NAME_MAX_CHARS),
+            ),
+            accepted(StatusCard {
+                session: Some(text(NAME_MAX_CHARS)),
+                person_name: Some(text(NAME_MAX_CHARS)),
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "card-session-and-person-name-of-65-chars-are-truncated-to-64",
+            Kind::Boundary,
+            set(
+                set(card_value(), "session", name(NAME_MAX_CHARS + 1)),
+                "person_name",
+                Value::from("é".repeat(NAME_MAX_CHARS + 1)),
+            ),
+            accepted(StatusCard {
+                session: Some(text(NAME_MAX_CHARS)),
+                person_name: Some("é".repeat(NAME_MAX_CHARS)),
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "card-session-and-person-name-are-cleaned-to-display-text",
+            Kind::Invalid,
+            set(
+                set(
+                    card_value(),
+                    "session",
+                    Value::from("re\u{1b}[31mview\u{202E}\u{2060}"),
+                ),
+                "person_name",
+                Value::from("  Alex\u{200B}andra\u{2060}  "),
+            ),
+            accepted(StatusCard {
+                session: Some("review".to_string()),
+                person_name: Some("Alexandra".to_string()),
+                ..minimal_card()
+            }),
+        ),
+        card(
             "card-binary-objective-is-malformed",
             Kind::Invalid,
             set(card_value(), "objective", Value::Binary(b"ship".to_vec())),
@@ -5336,6 +5453,8 @@ fn status_vectors() -> Vec<Vector> {
                 expect: map(vec![
                     ("v", Value::from(1u64)),
                     ("display_name", Value::from(text(DISPLAY_NAME_MAX_CHARS))),
+                    ("session", Value::from(text(NAME_MAX_CHARS))),
+                    ("person_name", Value::from(text(NAME_MAX_CHARS))),
                     ("objective", Value::from(text(OBJECTIVE_MAX_CHARS))),
                     (
                         "state",

@@ -1,6 +1,6 @@
 use super::paths;
 use crate::mesh::LocalEndpoint;
-use crate::mesh::card::ABOUT_MAX_CHARS;
+use crate::mesh::card::{ABOUT_MAX_CHARS, NAME_MAX_CHARS};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::request::DEFAULT_LINK_TIMEOUT;
 use anyhow::{Result, bail};
@@ -61,6 +61,16 @@ pub struct MeshConfig {
     /// One human-written line on what this node's envoy can help with; carried on the
     /// status card to trusted peers, never in the announce.
     pub about: Option<String>,
+    /// Whether the status card carries the name of the session serving it, to trusted
+    /// peers only; never in an announce, a knock or a message, and never logged. On by
+    /// default in Coyote, a deliberate departure from the SCOPE spec, whose default is
+    /// off: a session name is often a project or customer codename, so turn it off where
+    /// that matters.
+    pub share_session_name: bool,
+    /// The name you prefer to be called, carried on the status card to trusted peers
+    /// only; never derived from `display_name`, never in an announce, a knock or a
+    /// message, and never logged. Unset, the card carries no `person_name`.
+    pub person_name: Option<String>,
     pub interfaces: Vec<MeshInterface>,
     pub brief: MeshBrief,
     pub digest_prompt: Option<String>,
@@ -238,6 +248,8 @@ impl Default for MeshConfig {
             display_name: None,
             display_name_on_public: false,
             about: None,
+            share_session_name: true,
+            person_name: None,
             interfaces: vec![MeshInterface::Local {
                 port: None,
                 instance: None,
@@ -320,6 +332,14 @@ impl MeshConfig {
             if n > ABOUT_MAX_CHARS {
                 bail!(
                     "mesh.about is {n} characters, which is over the cap; use {ABOUT_MAX_CHARS} or fewer"
+                );
+            }
+        }
+        if let Some(person_name) = &self.person_name {
+            let n = person_name.chars().count();
+            if n > NAME_MAX_CHARS {
+                bail!(
+                    "mesh.person_name is {n} characters, which is over the cap; use {NAME_MAX_CHARS} or fewer"
                 );
             }
         }
@@ -590,6 +610,8 @@ pub fn mesh_settings_rows(mesh: &MeshConfig, with_interfaces: bool) -> Vec<(Stri
         mesh.display_name_on_public.to_string(),
     );
     row("about", super::format_option_value(&mesh.about));
+    row("share_session_name", mesh.share_session_name.to_string());
+    row("person_name", super::format_option_value(&mesh.person_name));
     if with_interfaces {
         for (i, interface) in mesh.interfaces.iter().enumerate() {
             row(&format!("interfaces[{i}]"), interface.to_string());
@@ -702,6 +724,11 @@ mod tests {
         assert_eq!(mesh.display_name, None);
         assert!(!mesh.display_name_on_public);
         assert_eq!(mesh.about, None);
+        assert!(
+            mesh.share_session_name,
+            "Coyote shares the session name by default, departing on purpose from the SCOPE spec's default of off; the config template, this key's doc and the wiki say so"
+        );
+        assert_eq!(mesh.person_name, None);
         assert_eq!(
             mesh.interfaces,
             vec![MeshInterface::Local {
@@ -1585,6 +1612,40 @@ mod tests {
     }
 
     #[test]
+    fn validate_caps_person_name_at_the_name_limit_counting_characters() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in ["Alexandra".to_string(), "\u{e9}".repeat(NAME_MAX_CHARS)] {
+            let mesh = MeshConfig {
+                person_name: Some(accepted),
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        let mesh = MeshConfig {
+            person_name: Some("\u{e9}".repeat(NAME_MAX_CHARS + 1)),
+            ..enabled
+        };
+        let err = mesh.validate(true).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "mesh.person_name is 65 characters, which is over the cap; use 64 or fewer"
+        );
+    }
+
+    #[test]
+    fn the_two_card_names_read_from_yaml_and_share_session_name_can_be_turned_off() {
+        let mesh: MeshConfig =
+            serde_yaml::from_str("share_session_name: false\nperson_name: Alexandra\n").unwrap();
+        assert!(!mesh.share_session_name);
+        assert_eq!(mesh.person_name.as_deref(), Some("Alexandra"));
+        let mesh: MeshConfig = serde_yaml::from_str("enabled: false\n").unwrap();
+        assert!(mesh.share_session_name, "an unset key keeps the default");
+    }
+
+    #[test]
     fn validate_keeps_inline_max_bytes_between_one_and_the_per_message_total() {
         let enabled = MeshConfig {
             enabled: true,
@@ -2038,6 +2099,14 @@ mod tests {
         );
         assert!(
             info.contains("  about                           null\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  share_session_name              true\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  person_name                     null\n"),
             "{info}"
         );
         assert!(

@@ -39,24 +39,30 @@ pub(crate) const CAP_MAX_CHARS: usize = 32;
 /// Cap on a person's or a session's name, in characters after `display_text` cleaning:
 /// the owner's alias and the `session` and `person_name` names a card advertises.
 pub(crate) const NAME_MAX_CHARS: usize = 64;
+/// Most `/status` requests in flight at once from one caller: a `mesh__peers` listing
+/// with its cards, or the background card fetches.
+pub(crate) const STATUS_MAX_CONCURRENCY: usize = 4;
 
 /// What a trusted peer learns about this session when it asks `/status`.
 ///
 /// Wire form: a msgpack map with string keys. `v` (integer) and `served_at_secs` (integer)
 /// are required, as is `state` (a map whose `code` is required and `since_secs` optional).
-/// `display_name`, `objective`, `repo` (`name` required, `branch` optional), `todo` (`goal`
-/// optional, `done`, `total`), `about`, `caps` and `snapshot_age_secs` are optional and left
-/// out when absent; a reader treats a missing key and nil alike, and an empty `caps` list is
-/// never emitted.
+/// `display_name`, `session`, `person_name`, `objective`, `repo` (`name` required, `branch`
+/// optional), `todo` (`goal` optional, `done`, `total`), `about`, `caps` and
+/// `snapshot_age_secs` are optional and left out when absent; a reader treats a missing key
+/// and nil alike, and an empty `caps` list is never emitted.
 ///
 /// Keys a reader does not know are ignored, so a same-version peer may add fields without
 /// breaking older readers; a state code or `caps` entry this Coyote does not define is kept
 /// as it came for the same reason. A `v` above `STATUS_CARD_VERSION` is refused with an
 /// error that names the upgrade.
 ///
-/// The card never carries a path, the working directory, the session name, the model, the
-/// role, individual todo items or brief text. `repo.name` is the last component of the
-/// repository root and nothing more.
+/// The card never carries a path, the working directory, the model, the role, individual
+/// todo items or brief text. `repo.name` is the last component of the repository root and
+/// nothing more. `session` (the serving session's name, only while `mesh.share_session_name`
+/// is on) and `person_name` (`mesh.person_name`, only when configured) are the two names a
+/// card may carry; they reach trusted peers only, are never logged, and are never put in an
+/// announce, a knock or a message.
 ///
 /// A decoded card is peer-supplied data. Its text has been through `display_text`, so it is
 /// clean and within the caps, but the numbers are not clamped. `state.code` is kept as
@@ -68,6 +74,8 @@ pub(crate) const NAME_MAX_CHARS: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusCard {
     pub display_name: Option<String>,
+    pub session: Option<String>,
+    pub person_name: Option<String>,
     pub objective: Option<String>,
     pub state: CardState,
     pub repo: Option<CardRepo>,
@@ -101,6 +109,8 @@ impl StatusCard {
     pub(crate) fn to_value(&self) -> Value {
         let mut entries = vec![(Value::from("v"), Value::from(STATUS_CARD_VERSION))];
         push_text(&mut entries, "display_name", self.display_name.as_deref());
+        push_text(&mut entries, "session", self.session.as_deref());
+        push_text(&mut entries, "person_name", self.person_name.as_deref());
         push_text(&mut entries, "objective", self.objective.as_deref());
         let mut state = vec![(Value::from("code"), Value::from(self.state.code))];
         push_u64(&mut state, "since_secs", self.state.since_secs);
@@ -171,6 +181,8 @@ impl StatusCard {
         };
         Ok(Self {
             display_name: card.text("display_name", DISPLAY_NAME_MAX_CHARS)?,
+            session: card.text_or_absent("session", NAME_MAX_CHARS),
+            person_name: card.text_or_absent("person_name", NAME_MAX_CHARS),
             objective: card.text("objective", OBJECTIVE_MAX_CHARS)?,
             state: CardState {
                 code,
@@ -318,13 +330,20 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
             .unwrap_or(now);
         crate::mesh::age_text(now, then)
     };
-    let mut lines = vec![
-        format!("name: {}", card.display_name.as_deref().unwrap_or("(none)")),
-        format!(
-            "objective: {}",
-            card.objective.as_deref().unwrap_or("(none)")
-        ),
-    ];
+    let mut lines = vec![format!(
+        "name: {}",
+        card.display_name.as_deref().unwrap_or("(none)")
+    )];
+    if let Some(session) = &card.session {
+        lines.push(format!("session: {session}"));
+    }
+    if let Some(person_name) = &card.person_name {
+        lines.push(format!("person: {person_name}"));
+    }
+    lines.push(format!(
+        "objective: {}",
+        card.objective.as_deref().unwrap_or("(none)")
+    ));
     if let Some(about) = &card.about {
         lines.push(format!("about: {about}"));
     }
@@ -365,6 +384,8 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
 /// No snapshot, as before the first turn boundary, still yields a card: state unknown,
 /// no objective even when an override is set, and only the fields read from configuration,
 /// since a trusted peer asking early is not refused.
+/// `session` is the name the snapshot was published with; `person_name` and the
+/// no-snapshot `session` come from configuration through `with_configured_names`.
 pub(crate) fn build_card(
     snapshot: Option<&MeshSnapshot>,
     objective_override: Option<&str>,
@@ -424,6 +445,10 @@ pub(crate) fn build_card(
     });
     StatusCard {
         display_name: display_name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
+        session: snapshot
+            .and_then(|snapshot| snapshot.session.as_deref())
+            .and_then(card_name),
+        person_name: None,
         objective,
         state,
         repo,
@@ -435,6 +460,29 @@ pub(crate) fn build_card(
     }
 }
 
+/// A `session` or `person_name` as the card carries it, on either side.
+fn card_name(name: &str) -> Option<String> {
+    display_text(name, NAME_MAX_CHARS)
+}
+
+impl StatusCard {
+    /// The card with the names read from configuration: `person_name` always, and
+    /// `unpublished_session`, the shared session name, only when `published` is false,
+    /// since a published snapshot carries the session name it was captured with.
+    pub(crate) fn with_configured_names(
+        mut self,
+        person_name: Option<&str>,
+        unpublished_session: Option<&str>,
+        published: bool,
+    ) -> Self {
+        self.person_name = person_name.and_then(card_name);
+        if !published {
+            self.session = unpublished_session.and_then(card_name);
+        }
+        self
+    }
+}
+
 /// Where the status provider reads the session from: the published snapshot and the live
 /// values overlaid on it. Everything is owned data, so serving never waits on a turn.
 pub(crate) trait CardSource: Send + Sync {
@@ -443,6 +491,11 @@ pub(crate) trait CardSource: Send + Sync {
     fn digest(&self) -> Option<Arc<Digest>>;
     fn display_name(&self) -> Option<String>;
     fn about(&self) -> Option<String>;
+    /// `mesh.person_name`, when configured.
+    fn person_name(&self) -> Option<String>;
+    /// The session's name while `mesh.share_session_name` is on, for the card served
+    /// before a snapshot is published; `None` while sharing is off.
+    fn shared_session(&self) -> Option<String>;
     fn caps(&self) -> Vec<String>;
 }
 
@@ -467,6 +520,15 @@ impl CardSource for MeshSlot {
     fn about(&self) -> Option<String> {
         self.get()
             .and_then(|runtime| runtime.about().map(str::to_string))
+    }
+
+    fn person_name(&self) -> Option<String> {
+        self.get()
+            .and_then(|runtime| runtime.person_name().map(str::to_string))
+    }
+
+    fn shared_session(&self) -> Option<String> {
+        self.get().and_then(|runtime| runtime.shared_session_name())
     }
 
     fn caps(&self) -> Vec<String> {
@@ -512,6 +574,11 @@ impl StatusHandler {
             about.as_deref(),
             &source.caps(),
             now,
+        )
+        .with_configured_names(
+            source.person_name().as_deref(),
+            source.shared_session().as_deref(),
+            snapshot.is_some(),
         )
     }
 }
@@ -697,6 +764,8 @@ mod tests {
     fn texts(card: &StatusCard) -> Vec<&str> {
         [
             card.display_name.as_deref(),
+            card.session.as_deref(),
+            card.person_name.as_deref(),
             card.objective.as_deref(),
             card.repo.as_ref().map(|repo| repo.name.as_str()),
             card.repo.as_ref().and_then(|repo| repo.branch.as_deref()),
@@ -738,6 +807,10 @@ mod tests {
                 text: Some("BRIEF-SECRET".into()),
                 digest_generated_at: Some(now() - Duration::from_secs(9)),
             },
+            session: Some(format!(
+                "\u{1b}[31mreview\u{202E} work\u{2060}{}",
+                "s".repeat(100)
+            )),
             cwd: PathBuf::from("/home/u/SECRET-DIR/proj/sub"),
             captured_at: now() - Duration::from_secs(7),
         }
@@ -765,6 +838,8 @@ mod tests {
             minimal,
             StatusCard {
                 display_name: None,
+                session: None,
+                person_name: None,
                 objective: None,
                 state: CardState {
                     code: STATE_UNKNOWN,
@@ -823,9 +898,146 @@ mod tests {
             None
         }
 
+        fn person_name(&self) -> Option<String> {
+            None
+        }
+
+        fn shared_session(&self) -> Option<String> {
+            None
+        }
+
         fn caps(&self) -> Vec<String> {
             Vec::new()
         }
+    }
+
+    /// A source with both names configured and the snapshot, if any, published with
+    /// `published_session`.
+    struct NamedSource {
+        snapshot: Option<MeshSnapshot>,
+    }
+
+    impl NamedSource {
+        fn published(session: Option<&str>) -> Self {
+            let mut snapshot = snapshot_fixture();
+            snapshot.session = session.map(str::to_string);
+            Self {
+                snapshot: Some(snapshot),
+            }
+        }
+    }
+
+    impl CardSource for NamedSource {
+        fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
+            self.snapshot.clone().map(Arc::new)
+        }
+
+        fn objective_override(&self) -> Option<Arc<String>> {
+            None
+        }
+
+        fn digest(&self) -> Option<Arc<Digest>> {
+            None
+        }
+
+        fn display_name(&self) -> Option<String> {
+            Some("Alex".into())
+        }
+
+        fn about(&self) -> Option<String> {
+            None
+        }
+
+        fn person_name(&self) -> Option<String> {
+            Some(format!("  Alexandra\u{1b}[1m\u{200B} {}", "x".repeat(80)))
+        }
+
+        fn shared_session(&self) -> Option<String> {
+            Some("configured-session".into())
+        }
+
+        fn caps(&self) -> Vec<String> {
+            vec!["fetch".to_string()]
+        }
+    }
+
+    #[test]
+    fn the_session_comes_from_the_snapshot_and_the_names_from_configuration_before_one() {
+        let minimal = Arc::new(NamedSource { snapshot: None });
+        let handler = StatusHandler::new(Arc::downgrade(&minimal) as Weak<dyn CardSource>);
+        let card = handler.card(now());
+        assert_eq!(card.state.code, STATE_UNKNOWN);
+        assert_eq!(card.session.as_deref(), Some("configured-session"));
+        let person = card.person_name.as_deref().unwrap();
+        assert_eq!(person.chars().count(), NAME_MAX_CHARS);
+        assert!(person.starts_with("Alexandra xx"), "{person:?}");
+        assert!(!person.chars().any(is_control_or_invisible), "{person:?}");
+
+        let published = Arc::new(NamedSource::published(Some("published-session")));
+        let handler = StatusHandler::new(Arc::downgrade(&published) as Weak<dyn CardSource>);
+        let card = handler.card(now());
+        assert_eq!(card.session.as_deref(), Some("published-session"));
+        assert_eq!(card.person_name.as_deref(), Some(person));
+
+        let unshared = Arc::new(NamedSource::published(None));
+        let handler = StatusHandler::new(Arc::downgrade(&unshared) as Weak<dyn CardSource>);
+        assert_eq!(
+            handler.card(now()).session,
+            None,
+            "a snapshot published while sharing was off carries no session, whatever the source says"
+        );
+        let keys: Vec<String> = match handler.card(now()).to_value() {
+            Value::Map(entries) => entries
+                .iter()
+                .map(|(key, _)| key.as_str().unwrap().to_string())
+                .collect(),
+            _ => unreachable!("a card encodes as a map"),
+        };
+        assert_eq!(&keys[..3], ["v", "display_name", "person_name"]);
+    }
+
+    #[test]
+    fn a_slot_without_a_runtime_serves_no_names() {
+        let slot = Arc::new(MeshSlot::default());
+        assert_eq!(CardSource::person_name(slot.as_ref()), None);
+        assert_eq!(CardSource::shared_session(slot.as_ref()), None);
+        let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
+        let card = handler.card(now());
+        assert_eq!((card.session, card.person_name), (None, None));
+    }
+
+    #[test]
+    fn names_of_the_wrong_type_read_as_absent_and_long_ones_are_cut() {
+        let mut card = build_card(None, None, None, None, None, &[], now());
+        let base = card.to_value();
+        for (key, wrong) in [
+            ("session", Value::from(7)),
+            ("person_name", Value::Array(vec![Value::from("x")])),
+            ("session", Value::Binary(b"bin".to_vec())),
+            ("person_name", Value::Boolean(true)),
+        ] {
+            let mut value = base.clone();
+            if let Value::Map(entries) = &mut value {
+                entries.push((Value::from(key), wrong));
+            }
+            assert_eq!(
+                StatusCard::from_value(&value),
+                Ok(card.clone()),
+                "a `{key}` that is not a string is treated as absent"
+            );
+        }
+        let long = format!("\u{1b}[2J{}", "\u{e9}".repeat(NAME_MAX_CHARS + 1));
+        let mut value = base;
+        if let Value::Map(entries) = &mut value {
+            entries.push((Value::from("session"), Value::from(long.as_str())));
+            entries.push((Value::from("person_name"), Value::from("  \u{200B} ")));
+        }
+        card.session = Some("\u{e9}".repeat(NAME_MAX_CHARS));
+        assert_eq!(
+            StatusCard::from_value(&value),
+            Ok(card),
+            "a long name is cleaned and cut to NAME_MAX_CHARS, a blank one is absent"
+        );
     }
 
     #[test]
@@ -1627,6 +1839,14 @@ mod tests {
         assert_eq!(todo.goal.as_deref(), Some("goal red with  breaks"));
         assert_eq!((todo.done, todo.total), (1, 2));
 
+        let session = card.session.as_deref().unwrap();
+        assert_eq!(session.chars().count(), NAME_MAX_CHARS);
+        assert!(session.starts_with("review workss"), "{session:?}");
+        assert_eq!(
+            card.person_name, None,
+            "build_card reads no configured name"
+        );
+
         assert_eq!(card.state.code, STATE_WORKING);
         assert_eq!(card.snapshot_age_secs, Some(7));
 
@@ -1738,6 +1958,8 @@ mod tests {
     fn maximal_card() -> StatusCard {
         StatusCard {
             display_name: Some("n".repeat(DISPLAY_NAME_MAX_CHARS)),
+            session: Some("s".repeat(NAME_MAX_CHARS)),
+            person_name: Some("p".repeat(NAME_MAX_CHARS)),
             objective: Some("o".repeat(OBJECTIVE_MAX_CHARS)),
             state: CardState {
                 code: STATE_WORKING,
@@ -1770,6 +1992,8 @@ mod tests {
         let known = [
             "v",
             "display_name",
+            "session",
+            "person_name",
             "objective",
             "state",
             "repo",

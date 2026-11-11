@@ -1704,6 +1704,7 @@ pub(crate) mod test_support {
                 text: None,
                 digest_generated_at: None,
             },
+            session: None,
             cwd: PathBuf::new(),
             captured_at: SystemTime::now(),
         }

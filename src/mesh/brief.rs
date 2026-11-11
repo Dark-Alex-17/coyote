@@ -115,6 +115,8 @@ pub(crate) fn assemble_brief(
 /// card's text is capped by `build_card`, but a line separator inside a field could still
 /// start a forged heading. An unknown state adds no line, so a card with nothing else in it
 /// yields no section.
+/// The card's `session` and `person_name` are never rendered: the envoy answers peers from
+/// the brief, and those names go to trusted peers on the card alone.
 fn render_card(card: &StatusCard) -> Option<String> {
     let mut lines = Vec::new();
     if let Some(name) = &card.display_name {
@@ -263,6 +265,8 @@ mod tests {
     fn card() -> StatusCard {
         StatusCard {
             display_name: Some("Alex".into()),
+            session: None,
+            person_name: None,
             objective: Some("ship it".into()),
             state: CardState {
                 code: STATE_WORKING,
@@ -383,6 +387,21 @@ mod tests {
     }
 
     #[test]
+    fn the_brief_never_carries_the_cards_session_or_person_name() {
+        let mut named = card();
+        named.session = Some("SESSION-NAME-MARKER".into());
+        named.person_name = Some("PERSON-NAME-MARKER".into());
+        let text = assemble_brief(MeshBrief::Auto, Some(&named), None, None, &todo())
+            .unwrap()
+            .text;
+        assert!(text.contains("Name: Alex"), "{text}");
+        assert!(
+            !text.contains("SESSION-NAME-MARKER") && !text.contains("PERSON-NAME-MARKER"),
+            "the envoy's brief never carries the card's names, so the envoy cannot repeat them: {text}"
+        );
+    }
+
+    #[test]
     fn the_card_section_names_about_and_caps_after_the_objective_when_the_card_has_them() {
         let mut described = card();
         described.about = Some("reviews Rust and writes docs".into());
@@ -458,6 +477,8 @@ mod tests {
 
         let unknown_card = StatusCard {
             display_name: None,
+            session: None,
+            person_name: None,
             objective: None,
             state: CardState {
                 code: STATE_UNKNOWN,
@@ -490,6 +511,8 @@ mod tests {
         let empty = TodoList::default();
         let with_code = |code: u64| StatusCard {
             display_name: Some("Alex".into()),
+            session: None,
+            person_name: None,
             objective: None,
             state: CardState {
                 code,

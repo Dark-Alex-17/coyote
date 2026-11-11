@@ -8946,6 +8946,14 @@ pub(crate) mod network {
             None
         }
 
+        fn person_name(&self) -> Option<String> {
+            None
+        }
+
+        fn shared_session(&self) -> Option<String> {
+            None
+        }
+
         fn caps(&self) -> Vec<String> {
             Vec::new()
         }
@@ -9514,6 +9522,98 @@ pub(crate) mod network {
             entries.iter().any(|(key, _)| key.as_str() == Some("about")),
             "about is on the wire"
         );
+
+        assert!(slot.stop().await.unwrap());
+        pair.responder.stop().await;
+    }
+
+    /// On the production path: node A started with `mesh.person_name` and the default
+    /// `share_session_name` serves both names cleaned. Before a snapshot the session name
+    /// is read live; once one is published the card carries the name it was published
+    /// with until the next one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_started_node_serves_its_person_name_and_the_session_name_its_snapshot_carries() {
+        let b_identity = TransportIdentity::new_from_rand(OsRng);
+        let b_identity_hash = b_identity.as_identity().address_hash;
+        let pair = NodePair::start_with(
+            "request-status-names",
+            |config| {
+                config.person_name = Some("  Alexandra\u{1b}[1m  ".into());
+            },
+            |responder| {
+                let b_destination = destination_address(&responder.origin().0, &b_identity_hash);
+                TrustList::default().destination(
+                    &b_destination.to_hex_string(),
+                    &b_identity_hash.to_hex_string(),
+                )
+            },
+        )
+        .await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(pair.node_a.clone()).unwrap();
+        slot.rename_session("first-name");
+
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(card.session.as_deref(), Some("first-name"));
+        assert_eq!(card.person_name.as_deref(), Some("Alexandra"));
+
+        slot.publish(MeshSnapshot {
+            session: CardSource::shared_session(slot.as_ref()),
+            ..snapshot_fixture()
+        });
+        slot.rename_session("second-name");
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(
+            card.session.as_deref(),
+            Some("first-name"),
+            "the card is built from the snapshot, which still carries the name it was published with"
+        );
+        slot.publish(MeshSnapshot {
+            session: CardSource::shared_session(slot.as_ref()),
+            ..snapshot_fixture()
+        });
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(card.session.as_deref(), Some("second-name"));
+        let Value::Map(entries) = card.to_value() else {
+            panic!("a card is a map");
+        };
+        let keys: Vec<&str> = entries.iter().filter_map(|(key, _)| key.as_str()).collect();
+        assert_eq!(&keys[..3], ["v", "session", "person_name"]);
+
+        assert!(slot.stop().await.unwrap());
+        pair.responder.stop().await;
+    }
+
+    /// `share_session_name: false` keeps the session name off the card and out of the
+    /// snapshot; with no `mesh.person_name` there is no `person_name` either, whatever
+    /// the display name is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_that_does_not_share_its_session_name_serves_neither_name() {
+        let b_identity = TransportIdentity::new_from_rand(OsRng);
+        let b_identity_hash = b_identity.as_identity().address_hash;
+        let pair = NodePair::start_with(
+            "request-status-no-names",
+            |config| {
+                config.share_session_name = false;
+                config.display_name = Some("Ada".into());
+            },
+            |responder| {
+                let b_destination = destination_address(&responder.origin().0, &b_identity_hash);
+                TrustList::default().destination(
+                    &b_destination.to_hex_string(),
+                    &b_identity_hash.to_hex_string(),
+                )
+            },
+        )
+        .await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(pair.node_a.clone()).unwrap();
+        slot.rename_session("codename");
+        assert_eq!(CardSource::shared_session(slot.as_ref()), None);
+
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(card.display_name.as_deref(), Some("Ada"));
+        assert_eq!((card.session, card.person_name), (None, None));
 
         assert!(slot.stop().await.unwrap());
         pair.responder.stop().await;

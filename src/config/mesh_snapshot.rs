@@ -1,4 +1,5 @@
 use super::RequestContext;
+use crate::mesh::card::CardSource;
 use crate::mesh::snapshot::{BriefState, MeshSnapshot, RepoInfo, TurnState};
 
 use std::env;
@@ -28,6 +29,7 @@ impl RequestContext {
                 text: brief.as_ref().map(|brief| brief.text.clone()),
                 digest_generated_at: brief.as_ref().and_then(|brief| brief.digest_generated_at),
             },
+            session: self.app.mesh.shared_session(),
             cwd,
             captured_at: SystemTime::now(),
         }
