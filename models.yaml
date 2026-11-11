@@ -8061,12 +8061,11 @@
     require_max_tokens: true
     supports_vision: true
     supports_function_calling: true
-  - name: baidu/ernie-5.5-flash-preview
+  - name: baidu/ernie-5.5-flash-preview:free
     type: chat
     max_input_tokens: 1024000
-    input_price: 0.28
-    output_price: 1.13
-    cache_read_price: 0.028
+    input_price: 0.0
+    output_price: 0.0
     max_output_tokens: 921600
     supports_function_calling: true
   - name: baidu/ernie-light-dt-1.0-intl
@@ -9059,10 +9058,10 @@
   - name: minimax/minimax-m2.5
     type: chat
     max_input_tokens: 200000
-    input_price: 0.3
-    output_price: 1.2
-    cache_read_price: 0.06
-    max_output_tokens: 58982
+    input_price: 0.27
+    output_price: 1.08
+    cache_read_price: 0.027
+    max_output_tokens: 128000
     supports_function_calling: true
   - name: minimax/minimax-m2.7
     type: chat
@@ -9084,9 +9083,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9445,7 +9444,7 @@
     supports_function_calling: true
   - name: nvidia/nemotron-3-super-120b-a12b
     type: chat
-    max_input_tokens: 1048576
+    max_input_tokens: 262144
     input_price: 0.075
     output_price: 0.4
     max_output_tokens: 16384
@@ -11567,9 +11566,9 @@
   - name: z-ai/glm-5.3-flash:batch
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.042
+    input_price: 0.047
     output_price: 0.061
-    cache_read_price: 0.018
+    cache_read_price: 0.02
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -11705,7 +11704,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.1824
-    output_price: 9.3388
+    output_price: 11.0055
     cache_read_price: 0.18
     max_output_tokens: 943718
     supports_vision: true
