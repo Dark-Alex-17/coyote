@@ -390,7 +390,7 @@ impl fmt::Display for AccessError {
             ),
             Self::Untrusted => write!(
                 f,
-                "The destination is not trusted for an access request. Trust it first with `.mesh access trust <destination>`; `.mesh people list` lists what this Coyote has heard from."
+                "The session is not trusted for an access request. Trust it first with `.mesh access trust session <who>`; `.mesh people list` lists what this Coyote has heard from."
             ),
             Self::UnknownDestination { recently_seen } => write!(
                 f,
@@ -1836,7 +1836,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from.",
+                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );
@@ -5417,7 +5417,7 @@ mod tests {
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(
             text.contains(&format!(
-                ".mesh access trust {}",
+                ".mesh access trust session {}",
                 origin_destination(&origin)
             )),
             "{text}"

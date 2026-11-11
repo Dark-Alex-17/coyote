@@ -3937,7 +3937,9 @@ pub(crate) mod network {
         assert!(text.contains(&presenter_hex), "{text}");
         assert!(text.contains("is refused when it asks"), "{text}");
         assert!(
-            text.contains(&format!(".mesh access trust {presenter_destination}")),
+            text.contains(&format!(
+                ".mesh access trust session {presenter_destination}"
+            )),
             "{text}"
         );
         assert!(
@@ -5905,13 +5907,16 @@ pub(crate) mod network {
         let (source, origin, text) = surface.only();
         assert_eq!(source, Source::Knock);
         assert_eq!(origin, Origin::Peer(a_identity[..8].to_string()));
-        assert!(text.contains(&format!("(identity {a_identity})")), "{text}");
         assert!(
-            text.contains(&format!("from instance {a_instance}: \"hi from A\"")),
+            text.contains(&format!(
+                "{} / {} asks you to trust them: \"hi from A\"",
+                &a_identity[..8],
+                &a_instance[..8]
+            )),
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh access trust {a_instance}")),
+            text.contains(&format!(".mesh access trust session {a_instance}")),
             "{text}"
         );
         assert!(
@@ -5919,7 +5924,7 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh access block --identity {a_identity}")),
+            text.contains(&format!(".mesh access block user {a_identity}")),
             "{text}"
         );
         let cached = rig.gate.cache().list(SystemTime::now()).unwrap();
@@ -5990,13 +5995,16 @@ pub(crate) mod network {
             assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
             assert!(notes[0].model_note.is_none());
             let text = notes[0].text.plain();
-            assert!(text.contains(&format!("(identity {b_identity})")), "{text}");
             assert!(
-                text.contains(&format!("knocks from instance {b_instance}: \"hello\"")),
+                text.contains(&format!(
+                    "{} / {} asks you to trust them: \"hello\"",
+                    &b_identity[..8],
+                    &b_instance[..8]
+                )),
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh access trust {b_instance}")),
+                text.contains(&format!(".mesh access trust session {b_instance}")),
                 "{text}"
             );
         }
@@ -6212,12 +6220,12 @@ pub(crate) mod network {
     }
 
     /// B's identity is trusted for all destinations and B's own instance also carries a
-    /// bound record. Withdrawing the identity grant, as `untrust --identity` does, serves
-    /// B's instance on its own record afterwards: the identity entry stays on file as a
-    /// known identity granting nothing, the destination record stays, and B's status
-    /// request is served on the destination tier instead of the identity tier.
+    /// bound record. Revoking B as a user, as `.mesh access revoke user` does, takes the
+    /// grant and the bound record: the identity entry stays on file granting nothing, so
+    /// B is known but not trusted. B's status request is refused rather than dropped, and
+    /// B's request to be trusted is filed and surfaced, so `.mesh access requests` lists it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn untrust_identity_withdraws_the_grant_and_serves_the_instance_on_its_own_record() {
+    async fn untrust_identity_takes_grant_and_record_and_files_the_users_knock() {
         install_log_collector();
         let pair = NodePair::start_with(
             "request-untrust-identity-own-record",
@@ -6230,13 +6238,12 @@ pub(crate) mod network {
             },
         )
         .await;
-        let (slot, _idle) = installed_slot(&pair);
+        let (slot, idle) = installed_slot(&pair);
         let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let trust = pair.node_a.trust();
 
         pair.status_of_a(&pair.responder.identity, Value::Nil).await;
-        let served = |rule: Rule| format!("served: {rule:?}");
         assert!(
             debug_snapshot().iter().any(|m| m
                 .contains(&format!("from {} on link ", &b_identity[..8]))
@@ -6245,37 +6252,55 @@ pub(crate) mod network {
             debug_snapshot()
         );
 
-        let standing = trust
+        let revoked = trust
             .untrust_identity(slot.as_ref(), &b_identity, false)
             .unwrap();
-        assert_eq!(standing, 1, "one instance stays trusted on its own");
+        assert!(revoked.was_granting);
+        assert_eq!(revoked.removed, vec![b_instance.clone()]);
         let records = trust.records();
         let identity_record = records
             .iter()
             .find(|record| record.hash == b_identity)
-            .expect("the identity entry stays while an instance is bound");
+            .expect("the identity entry stays, granting nothing");
         assert!(!identity_record.all_destinations, "{identity_record:#?}");
         assert!(
-            records.iter().any(|record| record.hash == b_instance),
-            "the bound destination record stays: {records:#?}"
+            !records.iter().any(|record| record.hash == b_instance),
+            "the bound destination record goes: {records:#?}"
         );
         assert_eq!(
             trust.authorize(&b_identity, &b_instance).rule,
-            Rule::DestinationTrusted
+            Rule::DefaultClosed
         );
 
-        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
-
-        assert_debug_logged_from(&b_identity[..8], &served(Rule::DestinationTrusted));
+        let err = link::request(
+            &pair.responder.transport,
+            &pair.responder.identity,
+            &pair.a_desc,
+            STATUS_PATH,
+            pair.responder.envelope(Value::Nil),
+            short_options(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            RequestError::Refused(RefusalCode::NoAccess),
+            "a known user's request is refused, not dropped"
+        );
+        let err = b_knocks_a(&pair).await.unwrap_err();
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        wait_until("the knock to be filed", || cached_knocks(&pair) >= 1).await;
+        wait_until("the knock to surface", || !idle.0.lock().is_empty()).await;
         pair.stop_node_a().await;
     }
 
     /// B's identity is trusted for all destinations and nothing else of B is on file.
-    /// Withdrawing the grant with no instance bound removes the identity entry, so B is a
-    /// stranger afterwards: its next status request is dropped before decode (B times
-    /// out), nothing is filed and nothing surfaces.
+    /// Revoking B as a user with no instance bound keeps the identity entry, granting
+    /// nothing, so B is known, not a stranger: its next status request is refused, and its
+    /// request to be trusted is filed. Forgetting B makes the stranger whose request is
+    /// dropped before decode (B times out), with nothing filed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn untrust_identity_with_nothing_bound_leaves_a_stranger_whose_request_is_silence() {
+    async fn untrust_identity_with_nothing_bound_leaves_a_known_user_and_forget_a_stranger() {
         install_log_collector();
         let pair = NodePair::start_with(
             "request-untrust-identity-nothing-bound",
@@ -6293,10 +6318,28 @@ pub(crate) mod network {
         pair.status_of_a(&pair.responder.identity, Value::Nil).await;
         assert_debug_logged_from(&b_identity[..8], "served: IdentityTrusted");
 
-        let standing = trust
+        let revoked = trust
             .untrust_identity(slot.as_ref(), &b_identity, false)
             .unwrap();
-        assert_eq!(standing, 0);
+        assert!(revoked.was_granting && revoked.removed.is_empty());
+        assert_eq!(
+            trust.identity_standing(&b_identity),
+            IdentityStanding::Trusted {
+                all_destinations: false
+            }
+        );
+        let err = b_knocks_a(&pair).await.unwrap_err();
+        assert_eq!(err, RequestError::Refused(RefusalCode::NoAccess));
+        wait_until("the knock to be filed", || cached_knocks(&pair) == 1).await;
+
+        trust
+            .forget_identity(slot.as_ref(), &b_identity, false)
+            .unwrap();
+        pair.node_a
+            .knock_gate()
+            .forget_identity(&b_identity)
+            .unwrap();
+        idle.0.lock().clear();
         let records = pair.trust_records_of_others();
         assert!(records.is_empty(), "{records:#?}");
         assert_eq!(
@@ -6577,7 +6620,7 @@ pub(crate) mod network {
     /// lifts the instance block alone: the lift names the identity's block as what still
     /// refuses the instance, and B's status request is dropped in silence. Lifting the
     /// identity block trusts nothing (B is a stranger whose request is dropped), and the
-    /// remedy the instance line named, `.mesh access trust <destination>`, is accepted afterwards
+    /// remedy the instance line named, `.mesh access trust session <destination>`, is accepted afterwards
     /// and serves B's next request on the destination tier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unblock_of_an_instance_under_a_blocked_identity_names_the_block_and_its_remedy_works()
@@ -6739,11 +6782,11 @@ pub(crate) mod network {
             assert!(text.starts_with("warning: "), "{text}");
             assert!(text.contains("is served while it asks"), "{text}");
             assert!(
-                text.contains(&format!(".mesh access trust {b_instance}")),
+                text.contains(&format!(".mesh access trust session {b_instance}")),
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh access block --identity {b_identity}")),
+                text.contains(&format!(".mesh access block user {b_identity}")),
                 "{text}"
             );
         }
@@ -6822,7 +6865,7 @@ pub(crate) mod network {
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains("is refused when it asks"), "{text}");
             assert!(
-                text.contains(&format!(".mesh access trust {b_instance}")),
+                text.contains(&format!(".mesh access trust session {b_instance}")),
                 "{text}"
             );
         }
@@ -6915,7 +6958,7 @@ pub(crate) mod network {
 
     /// The same identity-tier rotation under `mesh.collision_protection: true`: no record
     /// carries the instance, but the peer table does, so B's announce earns the owner one
-    /// `error:` line naming both identities and `.mesh access trust <B's destination>`, and B's
+    /// `error:` line naming both identities and `.mesh access trust session <B's destination>`, and B's
     /// `/status` request is refused `NoAccess` until then. Nothing is marked, `trust.yaml`
     /// is untouched, and the refused request restates nothing. The refusal outlives the
     /// table: with both rows swept at `PEER_TTL`, B's next request is refused the same way
@@ -6970,7 +7013,7 @@ pub(crate) mod network {
             assert!(!text.contains("is served while it asks"), "{text}");
             assert!(text.contains("nothing is marked"), "{text}");
             assert!(
-                text.contains(&format!(".mesh access trust {b_instance}")),
+                text.contains(&format!(".mesh access trust session {b_instance}")),
                 "{text}"
             );
         }
@@ -7030,7 +7073,7 @@ pub(crate) mod network {
     /// The one action the `error:` line names ends the presence refusal.
     /// Under `mesh.collision_protection: true` node A refuses B's `/status` (B, trusted
     /// for all destinations, presents an instance A's peer table holds under another such
-    /// identity). The human runs the named `.mesh access trust <B's destination>`: B's next
+    /// identity). The human runs the named `.mesh access trust session <B's destination>`: B's next
     /// `/status` is served, the record written is B's own destination grant with no
     /// key-change mark, and the owner hears nothing further: the destination allow is
     /// judged before the identity allow, so the peer table is not consulted for B.
@@ -7086,7 +7129,7 @@ pub(crate) mod network {
         let line = idle.0.lock()[0].text.plain();
         assert!(line.starts_with("error: "), "{line}");
         assert!(
-            line.contains(&format!(".mesh access trust {b_instance}")),
+            line.contains(&format!(".mesh access trust session {b_instance}")),
             "the line names the action: {line}"
         );
 
@@ -7452,11 +7495,11 @@ pub(crate) mod network {
                 "advises confirming with the identity's holder: {text}"
             );
             assert!(
-                text.contains(&format!(".mesh access trust {b_instance}")),
+                text.contains(&format!(".mesh access trust session {b_instance}")),
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh access block --identity {b_identity}")),
+                text.contains(&format!(".mesh access block user {b_identity}")),
                 "{text}"
             );
         }
@@ -7609,7 +7652,7 @@ pub(crate) mod network {
                 "advises confirming with the identity's holder: {text}"
             );
             assert!(
-                text.contains(&format!(".mesh access trust {b_instance}")),
+                text.contains(&format!(".mesh access trust session {b_instance}")),
                 "names the clearing trust: {text}"
             );
         }
@@ -7947,7 +7990,7 @@ pub(crate) mod network {
         assert_eq!(
             err.to_string(),
             format!(
-                "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides. No propagation node is known yet to hold the knock for it."
+                "Asked {dest8} to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
             )
         );
         assert_eq!(pair.responder.adapter.admitted_count(), 0);
@@ -8231,7 +8274,7 @@ pub(crate) mod network {
         );
         assert_eq!(
             err.to_string(),
-            "The knock could not be sent: The mesh peer refused the request: throttled (0xf6). Wait a minute and try again"
+            "The request to be trusted could not be sent: The mesh peer refused the request: throttled (0xf6). Wait a minute and try again"
         );
         assert!(!err.to_string().contains(".mesh people list"), "{err}");
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(KNOCK_PATH));
@@ -9271,7 +9314,7 @@ pub(crate) mod network {
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"{}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                "\"{}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
                 unnamed_who(
                     &pair.responder.desc.identity.address_hash.to_hex_string(),
                     &b_instance
@@ -9281,12 +9324,12 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh access trust {a_instance}")),
+            text.contains(&format!(".mesh access trust session {a_instance}")),
             "{text}"
         );
         assert!(
             text.contains(&format!(
-                "(This node does trust {b8}.) A status request",
+                "(You do trust {b8}.) A status request",
                 b8 = short(&b_instance)
             )),
             "{text}"
@@ -9347,13 +9390,13 @@ pub(crate) mod network {
             let text = err.to_string();
             assert!(
                 text.starts_with(&format!(
-                    "\"{b_who}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                    "\"{b_who}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
                     short(&b_instance)
                 )),
                 "{text}"
             );
             assert!(
-                text.contains(&format!(".mesh access trust {a_instance}")),
+                text.contains(&format!(".mesh access trust session {a_instance}")),
                 "{text}"
             );
             assert!(!text.contains("0xf1"), "{text}");
@@ -10557,7 +10600,7 @@ pub(crate) mod network {
         );
         assert!(
             err.to_string()
-                .contains(&format!(".mesh access trust {b_instance}")),
+                .contains(&format!(".mesh access trust session {b_instance}")),
             "{err}"
         );
 
@@ -11577,7 +11620,7 @@ pub(crate) mod network {
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"{}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                "\"{}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
                 unnamed_who(
                     &pair.responder.desc.identity.address_hash.to_hex_string(),
                     &b_instance
@@ -11587,11 +11630,11 @@ pub(crate) mod network {
             "{text}"
         );
         assert!(
-            text.contains(&format!(".mesh access trust {a_instance}")),
+            text.contains(&format!(".mesh access trust session {a_instance}")),
             "{text}"
         );
         assert!(
-            text.contains(&format!("(This node does trust {}.)", short(&b_instance))),
+            text.contains(&format!("(You do trust {}.)", short(&b_instance))),
             "{text}"
         );
         assert!(!text.contains("0xf1"), "{text}");
@@ -14035,7 +14078,7 @@ pub(crate) mod network {
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"{}\" ({}) refused the request: it has not trusted this instance ({a_instance}).",
+                "\"{}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
                 unnamed_who(
                     &pair.responder.desc.identity.address_hash.to_hex_string(),
                     &b_instance

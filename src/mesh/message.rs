@@ -1436,7 +1436,7 @@ impl fmt::Display for SendError {
         match self {
             Self::NotTrusted { destination } => write!(
                 f,
-                "Destination {destination} is not trusted for messaging. Trust it first with `.mesh access trust {destination}`; `.mesh people list` lists what this Coyote has heard from."
+                "Session {destination} is not trusted for messaging. Trust it first with `.mesh access trust session {destination}`; `.mesh people list` lists what this Coyote has heard from."
             ),
             Self::UnknownDestination {
                 destination,
@@ -3206,7 +3206,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from.",
+                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from.",
                 short(&to)
             )
         );
@@ -4538,7 +4538,7 @@ mod tests {
         }
         .to_string();
         assert!(
-            text.contains(&format!(".mesh access trust {}", hash_of("d"))),
+            text.contains(&format!(".mesh access trust session {}", hash_of("d"))),
             "{text}"
         );
         assert!(text.contains(".mesh people list"), "{text}");
@@ -4581,7 +4581,7 @@ mod tests {
         assert_eq!(
             named,
             format!(
-                "\"Bea\" ({d8}) refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {d8}.)",
+                "\"Bea\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {d8}.)",
                 d8 = short(&destination)
             )
         );
@@ -4593,7 +4593,7 @@ mod tests {
             "{unnamed}"
         );
         assert!(
-            unnamed.contains(&format!(".mesh access trust {own}")),
+            unnamed.contains(&format!(".mesh access trust session {own}")),
             "{unnamed}"
         );
         for text in [&named, &unnamed] {
@@ -5362,7 +5362,7 @@ mod tests {
         assert!(text.contains("is refused when it asks"), "{text}");
         assert!(text.contains("nothing is marked"), "{text}");
         assert!(
-            text.contains(&format!(".mesh access trust {sender_destination}")),
+            text.contains(&format!(".mesh access trust session {sender_destination}")),
             "{text}"
         );
 

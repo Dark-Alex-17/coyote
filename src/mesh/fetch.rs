@@ -1800,7 +1800,7 @@ mod no_answer_tests {
         assert_eq!(
             silent.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance).",
+                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
                 short(&to)
             )
         );

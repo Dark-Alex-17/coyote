@@ -2480,7 +2480,7 @@ fn seed_own_grant(trust: &TrustStore, fingerprint: &str, minted: bool) -> bool {
         Ok(granted) => granted,
         Err(err) => {
             warn!(
-                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh config show` shows.",
+                "The mesh is on, but this node's own identity {} could not be trusted for your other sessions ({}). Your sessions on this config dir are treated like an unknown peer until it is: make '{}' readable and writable again (fix or move it), then run `.mesh access trust user you`.",
                 short(fingerprint),
                 redact_hashes(&format!("{err:#}")),
                 trust.path().display()
@@ -12586,7 +12586,7 @@ mod tests {
             texts[0]
         );
         assert!(
-            texts[0].contains(&format!(".mesh access trust {b_destination}")),
+            texts[0].contains(&format!(".mesh access trust session {b_destination}")),
             "{}",
             texts[0]
         );
@@ -19133,7 +19133,7 @@ mod tests {
             assert!(!seed_own_grant(&trust, OWN, true));
 
             let remedy = format!(
-                "make '{}' readable and writable again (fix or move it), then run `.mesh access trust --identity <hash>` with the identity hash `.mesh config show` shows",
+                "make '{}' readable and writable again (fix or move it), then run `.mesh access trust user you`.",
                 trust.path().display()
             );
             let warned = warn_snapshot();
@@ -20024,14 +20024,14 @@ mod tests {
         assert_eq!(sentence.matches(&new_hash).count(), 3, "{sentence}");
         assert!(
             sentence.contains(&format!(
-                "Its owner can run .mesh access trust {new_hash} (or .mesh access unblock {new_hash} if it blocked this instance)."
+                "Its owner can run .mesh access trust session {new_hash} (or .mesh access unblock session {new_hash} if they blocked this session)."
             )),
             "{sentence}"
         );
         let next_action = refusal.next_action();
         assert!(!next_action.contains(&old_hash), "{next_action}");
         assert!(
-            next_action.contains(&format!("to run .mesh access trust {new_hash};")),
+            next_action.contains(&format!("to run .mesh access trust session {new_hash};")),
             "{next_action}"
         );
         let json = serde_json::to_value(&refusal).unwrap();
@@ -21342,9 +21342,10 @@ mod tests {
         assert_eq!(
             trust
                 .untrust_identity(slot.as_ref(), REMEMBERED_PEER, false)
-                .unwrap(),
-            1,
-            "the instance record stays bound"
+                .unwrap()
+                .removed,
+            vec![instance.clone()],
+            "the bound instance record goes with the grant"
         );
         for thread in ["first", "second"] {
             assert!(
@@ -21352,7 +21353,7 @@ mod tests {
                     .load(REMEMBERED_PEER, &remembered_from(), thread, now)
                     .unwrap()
                     .is_some(),
-                "{thread} went with an untrust"
+                "{thread} went with a revoke"
             );
         }
 

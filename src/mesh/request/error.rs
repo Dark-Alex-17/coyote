@@ -332,7 +332,7 @@ impl RemoteRefusal {
     /// identity's key change, filed none, and the wire does not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node unblocks it: ask the person at {} to run .mesh access trust {}; unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock (.mesh access requests on their side).",
+            "Nothing on this node unblocks it: ask the person at {} to run .mesh access trust session {}; unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
             short(&self.destination),
             self.own_destination
         )
@@ -363,7 +363,7 @@ impl fmt::Display for RemoteRefusal {
         }
         write!(
             f,
-            " refused the request: it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). (This node does trust {dest8}.)",
+            " refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust {dest8}.)",
             own = self.own_destination
         )
     }
@@ -392,7 +392,7 @@ impl NoAnswer {
     /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on this node lifts it: ask the person at {} to run .mesh access trust {} (or .mesh access unblock {} if they blocked this instance); the peer did not answer, so nothing reached them.",
+            "Nothing on this node lifts it: ask the person at {} to run .mesh access trust session {} (or .mesh access unblock session {} if they blocked this session); the peer did not answer, so nothing reached them.",
             short(&self.destination),
             self.own_destination,
             self.own_destination
@@ -415,7 +415,7 @@ impl fmt::Display for NoAnswer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance).",
+            "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
             short(&self.destination),
             own = self.own_destination
         )
@@ -435,13 +435,13 @@ mod no_answer_tests {
         assert_eq!(
             no_answer.to_string(),
             format!(
-                "no answer from bbbbbbbb: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance)."
+                "no answer from bbbbbbbb: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session)."
             )
         );
         let next = no_answer.next_action();
         assert!(next.is_ascii(), "{next}");
         assert!(
-            next.contains(&format!(".mesh access trust {own}")),
+            next.contains(&format!(".mesh access trust session {own}")),
             "{next}"
         );
         assert!(!next.contains("knock"), "silence filed no knock: {next}");

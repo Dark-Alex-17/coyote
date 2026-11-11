@@ -1667,18 +1667,18 @@ fn trust_verb(session: &mut Target, line: &str, expected: &str) -> String {
     transcript
 }
 
-/// Cold start with a node on and nobody heard: the trust verbs, typed against a
-/// destination and an identity the node has never seen, write exactly the entry each
-/// one names into `trust.yaml` and say so in the documented words. `forget` is not an
-/// alias of `untrust` any more: its destination form is refused before anything is
-/// read or written, `block <destination>` works on a never-heard hash and `.mesh people list`
-/// lists it as `blocked (instance)`, `untrust` on that deny-only hash names `unblock`, a second
-/// `block` changes nothing, `unblock` lifts the deny and trusts nothing (the `trust` it
-/// names is refused until the hash is heard), `block --identity` writes the block,
-/// `untrust --identity` on the blocked identity names `unblock` and writes nothing,
-/// `forget --identity` is a dry run until its own token comes back (never `--yes`) and
-/// then erases the block, after which the identity is a stranger the verb refuses. The
-/// identity-wide `untrust` of an unknown identity writes nothing.
+/// Cold start with a node on and nobody heard: the access verbs, typed against a session
+/// and a user the node has never seen, write exactly the entry each one names into
+/// `trust.yaml` and say so in the documented words. `forget` acts on a user only: its
+/// session form is refused before anything is read or written, as is an address with no
+/// `user` or `session` word. `block session` works on a never-heard hash and `.mesh people
+/// list` lists it as `blocked (instance)`, `revoke session` on that deny-only hash names
+/// `unblock`, a second `block` changes nothing, `unblock` lifts the deny and trusts
+/// nothing (the `trust` it names is refused until the hash is heard), `block user` writes
+/// the block, `revoke user` on the blocked user names `unblock` and writes nothing,
+/// `forget user` is a dry run until its own token comes back (never `--yes`) and then
+/// erases the block, after which the user is a stranger the verb refuses. `revoke user`
+/// of an unknown user writes nothing.
 #[test]
 fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias() {
     let relay = SilentRelay::start();
@@ -1707,10 +1707,25 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         }
     };
 
-    // `forget` takes `--identity` only; the destination form teaches the two verbs that
-    // act on one and reaches neither the untrust path nor the file.
+    // `forget` acts on a user only; the session form teaches the two verbs that act on
+    // one and reaches neither the revoke path nor the file.
     let expected = format!(
-        ".mesh access forget takes --identity <id>: a destination is untrusted with .mesh access revoke {dest} or refused with .mesh access block {dest}."
+        ".mesh access forget acts on a user: `.mesh access forget user {dest}` erases everything you know about the user of that session, while `.mesh access revoke session {dest}` takes back the trust in the session and `.mesh access block session {dest}` refuses it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh access forget session {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    assert!(
+        !out.contains("Revok") && !out.contains("Forgetting ") && !out.contains("Forgot "),
+        "`.mesh access forget session <who>` must not act as revoke: {out:?}"
+    );
+    no_entries("after forget session");
+    // With no `user` or `session` word the address is refused, naming the word.
+    let expected = format!(
+        "Say `user` before the address: `.mesh access forget user {dest}` erases everything you know about that user."
     );
     let out = trust_verb(
         &mut session,
@@ -1718,39 +1733,44 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
-    assert!(
-        !out.contains("Untrust") && !out.contains("untrusts instance") && !out.contains("Forget "),
-        "`.mesh access forget <destination>` must not act as untrust: {out:?}"
-    );
-    no_entries("after forget <destination>");
-
-    // `untrust` of a hash the list holds nothing of names both verbs that act on it.
     let expected = format!(
-        "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
-    );
-    let out = trust_verb(
-        &mut session,
-        &format!(".mesh access revoke {dest} --yes"),
-        &expected,
-    );
-    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
-    no_entries("after untrust of an unknown destination");
-
-    // `block <destination>` works on a never-heard hash: the deny alone is written and
-    // the result names `unblock`; with no identity to name, the clause is left out.
-    let expected = format!(
-        "Blocked cdcdcdcd: it is refused without a knock. .mesh access unblock {dest} lifts it."
+        "Say whom this acts on: `.mesh access block user {dest}` covers every session of that user, now and later; `.mesh access block session {dest}` that one session."
     );
     let out = trust_verb(
         &mut session,
         &format!(".mesh access block {dest} --yes"),
         &expected,
     );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after an address with no reach word");
+
+    // `revoke` of a hash the list holds nothing of names both verbs that act on it.
+    let expected = format!(
+        "Session cdcdcdcd is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh access revoke session {dest} --yes"),
+        &expected,
+    );
+    assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
+    no_entries("after revoke of an unknown session");
+
+    // `block session` works on a never-heard hash: the deny alone is written and the
+    // result names `unblock`; with no user to name, the clause is left out.
+    let expected = format!(
+        "Blocked unnamed / cdcdcdcd: it is refused and its requests to be trusted are ignored. .mesh access unblock session {dest} lifts it."
+    );
+    let out = trust_verb(
+        &mut session,
+        &format!(".mesh access block session {dest} --yes"),
+        &expected,
+    );
     assert!(
-        out.contains("This blocks instance cdcdcdcd: it is refused without a knock and its trust record, if any, is removed."),
+        out.contains("This blocks unnamed / cdcdcdcd: it is refused and its requests to be trusted are ignored, and any trust you gave it goes."),
         "{out:?}"
     );
-    assert!(!out.contains("Removed its trust record."), "{out:?}");
+    assert!(!out.contains("The trust you gave it is gone."), "{out:?}");
     assert_eq!(
         trust_file_keys(&dir, "denied_destinations"),
         vec![dest.clone()]
@@ -1772,13 +1792,13 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         "{peers:?}"
     );
 
-    // `untrust` on the deny-only hash names the block and the verb that lifts it.
+    // `revoke` on the deny-only hash names the block and the verb that lifts it.
     let expected = format!(
-        "Destination {dest} is blocked and has no trust record, so there is nothing to untrust; .mesh access unblock {dest} lifts the block."
+        "Session cdcdcdcd is blocked and not trusted, so there is nothing to revoke; .mesh access unblock session {dest} lifts the block."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke {dest} --yes"),
+        &format!(".mesh access revoke session {dest} --yes"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
@@ -1790,31 +1810,31 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // A second `block` of the same hash changes nothing and says so.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access block {dest} --yes"),
-        "cdcdcdcd is already blocked.",
+        &format!(".mesh access block session {dest} --yes"),
+        "unnamed / cdcdcdcd is already blocked.",
     );
     assert!(out.contains("Nothing was changed."), "{out:?}");
-    assert!(!out.contains("Blocked cdcdcdcd:"), "{out:?}");
+    assert!(!out.contains("Blocked unnamed / cdcdcdcd:"), "{out:?}");
 
-    // `unblock <destination>` lifts the deny and trusts nothing; with no record and no
-    // peer row for the hash, nothing binds it to an identity, so what serves it is
-    // known only once it announces or knocks.
+    // `unblock session` lifts the deny and trusts nothing; with no record and no peer
+    // row for the hash, nothing binds it to a user, so what trusts it is known only
+    // once it is heard or asks to be trusted.
     let standing = format!(
-        "no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh access trust {dest} does."
+        "its user is not known yet; once it is heard or asks to be trusted, trusting every session of that user covers it, otherwise .mesh access trust session {dest} does."
     );
-    let expected = format!("Unblocked cdcdcdcd; {standing}");
+    let expected = format!("Unblocked unnamed / cdcdcdcd; {standing}");
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access unblock {dest} --yes"),
+        &format!(".mesh access unblock session {dest} --yes"),
         &expected,
     );
     assert!(
         out.contains(&format!(
-            "This lifts the block on instance cdcdcdcd; afterwards {standing}"
+            "This lifts the block on unnamed / cdcdcdcd; afterwards {standing}"
         )),
         "{out:?}"
     );
-    no_entries("after unblock <destination>");
+    no_entries("after unblock session");
 
     // The verb that line names asks the mesh for the unheard hash first; nothing on the
     // relay answers for it, so it is refused and writes nothing.
@@ -1824,45 +1844,47 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access trust {dest} --yes"),
+        &format!(".mesh access trust session {dest} --yes"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
-    no_entries("after trust of a never-heard destination");
+    no_entries("after trust of a never-heard session");
 
     // Lifting a deny that is not there is refused, naming both next verbs, and nothing
     // is written.
     let expected = format!(
-        "Destination {dest} is not blocked, so there is nothing to unblock; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
+        "Session cdcdcdcd is not blocked, so there is nothing to unblock; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access unblock {dest} --yes"),
+        &format!(".mesh access unblock session {dest} --yes"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
     no_entries("after a second unblock");
 
-    // `untrust --identity` of an identity the list has never held writes nothing.
+    // `revoke user` of a user the list has never held writes nothing.
     let expected = format!(
-        "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh access trust --identity {id} grants it, .mesh access block --identity {id} silences it."
+        "User efefefef is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke --identity {id}"),
+        &format!(".mesh access revoke user {id}"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
-    no_entries("after untrust --identity of an unknown identity");
+    no_entries("after revoke user of an unknown user");
 
-    // `block --identity` works on an identity the list has never seen.
+    // `block user` works on a user the list has never seen.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access block --identity {id} --yes"),
-        "Blocked efefefef.",
+        &format!(".mesh access block user {id} --yes"),
+        &format!(
+            "Blocked efefefef: every session of theirs is refused. .mesh access unblock user {id} lifts it."
+        ),
     );
     assert!(
-        out.contains("This blocks identity efefefef: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed."),
+        out.contains("This blocks efefefef: every session of theirs, now and later, is refused, their requests to be trusted are dropped without a word, and any trust you gave them or their sessions goes."),
         "{out:?}"
     );
     assert_eq!(
@@ -1872,14 +1894,14 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     assert!(foreign_trust_file_keys(&dir, "identities", &own).is_empty());
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
 
-    // `untrust --identity` of the blocked identity names the unblock, the one verb that
-    // applies while the block stands, and writes nothing.
+    // `revoke user` of the blocked user names the unblock, the one verb that applies
+    // while the block stands, and writes nothing.
     let expected = format!(
-        "Identity efefefef is blocked and holds no trust record, so there is nothing to untrust; .mesh access unblock --identity {id} lifts the block."
+        "User efefefef is blocked and not trusted, so there is nothing to revoke; .mesh access unblock user {id} lifts the block."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke --identity {id}"),
+        &format!(".mesh access revoke user {id}"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
@@ -1888,26 +1910,23 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
         vec![id.clone()]
     );
 
-    // `forget --identity` is a dry run first: it lists the block and prints its own
-    // token; `--yes` is refused; nothing is written by either.
+    // `forget user` is a dry run first: it lists the block and prints its own token;
+    // `--yes` is refused; nothing is written by either.
     let token_line = format!(
-        "This was a dry run; nothing changed. To erase everything this node knows of this identity, run: .mesh access forget --identity {id} --confirm forget-efefefef"
+        "This was a dry run; nothing changed. To erase everything you know of efefefef, run: .mesh access forget user {id} --confirm forget-efefefef"
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access forget --identity {id}"),
+        &format!(".mesh access forget user {id}"),
         &token_line,
     );
-    assert!(
-        out.contains(&format!("Forgetting identity {id} erases:")),
-        "{out:?}"
-    );
-    assert!(out.contains("  block on identity efefefef"), "{out:?}");
-    assert!(!out.contains("Forgot identity"), "{out:?}");
-    let expected = "`.mesh access forget --identity` takes `--confirm forget-<identity-short>` from a dry run, not `--yes`.";
+    assert!(out.contains("Forgetting efefefef erases:"), "{out:?}");
+    assert!(out.contains("  the block on efefefef"), "{out:?}");
+    assert!(!out.contains("Forgot efefefef"), "{out:?}");
+    let expected = "`.mesh access forget user` takes `--confirm forget-<user-short>` from a dry run, not `--yes`.";
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access forget --identity {id} --yes"),
+        &format!(".mesh access forget user {id} --yes"),
         expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
@@ -1918,11 +1937,11 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
 
     // A wrong token is refused and names the right one; the right one erases the block.
     let expected = format!(
-        "'forget-00000000' is not the token for identity efefefef; run .mesh access forget --identity {id} --confirm forget-efefefef"
+        "'forget-00000000' is not the token for efefefef; run .mesh access forget user {id} --confirm forget-efefefef"
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access forget --identity {id} --confirm forget-00000000"),
+        &format!(".mesh access forget user {id} --confirm forget-00000000"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
@@ -1932,44 +1951,40 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access forget --identity {id} --confirm forget-efefefef"),
-        "Forgot identity efefefef: grants, blocks, knocks, remembered attachments and envoy memory erased; it is a stranger again.",
+        &format!(".mesh access forget user {id} --confirm forget-efefefef"),
+        "Forgot efefefef: trust, blocks, requests to be trusted, names, remembered attachments and envoy memory erased; they are a stranger again.",
     );
-    assert!(out.contains("  block on identity efefefef"), "{out:?}");
-    no_entries("after forget --identity");
+    assert!(out.contains("  the block on efefefef"), "{out:?}");
+    no_entries("after forget user");
 
     // A stranger has nothing to forget.
     let expected = format!(
-        "Identity {id} is a stranger already: no grant, block, knock, remembered attachment or envoy memory is recorded for it, so there is nothing to forget. .mesh envoy memory forget {id} --dry-run lists what the envoy memory on disk holds of it."
+        "efefefef is a stranger already: no trust, block, request to be trusted, name, remembered attachment or envoy memory is recorded for them, so there is nothing to forget. .mesh envoy memory forget {id} --dry-run lists what the envoy memory on disk holds of them."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access forget --identity {id}"),
+        &format!(".mesh access forget user {id}"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
 
-    // The verb list carries the split: `access forget` takes `--identity` only, `access
-    // block` and `access unblock` take a destination or `--identity`.
+    // The verb list carries the split: `access forget` takes a user only, `access block`
+    // and `access unblock` take a user or a session.
     let (_, help) = command_row_and_transcript(
         &mut session,
         ".mesh",
         &format!(
-            r"{}\s+Erase everything this node knows of an identity",
-            literally(
-                ".mesh access forget --identity <identity> [--dry-run|--confirm forget-<identity-short>]"
-            )
+            r"{}\s+Erase everything you know about them",
+            literally(".mesh access forget user <who> [--dry-run|--confirm forget-<user-short>]")
         ),
         SESSION_PROMPT,
     );
     assert!(
-        help.contains("  .mesh access block <destination> [--yes] [--note \"text\"] | --identity <identity> [--yes] [--note \"text\"]"),
+        help.contains("  .mesh access block user <who> [--yes] [--note \"text\"] | session <who> [--yes] [--note \"text\"]"),
         "{help}"
     );
     assert!(
-        help.contains(
-            "  .mesh access unblock <destination> [--yes] | --identity <identity> [--yes]"
-        ),
+        help.contains("  .mesh access unblock user <who> [--yes] | session <who> [--yes]"),
         "{help}"
     );
     assert!(!help.contains("alias of"), "{help}");
@@ -2327,7 +2342,9 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     ));
     sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
     assert!(
-        sent.contains(&format!("Destination {asker} is not trusted for messaging")),
+        sent.contains(&format!(
+            "Session {asker} is not trusted for messaging. Trust it first with `.mesh access trust session {asker}`"
+        )),
         "{sent:?}"
     );
     assert!(!sent.contains("Answered"), "{sent:?}");
@@ -3000,7 +3017,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     let knocks = command_text(
         &mut session,
         ".mesh access requests",
-        r"No knocks\.",
+        r"No requests to be trusted\.",
         SESSION_PROMPT,
     );
     assert!(!knocks.contains('┌'), "{knocks}");
@@ -3225,12 +3242,12 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     let own = probe.own_identity();
 
     let refusal = format!(
-        "Destination abababab belongs to identity 12121212, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block {dest}. To stop trusting the whole identity, run .mesh access revoke --identity {id}."
+        "Session abababab belongs to user 12121212, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session {dest}. To take back the trust in the user and every session of theirs, run .mesh access revoke user {id}."
     );
     for line in [
-        format!(".mesh access revoke {dest}"),
-        format!(".mesh access revoke {dest} --dry-run"),
-        format!(".mesh access revoke {dest} --yes"),
+        format!(".mesh access revoke session {dest}"),
+        format!(".mesh access revoke session {dest} --dry-run"),
+        format!(".mesh access revoke session {dest} --yes"),
     ] {
         let out = trust_verb(&mut session, &line, &refusal);
         assert!(
@@ -3238,7 +3255,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
             "{line}: {out:?}"
         );
         assert!(
-            !out.contains("This untrusts instance") && !out.contains("Untrust abababab?"),
+            !out.contains("This revokes") && !out.contains("Revoke Ida"),
             "{line}: refused before any preview or prompt: {out:?}"
         );
         assert_eq!(
@@ -3248,21 +3265,21 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
         );
     }
 
-    // `block <destination>` is the named remedy: the deny is written, the record goes,
-    // the identity grant stands, and the line names the identity it leaves unchanged.
+    // `block session` is the named remedy: the deny is written, the record goes, the
+    // grant for every session stands, and the line names the user it leaves unchanged.
     let expected = format!(
-        "Blocked abababab: it is refused without a knock (identity 12121212 otherwise unchanged). .mesh access unblock {dest} lifts it."
+        "Blocked Ida / abababab: it is refused and its requests to be trusted are ignored (Ida otherwise unchanged). .mesh access unblock session {dest} lifts it."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access block {dest} --yes"),
+        &format!(".mesh access block session {dest} --yes"),
         &expected,
     );
     assert!(
-        out.contains("This blocks instance abababab: it is refused without a knock and its trust record, if any, is removed; identity 12121212 is otherwise unchanged."),
+        out.contains("This blocks Ida / abababab: it is refused and its requests to be trusted are ignored, and any trust you gave it goes; Ida is otherwise unchanged."),
         "{out:?}"
     );
-    assert!(out.contains("Removed its trust record."), "{out:?}");
+    assert!(out.contains("The trust you gave it is gone."), "{out:?}");
     assert_eq!(
         trust_file_keys(&dir, "denied_destinations"),
         vec![dest.clone()]
@@ -3274,15 +3291,15 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     );
     assert!(trust_file_keys(&dir, "blocked_identities").is_empty());
 
-    // `unblock <destination>` lifts the deny only: the grant still stands, no record
-    // returns, and with the record gone and the peer unheard nothing binds the hash to the
-    // identity, so the line says the grant serves it once it announces or knocks.
+    // `unblock session` lifts the deny only: the grant still stands, no record returns,
+    // and with the record gone and the peer unheard nothing binds the hash to the user,
+    // so the line says the grant covers it once it is heard or asks to be trusted.
     let expected = format!(
-        "Unblocked abababab; no trust record names its identity; once it announces or knocks, an identity trusted for all destinations serves it, otherwise .mesh access trust {dest} does."
+        "Unblocked unnamed / abababab; its user is not known yet; once it is heard or asks to be trusted, trusting every session of that user covers it, otherwise .mesh access trust session {dest} does."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access unblock {dest} --yes"),
+        &format!(".mesh access unblock session {dest} --yes"),
         &expected,
     );
     assert!(!out.contains("Error:"), "{out:?}");
@@ -3301,7 +3318,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access trust {dest} --yes"),
+        &format!(".mesh access trust session {dest} --yes"),
         &expected,
     );
     assert!(out.contains(&format!("Error: {expected}")), "{out:?}");
@@ -3323,16 +3340,15 @@ fn identity_grants_all(config_dir: &Path, id: &str) -> Option<bool> {
     file["identities"][id]["all_destinations"].as_bool()
 }
 
-/// Cold start over a `trust.yaml` an earlier run left: an identity trusted for all
-/// destinations with two instance records bound to it, one of them denied. `untrust
-/// --identity` is a dry run until its own token comes back, and then withdraws the
-/// grant ALONE: both records stay, the deny stays, the identity stays on file as a
-/// known identity granting nothing, and the line says so. With no grant left to
-/// withdraw a second `untrust --identity` is refused in the documented sentence and
-/// writes nothing; `forget --identity` is what erases the identity with its instances
-/// and denies.
+/// Cold start over a `trust.yaml` an earlier run left: a user trusted for every session
+/// with two session records bound to them, one of them blocked. `revoke user` is a dry
+/// run until its own token comes back, and then takes back the grant AND the trusted
+/// record, while the blocked record and its block stay and the user stays on file known
+/// but not trusted (granting nothing), and the line says so. With nothing left to take
+/// back a second `revoke user` is refused in the documented sentence and writes nothing;
+/// `forget user` is what erases the user with the block.
 #[test]
-fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_records() {
+fn revoke_user_at_a_cold_prompt_takes_the_grant_and_the_bound_records_and_keeps_them_known() {
     let relay = SilentRelay::start();
     let probe = Probe::new("trust-grant-only", true, &[relay.port]);
     let dest_a = "ab".repeat(16);
@@ -3383,7 +3399,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     let at_start = fs::read(&trust_path).unwrap();
     let dir = probe.config_dir.clone();
     let own = probe.own_identity();
-    let token = "untrust-12121212";
+    let token = "revoke-12121212";
     let bound_both = |label: &str| {
         let mut destinations = trust_file_keys(&dir, "destinations");
         destinations.sort();
@@ -3401,31 +3417,36 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         );
     };
 
-    // The dry run (bare and `--dry-run`) previews the grant and the two instances that
-    // stay, names the token, and writes nothing.
+    // The dry run (bare and `--dry-run`) previews the grant and the two sessions it
+    // takes back, names the token, and writes nothing.
     let dry_tail = format!(
-        "This was a dry run; nothing changed. To withdraw the grant, run: .mesh access revoke --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id}."
+        "This was a dry run; nothing changed. To revoke, run: .mesh access revoke user {id} --confirm {token}"
     );
     for line in [
-        format!(".mesh access revoke --identity {id}"),
-        format!(".mesh access revoke --identity {id} --dry-run"),
+        format!(".mesh access revoke user {id}"),
+        format!(".mesh access revoke user {id} --dry-run"),
     ] {
         let out = trust_verb(&mut session, &line, &dry_tail);
+        assert!(out.contains("Revoking Ida takes back:"), "{line}: {out:?}");
         assert!(
-            out.contains(&format!(
-                "Untrusting identity {id} withdraws its grant for all destinations:"
-            )),
+            out.contains("  the trust in every session of Ida, now and later"),
             "{line}: {out:?}"
         );
         assert!(
-            out.contains("2 instance(s) stay trusted on their own:"),
+            out.contains("  Ida / abababab  last seen ") && out.contains(&format!("  {dest_a}")),
             "{line}: {out:?}"
         );
         assert!(
-            out.contains(&format!("instance {dest_b}")) && out.contains("refused"),
-            "{line}: the denied instance is listed with its refusal: {out:?}"
+            out.contains("  (1 session of theirs is blocked, and stays so)")
+                && !out.contains(&format!("  {dest_b}")),
+            "{line}: the blocked session is not taken back, and the line says it stays blocked: {out:?}"
+        );
+        assert!(
+            out.contains("Ida stays known but not trusted: they cannot message you or use anything you share, and when they ask to be trusted again, .mesh access requests lists it."),
+            "{line}: {out:?}"
         );
         assert!(!out.contains("Error:"), "{line}: {out:?}");
+        bound_both(&line);
         assert_eq!(
             fs::read(&trust_path).unwrap(),
             at_start,
@@ -3433,16 +3454,16 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         );
     }
 
-    // `--yes` is not the token for an identity-wide verb; the wrong token is refused too.
+    // `--yes` is not the token for a user-wide verb; the wrong token is refused too.
     for (line, expected) in [
         (
-            format!(".mesh access revoke --identity {id} --yes"),
-            "`.mesh access revoke --identity` takes `--confirm untrust-<identity-short>` from a dry run, not `--yes`.".to_string(),
+            format!(".mesh access revoke user {id} --yes"),
+            "`.mesh access revoke user` takes `--confirm revoke-<user-short>` from a dry run, not `--yes`.".to_string(),
         ),
         (
-            format!(".mesh access revoke --identity {id} --confirm untrust-nope"),
+            format!(".mesh access revoke user {id} --confirm revoke-nope"),
             format!(
-                "'untrust-nope' is not the token for identity 12121212; run .mesh access revoke --identity {id} --confirm {token}"
+                "'revoke-nope' is not the token for Ida; run .mesh access revoke user {id} --confirm {token}"
             ),
         ),
     ] {
@@ -3451,33 +3472,42 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         assert_eq!(fs::read(&trust_path).unwrap(), at_start, "{line}: a refusal writes nothing");
     }
 
-    // The token withdraws the grant alone.
+    // The token takes back the grant and the trusted record; the blocked one stays.
     let expected = format!(
-        "Untrusted identity 12121212: its grant for all destinations is withdrawn; 2 instance(s) stay trusted on their own. .mesh access forget --identity {id} erases them too."
+        "Revoked Ida: the trust in every session of theirs and in 1 session on its own is gone. Ida stays known but not trusted: they cannot message you or use anything you share, and when they ask to be trusted again, .mesh access requests lists it. Their name and what your envoy remembers of them stay; .mesh access forget user {id} erases those too. .mesh access trust user {id} trusts them again."
     );
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke --identity {id} --confirm {token}"),
+        &format!(".mesh access revoke user {id} --confirm {token}"),
         &expected,
     );
     assert!(!out.contains("Error:"), "{out:?}");
     assert_eq!(
         identity_grants_all(&dir, &id),
         Some(false),
-        "the identity stays on file as a known identity granting nothing"
+        "the user stays on file, known but granting nothing"
     );
-    bound_both("after untrust --identity");
+    assert_eq!(
+        trust_file_keys(&dir, "destinations"),
+        vec![dest_b.clone()],
+        "the trusted record went with the grant; the blocked one stays"
+    );
+    assert_eq!(
+        trust_file_keys(&dir, "denied_destinations"),
+        vec![dest_b.clone()],
+        "the block stays"
+    );
     let after_untrust = fs::read(&trust_path).unwrap();
     assert_ne!(after_untrust, at_start);
 
-    // With no grant left, the identity-wide untrust is refused in the documented
+    // With nothing left to take back, `revoke user` is refused in the documented
     // sentence before any prompt, and the file is byte-identical afterwards.
     let refusal = format!(
-        "Identity {id} holds no grant for all destinations, so there is no grant to withdraw; its 2 instance(s) are trusted on their own. .mesh access revoke <destination> stops serving one, .mesh access forget --identity {id} erases them all."
+        "User 12121212 is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
     );
     for line in [
-        format!(".mesh access revoke --identity {id}"),
-        format!(".mesh access revoke --identity {id} --confirm {token}"),
+        format!(".mesh access revoke user {id}"),
+        format!(".mesh access revoke user {id} --confirm {token}"),
     ] {
         let out = trust_verb(&mut session, &line, &refusal);
         assert!(
@@ -3485,7 +3515,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
             "{line}: {out:?}"
         );
         assert!(
-            !out.contains("Untrusting identity"),
+            !out.contains("Revoking Ida"),
             "{line}: refused before any preview: {out:?}"
         );
         assert_eq!(
@@ -3495,12 +3525,12 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
         );
     }
 
-    // `forget --identity` is the verb that erases the identity with its instances and
-    // the deny; it takes its own token.
+    // `forget user` is the verb that erases the user with the block; it takes its own
+    // token.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access forget --identity {id} --confirm forget-12121212"),
-        "Forgot identity 12121212",
+        &format!(".mesh access forget user {id} --confirm forget-12121212"),
+        "Forgot Ida",
     );
     assert!(!out.contains("Error:"), "{out:?}");
     for section in [
@@ -3511,7 +3541,7 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     ] {
         assert!(
             foreign_trust_file_keys(&dir, section, &own).is_empty(),
-            "after forget --identity: {section} must be empty"
+            "after forget user: {section} must be empty"
         );
     }
 
@@ -3519,15 +3549,14 @@ fn untrust_identity_at_a_cold_prompt_withdraws_the_grant_and_leaves_the_bound_re
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
 }
 
-/// Cold start with a seeded list that trusts one instance on its own: the identity entry
-/// grants nothing and exists only to bind the record. `untrust <destination>` removes
-/// that record alone and says the identity stays known; the entry it leaves behind
-/// holds no grant and names no instance, and `untrust --identity` then previews that
-/// entry as the thing it removes (no instance rows, the token named), writes nothing
-/// until the token comes back, removes the entry with the token and refuses a repeat
-/// as an identity the list does not hold.
+/// Cold start with a seeded list that trusts one session on its own: the user entry
+/// grants nothing and exists only to bind the record. `revoke session` removes that
+/// record alone and says the user stays known; the entry it leaves behind holds no grant
+/// and names no session, so `revoke user` has nothing left to take back and refuses,
+/// writing nothing. `forget user` erases the entry, after which `revoke user` is refused
+/// as a user the list does not hold.
 #[test]
-fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identity_removes() {
+fn revoke_of_the_last_session_keeps_the_user_known_and_revoke_user_has_nothing_left() {
     let relay = SilentRelay::start();
     let probe = Probe::new("trust-binding-only", true, &[relay.port]);
     let dest = "ab".repeat(16);
@@ -3568,13 +3597,11 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
     let at_start = fs::read(&trust_path).unwrap();
     let dir = probe.config_dir.clone();
     let own = probe.own_identity();
-    let token = "untrust-12121212";
-
-    // The dry run of the instance untrust previews the record going and writes nothing.
-    let preview = "This untrusts instance abababab: its destination record goes; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.";
+    // The dry run of the session revoke previews the record going and writes nothing.
+    let preview = "This revokes Ida / abababab: it can no longer message you, ask your envoy or fetch your files; Ida stays known, so they can ask again and you will see the request. A request from it to be trusted is listed by .mesh access requests again.";
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke {dest} --dry-run"),
+        &format!(".mesh access revoke session {dest} --dry-run"),
         preview,
     );
     assert!(
@@ -3587,11 +3614,11 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
         "a dry run writes nothing"
     );
 
-    // `--yes` removes the record alone: the identity entry stays, granting nothing.
+    // `--yes` removes the record alone: the user entry stays, granting nothing.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke {dest} --yes"),
-        "Untrusted Ida / abababab (abababab): its destination record is gone; the identity 12121212 stays known. It is served no longer; a knock from it will be filed again.",
+        &format!(".mesh access revoke session {dest} --yes"),
+        "Revoked Ida / abababab: Ida stays known and can ask again. A request from it to be trusted is listed by .mesh access requests again.",
     );
     assert!(!out.contains("Error:"), "{out:?}");
     assert!(
@@ -3606,56 +3633,36 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
     assert!(trust_file_keys(&dir, "denied_destinations").is_empty());
     let after_untrust = fs::read(&trust_path).unwrap();
 
-    // A second untrust of the same hash is the teaching error for a hash the list does
-    // not hold, naming block and trust; nothing is written.
+    // A second revoke of the same hash is the teaching error for a session the list
+    // does not hold, naming block and trust; nothing is written.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke {dest}"),
+        &format!(".mesh access revoke session {dest}"),
         &format!(
-            "Destination {dest} is not in the trust list, so there is nothing to untrust; .mesh access block {dest} refuses it, .mesh access trust {dest} serves it."
+            "Session abababab is not trusted, so there is nothing to revoke; .mesh access block session {dest} blocks it, .mesh access trust session {dest} trusts it."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
     assert_eq!(fs::read(&trust_path).unwrap(), after_untrust);
 
-    // The identity-wide untrust previews the binding-only entry as what it removes: no
-    // grant, no instance rows, its own token; a dry run writes nothing.
+    // The user is known but not trusted: `revoke user` has nothing to take back, says
+    // so before any preview, and writes nothing.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke --identity {id}"),
+        &format!(".mesh access revoke user {id}"),
         &format!(
-            "This was a dry run; nothing changed. To remove the entry, run: .mesh access revoke --identity {id} --confirm {token}. To erase the identity with its instances, denies and knocks, run .mesh access forget --identity {id}."
+            "User 12121212 is known but not trusted already: no grant and no trusted session is recorded for them, so there is nothing to revoke. .mesh access trust user {id} trusts them, .mesh access forget user {id} erases them."
         ),
     );
-    assert!(
-        out.contains(&format!(
-            "Untrusting identity {id} removes its entry from the trust list, which holds no grant and names no instance of it:"
-        )),
-        "{out:?}"
-    );
-    assert!(
-        out.contains("identity 12121212") && out.contains("listed instances only"),
-        "{out:?}"
-    );
-    assert!(
-        !out.contains("instance(s) stay trusted") && !out.contains(&format!("instance {dest}")),
-        "no instance is bound, so none is listed: {out:?}"
-    );
-    assert!(!out.contains("Error:"), "{out:?}");
-    assert_eq!(
-        fs::read(&trust_path).unwrap(),
-        after_untrust,
-        "a dry run writes nothing"
-    );
+    assert!(out.contains("Error:"), "{out:?}");
+    assert!(!out.contains("Revoking Ida"), "{out:?}");
+    assert_eq!(fs::read(&trust_path).unwrap(), after_untrust);
 
-    // The token removes the entry; the identity is a stranger and the line says what
-    // grants it again.
+    // `forget user` erases the entry; the user is a stranger.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke --identity {id} --confirm {token}"),
-        &format!(
-            "Untrusted identity 12121212: the trust list no longer names it; no instance of it is trusted. .mesh access trust --identity {id} grants it again."
-        ),
+        &format!(".mesh access forget user {id} --confirm forget-12121212"),
+        "Forgot Ida: trust, blocks, requests to be trusted, names, remembered attachments and envoy memory erased; they are a stranger again.",
     );
     assert!(!out.contains("Error:"), "{out:?}");
     for section in [
@@ -3666,17 +3673,17 @@ fn untrust_of_the_last_instance_leaves_a_binding_only_entry_that_untrust_identit
     ] {
         assert!(
             foreign_trust_file_keys(&dir, section, &own).is_empty(),
-            "after untrust --identity: {section} must be empty"
+            "after forget user: {section} must be empty"
         );
     }
     let emptied = fs::read(&trust_path).unwrap();
 
-    // A repeat is refused as an identity the list does not hold, and writes nothing.
+    // `revoke user` is now refused as a user the list does not hold, and writes nothing.
     let out = trust_verb(
         &mut session,
-        &format!(".mesh access revoke --identity {id} --confirm {token}"),
+        &format!(".mesh access revoke user {id} --confirm revoke-12121212"),
         &format!(
-            "Identity {id} is not in the trust list, so there is nothing to untrust; .mesh access trust --identity {id} grants it, .mesh access block --identity {id} silences it."
+            "User 12121212 is not trusted, so there is nothing to revoke; .mesh access trust user {id} trusts every session of theirs, .mesh access block user {id} blocks them."
         ),
     );
     assert!(out.contains("Error:"), "{out:?}");
@@ -3699,7 +3706,7 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     let probe = Probe::new("trust-header-restart", true, &[relay.port]);
     let dest = "cd".repeat(16);
     let trust_path = probe.config_dir.join("mesh").join("trust.yaml");
-    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block <destination>; blocked (identity) = .mesh access block --identity <identity>";
+    let legend = "trust: trusted = this instance is served; known = its identity is known, this instance is not trusted; untrusted = nothing known; blocked (instance) = .mesh access block session <who>; blocked (identity) = .mesh access block user <who>";
 
     let mut command = probe.command();
     command.args(["--session", "probe"]);
@@ -3709,9 +3716,9 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     probe.wait_for_marker("MESH_STARTED");
     trust_verb(
         &mut session,
-        &format!(".mesh access block {dest} --yes"),
+        &format!(".mesh access block session {dest} --yes"),
         &format!(
-            "Blocked cdcdcdcd: it is refused without a knock. .mesh access unblock {dest} lifts it."
+            "Blocked unnamed / cdcdcdcd: it is refused and its requests to be trusted are ignored. .mesh access unblock session {dest} lifts it."
         ),
     );
     let written = fs::read_to_string(&trust_path).unwrap();
@@ -3770,8 +3777,8 @@ fn the_trust_file_header_survives_a_cold_restart_and_the_block_is_read_back() {
     // The next write keeps the header: unblock rewrites the file, header first.
     trust_verb(
         &mut session,
-        &format!(".mesh access unblock {dest} --yes"),
-        "Unblocked cdcdcdcd;",
+        &format!(".mesh access unblock session {dest} --yes"),
+        "Unblocked unnamed / cdcdcdcd;",
     );
     let rewritten = fs::read_to_string(&trust_path).unwrap();
     assert!(rewritten.starts_with(&header.join("\n")), "{rewritten}");
@@ -3804,9 +3811,9 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
     probe.wait_for_marker("MESH_STARTED");
     trust_verb(
         &mut session,
-        &format!(".mesh access block {dest} --yes"),
+        &format!(".mesh access block session {dest} --yes"),
         &format!(
-            "Blocked cdcdcdcd: it is refused without a knock. .mesh access unblock {dest} lifts it."
+            "Blocked unnamed / cdcdcdcd: it is refused and its requests to be trusted are ignored. .mesh access unblock session {dest} lifts it."
         ),
     );
     let current = fs::read_to_string(&trust_path).unwrap();
@@ -3853,7 +3860,11 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
         .find(|line| line.contains("cdcdcdcd"))
         .unwrap_or_else(|| panic!("no peers row for the blocked destination: {peers:?}"));
     assert!(row.contains("blocked (instance)"), "{row:?}");
-    let knocks = trust_verb(&mut session, ".mesh access requests", "No knocks.");
+    let knocks = trust_verb(
+        &mut session,
+        ".mesh access requests",
+        "No requests to be trusted.",
+    );
     assert!(
         !knocks.contains("dropped in the last") && !knocks.contains("rate limit"),
         "nothing was dropped, so no drop line: {knocks:?}"
@@ -3863,8 +3874,8 @@ fn a_header_less_trust_file_from_an_older_build_loads_and_gains_the_header_on_it
     // survives next to the new one, and the YAML still parses as version 2.
     trust_verb(
         &mut session,
-        &format!(".mesh access block --identity {id} --yes"),
-        "Blocked efefefef.",
+        &format!(".mesh access block user {id} --yes"),
+        "Blocked efefefef: every session of theirs is refused.",
     );
     let upgraded = fs::read_to_string(&trust_path).unwrap();
     assert!(
@@ -5588,7 +5599,7 @@ fn people_names_at_a_cold_prompt_show_everywhere_and_the_naming_rules_refuse_wha
     // `--label` is gone: names come from `people name`.
     let out = people_command(
         &mut session,
-        &format!(".mesh access trust {MAKI_ONE} --yes --label x"),
+        &format!(".mesh access trust session {MAKI_ONE} --yes --label x"),
     );
     assert!(out.contains("Error: Unexpected '--label'"), "{out:?}");
     let text = fs::read_to_string(dir.join("mesh").join("trust.yaml")).unwrap();
@@ -5791,7 +5802,7 @@ fn people_addressing_against_heard_sessions_refuses_a_user_with_two_and_reaches_
         "a session hash prefix reaches its session",
         &out,
     );
-    let out = people_command(&mut mine, ".mesh access trust maki --yes");
+    let out = people_command(&mut mine, ".mesh access trust session maki --yes");
     check(
         out.contains("`Maki/laptop`") && out.contains(&format!("`Maki/{two}`")),
         "access trust of a user with two sessions lists the paths",
@@ -6040,7 +6051,7 @@ fn people_names_survive_a_cold_restart_and_clear_falls_back_advertised_then_hash
         // A trust verb names the peer with the display helper.
         let out = people_command(
             &mut session,
-            &format!(".mesh access revoke {MAKI_TWO} --yes"),
+            &format!(".mesh access revoke session {MAKI_TWO} --yes"),
         );
         check(
             out.contains("Maki / tower"),
@@ -6146,7 +6157,6 @@ fn an_own_sibling_session_reads_you_slash_its_session_name() {
 /// verb) on its success line, never only by hash, and the bare session name the card
 /// advertised addresses the one session.
 #[test]
-#[ignore = "the access verb lines still name a peer by hash alone until the access wording speaks users and sessions"]
 fn access_verb_lines_name_the_peer_through_the_people_view() {
     let relay = SilentRelay::start();
     let probe = Probe::new("people-access-lines", true, &[relay.port]);
@@ -6175,26 +6185,26 @@ fn access_verb_lines_name_the_peer_through_the_people_view() {
         &out,
     );
 
-    let out = people_command(&mut session, ".mesh access block den --yes");
+    let out = people_command(&mut session, ".mesh access block session den --yes");
     check(
         out.contains("Blocked zed / den"),
         "access block names the session <user> / <session>",
         &out,
     );
-    let out = people_command(&mut session, ".mesh access unblock den --yes");
+    let out = people_command(&mut session, ".mesh access unblock session den --yes");
     check(
         out.contains("Unblocked zed / den"),
         "access unblock names the session <user> / <session>",
         &out,
     );
-    let out = people_command(&mut session, ".mesh access trust --identity zed --yes");
+    let out = people_command(&mut session, ".mesh access trust user zed --yes");
     check(
         out.lines()
             .any(|line| line.starts_with("Trusted") && line.contains("zed")),
         "access trust of a user names the user on its success line",
         &out,
     );
-    let out = people_command(&mut session, ".mesh access forget --identity zed --dry-run");
+    let out = people_command(&mut session, ".mesh access forget user zed --dry-run");
     check(
         out.contains("zed"),
         "access forget names the user it would erase",
@@ -6211,7 +6221,6 @@ fn access_verb_lines_name_the_peer_through_the_people_view() {
 /// session and the success line of `access trust` name it `<user> / <session>`, not
 /// only by its hash.
 #[test]
-#[ignore = "the trust refusal and access trust lines still name a peer by hash alone until the access wording speaks users and sessions"]
 fn lines_about_a_heard_named_session_name_it_user_slash_session() {
     let Some(relay) = RnsdRelay::start("people-lines") else {
         eprintln!("skipped: no rnsd on the PATH");
@@ -6266,7 +6275,7 @@ fn lines_about_a_heard_named_session_name_it_user_slash_session() {
         "the messaging send refusal names the session <user> / <session>",
         &out,
     );
-    let out = people_command(&mut mine, ".mesh access trust carol --yes");
+    let out = people_command(&mut mine, ".mesh access trust session carol --yes");
     check(
         out.lines()
             .any(|line| line.starts_with(&format!("Trusted {who}"))),

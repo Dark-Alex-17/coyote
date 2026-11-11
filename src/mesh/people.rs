@@ -327,6 +327,19 @@ impl People {
                 ),
             })
     }
+
+    /// The identity whose named session is at `destination`, for display only: a session
+    /// the people section names is filed under the user it was heard from.
+    pub(crate) fn identity_of_session(&self, destination: &str) -> Option<&str> {
+        let destination = destination.to_ascii_lowercase();
+        self.names.keys().find_map(|subject| match subject {
+            Subject::Session {
+                identity,
+                destination: at,
+            } if *at == destination => Some(identity.as_str()),
+            _ => None,
+        })
+    }
 }
 
 /// What every human-facing line calls a peer: the user, then the session, as

@@ -42,7 +42,7 @@ const INTERFACES_DEFAULT: &str = "`[{type: local}]`";
 /// Configuration pages alike, whitespace flattened: the trust list is reloaded before
 /// every decision and written under its lock, so nothing needs splitting for a change
 /// made in one REPL to hold in the other.
-const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared live: a trust, untrust or block made in one REPL is seen by the other before its next decision, and two REPLs never overwrite each other's records; the write is serialised through `mesh/trust.yaml.lock`.";
+const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared live: a trust, revoke or block made in one REPL is seen by the other before its next decision, and two REPLs never overwrite each other's records; the write is serialised through `mesh/trust.yaml.lock`.";
 /// The release from which the image runs rnsd, as the README, the propagation node's
 /// README and the Containers page qualify it; one edit site when the cut is numbered
 /// differently.
@@ -1781,9 +1781,9 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
             "nothing is marked",
             "remembered for as long as the node runs from the refusal itself",
             "names the key first heard holding the instance",
-            "`.mesh access trust <new destination>` admits the new key and clears the memory",
+            "`.mesh access trust session <new destination>` admits the new key and clears the memory",
             "`.mesh access block` of either key clears it too",
-            "`.mesh access revoke --identity <old key>` admits the new key",
+            "`.mesh access revoke user <old key>` admits the new key",
         ] {
             assert!(
                 text.contains(needle),
@@ -1876,7 +1876,7 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
         "identity",
         "thread",
         "the proved sending destination",
-        "forget every thread of the identity, whichever of its instances it was held for",
+        "forget every thread of the user, whichever of their sessions it was held for",
         "`mesh.envoy_memory.*`",
         "whose index cannot be read is counted and named so you can empty it with `.mesh envoy memory forget all`",
         "256 threads across all peers",
@@ -2073,7 +2073,7 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
     let sentence = section[sentence_at..].split(". ").next().unwrap();
     assert_eq!(
         sentence,
-        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (instance)`, `blocked (identity)`; `trusted` is an instance this node serves, `known` an instance of an identity the list knows (it or another of its instances was trusted) that has no record of its own and no all-destinations grant, `untrusted` one the list knows nothing of, `blocked (instance)` one `.mesh access block <destination>` refused, whatever its identity's standing, and `blocked (identity)` one whose identity `.mesh access block --identity <identity>` refused"
+        "Trust is one of `trusted`, `known`, `untrusted`, `blocked (instance)`, `blocked (identity)`; `trusted` is a session you trust, `known` a session of a user you know (you trusted them, or another session of theirs, and have not forgotten them) that is not trusted itself and not covered by trust in every session of the user, `untrusted` one you know nothing of, `blocked (instance)` one `.mesh access block session <who>` refused, whatever its user's standing, and `blocked (identity)` one whose user `.mesh access block user <who>` refused"
     );
     for phrase in [
         "collision_protection",
@@ -5074,8 +5074,8 @@ fn mesh_table_header(render: &str, first: &str, columns: usize) -> Vec<String> {
 /// code side is checked on every run.
 #[test]
 fn the_knocks_and_shares_samples_use_the_code_table_headers() {
-    let knocks = mesh_table_header("render_knocks", "name", 5);
-    assert_eq!(knocks, ["name", "identity", "dest", "age", "intro"]);
+    let knocks = mesh_table_header("render_knocks", "who", 6);
+    assert_eq!(knocks, ["who", "name", "age", "intro", "user", "session"]);
     let rules = mesh_table_header("render_share_rules", "kind", 4);
     assert_eq!(rules, ["kind", "pattern", "layer", "note"]);
     let effective = mesh_table_header("render_effective_shares", "path", 2);
@@ -5203,7 +5203,19 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     };
     let status = progress_line("peer_status", "for its status card; Ctrl-C cancels...");
     let sync = progress_line("sync", "; Ctrl-C cancels...");
-    let knock = progress_line("knock", "Knocking on {}; Ctrl-C cancels...");
+    // The ask progress line frames the peer's name between two literals rather than
+    // formatting it, so the line is rebuilt from the pieces in the order they print.
+    assert_in_source_order(
+        "fn knock in src/repl/mesh.rs",
+        &fn_body("src/repl/mesh.rs", "knock"),
+        &[
+            ".frame(\"Asking \")",
+            ".peer(name.as_str())",
+            ".frame(\" to trust you; Ctrl-C cancels...\")",
+            "result_follows();",
+        ],
+    );
+    let knock = "Asking {} to trust you; Ctrl-C cancels...".to_string();
     let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
     let request = progress_line("send_request", "path(s); Ctrl-C cancels...");
     let sending = progress_line("sending_notice", "over the mesh...");
@@ -5297,7 +5309,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             vec![
                 span(&status),
                 span(&sync),
-                span(&knock),
+                format!("`{}`", knock.replace("{}", "<who>")),
                 request_span.clone(),
                 fetch_span("<path>"),
                 span(&sending),
@@ -5817,23 +5829,39 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
         .into_iter()
         .next()
         .expect("KNOCK_IS_NOT_FIRST_CONTACT is a string literal");
-    assert!(first_contact.starts_with("A knock is heard only by a peer"));
+    assert!(first_contact.starts_with(
+        "A request to be trusted is heard only by a session whose owner already knows you"
+    ));
+    let stored_tail = "; no answer over the link, so a propagation node holds the request until the session fetches it. {KNOCK_IS_NOT_FIRST_CONTACT}";
     let stored = format!(
-        "Knocked on {{dest8}}; no answer over the link, so a propagation node holds the knock until the peer fetches it. {first_contact}"
+        "Asked {{who}} to trust you{}",
+        stored_tail.replace("{KNOCK_IS_NOT_FIRST_CONTACT}", &first_contact)
     );
-    let unanswered = "Knocked on {dest8}; no answer. A knock is heard only by a peer that already trusts this identity (a new instance of a known identity). For first contact, exchange destination hashes and run `.mesh access trust <destination>` on both sides. No propagation node is known yet to hold the knock for it.";
-    let unreachable = "The peer is unreachable and no propagation node is known yet to hold the knock for it. Run `.mesh people list` to see which nodes this Coyote has heard from.";
-    let preview_tail = "A knock is heard only by a peer that already trusts this identity; for first contact use `.mesh access trust` on both sides.";
+    let unanswered_template = "Asked {dest8} to trust you; no answer. {KNOCK_IS_NOT_FIRST_CONTACT} No propagation node is known yet to hold the request for it.";
+    let unanswered = unanswered_template.replace("{KNOCK_IS_NOT_FIRST_CONTACT}", &first_contact);
+    let unreachable = "The session is unreachable and no propagation node is known yet to hold the request for it. Run `.mesh people list` to see which sessions you have heard from.";
+    let preview_tail = "Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides.";
     assert!(
-        repl.contains(&stored.replace(&first_contact, "{KNOCK_IS_NOT_FIRST_CONTACT}")),
+        repl.contains(&format!("\"{stored_tail}\"")),
         "src/repl/mesh.rs no longer prints the stored-after-silence report this test quotes"
+    );
+    // The report frames the peer's name between two literals rather than formatting it.
+    assert_in_source_order(
+        "fn knock_report in src/repl/mesh.rs",
+        &fn_body("src/repl/mesh.rs", "knock_report"),
+        &[
+            stored_tail,
+            ".frame(\"Asked \")",
+            ".peer(who)",
+            ".frame(format!(\" to trust you{tail}\"))",
+        ],
     );
     assert!(
         repl.contains(preview_tail),
         "the preview no longer ends with {preview_tail:?}"
     );
     for (name, literal) in [
-        ("Unanswered", unanswered),
+        ("Unanswered", unanswered_template),
         ("NoPropagationNode", unreachable),
     ] {
         assert!(
@@ -5847,9 +5875,9 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
         "### `.mesh access ask`",
     ));
     for needle in [
-        "A knock is not first contact".to_string(),
+        "A request to be trusted is not first contact".to_string(),
         preview_tail.to_string(),
-        stored.replace("{dest8}", "<dest8>"),
+        stored.replace("{who}", "<who>"),
         unanswered.replace("{dest8}", "<dest8>"),
         unreachable.to_string(),
         "(Mesh-Deployment#two-laptops-on-one-network)".to_string(),
@@ -5865,8 +5893,8 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
         "## Knocks",
     ));
     for needle in [
-        "A knock is not first contact.",
-        "reports the knock as unanswered rather than the peer as unreachable",
+        "A request to be trusted is not first contact.",
+        "reports the request as unanswered rather than the session as unreachable",
         "(Mesh-Deployment#two-laptops-on-one-network)",
     ] {
         assert!(
@@ -5915,7 +5943,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     let repl = read(repo_root().join("src").join("repl").join("mesh.rs"));
     let send_tail = "Nothing was queued for it: this node holds no key for the peer, and a message can be held on a propagation node only once the peer's announce has brought its key. Try again after it announces; `.mesh people list` shows when it was last heard.";
     let status_tail = "A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.";
-    let knock_tail = "Try again in a minute; nothing was queued for it, because a knock can be held on a propagation node only after the peer's announce has been heard. `.mesh people list` shows when it was last heard.";
+    let knock_tail = "Try again in a minute; nothing was queued for it, because a request to be trusted can be held on a propagation node only after the session's announce has been heard. `.mesh people list` shows when it was last heard.";
     let fetch_tail = "A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.";
     for (path, source, tail, hint_fn) in [
         (
@@ -8521,7 +8549,7 @@ fn trust_verb_fragments() -> Vec<String> {
         "unblocked_standing",
         "classify_untrust",
         "classify_forget",
-        "confirmed_identity_arg",
+        "confirmed_user_arg",
     ]
     .iter()
     .map(|name| fn_body(repl, name))
@@ -8565,7 +8593,7 @@ fn quotes_verb_output(span: &str) -> bool {
         "blocked (identity)",
     ];
     let command = [
-        ".mesh ", "trust ", "untrust ", "block ", "unblock ", "forget ",
+        ".mesh ", "trust ", "revoke ", "block ", "unblock ", "forget ",
     ]
     .iter()
     .any(|prefix| span.starts_with(prefix))
@@ -8584,12 +8612,12 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     let pool = trust_verb_fragments();
     for (span, fragment) in [
         (
-            "Destination <dest8> belongs to identity <id8>, which this node trusts fully, so untrusting the destination alone would change nothing. To stop serving just this instance, run .mesh access block <destination>. To stop trusting the whole identity, run .mesh access revoke --identity <identity>.",
-            "Destination <> belongs to identity <>, which this node trusts fully",
+            "Session <dest8> belongs to user <id8>, whom you trust for every session, so revoking this session alone would change nothing. To refuse just this session, run .mesh access block session <destination>. To take back the trust in the user and every session of theirs, run .mesh access revoke user <identity>.",
+            "Session <> belongs to user <>, whom you trust for every session",
         ),
         (
-            "This untrusts instance <dest8>: its destination record goes; the identity <id8> stays known. It is served no longer; a knock from it will be filed again.",
-            "This untrusts instance <>:",
+            "This revokes <who>: it can no longer message you, ask your envoy or fetch your files; <user> stays known, so they can ask again and you will see the request. A request from it to be trusted is listed by .mesh access requests again.",
+            "This revokes <>:",
         ),
         (
             "Forgot the N envoy conversations remembered of it.",
@@ -8607,7 +8635,7 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
     }
     assert!(
         !printed_from(
-            &blank_placeholders("This untrusts instance <dest8>: its destination record stays."),
+            &blank_placeholders("This revokes <who>: it can still message you."),
             &pool
         ),
         "a sentence the code does not print passes as printed"
@@ -8628,7 +8656,7 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
         (
             "Mesh-Trust-Model.md",
             &model,
-            "## deny, block, untrust, prune",
+            "## revoke, block, unblock, forget",
         ),
     ] {
         let text = section(label, page, heading);
@@ -8655,13 +8683,13 @@ fn the_commands_page_quotes_the_trust_verb_sentences_as_the_code_prints_them() {
         "code spans no trust verb prints (placeholders aside):\n{}",
         misquoted.join("\n")
     );
-    let headline = "Destination <dest8> belongs to identity <id8>";
+    let headline = "Session <dest8> belongs to user <id8>";
     for (label, page, heading) in [
         ("Mesh-Commands.md", &commands, "### `.mesh access revoke`"),
         (
             "Mesh-Trust-Model.md",
             &model,
-            "## deny, block, untrust, prune",
+            "## revoke, block, unblock, forget",
         ),
     ] {
         assert!(
@@ -8683,16 +8711,16 @@ fn the_mesh_forget_section_quotes_the_headline_the_refusal_and_the_claims_row_as
     let literals = string_literals(&fn_body("src/repl/mesh.rs", "forget"));
     let headline = literals
         .iter()
-        .find(|literal| literal.starts_with("Forgot identity {}: "))
-        .expect("src/repl/mesh.rs's fn forget prints `Forgot identity {}: ...`");
+        .find(|literal| literal.starts_with("Forgot {user}: "))
+        .expect("src/repl/mesh.rs's fn forget prints `Forgot {user}: ...`");
     let refusal = literals
         .iter()
-        .find(|literal| literal.starts_with("Identity {identity} is a stranger already: "))
-        .expect("src/repl/mesh.rs's fn forget bails with `Identity {identity} is a stranger already: ...`");
+        .find(|literal| literal.starts_with("{user} is a stranger already: "))
+        .expect("src/repl/mesh.rs's fn forget bails with `{user} is a stranger already: ...`");
     let claims_row = literals
         .iter()
-        .find(|literal| literal.starts_with("  {} from its instances"))
-        .expect("src/repl/mesh.rs's fn forget prints `  {} from its instances`");
+        .find(|literal| literal.starts_with("  {} from their sessions"))
+        .expect("src/repl/mesh.rs's fn forget prints `  {} from their sessions`");
     let claims_many = literals
         .iter()
         .find(|literal| literal.starts_with("remembered attachments, "))
@@ -8710,8 +8738,10 @@ fn the_mesh_forget_section_quotes_the_headline_the_refusal_and_the_claims_row_as
         assert!(claims_many.contains(noun), "{claims_many:?} lacks {noun}");
     }
     let expected = [
-        headline.replacen("{}", "<id8>", 1),
-        refusal.replace("{identity}", "<identity>"),
+        headline.replace("{user}", "<user>"),
+        refusal
+            .replace("{user}", "<user>")
+            .replace("{identity}", "<identity>"),
         claims_row.replacen("{}", &format!("N {claims_many}"), 1),
     ];
     for text in &expected {
@@ -8750,7 +8780,7 @@ fn the_forget_entry_prose_names_every_remembered_claim_class_the_row_counts() {
         "### `.mesh access forget`",
     ));
     let sentence =
-        "the attachment references, grants and access requests remembered from its instances";
+        "the attachment references, grants and access requests remembered from their sessions";
     assert!(
         prose.contains(sentence),
         "{label}'s `.mesh access forget` entry does not open with {sentence:?}:\n{prose}"
@@ -8858,7 +8888,7 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
     }
 
     let trust = flat(&section(label, &page, "### `.mesh access trust`"));
-    let proven = "each with a verifiable name hash and minus a blocked identity's";
+    let proven = "each with a verifiable name hash and minus a blocked user's";
     assert!(
         trust.contains(proven),
         "{label}'s `.mesh access trust` TAB sentence does not say {proven:?}"
@@ -8868,7 +8898,7 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
         &page,
         "### `.mesh access block` and `.mesh access unblock`",
     ));
-    let exclusion = "minus the blocked destinations and a blocked identity's instances";
+    let exclusion = "minus the blocked sessions and a blocked user's sessions";
     assert!(
         block.contains(exclusion),
         "{label}'s `.mesh access block` TAB sentence does not say {exclusion:?}"
@@ -8881,8 +8911,8 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
     );
     let untrust = flat(&section(label, &page, "### `.mesh access revoke`"));
     for refused in [
-        "an instance covered by an identity grant alone has no record and is not offered",
-        "a record whose identity is trusted for all destinations is left out, since `untrust` refuses it and points at `--identity`",
+        "a session covered only by trust in every session of its user has no record and is not offered",
+        "a session whose user is trusted for every session is left out, since `revoke session` refuses it and points at `revoke user`",
     ] {
         assert!(
             untrust.contains(refused),
@@ -9223,7 +9253,7 @@ fn both_tool_tables_name_the_not_shared_reason_words_the_fetch_tool_returns() {
     }
 }
 
-/// Every command cell of the Trust Model page's `deny, block, untrust, prune` table is a
+/// Every command cell of the Trust Model page's `revoke, block, unblock, forget` table is a
 /// `.mesh` path of `COMMANDS` in the form its usage cell spells, and the four commands
 /// that write a refusal or a removal each have a row.
 #[test]
@@ -9235,7 +9265,7 @@ fn the_trust_model_state_table_names_every_trust_verb_the_repl_takes() {
     let table = section(
         label,
         &read(wiki.join(label)),
-        "## deny, block, untrust, prune",
+        "## revoke, block, unblock, forget",
     );
     let cells: Vec<String> = table
         .lines()
@@ -9301,11 +9331,11 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
             })
             .clone()
     };
-    let head = find("Trusted {} (identity {}) - {}.");
-    let instance_only = find("{head} {known} - ");
-    let all_destinations = find("{head} Its identity is trusted for all destinations");
-    let now_known = find("Its identity is now known");
-    let known = find("Its identity is known");
+    let head = find("Trusted {who} - {}.");
+    let instance_only = find("{head} {} {known} - ");
+    let all_destinations = find("{head} {} is trusted for every session");
+    let now_known = find("is now known");
+    let known = find("is known");
     let mut fragments = format_fragments(&head);
     fragments.push(now_known);
     fragments.extend(format_fragments(&instance_only));
@@ -9322,7 +9352,7 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
     let spans = code_spans(&trust_section);
     let quoted = spans
         .iter()
-        .find(|span| span.starts_with("Trusted <dest8> (identity <id8>) - added."))
+        .find(|span| span.starts_with("Trusted <who> - added."))
         .unwrap_or_else(|| {
             panic!(
                 "{label}'s `.mesh access trust` section does not quote the success line: {spans:?}"
@@ -9336,7 +9366,7 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
     }
     let text = flat(&trust_section);
     for (tail, variant) in [
-        (format!("- updated. {known} - "), "repeat grant"),
+        (format!("- updated. <user> {known} - "), "repeat grant"),
         (all_destinations[0].clone(), "all-destinations"),
     ] {
         assert!(
@@ -9358,21 +9388,21 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     let literals = string_literals(&fn_body("src/repl/mesh.rs", "render_knocks"));
     let drop_line = literals
         .iter()
-        .find(|literal| literal.starts_with("{} knock(s) from {} dropped in the last {}"))
-        .expect("src/repl/mesh.rs's fn render_knocks prints `{} knock(s) from {} dropped in the last {}`");
+        .find(|literal| literal.starts_with("{} request(s) from {} dropped in the last {}"))
+        .expect("src/repl/mesh.rs's fn render_knocks prints `{} request(s) from {} dropped in the last {}`");
     let wait = literals
         .iter()
         .find(|literal| literal.starts_with("next accepted in {}"))
         .expect("src/repl/mesh.rs's fn render_knocks prints `next accepted in {}m`");
     let listed_above = literals
         .iter()
-        .find(|literal| literal.starts_with("; its earlier knocks are listed above"))
-        .expect("src/repl/mesh.rs's fn render_knocks ends a drop line with `; its earlier knocks are listed above, ...`");
+        .find(|literal| literal.starts_with("; their earlier requests are listed above"))
+        .expect("src/repl/mesh.rs's fn render_knocks ends a drop line with `; their earlier requests are listed above, ...`");
     let none_on_file = literals
         .iter()
-        .find(|literal| literal.starts_with("; none of its knocks"))
+        .find(|literal| literal.starts_with("; none of their requests"))
         .expect(
-            "src/repl/mesh.rs's fn render_knocks ends a drop line with `; none of its knocks ...`",
+            "src/repl/mesh.rs's fn render_knocks ends a drop line with `; none of their requests ...`",
         );
     let mut fragments = format_fragments(drop_line);
     fragments.extend(format_fragments(wait));
@@ -9411,7 +9441,7 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     }
     let prose = flat(&sample);
     for needle in [
-        format!("({burst} per identity back to back, then one per {refill_minutes} minutes)"),
+        format!("({burst} per user back to back, then one per {refill_minutes} minutes)"),
         none_on_file.trim_start_matches("; ").to_string(),
         capped_count.clone(),
     ] {
@@ -9424,7 +9454,7 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     let label = "Mesh-Trust-Model.md";
     let knocks = flat(&section(label, &read(wiki.join(label)), "## Knocks"));
     for needle in [
-        format!("{burst} knocks land back to back and then one per {refill_minutes} minutes"),
+        format!("{burst} requests land back to back and then one per {refill_minutes} minutes"),
         "`.mesh access requests` counts the ones that were dropped".to_string(),
         capped_count,
     ] {
@@ -9490,16 +9520,16 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         "the refusal no longer names the trust command: {literal:?}"
     );
     assert!(
-        literal.ends_with("(This node does trust {dest8}.)"),
+        literal.ends_with("(You do trust {dest8}.)"),
         "the refusal no longer closes on the trust fact: {literal:?}"
     );
     let next_action = string_literals(&method_body("src/mesh/request/error.rs", "next_action"));
     let action_fragments = format_fragments(&next_action[0]);
     assert!(
         action_fragments.iter().any(|piece| piece.contains(
-            "unless that peer blocked this instance or saw this identity's key change, the request already reached them as a knock"
+            "unless that peer blocked this session or saw this identity's key change, the request already reached them as a request to be trusted"
         )),
-        "next_action no longer says a default-closed refusal filed the request as a knock, or no longer hedges that for a block or a key change: {next_action:?}"
+        "next_action no longer says a default-closed refusal filed the request as a request to be trusted, or no longer hedges that for a block or a key change: {next_action:?}"
     );
     let card_rs = read(repo_root().join("src/mesh/card.rs"));
     let tail = "A status request is answered live or not at all; nothing queues it for later.";
@@ -9562,7 +9592,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         for quote in quotes {
             let closing = quote.strip_suffix(&format!(" {tail}")).unwrap_or(quote);
             let trust_fact = closing
-                .rsplit_once("(This node does trust ")
+                .rsplit_once("(You do trust ")
                 .map_or("", |(_, fact)| fact);
             assert!(
                 trust_fact.ends_with(".)") && trust_fact.matches('.').count() == 1,
@@ -9570,7 +9600,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
             );
         }
     }
-    let with_tail = format!("(This node does trust <dest8>.) {tail}");
+    let with_tail = format!("(You do trust <dest8>.) {tail}");
     assert!(
         status.contains(&with_tail),
         "Mesh-Commands.md's `.mesh status` quote does not end with the live-only tail: {with_tail:?}"

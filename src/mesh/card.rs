@@ -662,7 +662,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from {}: most likely it has not trusted this instance ({own}). Its owner can run .mesh access trust {own} (or .mesh access unblock {own} if it blocked this instance). A status request is answered live or not at all; nothing queues it for later.",
+                "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). A status request is answered live or not at all; nothing queues it for later.",
                 short(&to)
             )
         );
@@ -1964,12 +1964,12 @@ mod tests {
         .to_string();
         assert!(
             text.starts_with(&format!(
-                "\"Bea\" (bbbbbbbb) refused the request: it has not trusted this instance ({}). ",
+                "\"Bea\" (bbbbbbbb) refused the request: it has not trusted this session ({}). ",
                 "a".repeat(32)
             )),
             "{text}"
         );
-        assert!(text.ends_with(". (This node does trust bbbbbbbb.) A status request is answered live or not at all; nothing queues it for later."), "{text}");
+        assert!(text.ends_with(". (You do trust bbbbbbbb.) A status request is answered live or not at all; nothing queues it for later."), "{text}");
         assert!(!text.contains("0xf1"), "{text}");
     }
 
