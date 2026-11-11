@@ -11917,7 +11917,7 @@ mod tests {
             first_seen: now - Duration::from_secs(3600),
             last_seen: now - Duration::from_secs(seen_secs_ago),
             left_at: None,
-            served_this_node: false,
+            served_instances: Default::default(),
         }
     }
 

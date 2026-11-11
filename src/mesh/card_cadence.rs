@@ -33,6 +33,8 @@ pub(crate) enum CardTrigger {
 /// The bookkeeping behind the background card fetch, in memory for one run.
 pub(crate) struct CardCadence {
     state: Mutex<CadenceState>,
+    /// The node's one `STATUS_MAX_CONCURRENCY` cap, shared by the background fetches and
+    /// a `mesh__peers` listing with its cards.
     permits: Arc<Semaphore>,
     /// Added to the clock, so a test can let hours pass at once.
     #[cfg(test)]
@@ -47,7 +49,8 @@ struct CadenceState {
     /// When each destination was last asked in the background.
     last_asked: HashMap<String, Instant>,
     /// Destinations whose last answer was a refusal; not asked in the background again
-    /// until the trust on either side changes or the owner asks by hand.
+    /// until the trust on either side changes or the owner asks by hand. Kept for the
+    /// run only: a restart asks again once, at most, before a refusal stops it anew.
     refused: HashSet<String>,
 }
 
@@ -63,6 +66,12 @@ impl Default for CardCadence {
 }
 
 impl CardCadence {
+    /// The permits every `/status` request this node makes on its own or for a listing
+    /// takes one of, so together they never exceed `STATUS_MAX_CONCURRENCY`.
+    pub(crate) fn status_permits(&self) -> Arc<Semaphore> {
+        self.permits.clone()
+    }
+
     fn now(&self) -> Instant {
         Instant::now() + self.skew()
     }
@@ -122,8 +131,9 @@ impl CardCadence {
         self.state.lock().refused.insert(destination.to_string());
     }
 
-    /// The trust on the session's side changed (it sent this node a message, which it
-    /// can only do while it trusts this node) or the owner asked for its card by hand.
+    /// The trust on the session's side may have changed (it sent this node a message,
+    /// which it sends only to a session it trusts, though a held message may predate a
+    /// later revoke) or the owner asked for its card by hand.
     pub(crate) fn lift(&self, destination: &str) {
         self.state.lock().refused.remove(destination);
     }
@@ -137,6 +147,12 @@ impl CardCadence {
     #[cfg(test)]
     pub(crate) fn is_refused(&self, destination: &str) -> bool {
         self.state.lock().refused.contains(destination)
+    }
+
+    /// Forgets that `destination` was heard, as a new run starts out.
+    #[cfg(test)]
+    pub(crate) fn forget_heard(&self, destination: &str) {
+        self.state.lock().heard.remove(destination);
     }
 }
 
@@ -199,8 +215,10 @@ impl MeshRuntime {
     /// Asks the session at `destination` for its card in the background when the cadence
     /// allows: the peer table holds it, it has not said it left, this node trusts it, and
     /// `CardCadence::admit` agrees. The fetch waits for one of `STATUS_MAX_CONCURRENCY`
-    /// permits, never asks the network for a path and never knocks; it says nothing
-    /// above the debug log. Returns the fetch's task, which a caller may drop.
+    /// permits, never asks the network for a path and never sends a `/knock` of its own
+    /// (a peer that no longer trusts this session files the refused request as a knock,
+    /// which is why a refusal stops the cadence); it says nothing above the debug log.
+    /// Returns the fetch's task, which a caller may drop.
     pub(crate) fn consider_card_fetch(
         self: &Arc<Self>,
         destination: &str,
@@ -347,6 +365,29 @@ mod network {
             .count()
     }
 
+    fn knocks(at: &MeshRuntime, from_identity: &str) -> usize {
+        at.knock_gate()
+            .cache()
+            .list(SystemTime::now())
+            .unwrap()
+            .iter()
+            .filter(|knock| knock.identity_hash == from_identity)
+            .count()
+    }
+
+    /// Waits for `at` to have filed `count` knocks from `from_identity`; knocks are filed
+    /// off the request path.
+    async fn wait_for_knocks(at: &MeshRuntime, from_identity: &str, count: usize) {
+        for _ in 0..100 {
+            if knocks(at, from_identity) >= count {
+                assert_eq!(knocks(at, from_identity), count);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("{count} knock(s) were never filed");
+    }
+
     /// A card from a session A trusts is kept as that session's and its person's
     /// advertised names; after B revokes A, an hour of the triggers A's background
     /// fetch answers to (B's announces every ten minutes) files nothing at B: no status
@@ -411,6 +452,8 @@ mod network {
             .untrust_destination(slot_b.as_ref(), &a_rt.current_destination_hash(), false)
             .unwrap();
         let asked = status_requests(a_rt);
+        // B's announces over the next hour: A has heard B in this run, so none of them
+        // prompts a fetch, and nothing reaches B.
         for _ in 0..6 {
             a_rt.card_cadence().advance(CARD_FETCH_MIN_INTERVAL);
             if let Some(fetch) = a_rt.consider_card_fetch(&b_dest, CardTrigger::Heard) {
@@ -422,31 +465,40 @@ mod network {
             asked,
             "an hour of B's announces sends B no status request"
         );
-        let knocks_from_a = |at: &MeshRuntime| {
-            at.knock_gate()
-                .cache()
-                .list(SystemTime::now())
-                .unwrap()
-                .iter()
-                .filter(|knock| knock.identity_hash == a_rt.fingerprint())
-                .count()
-        };
+        let knocks_from_a = |at: &MeshRuntime| knocks(at, a_rt.fingerprint());
         assert_eq!(knocks_from_a(b_rt), 0, "B holds no knock from A");
 
-        // A trusts B again: a trust change on A's side, so one fetch goes out, B refuses
-        // it, and nothing more is asked for the rest of the hour.
+        // A grant on A's side (a trust change on A's side) asks once more. B refuses it,
+        // and since B knows A's identity but no longer trusts its session, B files that
+        // one request as a knock: the one a refusal costs before the stop holds.
         a_rt.card_cadence().advance(CARD_FETCH_MIN_INTERVAL);
         a_rt.consider_card_fetch(&b_dest, CardTrigger::Granted)
             .expect("a grant on A's side asks once more")
             .await
             .unwrap();
+        assert_eq!(status_requests(a_rt), asked + 1);
         assert!(a_rt.card_cadence().is_refused(&b_dest));
+        wait_for_knocks(b_rt, a_rt.fingerprint(), 1).await;
+
+        // From here the stop alone holds the cadence: each hour step forgets that B was
+        // heard, as a new run would, so every one of these announces would ask B but for
+        // the refusal.
         let asked = status_requests(a_rt);
-        for trigger in [CardTrigger::Heard; 6] {
+        for _ in 0..6 {
             a_rt.card_cadence().advance(CARD_FETCH_MIN_INTERVAL);
-            assert!(a_rt.consider_card_fetch(&b_dest, trigger).is_none());
+            a_rt.card_cadence().forget_heard(&b_dest);
+            assert!(
+                a_rt.consider_card_fetch(&b_dest, CardTrigger::Heard)
+                    .is_none()
+            );
         }
         assert_eq!(status_requests(a_rt), asked);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            knocks_from_a(b_rt),
+            1,
+            "an hour of announces after the refusal files nothing more at B"
+        );
         assert_eq!(
             a_rt.trust()
                 .people(&[])
@@ -455,6 +507,22 @@ mod network {
                 .as_deref(),
             Some("named-session"),
             "a refusal keeps the names the last card gave"
+        );
+        // A refusal reaches tools' results unfenced, so it names B by A's own aliases or
+        // B's hashes, never by the names B's card advertised.
+        let refusal = a_rt.remote_refusal(&b_dest);
+        for text in [refusal.to_string(), refusal.next_action()] {
+            assert!(
+                !text.contains("Beatrice") && !text.contains("named-session"),
+                "{text}"
+            );
+        }
+        a_rt.trust()
+            .set_person_alias(&b_identity, Some("Bea"), &[])
+            .unwrap();
+        assert!(
+            a_rt.remote_refusal(&b_dest).to_string().contains("Bea"),
+            "the owner's own alias still names the peer"
         );
         a_rt.note_served_by(&b_dest);
         assert!(
@@ -467,8 +535,8 @@ mod network {
         relay.stop().await;
     }
 
-    /// A session this node does not trust is never fetched in the background, and the
-    /// names of a card read from one are not kept.
+    /// A session this node does not trust is never fetched in the background, even one
+    /// that served it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_untrusted_session_is_never_fetched_in_the_background() {
         let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;

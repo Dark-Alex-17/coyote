@@ -6,7 +6,7 @@ use crate::mesh::request::{
     RequestError, RequestOptions, STATUS_PATH, request_remedy, short,
 };
 use crate::mesh::snapshot::{MeshSnapshot, TurnState};
-use crate::mesh::trust::Decision;
+use crate::mesh::trust::{Decision, TrustStore};
 use crate::mesh::{destination_address, display_text, redact_hashes};
 
 use async_trait::async_trait;
@@ -721,46 +721,70 @@ impl MeshRuntime {
         Ok(card)
     }
 
-    /// Keeps the names `card` advertises as the aliases of the session and person it came
-    /// from, but only when that pair is proven and trusted: `destination` must derive
-    /// from its identity, which the link that carried the card proved the peer holds,
-    /// and the trust list must allow that identity at that destination. Anything else
-    /// keeps nothing, so a card never grows the people section for a stranger. Nothing
-    /// here logs a name.
+    /// `keep_card_names` against this node's trust list, saying why at debug when
+    /// nothing was kept. Nothing here logs a name.
     fn keep_advertised_names(&self, destination: &DestinationDesc, card: &StatusCard) {
         let destination_hex = destination.address_hash.to_hex_string();
         let dest8 = short(&destination_hex);
-        let identity = destination.identity.address_hash;
-        let derives = <[u8; NAME_HASH_LEN]>::try_from(destination.name.as_name_hash_slice())
-            .is_ok_and(|name_hash| {
-                destination_address(&name_hash, &identity) == destination.address_hash
-            });
-        if !derives {
-            debug!(
+        match keep_card_names(&self.trust(), destination, card) {
+            Ok(NamesKept::Written | NamesKept::Unchanged) => {}
+            Ok(NamesKept::NotDerived) => debug!(
                 "Mesh status card from {dest8}: its destination does not derive from the identity that served it; its names are not kept"
-            );
-            return;
-        }
-        let identity_hex = identity.to_hex_string();
-        let trust = self.trust();
-        if trust.authorize(&identity_hex, &destination_hex).decision != Decision::Allow {
-            debug!(
+            ),
+            Ok(NamesKept::NotTrusted) => debug!(
                 "Mesh status card from {dest8}: the session is not trusted here; its names are not kept"
-            );
-            return;
-        }
-        if let Err(err) = trust.record_advertised(
-            &identity_hex,
-            &destination_hex,
-            card.person_name.as_deref(),
-            card.session.as_deref(),
-        ) {
-            debug!(
+            ),
+            Err(err) => debug!(
                 "Mesh status card from {dest8}: its names could not be kept: {}",
                 redact_hashes(&format!("{err:#}"))
-            );
+            ),
         }
     }
+}
+
+/// What `keep_card_names` did with a card's names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamesKept {
+    Written,
+    Unchanged,
+    NotDerived,
+    NotTrusted,
+}
+
+/// Keeps the names `card` advertises as the aliases of the session and person it came
+/// from, but only when that pair is proven and trusted: `destination` must derive from
+/// its identity, which the link that carried the card proved the peer holds, and the
+/// trust list must allow that identity at that destination, judged under the lock the
+/// write takes. Anything else keeps nothing, so a card never grows the people section
+/// for a stranger.
+fn keep_card_names(
+    trust: &TrustStore,
+    destination: &DestinationDesc,
+    card: &StatusCard,
+) -> anyhow::Result<NamesKept> {
+    let identity = destination.identity.address_hash;
+    let derives = <[u8; NAME_HASH_LEN]>::try_from(destination.name.as_name_hash_slice()).is_ok_and(
+        |name_hash| destination_address(&name_hash, &identity) == destination.address_hash,
+    );
+    if !derives {
+        return Ok(NamesKept::NotDerived);
+    }
+    let identity_hex = identity.to_hex_string();
+    let destination_hex = destination.address_hash.to_hex_string();
+    if trust.authorize(&identity_hex, &destination_hex).decision != Decision::Allow {
+        return Ok(NamesKept::NotTrusted);
+    }
+    let written = trust.record_advertised_if_trusted(
+        &identity_hex,
+        &destination_hex,
+        card.person_name.as_deref(),
+        card.session.as_deref(),
+    )?;
+    Ok(if written {
+        NamesKept::Written
+    } else {
+        NamesKept::Unchanged
+    })
 }
 
 #[cfg(test)]
@@ -1072,6 +1096,81 @@ mod tests {
         let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
         let card = handler.card(now());
         assert_eq!((card.session, card.person_name), (None, None));
+    }
+
+    /// A card's names are kept only from a destination that derives from the identity
+    /// that served it, and only while the trust list allows that pair; a stranger's card
+    /// and a card whose destination is not its identity's keep nothing.
+    #[test]
+    fn card_names_are_kept_only_from_a_proven_trusted_session() {
+        use crate::mesh::session_destination_name;
+        use crate::mesh::test_support::TrustList;
+        use rns_transport::destination::SingleInputDestination;
+        use rns_transport::identity::PrivateIdentity;
+        use rns_transport::rand_core::OsRng;
+
+        let desc = |aspect: &str| {
+            SingleInputDestination::new(
+                PrivateIdentity::new_from_rand(OsRng),
+                session_destination_name(aspect),
+            )
+            .desc
+        };
+        let trusted = desc("card-names-trusted");
+        let stranger = desc("card-names-stranger");
+        let mut forged = desc("card-names-forged");
+        forged.address_hash = trusted.address_hash;
+        let pair = |desc: &DestinationDesc| {
+            (
+                desc.identity.address_hash.to_hex_string(),
+                desc.address_hash.to_hex_string(),
+            )
+        };
+        let (trusted_id, trusted_dest) = pair(&trusted);
+        let (forged_id, _) = pair(&forged);
+        let (stranger_id, stranger_dest) = pair(&stranger);
+        let (trust, _tmp) = TrustList::default()
+            .destination(&trusted_dest, &trusted_id)
+            .identity(&forged_id, true)
+            .open("card-names-kept");
+        let mut card = build_card(None, None, None, None, None, &[], now());
+        card.person_name = Some("Beatrice".into());
+        card.session = Some("review".into());
+        let names = |identity: &str, destination: &str| {
+            let people = trust.people(&[]);
+            (
+                people.person(identity).map(|alias| alias.text.clone()),
+                people
+                    .session(identity, destination)
+                    .map(|alias| alias.text.clone()),
+            )
+        };
+
+        assert_eq!(
+            keep_card_names(&trust, &stranger, &card).unwrap(),
+            NamesKept::NotTrusted
+        );
+        assert_eq!(names(&stranger_id, &stranger_dest), (None, None));
+        assert_eq!(
+            keep_card_names(&trust, &forged, &card).unwrap(),
+            NamesKept::NotDerived,
+            "an identity trusted everywhere still cannot claim a destination that is not its own"
+        );
+        assert_eq!(names(&forged_id, &trusted_dest), (None, None));
+        assert_eq!(names(&trusted_id, &trusted_dest), (None, None));
+
+        assert_eq!(
+            keep_card_names(&trust, &trusted, &card).unwrap(),
+            NamesKept::Written
+        );
+        assert_eq!(
+            names(&trusted_id, &trusted_dest),
+            (Some("Beatrice".into()), Some("review".into()))
+        );
+        assert_eq!(
+            keep_card_names(&trust, &trusted, &card).unwrap(),
+            NamesKept::Unchanged
+        );
     }
 
     #[test]

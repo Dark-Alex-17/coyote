@@ -2915,6 +2915,20 @@ impl TrustStore {
         People::new(&self.loaded().file.people, own_sessions)
     }
 
+    /// `people` with every advertised name left out, so a peer is named by its owner's
+    /// aliases or its hashes alone: for text a model may be shown unfenced, where a name
+    /// a peer advertised is peer-supplied free text and must not appear.
+    pub(crate) fn owner_people(&self, own_sessions: &[&str]) -> People {
+        let mut entries = self.loaded().file.people.clone();
+        for entry in entries.values_mut() {
+            entry.advertised = None;
+            for session in entry.sessions.values_mut() {
+                session.advertised = None;
+            }
+        }
+        People::new(&entries, own_sessions)
+    }
+
     /// Sets the owner's alias of the person `identity_hash`, or clears it with `None`.
     /// Refused when it breaks a naming rule or reads the same as another owner's alias
     /// or one of `own_sessions`. The identity needs no trust record: naming a stranger
@@ -2984,9 +2998,9 @@ impl TrustStore {
     /// says it and its person are called, each cleaned first. Each replaces the one an
     /// earlier card gave, and a field the card left out clears it. An owner's alias is
     /// never touched. Writes only when something changed; returns whether it did.
-    /// Nothing here checks the pair: the caller passes the identity and destination the
-    /// card was proven to come from, and only for a session it trusts, so a stranger's
-    /// card never grows the file.
+    /// Nothing here checks the pair, so this unchecked form only seeds names in tests;
+    /// the card path keeps names through `record_advertised_if_trusted`.
+    #[cfg(test)]
     pub(crate) fn record_advertised(
         &self,
         identity_hash: &str,
@@ -2994,9 +3008,37 @@ impl TrustStore {
         person_name: Option<&str>,
         session: Option<&str>,
     ) -> Result<bool> {
+        self.record_advertised_when(identity_hash, destination_hash, person_name, session, false)
+    }
+
+    /// `record_advertised` only while the trust list allows `identity_hash` at
+    /// `destination_hash`, judged under the same write lock as the write, so a revoke or
+    /// forget that lands first is never undone by a card read before it. `Ok(false)`, and
+    /// nothing written, when the pair is not allowed.
+    pub(crate) fn record_advertised_if_trusted(
+        &self,
+        identity_hash: &str,
+        destination_hash: &str,
+        person_name: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<bool> {
+        self.record_advertised_when(identity_hash, destination_hash, person_name, session, true)
+    }
+
+    fn record_advertised_when(
+        &self,
+        identity_hash: &str,
+        destination_hash: &str,
+        person_name: Option<&str>,
+        session: Option<&str>,
+        only_if_trusted: bool,
+    ) -> Result<bool> {
         let identity = valid_hash("identity", identity_hash)?;
         let destination = valid_hash("destination", destination_hash)?;
         let mut state = self.writing()?;
+        if only_if_trusted && state.authorize(&identity, &destination).decision != Decision::Allow {
+            return Ok(false);
+        }
         let mut file = state.file.clone();
         people::set_name(
             &mut file.people,

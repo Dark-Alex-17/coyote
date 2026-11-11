@@ -4207,7 +4207,7 @@ fn code_vectors() -> Vec<Vector> {
                         first_seen: UNIX_EPOCH,
                         last_seen: UNIX_EPOCH,
                         left_at: None,
-                        served_this_node: false,
+                        served_instances: Default::default(),
                     },
                 )?;
                 refuses_an_unknown_key(
@@ -5164,7 +5164,7 @@ fn status_vectors() -> Vec<Vector> {
         ),
         card(
             "card-session-and-person-name-are-cleaned-to-display-text",
-            Kind::Invalid,
+            Kind::Valid,
             set(
                 set(
                     card_value(),

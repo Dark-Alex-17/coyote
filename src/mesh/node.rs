@@ -51,7 +51,7 @@ use crate::mesh::pending::{
     Correlations, InboundKind, InboundRecord, InboundStore, OtherSessionAsk, PendingRecord,
     PendingStore, access_not_a_question, other_sessions_asked,
 };
-use crate::mesh::people::{Namer, Who, YOU};
+use crate::mesh::people::{Namer, People, Who, YOU};
 use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
@@ -840,6 +840,7 @@ impl MeshRuntime {
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
             SystemTime::now(),
         )?);
+        peers.claim_served(&instance_id);
         let propagation_nodes = Arc::new(PropagationNodeTable::load(
             mesh_cache_dir(&paths.cache_dir).join(PROPAGATION_NODE_TABLE_FILE),
             SystemTime::now(),
@@ -1204,13 +1205,24 @@ impl MeshRuntime {
     /// your running sessions' names, your identity and your sessions on this config dir
     /// (the running ones over the gone ones the registry still keeps).
     pub(crate) fn namer(&self) -> Namer {
+        self.namer_from(|trust, running| trust.people(running))
+    }
+
+    /// `namer` without the names peers advertised: for a sentence that reaches a model
+    /// outside a fence, such as a peer's refusal, which may only name a peer by your own
+    /// aliases or its hashes.
+    pub(crate) fn owner_namer(&self) -> Namer {
+        self.namer_from(|trust, running| trust.owner_people(running))
+    }
+
+    fn namer_from(&self, people_of: impl FnOnce(&TrustStore, &[&str]) -> People) -> Namer {
         let sessions = self.registered_sessions();
         let running: Vec<&str> = sessions
             .running
             .values()
             .map(|row| row.session.as_str())
             .collect();
-        let people = self.trust().people(&running);
+        let people = people_of(&self.trust(), &running);
         let mut own: HashMap<String, String> = sessions
             .gone
             .iter()
@@ -1355,9 +1367,14 @@ impl MeshRuntime {
     }
 
     /// A peer's `NoAccess` as every request path reports it: the peer as `<user> /
-    /// <session>`, as every other line names it, this node by its current destination.
+    /// <session>`, this node by its current destination. The sentence reaches tools'
+    /// results unfenced, so the peer is named by your aliases or its hashes, never by a
+    /// name it advertised.
     pub(crate) fn remote_refusal(&self, destination: &str) -> RemoteRefusal {
-        let who = self.who_at(destination).to_string();
+        let who = self
+            .owner_namer()
+            .who(self.identity_at(destination).as_deref(), destination)
+            .to_string();
         RemoteRefusal::new(destination, Some(&who), self.current_destination_hash())
     }
 
@@ -2228,6 +2245,7 @@ impl MeshRuntime {
             instance_id: state.instance_id.clone(),
             destination_hash: hash.to_hex_string(),
         };
+        self.peers.claim_served(&state.instance_id);
         {
             let mut row = self.instance_row.lock();
             row.destination = hash.to_hex_string();

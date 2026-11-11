@@ -177,6 +177,8 @@ class ReferencePeer:
 
     def serve_status(self, path, data, request_id, link_id, remote_identity, requested_at):
         self._note_request(path, data, remote_identity)
+        # The names are deliberately dirty so the node's cleaning is exercised. The
+        # reference keeps no trust list, so it serves them to whoever asks.
         return {
             "v": 1,
             "session": " reference\u001b[31m-session ",

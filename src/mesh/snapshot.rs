@@ -114,8 +114,9 @@ pub(crate) struct MeshSnapshot {
     pub(crate) repo: Option<RepoInfo>,
     pub(crate) todo: TodoList,
     pub(crate) brief: BriefState,
-    /// The session's name as the card shares it, captured with everything else; `None`
-    /// while `mesh.share_session_name` is off.
+    /// The serving session's name, captured with everything else and not yet cleaned
+    /// (the card cleans it); `None` while `mesh.share_session_name` is off or no node is
+    /// running.
     pub(crate) session: Option<String>,
     /// The share root the `/list` and `/fetch` providers serve from.
     pub(crate) cwd: PathBuf,
