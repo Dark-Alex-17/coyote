@@ -7,7 +7,7 @@ description: |
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks — or, with
   pr_strategy=multi, one stacked draft PR per plan-declared PR group. Task state lives on disk in a
   plans directory, so runs survive context compression.
-version: 2.13.0
+version: 2.14.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -73,6 +73,9 @@ variables:
   - name: build_lock
     description: "Command prefix forwarded to every Sisyphus spawn and on to its coder/step-runner build/test/lint gates and to the review-gauntlet/adversary verification runs, e.g. `flock -w 240 /path/to/lock`; empty runs gates bare. It is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`)"
     default: ''
+  - name: task_granularity
+    description: "Task sizing for the plan: 'standard' (default, ~1 engineer-day tasks - today's behavior, unchanged) or 'micro' (tasks sized to one file/seam with exact signatures and EXECUTABLE acceptance criteria, grouped into plan-section batches; per task only coder verify + the adversary criteria check run, the full review gauntlet runs once per batch; designed for small/local implementer models and for runs where per-task blast radius must be minimal)"
+    default: 'standard'
 
 global_tools:
   - ast_grep.sh
@@ -88,8 +91,9 @@ global_tools:
 instructions: |
   Instructions are rendered dynamically: the `_instructions` tool (tools.sh) assembles them from
   instructions.md, resolving `<!-- when:... -->` conditional blocks against the agent variables
-  (autonomy, escalation_policy, parallel_tasks, pr_strategy). This static text is a placeholder
-  shown only when the dynamic render is unavailable (e.g. `--info`); it is never the live prompt.
+  (autonomy, escalation_policy, parallel_tasks, pr_strategy, task_granularity). This static text
+  is a placeholder shown only when the dynamic render is unavailable (e.g. `--info`); it is never
+  the live prompt.
 
 conversation_starters:
   - 'Implement the design doc at {{design_doc}} end to end'
