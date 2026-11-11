@@ -1380,7 +1380,8 @@ async fn reference_requests_hear_the_specified_replies() {
     // The identity is known but its instance is not trusted: the default-closed verdict,
     // which knocks and refuses. An unknown identity would hear silence instead.
     let known_identity = TrustList::default().identity(&reference.ready.identity_hash, false);
-    let (session, _) = session_with_instance_id();
+    let (mut session, _) = session_with_instance_id();
+    session.set_name("interop-node".to_string());
     let node = Node::start(
         "interop-replies",
         reference.ready.relay_port,
@@ -1433,6 +1434,20 @@ async fn reference_requests_hear_the_specified_replies() {
         .unwrap_or_else(|| panic!("{card}"));
     assert!(code <= 2, "{card}");
     assert!(card["served_at_secs"].as_u64().is_some(), "{card}");
+    assert_eq!(
+        card["session"],
+        json!("interop-node"),
+        "Coyote shares the session name by default: {card}"
+    );
+    assert_eq!(
+        keys(&card)[..2],
+        ["v", "session"],
+        "the session name follows `v` and the absent display name: {card}"
+    );
+    assert!(
+        card.get("person_name").is_none(),
+        "no person_name is configured, so none is sent: {card}"
+    );
 
     let body = json!({
         "v": 1,
@@ -1773,6 +1788,29 @@ async fn our_requests_are_decoded_by_the_reference() {
         .unwrap();
     assert_eq!(card.state.code, 1);
     assert!(card.served_at_secs > 1_700_000_000);
+    assert_eq!(
+        (card.session.as_deref(), card.person_name.as_deref()),
+        (Some("reference-session"), Some("Reference Person")),
+        "the reference's names are read cleaned"
+    );
+    let people = node.runtime.trust().people(&[]);
+    assert_eq!(
+        people
+            .person(&reference.ready.identity_hash)
+            .map(|alias| alias.text.as_str()),
+        Some("Reference Person"),
+        "a trusted card's person_name is kept as the identity's advertised name"
+    );
+    assert_eq!(
+        people
+            .session(
+                &reference.ready.identity_hash,
+                &reference.ready.destination_hash
+            )
+            .map(|alias| alias.text.as_str()),
+        Some("reference-session"),
+        "a trusted card's session is kept as the destination's advertised name"
+    );
     let heard = reference.next_event("request", REQUEST_TIMEOUT).await;
     assert_eq!(heard["path"], json!("/status"), "{heard}");
     assert_eq!(heard["envelope"]["name_hash"], json!(node.name_hash()));

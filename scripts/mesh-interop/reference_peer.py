@@ -177,7 +177,13 @@ class ReferencePeer:
 
     def serve_status(self, path, data, request_id, link_id, remote_identity, requested_at):
         self._note_request(path, data, remote_identity)
-        return {"v": 1, "state": {"code": 1}, "served_at_secs": int(time.time())}
+        return {
+            "v": 1,
+            "session": " reference\u001b[31m-session ",
+            "person_name": "Reference\u200b Person",
+            "state": {"code": 1},
+            "served_at_secs": int(time.time()),
+        }
 
     def serve_message(self, path, data, request_id, link_id, remote_identity, requested_at):
         self._note_request(path, data, remote_identity)
