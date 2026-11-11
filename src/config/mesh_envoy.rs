@@ -8970,6 +8970,114 @@ mod tests {
         source.remove_dir();
     }
 
+    /// What `.mesh <args>` printed to stdout on `ctx`, as the person at the keyboard reads it.
+    #[cfg(unix)]
+    async fn repl_out(ctx: &mut RequestContext, args: &str) -> String {
+        use crate::repl::mesh::capture;
+        let before = capture::lines().len();
+        Box::pin(crate::repl::mesh::run(
+            ctx,
+            crate::utils::create_abort_signal(),
+            Some(args),
+        ))
+        .await
+        .unwrap();
+        capture::lines()[before..]
+            .iter()
+            .filter(|(stream, _)| *stream == capture::Stream::Out)
+            .map(|(_, text)| text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Over two real nodes, the reply to the model's open `mesh__ask` stays in the
+    /// person's inbox, labelled `answered, awaiting the model`; the person reading it
+    /// takes nothing from `mesh__check_inbox`, and the model reading it takes nothing
+    /// from the person. Once collected the label goes and the reply stays, no longer
+    /// new; `clear --yes` then empties the inbox for both.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_reply_to_the_models_ask_stays_in_the_persons_inbox_and_both_read_it() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-inbox-readers");
+        let _capture = crate::repl::mesh::capture::install();
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(60);
+        let mut peer = AskingPeer::start("two-nodes-inbox-readers", Arc::clone(&app_b)).await;
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app_b),
+            drive_of(|_, _, _| async move { Ok("four".to_string()) }),
+        );
+        runner.attach();
+
+        let id = peer.ask("what is 2+2?").await;
+        wait_until("the reply to reach A's inbox", || {
+            peer.ctx.app.mesh.peer_inbox().len() == 1
+        })
+        .await;
+        wait_until("the correlation to hold the reply", || {
+            peer.ctx
+                .app
+                .mesh
+                .correlations()
+                .list()
+                .iter()
+                .any(|c| c.record.id == id && c.reply.is_some())
+        })
+        .await;
+
+        let first = repl_out(&mut peer.ctx, "messaging inbox").await;
+        let lines: Vec<&str> = first.lines().collect();
+        assert!(lines[0].starts_with("reply . from "), "{first}");
+        assert!(lines[0].ends_with(" . new"), "{first}");
+        assert!(first.contains("four"), "{first}");
+        assert_eq!(
+            lines.last(),
+            Some(&"  answered, awaiting the model"),
+            "{first}"
+        );
+        assert!(!first.contains("awaiting collect"), "{first}");
+
+        let inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(
+            inbox["count"], 1,
+            "the person reading took nothing: {inbox}"
+        );
+        assert_eq!(inbox["answered_awaiting_collect"], json!([id]), "{inbox}");
+        assert!(inbox.get("dropped").is_none(), "{inbox}");
+        assert_eq!(peer.tool("check_inbox", json!({})).await["count"], 0);
+
+        let second = repl_out(&mut peer.ctx, "messaging inbox").await;
+        assert_eq!(
+            second,
+            first.replacen(" . new", "", 1),
+            "kept, no longer new"
+        );
+
+        let replied = peer.collect(&id, 5).await;
+        assert_collected(&replied, &id, &peer.to_b, "answered", "four");
+        let third = repl_out(&mut peer.ctx, "messaging inbox").await;
+        assert!(
+            third.starts_with("reply . from "),
+            "the reply stays: {third}"
+        );
+        assert!(!third.contains("awaiting the model"), "collected: {third}");
+        assert!(!third.contains(" . new"), "{third}");
+
+        let cleared = repl_out(&mut peer.ctx, "messaging inbox clear --yes").await;
+        assert_eq!(cleared, "Cleared 1 message from your inbox.");
+        assert_eq!(peer.ctx.app.mesh.peer_inbox().len(), 0, "both had read it");
+        assert_eq!(
+            repl_out(&mut peer.ctx, "messaging inbox").await,
+            "Inbox is empty."
+        );
+        assert_eq!(peer.tool("check_inbox", json!({})).await["count"], 0);
+
+        runner.stop().await;
+        peer.stop().await;
+        source.remove_dir();
+    }
+
     /// Over two real nodes, `mesh__send` with `kind: "note"` on a question B asked of A
     /// reaches B as an interim note: B's correlation stays open with no answer to take,
     /// nothing is filed on B, B's envoy sees no job, and the note sits in B's inbox as a

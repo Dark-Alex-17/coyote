@@ -852,6 +852,79 @@ fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused()
     assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
 }
 
+/// Cold start, mesh off, no session: the inbox reads and clears through the real
+/// binary with the words the docs quote. An empty inbox reads `Inbox is empty.`,
+/// `clear` on it asks nothing, `--yes` alone is refused naming what it goes with,
+/// the inbox help says reading takes nothing from the model, the send help says
+/// where a reply lands, and neither help says "this node". No node starts.
+#[test]
+fn the_inbox_reads_and_clears_at_a_cold_prompt_and_the_help_says_where_replies_land() {
+    const YES_ALONE: &str = "`--yes` goes with `clear` or `--purge-files`, and `--dry-run` with `--purge-files`; pass one or drop them.";
+    const INBOX_USAGE: &str =
+        "Usage: .mesh messaging inbox [clear [--yes] | --purge-files [--yes|--dry-run]]";
+
+    let relay = SilentRelay::start();
+    let probe = Probe::new("inbox-cold", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    wait_for(&mut session, BARE_PROMPT);
+
+    let (row, transcript) = command_row_and_transcript(
+        &mut session,
+        ".mesh messaging inbox",
+        r"Inbox is empty\.",
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), "Inbox is empty.", "{transcript}");
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh messaging inbox clear",
+        r"Inbox is empty; nothing to clear\.",
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), "Inbox is empty; nothing to clear.");
+    let (row, _) = command_row_and_transcript(
+        &mut session,
+        ".mesh messaging inbox --yes",
+        &literally(YES_ALONE),
+        BARE_PROMPT,
+    );
+    assert_eq!(row.trim(), format!("Error: {YES_ALONE}"));
+
+    let help = command_prints(
+        &mut session,
+        ".mesh messaging inbox --help",
+        r"lasts for this session only\.",
+        BARE_PROMPT,
+    );
+    assert!(help.contains(INBOX_USAGE), "{help}");
+    assert!(
+        help.contains("Show the messages peers sent this session, the new ones marked"),
+        "{help}"
+    );
+    assert!(help.contains("mesh__check_inbox"), "{help}");
+    assert!(!help.to_ascii_lowercase().contains("this node"), "{help}");
+
+    let help = command_prints(
+        &mut session,
+        ".mesh messaging send --help",
+        r"Usage: \.mesh messaging send",
+        BARE_PROMPT,
+    );
+    assert!(
+        help.contains("envoy"),
+        "the send help says the envoy may reply: {help}"
+    );
+    assert!(
+        help.contains(".mesh messaging inbox"),
+        "the send help says the reply lands in the inbox: {help}"
+    );
+    assert!(!help.to_ascii_lowercase().contains("this node"), "{help}");
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert_eq!(probe.marker_count("MESH_STARTED"), 0, "no node was started");
+}
+
 /// Failed precondition: `mesh.enabled: true` with no session prints the
 /// autostart notice and the very `.mesh on` refusal, then goes on to a usable
 /// prompt with the mesh off; no node is started (no `mesh.started`).

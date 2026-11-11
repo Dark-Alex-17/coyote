@@ -6887,10 +6887,11 @@ fn the_inbox_renderer_carries_only_ascii_user_facing_strings() {
 
 /// The Commands page's `.mesh messaging inbox` sample shows the block shape the renderer prints: a
 /// dot-separated header naming the sender, route and thread, an indented `file:` line
-/// pointing at a home-relative staged path, a block this node sent, a header marked
+/// pointing at a home-relative staged path, a `you ->` block, a header marked
 /// ` . new` and the `answered, awaiting the model` tail; the prose names every header
-/// segment, the two readers and `clear`, and the
-/// `from_self` key `mesh__check_inbox` adds, and says a `this node ->` block is either
+/// segment, the two readers and `clear`, quotes the clear and dropped-message lines as
+/// the code builds them, and names the `from_self` key `mesh__check_inbox` adds, and
+/// says a `you ->` block is either
 /// the envoy's reply or one typed with `.mesh envoy answer`. The sibling pages that walk a
 /// first exchange quote the same shape, and no Mesh page still quotes the retired
 /// one-line shape or an `envoy ->` header. The code side, the labels `render_inbox`
@@ -6979,7 +6980,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         lines
             .iter()
             .any(|line| line.starts_with("you -> ") && line.contains(" . answering ")),
-        "the `.mesh messaging inbox` sample has no block this node sent:\n{sample}"
+        "the `.mesh messaging inbox` sample has no `you -> ` block:\n{sample}"
     );
     let own_block: Vec<&str> = lines
         .iter()
@@ -6992,7 +6993,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
             && !own_block
                 .iter()
                 .any(|line| line.contains("answered, awaiting the model")),
-        "the sample's `you -> ` block answers this node's own question:\n{sample}"
+        "the sample's `you -> ` block must not carry `answered, awaiting the model`:\n{sample}"
     );
     let headers = lines
         .iter()
@@ -7045,6 +7046,67 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
             "the `.mesh messaging inbox` prose does not spell the word `{word}`:\n{prose}"
         );
     }
+    assert!(
+        !prose.contains("answered, awaiting collect")
+            && !sample.contains("answered, awaiting collect"),
+        "the `.mesh messaging inbox` section still uses the retired tail wording:\n{prose}"
+    );
+    let clear = string_literals(&fn_body("src/repl/mesh.rs", "clear_inbox"));
+    let kept = string_literals(&fn_body("src/repl/mesh.rs", "kept_for_model_text"));
+    let dropped = string_literals(&fn_body("src/repl/mesh.rs", "dropped_warning"));
+    let send_note = string_literals(&fn_body("src/repl/mesh.rs", "verb_help_note"));
+    for (literals, code, wiki) in [
+        (
+            &clear,
+            "Inbox is empty; nothing to clear.",
+            "`Inbox is empty; nothing to clear.`",
+        ),
+        (
+            &clear,
+            "Clear {messages} from your inbox?",
+            "`Clear N messages from your inbox? This cannot be undone.`",
+        ),
+        (&clear, " This cannot be undone.", "This cannot be undone.`"),
+        (
+            &clear,
+            " You have not seen {which} yet.",
+            "`You have not seen N of them yet.`",
+        ),
+        (
+            &clear,
+            "Cleared {messages} from your inbox.",
+            "`Cleared N messages from your inbox. The model has not read 1 message yet; it stays for the model, out of your view.`",
+        ),
+        (
+            &kept,
+            "The model has not read 1 message yet; it stays for the model, out of your view.",
+            "The model has not read 1 message yet; it stays for the model, out of your view.`",
+        ),
+        (
+            &dropped,
+            "WARNING: {dropped} peer message(s) were dropped before you read them because the inbox was full.",
+            "`WARNING: N peer message(s) were dropped before you read them because the inbox was full.`",
+        ),
+    ] {
+        assert!(
+            literals.iter().any(|literal| literal == code),
+            "the code no longer builds {code:?}: {literals:?}"
+        );
+        assert!(
+            prose.contains(wiki),
+            "the `.mesh messaging inbox` prose does not quote {wiki}:\n{prose}"
+        );
+    }
+    let reply_lands = "The receiving session's envoy may answer for its user; the reply lands in your inbox (.mesh messaging inbox).";
+    assert!(
+        send_note.iter().any(|literal| literal == reply_lands),
+        "the `messaging send` help note moved: {send_note:?}"
+    );
+    let send = section("Mesh-Commands.md", &page, "### `.mesh messaging send`");
+    assert!(
+        flat(&send).contains(&format!("`{reply_lands}`")),
+        "the `.mesh messaging send` section does not quote the help note:\n{send}"
+    );
 
     for (page, needle) in [
         ("Mesh-File-Sharing.md", "file: <name> (<size> B) -> <path>"),

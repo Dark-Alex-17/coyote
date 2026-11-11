@@ -3162,35 +3162,50 @@ impl PeerInbox {
         (envelopes, dropped)
     }
 
-    /// How many entries the human's view holds and how many of those the model has not
-    /// read, for the question `clear` asks first.
-    pub(crate) fn human_view_counts(&self) -> (usize, usize) {
+    /// What the human's view holds right now, for the question `clear` asks first and
+    /// for the clear itself, so a message that arrives while the question stands is
+    /// neither counted nor cleared.
+    pub(crate) fn human_view(&self) -> HumanView {
         let state = self.state.lock();
-        let shown = state
+        let mut view = HumanView {
+            shown: 0,
+            unseen: 0,
+            unread_by_model: 0,
+            through: state.last,
+        };
+        for (seq, _) in state
             .entries
             .iter()
-            .filter(|(seq, _)| *seq > state.hidden_from_human);
-        let (mut total, mut unread_by_model) = (0, 0);
-        for (seq, _) in shown {
-            total += 1;
+            .filter(|(seq, _)| *seq > state.hidden_from_human)
+        {
+            view.shown += 1;
+            if *seq > state.human.seen {
+                view.unseen += 1;
+            }
             if *seq > state.model.seen {
-                unread_by_model += 1;
+                view.unread_by_model += 1;
             }
         }
-        (total, unread_by_model)
+        view
     }
 
-    /// Empties the human's view: entries the model has read leave the inbox, the rest
-    /// stay for the model and are hidden from the human. Everything here counts as seen
-    /// by the human. Returns how many entries stay for the model.
-    pub(crate) fn clear_for_human(&self) -> usize {
+    /// Empties the human's view as `view` saw it: of those entries, the ones the model
+    /// has read leave the inbox and the rest stay for the model, hidden from the human
+    /// and counted as seen by it. Anything newer than `view` stays shown and new.
+    /// Returns how many of the cleared entries stay for the model.
+    pub(crate) fn clear_for_human(&self, view: &HumanView) -> usize {
         let mut state = self.state.lock();
-        let model_seen = state.model.seen;
-        state.entries.retain(|(seq, _)| *seq > model_seen);
-        let last = state.last;
-        state.human.seen = last;
-        state.hidden_from_human = last;
-        state.entries.len()
+        let (model_seen, hidden) = (state.model.seen, state.hidden_from_human);
+        state
+            .entries
+            .retain(|(seq, _)| *seq > view.through || *seq > model_seen);
+        state.human.seen = state.human.seen.max(view.through);
+        state.hidden_from_human = hidden.max(view.through);
+        state
+            .entries
+            .iter()
+            .filter(|(seq, _)| *seq > hidden && *seq <= view.through)
+            .count()
     }
 
     /// Every retained entry, oldest first, emptying the inbox for both readers, and the
@@ -3215,6 +3230,16 @@ impl PeerInbox {
     pub(crate) fn len(&self) -> usize {
         self.state.lock().entries.len()
     }
+}
+
+/// The human's view of the inbox at one moment: how many entries it shows, how many of
+/// those the human has not been shown and the model has not read, and the newest entry
+/// it covers.
+pub(crate) struct HumanView {
+    pub(crate) shown: usize,
+    pub(crate) unseen: usize,
+    pub(crate) unread_by_model: usize,
+    through: u64,
 }
 
 #[derive(Default)]
@@ -4641,15 +4666,17 @@ mod tests {
         inbox.deliver(numbered(1));
         assert_eq!(envelope_ids(&inbox.read_for_model().0), ["m0", "m1"]);
         inbox.deliver(numbered(2));
-        assert_eq!(inbox.human_view_counts(), (3, 1));
+        let view = inbox.human_view();
+        assert_eq!((view.shown, view.unseen, view.unread_by_model), (3, 3, 1));
 
-        assert_eq!(inbox.clear_for_human(), 1, "m2 stays for the model");
+        assert_eq!(inbox.clear_for_human(&view), 1, "m2 stays for the model");
         assert_eq!(inbox.len(), 1, "m0 and m1, read by both, are gone");
         assert!(
             inbox.read_for_human().0.is_empty(),
             "the human view is empty"
         );
-        assert_eq!(inbox.human_view_counts(), (0, 0));
+        let view = inbox.human_view();
+        assert_eq!((view.shown, view.unseen, view.unread_by_model), (0, 0, 0));
         assert_eq!(
             envelope_ids(&inbox.read_for_model().0),
             ["m2"],
@@ -4663,13 +4690,57 @@ mod tests {
             "what arrives after a clear is shown, and only that"
         );
         assert_eq!(
-            inbox.clear_for_human(),
+            inbox.clear_for_human(&inbox.human_view()),
             1,
             "m2 the model has now read goes; m3 it has not stays"
         );
         assert_eq!(inbox.len(), 1);
         assert_eq!(envelope_ids(&inbox.read_for_model().0), ["m3"]);
         assert!(inbox.read_for_human().0.is_empty());
+    }
+
+    /// A message that arrives after the view was counted, while `clear` waits for its
+    /// answer, is neither cleared nor hidden: it stays shown and new. The count of what
+    /// stays for the model covers only the entries the view showed, not ones an earlier
+    /// clear already hid.
+    #[test]
+    fn peer_inbox_clear_takes_only_what_the_counted_view_showed() {
+        let inbox = PeerInbox::default();
+        inbox.deliver(numbered(0));
+        inbox.read_for_model();
+        inbox.deliver(numbered(1));
+        let view = inbox.human_view();
+        assert_eq!((view.shown, view.unseen, view.unread_by_model), (2, 2, 1));
+
+        inbox.deliver(numbered(2));
+        inbox.read_for_model();
+        assert_eq!(
+            inbox.clear_for_human(&view),
+            0,
+            "the model read m1 meanwhile"
+        );
+        assert_eq!(
+            entry_ids(&inbox.read_for_human().0),
+            [("m2".to_string(), true)],
+            "m2 arrived after the count and is still shown, new"
+        );
+        assert_eq!(inbox.len(), 1, "m0 and m1, read by both, are gone");
+
+        inbox.deliver(numbered(3));
+        assert_eq!(
+            inbox.clear_for_human(&inbox.human_view()),
+            1,
+            "m3 is unread"
+        );
+        inbox.deliver(numbered(4));
+        let view = inbox.human_view();
+        assert_eq!((view.shown, view.unseen, view.unread_by_model), (1, 1, 1));
+        assert_eq!(
+            inbox.clear_for_human(&view),
+            1,
+            "m4 alone; m3, hidden by the first clear, is not counted again"
+        );
+        assert_eq!(envelope_ids(&inbox.read_for_model().0), ["m3", "m4"]);
     }
 
     /// At the cap the oldest entry goes. When both readers had seen it nobody counts a

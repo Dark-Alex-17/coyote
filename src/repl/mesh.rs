@@ -1335,25 +1335,34 @@ fn show_inbox(ctx: &RequestContext) -> Result<()> {
 }
 
 /// Empties the human's view of the inbox once confirmed: what the model has read too
-/// leaves the inbox, and what it has not stays for `mesh__check_inbox`.
+/// leaves the inbox, and what it has not stays for `mesh__check_inbox`. The clear takes
+/// exactly what the question counted; a message that lands while it is asked stays.
 fn clear_inbox(ctx: &RequestContext, yes: bool) -> Result<()> {
     let inbox = ctx.app.mesh.peer_inbox();
-    let (shown, unread_by_model) = inbox.human_view_counts();
-    if shown == 0 {
+    let view = inbox.human_view();
+    if view.shown == 0 {
         out_text("Inbox is empty; nothing to clear.");
         return Ok(());
     }
-    let messages = plural(shown, "message", "messages");
+    let messages = plural(view.shown, "message", "messages");
     let mut question = format!("Clear {messages} from your inbox?");
-    if unread_by_model > 0 {
-        question.push_str(&format!(" {}", kept_for_model_text(unread_by_model)));
+    if view.unseen > 0 {
+        let which = match (view.unseen, view.shown) {
+            (1, 1) => "it".to_string(),
+            (unseen, shown) if unseen == shown => "them".to_string(),
+            (unseen, _) => format!("{unseen} of them"),
+        };
+        question.push_str(&format!(" You have not seen {which} yet."));
+    }
+    if view.unread_by_model > 0 {
+        question.push_str(&format!(" {}", kept_for_model_text(view.unread_by_model)));
     }
     question.push_str(" This cannot be undone.");
     if !confirm_or_flag(&question, "--yes", yes)? {
         out_text(NOTHING_CHANGED);
         return Ok(());
     }
-    let kept = inbox.clear_for_human();
+    let kept = inbox.clear_for_human(&view);
     let mut done = format!("Cleared {messages} from your inbox.");
     if kept > 0 {
         done.push_str(&format!(" {}", kept_for_model_text(kept)));
@@ -9691,7 +9700,7 @@ fn render_verb_help(group: &str, verb: &str) -> String {
 fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
     match (group, verb) {
         ("messaging", "send") => Some(
-            "The session's envoy may reply on your behalf; the reply lands in your inbox (.mesh messaging inbox).",
+            "The receiving session's envoy may answer for its user; the reply lands in your inbox (.mesh messaging inbox).",
         ),
         ("messaging", "inbox") => Some(
             "Reading takes nothing away: the model reads the same messages with mesh__check_inbox and keeps its own place. `clear` removes what you and the model have both read and hides the rest from you; the model still gets them. The inbox lasts for this session only.",
@@ -11112,8 +11121,8 @@ enum InboxSender {
     ThisNode { answered: String },
 }
 
-/// Each message's content is rendered in full: it
-/// was capped at `PEER_CONTENT_MAX_CHARS` on decode, is flattened to one line and
+/// Each message's content is rendered in full: it was capped at
+/// `PEER_CONTENT_MAX_CHARS` on decode, is flattened to one line and
 /// word-wrapped under its header at `width`, breaking at spaces and never at a hyphen;
 /// a token wider than the line is still split. Only the header is painted, and every
 /// body, part and disposition line is indented and wrapped the same way, so peer text
@@ -12468,7 +12477,7 @@ mod tests {
         assert!(send.starts_with("Usage: .mesh messaging send "), "{send}");
         assert!(
             send.ends_with(
-                "\n  Send your own text to one session, bypassing the model\n  The session's envoy may reply on your behalf; the reply lands in your inbox (.mesh messaging inbox)."
+                "\n  Send your own text to one session, bypassing the model\n  The receiving session's envoy may answer for its user; the reply lands in your inbox (.mesh messaging inbox)."
             ),
             "{send}"
         );
@@ -18900,7 +18909,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(
                 questions.lock().unwrap().as_slice(),
                 [
-                    "Clear 3 messages from your inbox? The model has not read 1 message yet; it stays for the model, out of your view. This cannot be undone."
+                    "Clear 3 messages from your inbox? You have not seen them yet. The model has not read 1 message yet; it stays for the model, out of your view. This cannot be undone."
                 ]
             );
             assert_eq!(ctx.app.mesh.peer_inbox().len(), 3);
@@ -18947,6 +18956,46 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert!(out.contains("content of m5"), "{out}");
         }
 
+        /// A message that lands while the `clear` question is open was never counted, so
+        /// it is neither cleared nor hidden: the next look shows it, new. The question
+        /// says how many of the counted messages the person has not seen.
+        #[test]
+        #[serial]
+        fn inbox_clear_leaves_a_message_that_lands_while_it_asks() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            let app = Arc::clone(&ctx.app);
+            let questions = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let asked = Arc::clone(&questions);
+            let _script = prompt_script::install_answering(move |question| {
+                asked.lock().unwrap().push(question.to_string());
+                app.mesh.peer_inbox().deliver(inbox_message("late"));
+                true
+            });
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m1"));
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m2"));
+            run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            ctx.app.mesh.peer_inbox().deliver(inbox_message("m3"));
+
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox clear")).unwrap();
+            assert_eq!(
+                questions.lock().unwrap().as_slice(),
+                [
+                    "Clear 3 messages from your inbox? You have not seen 1 of them yet. The model has not read 3 messages yet; they stay for the model, out of your view. This cannot be undone."
+                ]
+            );
+            assert_eq!(
+                out,
+                "Cleared 3 messages from your inbox. The model has not read 3 messages yet; they stay for the model, out of your view."
+            );
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            let headers = inbox_headers(&out);
+            assert_eq!(headers.len(), 1, "{out}");
+            assert!(headers[0].ends_with(" . new"), "{out}");
+            assert!(out.contains("content of late"), "{out}");
+            assert_eq!(ctx.app.mesh.peer_inbox().read_for_model().0.len(), 4);
+        }
+
         /// `clear` takes `--yes` and nothing else, and with no terminal it names `--yes`
         /// instead of waiting on a prompt.
         #[test]
@@ -18981,10 +19030,84 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             assert_eq!(prompt_script::prompts_asked(), 0);
         }
 
+        /// A full inbox of messages neither reader has seen drops the oldest for both:
+        /// the person is warned once, on the read that first finds the loss, and the
+        /// model's own read reports its own drop. Entries the person cleared out of view
+        /// were seen by the person, so their later eviction warns the model alone.
+        #[test]
+        #[serial]
+        fn inbox_overflow_warns_each_reader_once_for_what_it_had_not_seen() {
+            use crate::mesh::message::PEER_INBOX_CAPACITY;
+
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            for i in 0..=PEER_INBOX_CAPACITY {
+                ctx.app
+                    .mesh
+                    .peer_inbox()
+                    .deliver(inbox_message(&format!("{:02}", i % 100)));
+            }
+
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            let headers = inbox_headers(&out);
+            assert_eq!(headers.len(), PEER_INBOX_CAPACITY, "{out}");
+            assert!(headers.iter().all(|h| h.ends_with(" . new")), "{out}");
+            assert!(!out.contains("content of 00"), "the oldest went: {out}");
+            assert!(out.contains("content of 01"), "{out}");
+            assert!(
+                out.find("content of 01").unwrap() < out.find("content of 64").unwrap(),
+                "oldest first, newest last: {out}"
+            );
+            assert_eq!(
+                stderr_lines(),
+                [
+                    "WARNING: 1 peer message(s) were dropped before you read them because the inbox was full."
+                ]
+            );
+
+            let again = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            assert_eq!(inbox_headers(&again).len(), PEER_INBOX_CAPACITY);
+            assert_eq!(stderr_lines().len(), 1, "the warning is given once");
+
+            let (model, dropped) = ctx.app.mesh.peer_inbox().read_for_model();
+            assert_eq!(model.len(), PEER_INBOX_CAPACITY, "the person took nothing");
+            assert_eq!(dropped, 1, "the model missed the same message");
+            assert_eq!(ctx.app.mesh.peer_inbox().read_for_model().1, 0, "told once");
+
+            // Both have read everything: clearing empties the inbox for real.
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox clear --yes")).unwrap();
+            assert_eq!(
+                out,
+                format!("Cleared {PEER_INBOX_CAPACITY} messages from your inbox.")
+            );
+            assert_eq!(ctx.app.mesh.peer_inbox().len(), 0);
+
+            // Three the person saw and cleared, the model never read; a full ring of
+            // newer ones pushes them out without telling the person anything.
+            for id in ["h1", "h2", "h3"] {
+                ctx.app.mesh.peer_inbox().deliver(inbox_message(id));
+            }
+            run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            run_async(out_of(&mut ctx, ".mesh messaging inbox clear --yes")).unwrap();
+            for i in 0..PEER_INBOX_CAPACITY {
+                ctx.app
+                    .mesh
+                    .peer_inbox()
+                    .deliver(inbox_message(&format!("{:x}", 0x80 + i)));
+            }
+            let out = run_async(out_of(&mut ctx, ".mesh messaging inbox")).unwrap();
+            assert_eq!(inbox_headers(&out).len(), PEER_INBOX_CAPACITY, "{out}");
+            assert!(!out.contains("content of h"), "{out}");
+            assert_eq!(stderr_lines().len(), 1, "the person had seen h1..h3");
+            let (model, dropped) = ctx.app.mesh.peer_inbox().read_for_model();
+            assert_eq!(model.len(), PEER_INBOX_CAPACITY);
+            assert_eq!(dropped, 3, "the model never read h1..h3");
+        }
+
         /// Messages delivered straight to the inbox, as a peer's arrive, were not filed
         /// by this node, so every block is a peer's whatever its source: one with an
         /// empty `source_destination` is included and headed `from unknown`. Nothing is
-        /// headed `this node ->`.
+        /// headed `you ->`.
         #[test]
         #[serial]
         fn inbox_with_the_mesh_off_heads_every_block_from_a_peer() {
@@ -21569,7 +21692,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// With the node on, `.mesh messaging inbox` tells a peer's message from the reply this
             /// node filed in answer: the peer's block is `from` the peer; this node's
-            /// block is headed `this node ->` and names the peer it answered, by the
+            /// block is headed `you ->` and names the peer it answered, by the
             /// peer table's name for the reply's destination, with the node's own hash
             /// nowhere in the header.
             #[test]
@@ -21657,7 +21780,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
             }
 
             /// The reply the envoy path itself files, minted from the running instance's
-            /// destination, is what `.mesh messaging inbox` heads `this node ->`; the question it
+            /// destination, is what `.mesh messaging inbox` heads `you ->`; the question it
             /// answered, filed just before it, stays the peer's.
             #[test]
             #[serial]
@@ -21726,7 +21849,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
 
             /// `.mesh off` takes the runtime but leaves the inbox and the marks on what
             /// this node filed, so a reply it filed while on is still headed
-            /// `this node ->` when read after the stop.
+            /// `you ->` when read after the stop.
             #[test]
             #[serial]
             fn inbox_drain_after_mesh_off_still_heads_the_reply_this_node_filed() {
@@ -48783,12 +48906,12 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                     });
                 }
 
-                /// The default dismissal's own copy: `.mesh messaging inbox` heads it `this node ->`,
+                /// The default dismissal's own copy: `.mesh messaging inbox` heads it `you ->`,
                 /// answering the question, carries the refused body and a
                 /// `disposition: refused` row read from this node's side; the person at the
                 /// keyboard gets the one idle line `you declined <dest8>'s question`; the
-                /// stub heard the same refused reply. A second `.mesh messaging inbox` finds the copy
-                /// drained.
+                /// stub heard the same refused reply. A second `.mesh messaging inbox` still shows
+                /// the copy, no longer new.
                 #[test]
                 #[serial]
                 fn the_nodes_own_copy_of_a_dismissal_reads_refused_in_the_inbox_and_as_one_idle_line()
@@ -49596,7 +49719,7 @@ shared: a trusted peer can fetch it; denied: a deny rule holds it back; built-in
                 /// its disposition) keep the peer-side clauses, while this node's own copy
                 /// of a dismissal made in the same session reads `you declined to answer`;
                 /// the three sit in one `.mesh messaging inbox` and only the own copy is headed
-                /// `this node ->`.
+                /// `you ->`.
                 #[test]
                 #[serial]
                 fn a_peers_refused_reply_keeps_the_peer_side_clause_beside_this_nodes_own_dismissal()
