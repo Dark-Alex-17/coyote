@@ -126,17 +126,30 @@ pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) ->
         .clone()
         .ok_or_else(|| anyhow!("Password file is not configured"))?;
 
-    if vault_password_file.exists() {
-        {
-            let file_contents = std::fs::read_to_string(&vault_password_file)?;
-            if !file_contents.trim().is_empty() {
-                debug!(
-                    "create_vault_password_file was called but the password file already exists and is non-empty"
-                );
-                return Ok(());
-            }
-        }
+    let exists = vault_password_file.exists();
+    if exists
+        && !std::fs::read_to_string(&vault_password_file)?
+            .trim()
+            .is_empty()
+    {
+        debug!(
+            "create_vault_password_file was called but the password file already exists and is non-empty"
+        );
+        return Ok(());
+    }
+    // Every path from here asks at least twice (create, then the password
+    // itself), so a run with nowhere to ask is refused before the first.
+    if !crate::config::conflict::menu_can_use_terminal() {
+        return Err(crate::config::conflict::refuse_non_interactive(
+            format_args!(
+                "create the vault password file at '{}'",
+                vault_password_file.display()
+            ),
+            ".",
+        ));
+    }
 
+    if exists {
         let ans = confirm(
             prompter,
             format!(
@@ -530,6 +543,7 @@ fn set_password_file_permissions(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::conflict::prompt_script;
     use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
     use crate::testing::AtomicFlagGuard;
     use anyhow::Error;
@@ -947,6 +961,7 @@ mod tests {
     #[test]
     #[serial]
     fn an_empty_password_file_is_filled_through_the_prompter() {
+        let _script = prompt_script::install(&[]);
         let dir = TempDir::new("fill");
         let configured = dir.0.join("configured");
         std::fs::write(&configured, "  \n").unwrap();
@@ -981,6 +996,7 @@ mod tests {
     #[test]
     #[serial]
     fn a_rejected_path_or_short_password_is_asked_again() {
+        let _script = prompt_script::install(&[]);
         let dir = TempDir::new("re-ask");
         let taken = dir.0.join("taken");
         std::fs::write(&taken, "x").unwrap();
@@ -1020,6 +1036,7 @@ mod tests {
     #[test]
     #[serial]
     fn declining_or_cancelling_writes_no_password_file() {
+        let _script = prompt_script::install(&[]);
         let dir = TempDir::new("decline");
         let configured = dir.0.join("configured");
 
@@ -1057,11 +1074,44 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&configured).unwrap(), "");
     }
 
+    /// With nowhere to show a question, no password file is created and
+    /// nothing is asked: the secret entry that would follow is refused
+    /// the same way, so an empty file must not be left behind for it.
+    #[test]
+    #[serial]
+    fn without_a_terminal_no_vault_password_file_is_written() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let dir = TempDir::new("no-tty");
+        let configured = dir.0.join("configured");
+        let mut vault = dir.local_vault("configured");
+
+        let err =
+            create_vault_password_file(&mut vault, &ScriptedPrompter::refusing()).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Refusing to create the vault password file at '{}' non-interactively. \
+                 Re-run in a terminal.",
+                configured.display()
+            )
+        );
+        assert!(!configured.exists());
+
+        // A populated file never asks, so it is not refused either.
+        std::fs::write(&configured, "already set").unwrap();
+        let mut vault = dir.local_vault("configured");
+        create_vault_password_file(&mut vault, &ScriptedPrompter::refusing()).unwrap();
+        assert_eq!(std::fs::read_to_string(&configured).unwrap(), "already set");
+    }
+
     /// With no human to answer, every prompt of the wizard is refused
     /// and nothing is written or chosen.
     #[test]
     #[serial]
     fn provider_and_password_prompts_without_a_human_are_refused() {
+        let _script = prompt_script::install(&[]);
         let dir = TempDir::new("headless");
         let mut vault = dir.local_vault("configured");
         let err = create_vault_password_file(&mut vault, &HeadlessPrompter).unwrap_err();

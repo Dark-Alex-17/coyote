@@ -1054,6 +1054,12 @@ impl AssertState {
 }
 
 pub async fn create_config_file(config_path: &Path) -> Result<()> {
+    if !conflict::menu_can_use_terminal() {
+        return Err(conflict::refuse_non_interactive(
+            format_args!("create the config file at '{}'", config_path.display()),
+            ".",
+        ));
+    }
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
         .prompt()?;
@@ -2281,5 +2287,29 @@ hooks:
             installed.iter().any(|name| name == "record-miss.yaml"),
             "bundled macros were not written: {installed:?}"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn without_a_terminal_create_config_file_refuses_before_writing() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("create-config-no-tty");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let config_path = _guard.path.join("config.yaml");
+
+        let err = create_config_file(&config_path).await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Refusing to create the config file at '{}' non-interactively. \
+                 Re-run in a terminal.",
+                config_path.display()
+            )
+        );
+        assert!(!config_path.exists());
+        assert_eq!(fs::read_dir(&_guard.path).unwrap().count(), 0);
     }
 }
