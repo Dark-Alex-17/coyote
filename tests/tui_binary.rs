@@ -4903,3 +4903,111 @@ fn a_tty_less_bare_dot_rag_is_refused_before_the_temp_rag_is_removed() {
         "the macro went on to `.info` after the refused `.rag`:\n{out}"
     );
 }
+
+/// Agents started with a terminal on stdout but stdin redirected from
+/// `/dev/null` (a pipeline feeding the command): a graph agent whose
+/// `rag` node is not fully specified is refused in the shared shape
+/// naming the node, the agent and the three fields, exactly as with no
+/// terminal at all, with nothing written; and an agent with documents
+/// skips its optional knowledge base silently (no question painted, one
+/// `[DEBUG]` skip line, exit 0, the model reached). Neither run touches
+/// the controlling terminal: the piped stdin is what decides.
+#[test]
+#[serial]
+fn agents_with_a_tty_on_stdout_but_a_piped_stdin_refuse_the_unbuilt_rag_node_and_skip_the_optional_rag()
+ {
+    let dir = fresh_config_dir("agents-piped-stdin");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let graph = "graph-p9r";
+    let agent_dir = write_graph_agent_with_an_unbuilt_rag_node(&dir, graph);
+    write_agent_with_documents(&dir, "docs-p9r");
+    let files_before = walk(&dir);
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        &format!(" --agent {graph} hi"),
+    );
+    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_ne!(exit_code(&plain), 0, "{plain}");
+    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
+        panic!("the piped-stdin graph agent is not refused in the shared shape:\n{plain}")
+    });
+    assert!(
+        action.contains("'retrieve'") && action.contains(graph),
+        "the refusal does not name the rag node and its agent: {action:?}\n{plain}"
+    );
+    for field in ["embedding_model", "chunk_size", "chunk_overlap"] {
+        assert!(
+            remedy.contains(field),
+            "the remedy does not name `{field}`: {remedy:?}\n{plain}"
+        );
+    }
+    assert!(
+        !plain.contains("Select") && !plain.contains("? "),
+        "a widget was painted with nothing to read an answer from:\n{plain}"
+    );
+    assert!(
+        !plain.contains("Load ") && !plain.contains("Initializing RAG"),
+        "the refused run went on to load documents:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+    let written: Vec<PathBuf> = walk(&dir)
+        .into_iter()
+        .filter(|path| !files_before.contains(path))
+        .filter(|path| path.starts_with(&agent_dir) || path.to_string_lossy().contains("/rags/"))
+        .collect();
+    assert!(
+        written.is_empty(),
+        "the refused run wrote under the agent or rags: {written:?}\n{plain}"
+    );
+
+    let log = dir.join("probe.log");
+    let log_path = log.to_str().unwrap();
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[
+            ("COYOTE_UI", "repl"),
+            ("COYOTE_LOG_LEVEL", "debug"),
+            ("COYOTE_LOG_PATH", log_path),
+        ],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --agent docs-p9r 'say hello-sentinel-p9r'",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(
+        exit_code(&transcript),
+        0,
+        "the piped-stdin agent with documents did not exit 0:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("hello-sentinel-p9r"),
+        "the run never reached the dry-run model:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains(INIT_RAG_QUESTION) && !transcript.contains("starting without"),
+        "the run painted the question or a notice instead of logging the skip:\n{transcript}"
+    );
+    let skips = rag_skip_lines(&log, "docs-p9r");
+    assert_eq!(
+        skips.len(),
+        1,
+        "expected one debug line recording the skipped rag, got {skips:?}:\n{transcript}"
+    );
+    assert!(
+        skips[0].contains("no terminal") && skips[0].contains("starting without it"),
+        "the debug line does not record a terminal-less skip: {skips:?}"
+    );
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "the run built a rag without asking: {written:?}\n{transcript}"
+    );
+    assert_tty_restored(&transcript);
+}

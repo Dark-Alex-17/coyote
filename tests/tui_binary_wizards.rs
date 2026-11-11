@@ -4446,3 +4446,209 @@ fn dot_install_of_a_builtin_category_in_the_plain_repl_confirms_on_enter_not_on_
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------
+// A terminal on stdout with stdin redirected from a pipe or /dev/null:
+// the command-line menus and the plain REPL's wizards cannot read an
+// answer, so they refuse in the shared shape before painting a widget,
+// consume nothing from the pipe and change nothing on disk.
+// ---------------------------------------------------------------------
+
+/// A bash `{stdin}` slot carrying a would-be answer on a real pipe, so a
+/// prompt that read it anyway would be answered. The leading space keeps
+/// the wrapper's `<` from gluing onto `<(` as a heredoc.
+fn piped_answer(text: &str) -> String {
+    format!(" <(printf '{text}\\n')")
+}
+
+/// `--update-secret <name>` fed a value on a pipe, and `--install` of a
+/// bundle whose roles conflict with local files, once from `/dev/null`
+/// and once fed `replace-all` on a pipe, all with a terminal on stdout:
+/// each refuses in the shared shape (the secret with nothing but a
+/// terminal as the remedy, the install naming `--install-force`), exits
+/// non-zero, paints neither the secret prompt nor a conflict row, leaves
+/// the piped answer unconsumed (the local roles keep their text) and
+/// writes no vault file.
+#[test]
+#[serial]
+fn cli_menus_with_a_tty_on_stdout_but_a_piped_stdin_refuse_without_reading_the_pipe() {
+    let dir = fresh_config_dir("cli-menus-piped-stdin");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let name = "bundle-p7s";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let locals = write_conflicting_local_roles(&dir, name);
+    let files_before = walk(&dir);
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        &piped_answer("piped-value-p7s"),
+        " --update-secret piped-secret-p7s",
+    );
+    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_ne!(exit_code(&plain), 0, "{plain}");
+    assert_eq!(
+        refusal_shape(&plain),
+        Some(("update secret 'piped-secret-p7s'".into(), ".".into())),
+        "the piped-stdin `--update-secret` is not refused in the shared shape:\n{plain}"
+    );
+    assert!(
+        !plain.contains("Enter the secret value") && !plain.contains("Secret?"),
+        "the secret prompt was painted with only a pipe to read it from:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+
+    for (what, stdin) in [
+        ("install from /dev/null", "/dev/null".to_string()),
+        ("install fed `replace-all`", piped_answer("replace-all")),
+    ] {
+        let mut pty = spawn_binary_under(
+            built_binary(),
+            &dir,
+            &[("COYOTE_UI", "repl")],
+            WAIT_WRAPPER,
+            &stdin,
+            &format!(" --install {}", repo.display()),
+        );
+        let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        assert_ne!(exit_code(&plain), 0, "{what}:\n{plain}");
+        let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
+            panic!("{what}: the conflict is not refused in the shared shape:\n{plain}")
+        });
+        assert!(
+            action.starts_with("overwrite local file "),
+            "{what}: the refusal names the action {action:?}:\n{plain}"
+        );
+        assert!(
+            remedy.contains("--install-force"),
+            "{what}: the remedy does not name `--install-force`:\n{plain}"
+        );
+        for row in ["keep-all", "replace-all", "abort"] {
+            assert!(
+                !plain.contains(row),
+                "{what}: the conflict menu row `{row}` was painted with nothing to read an answer from:\n{plain}"
+            );
+        }
+        for path in &locals {
+            assert_eq!(
+                fs::read_to_string(path).ok().as_deref(),
+                Some(LOCAL_ROLE_TEXT),
+                "{what}: the refused install changed {}:\n{plain}",
+                path.display()
+            );
+        }
+        assert_tty_restored(&plain);
+    }
+
+    for needle in ["vault", "piped-secret-p7s"] {
+        let written = new_files_named(&dir, &files_before, needle);
+        assert!(
+            written.is_empty(),
+            "the refused secret entry still wrote {written:?}"
+        );
+    }
+}
+
+/// The plain REPL started on a terminal with stdin redirected from
+/// `/dev/null` (its line editor still reads the terminal) and its
+/// wizards typed in: bare `.rag`, `.vault add`, `.install` of a bundle
+/// at conflicting local files and `.uninstall` of an installed bundle
+/// each refuse in the shared shape, nothing is painted to answer, the
+/// REPL keeps taking commands, and `.exit` leaves with the tty restored;
+/// no rag, vault file or role changes, and the installed bundle stays.
+#[test]
+#[serial]
+fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_shared_shape() {
+    let dir = fresh_config_dir("repl-wizards-stdin-null");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    secure_vault_password_file(&dir);
+    let installed = "bundle-r7k";
+    let installed_repo = write_bundle_repo(&dir, installed, &[]);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", installed_repo.to_str().unwrap()],
+        "tty-less install of the bundle to uninstall",
+    );
+    let installed_role = dir.join("roles").join(format!("{installed}-role.md"));
+    assert!(ok && installed_role.exists(), "{out}");
+    let conflicting = "bundle-r7k-conflict";
+    let conflicting_repo = dir.join("bundle-conflict-src");
+    write_bundle_repo_at(&conflicting_repo, conflicting, &[]);
+    let locals = write_conflicting_local_roles(&dir, conflicting);
+    let files_before = walk(&dir);
+
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
+    pty.wait_for(")> ", PTY_DEADLINE).unwrap();
+    let mut shapes = Vec::new();
+    for (command, action_prefix, remedy_needle) in [
+        (".rag".to_string(), "initialize RAG knowledge base", "."),
+        (
+            ".vault add repl-secret-r7k".to_string(),
+            "add secret 'repl-secret-r7k'",
+            ".",
+        ),
+        (
+            format!(".install {}", conflicting_repo.display()),
+            "overwrite local file ",
+            "--install-force",
+        ),
+        (
+            format!(".uninstall {installed}"),
+            "uninstall bundle 'bundle-r7k'",
+            "--yes",
+        ),
+    ] {
+        let from = pty.raw().len();
+        pty.send(format!("{command}\r").as_bytes()).unwrap();
+        let since = pty
+            .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
+            .unwrap_or_else(|err| panic!("`{command}` did not refuse: {err}"));
+        let (action, remedy) = refusal_shape(&since)
+            .unwrap_or_else(|| panic!("`{command}` is not refused in the shared shape:\n{since}"));
+        assert!(
+            action.starts_with(action_prefix),
+            "`{command}` names the action {action:?}, not `{action_prefix}...`:\n{since}"
+        );
+        assert!(
+            remedy.contains(remedy_needle),
+            "`{command}` remedy {remedy:?} does not name `{remedy_needle}`:\n{since}"
+        );
+        for widget in ["Enter the secret value", "keep-all", "Continue?", "? "] {
+            assert!(
+                !since.contains(widget),
+                "`{command}` painted `{widget}` with nothing to read an answer from:\n{since}"
+            );
+        }
+        shapes.push((command, action, remedy));
+        pty.read_for(Duration::from_millis(300));
+    }
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    for needle in ["/rags/", "vault", "repl-secret-r7k"] {
+        let written = new_files_named(&dir, &files_before, needle);
+        assert!(
+            written.is_empty(),
+            "a refused REPL wizard still wrote {written:?}:\n{shapes:?}"
+        );
+    }
+    for path in &locals {
+        assert_eq!(
+            fs::read_to_string(path).ok().as_deref(),
+            Some(LOCAL_ROLE_TEXT),
+            "the refused `.install` changed {}:\n{shapes:?}",
+            path.display()
+        );
+    }
+    assert!(
+        installed_role.exists(),
+        "the refused `.uninstall` still removed a bundle file:\n{shapes:?}"
+    );
+}
