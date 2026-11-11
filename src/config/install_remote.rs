@@ -9,7 +9,7 @@ use crate::config::{
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
-use crate::prompt::{Prompter, select_closed};
+use crate::prompt::{Prompter, select_closed, select_closed_or_cancel};
 use crate::utils;
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -612,28 +612,48 @@ fn resolve_obsolete(
     let prompt = format!(
         "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
     );
-    let choice = select_closed(prompter, &prompt, keep_or_delete_options())
+    let choice = select_closed_or_cancel(prompter, &prompt, keep_or_delete_options())
         .with_context(|| "failed to read obsolete-file choice")?;
 
-    match choice.as_str() {
-        "keep" => Ok(ObsoleteAction::Keep),
-        "delete" => Ok(ObsoleteAction::Delete),
-        "keep-all" => {
-            *sticky = Some(ObsoleteAction::Keep);
-            Ok(ObsoleteAction::Keep)
-        }
-        "delete-all" => {
-            *sticky = Some(ObsoleteAction::Delete);
-            Ok(ObsoleteAction::Delete)
-        }
-        _ => unreachable!("select_closed only hands back an offered option"),
-    }
+    Ok(keep_or_delete_choice(
+        choice,
+        sticky,
+        "Kept the obsolete files: the question was cancelled.",
+    ))
 }
 
 fn keep_or_delete_options() -> Vec<String> {
     ["keep", "delete", "keep-all", "delete-all"]
         .map(str::to_string)
         .to_vec()
+}
+
+/// The action behind one of [`keep_or_delete_options`]. A cancelled
+/// question is the keep-everything answer, like a run with no human: it
+/// sticks for the rest of the loop and `cancelled_note` is printed once.
+fn keep_or_delete_choice(
+    choice: Option<String>,
+    sticky: &mut Option<ObsoleteAction>,
+    cancelled_note: &str,
+) -> ObsoleteAction {
+    match choice.as_deref() {
+        Some("keep") => ObsoleteAction::Keep,
+        Some("delete") => ObsoleteAction::Delete,
+        Some("keep-all") => {
+            *sticky = Some(ObsoleteAction::Keep);
+            ObsoleteAction::Keep
+        }
+        Some("delete-all") => {
+            *sticky = Some(ObsoleteAction::Delete);
+            ObsoleteAction::Delete
+        }
+        None => {
+            println!("{cancelled_note}");
+            *sticky = Some(ObsoleteAction::Keep);
+            ObsoleteAction::Keep
+        }
+        Some(_) => unreachable!("select_closed_or_cancel only hands back an offered option"),
+    }
 }
 
 fn apply_obsolete_action(
@@ -1043,21 +1063,13 @@ fn resolve_uninstall_action(
         return Ok(action);
     }
 
-    let choice = select_closed(prompter, prompt, keep_or_delete_options())
+    let choice = select_closed_or_cancel(prompter, prompt, keep_or_delete_options())
         .with_context(|| "failed to read uninstall choice")?;
-    match choice.as_str() {
-        "keep" => Ok(ObsoleteAction::Keep),
-        "delete" => Ok(ObsoleteAction::Delete),
-        "keep-all" => {
-            *sticky = Some(ObsoleteAction::Keep);
-            Ok(ObsoleteAction::Keep)
-        }
-        "delete-all" => {
-            *sticky = Some(ObsoleteAction::Delete);
-            Ok(ObsoleteAction::Delete)
-        }
-        _ => unreachable!("select_closed only hands back an offered option"),
-    }
+    Ok(keep_or_delete_choice(
+        choice,
+        sticky,
+        "Kept the locally modified items: the question was cancelled.",
+    ))
 }
 
 /// mcp.json is written before any ownership record is dropped: a failed write
@@ -3571,6 +3583,25 @@ mod tests {
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, None);
+    }
+
+    /// Closing the obsolete-file question keeps the file and keeps every
+    /// later one without asking again.
+    #[test]
+    #[serial]
+    fn cancelling_the_obsolete_file_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let first = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter).unwrap();
+        let second = resolve_obsolete("macros/older.yaml", &mut sticky, &prompter).unwrap();
+
+        assert_eq!(first, ObsoleteAction::Keep);
+        assert_eq!(second, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(prompter.requests().len(), 1);
     }
 
     fn write_manifest(root: &Path, yaml: &str) {
@@ -6456,6 +6487,37 @@ mod tests {
 
         assert!(NeedsHuman::caused(&err), "{err:#}");
         assert_eq!(sticky, None);
+    }
+
+    /// Closing the uninstall question keeps the modified file and keeps
+    /// every later one without asking again.
+    #[test]
+    #[serial]
+    fn cancelling_the_uninstall_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let first = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+        )
+        .unwrap();
+        let second = resolve_uninstall_action(
+            "File macros/b.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+        )
+        .unwrap();
+
+        assert_eq!(first, ObsoleteAction::Keep);
+        assert_eq!(second, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(prompter.requests().len(), 1);
     }
 
     #[test]

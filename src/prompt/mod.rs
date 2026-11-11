@@ -305,6 +305,19 @@ pub(crate) fn select_closed(
     question: &str,
     options: Vec<String>,
 ) -> Result<String> {
+    match select_closed_or_cancel(prompter, question, options)? {
+        Some(choice) => Ok(choice),
+        None => Err(PromptAnswer::Cancelled.mismatch(PromptAction::Select)),
+    }
+}
+
+/// [`select_closed`] for a menu where closing the question is itself an
+/// answer: `Ok(None)` when the human cancelled instead of choosing.
+pub(crate) fn select_closed_or_cancel(
+    prompter: &dyn Prompter,
+    question: &str,
+    options: Vec<String>,
+) -> Result<Option<String>> {
     if options.is_empty() {
         bail!("'{question}' has no options to choose from");
     }
@@ -313,11 +326,14 @@ pub(crate) fn select_closed(
         closed: true,
         ..PromptRequest::new(PromptAction::Select, question, Origin::detached())
     };
-    let choice = ask(prompter, req).and_then(PromptAnswer::into_selected)?;
+    let choice = match ask(prompter, req)? {
+        PromptAnswer::Cancelled => return Ok(None),
+        answer => answer.into_selected()?,
+    };
     if !options.contains(&choice) {
         bail!("'{choice}' is not one of the offered options");
     }
-    Ok(choice)
+    Ok(Some(choice))
 }
 
 pub(crate) fn input(
@@ -1075,6 +1091,26 @@ mod tests {
             "'pick one pm-sc4' has no options to choose from"
         );
         assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn a_cancelled_closed_select_is_an_error_unless_the_caller_accepts_the_cancel() {
+        let options = vec!["a".to_string(), "b".to_string()];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let err = select_closed(&prompter, "pick one pm-sc5", options.clone()).unwrap_err();
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        assert_eq!(
+            select_closed_or_cancel(&prompter, "pick one pm-sc6", options.clone()).unwrap(),
+            None
+        );
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("a".to_string())]);
+        assert_eq!(
+            select_closed_or_cancel(&prompter, "pick one pm-sc7", options).unwrap(),
+            Some("a".to_string())
+        );
     }
 
     #[test]
