@@ -15,6 +15,26 @@ set -e
 # @env LLM_OUTPUT=/dev/stdout The output path
 # @env LLM_ATTACHMENTS The file to append image paths to (one per line) to attach them to the result
 
+# Review lanes ground relative paths in the checkout under review and refuse
+# reads in another clone of the same repository (utils/review-paths.sh).
+if [[ -n "${LLM_PROMPT_UTILS_FILE:-}" ]]; then
+    _review_lib="$(dirname "$LLM_PROMPT_UTILS_FILE")/review-paths.sh"
+else
+    _review_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../utils/review-paths.sh"
+fi
+if [[ -f "$_review_lib" ]]; then
+    # shellcheck source=/dev/null
+    source "$_review_lib"
+else
+    review_ground_path() {
+        if [[ "${LLM_AGENT_VAR_REVIEW_GROUNDING:-}" == "1" ]]; then
+            echo "Refused: the review path guard ($_review_lib) is not installed; reinstall the built-in functions." >> "$LLM_OUTPUT"
+            return 1
+        fi
+        REVIEW_GROUNDED_PATH="$1"
+    }
+fi
+
 MAX_LINE_LENGTH=2000
 MAX_BYTES=51200
 
@@ -23,6 +43,8 @@ main() {
     local target="$argc_path"
     local offset="${argc_offset:-1}"
     local limit="${argc_limit:-2000}"
+    review_ground_path "$target" || return 0
+    target="$REVIEW_GROUNDED_PATH"
 
     if [[ ! -e "$target" ]]; then
         echo "Error: path not found: $target" >&2

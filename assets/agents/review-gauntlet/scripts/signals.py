@@ -22,11 +22,19 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -85,10 +93,16 @@ def normalize_base(spec):
         return spec
 
 
-# Shared surface patterns: the primary diff and the re-review delta are
-# classified with the SAME rules, so "would the delta alone have selected
-# this lane" (build_items' narrowing test) is answered on the same evidence
-# basis the original selection used.
+# Shared surface patterns: the primary diff, the re-review delta, AND any
+# downstream watch-round delta are classified with the SAME rules, so
+# "would the delta alone have selected this lane" (build_items' narrowing
+# test) is answered on the same evidence basis the original selection used.
+# The one copy of the rules is agents/.shared/diff_signals.py: the constants
+# below are the shared module's, byte for byte, and the fallback classify is
+# the shared body for an install without the shared module.
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+)
 DOCS_RE = r"\.(md|rst|txt|adoc)$"
 TESTS_RE = (
     r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
@@ -121,6 +135,26 @@ CONSUMER_RE = (
 )
 PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
 MIGRATIONS_RE = r"migrations?/|\.sql$"
+try:
+    from diff_signals import classify as _classify
+except Exception:  # noqa: BLE001 - fall back to the inline copy
+
+    def _classify(files, added):
+        def any_path(pattern):
+            return any(re.search(pattern, f, re.I) for f in files)
+
+        return {
+            "files": list(files),
+            "touches_proto": any_path(PROTO_RE),
+            "touches_migrations": any_path(MIGRATIONS_RE),
+            "touches_auth": any_path(AUTH_PATH_RE) or bool(re.search(AUTH_ADDED_RE, added, re.I)),
+            "touches_deps": any_path(DEPS_RE),
+            "touches_exec": bool(re.search(EXEC_RE, added)),
+            "consumer_surface": any_path(CONSUMER_RE),
+            "docs_only": bool(files) and all(re.search(DOCS_RE, f, re.I) for f in files),
+            "tests_docs_only": bool(files)
+            and all(re.search(DOCS_RE, f, re.I) or re.search(TESTS_RE, f, re.I) for f in files),
+        }
 
 
 def diff_signals(spec_):
@@ -140,26 +174,7 @@ def diff_signals(spec_):
     added = "\n".join(
         l for l in difftext.splitlines() if l.startswith("+") and not l.startswith("+++")
     )
-
-    def any_path(pattern):
-        return any(re.search(pattern, f, re.I) for f in files)
-
-    return {
-        "files": files,
-        "touches_proto": any_path(PROTO_RE),
-        "touches_migrations": any_path(MIGRATIONS_RE),
-        "touches_auth": any_path(AUTH_PATH_RE)
-        or bool(re.search(AUTH_ADDED_RE, added, re.I)),
-        "touches_deps": any_path(DEPS_RE),
-        "touches_exec": bool(re.search(EXEC_RE, added)),
-        "consumer_surface": any_path(CONSUMER_RE),
-        "docs_only": bool(files)
-        and all(re.search(DOCS_RE, f, re.I) for f in files),
-        "tests_docs_only": bool(files)
-        and all(
-            re.search(DOCS_RE, f, re.I) or re.search(TESTS_RE, f, re.I) for f in files
-        ),
-    }
+    return _classify(files, added)
 
 
 out = {"project_dir": proj, "diff_spec_resolved": spec}

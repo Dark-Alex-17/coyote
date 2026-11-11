@@ -46,7 +46,11 @@ those rules are *structure*:
 
 - **Lane selection floor is deterministic** (`build_items.py`): code-review
   always runs; adversary runs when a spec/plan is present; security runs on
-  attack-surface signals (auth/deps/exec paths or diff content) or hardened
+  attack-surface signals (auth/deps/exec paths or diff content - the surface
+  rules come from `agents/.shared/diff_signals.py`, shared with any
+  downstream watch-round classifier; `signals.py` carries a byte-equal copy
+  of its regex constants plus an inline fallback `classify`, held equal to
+  the shared module by a test) or hardened
   posture; probe runs when consumer-facing surface changed *and* a local-run
   recipe exists. The `select_lanes` LLM can only **widen** the set — a false
   flag never removes a rule-selected lane. `forced_lanes` from the caller
@@ -60,7 +64,13 @@ those rules are *structure*:
   sentinel is a lane FAILURE, never a pass; the critical count from the
   code-review report's summary line (raw 🔴 count if absent) blocks
   regardless of its verdict line; a code-review lane whose own verdict line
-  records a pipeline fault blocks (a degraded review is never a pass); the
+  records a pipeline fault blocks (a degraded review is never a pass); a
+  code-review lane whose own verdict reason opens with `review incomplete:`
+  (finding verification failed as a whole, so its unverified findings sit in
+  a separate section and count as no 🔴) blocks as an incomplete review and is
+  named on the incomplete line, never routed as findings to fix; single
+  unverified findings and criticals the anchor gate could not anchor are named
+  attention lines on a GREEN (attention) row, never blockers; the
   adversary's own degraded-run header (the `Criteria: …` line directly under
   its sentinel recording a pipeline fault, died criterion checks, or its
   verdict script's crash stub) blocks as a pipeline fault,
@@ -68,6 +78,13 @@ those rules are *structure*:
   `NEEDS-HUMAN` without 🔴 passes but
   is surfaced under *Human attention required*; probe `INCONCLUSIVE` blocks
   with an environment note — it is never treated as PASS or FAIL.
+- **The report header is one line per item**: everything above
+  `## Full lane reports` renders one line per table row, bullet or note.
+  Every value that is not a gate literal is folded through
+  `scripts/report_text.py`: `one_line` joins any line boundary into a space,
+  and `table_cell`, used for derived lane-table cells, also maps `|` to `/`
+  so a value cannot open another column. `lanes_summary` is folded again at
+  render time, whoever wrote it.
 - **Implementation debris is linted, not judged** (`debris_lint.py`, over the
   shared `.shared/debris.py`): every ADDED line of the diff is scanned for
   non-ASCII punctuation (dashes, ellipsis, arrows, section signs,
@@ -88,7 +105,8 @@ those rules are *structure*:
   argument of `agent__spawn`) or one directory name. Empty means none; a
   value that is neither a string nor a list of strings (`false`, `0`) is
   rejected rather than read as none, and any invalid value is a lint crash,
-  so it blocks.
+  so it blocks. The adversary lane receives the same value through its
+  `inputs:`, so its own debris lint leaves out the same directories.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
 - **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`
@@ -150,7 +168,8 @@ builder, the retry gate, the default-lanes fallback, or the verdict gate
 itself (the default-lanes fallback's crash still runs the widened lanes, so
 `pipeline` appears alongside real lane rows), plus `debris` when the lint
 crashed, was killed, its module could not be imported, or its findings
-arrived malformed. The report gains a
+arrived malformed, plus `code-review` when its own verdict reason opens with
+`review incomplete:`. The report gains a
 `## Review incomplete` section naming each exhausted lane with its
 attempt count; `PIPELINE-FAULT` lane rows carry ` ×N` when the lane was
 re-run (N > 1). The *named* entries are faults to re-run, never code
@@ -161,8 +180,8 @@ still appear under `## Blockers` and must be fixed as usual.
 
 | Lane | Sentinel | Blocks on |
 |------|----------|-----------|
-| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault |
-| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES; own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
+| code-reviewer | `**Verdict: MERGE-READY \| NEEDS-HUMAN**` | critical count from the report's summary line (raw 🔴 count if absent); missing sentinel; own verdict line records a pipeline fault; own verdict reason opens with `review incomplete:` (incomplete review) |
+| adversary | `ADVERSARIAL_REVIEW: CONFORMS \| DIVERGES` | DIVERGES (each numbered item under the report's `Complaints:` line becomes its own blocker, so a fix round can act on it: at most 8, each clipped to 600 characters, the rest folded into one line of their heads); own degraded-run header (pipeline fault, died criterion checks, or its verdict script's crash stub); missing sentinel |
 | security-reviewer | `SECURITY_REVIEW: PASS \| FAIL` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; missing sentinel |
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 | debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |
