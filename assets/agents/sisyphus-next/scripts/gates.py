@@ -31,7 +31,7 @@ from _lib import (  # noqa: E402
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
-    note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot,
+    note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot, split_option_reply,
     tail, truthy, var, write_artifact,
 )
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
@@ -968,7 +968,19 @@ def _choice_pick(text, options):
     reads" qualifies the pick, so it is interpreted and recorded in full.
     """
     m = re.match(r"(?i)^\s*option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text or "")
-    return match_option(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+    return _bare_pick(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+
+
+def _bare_pick(text, options):
+    """match_option, except that a numbered pick carrying free text ("2: only for reads") names no option."""
+    picked, rest = split_option_reply(text, options)
+    return None if picked and rest else match_option(text, options)
+
+
+def _pick_with_note(text, options):
+    """The option a reply names, with any free text after its number kept as "<option>: <text>"."""
+    picked, rest = split_option_reply(text, options)
+    return f"{picked}: {rest}" if picked and rest else match_option(text, options)
 
 
 def escalate_gate(state):
@@ -1003,7 +1015,7 @@ def ladder_route(state):
         ledger(state, u, f"ladder: {esc.get('kind')} carried several recommended options; escalating")
         res = "escalate"
     if res in ("ruling", "recommended"):
-        choice = match_option(state.get("ladder_choice") or "", esc.get("options") or [])
+        choice = _pick_with_note(state.get("ladder_choice") or "", esc.get("options") or [])
         if choice is None and res == "recommended":
             rec = [o for o in esc.get("options") or [] if o.get("recommended")]
             choice = rec[0]["text"] if len(rec) == 1 else None
@@ -1034,7 +1046,7 @@ def consult_route(state):
     text = state.get("consult_result") or ""
     m = re.search(r"CONSULT:\s*ANSWER\s+(.+)", text)
     if m:
-        choice = match_option(m.group(1).strip(), esc.get("options") or []) or m.group(1).strip()
+        choice = _pick_with_note(m.group(1).strip(), esc.get("options") or []) or m.group(1).strip()
         u.update({"last_answer": choice, "last_answer_text": choice})
         ledger(state, u, f"consult: {esc.get('kind')}: {choice} (navigator)")
         u["_next"] = "apply_answer"
@@ -1121,12 +1133,12 @@ def parse_answer(state):
         ledger(state, u, f"headless: {kind}: no human available -> the recommended option: {tail(choice, 200)}")
     elif kind == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
-        choice = match_option(text, options) or text
+        choice = _bare_pick(text, options) or text
     elif kind in ("handoff_confirm", "handoff_path") and _typed_path(text, state):
         choice = text
     else:
-        # at a multiple-choice prompt a qualified pick ("Option 2, but ...") names no option and is interpreted
-        choice = _choice_pick(text, options) if picker else match_option(text, options)
+        # a qualified pick ("Option 2, but ...", "2: but ...") names no option and is interpreted
+        choice = _choice_pick(text, options) if picker else _bare_pick(text, options)
         if choice is None and kind in STOP_AWARE_KINDS and re.sub(r"[\W_]+$", "", text.lower()) in STOP_REPLIES:
             # a whole-reply stop goes straight to apply_answer, which stops; it is never interpreted or re-asked
             choice = text
@@ -1414,7 +1426,7 @@ def apply_answer(state):
 
     if kind == "draft_confirm":
         # matched before any abort check: an edit such as "do not abort, add a flag" must not abort
-        picked = match_option(answer, options)
+        picked = _bare_pick(answer, options)
         rounds = as_int(state.get("draft_rounds")) + 1
         draft = str(state.get("draft_text") or "").strip()
         if picked == "Abort the run":
@@ -1568,8 +1580,12 @@ def apply_answer(state):
                 f"Accepted without fix at the user's say-so: {tail(esc.get('evidence', ''), 300)}"]
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "plan_defect":
-        # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a stop reply stops
-        a = "stop" if stop else _answered(state, {"continue": ["continue", "treat"]}, "stop")
+        # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a reply that is or leads
+        # with a stop stops; a reply naming no side at all stays the conservative stop
+        said = (split_option_reply(answer, options)[0] or answer).strip().lower()
+        leads_stop = stop or said.startswith(("stop", "abort"))
+        goes_on = any(w in said for w in ("continue", "treat", "amendment", "amended", "proceed", "advance"))
+        a = "continue" if goes_on and not leads_stop else "stop"
         if a == "continue" and _subtask_phase(state):
             # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
             subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]

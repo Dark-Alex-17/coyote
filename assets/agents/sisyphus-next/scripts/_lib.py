@@ -398,16 +398,26 @@ def review_fault(blocker):
     return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
 
 
+def split_option_reply(text, options):
+    """(option text, free text after it) for a reply led by an in-range option number ("2", "Option 2 - x",
+    "2: x", "2) x", or an em or en dash); (None, text) otherwise. Free text that is only punctuation counts as none."""
+    text = (text or "").strip()
+    m = re.match(r"(?is)^(?:option\s+)?(\d+)\s*(?:$|[-:).\u2014\u2013]\s*(.*)$)", text)
+    if not m or not 1 <= int(m.group(1)) <= len(options or []):
+        return None, text
+    rest = (m.group(2) or "").strip()
+    return options[int(m.group(1)) - 1]["text"], rest if re.search(r"\w", rest) else ""
+
+
 def match_option(text, options):
-    """Map a user reply to an option text: a 1-based number, exact, prefix, or 'recommended'."""
+    """Map a user reply to an option text: a 1-based number (free text after it is dropped), exact, prefix, or
+    'recommended'."""
     text = (text or "").strip()
     if not options:
         return text or None
-    m = re.match(r"^\s*(\d+)\s*[).:]?\s*$", text)
-    if m:
-        i = int(m.group(1))
-        if 1 <= i <= len(options):
-            return options[i - 1]["text"]
+    picked, _ = split_option_reply(text, options)
+    if picked:
+        return picked
     low = text.lower()
     for o in options:
         if o["text"].strip().lower() == low:

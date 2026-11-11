@@ -569,6 +569,38 @@ check("interpret_route -> apply_answer: an accepted free-form instruction keeps 
       u["_next"] == "build_gauntlet_prompt" and text in s2["spec_text"] and s2["reply_interpreted"] is False)
 s2, u = chain(base_state(escalation=pd, last_answer_text="stop"), "parse_answer", "apply_answer")
 check("apply_answer: a whole-reply stop is a stop", u["_next"] == "end_blocked" and aa("plan_defect", "Stop.")["_next"] == "end_blocked")
+PD_CONT = pd["options"][1]["text"]
+check("858ae4: match_option reads a leading option number with any separator and free text after it",
+      all(_lib.match_option(t, pd["options"]) == PD_CONT for t in ("2", "2.", "2)", "2:", "2 - amendment: x", "2: x", "2) x",
+                                                                  "2 \u2014 x", "2\u2013x", "Option 2 - x")))
+check("858ae4: split_option_reply keeps the free text, rejects out-of-range numbers and leaves prose alone",
+      _lib.split_option_reply("2 \u2014 amendment: x", pd["options"]) == (PD_CONT, "amendment: x")
+      and _lib.split_option_reply("Option 2", pd["options"]) == (PD_CONT, "")
+      and _lib.split_option_reply("3 - x", pd["options"]) == (None, "3 - x") and _lib.match_option("3 - x", pd["options"]) is None
+      and _lib.match_option("0", pd["options"]) is None and _lib.match_option("please keep going with it", pd["options"]) is None)
+PD_REPLY = ("2 \u2014 amendment: for subtask 1/4, the full test run failing is expected; it conforms when vet exits 0, the only "
+            "failures are the new TestIntervalNext/TestRenewKeepsMonthEndAnchor/TestTrialEndingOnMonthEndRenewsToMonthEnd "
+            "cases, and only _test.go files changed (all verified); advance to subtask 2/4")
+PD_SUBTASKS = [{"title": f"subtask {i}", "outcome": "o"} for i in range(1, 5)]
+s2, u = chain(base_state(escalation=pd, consult_result=f"...\nCONSULT: ANSWER {PD_REPLY}", subtasks=PD_SUBTASKS,
+                         subtask_index=1, spec_text="AC"), "consult_route", "apply_answer")
+check("858ae4: a navigator pick with an em-dash amendment continues on subtask 1 with the amendment, never end_blocked",
+      s2["last_answer"].startswith(PD_CONT) and "only _test.go files changed" in s2["last_answer"]
+      and u["_next"] == "build_gauntlet_prompt" and "only _test.go files changed" in s2["subtasks"][0]["amendments"][0]
+      and not s2["subtasks"][1].get("amendments"), u.get("_next"))
+u = gates.ladder_route(base_state(escalation=pd, ladder_resolution="ruling", ladder_choice="2: drop the vet criterion"))
+check("858ae4: a ladder ruling naming an option number keeps its amendment",
+      u["_next"] == "apply_answer" and u["last_answer"] == f"{PD_CONT}: drop the vet criterion")
+check("858ae4: plan_defect stop option, its number and a bare stop -> end_blocked",
+      all(gates.apply_answer(base_state(escalation=pd, last_answer=a))["_next"] == "end_blocked"
+          for a in ("Stop; the plan needs amending (report it)", "1", "stop")))
+check("858ae4: plan_defect raw numbered reply with an em-dash amendment continues",
+      aa("plan_defect", "2 \u2014 amendment: vet exit 0 is enough", spec_text="AC")["_next"] == "build_gauntlet_prompt"
+      and gates.apply_answer(base_state(escalation=pd, last_answer="2 \u2014 amendment: x", spec_text="AC"))["_next"]
+      == "build_gauntlet_prompt")
+check("858ae4: a typed numbered pick with free text is interpreted, never truncated to the option",
+      all(gates.parse_answer(base_state(escalation=e, last_answer_text=t))["_next"] == "interpret_reply"
+          for e in (pd, {**pd, "data": {"multiple_choice": True}}) for t in ("2 - only for the read path", "Option 2: reads only")))
 u = gates.interpret_route(base_state(escalation=pd, last_answer_text="x", reply_verdict="instruction", reply_instruction="path",
                                      reply_value=old))
 check("interpret_route: an instruction the kind does not accept -> unclear, never applied, ledgered",
