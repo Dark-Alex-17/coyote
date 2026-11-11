@@ -536,19 +536,18 @@ fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_
     );
 
     // The graph defaults are YAML single-quoted scalars: `''` in source is `'`.
-    for rel in ["step-runner/graph.yaml"] {
-        let graph = agent_file(rel).replace("''", "'");
-        assert_eq!(
-            graph.matches(GREP_TAIL).count(),
-            1,
-            "{rel} must carry the fallback grep exactly once (the initial-state default)"
-        );
-        assert_eq!(
-            graph.matches(pipeline.as_str()).count(),
-            1,
-            "{rel}: the debt_hits default must quote MANUAL_PIPELINE exactly once"
-        );
-    }
+    let rel = "step-runner/graph.yaml";
+    let graph = agent_file(rel).replace("''", "'");
+    assert_eq!(
+        graph.matches(GREP_TAIL).count(),
+        1,
+        "{rel} must carry the fallback grep exactly once (the initial-state default)"
+    );
+    assert_eq!(
+        graph.matches(pipeline.as_str()).count(),
+        1,
+        "{rel}: the debt_hits default must quote MANUAL_PIPELINE exactly once"
+    );
     assert!(
         !agent_file("sisyphus/instructions.md").contains("grep -nE"),
         "sisyphus prose must not keep its own copy of the debt grep - the tool owns it"
@@ -630,16 +629,15 @@ fn debt_scan_git_timeouts_fit_inside_the_graph_node_budgets() {
         .trim()
         .parse()
         .expect("GIT_TIMEOUT is an integer");
-    for rel in ["step-runner/graph.yaml"] {
-        let doc: serde_yaml::Value = serde_yaml::from_str(&agent_file(rel)).unwrap();
-        let timeout = doc["nodes"]["debt_scan"]["timeout"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("{rel}: nodes.debt_scan.timeout is an integer"));
-        assert!(
-            3 * git_timeout < timeout,
-            "{rel}: 3 * GIT_TIMEOUT ({git_timeout}) must stay under the debt_scan node timeout ({timeout})"
-        );
-    }
+    let rel = "step-runner/graph.yaml";
+    let doc: serde_yaml::Value = serde_yaml::from_str(&agent_file(rel)).unwrap();
+    let timeout = doc["nodes"]["debt_scan"]["timeout"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{rel}: nodes.debt_scan.timeout is an integer"));
+    assert!(
+        3 * git_timeout < timeout,
+        "{rel}: 3 * GIT_TIMEOUT ({git_timeout}) must stay under the debt_scan node timeout ({timeout})"
+    );
 }
 
 /// The gauntlet blocker shape Sisyphus routes on comes from two scripts it
