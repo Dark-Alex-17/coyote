@@ -9110,14 +9110,18 @@ mod tests {
         // The allowlist keys the inquire prompter's methods by bare name,
         // which the prompt module's free fns `confirm` and `input` share.
         // Those, and the other free askers beside them, must stay free of
-        // widgets so a builder in one cannot hide behind a method's entry.
+        // widgets so a builder in one cannot hide behind a method's entry;
+        // so must the headless prompter's `prompt`, which shares its name
+        // with the inquire prompter's allowlisted method.
         let prompt = include_str!("../prompt/mod.rs");
         for signature in [
             "pub fn ask(",
             "pub(crate) fn confirm(",
             "pub(crate) fn confirm_with_help(",
             "pub(crate) fn select_closed(",
+            "pub(crate) fn select_closed_or_cancel(",
             "pub(crate) fn input(",
+            "impl Prompter for HeadlessPrompter",
         ] {
             let body = fn_body(prompt, signature);
             for needle in NEEDLES {

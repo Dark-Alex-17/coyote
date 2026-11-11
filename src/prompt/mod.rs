@@ -403,14 +403,25 @@ impl InquirePrompter {
     }
 
     fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
+        let default = Self::input_default(req);
         let mut text = Text::new(&req.question);
-        if let Some(default) = req.default.as_ref().and_then(Value::as_str) {
+        if let Some(default) = default.as_deref() {
             text = text.with_default(default);
         }
         if let Some(help) = req.help.as_deref() {
             text = text.with_help_message(help);
         }
         text.prompt().map(PromptAnswer::Text)
+    }
+
+    /// The default an input offers, as the text the widget shows: a
+    /// string as it is, any other value (a number, a bool) rendered.
+    fn input_default(req: &PromptRequest) -> Option<String> {
+        match req.default.as_ref()? {
+            Value::Null => None,
+            Value::String(text) => Some(text.clone()),
+            other => Some(other.to_string()),
+        }
     }
 
     fn password(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
@@ -706,6 +717,31 @@ mod tests {
             vec!["a", "b", CUSTOM_MULTI_CHOICE_ANSWER_OPTION]
         );
         assert_eq!(InquirePrompter::select_options(&closed), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn an_input_default_that_is_a_number_is_offered_as_text() {
+        let input = |default: Option<Value>| PromptRequest {
+            default,
+            ..request(PromptAction::Input, None)
+        };
+        assert_eq!(
+            InquirePrompter::input_default(&input(Some(json!(1000)))).as_deref(),
+            Some("1000")
+        );
+        assert_eq!(
+            InquirePrompter::input_default(&input(Some(json!(true)))).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            InquirePrompter::input_default(&input(Some(json!("plain")))).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(
+            InquirePrompter::input_default(&input(Some(Value::Null))),
+            None
+        );
+        assert_eq!(InquirePrompter::input_default(&input(None)), None);
     }
 
     /// Which widget a closed select gets depends on who asks: a command
