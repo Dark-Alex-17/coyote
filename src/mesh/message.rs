@@ -2599,6 +2599,7 @@ mod left_mesh_hint_tests {
             first_seen: now - ago,
             last_seen: now - ago,
             left_at: None,
+            served_this_node: false,
         }
     }
 

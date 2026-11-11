@@ -77,6 +77,12 @@ pub(crate) struct PeerRecord {
     /// questions stay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left_at: Option<SystemTime>,
+    /// Whether the instance served this node a status card or a message during the run
+    /// that last wrote the table. Read back at the next load as "served the previous
+    /// run", then cleared; the background card fetch asks only an instance that served
+    /// this node in this run or the previous one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub served_this_node: bool,
 }
 
 impl PeerRecord {
@@ -211,6 +217,9 @@ pub(crate) struct PeerTable {
     /// The rows whose last link attempt failed, until a link to them comes up or they
     /// announce again. Held in memory only: a restart starts with none marked.
     link_failed: Mutex<BTreeSet<String>>,
+    /// The rows whose `served_this_node` the previous run left set, cleared on load so
+    /// the flag on disk speaks for one run only.
+    served_previous_run: BTreeSet<String>,
 }
 
 impl PeerTable {
@@ -239,6 +248,7 @@ impl PeerTable {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => set_aside_corrupt(&path, format!("could not be read: {err}")),
         };
+        let mut served_previous_run = BTreeSet::new();
         let inner = records
             .into_iter()
             .filter(|record| !is_expired(record, now))
@@ -250,15 +260,19 @@ impl PeerTable {
                 if record.compatibility == Compatibility::Compatible {
                     record.compatibility = Compatibility::of(record.protocol_version);
                 }
+                if std::mem::take(&mut record.served_this_node) {
+                    served_previous_run.insert(record.destination_hash.clone());
+                }
                 record
             })
             .map(|record| (record.destination_hash.clone(), record))
-            .collect();
+            .collect::<BTreeMap<_, _>>();
         Ok(Self {
             path,
             inner: Mutex::new(inner),
-            dirty: AtomicBool::new(false),
+            dirty: AtomicBool::new(!served_previous_run.is_empty()),
             link_failed: Mutex::new(BTreeSet::new()),
+            served_previous_run,
         })
     }
 
@@ -289,6 +303,7 @@ impl PeerTable {
                         first_seen: now,
                         last_seen: now,
                         left_at: None,
+                        served_this_node: false,
                     },
                 );
                 PeerChange::Added
@@ -351,6 +366,29 @@ impl PeerTable {
     /// neither linked nor announced since.
     pub(crate) fn link_failed(&self, destination_hash: &str) -> bool {
         self.link_failed.lock().contains(destination_hash)
+    }
+
+    /// Notes that `destination_hash` served this node a status card or a message in this
+    /// run; a destination the table does not know is left unknown.
+    pub(crate) fn mark_served(&self, destination_hash: &str) {
+        let mut peers = self.inner.lock();
+        if let Some(record) = peers.get_mut(destination_hash)
+            && !record.served_this_node
+        {
+            record.served_this_node = true;
+            self.dirty.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether `destination_hash` served this node a status card or a message in this run
+    /// or the previous one.
+    pub(crate) fn served_recently(&self, destination_hash: &str) -> bool {
+        self.served_previous_run.contains(destination_hash)
+            || self
+                .inner
+                .lock()
+                .get(destination_hash)
+                .is_some_and(|record| record.served_this_node)
     }
 
     /// Marks the row of `destination_hash` as having said it is leaving the mesh, at
@@ -581,6 +619,7 @@ mod public_key_tests {
             first_seen: SystemTime::UNIX_EPOCH,
             last_seen: SystemTime::UNIX_EPOCH,
             left_at: None,
+            served_this_node: false,
         };
         assert!(row.verified_destination().is_some());
 
@@ -701,6 +740,7 @@ mod tests {
             first_seen: at,
             last_seen: at,
             left_at: None,
+            served_this_node: false,
         }
     }
 
@@ -1252,6 +1292,44 @@ mod tests {
         assert_eq!(table.sweep(t0 + PEER_TTL), vec!["aa".to_string()]);
         table.persist_if_dirty().unwrap();
         assert!(path.exists(), "a sweep that removed a peer must be written");
+    }
+
+    /// A session that served this node is remembered for this run and the next one, and
+    /// no further: the flag on disk speaks for the run that wrote it.
+    #[test]
+    fn served_this_node_lasts_this_run_and_the_next() {
+        let tmp = TempDir::new("peers-served");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let first = PeerTable::load(path.clone(), t0).unwrap();
+        first.observe(sighting("aa", None), t0);
+        first.observe(sighting("bb", None), t0);
+        assert!(!first.served_recently("aa"));
+        first.mark_served("aa");
+        first.mark_served("unknown");
+        assert!(first.served_recently("aa"));
+        assert!(!first.served_recently("bb"));
+        assert!(!first.served_recently("unknown"));
+        first.persist_if_dirty().unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("served_this_node").count(), 1, "{text}");
+
+        let second = PeerTable::load(path.clone(), t0).unwrap();
+        assert!(second.served_recently("aa"), "served the previous run");
+        assert!(!second.get("aa").unwrap().served_this_node);
+        second.persist_if_dirty().unwrap();
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("served_this_node"),
+            "the load cleared the flag and the next write drops it"
+        );
+
+        let third = PeerTable::load(path, t0).unwrap();
+        assert!(
+            !third.served_recently("aa"),
+            "two runs ago no longer counts"
+        );
     }
 
     #[test]

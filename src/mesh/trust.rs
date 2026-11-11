@@ -2979,7 +2979,6 @@ impl TrustStore {
 }
 
 /// What a peer's status card says it and its user are called.
-#[cfg_attr(not(test), expect(dead_code))] // called once trusted status cards carry names
 impl TrustStore {
     /// Keeps what a status card from the session at `destination_hash` of `identity_hash`
     /// says it and its person are called, each cleaned first. Each replaces the one an

@@ -12,6 +12,9 @@ use crate::mesh::announce::{
 };
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
+use crate::mesh::card_cadence::{
+    CadenceTrustObserver, CardCadence, CardTrigger, drive_card_cadence,
+};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::envoy_sessions::{
     EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn, Forgotten, RememberedOf,
@@ -730,6 +733,7 @@ pub(crate) struct MeshRuntime {
     /// grants: `rebind_sent_threads` re-points it at the fork's file on a re-key.
     sent_threads: ArcSwap<SentThreads>,
     memory: PeerMemory,
+    card_cadence: CardCadence,
     /// Every configured interface with what it is doing, in config order.
     interface_states: RwLock<Vec<InterfaceStatus>>,
     /// Every TCP client and `local` rnsd from the config, connected or not, in config
@@ -817,7 +821,11 @@ impl MeshRuntime {
         let plans = plan_interfaces(config.interfaces());
         let app_data = announce_app_data(config, options.agent.as_deref())?;
         let trust = Arc::new(TrustStore::open(&paths.config_dir)?);
-        trust.set_observer(Arc::new(TrustHookObserver(options.hooks.clone())));
+        let (grants, granted) = mpsc::unbounded_channel();
+        trust.set_observer(Arc::new(CadenceTrustObserver {
+            inner: Arc::new(TrustHookObserver(options.hooks.clone())),
+            grants,
+        }));
         trust.set_collision_protection(config.collision_protection);
 
         let instance_id = session.ensure_mesh_instance_id().to_string();
@@ -1030,6 +1038,7 @@ impl MeshRuntime {
             envoy_memory_config: config.envoy_memory.clone(),
             sent_threads: ArcSwap::from_pointee(sent_threads),
             memory: PeerMemory::default(),
+            card_cadence: CardCadence::default(),
             interface_states: RwLock::new(states),
             watched_interfaces: watched,
             interface_events: parking_lot::Mutex::new(Some(interface_events)),
@@ -1096,6 +1105,11 @@ impl MeshRuntime {
         runtime.register_task(tokio::spawn(persist_tables_periodically(
             runtime.peers.clone(),
             runtime.propagation_nodes.clone(),
+            runtime.cancellation_token(),
+        )));
+        runtime.register_task(tokio::spawn(drive_card_cadence(
+            granted,
+            Arc::downgrade(&runtime),
             runtime.cancellation_token(),
         )));
         runtime
@@ -1174,6 +1188,16 @@ impl MeshRuntime {
         let mut row = self.instance_row.lock();
         row.session = session.to_string();
         instances::register(&self.cache_dir, &self.current_instance_id(), row.clone());
+    }
+
+    /// A trusted session at `destination` sent this node a message it filed: it served
+    /// this node, which the background card fetch asks before it asks anything.
+    pub(crate) fn note_served_by(&self, destination: &str) {
+        if !destination.is_empty() {
+            self.peers.mark_served(destination);
+            self.card_cadence.lift(destination);
+            self.card_cadence.note_heard(destination);
+        }
     }
 
     /// What every human-facing line names peers from: the people section judged against
@@ -1398,6 +1422,11 @@ impl MeshRuntime {
     /// What this node last heard from each peer: status cards and listing pages.
     pub(crate) fn memory(&self) -> &PeerMemory {
         &self.memory
+    }
+
+    /// When the background card fetch last asked each session, and which refused it.
+    pub(crate) fn card_cadence(&self) -> &CardCadence {
+        &self.card_cadence
     }
 
     /// Where a file fetched from a peer is staged: under the directory
@@ -3314,10 +3343,12 @@ async fn receive_announces(
             public_key: Some(desc.identity.to_hex_string()),
         };
         let app_data = event.app_data.as_slice();
-        if event.is_path_response {
-            filer.file_path_response(announced, app_data, event.hops, now);
+        let destination = announced.destination_hash.clone();
+        let filed = if event.is_path_response {
+            filer
+                .file_path_response(announced, app_data, event.hops, now)
+                .is_some()
         } else {
-            let destination = announced.destination_hash.clone();
             let had_left = peers
                 .get(&destination)
                 .is_some_and(|row| row.left_at.is_some());
@@ -3325,6 +3356,10 @@ async fn receive_announces(
             if had_left && filed {
                 note_return(&runtime, &destination);
             }
+            filed
+        };
+        if filed && let Some(runtime) = runtime.upgrade() {
+            runtime.consider_card_fetch(&destination, CardTrigger::Heard);
         }
     }
 }
@@ -6007,6 +6042,13 @@ impl MeshSlot {
         }
     }
 
+    /// `MeshRuntime::note_served_by`; a no-op while the mesh is off.
+    fn note_served_by(&self, destination: &str) {
+        if let Some(runtime) = self.get() {
+            runtime.note_served_by(destination);
+        }
+    }
+
     /// Whether this node put `message` in its own inbox: its envoy's reply, or one the
     /// person typed with `.mesh envoy answer`. Read from the marks those two producers set as
     /// they filed, keyed on the entry's source destination and message id, which `stop`
@@ -6560,10 +6602,12 @@ impl PeerSurface for MeshSlot {
     }
 
     fn deliver_peer(&self, message: PeerMessage) {
+        self.note_served_by(&message.source_destination);
         MeshSlot::deliver_peer(self, message);
     }
 
     fn file_peer(&self, mut message: PeerMessage) {
+        self.note_served_by(&message.source_destination);
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
         self.remember_received_thread(message.thread());

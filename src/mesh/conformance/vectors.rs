@@ -4207,6 +4207,7 @@ fn code_vectors() -> Vec<Vector> {
                         first_seen: UNIX_EPOCH,
                         last_seen: UNIX_EPOCH,
                         left_at: None,
+                        served_this_node: false,
                     },
                 )?;
                 refuses_an_unknown_key(

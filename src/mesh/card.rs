@@ -1,12 +1,13 @@
 use crate::mesh::brief::{Digest, digest_objective_for};
-use crate::mesh::display_text;
 use crate::mesh::message::Route;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::request::{
-    AdmittedRequest, DispatchError, Handler, NoAnswer, RemoteRefusal, Reply, RequestError,
-    RequestOptions, STATUS_PATH, request_remedy,
+    AdmittedRequest, DispatchError, Handler, NAME_HASH_LEN, NoAnswer, RemoteRefusal, Reply,
+    RequestError, RequestOptions, STATUS_PATH, request_remedy, short,
 };
 use crate::mesh::snapshot::{MeshSnapshot, TurnState};
+use crate::mesh::trust::Decision;
+use crate::mesh::{destination_address, display_text, redact_hashes};
 
 use async_trait::async_trait;
 use rmpv::Value;
@@ -667,31 +668,98 @@ impl MeshRuntime {
 
     /// `request_status` with the caller's timeouts. The request goes to the peer directly
     /// and fails typed when it cannot be answered now; it is never held for later. A card
-    /// that was read is remembered for `last_card`.
+    /// that was read is remembered for `last_card`. Asking by hand lifts the stop a
+    /// refusal put on the background card fetch to this destination.
     pub(crate) async fn request_status_with(
         &self,
         destination: &DestinationDesc,
         options: RequestOptions,
     ) -> Result<StatusCard, StatusError> {
+        self.card_cadence()
+            .lift(&destination.address_hash.to_hex_string());
+        self.fetch_status(destination, options).await
+    }
+
+    /// The status request itself, for a caller and for the background fetch alike. A
+    /// refusal, or no answer at all, stops the background fetch to the destination; a
+    /// card read marks the destination as having served this node and keeps the names
+    /// it advertises.
+    pub(crate) async fn fetch_status(
+        &self,
+        destination: &DestinationDesc,
+        options: RequestOptions,
+    ) -> Result<StatusCard, StatusError> {
+        let destination_hex = destination.address_hash.to_hex_string();
         let reply = self
             .request(destination, STATUS_PATH, Value::Nil, options)
             .await
             .map_err(|err| match err {
-                err if err.is_access_refusal() => StatusError::NotTrustedByPeer(
-                    self.remote_refusal(&destination.address_hash.to_hex_string()),
-                ),
+                err if err.is_access_refusal() => {
+                    StatusError::NotTrustedByPeer(self.remote_refusal(&destination_hex))
+                }
                 RequestError::Timeout { .. } => {
-                    StatusError::NoAnswer(self.no_answer(&destination.address_hash.to_hex_string()))
+                    StatusError::NoAnswer(self.no_answer(&destination_hex))
                 }
                 err => StatusError::Transport(err),
+            })
+            .inspect_err(|err| {
+                if matches!(
+                    err,
+                    StatusError::NotTrustedByPeer(_) | StatusError::NoAnswer(_)
+                ) {
+                    self.card_cadence().refused(&destination_hex);
+                }
             })?;
         if let Some(error) = DispatchError::from_value(&reply) {
             return Err(StatusError::NotServed(error));
         }
         let card = StatusCard::from_value(&reply)?;
-        self.memory()
-            .remember_card(&destination.address_hash.to_hex_string(), card.clone());
+        self.memory().remember_card(&destination_hex, card.clone());
+        self.peers().mark_served(&destination_hex);
+        self.card_cadence().note_heard(&destination_hex);
+        self.keep_advertised_names(destination, &card);
         Ok(card)
+    }
+
+    /// Keeps the names `card` advertises as the aliases of the session and person it came
+    /// from, but only when that pair is proven and trusted: `destination` must derive
+    /// from its identity, which the link that carried the card proved the peer holds,
+    /// and the trust list must allow that identity at that destination. Anything else
+    /// keeps nothing, so a card never grows the people section for a stranger. Nothing
+    /// here logs a name.
+    fn keep_advertised_names(&self, destination: &DestinationDesc, card: &StatusCard) {
+        let destination_hex = destination.address_hash.to_hex_string();
+        let dest8 = short(&destination_hex);
+        let identity = destination.identity.address_hash;
+        let derives = <[u8; NAME_HASH_LEN]>::try_from(destination.name.as_name_hash_slice())
+            .is_ok_and(|name_hash| {
+                destination_address(&name_hash, &identity) == destination.address_hash
+            });
+        if !derives {
+            debug!(
+                "Mesh status card from {dest8}: its destination does not derive from the identity that served it; its names are not kept"
+            );
+            return;
+        }
+        let identity_hex = identity.to_hex_string();
+        let trust = self.trust();
+        if trust.authorize(&identity_hex, &destination_hex).decision != Decision::Allow {
+            debug!(
+                "Mesh status card from {dest8}: the session is not trusted here; its names are not kept"
+            );
+            return;
+        }
+        if let Err(err) = trust.record_advertised(
+            &identity_hex,
+            &destination_hex,
+            card.person_name.as_deref(),
+            card.session.as_deref(),
+        ) {
+            debug!(
+                "Mesh status card from {dest8}: its names could not be kept: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+        }
     }
 }
 
