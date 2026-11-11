@@ -110,3 +110,49 @@ For every step, enumerate the edge cases you can foresee: empty inputs, concurre
 - An added document, directory or example without a lifetime -- it outlives the thing it scaffolded
 - A scaffolding task with no superseding task named -- "add deps ahead of use" with nothing scheduled to delete it
 - Decisions recorded in CONTRIBUTING or README -- they belong in the plan file or the task log
+
+## Micro-grain addendum (applies ONLY when the spawner names it)
+
+Inert unless the caller says the plan is micro-grain (the architect's `task_granularity:
+micro`). Micro plans are written for implementers that follow pointers poorly and judge
+nothing; everything above still applies, and these rules size DOWN to the smallest unit that
+still compiles - never below it.
+
+**Sizing rule.** One task = one file or one tight seam; hard cap 3 files including tests. The
+FLOOR is compile-atomicity: the tree must build and its tests pass after every task, so a
+signature change travels WITH its callers in the same task even when that breaks the cap -
+state the reason in the task ("exceeds 3 files: signature change + 4 callers"). Decompose until
+every task is true to both; when the cap and the floor conflict, the floor wins.
+
+**Breakdown table.** Two extra columns: `Batch` (one batch per plan section, a slug such as
+`B1-ingest`; dependency order must hold INSIDE a batch and ACROSS batches) and `Protected`
+(set for tasks on money paths, auth/authz, secrets, migrations - the always-human list; a
+protected task closes its batch early for the full review panel). Task frontmatter mirrors
+them: `batch: <slug>`, `protected: true`.
+
+**Context pack (per task, mandatory).** A subsection `#### Context pack - TASK-NNN` holding,
+inline: the exact current code the task edits (the function/type/route as it is now), the
+exact target signature(s) after the change, the call sites that must change with it, and the
+test file(s) the criteria run. A pointer replaces a snippet only when the target is longer than
+a screen, and the pointer is verified. The pack exists to be pasted verbatim into the
+implementer's prompt - write it so it survives that.
+
+**Executable criteria catalog.** Every acceptance criterion is a command + expected output.
+Acceptable shapes:
+
+| Shape | Example |
+|---|---|
+| test invocation | `go test ./internal/x -run TestFoo_Rejects -count=1` -> `ok` |
+| build | `go build ./...` -> exit 0 |
+| usage suite | `hurl --test tools/scripts/x.hurl` -> `1 executed, 0 failed` |
+| grep that must match | `grep -n 'func (s \*Svc) Foo(ctx context.Context, id string) error' internal/x/svc.go` -> 1 hit |
+| grep that must NOT match | `grep -rn 'oldHelper(' internal/ ` -> 0 hits |
+| generated artefact in sync | `make generate && git diff --exit-code gen/` -> exit 0 |
+
+Not acceptable: "works correctly", "handles errors", "is idiomatic", "reviewer confirms" - a
+prose criterion is a plan defect in micro mode. Where behaviour needs judgment, write the
+test that encodes the judgment and make the criterion that test.
+
+**Anti-patterns (micro).** A task whose criteria the implementer must interpret; a Context
+pack that is only pointers; a batch that spans a protected task without marking it; "and
+update the callers" with the callers unnamed; a task that leaves the tree red for the next one.
