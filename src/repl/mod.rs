@@ -1089,7 +1089,7 @@ pub async fn run_repl_command_with_prefix(
             }
             ".install" => match parse_repl_install(args) {
                 ReplInstallDispatch::Builtins(category) => {
-                    config::install_assets(category, ctx.prompter.as_ref())?
+                    config::install_assets(category, ctx.prompter.as_ref(), false, ".")?
                 }
                 ReplInstallDispatch::Unified(value) => {
                     config::install_or_update_from_repl_args(

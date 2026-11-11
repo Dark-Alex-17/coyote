@@ -549,7 +549,16 @@ impl InstallFilter {
     }
 }
 
-pub fn install_assets(category: AssetCategory, prompter: &dyn Prompter) -> Result<()> {
+/// Reinstalls one bundled category over the user's copies. The overwrite
+/// is confirmed first unless `assume_yes`; a run with nowhere to ask is
+/// refused before anything is written, and `remedy` names what the caller
+/// offers instead of the question (the CLI has `--yes`, the REPL nothing).
+pub fn install_assets(
+    category: AssetCategory,
+    prompter: &dyn Prompter,
+    assume_yes: bool,
+    remedy: &str,
+) -> Result<()> {
     let (label, target) = match category {
         AssetCategory::Agents => ("agents", paths::agents_data_dir()),
         AssetCategory::Macros => ("macros", paths::macros_dir()),
@@ -559,7 +568,7 @@ pub fn install_assets(category: AssetCategory, prompter: &dyn Prompter) -> Resul
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
-    if !confirm_asset_overwrite(category, label, &target, prompter)? {
+    if !assume_yes && !confirm_asset_overwrite(category, label, &target, prompter, remedy)? {
         println!("Aborted. No files were changed.");
         return Ok(());
     }
@@ -588,9 +597,13 @@ fn confirm_asset_overwrite(
     label: &str,
     target: &Path,
     prompter: &dyn Prompter,
+    remedy: &str,
 ) -> Result<bool> {
     if !conflict::menu_can_use_terminal() {
-        return Ok(true);
+        return Err(conflict::refuse_non_interactive(
+            format_args!("reinstall bundled {label}"),
+            remedy,
+        ));
     }
     let body = match category {
         AssetCategory::McpConfig => format!(
@@ -2189,6 +2202,7 @@ hooks:
             "macros",
             Path::new("/tmp/coyote-macros"),
             &prompter,
+            ".",
         )
         .unwrap();
 
@@ -2214,8 +2228,58 @@ hooks:
             "hooks",
             Path::new("/tmp/coyote-hooks"),
             &prompter,
+            ".",
         )
         .unwrap();
         assert!(!proceed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn without_a_terminal_a_builtin_reinstall_is_refused_and_writes_nothing() {
+        use crate::config::conflict::prompt_script;
+        use crate::prompt::ScriptedPrompter;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-no-tty");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err =
+            install_assets(AssetCategory::Macros, &prompter, false, " or pass --yes.").unwrap_err();
+
+        assert!(
+            err.to_string().starts_with(
+                "Refusing to reinstall bundled macros non-interactively. \
+                 Re-run in a terminal or pass --yes."
+            ),
+            "{err}"
+        );
+        assert!(prompter.requests().is_empty());
+        assert!(!paths::macros_dir().exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn with_yes_a_builtin_reinstall_proceeds_without_asking() {
+        use crate::config::conflict::prompt_script;
+        use crate::prompt::ScriptedPrompter;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-yes");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        install_assets(AssetCategory::Macros, &prompter, true, " or pass --yes.").unwrap();
+
+        assert!(prompter.requests().is_empty());
+        let installed: Vec<_> = fs::read_dir(paths::macros_dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            installed.iter().any(|name| name == "record-miss.yaml"),
+            "bundled macros were not written: {installed:?}"
+        );
     }
 }

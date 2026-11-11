@@ -221,7 +221,12 @@ async fn async_main() -> Result<()> {
     }
 
     if let Some(category) = cli.install_builtins {
-        return config::install_assets(category, &InquirePrompter::default());
+        return config::install_assets(
+            category,
+            &InquirePrompter::default(),
+            cli.yes,
+            " or pass --yes.",
+        );
     }
 
     if let Some(value) = cli.install.as_deref() {

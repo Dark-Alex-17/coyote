@@ -242,6 +242,7 @@ pub struct Cli {
         long,
         value_name = "CATEGORY",
         value_enum,
+        group = "yes_scope",
         conflicts_with_all = ["update_bundle", "uninstall"],
         help_heading = "Installation & Updates"
     )]
@@ -282,11 +283,11 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub uninstall: Option<String>,
-    /// Proceed without prompts for --uninstall and --update-bundle (locally modified items are always kept)
+    /// Proceed without prompts for --uninstall and --update-bundle (locally modified items are always kept) and for --install-builtins (bundled items are overwritten)
     #[arg(
         long,
         requires = "yes_scope",
-        conflicts_with_all = ["install", "install_builtins"],
+        conflicts_with = "install",
         help_heading = "Installation & Updates"
     )]
     pub yes: bool,
@@ -624,9 +625,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_yes_flag_requires_uninstall_or_update_bundle() {
+    fn parse_yes_flag_requires_uninstall_update_bundle_or_install_builtins() {
         assert!(parse(&["--uninstall", "foo", "--yes"]).yes);
         assert!(parse(&["--update-bundle", "foo", "--yes"]).yes);
+        assert!(parse(&["--install-builtins", "macros", "--yes"]).yes);
         assert!(Cli::try_parse_from(["coyote", "--yes"]).is_err());
     }
 

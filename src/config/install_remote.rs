@@ -4374,8 +4374,13 @@ mod tests {
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-builtin");
 
-        config::install_assets(config::AssetCategory::Macros, &ScriptedPrompter::refusing())
-            .unwrap();
+        config::install_assets(
+            config::AssetCategory::Macros,
+            &ScriptedPrompter::refusing(),
+            true,
+            ".",
+        )
+        .unwrap();
 
         assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
         assert!(!paths::installed_bundles_file().exists());
@@ -4396,7 +4401,12 @@ mod tests {
 
         // Capture outcomes before restoring the env var so a failed assertion
         // cannot leave the hooks-dir override pointing at a deleted temp dir.
-        let result = config::install_assets(AssetCategory::Hooks, &ScriptedPrompter::refusing());
+        let result = config::install_assets(
+            AssetCategory::Hooks,
+            &ScriptedPrompter::refusing(),
+            true,
+            ".",
+        );
         let installed = (
             hooks_dir.join("notify.sh").is_file(),
             hooks_dir.join("log-events.sh").is_file(),

@@ -5011,3 +5011,64 @@ fn agents_with_a_tty_on_stdout_but_a_piped_stdin_refuse_the_unbuilt_rag_node_and
     );
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------
+// A bundled-category reinstall with no terminal to ask on.
+// ---------------------------------------------------------------------
+
+/// `--install-builtins macros` with no terminal at all is refused in the
+/// shared shape, naming `--yes` as the remedy, and overwrites nothing:
+/// every bundled macro is seeded with a local edit first (so the
+/// startup install, which only adds missing files, leaves the directory
+/// alone) and each edit survives the refused run.
+#[test]
+#[serial]
+fn a_tty_less_install_builtins_is_refused_in_the_shared_shape_and_touches_no_file() {
+    let dir = fresh_config_dir("ttyless-install-builtins");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let macros_dir = dir.join("macros");
+    fs::create_dir_all(&macros_dir).unwrap();
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/macros");
+    for entry in fs::read_dir(&bundled).unwrap() {
+        let name = entry.unwrap().file_name();
+        fs::write(macros_dir.join(name), "# local edit\n").unwrap();
+    }
+    let files_before = walk(&macros_dir);
+    assert!(!files_before.is_empty(), "no bundled macros to seed");
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install-builtins", "macros"],
+        "tty-less --install-builtins macros",
+    );
+    assert!(!ok, "the tty-less builtin reinstall exited 0:\n{out}");
+    let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("the refusal is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{out}")
+    });
+    assert!(
+        action.starts_with("reinstall bundled macros"),
+        "the refusal does not name the reinstall: {action:?}\n{out}"
+    );
+    assert!(
+        remedy.contains("--yes"),
+        "the remedy does not name `--yes`: {remedy:?}\n{out}"
+    );
+    assert!(
+        !out.contains("Reinstalled") && !out.contains("Continue?"),
+        "the refused run asked or reinstalled anyway:\n{out}"
+    );
+    assert_eq!(
+        walk(&macros_dir),
+        files_before,
+        "the refused run changed the macros directory:\n{out}"
+    );
+    for path in &files_before {
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "# local edit\n",
+            "{} was overwritten by the refused run:\n{out}",
+            path.display()
+        );
+    }
+}
