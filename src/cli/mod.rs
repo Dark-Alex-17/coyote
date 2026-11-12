@@ -237,7 +237,7 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub git_host: Option<String>,
-    /// Reinstall bundled assets for a category (asks before overwriting your local changes)
+    /// Reinstall bundled assets for a category (asks before overwriting your local changes unless --yes)
     #[arg(
         long,
         value_name = "CATEGORY",
@@ -283,7 +283,7 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub uninstall: Option<String>,
-    /// Proceed without questions for --uninstall, --update-bundle and --install-builtins; locally modified items are always kept
+    /// Proceed without questions: --uninstall/--update-bundle keep locally modified items, --install-builtins keeps edited hooks but reinstalls the other bundled categories
     #[arg(
         long,
         requires = "yes_scope",
@@ -630,6 +630,11 @@ mod tests {
         assert!(parse(&["--update-bundle", "foo", "--yes"]).yes);
         assert!(parse(&["--install-builtins", "macros", "--yes"]).yes);
         assert!(Cli::try_parse_from(["coyote", "--yes"]).is_err());
+    }
+
+    #[test]
+    fn yes_is_rejected_next_to_install() {
+        assert!(Cli::try_parse_from(["coyote", "--install", "x", "--yes"]).is_err());
     }
 
     #[test]

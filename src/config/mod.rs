@@ -2294,7 +2294,7 @@ hooks:
 
     #[test]
     #[serial_test::serial]
-    fn with_yes_a_builtin_reinstall_proceeds_without_asking() {
+    fn with_yes_a_macros_reinstall_asks_nothing_and_overwrites_a_local_edit() {
         use crate::config::conflict::prompt_script;
         use crate::prompt::ScriptedPrompter;
 
@@ -2302,17 +2302,17 @@ hooks:
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = prompt_script::install_non_interactive();
         let prompter = ScriptedPrompter::refusing();
+        let edited = paths::macros_dir().join("record-miss.yaml");
+        fs::create_dir_all(paths::macros_dir()).unwrap();
+        fs::write(&edited, "name: local-edit\n").unwrap();
 
         install_assets(AssetCategory::Macros, &prompter, true, " or pass --yes.").unwrap();
 
         assert!(prompter.requests().is_empty());
-        let installed: Vec<_> = fs::read_dir(paths::macros_dir())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert!(
-            installed.iter().any(|name| name == "record-miss.yaml"),
-            "bundled macros were not written: {installed:?}"
+        assert_eq!(
+            fs::read_to_string(&edited).unwrap(),
+            include_str!("../../assets/macros/record-miss.yaml"),
+            "the local edit survived a --yes macros reinstall"
         );
     }
 

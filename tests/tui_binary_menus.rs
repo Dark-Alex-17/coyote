@@ -3085,8 +3085,9 @@ fn a_first_run_with_no_human_refuses_to_create_the_config_file_and_writes_nothin
 // ---------------------------------------------------------------------
 
 /// The `--yes` flag's help sentence as a first-time user reads it.
-const YES_HELP: &str = "Proceed without questions for --uninstall, --update-bundle and \
-                        --install-builtins; locally modified items are always kept";
+const YES_HELP: &str = "Proceed without questions: --uninstall/--update-bundle keep locally \
+                        modified items, --install-builtins keeps edited hooks but reinstalls \
+                        the other bundled categories";
 
 /// Seeds the bundled hooks into `dir` (a `--yes` reinstall with nothing
 /// local to conflict), edits one of them locally and deletes another, and
