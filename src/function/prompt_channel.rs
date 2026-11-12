@@ -1072,7 +1072,10 @@ impl ToolPrompter {
         }
         // A run with no human cannot answer a tool, so the tool fails closed;
         // the headless prompter's `needs_human` JSON is only useful to
-        // built-in tools, which hand it back to the model.
+        // built-in tools, which hand it back to the model. The cancel is
+        // substituted here, before any widget is built, because a tool
+        // must see a clean cancel on its protocol and never a crash; the
+        // prompter is not consulted (`headless_run_answers_tool_prompts_with_cancel`).
         if !crate::prompt::human_present() {
             let answer = PromptAnswer::Cancelled;
             events::bus().publish(req.requested_event());
@@ -1785,8 +1788,9 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     fn headless_run_answers_tool_prompts_with_cancel() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, true);
         let sink = RecordingSink::install();
+        let scripted = Arc::new(ScriptedPrompter::refusing());
         let prompter = ToolPrompter::new(
-            Arc::new(crate::prompt::HeadlessPrompter),
+            scripted.clone(),
             Arc::new(PromptMemory::default()),
             Origin::detached(),
         );
@@ -1799,6 +1803,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         let answer = prompter.answer(req).unwrap();
 
         assert_eq!(answer, PromptAnswer::Cancelled);
+        assert!(scripted.requests().is_empty(), "{:?}", scripted.requests());
         let (requested, answered) = prompt_events(sink.drain(), "Name? headless-x7x");
         let [Event::PromptRequested { id, .. }] = requested.as_slice() else {
             panic!("{requested:?}");

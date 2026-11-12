@@ -4128,6 +4128,10 @@ impl RequestContext {
         if self.macro_flag {
             // A macro step never opens an editor; with no human on the run
             // the refusal says who is missing rather than a bare `No role`.
+            // It is raised before any prompt is built, as a typed Creating
+            // refusal naming what could not be created; the prompter is never
+            // reached, which
+            // `a_macro_step_creating_a_role_or_macro_names_the_missing_human_when_headless` pins.
             if !human_present() {
                 return Err(NeedsHuman::for_creating("role", name).into());
             }
@@ -4253,6 +4257,8 @@ impl RequestContext {
             bail!("'{name}' is a reserved macro name");
         }
         if self.macro_flag {
+            // The same pre-prompt Creating refusal as `new_role`, pinned by
+            // the same test: nothing reaches the prompter.
             if !human_present() {
                 return Err(NeedsHuman::for_creating("macro", name).into());
             }
@@ -12274,6 +12280,8 @@ mod tests {
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         ctx.macro_flag = true;
+        let scripted = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompter = scripted.clone();
         {
             let _headless = AtomicFlagGuard::set(&utils::HEADLESS, true);
             let err = ctx.new_role(&app, "gate-role").unwrap_err();
@@ -12289,6 +12297,7 @@ mod tests {
                 "Creating macro 'gate-macro' needs a human to answer the prompt and none is \
                  attached to this run; run it without --headless or --acp-server"
             );
+            assert!(scripted.requests().is_empty(), "{:?}", scripted.requests());
         }
         let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
         assert_eq!(

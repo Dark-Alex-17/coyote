@@ -970,6 +970,10 @@ fn build_token_request(
 }
 
 fn ask_paste_input(prompter: &dyn Prompter) -> Result<(String, Option<String>)> {
+    // Refused before any widget exists, with the flow's own message rather
+    // than the prompter's typed refusal, so a headless run reads the same
+    // error whichever step it stops at; `ask_paste_input_bails_without_a_human_before_asking`
+    // pins that no request reaches the prompter.
     if !human_present() {
         bail!("{NO_HUMAN_FOR_OAUTH}");
     }

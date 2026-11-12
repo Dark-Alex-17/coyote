@@ -124,6 +124,10 @@ pub async fn run_mcp_oauth_flow(
 ) -> Result<()> {
     // Checked before discovery so a headless run never reaches the point
     // where a prompter's placeholder answer could be persisted as a client_id.
+    // This is a deliberate gate ahead of the prompter rather than a routed
+    // refusal: the bail is the contract the flow's callers pin, and no
+    // request is ever made (see
+    // `run_mcp_oauth_flow_bails_without_a_human_before_discovery_or_the_prompter`).
     if !human_present() {
         bail!("{NO_HUMAN_FOR_OAUTH}");
     }
@@ -209,6 +213,10 @@ pub async fn run_mcp_oauth_flow(
 }
 
 fn ask_client_id(prompter: &dyn Prompter) -> Result<String> {
+    // Refused before any widget exists, with the flow's own message rather
+    // than the prompter's typed refusal, so a headless run reads the same
+    // error whichever step it stops at; `ask_client_id_bails_without_a_human_before_asking`
+    // pins that no request reaches the prompter.
     if !human_present() {
         bail!("{NO_HUMAN_FOR_OAUTH}");
     }
