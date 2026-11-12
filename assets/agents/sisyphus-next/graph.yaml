@@ -549,10 +549,13 @@ nodes:
       compound = an ordered breakdown of at most 6 subtasks in one PR, each
       sealable with executable acceptance criteria; plan_shaped = more than 6
       subtasks, cross-PR sequencing, or batch/protected semantics - that wants an
-      architect run, and a top-level run asks the user with your verdict. Unsure
-      between simple and compound: compound. Unsure between compound and
-      plan_shaped: compound; plan_shaped only when the evidence shows it. Never
-      silently ambitious.
+      architect run, and a top-level run asks the user with your verdict. A bug
+      fix together with its regression tests is simple, even when it touches a
+      few files or its size is unclear; compound only when the request asks for
+      several independent changes, so a bug fix is never compound for being
+      unsure. Unsure between simple and compound: compound. Unsure between
+      compound and plan_shaped: compound; plan_shaped only when the evidence
+      shows it. Never silently ambitious.
 
       State the sizing verdict for every implementation: sizing_reason is ONE line
       naming the evidence (for example "about 9 subtasks across 3 modules, needs a
@@ -733,6 +736,11 @@ nodes:
       and never put git or PR state (git status, branch names, the PR body or
       its draft state) in acceptance criteria: the run publishes after review
       in its own step, and a script checks that step.
+      Never split tests from the code they test (no failing-tests-first
+      subtask): a subtask writes its tests together with the code that makes
+      them pass, and every subtask's acceptance criteria hold, green, when it
+      ends. Prefer the fewest subtasks that keep each one sealed; a small
+      request may be one subtask.
       When a sizing note is present, the user chose to do plan-shaped work here:
       fit it into at most 6 subtasks if that is at all possible.
     prompt: |

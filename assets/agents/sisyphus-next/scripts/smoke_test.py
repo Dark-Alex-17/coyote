@@ -3346,6 +3346,122 @@ findings_changed = getattr(gates, "_findings_changed", lambda a, b: None)
 same_kept = findings_changed([A6_FINDING], [A6_AGAIN]) is False and findings_changed([A6_FINDING], [A6_OTHER]) is True
 check("a6ec7b: moved line numbers are the same finding; a different complaint is a new one", same_kept)
 
+BILLING_ANCHOR_SUBTASKS = [
+    {
+        "title": "Add failing regression tests for month-end and leap-day periods",
+        "outcome": ("Table-driven tests in the billing package's test files cover every case in the request. Interval.Next "
+                    "cases: IntervalMonth.Next(2024-01-31 09:30Z, 31) is 2024-02-29 09:30Z. IntervalMonth.Next(2024-03-31, "
+                    "31) is 2024-04-30. IntervalMonth.Next(2024-02-29, 31) is 2024-03-31. IntervalMonth.Next(2024-04-30, "
+                    "31) is 2024-05-31. IntervalYear.Next(2024-02-29, 29) is 2025-02-28. IntervalYear.Next(2027-02-28, "
+                    "29) is 2028-02-29. The time of day is kept in every case. Service tests use testdb.Seeded, "
+                    "clock.NewManual at 2024-01-31 09:30 UTC, the seeded `team` plan and billing.Config{PaymentTermsDays: "
+                    "14}. They check that Create gives PeriodEnd 2024-02-29 09:30Z. Each Renew, after Manual.Set to the "
+                    "previous PeriodEnd, goes Feb 29, then Mar 31, then Apr 30, then May 31. BillingAnchorDay stays 31 "
+                    "throughout, and each Result.Invoice.PeriodEnd equals Subscription.PeriodEnd. A trial test with "
+                    "billing.Config{TrialDays: 30} checks that the trial ends Jan 31 with StatusTrialing until Renew. On "
+                    "Renew, the first paid PeriodEnd is Feb 29, not Mar 2."),
+        "constraints": ("Use only the public API named in the request (billing.NewService, Create, Renew, CreateParams, "
+                        "Interval.Next, testdb.Seeded, clock.NewManual/Manual.Set). Don't change production code in this "
+                        "subtask. Follow the existing test style in the package."),
+        "acceptance_criteria": [
+            "`./ci vet` passes",
+            ("`./ci test` fails, and the only failures are the new month-end/leap-day test cases (for example, the "
+             "output shows 2024-03-02 where 2024-02-29 was expected)"),
+            "Running `git diff --stat` shows that only test files changed",
+        ],
+    },
+    {
+        "title": "Fix Interval.Next to clamp to month end and use the anchor day",
+        "outcome": ("Interval.Next(t, anchorDay) works out the target month first: the following month for IntervalMonth, "
+                    "or the same month of the next year for IntervalYear. It does not use time.AddDate overflow. The day "
+                    "is min(anchorDay, number of days in the target month). Hour, minute, second, nanosecond and location "
+                    "come from t. Because the day always comes from anchorDay, not from t.Day(), a clamped period never "
+                    "shifts later ones."),
+        "constraints": ("Keep the Interval.Next signature and its public behaviour for days that don't clamp. Handle "
+                        "anchorDay values 1 to 31 and December rolling into the next year. Don't change the meaning of any "
+                        "other Interval value."),
+        "acceptance_criteria": [
+            "`./ci test -run Next` passes, covering all Interval.Next cases from subtask 1",
+            "`./ci test` passes, or the only remaining failures are the service-level tests that subtask 3 fixes",
+            "`./ci vet` passes",
+        ],
+    },
+    {
+        "title": "Make Service.Create/Renew and trial conversion use the anchor rule",
+        "outcome": ("Service.Create sets BillingAnchorDay from the start date and computes PeriodEnd with "
+                    "Interval.Next(start, BillingAnchorDay). Service.Renew computes the next PeriodEnd with "
+                    "Interval.Next(prevPeriodEnd, sub.BillingAnchorDay) and never writes BillingAnchorDay. A trial that "
+                    "ends Jan 31 stays in StatusTrialing until Renew. On Renew it converts to a paid period that ends on "
+                    "Feb 29 and keeps the anchor. Every Result.Invoice gets the same PeriodEnd as the subscription it was "
+                    "issued for."),
+        "constraints": ("Find and remove any separate date arithmetic, such as AddDate, in the service or store code paths. "
+                        "Don't change the PaymentTermsDays or due-date semantics, and don't change the store schema unless "
+                        "that is truly needed. Keep the README rule exactly as stated."),
+        "acceptance_criteria": [
+            "`./ci test` passes, including every new test from subtask 1",
+            ("Searching the billing package with `grep -rn 'AddDate' .` shows no period-end calculation outside "
+             "Interval.Next (any remaining hits are unrelated, such as payment-terms due dates)"),
+            "`./ci vet` passes",
+        ],
+    },
+    {
+        "title": "Commit on a new branch and open a draft PR",
+        "outcome": ("The tests and the fix are committed on a new branch created from the current default branch, for "
+                    "example fix/billing-month-end-periods. The branch is pushed and a draft PR is open. The PR describes "
+                    "the bug with the reported examples (2024-01-31 \u2192 2024-03-02, Mar 31 \u2192 May 1, drift to the "
+                    "29th/30th, leap-year annual cases, trial conversion), the clamp-to-anchor rule, and the tests added."),
+        "constraints": ("Don't commit to or push to the default branch directly. Don't include unrelated changes. The PR "
+                        "must be a draft."),
+        "acceptance_criteria": [
+            "`git branch --show-current` prints the new branch name, not main/master",
+            "`./ci test` passes on the committed HEAD (`git status --porcelain` is empty)",
+            "`gh pr view --json isDraft,headRefName` shows isDraft=true and the new branch name",
+        ],
+    },
+]
+
+u = gates.record_subtasks(base_state(subtasks=BILLING_ANCHOR_SUBTASKS, top_level=True, git_actions={}))
+ba_kept = as_list_(u.get("subtasks"))
+ba_first = ba_kept[0] if ba_kept else {}
+ba_criteria = as_list_(ba_first.get("acceptance_criteria"))
+check("858ae4: failing tests, two fixes and a publish step -> 2 subtasks, the tests merged into the first fix",
+      len(ba_kept) == 2 and ba_first.get("title", "").endswith("(with its regression tests)")
+      and ba_first.get("outcome", "").startswith(BILLING_ANCHOR_SUBTASKS[0]["outcome"])
+      and ba_first.get("outcome", "").endswith(BILLING_ANCHOR_SUBTASKS[1]["outcome"])
+      and ba_criteria[:1] == ["`./ci vet` passes"] and ba_criteria[1:] == BILLING_ANCHOR_SUBTASKS[1]["acceptance_criteria"]
+      and not any(re.search(r"\bfails\b|only test files", c) for c in ba_criteria)
+      and "production code" not in ba_first.get("constraints", "")
+      and BILLING_ANCHOR_SUBTASKS[1]["constraints"] in ba_first.get("constraints", "")
+      and any("merged into subtask 2" in d for d in u.get("decisions", [])),
+      (len(ba_kept), ba_first, u.get("decisions")))
+
+u = gates.record_subtasks(base_state(subtasks=BILLING_ANCHOR_SUBTASKS[:2], top_level=True, git_actions={}))
+one = as_list_(u.get("subtasks"))
+u0 = gates.next_subtask(base_state(subtasks=one, subtask_index=0, intent="implementation"))
+u1 = gates.next_subtask(base_state(subtasks=one, subtask_index=1))
+check("858ae4: tests plus their fix merge into one subtask that runs as simple work, with no final whole-task review",
+      len(one) == 1 and not u0.get("current_task", "").startswith("Subtask ") and u1.get("_next") == "final_report"
+      and not u1.get("final_review"), (len(one), u0.get("current_task", "")[:80], u1.get("_next")))
+
+trailing = [BILLING_ANCHOR_SUBTASKS[1], BILLING_ANCHOR_SUBTASKS[0]]
+u = gates.record_subtasks(base_state(subtasks=trailing, top_level=True, git_actions={}))
+check("858ae4: a tests-first subtask that comes last is kept as it is",
+      as_list_(u.get("subtasks")) == trailing and not any("merged into" in d for d in u.get("decisions", [])),
+      u.get("subtasks"))
+
+pin = {"title": "Pin the month-end cases", "outcome": "Failing tests pin every month-end case in the request.",
+       "acceptance_criteria": ["`./ci vet` passes"]}
+u = gates.record_subtasks(base_state(subtasks=[pin] + BILLING_ANCHOR_SUBTASKS[1:3], top_level=True, git_actions={}))
+check("858ae4: the merged tests' wording does not pull the subtask after the fix into the merge too",
+      [s.get("title") for s in as_list_(u.get("subtasks"))]
+      == [BILLING_ANCHOR_SUBTASKS[1]["title"] + " (with its regression tests)", BILLING_ANCHOR_SUBTASKS[2]["title"]],
+      u.get("subtasks"))
+
+plain = BILLING_ANCHOR_SUBTASKS[1:3]
+u = gates.record_subtasks(base_state(subtasks=plain, top_level=True, git_actions={}))
+plain_kept = as_list_(u.get("subtasks")) == plain and not any("merged into" in d for d in u.get("decisions", []))
+check("858ae4: a plain two-subtask plan with no tests-first subtask is unchanged", plain_kept, u.get("subtasks"))
+
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
 shutil.rmtree(TMP, ignore_errors=True)

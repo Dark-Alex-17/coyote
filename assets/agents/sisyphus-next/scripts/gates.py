@@ -701,6 +701,7 @@ def record_subtasks(state):
     harvest_anomalies(state, u, "plan_subtasks")
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
     subtasks = _fold_publish(state, u, subtasks)
+    subtasks = _merge_tests_first(state, u, subtasks)
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
         if truthy(state.get("top_level")):
@@ -810,6 +811,54 @@ def _fold_publish(state, u, subtasks):
     if not kept:
         ledger(state, u, "subtasks: only publishing was planned -> one subtask for the brief")
         kept = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
+    return kept
+
+
+# Tests written ahead of the code they test: said in the title or outcome, or a criterion wants the suite red.
+_TESTS_FIRST_RE = re.compile(r"\b(?:failing|red)\s+(?:\w+\s+){0,2}?(?:tests?|specs?|cases?)\b"
+                             r"|\btests?(?:\s+|-)(?:first|before|ahead\s+of)\b", re.I)
+_EXPECTS_FAIL_RE = re.compile(r"\b(?:tests?|suite|specs?)\b[^.;]{0,60}?\b(?:fails?|failing|(?:is|goes|turns?)\s+red)\b",
+                              re.I)
+_NOT_RE = re.compile(r"\b(?:no|not|never|without|none)\b|n't\b", re.I)
+# The tests-only fence of a split ("only test files change", "no production code") contradicts the merged subtask.
+_TESTS_ONLY_RE = re.compile(r"\bonly\s+(?:the\s+)?(?:new\s+)?\S*test\S*\s+files?\b|\bproduction\s+code\b", re.I)
+
+
+def _expects_failure(criterion):
+    m = _EXPECTS_FAIL_RE.search(str(criterion))
+    return bool(m) and not _NOT_RE.search(m.group(0))
+
+
+def _tests_first(s):
+    about = f"{s.get('title') or ''}\n{s.get('outcome') or ''}"
+    return bool(_TESTS_FIRST_RE.search(about)) or any(_expects_failure(c) for c in as_list(s.get("acceptance_criteria")))
+
+
+def _with_tests(tests, s):
+    keep = [c for c in as_list(tests.get("acceptance_criteria"))
+            if not _expects_failure(c) and not _TESTS_ONLY_RE.search(str(c))]
+    fence = [p for p in re.split(r"(?<=[.!?])\s+", str(tests.get("constraints") or "").strip())
+             if p and not _TESTS_ONLY_RE.search(p)]
+    return {**s, "title": f"{s.get('title') or ''} (with its regression tests)".strip(),
+            "outcome": " ".join(o for o in [str(tests.get("outcome") or "").strip(), str(s.get("outcome") or "").strip()] if o),
+            "constraints": " ".join(c for c in [" ".join(fence), str(s.get("constraints") or "").strip()] if c),
+            "acceptance_criteria": keep + as_list(s.get("acceptance_criteria"))}
+
+
+def _merge_tests_first(state, u, subtasks):
+    """A subtask that writes tests ahead of their code joins the subtask after it, so no subtask ends red."""
+    kept, carry = [], None
+    for i, s in enumerate(subtasks, 1):
+        # judged before the merge: the carried tests' wording must not pull the next subtask forward too
+        first = i < len(subtasks) and _tests_first(s)
+        if carry is not None:
+            ledger(state, u, f"subtasks: subtask {i - 1} ({_one_line(carry.get('title') or '', 80)}) writes tests "
+                             f"ahead of their code -> merged into subtask {i} ({_one_line(s.get('title') or '', 80)})")
+            s, carry = _with_tests(carry, s), None
+        if first:
+            carry = s
+            continue
+        kept.append(s)
     return kept
 
 
