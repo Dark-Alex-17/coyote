@@ -90,14 +90,17 @@ fn is_dir_writable(dir: &Path) -> bool {
     }
 }
 
+/// `remedy` names what the caller offers instead of the package-manager
+/// confirm (the CLI has `--force`, the REPL nothing).
 pub fn run_self_update(
     requested: Option<String>,
     force: bool,
     prompter: &dyn Prompter,
+    remedy: &str,
 ) -> Result<()> {
     let exe_path = env::current_exe()
         .context("Could not determine the path of the running coyote executable")?;
-    update_binary_at(exe_path, requested, force, prompter)
+    update_binary_at(exe_path, requested, force, prompter, remedy)
 }
 
 fn update_binary_at(
@@ -105,6 +108,7 @@ fn update_binary_at(
     requested: Option<String>,
     force: bool,
     prompter: &dyn Prompter,
+    remedy: &str,
 ) -> Result<()> {
     let target_tag = normalize_version(requested);
     let resolved = canonicalize(&exe_path).unwrap_or_else(|_| exe_path.clone());
@@ -142,7 +146,7 @@ fn update_binary_at(
         } else {
             return Err(crate::config::conflict::refuse_non_interactive(
                 format_args!("update a {} install", source.label()),
-                " or pass --force.",
+                remedy,
             ));
         }
     }
@@ -284,7 +288,7 @@ mod tests {
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
 
-        update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter).unwrap();
+        update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter, ".").unwrap();
 
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1);
@@ -302,7 +306,8 @@ mod tests {
     }
 
     /// Off a terminal and without --force, a package-managed update is
-    /// refused in the shape every non-interactive menu shares.
+    /// refused in the shape every non-interactive menu shares, ending in
+    /// the remedy the caller offers.
     #[test]
     #[serial]
     fn package_managed_update_without_a_tty_is_refused() {
@@ -310,8 +315,14 @@ mod tests {
         let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let prompter = ScriptedPrompter::refusing();
 
-        let err =
-            update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter).unwrap_err();
+        let err = update_binary_at(
+            PathBuf::from(CARGO_INSTALLED),
+            None,
+            false,
+            &prompter,
+            " or pass --force.",
+        )
+        .unwrap_err();
 
         let message = err.to_string();
         assert!(message.starts_with("Refusing to update a"), "{message}");
@@ -333,6 +344,7 @@ mod tests {
             None,
             false,
             &HeadlessPrompter,
+            ".",
         )
         .unwrap_err();
 

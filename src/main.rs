@@ -261,8 +261,10 @@ async fn run_cli_flag(
         let version = version.clone();
         let force = cli.force;
         let prompter = InquirePrompter::default();
-        tokio::task::spawn_blocking(move || config::run_self_update(version, force, &prompter))
-            .await??;
+        tokio::task::spawn_blocking(move || {
+            config::run_self_update(version, force, &prompter, " or pass --force.")
+        })
+        .await??;
         return Ok(Some(()));
     }
 

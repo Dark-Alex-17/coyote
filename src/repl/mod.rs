@@ -1119,7 +1119,7 @@ pub async fn run_repl_command_with_prefix(
                 let version = args.map(|s| s.trim().to_string());
                 let prompter = Arc::clone(&ctx.prompter);
                 task::spawn_blocking(move || {
-                    config::run_self_update(version, false, prompter.as_ref())
+                    config::run_self_update(version, false, prompter.as_ref(), ".")
                 })
                 .await??;
             }
