@@ -3076,3 +3076,520 @@ fn a_first_run_with_no_human_refuses_to_create_the_config_file_and_writes_nothin
     assert!(!out.contains("create a new one?"), "{out}");
     nothing_written("sandbox, no tty", &out);
 }
+
+// ---------------------------------------------------------------------
+// The hooks reinstall under `--yes`, a tool's Input question carrying a
+// numeric default, a headless macro reaching a select on a real
+// terminal, the MCP remove/overwrite confirms and the OAuth client pick
+// with no human to ask.
+// ---------------------------------------------------------------------
+
+/// The `--yes` flag's help sentence as a first-time user reads it.
+const YES_HELP: &str = "Proceed without questions for --uninstall, --update-bundle and \
+                        --install-builtins; locally modified items are always kept";
+
+/// Seeds the bundled hooks into `dir` (a `--yes` reinstall with nothing
+/// local to conflict), edits one of them locally and deletes another, and
+/// hands back the edited path with its local bytes and the deleted path
+/// with the bytes the bundled asset would restore.
+fn seed_hooks_with_a_local_edit_and_a_missing_file(
+    dir: &Path,
+) -> (PathBuf, &'static str, PathBuf, Vec<u8>) {
+    let (ok, out) = run_ttyless(
+        dir,
+        &["--install-builtins", "hooks", "--yes"],
+        "seeding the hooks",
+    );
+    assert!(ok, "seeding the bundled hooks failed:\n{out}");
+    let hooks = dir.join("hooks");
+    let edited = hooks.join("notify.sh");
+    let local = "# local edit kept-k7h\n";
+    fs::write(&edited, local).unwrap();
+    let missing = hooks.join("log-events.sh");
+    let asset = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("hooks")
+            .join("log-events.sh"),
+    )
+    .unwrap();
+    fs::remove_file(&missing).unwrap();
+    (edited, local, missing, asset)
+}
+
+/// `--install-builtins hooks --yes` asks nothing anywhere: with no
+/// terminal at all it exits 0 without a refusal or a `Continue?`, the
+/// locally edited hook keeps its bytes, the deleted bundled hook comes
+/// back, and the run says what it reinstalled. Without `--yes` the same
+/// tty-less run is refused in the shared shape naming the `--yes` remedy
+/// and still leaves the edit alone. The flag's help carries the sentence
+/// that says so.
+#[test]
+#[serial]
+fn install_builtins_hooks_with_yes_asks_nothing_and_keeps_a_local_edit_without_a_terminal() {
+    let dir = fresh_config_dir("hooks-yes-ttyless");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let (edited, local, missing, asset) = seed_hooks_with_a_local_edit_and_a_missing_file(&dir);
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install-builtins", "hooks", "--yes"],
+        "tty-less --install-builtins hooks --yes",
+    );
+    assert!(
+        ok,
+        "`--install-builtins hooks --yes` with no terminal failed:\n{out}"
+    );
+    assert!(
+        refusal_shape(&out).is_none() && !out.contains("Continue?") && !out.contains("(y/N)"),
+        "`--yes` still refused or asked:\n{out}"
+    );
+    assert!(
+        out.contains("Reinstalled bundled hooks"),
+        "the `--yes` run did not say what it reinstalled:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&edited).ok().as_deref(),
+        Some(local),
+        "`--yes` replaced the locally edited hook instead of keeping it:\n{out}"
+    );
+    assert_eq!(
+        fs::read(&missing).ok().as_deref(),
+        Some(asset.as_slice()),
+        "`--yes` did not bring the deleted bundled hook back:\n{out}"
+    );
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install-builtins", "hooks"],
+        "tty-less --install-builtins hooks",
+    );
+    assert!(
+        !ok,
+        "a tty-less hooks reinstall without `--yes` exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("the hooks reinstall is not refused in the shared shape:\n{out}")
+    });
+    assert_eq!(action, "reinstall bundled hooks", "{out}");
+    assert_eq!(remedy, " or pass --yes.", "{out}");
+    assert_eq!(
+        fs::read_to_string(&edited).ok().as_deref(),
+        Some(local),
+        "the refused run touched the locally edited hook:\n{out}"
+    );
+
+    let (ok, help) = run_ttyless(&dir, &["--help"], "--help");
+    assert!(ok, "{help}");
+    assert!(
+        squeezed(&help).contains(&squeezed(YES_HELP)),
+        "`--help` does not carry the `--yes` sentence `{YES_HELP}`:\n{help}"
+    );
+}
+
+/// The same `--yes` reinstall on a real terminal (where a question could
+/// be asked) asks none either: no `Continue?`, no per-file keep/replace
+/// menu, exit 0, the local edit kept and the terminal left clean.
+#[test]
+#[serial]
+fn install_builtins_hooks_with_yes_on_a_terminal_asks_no_question_and_keeps_the_edit() {
+    let dir = fresh_config_dir("hooks-yes-tty");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let (edited, local, missing, asset) = seed_hooks_with_a_local_edit_and_a_missing_file(&dir);
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/tty",
+        " --install-builtins hooks --yes",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_eq!(exit_code(&plain), 0, "{plain}");
+    let flat = squeezed(&plain);
+    assert!(
+        !flat.contains("Continue?") && !flat.contains("(y/N)") && !flat.contains("Keep"),
+        "`--yes` on a terminal still asked:\n{plain}"
+    );
+    assert!(
+        plain.contains("Reinstalled bundled hooks"),
+        "the `--yes` run did not say what it reinstalled:\n{plain}"
+    );
+    assert_eq!(
+        fs::read_to_string(&edited).ok().as_deref(),
+        Some(local),
+        "`--yes` on a terminal replaced the locally edited hook:\n{plain}"
+    );
+    assert_eq!(
+        fs::read(&missing).ok().as_deref(),
+        Some(asset.as_slice()),
+        "`--yes` on a terminal did not bring the deleted bundled hook back:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+}
+
+/// A tool that asks one free-text question over the prompt channel with
+/// a NUMERIC default (`"default": 1000` on the wire, not a string) and
+/// records the answer it gets back.
+const NUMERIC_DEFAULT_INPUT_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user for a chunk size and record the answer.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out id line reply v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   id=\"q1k-$$\"\n\
+    \x20   line=\"$(jq -cn --arg id \"$id\" '{coyote_prompt:{id:$id,action:\"input\",question:\"Chunk size q1k-q\",options:[],default:1000}}')\"\n\
+    \x20   printf '%s\\n' \"$line\" >&\"$_COYOTE_PROMPT_OUT\"\n\
+    \x20   while IFS= read -r reply <\"$_COYOTE_PROMPT_REPLY_PATH\"; do\n\
+    \x20       if printf '%s' \"$reply\" | jq -e --arg id \"$id\" '.id == $id' >/dev/null 2>&1; then break; fi\n\
+    \x20   done\n\
+    \x20   v=\"$(printf '%s' \"$reply\" | jq -r 'if (.answer | type) == \"string\" then .answer else \"cancelled\" end')\"\n\
+    \x20   printf '%s' \"$v\" > \"$out\"\n\
+    \x20   echo \"fixture chunk: $v q1k-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Whether `needle` is painted at least once after `from` with the DIM
+/// attribute on (SGR 2 with no 22/0 between it and the text).
+fn painted_dim_after(raw: &[u8], from: usize, needle: &[u8]) -> bool {
+    let mut at = from;
+    while let Some(found) = find(raw, needle, at) {
+        let start = found.saturating_sub(64);
+        let dim = sgr_params(&raw[start..found])
+            .iter()
+            .fold(false, |dim, params| match params.as_slice() {
+                [] | [0] => false,
+                params if params.contains(&22) => false,
+                params if params.contains(&2) => true,
+                _ => dim,
+            });
+        if dim {
+            return true;
+        }
+        at = found + needle.len();
+    }
+    false
+}
+
+/// A tool's Input question whose default is the JSON number `1000` under
+/// the UI: the modal shows `1000` as a dim placeholder (not as typed text),
+/// Enter on the untouched field answers the string `1000`, and on the
+/// next call typing `5` answers `5` (the placeholder is not prepended).
+#[test]
+#[serial]
+fn a_tools_input_question_with_a_numeric_default_shows_it_dim_and_enter_answers_it_under_the_ui() {
+    let dir = fresh_config_dir("tool-input-numeric-default");
+    let _guard = TempDirGuard(dir.clone());
+    let first = dir.join("chunk-answer-1");
+    let second = dir.join("chunk-answer-2");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_chunk_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", first.display()),
+        },
+        Reply::ToolCall {
+            name: "fixture_chunk_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", second.display()),
+        },
+        Reply::Text("fixture done q1k".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_chunk_rec.sh", NUMERIC_DEFAULT_INPUT_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let asked_at = pty.raw().len();
+    pty.send(b"call the chunk tool\r").unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        asked_at,
+        "the chunk tool",
+        &["Chunksizeq1k-q", "1000", "Enter=answer"],
+    );
+    assert!(
+        painted_dim_after(pty.raw(), asked_at, b"1000"),
+        "the numeric default 1000 is not painted dim as a placeholder:\n{modal}\n--- raw ---\n{}",
+        String::from_utf8_lossy(&pty.raw()[asked_at..]).escape_debug()
+    );
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &first, "the tool's first recorded answer");
+    assert_eq!(
+        fs::read_to_string(&first).unwrap().trim(),
+        "1000",
+        "Enter on the untouched Input modal did not answer the numeric default as `1000`"
+    );
+
+    let second_at = pty.raw().len();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        second_at,
+        "the chunk tool (second call)",
+        &["Chunksizeq1k-q", "1000", "Enter=answer"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"5").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &second, "the tool's second recorded answer");
+    let typed = fs::read_to_string(&second).unwrap();
+    assert_eq!(
+        typed.trim(),
+        "5",
+        "typing `5` over the placeholder answered {typed:?} (the default was prepended or kept):\n{modal}"
+    );
+    let transcript = wait_for_squeezed(&mut pty, "fixture done q1k", "the reply after the tool");
+    assert_eq!(fake.served(), 3, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `--headless --macro <name> <prompt>` on a real terminal (both ttys
+/// present, but no human declared) whose macro issues a bare `.rag`: the
+/// embedding-model select is refused with the typed headless sentence
+/// naming the select and the flag, the run exits non-zero, the macro does
+/// not go on to its next step, and the previous temp rag is still on disk
+/// with its bytes untouched (it is removed only after a successful init).
+#[test]
+#[serial]
+fn a_headless_macro_bare_dot_rag_on_a_terminal_is_refused_with_the_typed_select_and_keeps_the_temp_rag()
+ {
+    let dir = fresh_config_dir("headless-rag-temp-tty");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros").join("bare-rag.yaml"),
+        "isolated: false\nsteps:\n  - \".rag\"\n  - \".info\"\n",
+    )
+    .unwrap();
+    let rags = dir.join("rags");
+    fs::create_dir_all(&rags).unwrap();
+    let temp_rag = rags.join("temp.yaml");
+    let seeded = "embedding_model: dryrun:dry-embed-a\nchunk_size: 1000\nchunk_overlap: 50\ndocument_paths: []\nfiles: []\nmarker: temp-rag-seeded-h7r\n";
+    fs::write(&temp_rag, seeded).unwrap();
+    let files_before = walk(&dir);
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/tty",
+        " --headless --macro bare-rag probe-h7r",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "the headless bare `.rag` exited 0:\n{plain}"
+    );
+    assert!(
+        plain.contains("select prompt needs a human") && plain.contains("--headless"),
+        "the headless bare `.rag` is not refused with the typed select sentence:\n{plain}"
+    );
+    assert_eq!(
+        fs::read_to_string(&temp_rag).ok().as_deref(),
+        Some(seeded),
+        "the refused headless `.rag` removed or rewrote the previous temp rag:\n{plain}"
+    );
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "the refused headless `.rag` still wrote {written:?}:\n{plain}"
+    );
+    assert!(
+        !plain.contains("log_path"),
+        "the macro went on to `.info` after the refused `.rag`:\n{plain}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "a headless run entered the alternate screen:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+}
+
+/// `--mcp-remove <name>` and `--mcp-add <name>` for a server that is
+/// already configured are confirms; with no terminal they are refused in
+/// the shared shape (`remove MCP server '<name>'` / `overwrite MCP server
+/// '<name>'`, remedy `.`), exit non-zero and leave mcp.json byte-for-byte
+/// as it was. A terminal on stdout with stdin from /dev/null is refused
+/// the same way.
+#[test]
+#[serial]
+fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mcp_json_alone() {
+    let dir = fresh_config_dir("ttyless-mcp-remove-overwrite");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--mcp-add", "probe-srv-r7m", "--", "echo", "hi"],
+        "tty-less --mcp-add",
+    );
+    assert!(ok, "the secret-free `--mcp-add` failed:\n{out}");
+    let mcp_json = dir.join("mcp.json");
+    let before =
+        fs::read(&mcp_json).unwrap_or_else(|_| panic!("no mcp.json after the add:\n{out}"));
+    assert!(
+        String::from_utf8_lossy(&before).contains("probe-srv-r7m"),
+        "{out}"
+    );
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--mcp-remove", "probe-srv-r7m"],
+        "tty-less --mcp-remove",
+    );
+    assert!(!ok, "the tty-less `--mcp-remove` exited 0:\n{out}");
+    let (action, remedy) = refusal_shape(&out)
+        .unwrap_or_else(|| panic!("`--mcp-remove` is not refused in the shared shape:\n{out}"));
+    assert_eq!(action, "remove MCP server 'probe-srv-r7m'", "{out}");
+    assert_eq!(remedy, ".", "{out}");
+    assert!(
+        !out.contains("Remove MCP server"),
+        "the tty-less `--mcp-remove` asked anyway:\n{out}"
+    );
+    assert_eq!(
+        fs::read(&mcp_json).unwrap(),
+        before,
+        "the refused remove changed mcp.json:\n{out}"
+    );
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--mcp-add", "probe-srv-r7m", "--", "echo", "bye"],
+        "tty-less --mcp-add of an existing server",
+    );
+    assert!(
+        !ok,
+        "the tty-less `--mcp-add` of an existing server exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("`--mcp-add` of an existing server is not refused in the shared shape:\n{out}")
+    });
+    assert_eq!(action, "overwrite MCP server 'probe-srv-r7m'", "{out}");
+    assert_eq!(remedy, ".", "{out}");
+    assert_eq!(
+        fs::read(&mcp_json).unwrap(),
+        before,
+        "the refused re-add changed mcp.json:\n{out}"
+    );
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --mcp-remove probe-srv-r7m",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "the piped-stdin `--mcp-remove` exited 0:\n{plain}"
+    );
+    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
+        panic!("the piped-stdin `--mcp-remove` is not refused in the shared shape:\n{plain}")
+    });
+    assert_eq!(action, "remove MCP server 'probe-srv-r7m'", "{plain}");
+    assert_eq!(remedy, ".", "{plain}");
+    assert_eq!(
+        fs::read(&mcp_json).unwrap(),
+        before,
+        "the piped-stdin remove changed mcp.json:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+}
+
+/// Two more clients that authenticate with OAuth against unreachable
+/// hosts, so `--authenticate` has a pick to make and never gets a token.
+const TWO_OAUTH_CLIENTS: &str = "\x20 - type: openai-compatible\n\
+    \x20   name: gateway-one-o7a\n\
+    \x20   api_base: https://one.invalid/v1\n\
+    \x20   auth: oauth\n\
+    \x20   oauth:\n\
+    \x20     client_id: one-id\n\
+    \x20     device_authorization_url: https://one.invalid/device\n\
+    \x20     token_url: https://one.invalid/token\n\
+    \x20     flow: device_code\n\
+    \x20   models:\n\
+    \x20     - name: m1\n\
+    \x20       max_input_tokens: 1000\n\
+    \x20 - type: openai-compatible\n\
+    \x20   name: gateway-two-o7b\n\
+    \x20   api_base: https://two.invalid/v1\n\
+    \x20   auth: oauth\n\
+    \x20   oauth:\n\
+    \x20     client_id: two-id\n\
+    \x20     device_authorization_url: https://two.invalid/device\n\
+    \x20     token_url: https://two.invalid/token\n\
+    \x20     flow: device_code\n\
+    \x20   models:\n\
+    \x20     - name: m2\n\
+    \x20       max_input_tokens: 1000\n\
+    save_session: false\n";
+
+/// `coyote --authenticate` with two OAuth-capable clients and no terminal
+/// cannot pick one: it is refused in the shared shape naming both clients
+/// with the remedy ` or pass --authenticate <CLIENT_NAME>.`, exits
+/// non-zero and asks nothing. Naming the client skips the pick (the run
+/// then fails on its unreachable host, not on a refusal).
+#[test]
+#[serial]
+fn tty_less_authenticate_with_two_oauth_clients_is_refused_naming_both_and_the_flag_remedy() {
+    let dir = fresh_config_dir("ttyless-authenticate-pick");
+    let _guard = TempDirGuard(dir.clone());
+    write_config(&dir, TWO_OAUTH_CLIENTS);
+
+    let (ok, out) = run_ttyless(&dir, &["--authenticate"], "tty-less --authenticate");
+    assert!(
+        !ok,
+        "the tty-less `--authenticate` with two OAuth clients exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out)
+        .unwrap_or_else(|| panic!("`--authenticate` is not refused in the shared shape:\n{out}"));
+    assert!(
+        action.contains("gateway-one-o7a") && action.contains("gateway-two-o7b"),
+        "the refusal does not name both OAuth clients: {action:?}\n{out}"
+    );
+    assert_eq!(remedy, " or pass --authenticate <CLIENT_NAME>.", "{out}");
+    assert!(
+        !out.contains("to move, enter to select"),
+        "the tty-less `--authenticate` drew the select anyway:\n{out}"
+    );
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--authenticate", "gateway-two-o7b"],
+        "tty-less --authenticate <name>",
+    );
+    assert!(
+        !ok,
+        "`--authenticate gateway-two-o7b` against an unreachable host exited 0:\n{out}"
+    );
+    assert!(
+        refusal_shape(&out).is_none(),
+        "naming the client still hit the no-human refusal:\n{out}"
+    );
+    assert!(
+        out.contains("two.invalid"),
+        "the named client was not the one authenticated:\n{out}"
+    );
+}
