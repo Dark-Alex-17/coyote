@@ -161,8 +161,21 @@ pub fn spawn_binary_under(
             .replace("{report}", TTY_REPORT),
     );
     base_env(&mut cmd, dir);
+    assert_env_stays_under_dir(extra_env);
     cmd.env("COYOTE_UI", "tui").envs(extra_env.iter().copied());
     Pty::spawn(cmd).unwrap()
+}
+
+/// `extra_env` may add to the shared environment but never move the
+/// binary out of the test's own dir: a test that overrode one of these
+/// would run against the developer's real config, cache or home.
+fn assert_env_stays_under_dir(extra_env: &[(&str, &str)]) {
+    assert!(
+        !extra_env
+            .iter()
+            .any(|(k, _)| matches!(*k, "COYOTE_CONFIG_DIR" | "COYOTE_CACHE_DIR" | "HOME")),
+        "extra_env must not override COYOTE_CONFIG_DIR, COYOTE_CACHE_DIR or HOME: {extra_env:?}"
+    );
 }
 
 /// The environment every spawn of the binary shares: working dir, config
@@ -225,7 +238,8 @@ pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) 
 /// a child that is still running at the deadline is killed, reaped and
 /// reported with whatever it had written by then. Either way anything
 /// the child spawned is killed with it, so a detached grandchild cannot
-/// hold the pipes open and stall the readers.
+/// hold the pipes open and stall the readers; the group is killed before
+/// the child is reaped, while its pid still names that group.
 pub fn run_ttyless_with_env(
     binary: &Path,
     dir: &Path,
@@ -233,6 +247,7 @@ pub fn run_ttyless_with_env(
     extra_env: &[(&str, &str)],
     what: &str,
 ) -> (bool, String) {
+    assert_env_stays_under_dir(extra_env);
     let mut cmd = ttyless_command(binary, dir);
     cmd.args(args)
         .envs(extra_env.iter().copied())
@@ -242,12 +257,12 @@ pub fn run_ttyless_with_env(
     let stdout = drain(child.stdout.take().unwrap());
     let stderr = drain(child.stderr.take().unwrap());
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
+    loop {
+        if exited_unreaped(child.id() as libc::pid_t) {
+            break;
         }
         if std::time::Instant::now() > deadline {
-            kill_session_group(child.id());
+            kill_process_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
             panic!(
@@ -258,18 +273,40 @@ pub fn run_ttyless_with_env(
             );
         }
         std::thread::sleep(Duration::from_millis(100));
-    };
-    kill_session_group(child.id());
+    }
+    kill_process_group(child.id());
+    let status = child.wait().unwrap();
     (
         status.success(),
         both_streams_within(stdout, stderr, PTY_DEADLINE),
     )
 }
 
-/// SIGKILLs the process group the child leads (its pid, see `detached`):
-/// the child itself if still running and every grandchild it left
-/// behind. A group that is already gone is not an error worth reporting.
-fn kill_session_group(pid: u32) {
+/// Whether our child `pid` has exited and is still waiting to be reaped.
+/// A pid that is no child of ours any more counts as exited.
+fn exited_unreaped(pid: libc::pid_t) -> bool {
+    // SAFETY: all-zero bytes are a valid `siginfo_t`, and `waitid` only
+    // writes into it; with WNOHANG a pid that has not exited leaves
+    // `si_pid` at zero.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        let options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+        // SAFETY: `info` is a live, writable `siginfo_t`.
+        if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, options) } == 0 {
+            // SAFETY: `si_pid` is valid for a child-state report.
+            return unsafe { info.si_pid() } != 0;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return true;
+        }
+    }
+}
+
+/// SIGKILLs the process group whose id is `pid`, the one the child leads
+/// after `detached` made it a session leader: the child itself if still
+/// running and every grandchild still in the group. A group that is
+/// already gone is not an error worth reporting.
+fn kill_process_group(pid: u32) {
     // SAFETY: kill takes no pointers; a stale pid is reported as an
     // error, not UB.
     unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
@@ -446,6 +483,52 @@ pub fn sgr_params(raw: &[u8]) -> Vec<Vec<u16>> {
         rest = &rest[end + final_byte..];
     }
     out
+}
+
+/// Whether some occurrence of `needle` at or after `from` is painted
+/// under the DIM attribute: the SGR sequences within the 64 bytes before
+/// it, read in order, leave DIM on (a `2` parameter standing on its own,
+/// with no `22` or `0` after it). The arguments of an extended colour are
+/// stepped over, so the `2` of a `38;2;r;g;b` truecolour is not mistaken
+/// for the attribute.
+pub fn painted_dim(raw: &[u8], from: usize, needle: &[u8]) -> bool {
+    let mut at = from;
+    while let Some(found) = find(raw, needle, at) {
+        let start = found.saturating_sub(64);
+        let dim = sgr_params(&raw[start..found])
+            .iter()
+            .fold(false, |dim, params| dim_after(params).unwrap_or(dim));
+        if dim {
+            return true;
+        }
+        at = found + needle.len();
+    }
+    false
+}
+
+/// What one SGR parameter list does to DIM: `Some(true)` when it switches
+/// it on, `Some(false)` when it resets it (`22`, or `0` for everything),
+/// `None` when it leaves it alone; the last word in the list wins.
+pub fn dim_after(params: &[u16]) -> Option<bool> {
+    let mut dim = None;
+    let mut i = 0;
+    while i < params.len() {
+        match params[i] {
+            38 | 48 | 58 => {
+                i += match params.get(i + 1) {
+                    Some(5) => 3,
+                    Some(2) => 5,
+                    _ => 1,
+                };
+                continue;
+            }
+            2 => dim = Some(true),
+            0 | 22 => dim = Some(false),
+            _ => {}
+        }
+        i += 1;
+    }
+    dim
 }
 
 /// Whether an SGR parameter list switches conceal on: an `8` standing on

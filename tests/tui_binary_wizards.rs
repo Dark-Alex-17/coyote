@@ -3135,52 +3135,6 @@ fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal()
 // re-ask, and `--update` with only stdout piped.
 // ---------------------------------------------------------------------
 
-/// Whether some occurrence of `needle` at or after `from` is painted
-/// under the DIM attribute: the SGR sequences within the 64 bytes before
-/// it, read in order, leave DIM on (a `2` parameter standing on its own,
-/// with no `22` or `0` after it). The arguments of an extended colour are
-/// stepped over, so the `2` of a `38;2;r;g;b` truecolour is not mistaken
-/// for the attribute.
-fn painted_dim(raw: &[u8], from: usize, needle: &[u8]) -> bool {
-    let mut at = from;
-    while let Some(found) = find(raw, needle, at) {
-        let start = found.saturating_sub(64);
-        let dim = sgr_params(&raw[start..found])
-            .iter()
-            .fold(false, |dim, params| dim_after(params).unwrap_or(dim));
-        if dim {
-            return true;
-        }
-        at = found + needle.len();
-    }
-    false
-}
-
-/// What one SGR parameter list does to DIM: `Some(true)` when it switches
-/// it on, `Some(false)` when it resets it (`22`, or `0` for everything),
-/// `None` when it leaves it alone; the last word in the list wins.
-fn dim_after(params: &[u16]) -> Option<bool> {
-    let mut dim = None;
-    let mut i = 0;
-    while i < params.len() {
-        match params[i] {
-            38 | 48 | 58 => {
-                i += match params.get(i + 1) {
-                    Some(5) => 3,
-                    Some(2) => 5,
-                    _ => 1,
-                };
-                continue;
-            }
-            2 => dim = Some(true),
-            0 | 22 => dim = Some(false),
-            _ => {}
-        }
-        i += 1;
-    }
-    dim
-}
-
 /// `Set chunk size:` under the UI shows its default `1000` as a dim
 /// placeholder; Enter on the untouched field answers the default (the
 /// next question's default is 1/20th of the chunk size: `50`), and a

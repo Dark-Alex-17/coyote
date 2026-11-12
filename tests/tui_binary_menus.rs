@@ -3321,28 +3321,6 @@ const NUMERIC_DEFAULT_INPUT_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   echo \"fixture chunk: $v q1k-r\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
-/// Whether `needle` is painted at least once after `from` with the DIM
-/// attribute on (SGR 2 with no 22/0 between it and the text).
-fn painted_dim_after(raw: &[u8], from: usize, needle: &[u8]) -> bool {
-    let mut at = from;
-    while let Some(found) = find(raw, needle, at) {
-        let start = found.saturating_sub(64);
-        let dim = sgr_params(&raw[start..found])
-            .iter()
-            .fold(false, |dim, params| match params.as_slice() {
-                [] | [0] => false,
-                params if params.contains(&22) => false,
-                params if params.contains(&2) => true,
-                _ => dim,
-            });
-        if dim {
-            return true;
-        }
-        at = found + needle.len();
-    }
-    false
-}
-
 /// A tool's Input question whose default is the JSON number `1000` under
 /// the UI: the modal shows `1000` as a dim placeholder (not as typed text),
 /// Enter on the untouched field answers the string `1000`, and on the
@@ -3379,7 +3357,7 @@ fn a_tools_input_question_with_a_numeric_default_shows_it_dim_and_enter_answers_
         &["Chunksizeq1k-q", "1000", "Enter=answer"],
     );
     assert!(
-        painted_dim_after(pty.raw(), asked_at, b"1000"),
+        painted_dim(pty.raw(), asked_at, b"1000"),
         "the numeric default 1000 is not painted dim as a placeholder:\n{modal}\n--- raw ---\n{}",
         String::from_utf8_lossy(&pty.raw()[asked_at..]).escape_debug()
     );
