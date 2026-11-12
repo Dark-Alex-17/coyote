@@ -28,7 +28,7 @@ AGENT_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(o
 # only if it passes through at least one of these nodes.
 BOUNDED = {
     "open_questions_gate": "B1 design_rounds<=3 / re-frame once per round (choice_reframed) / choice_index list-bounded",
-    "reseal_gate": "B2 amend_cycles<=3 (A1)",
+    "reseal_gate": "B2 amend_counts per source (design/gate1/gate2/rework) and amend_cycles<=12 overall (A1)",
     "gate1_route": "B3 same-leak retry once (A1) / FRICTION seal",
     "leak_route": "re-frame once per leak round (choice_reframed) / choice_index list-bounded",
     "plan_route": "B4 author_retries<=1",

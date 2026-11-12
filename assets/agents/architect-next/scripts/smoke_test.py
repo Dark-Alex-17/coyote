@@ -783,6 +783,91 @@ check("autonomy_gate: plan-gate -> approve_breakdown", u["_next"] == "approve_br
 check("autonomy_gate: full -> promote_tasks", gates.autonomy_gate(base_state(autonomy="full"))["_next"] == "promote_tasks")
 check("autonomy_gate: phase-gate -> promote_tasks (gates later)", gates.autonomy_gate(base_state(autonomy="phase-gate"))["_next"] == "promote_tasks")
 
+# ---------------------------------------------------------------- A1 budgets per amendment source
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="design", amend_counts={"design": _lib.AMEND_DESIGN_MAX}))
+check("reseal_gate: a source past its own budget -> amend_cap naming that source (hard trigger)",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap" and u["escalation"]["data"] == {"source": "design"}
+      and "design-round" in u["escalation"]["question"], u.get("escalation"))
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_cycles=_lib.AMEND_DESIGN_MAX + _lib.AMEND_GATE1_MAX,
+                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}))
+check("reseal_gate: spent design and Gate 1 budgets leave the Gate 2 budget whole -> gate1_build, gate2 cycle 1",
+      u["_next"] == "gate1_build" and u["amend_counts"]["gate2"] == 1 and u["amend_source"] == "", u)
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="", amend_counts={}))
+check("reseal_gate: an untagged amendment spends the rework budget", u["amend_counts"] == {"rework": 1}, u)
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)],
+                                                        data={"source": "gate1"}),
+                                  last_answer="Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1,
+                                  amend_counts={"gate1": _lib.AMEND_GATE1_MAX + 1, "design": 2}))
+check("apply_answer: amend_cap allow -> one more cycle of the capped source and under the ceiling, others untouched",
+      u["_next"] == "gate1_build" and u["amend_counts"] == {"gate1": _lib.AMEND_GATE1_MAX - 1, "design": 2}
+      and u["amend_cycles"] == AMEND_CYCLES_MAX - 1, u)
+
+AMEND_PLAN = os.path.join(TMP, "amend-chain-plan.md")
+
+
+def amend_chain(events):
+    """Drive the planning gates through a run's ledger sequence; amend_plan is stood in for by an append to the plan."""
+    write(AMEND_PLAN, PLAN_TEXT)
+    s = base_state(plan_path=AMEND_PLAN, amend_cycles=0, amend_counts={}, amend_source="", oracle_rejects=0,
+                   leak_fingerprints=[], plan_revision="", design_rounds=1, after_reseal="", tasks=[])
+    steps = []
+
+    def run(gate, **over):
+        s.update(over)
+        s.update(gate(s))
+        steps.append(s["_next"])
+
+    def amend():
+        with open(AMEND_PLAN, "a") as f:
+            f.write(f"\n<!-- amendment {len(steps)} -->\n")
+        run(gates.reseal_gate)
+        if s["_next"] == "gate1_build":
+            run(gates.gate1_build)
+
+    for i, ev in enumerate(events):
+        if s.get("_next") == "escalate_gate":
+            break
+        if ev == "design":
+            run(gates.open_questions_gate, choice_kind="design_round", choice_queue=[{"question": "Which store?"}], choice_index=1,
+                choice_answers=[{"question": "Which store?", "answer": "pg"}])
+            amend()
+        elif ev == "leak":
+            run(gates.gate1_route, gate1_result=f"PLAN_GATE: LEAKY\n- Where does module {i} of the infra code go?")
+            run(gates.leak_route, leak_answers=[{"question": f"module {i}?", "answer": "infra/"}], leak_unanswerable=[])
+            amend()
+        elif ev == "seal":
+            run(gates.gate1_route, gate1_result="PLAN_GATE: SEALED")
+            run(gates.gate2_build)
+        elif ev == "reject":
+            run(gates.gate2_route, gate2_result=f"PLAN_REVIEW: REJECT\n1. line {i} is wrong")
+            amend()
+        elif ev == "okay":
+            run(gates.gate2_route, gate2_result="PLAN_REVIEW: OKAY")
+            run(gates.reseal_return)
+            run(gates.autonomy_gate)
+    return s, steps
+
+
+# the four parity runs that stopped on the shared amendment cap before any delegation, as their ledgers ran
+AMEND_CAP_RUNS = {
+    "6451ba": ["design", "leak", "seal", "reject", "seal", "reject", "seal", "okay"],
+    "8edf96": ["design", "leak", "leak", "seal", "reject", "seal", "okay"],
+    "3136b6": ["design", "leak", "seal", "reject", "seal", "reject", "seal", "okay"],
+    "be7e23": ["design", "leak", "leak", "seal", "reject", "seal", "okay"],
+}
+for run_id, events in AMEND_CAP_RUNS.items():
+    s, steps = amend_chain(events)
+    check(f"amend budgets: run {run_id}'s ledger (design, {events.count('leak')} Gate 1 LEAKY, {events.count('reject')} Gate 2 REJECT) "
+          "-> sealed, reviewed and on to promote_tasks, no amend_cap",
+          steps[-1] == "promote_tasks" and "escalate_gate" not in steps
+          and s["amend_counts"] == {"design": 1, "gate1": events.count("leak"), "gate2": events.count("reject")}
+          and any(f"amend: gate2 cycle {events.count('reject')}/{_lib.AMEND_GATE2_MAX}" in d for d in s["decisions"]),
+          (steps, s.get("amend_counts"), s.get("escalation", {}).get("question")))
+s, steps = amend_chain(["design"] + ["leak"] * (_lib.AMEND_GATE1_MAX + 1))
+check("amend budgets: Gate 1 leaks with fresh questions every pass still end, on the Gate 1 budget",
+      steps[-1] == "escalate_gate" and s["escalation"]["data"] == {"source": "gate1"}
+      and s["amend_counts"]["gate1"] == _lib.AMEND_GATE1_MAX + 1, (steps, s.get("amend_counts")))
+
 # ---------------------------------------------------------------- promote (B6) with the stub task store
 u = gates.promote_verify(base_state(promote_retries=0))
 check("promote_verify: no promoted PLAN / no tasks -> one retry (B6 side 1)", u["_next"] == "promote_tasks" and u["promote_retries"] == 1 and ("PLAN" in u["promote_defects"] or "task dirs" in u["promote_defects"]))
@@ -2195,8 +2280,10 @@ check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_ga
 u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))
 check("apply_answer: checklist_accept -> recorded through the queue -> checklist_round", u["_next"] == "checklist_round" and u["choice_index"] == 1)
 check("apply_answer: amend_cap stop -> end_blocked", AA("amend_cap", "Stop and report")["_next"] == "end_blocked")
-u = AA("amend_cap", "Allow one more amendment cycle")
-check("apply_answer: amend_cap allow -> one more cycle then gate1", u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1)
+u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"design": 9})
+check("apply_answer: amend_cap allow on an escalation with no source -> one more cycle of every source and the ceiling, then gate1",
+      u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1
+      and u["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX - 1}, u)
 check("apply_answer: gate1_stuck stop -> end_blocked", AA("gate1_stuck", "Stop and report")["_next"] == "end_blocked")
 u = AA("gate1_stuck", "infra goes in infra/; DB is pg")
 check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u["_next"] == "amend_plan" and u["leak_fingerprints"] == [])

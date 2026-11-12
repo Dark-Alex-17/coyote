@@ -120,23 +120,23 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:621:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
-scripts/gates.py:46:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:3695:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:3704:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/_lib.py:627:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
+scripts/gates.py:47:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
+scripts/gates.py:3726:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:3735:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1207:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:1612:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:2233:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1292:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:1697:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:2320:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:621` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:627` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
-command), `gates.py:46` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:3695` and `:3704` are the English verb `make` in prompt prose, and
+command), `gates.py:47` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
+lockfile names), `gates.py:3726` and `:3735` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -216,6 +216,18 @@ test-file paths (read only when the probe verdict is PASS, adoption capped at on
 When the reply carries a gauntlet header verdict, none of them can turn a BLOCKED into a
 PASS, or a PASS into anything but that one capped adopt round; the direct adversary lane
 has no header, so its `ADVERSARIAL_REVIEW:` line is the only verdict there.
+
+### Amendment budgets
+
+Every `amend_plan` round is tagged with its source (`queue_amendments` in `gates.py`), and
+`reseal_gate` counts it in `amend_counts` against that source's own budget: `design` (design
+round answers and accepted checklist items, `AMEND_DESIGN_MAX`), `gate1` (leak answers and the
+owner's `gate1_stuck` answers, `AMEND_GATE1_MAX`), `gate2` (oracle rejections,
+`AMEND_GATE2_MAX`) and `rework` (plan-gate revisions, re-scopes, plan defects, probe recipes and
+integration findings, `AMEND_REWORK_MAX`; an untagged round counts here). `amend_cycles` is the
+run total under the overall ceiling `AMEND_CYCLES_MAX`. Going past either raises `amend_cap`
+with the source in its data, and "Allow one more amendment cycle" grants one more cycle of that
+source and of the ceiling. A design round or a Gate 1 leak never spends a Gate 2 chance.
 
 ## Verify
 

@@ -26,8 +26,13 @@ import time
 # ---------------------------------------------------------------- constants
 STRIKE_LIMIT = 3          # 3-strike family (B1, B5, B14, B16, B18, B22)
 RERUN_ONCE = 1            # re-run-once family (B3 retry, B4, B6, B9-B13, B17, B23)
-AMEND_CYCLES_MAX = 3      # A1: amendment cycles per run
 DESIGN_ROUNDS_MAX = STRIKE_LIMIT
+# A1: amendment cycles per run, budgeted per source so that one source never spends another's chances
+AMEND_DESIGN_MAX = DESIGN_ROUNDS_MAX + 1  # each design round's answers, plus the checklist round's accepted items
+AMEND_GATE1_MAX = 2 * STRIKE_LIMIT        # the prose architect's 2 leak amend cycles per Gate 2 round
+AMEND_GATE2_MAX = STRIKE_LIMIT            # one amendment per oracle REJECT (B5)
+AMEND_REWORK_MAX = STRIKE_LIMIT           # owner revisions, re-scopes, plan defects, recipes, integration findings
+AMEND_CYCLES_MAX = 4 * STRIKE_LIMIT       # the overall ceiling, below the per-source sum, so every loop still ends
 CHOICE_OPTIONS_MIN = 2    # a multiple-choice question offers 2-4 options, one recommended
 CHOICE_OPTIONS_MAX = 4
 DISCUSSION_PARKS_MAX = 3  # times one multiple-choice question may park the run for a discussion
@@ -286,7 +291,8 @@ STATE_KEYS = (
     "run_id", "run_dir", "phase", "mode_vector", "code_repo_path", "tasks_root", "plans_root", "base_branch_name",
     "owner_name", "reference_root_path", "design_doc_path", "seed_path", "draft_path", "draft_rounds", "draft_feedback",
     "draft_text", "plan_path", "plan_slug", "plan_revision",
-    "amend_cycles", "leak_fingerprints", "oracle_rejects", "gate1_verdict", "gate2_verdict", "sealed",
+    "amend_cycles", "amend_counts", "amend_source", "leak_fingerprints", "oracle_rejects", "gate1_verdict",
+    "gate2_verdict", "sealed",
     "current_task", "current_unit", "run_branch", "group_index", "pending_fixes", "task_rounds",
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",
     "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",

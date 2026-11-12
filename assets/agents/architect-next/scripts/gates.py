@@ -20,7 +20,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _lib  # noqa: E402
 from _lib import (  # noqa: E402
-    AMEND_CYCLES_MAX, ARCHIVIST_AVAILABLE, CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
+    AMEND_CYCLES_MAX, AMEND_DESIGN_MAX, AMEND_GATE1_MAX, AMEND_GATE2_MAX, AMEND_REWORK_MAX, ARCHIVIST_AVAILABLE,
+    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
     CI_POLL_FAILS, CI_POLL_SLEEP,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONTINUE_RE, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
     DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX,
@@ -554,9 +555,9 @@ def open_questions_gate(state):
         if as_int(state.get("choice_index")) < len(queue):
             return _ask_choice(state, u, f"Design frontier round {as_int(state.get('design_rounds'))}, question")
         answers = as_list(state.get("choice_answers"))
-        u["pending_amendments"] = ["Design round answers (apply each to the plan, resolving its Open question):\n"
-                                   + "\n".join(f"{i}. {a.get('question')}\n   Answer: {a.get('answer')}"
-                                               for i, a in enumerate(answers, 1))]
+        queue_amendments(u, "design", ["Design round answers (apply each to the plan, resolving its Open question):\n"
+                                       + "\n".join(f"{i}. {a.get('question')}\n   Answer: {a.get('answer')}"
+                                                   for i, a in enumerate(answers, 1))])
         u["open_questions"] = []
         _end_choices(u)
         ledger(state, u, f"design: round {as_int(state.get('design_rounds'))} answered ({len(answers)} question(s)) -> amend_plan")
@@ -724,7 +725,7 @@ def checklist_round(state):
                              "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
                              + "\n".join(f"- {x}" for x in accepted))
             lines += rulings
-            u["pending_amendments"] = ["\n".join(lines)]
+            queue_amendments(u, "design", ["\n".join(lines)])
             ledger(state, u, f"checklist: {len(accepted)}/{len(queue)} items accepted, {len(rulings)} owner ruling(s)")
             u["_next"] = "amend_plan"
         else:
@@ -752,6 +753,17 @@ def checklist_round(state):
 
 
 # ====================================================================== 2.3 gates
+AMEND_CAPS = {"design": AMEND_DESIGN_MAX, "gate1": AMEND_GATE1_MAX, "gate2": AMEND_GATE2_MAX, "rework": AMEND_REWORK_MAX}
+AMEND_SOURCE_LABELS = {"design": "design-round and checklist", "gate1": "Gate 1 leak", "gate2": "Gate 2 rejection",
+                       "rework": "owner and implementation"}
+
+
+def queue_amendments(u, source, items):
+    """Hand amendment lines to amend_plan, tagged with the source whose budget the round spends."""
+    u["pending_amendments"] = list(items)
+    u["amend_source"] = source if source in AMEND_CAPS else "rework"
+
+
 def reseal_gate(state):
     u = {}
     harvest_anomalies(state, u, "amend_plan")
@@ -760,20 +772,29 @@ def reseal_gate(state):
     path = state.get("plan_path") or ""
     text = read_file(path)
     rev = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10] if text else ""
-    cycles = as_int(state.get("amend_cycles"))
     if state.get("pending_amendments"):
         # An amendment round just ran (or failed); it counts whether or not the file changed.
-        cycles += 1
+        source = state.get("amend_source") if state.get("amend_source") in AMEND_CAPS else "rework"
+        counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
+        counts[source] = counts.get(source, 0) + 1
+        cycles = as_int(state.get("amend_cycles")) + 1
         u["amend_cycles"] = cycles
+        u["amend_counts"] = counts
         u["pending_amendments"] = []
+        u["amend_source"] = ""
         changed = rev != state.get("plan_revision")
-        ledger(state, u, f"amend: cycle {cycles}/{AMEND_CYCLES_MAX} ({'plan changed' if changed else 'plan unchanged - amendment did not land'})")
-        if cycles > AMEND_CYCLES_MAX:
+        cap = AMEND_CAPS[source]
+        ledger(state, u, f"amend: {source} cycle {counts[source]}/{cap}, run total {cycles}/{AMEND_CYCLES_MAX} "
+                         f"({'plan changed' if changed else 'plan unchanged - amendment did not land'})")
+        over = (f"the {AMEND_SOURCE_LABELS[source]} amendment budget ({cap})" if counts[source] > cap
+                else f"the run's overall amendment ceiling ({AMEND_CYCLES_MAX})" if cycles > AMEND_CYCLES_MAX else "")
+        if over:
             return raise_escalation(state, u, escalation(
-                "amend_cap", f"The plan has been amended {AMEND_CYCLES_MAX} times this run (A1 cap). Continue amending, "
-                             "seal as-is and proceed to Gate 2, or stop?",
+                "amend_cap", f"This amendment went past {over} (A1 cap; {cycles} amendment cycles this run). "
+                             "Allow one more amendment cycle, or stop?",
                 [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)],
-                evidence=tail(state.get("amend_summary", ""), 1500), hard_trigger=True))
+                evidence=tail(state.get("amend_summary", ""), 1500), hard_trigger=True,
+                data={"source": source}))
     u.update({"plan_revision": rev, "sealed": False, "gate2_verdict": "", "gate1_verdict": ""})
     snapshot(state, u, "reseal")
     u["_next"] = "gate1_build"
@@ -867,7 +888,7 @@ def _leak_item(q):
 def _leak_amend(state, u, asked):
     """Close the leak round: the held answers and the asked ones become the amendment."""
     held = [a for a in as_list({**state, **u}.get("leak_pending_answers")) if isinstance(a, dict) and a.get("answer")]
-    u["pending_amendments"] = [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in held + asked]
+    queue_amendments(u, "gate1", [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in held + asked])
     u["leak_pending_answers"] = []
     _end_choices(u)
     ledger(state, u, f"gate1: {len(held)} held and {len(asked)} asked answer(s) -> amend_plan")
@@ -969,7 +990,7 @@ def gate2_route(state):
             "gate2_stuck", f"The oracle still REJECTS the plan after {STRIKE_LIMIT} fix rounds. Stop, or override and promote?",
             [option("Stop and report", recommended=True), option("Override: promote the plan as reviewed (recorded)")],
             evidence=tail(text, 3000), hard_trigger=True))
-    u["pending_amendments"] = [f"Oracle complaint (round {rejects}): {tail(text, 4000)}"]
+    queue_amendments(u, "gate2", [f"Oracle complaint (round {rejects}): {tail(text, 4000)}"])
     ledger(state, u, f"gate2: REJECT round {rejects} -> amend_plan (re-seal follows, A3)")
     u["_next"] = "amend_plan"
     return u
@@ -3241,10 +3262,20 @@ def apply_answer(state):
         u["_next"] = "quality_bar_gate"
     elif kind == "amend_cap":
         if stop:
-            u["failure_reason"] = f"stopped: the A1 amendment cap ({AMEND_CYCLES_MAX}) was reached"
+            source = as_dict(esc.get("data")).get("source")
+            u["failure_reason"] = (f"stopped: the A1 amendment cap was reached ({AMEND_SOURCE_LABELS.get(source, 'run')} budget "
+                                   f"{AMEND_CAPS.get(source, AMEND_CYCLES_MAX)}, overall ceiling {AMEND_CYCLES_MAX})")
             u["_next"] = "end_blocked"
         else:
-            u["amend_cycles"] = AMEND_CYCLES_MAX - 1
+            # one more cycle of the source that hit its budget, and one more under the overall ceiling
+            source = as_dict(esc.get("data")).get("source")
+            counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
+            if source in AMEND_CAPS:
+                counts[source] = min(counts.get(source, 0), AMEND_CAPS[source] - 1)
+            else:
+                counts = {k: min(v, AMEND_CAPS.get(k, v) - 1) for k, v in counts.items()}
+            u["amend_counts"] = counts
+            u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
             u["_next"] = "gate1_build"
     elif kind == "gate1_stuck":
         # the free-text answers often mention stopping ("stop retrying on 5xx"), so only a stop reply stops
@@ -3252,7 +3283,7 @@ def apply_answer(state):
             u["failure_reason"] = "stopped: Gate 1 LEAKY on the same questions after the A1 retry"
             u["_next"] = "end_blocked"
         else:
-            u["pending_amendments"] = [f"Owner's answers to the gatekeeper's open questions:\n{answer}"]
+            queue_amendments(u, "gate1", [f"Owner's answers to the gatekeeper's open questions:\n{answer}"])
             u["leak_fingerprints"] = []
             u["_next"] = "amend_plan"
     elif kind == "gate2_stuck":
@@ -3276,7 +3307,7 @@ def apply_answer(state):
         if a == "approve":
             u["_next"] = "promote_tasks"
         elif a == "revise":
-            u["pending_amendments"] = [f"Owner's revision at plan-gate:\n{answer}"]
+            queue_amendments(u, "rework", [f"Owner's revision at plan-gate:\n{answer}"])
             u["_next"] = "amend_plan"
         else:
             u["failure_reason"] = "aborted at plan-gate"
@@ -3351,7 +3382,7 @@ def apply_answer(state):
                       "fix_note": "Oracle diagnosis:\n" + tail(state.get("oracle_result", ""), 4000)})
             u["_next"] = "compose_delegation"
         elif a == "rescope":
-            u["pending_amendments"] = [f"Re-scope of {task.get('id')} after a failed implementation:\n{answer}"]
+            queue_amendments(u, "rework", [f"Re-scope of {task.get('id')} after a failed implementation:\n{answer}"])
             task["status"] = "pending"
             save_tasks(state, u, tasks)
             u["_next"] = "amend_plan"
@@ -3379,12 +3410,12 @@ def apply_answer(state):
             u["failure_reason"] = f"stopped: the plan is the root cause of a conformance failure on {task.get('id')}"
             u["_next"] = "end_blocked"
         else:
-            u["pending_amendments"] = [f"Plan defect found by the adversary on {task.get('id')} (criterion amended, never the scope):\n{answer}\n\nEvidence:\n{esc.get('evidence', '')}"]
+            queue_amendments(u, "rework", [f"Plan defect found by the adversary on {task.get('id')} (criterion amended, never the scope):\n{answer}\n\nEvidence:\n{esc.get('evidence', '')}"])
             u["after_reseal"] = "verify"
             u["_next"] = "amend_plan"
     elif kind == "probe_gap":
         if _answered(state, {"supply": ["supply"]}, None) == "supply":
-            u["pending_amendments"] = [f"Local-run recipe supplied by the owner for the probe:\n{answer}"]
+            queue_amendments(u, "rework", [f"Local-run recipe supplied by the owner for the probe:\n{answer}"])
             u["after_reseal"] = "verify"
             u["_next"] = "amend_plan"
         else:
@@ -3664,7 +3695,7 @@ def integrate_route(state):
     amends = [a for a in as_list(state.get("integration_amendments")) if isinstance(a, str) and a.strip()]
     if amends and not truthy(state.get("integration_amended")):
         u["integration_amended"] = True
-        u["pending_amendments"] = [f"Integration finding: {a}" for a in amends]
+        queue_amendments(u, "rework", [f"Integration finding: {a}" for a in amends])
         u["after_reseal"] = "phase_f"
         ledger(state, u, f"integrate: {len(amends)} plan amendment(s) -> amend_plan (re-seal)")
         u["_next"] = "amend_plan"

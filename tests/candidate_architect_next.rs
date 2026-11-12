@@ -3024,10 +3024,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![46, 3695, 3704],
+        vec![47, 3726, 3735],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3695, 3704] {
+    for line in [3726, 3735] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4910,7 +4910,11 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// name, annotation (none carries one), the expression as written, and the
 /// value the module computes from it.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
-    ("AMEND_CYCLES_MAX", "", "3", 3),
+    ("AMEND_CYCLES_MAX", "", "4 * STRIKE_LIMIT", 12),
+    ("AMEND_DESIGN_MAX", "", "DESIGN_ROUNDS_MAX + 1", 4),
+    ("AMEND_GATE1_MAX", "", "2 * STRIKE_LIMIT", 6),
+    ("AMEND_GATE2_MAX", "", "STRIKE_LIMIT", 3),
+    ("AMEND_REWORK_MAX", "", "STRIKE_LIMIT", 3),
     ("CHOICE_OPTIONS_MAX", "", "4", 4),
     ("CHOICE_OPTIONS_MIN", "", "2", 2),
     ("CI_FLAKE_RERUNS", "", "2", 2),
