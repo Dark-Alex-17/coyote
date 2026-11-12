@@ -271,6 +271,80 @@ fn dot_install_of_a_bundle_with_secrets_defers_every_secret_the_user_declines() 
     assert_tty_restored(&transcript);
 }
 
+/// The uninstall twin: `.uninstall <bundle>`, `y`, then Esc on the
+/// `was modified locally after install` Select modal keeps the edited
+/// file (the unmodified one is removed), the report still prints, one
+/// note says the question was cancelled, and the UI stays live.
+#[test]
+#[serial]
+fn esc_on_the_uninstall_modified_file_select_modal_keeps_the_file_and_says_so() {
+    let dir = fresh_config_dir("uninstall-esc-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-u8e";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    install_bundle_without_questions(&mut pty, &repo);
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    let edited = dir.join("roles").join(format!("{name}-obsolete.md"));
+    fs::write(&edited, EDITED_OBSOLETE).unwrap();
+
+    let at = pty.raw().len();
+    pty.send(format!(".uninstall {name}\r").as_bytes()).unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        at,
+        ".uninstall",
+        &[&format!("Uninstall bundle '{name}'?"), "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        at,
+        ".uninstall (modified file)",
+        &["wasmodifiedlocallyafterinstall", "keep", "delete-all"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "the question was cancelled",
+        "the note after Esc on the modified-file modal",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..]));
+    let flat = squeezed(&since);
+    assert_eq!(
+        flat.matches("thequestionwascancelled").count(),
+        1,
+        "the cancelled note was printed more or less than once:\n{since}"
+    );
+    assert!(
+        flat.contains("keptmodifiedfile") && flat.contains("partiallyuninstalled"),
+        "the cancelled question did not resolve to keep with the report:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&edited).ok().as_deref(),
+        Some(EDITED_OBSOLETE),
+        "Esc on the modified-file modal did not keep the edited file:\n{since}"
+    );
+    assert!(
+        !role.exists(),
+        "the unmodified role survived the uninstall:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a question released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "the cancelled modified-file question");
+}
+
 /// Whether `pid` still exists (signal 0 is checked, not delivered).
 fn process_alive(pid: i32) -> bool {
     // SAFETY: kill with signal 0 touches no memory; it only checks the pid.
@@ -2652,6 +2726,171 @@ fn dot_rag_chunk_size_typed_in_the_plain_repl_replaces_the_default() {
     pty.read_for(Duration::from_millis(300));
     pty.send(b".exit\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+// ---------------------------------------------------------------------
+// Cancelling the obsolete-file question of a bundle update.
+// ---------------------------------------------------------------------
+
+const EDITED_OBSOLETE: &str = "---\nmodel: fake:fake-model\n---\nEdited locally by the user.\n";
+const KEPT_OBSOLETE_NOTE: &str = "Kept the obsolete files: the question was cancelled.";
+
+/// Installs the secret-free bundle `name` from `repo`, edits its second
+/// role locally, then drops that role from the source and commits, so
+/// the next `.install <name>` finds an obsolete file to ask about.
+/// Returns the edited file's path.
+fn make_the_second_role_obsolete(dir: &Path, repo: &Path, name: &str) -> PathBuf {
+    let obsolete = dir.join("roles").join(format!("{name}-obsolete.md"));
+    assert!(
+        obsolete.exists(),
+        "the bundle's second role was not installed at {}",
+        obsolete.display()
+    );
+    fs::write(&obsolete, EDITED_OBSOLETE).unwrap();
+    fs::remove_file(repo.join("roles").join(format!("{name}-obsolete.md"))).unwrap();
+    git(repo, &["add", "-A"]);
+    git(repo, &["commit", "-q", "-m", "drop a role"]);
+    obsolete
+}
+
+/// `.install <bundle>` updating a bundle whose source dropped a role the
+/// user edited: the obsolete file's fate is a Select modal; Esc on it
+/// keeps the file, the update still prints its summary and one note,
+/// `Kept the obsolete files: the question was cancelled.`, the terminal
+/// is never released, and the UI keeps taking keys.
+#[test]
+#[serial]
+fn esc_on_the_obsolete_file_select_modal_keeps_the_file_and_says_the_question_was_cancelled() {
+    let dir = fresh_config_dir("obsolete-esc-modal");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-o8e";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    install_bundle_without_questions(&mut pty, &repo);
+    let obsolete = make_the_second_role_obsolete(&dir, &repo, name);
+
+    let update_at = pty.raw().len();
+    pty.send(format!(".install {name}\r").as_bytes()).unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        update_at,
+        ".install <bundle> (obsolete file)",
+        &["Obsolete file", &format!("{name}-obsolete.md"), "keep"],
+    );
+    assert!(
+        !squeezed(&modal).contains("Other(custom)"),
+        "the obsolete-file select is closed but the modal offers a custom row:\n{modal}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        KEPT_OBSOLETE_NOTE,
+        "the note after Esc on the obsolete-file modal",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
+    let flat = squeezed(&since);
+    assert_eq!(
+        flat.matches(&squeezed(KEPT_OBSOLETE_NOTE)).count(),
+        1,
+        "the kept-files note was printed more or less than once:\n{since}"
+    );
+    assert!(
+        flat.contains("Installed:") || flat.contains("Updated") || flat.contains("unchanged"),
+        "the cancelled question swallowed the update's summary:\n{since}"
+    );
+    let frame = repainted_frame(&mut pty, 58, 140);
+    assert!(
+        !squeezed(&frame).contains("Esc=cancel"),
+        "the obsolete-file modal is still up after Esc:\n{frame}"
+    );
+    assert_eq!(
+        fs::read_to_string(&obsolete).ok().as_deref(),
+        Some(EDITED_OBSOLETE),
+        "Esc on the obsolete-file modal did not keep the edited file:\n{since}"
+    );
+    assert!(
+        dir.join("roles").join(format!("{name}-role.md")).exists(),
+        "the update dropped the bundle's current role:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the obsolete-file question released the terminal:\n{since}"
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the cancelled obsolete-file question");
+}
+
+/// The same update in the plain REPL: the obsolete file's fate is an
+/// inquire Select; Esc cancels it, the file is kept, the summary and
+/// the one note line follow, and the REPL goes on taking commands.
+#[test]
+#[serial]
+fn esc_on_the_obsolete_file_select_in_the_plain_repl_keeps_the_file_and_says_so() {
+    let dir = fresh_config_dir("obsolete-esc-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-o8r";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", repo.to_str().unwrap()],
+        "tty-less install of the bundle to update",
+    );
+    assert!(ok, "{out}");
+    let obsolete = make_the_second_role_obsolete(&dir, &repo, name);
+
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    pty.wait_for(")> ", PTY_DEADLINE).unwrap();
+    let update_at = pty.raw().len();
+    pty.send(format!(".install {name}\r").as_bytes()).unwrap();
+    pty.wait_for_after("Obsolete file", update_at, PTY_DEADLINE)
+        .expect("the REPL update did not ask about the obsolete file");
+    pty.read_for(Duration::from_millis(500));
+    let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
+    assert!(
+        asked.contains("keep") && !asked.contains("Other (custom)"),
+        "the REPL question is not the closed keep/delete select:\n{asked}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.wait_for_after(KEPT_OBSOLETE_NOTE, update_at, PTY_DEADLINE)
+        .expect("the REPL did not print the kept-files note after Esc");
+    pty.read_for(Duration::from_millis(500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
+    assert_eq!(
+        since.matches(KEPT_OBSOLETE_NOTE).count(),
+        1,
+        "the kept-files note was printed more or less than once:\n{since}"
+    );
+    assert!(
+        since.contains("Installed:") || since.contains("Updated") || since.contains("unchanged"),
+        "the cancelled question swallowed the update's summary:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&obsolete).ok().as_deref(),
+        Some(EDITED_OBSOLETE),
+        "Esc on the REPL select did not keep the edited file:\n{since}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the plain REPL entered the alternate screen:\n{since}"
+    );
+
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("`.info` after the cancelled question never rendered");
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }

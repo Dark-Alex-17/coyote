@@ -2863,3 +2863,237 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
         "the refused `.uninstall` still removed a bundle file:\n{shapes:?}"
     );
 }
+
+// ---------------------------------------------------------------------
+// The no-tty runs of the reinstall with `--yes`, the MCP add that needs a
+// vault secret, and the very first run with no config file.
+// ---------------------------------------------------------------------
+
+/// `--install-builtins macros --yes` with no terminal at all proceeds
+/// without a question: exit 0, no refusal, no `Continue?`, and every
+/// locally edited bundled macro is back to the asset's bytes; the run
+/// says what it reinstalled.
+#[test]
+#[serial]
+fn a_tty_less_install_builtins_with_yes_reinstalls_every_bundled_file_without_asking() {
+    let dir = fresh_config_dir("ttyless-install-builtins-yes");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let macros_dir = dir.join("macros");
+    fs::create_dir_all(&macros_dir).unwrap();
+    let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/macros");
+    let mut expected = Vec::new();
+    for entry in fs::read_dir(&bundled).unwrap() {
+        let entry = entry.unwrap();
+        fs::write(macros_dir.join(entry.file_name()), "# local edit\n").unwrap();
+        expected.push((
+            macros_dir.join(entry.file_name()),
+            fs::read(entry.path()).unwrap(),
+        ));
+    }
+    assert!(!expected.is_empty(), "no bundled macros to seed");
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install-builtins", "macros", "--yes"],
+        "tty-less --install-builtins macros --yes",
+    );
+    assert!(
+        ok,
+        "`--install-builtins macros --yes` with no terminal failed:\n{out}"
+    );
+    assert!(
+        refusal_shape(&out).is_none() && !out.contains("Continue?"),
+        "`--yes` still refused or asked:\n{out}"
+    );
+    assert!(
+        out.contains("Reinstalled bundled macros"),
+        "the `--yes` run did not say what it reinstalled:\n{out}"
+    );
+    for (path, bytes) in &expected {
+        assert_eq!(
+            fs::read(path).ok().as_deref(),
+            Some(bytes.as_slice()),
+            "{} was not restored to the bundled asset by `--yes`:\n{out}",
+            path.display()
+        );
+    }
+}
+
+/// `--mcp-add` of a server whose env references a vault secret the vault
+/// does not hold, with no terminal at all and again with a terminal on
+/// stdout but stdin from /dev/null: refused in the shared shape before
+/// any `to vault now?` question, the remedy naming
+/// `coyote --add-secret <NAME>`, and the server is not written. The same
+/// command without the placeholder succeeds, so the refusal is the
+/// secret's, not the vault's.
+#[test]
+#[serial]
+fn a_tty_less_mcp_add_needing_a_vault_secret_is_refused_naming_add_secret_before_any_question() {
+    let dir = fresh_config_dir("ttyless-mcp-add-secret");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &[
+            "--mcp-add",
+            "probe-srv-m4c",
+            "--env",
+            "TOKEN={{ PROBE_MCP_TOKEN_M4C }}",
+            "--",
+            "echo",
+            "hi",
+        ],
+        "tty-less --mcp-add with a vault placeholder",
+    );
+    assert!(
+        !ok,
+        "the tty-less `--mcp-add` needing a secret exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("the refusal is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{out}")
+    });
+    assert!(
+        action.contains("probe-srv-m4c") && action.contains("secret"),
+        "the refusal does not name the server's secrets: {action:?}\n{out}"
+    );
+    assert!(
+        remedy.contains("coyote --add-secret PROBE_MCP_TOKEN_M4C"),
+        "the remedy does not name `coyote --add-secret PROBE_MCP_TOKEN_M4C`: {remedy:?}\n{out}"
+    );
+    assert!(
+        !out.contains("to vault now?") && !out.contains("Added MCP server"),
+        "the refused run asked or added the server anyway:\n{out}"
+    );
+    let mentions = walk(&dir)
+        .into_iter()
+        .filter(|p| fs::read_to_string(p).is_ok_and(|s| s.contains("probe-srv-m4c")))
+        .collect::<Vec<_>>();
+    assert!(
+        mentions.is_empty(),
+        "the refused `--mcp-add` still wrote the server into {mentions:?}:\n{out}"
+    );
+
+    // A terminal on stdout, stdin from /dev/null: the same refusal.
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --mcp-add probe-srv-m4d --env TOKEN={{PROBE_MCP_TOKEN_M4D}} -- echo hi",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "the piped-stdin `--mcp-add` exited 0:\n{plain}"
+    );
+    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
+        panic!("the piped-stdin `--mcp-add` is not refused in the shared shape:\n{plain}")
+    });
+    assert!(
+        action.contains("probe-srv-m4d")
+            && remedy.contains("coyote --add-secret PROBE_MCP_TOKEN_M4D"),
+        "the piped-stdin refusal names {action:?} / {remedy:?}:\n{plain}"
+    );
+    assert!(
+        !plain.contains("to vault now?"),
+        "the piped-stdin run asked on the terminal:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+
+    // Control: no placeholder, no question to ask, the add goes through.
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--mcp-add", "plain-srv-m4e", "--", "echo", "hi"],
+        "tty-less --mcp-add without a placeholder",
+    );
+    assert!(
+        ok,
+        "a tty-less `--mcp-add` with nothing to ask failed:\n{out}"
+    );
+    assert!(
+        fs::read_to_string(dir.join("mcp.json")).is_ok_and(|s| s.contains("plain-srv-m4e")),
+        "the secret-free `--mcp-add` did not write the server:\n{out}"
+    );
+}
+
+/// The first run ever with no config file and nobody to ask: with a
+/// terminal on stdout but stdin from /dev/null, and in the sandbox with
+/// no terminal at all, the run refuses to create the config file in the
+/// shared shape, paints no `create a new one?` question, and writes
+/// neither a config file nor a vault password file.
+#[test]
+#[serial]
+fn a_first_run_with_no_human_refuses_to_create_the_config_file_and_writes_nothing() {
+    let dir = fresh_config_dir("first-run-no-human");
+    let _guard = TempDirGuard(dir.clone());
+    assert!(!dir.join("config.yaml").exists());
+
+    let nothing_written = |what: &str, out: &str| {
+        assert!(
+            !dir.join("config.yaml").exists(),
+            "{what}: the refused first run wrote config.yaml:\n{out}"
+        );
+        let secrets = walk(&dir)
+            .into_iter()
+            .filter(|p| {
+                let text = p.to_string_lossy().to_ascii_lowercase();
+                text.contains("vault")
+                    || text.contains("pass")
+                    || text.starts_with(&format!("{}/home/", dir.display()))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            secrets.is_empty(),
+            "{what}: the refused first run wrote a password or vault file {secrets:?}:\n{out}"
+        );
+    };
+
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "the first run with stdin from /dev/null exited 0:\n{plain}"
+    );
+    let (action, remedy) = refusal_shape(&plain)
+        .unwrap_or_else(|| panic!("the first run is not refused in the shared shape:\n{plain}"));
+    assert!(
+        action.starts_with("create the config file at '") && action.contains("config.yaml"),
+        "the refusal does not name the config file: {action:?}\n{plain}"
+    );
+    assert_eq!(
+        remedy, ".",
+        "the first-run refusal carries a remedy: {remedy:?}\n{plain}"
+    );
+    assert!(
+        !plain.contains("create a new one?"),
+        "the first run asked on the terminal anyway:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+    nothing_written("stdout tty, stdin /dev/null", &plain);
+
+    let (ok, out) = run_ttyless_with_env(
+        built_binary(),
+        &dir,
+        &[],
+        &[("IS_SANDBOX", "1")],
+        "sandbox first run with no terminal",
+    );
+    assert!(!ok, "the tty-less sandbox first run exited 0:\n{out}");
+    let (action, _) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("the tty-less sandbox first run is not refused in the shared shape:\n{out}")
+    });
+    assert!(
+        action.starts_with("create the config file at '"),
+        "the sandbox refusal does not name the config file: {action:?}\n{out}"
+    );
+    assert!(!out.contains("create a new one?"), "{out}");
+    nothing_written("sandbox, no tty", &out);
+}
