@@ -84,13 +84,26 @@ def git_diff(*args):
 def normalize_base(spec):
     """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
     commits that landed on the base after branching never surface as changes.
-    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    Explicit `..` ranges are the caller's choice and pass through untouched, and
+    so does a checkpoint commit on top of HEAD, whose merge-base would be HEAD."""
     if ".." in spec:
         return spec
     try:
-        return git("merge-base", spec, "HEAD").strip()
+        base = git("merge-base", spec, "HEAD").strip()
     except Exception:  # noqa: BLE001 — the plain diff below reports the real error
         return spec
+    try:
+        head, commit = git("rev-parse", "HEAD", f"{spec}^{{commit}}").split()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    if base != head or head == commit:
+        return base
+    try:
+        # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+        held = git("for-each-ref", "--count=1", "--contains", commit).strip()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    return base if held else spec
 
 
 # Shared surface patterns: the primary diff and the re-review delta are

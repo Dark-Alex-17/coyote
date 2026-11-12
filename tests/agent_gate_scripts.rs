@@ -2837,6 +2837,105 @@ fn sisyphus_debt_scan_tool_requires_a_base() {
     assert!(stderr.contains("--base"), "{stderr}");
 }
 
+/// A per-subtask review hands the lanes a checkpoint commit of the worktree
+/// on top of HEAD as `--base`. Its merge-base with HEAD is HEAD, so mapping
+/// it there would show the earlier subtasks' uncommitted work again: every
+/// lane's `get_diff` diffs from the checkpoint itself, while a branch ahead
+/// of HEAD still diffs from its merge-base.
+#[cfg(unix)]
+#[test]
+fn review_lane_get_diff_diffs_a_checkpoint_base_directly() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("review-lane-checkpoint-base");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let index = dir.0.join("checkpoint-index");
+    let git = |args: &[&str], envs: &[(&str, &Path)]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .envs(envs.iter().copied())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"], &[]);
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    fs::write(repo.join("b.txt"), "b\n").unwrap();
+    git(&["add", "."], &[]);
+    git(&["commit", "-qm", "init"], &[]);
+    let head = git(&["rev-parse", "HEAD"], &[]);
+    fs::write(repo.join("a.txt"), "a\nearlier subtask\n").unwrap();
+    fs::copy(repo.join(".git/index"), &index).unwrap();
+    git(&["add", "-u"], &[("GIT_INDEX_FILE", &index)]);
+    let tree = git(&["write-tree"], &[("GIT_INDEX_FILE", &index)]);
+    let checkpoint = git(
+        &["commit-tree", &tree, "-p", &head, "-m", "checkpoint"],
+        &[],
+    );
+    let ahead = git(
+        &[
+            "commit-tree",
+            &format!("{head}^{{tree}}"),
+            "-p",
+            &head,
+            "-m",
+            "upstream",
+        ],
+        &[],
+    );
+    git(&["branch", "ahead", &ahead], &[]);
+    fs::write(repo.join("b.txt"), "b\nlatest subtask\n").unwrap();
+    let prompt_utils = dir.0.join("prompt-utils.sh");
+    fs::write(
+        &prompt_utils,
+        "info() { echo \"$*\"; }\nwarn() { echo \"$*\"; }\n",
+    )
+    .unwrap();
+    for agent in [
+        "code-reviewer",
+        "domain-reviewer",
+        "security-reviewer",
+        "probe",
+    ] {
+        let tool = engine_built_tool(&dir.0, agent);
+        let get_diff = |base: &str| {
+            run(bash()
+                .arg(&tool)
+                .args(["get_diff", "--base", base])
+                .env("LLM_ROOT_DIR", dir.0.join("config"))
+                .env("LLM_AGENT_ROOT_DIR", tool.parent().unwrap())
+                .env("LLM_PROMPT_UTILS_FILE", &prompt_utils)
+                .env("LLM_AGENT_VAR_PROJECT_DIR", &repo)
+                .env("LLM_OUTPUT", "/dev/stdout")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("spawn bash"))
+        };
+        let (code, stdout, stderr) = get_diff(&checkpoint);
+        assert_eq!(code, 0, "{agent}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stdout.contains("diff --git a/b.txt b/b.txt") && !stdout.contains("a/a.txt"),
+            "{agent}: a checkpoint base must show only the latest subtask's file: {stdout}"
+        );
+        let (code, stdout, stderr) = get_diff("ahead");
+        assert_eq!(code, 0, "{agent}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stdout.contains("a/a.txt") && stdout.contains("a/b.txt"),
+            "{agent}: a branch ahead of HEAD must still diff from its merge-base: {stdout}"
+        );
+    }
+}
+
 /// Without python3 on PATH the tool still answers, exit 0, with the
 /// DEBT_SCAN_FAILED report and the manual pipeline to run instead.
 #[cfg(unix)]
