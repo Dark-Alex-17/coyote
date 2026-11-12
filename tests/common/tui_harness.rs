@@ -783,3 +783,149 @@ pub fn refusal_shape(out: &str) -> Option<(String, String)> {
         ))
     })
 }
+
+/// Whether an SGR sequence sets a foreground, background or underline
+/// colour (the 16 named colours, their bright twins, or a 38/48/58
+/// extended-colour introducer).
+pub fn is_colour_sgr(params: &[u16]) -> bool {
+    let mut i = 0;
+    while i < params.len() {
+        let p = params[i];
+        if (30..=37).contains(&p)
+            || (40..=47).contains(&p)
+            || (90..=97).contains(&p)
+            || (100..=107).contains(&p)
+            || p == 38
+            || p == 48
+            || p == 58
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Writes an `$EDITOR` that records into `launched` the path it was asked
+/// to open and, on a second line, whether that file `existed` or was
+/// `missing` when the editor started; a missing file is saved the way an
+/// editor's save would (a new role or macro exists only once its editor
+/// wrote it). Returns the editor's path.
+pub fn recording_editor(dir: &Path, launched: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let editor = dir.join("recording-editor.sh");
+    fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" > '{launched}'\n\
+             if [ -e \"$1\" ]; then echo existed; else echo missing; printf 'saved\\n' > \"$1\"; fi >> '{launched}'\n\
+             exit 0\n",
+            launched = launched.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).unwrap();
+    editor.to_str().unwrap().to_string()
+}
+
+/// Runs one git command in `repo`, with an identity so `commit` works on a
+/// machine without one.
+pub fn git(repo: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "user.email=tests@example.invalid",
+            "-c",
+            "user.name=tests",
+        ])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        repo.display()
+    );
+}
+
+/// The bundle's `mcp.json`: one stdio server whose env references every
+/// name in `secrets` as `{{NAME}}`.
+pub fn bundle_mcp_json(secrets: &[&str]) -> String {
+    let env: Vec<String> = secrets
+        .iter()
+        .map(|name| format!("\"{name}_VAR\": \"{{{{{name}}}}}\""))
+        .collect();
+    format!(
+        "{{\"mcpServers\": {{\"bundle-k7s-server\": {{\"type\": \"stdio\", \"command\": \"echo\", \
+         \"args\": [\"k7s\"], \"env\": {{{}}}}}}}}}\n",
+        env.join(", ")
+    )
+}
+
+/// A local git repository laid out as a bundle (`coyote-bundle.yaml`, a
+/// role, an `mcp.json` referencing `secrets`), committed so `.install`
+/// can clone it, at `dir/bundle-src`. Returns the repository path.
+pub fn write_bundle_repo(dir: &Path, name: &str, secrets: &[&str]) -> PathBuf {
+    let repo = dir.join("bundle-src");
+    write_bundle_repo_at(&repo, name, secrets);
+    repo
+}
+
+/// `write_bundle_repo` at a path of the caller's choosing, for a test
+/// that installs two bundles; the store tells bundles apart by source.
+pub fn write_bundle_repo_at(repo: &Path, name: &str, secrets: &[&str]) {
+    fs::create_dir_all(repo.join("roles")).unwrap();
+    fs::write(repo.join("coyote-bundle.yaml"), format!("name: {name}\n")).unwrap();
+    fs::write(
+        repo.join("roles").join(format!("{name}-role.md")),
+        "---\nmodel: fake:fake-model\n---\nYou are the bundle role.\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("roles").join(format!("{name}-obsolete.md")),
+        "---\nmodel: fake:fake-model\n---\nYou are the role the update drops.\n",
+    )
+    .unwrap();
+    fs::write(repo.join("mcp.json"), bundle_mcp_json(secrets)).unwrap();
+    git(repo, &["init", "-q"]);
+    git(repo, &["add", "."]);
+    git(repo, &["commit", "-q", "-m", "bundle"]);
+}
+
+/// The UI after `.info` still takes keys, then Ctrl+D leaves it clean.
+pub fn assert_ui_alive_then_quit(pty: &mut Pty, after: &str) -> String {
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("`.info` after {after} never rendered: {e:?}"));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    transcript
+}
+
+/// Forces a full repaint and returns the stripped frame painted since the
+/// resize; the painter only repaints changed cells, so a frame read
+/// straight after a key may be a partial diff.
+pub fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
+    pty.read_for(Duration::from_millis(500));
+    let from = pty.raw().len();
+    pty.resize(rows, cols).unwrap();
+    pty.read_for(Duration::from_millis(800));
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
+}
+
+/// The vault refuses a password file anyone else can read; the fixture
+/// writes it with the default mode, so a case that stores a secret
+/// tightens it first.
+pub fn secure_vault_password_file(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir.join("vault-pass"), fs::Permissions::from_mode(0o600)).unwrap();
+}

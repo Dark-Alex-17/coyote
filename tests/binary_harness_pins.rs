@@ -42,7 +42,11 @@ const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
     concat!("Pty::", "spawn("),
 ];
-const HARNESS_USERS: [&str; 2] = ["tui_binary.rs", "tui_binary_wizards.rs"];
+const HARNESS_USERS: [&str; 3] = [
+    "tui_binary.rs",
+    "tui_binary_menus.rs",
+    "tui_binary_wizards.rs",
+];
 // Files that spawn the binary outside the shared harness's import, as of
 // 2026-11-10: 29 self-contained suites plus the shared harness itself.
 // Files with no spawn and no dir pin at all are skipped before they are
