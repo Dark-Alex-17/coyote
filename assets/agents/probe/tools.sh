@@ -59,12 +59,12 @@ get_diff() {
     fi
     diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv "${resolved}" -- 2>&1) || true
   else
-    diff_output=$(cd "${project_dir}" && git diff --cached 2>&1) || true
+    diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv --cached 2>&1) || true
     if [[ -z "${diff_output}" ]]; then
-      diff_output=$(cd "${project_dir}" && git diff 2>&1) || true
+      diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv 2>&1) || true
     fi
     if [[ -z "${diff_output}" ]]; then
-      diff_output=$(cd "${project_dir}" && git diff HEAD~1 2>&1) || true
+      diff_output=$(cd "${project_dir}" && git diff --no-ext-diff --no-textconv HEAD~1 2>&1) || true
     fi
   fi
 
@@ -100,12 +100,12 @@ get_changed_files() {
     fi
     stat_output=$(cd "${project_dir}" && git diff --stat --no-ext-diff --no-textconv "${resolved}" -- 2>&1) || true
   else
-    stat_output=$(cd "${project_dir}" && git diff --cached --stat 2>&1) || true
+    stat_output=$(cd "${project_dir}" && git diff --cached --stat --no-ext-diff --no-textconv 2>&1) || true
     if [[ -z "${stat_output}" ]]; then
-      stat_output=$(cd "${project_dir}" && git diff --stat 2>&1) || true
+      stat_output=$(cd "${project_dir}" && git diff --stat --no-ext-diff --no-textconv 2>&1) || true
     fi
     if [[ -z "${stat_output}" ]]; then
-      stat_output=$(cd "${project_dir}" && git diff --stat HEAD~1 2>&1) || true
+      stat_output=$(cd "${project_dir}" && git diff --stat --no-ext-diff --no-textconv HEAD~1 2>&1) || true
     fi
   fi
 

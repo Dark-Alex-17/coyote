@@ -63,9 +63,9 @@ get_diff() {
 
   _diff() {
     if ((${#path_args[@]})); then
-      (cd "${project_dir}" && git diff "$@" -- "${path_args[@]}" 2>&1) || true
+      (cd "${project_dir}" && git diff --no-ext-diff --no-textconv "$@" -- "${path_args[@]}" 2>&1) || true
     else
-      (cd "${project_dir}" && git diff "$@" -- 2>&1) || true
+      (cd "${project_dir}" && git diff --no-ext-diff --no-textconv "$@" -- 2>&1) || true
     fi
   }
 
@@ -78,7 +78,7 @@ get_diff() {
     elif ((rc)); then
       echo "No merge-base between '${base}' and HEAD; diffing against '${base}' directly." >> "$LLM_OUTPUT"
     fi
-    diff_output=$(_diff --no-ext-diff --no-textconv "${resolved}")
+    diff_output=$(_diff "${resolved}")
   else
     diff_output=$(_diff --cached)
     [[ -z "${diff_output}" ]] && diff_output=$(_diff)
