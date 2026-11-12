@@ -837,9 +837,9 @@ impl Config {
                     if inspection {
                         return Ok(Self::default());
                     }
-                    if conflict::menu_can_use_terminal() {
-                        create_config_file(&config_path).await?;
-                    }
+                    // Without a terminal the wizard refuses in the shared
+                    // shape before writing anything.
+                    create_config_file(&config_path).await?;
                     Self::load_from_file(&config_path)?
                 }
             }
