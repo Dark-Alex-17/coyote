@@ -2525,25 +2525,24 @@ fn headless_agent_with_documents_starts_without_rag_silently() {
 /// pipes) reaching a rerouted question (`.vault add`, `.rag <new>`) is
 /// refused the way the plain REPL always refused it: the run ends on its
 /// own instead of hanging on a prompt, exits non-zero, says what is
-/// missing (the secret reader reports the input is not a tty; the rag
-/// step refuses in the shared shape, naming the knowledge base), writes
-/// nothing for the secret or the rag, and the macro does not go on to
-/// its next step.
+/// missing in the shared refusal shape (naming the secret or the
+/// knowledge base), writes nothing for the secret or the rag, and the
+/// macro does not go on to its next step.
 #[test]
 #[serial]
 fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
-    for (scenario, step, footprints, refused_action) in [
+    for (scenario, step, footprints, action_prefix) in [
         (
             "vault-add",
             ".vault add probe-secret-m7q",
             &["m7q", "vault.yml"][..],
-            None,
+            "add secret 'probe-secret-m7q'",
         ),
         (
             "rag-create",
             ".rag probe-rag-m7q",
             &["m7q", "/rags/"][..],
-            Some("initialize RAG knowledge base 'probe-rag-m7q'"),
+            "initialize RAG knowledge base 'probe-rag-m7q'",
         ),
     ] {
         let dir = fresh_config_dir(&format!("ttyless-macro-{scenario}"));
@@ -2574,27 +2573,13 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
             !ok,
             "{scenario}: a refused tty-less `{step}` exited 0:\n{everything}"
         );
-        match refused_action {
-            Some(action_prefix) => {
-                let (action, _remedy) = refusal_shape(&everything).unwrap_or_else(|| {
-                    panic!("{scenario}: the refusal of `{step}` is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{everything}")
-                });
-                assert!(
-                    action.starts_with(action_prefix),
-                    "{scenario}: the refusal names the action {action:?}, not `{action_prefix}...`:\n{everything}"
-                );
-            }
-            None => {
-                let lower = everything.to_lowercase();
-                assert!(
-                    lower.contains("not a tty")
-                        || lower.contains("terminal")
-                        || lower.contains("human")
-                        || lower.contains("interactive"),
-                    "{scenario}: the refusal of `{step}` does not say what is missing:\n{everything}"
-                );
-            }
-        }
+        let (action, _remedy) = refusal_shape(&everything).unwrap_or_else(|| {
+            panic!("{scenario}: the refusal of `{step}` is not `Refusing to <action> non-interactively. Re-run in a terminal...`:\n{everything}")
+        });
+        assert!(
+            action.starts_with(action_prefix),
+            "{scenario}: the refusal names the action {action:?}, not `{action_prefix}...`:\n{everything}"
+        );
         for footprint in footprints {
             let written = new_files_named(&dir, &files_before, footprint);
             assert!(

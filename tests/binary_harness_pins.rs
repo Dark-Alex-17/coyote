@@ -8,10 +8,15 @@
 //!    its program as a string literal (`"git"`, `"bash"`), so no path to
 //!    the built binary can be smuggled in under another name; and they
 //!    carry no `env!("CARGO_BIN_EXE_...")` and no `Pty::spawn(` of their
-//!    own. The harness is the one audited place
-//!    that pins the config and cache dirs, detaches from the runner's tty
-//!    and selects the UI, so a spawn written around it is a spawn nobody
-//!    checked.
+//!    own. The harness is the one audited place that pins the config and
+//!    cache dirs, detaches from the runner's tty and selects the UI, so a
+//!    spawn written around it is a spawn nobody checked. One gap stays
+//!    open on purpose: `built_binary()` is public because the suites hand
+//!    it to the harness's own helpers (`spawn_binary_under`,
+//!    `ttyless_command`, `run_ttyless_binary`), so a suite could still
+//!    pass it as an argument to a literal program
+//!    (`Command::new("bash").arg(built_binary())`). That is a spawn for
+//!    review to catch; this lint does not look for it.
 //! 2. Every other file (a self-contained harness that spawns the binary
 //!    itself, and the shared harness) pins both dirs at every spawn: per
 //!    file, the spawn sites, the `COYOTE_CONFIG_DIR` sites and the
