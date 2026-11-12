@@ -1081,7 +1081,7 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         None => Vault::default_local(),
         Some(provider) => Vault::from_provider(provider.clone()),
     };
-    create_vault_password_file(&mut vault, &prompter)?;
+    create_vault_password_file(&mut vault, &prompter, &mut |note| println!("{note}"))?;
     if provider_choice.is_some() {
         vault.validate_round_trip()?;
     }

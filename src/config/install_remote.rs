@@ -2464,7 +2464,7 @@ fn prompt_for_each_secret(
             continue;
         }
         if !password_file_ensured {
-            create_vault_password_file(&mut vault, prompter)
+            create_vault_password_file(&mut vault, prompter, &mut print_note)
                 .context("Failed to initialize the vault password file")?;
             password_file_ensured = true;
         }

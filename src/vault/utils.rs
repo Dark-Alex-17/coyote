@@ -113,7 +113,13 @@ fn ask_password_file_path(prompter: &dyn Prompter, default: &Path) -> Result<Pat
     }
 }
 
-pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) -> Result<()> {
+/// Creates or fills the local provider's password file through `prompter`;
+/// the one-line report of what was written goes to `note`.
+pub fn create_vault_password_file(
+    vault: &mut Vault,
+    prompter: &dyn Prompter,
+    note: &mut dyn FnMut(&str),
+) -> Result<()> {
     let SupportedProvider::Local {
         provider_def: local_provider,
     } = &mut vault.provider
@@ -170,10 +176,10 @@ pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) ->
             .context("Failed to read password from input. Password file not updated.")?;
         std::fs::write(&vault_password_file, password.as_bytes())?;
         set_password_file_permissions(&vault_password_file)?;
-        println!(
+        note(&format!(
             "✓ Password file '{}' updated.",
             vault_password_file.display()
-        );
+        ));
     } else {
         let ans = confirm(
             prompter,
@@ -209,7 +215,10 @@ pub fn create_vault_password_file(vault: &mut Vault, prompter: &dyn Prompter) ->
             .context("Failed to read password from input. Password file not created.")?;
         std::fs::write(&password_file, password.as_bytes())?;
         set_password_file_permissions(&password_file)?;
-        println!("✓ Password file '{}' created.", password_file.display());
+        note(&format!(
+            "✓ Password file '{}' created.",
+            password_file.display()
+        ));
         local_provider.password_file = Some(password_file);
     }
 
@@ -926,7 +935,7 @@ mod tests {
             text("correct horse battery"),
         ]);
 
-        create_vault_password_file(&mut vault, &prompter).unwrap();
+        create_vault_password_file(&mut vault, &prompter, &mut |_| {}).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&chosen).unwrap(),
@@ -956,6 +965,33 @@ mod tests {
         );
     }
 
+    /// The created-file line reports the path the user chose, not the
+    /// configured default it was offered.
+    #[test]
+    #[serial]
+    fn the_created_password_file_line_names_the_chosen_path() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = TempDir::new("create-note");
+        let mut vault = dir.local_vault("configured");
+        let chosen = dir.0.join("chosen");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            text(&chosen.display().to_string()),
+            text("correct horse battery"),
+        ]);
+        let mut notes = Vec::new();
+
+        create_vault_password_file(&mut vault, &prompter, &mut |note| {
+            notes.push(note.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(
+            notes,
+            [format!("✓ Password file '{}' created.", chosen.display())]
+        );
+    }
+
     /// An empty configured password file is filled through the
     /// prompter after a confirm that defaults to yes.
     #[test]
@@ -971,7 +1007,7 @@ mod tests {
             text("correct horse battery"),
         ]);
 
-        create_vault_password_file(&mut vault, &prompter).unwrap();
+        create_vault_password_file(&mut vault, &prompter, &mut |_| {}).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&configured).unwrap(),
@@ -1014,7 +1050,7 @@ mod tests {
             text("long enough"),
         ]);
 
-        create_vault_password_file(&mut vault, &prompter).unwrap();
+        create_vault_password_file(&mut vault, &prompter, &mut |_| {}).unwrap();
 
         assert_eq!(std::fs::read_to_string(&chosen).unwrap(), "long enough");
         assert_eq!(
@@ -1042,7 +1078,7 @@ mod tests {
 
         let mut vault = dir.local_vault("configured");
         let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
-        let err = create_vault_password_file(&mut vault, &declined).unwrap_err();
+        let err = create_vault_password_file(&mut vault, &declined, &mut |_| {}).unwrap_err();
         assert!(
             err.to_string()
                 .starts_with("A password file is required to utilize the Coyote vault."),
@@ -1055,7 +1091,7 @@ mod tests {
             text(&configured.display().to_string()),
             PromptAnswer::Cancelled,
         ]);
-        let err = create_vault_password_file(&mut vault, &cancelled).unwrap_err();
+        let err = create_vault_password_file(&mut vault, &cancelled, &mut |_| {}).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Failed to read password from input. Password file not created."
@@ -1066,7 +1102,7 @@ mod tests {
         let mut vault = dir.local_vault("configured");
         let cancelled =
             ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), PromptAnswer::Cancelled]);
-        let err = create_vault_password_file(&mut vault, &cancelled).unwrap_err();
+        let err = create_vault_password_file(&mut vault, &cancelled, &mut |_| {}).unwrap_err();
         assert_eq!(
             err.to_string(),
             "Failed to read password from input. Password file not updated."
@@ -1087,7 +1123,8 @@ mod tests {
         let mut vault = dir.local_vault("configured");
 
         let err =
-            create_vault_password_file(&mut vault, &ScriptedPrompter::refusing()).unwrap_err();
+            create_vault_password_file(&mut vault, &ScriptedPrompter::refusing(), &mut |_| {})
+                .unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -1102,7 +1139,7 @@ mod tests {
         // A populated file never asks, so it is not refused either.
         std::fs::write(&configured, "already set").unwrap();
         let mut vault = dir.local_vault("configured");
-        create_vault_password_file(&mut vault, &ScriptedPrompter::refusing()).unwrap();
+        create_vault_password_file(&mut vault, &ScriptedPrompter::refusing(), &mut |_| {}).unwrap();
         assert_eq!(std::fs::read_to_string(&configured).unwrap(), "already set");
     }
 
@@ -1114,7 +1151,8 @@ mod tests {
         let _script = prompt_script::install(&[]);
         let dir = TempDir::new("headless");
         let mut vault = dir.local_vault("configured");
-        let err = create_vault_password_file(&mut vault, &HeadlessPrompter).unwrap_err();
+        let err =
+            create_vault_password_file(&mut vault, &HeadlessPrompter, &mut |_| {}).unwrap_err();
         assert!(NeedsHuman::caused(&err), "{err:#}");
         assert!(!dir.0.join("configured").exists());
         assert_eq!(
