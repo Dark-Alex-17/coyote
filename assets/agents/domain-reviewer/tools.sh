@@ -13,11 +13,16 @@ _project_dir() {
 # Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so
 # commits that landed on the base after branching never surface as changes.
 # Explicit `..` ranges pass through, and so does a checkpoint commit on top of
-# HEAD that no ref holds, whose merge-base would be HEAD. Returns nonzero when
-# no merge-base exists.
+# HEAD that no ref holds, whose merge-base would be HEAD. Prints the base to
+# diff from. Returns 1 when there is no merge-base (printing the base as given)
+# and 2, printing nothing, for an option-shaped base that git would read as a
+# flag.
 _resolve_base() {
   local project_dir="$1" base="$2" mb head commit held
-  case "${base}" in *..*) printf '%s' "${base}"; return ;; esac
+  case "${base}" in
+    -*) echo "error: --base '${base}' starts with '-'; pass a ref, a commit SHA or an a..b range" >&2; return 2 ;;
+    *..*) printf '%s' "${base}"; return ;;
+  esac
   if mb=$(cd "${project_dir}" && git merge-base "${base}" HEAD 2>/dev/null) && [[ -n "${mb}" ]]; then
     head=$(cd "${project_dir}" && git rev-parse HEAD 2>/dev/null) || head=""
     commit=$(cd "${project_dir}" && git rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null) || commit=""
@@ -58,17 +63,21 @@ get_diff() {
 
   _diff() {
     if ((${#path_args[@]})); then
-      (cd "${project_dir}" && git diff "$@" -- "${path_args[@]}" 2>&1) || true
+      (cd "${project_dir}" && git diff --no-ext-diff --no-textconv "$@" -- "${path_args[@]}" 2>&1) || true
     else
-      (cd "${project_dir}" && git diff "$@" 2>&1) || true
+      (cd "${project_dir}" && git diff --no-ext-diff --no-textconv "$@" -- 2>&1) || true
     fi
   }
 
   local diff_output=""
   if [[ -n "${base}" ]]; then
-    local resolved
-    resolved=$(_resolve_base "${project_dir}" "${base}") ||
+    local resolved rc=0
+    resolved=$(_resolve_base "${project_dir}" "${base}") || rc=$?
+    if ((rc == 2)); then
+      return 1
+    elif ((rc)); then
       echo "No merge-base between '${base}' and HEAD; diffing against '${base}' directly." >> "$LLM_OUTPUT"
+    fi
     diff_output=$(_diff "${resolved}")
   else
     diff_output=$(_diff --cached)

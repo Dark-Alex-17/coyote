@@ -3131,6 +3131,7 @@ NEW_BRANCH_PR_SUBTASKS = [
 GIT_STATE_RE = getattr(gates, "GIT_STATE_RE", None)
 PUBLISH_REVIEW_NOTE = getattr(gates, "PUBLISH_REVIEW_NOTE", None)
 PUBLISH_ALL = {"commit": True, "push": True, "open_pr": True, "new_branch": True, "draft": True}
+PUBLISH_ASK = "add a hello endpoint. Commit on a new branch and open a draft PR."
 
 
 def as_list_(v):
@@ -3147,7 +3148,8 @@ def asks_all(actions):
 
 
 pub_dir = os.path.join(TMP, "runs", "publish-trailing")
-u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={}))
+u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={},
+                                     brief=PUBLISH_ASK))
 kept = as_list_(u.get("subtasks"))
 folded = as_list_(u.get("publish_criteria"))
 tasklog_exists = os.path.exists(os.path.join(pub_dir, "tasklog.md"))
@@ -3159,7 +3161,7 @@ check("publish: a trailing 'Branch, commit, and open draft PR' subtask folds int
       and "Branch, commit, and open draft PR" not in tasklog and any("folded into git_actions" in d for d in u.get("decisions", [])),
       (len(kept), u.get("git_actions"), folded))
 
-u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}))
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}, brief=PUBLISH_ASK))
 ef_kept = as_list_(u.get("subtasks"))
 check("publish: a trailing 'Commit on a new branch and open a draft PR' subtask folds into git_actions (4 -> 3 subtasks)",
       len(ef_kept) == 3 and asks_all(u.get("git_actions")) and not git_state_left(ef_kept)
@@ -3177,10 +3179,56 @@ check("publish: a final whole-task review carrying PR-body criteria drops them a
       "Add account and date filters" in gp and "`./ci test` passes" in gp and "new branch" not in gp
       and "PR body" not in gp and "PR description" not in gp and PUBLISH_REVIEW_NOTE is not None and PUBLISH_REVIEW_NOTE in gp, gp)
 
-u = gates.record_subtasks(base_state(subtasks=[NEW_BRANCH_PR_SUBTASKS[3]], top_level=True, git_actions={}))
+u = gates.record_subtasks(base_state(subtasks=[NEW_BRANCH_PR_SUBTASKS[3]], top_level=True, git_actions={}, brief=PUBLISH_ASK))
 check("publish: a plan that only publishes keeps one subtask for the brief",
-      [s.get("outcome") for s in as_list_(u.get("subtasks"))] == ["add a hello endpoint"] and asks_all(u.get("git_actions")),
+      [s.get("outcome") for s in as_list_(u.get("subtasks"))] == [PUBLISH_ASK] and asks_all(u.get("git_actions")),
       u.get("subtasks"))
+
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}))
+check("publish: a publish-only subtask nobody asked for still folds, adopts no git action, ledgers what it dropped "
+      "and leaves its criteria to follow_ups",
+      len(as_list_(u.get("subtasks"))) == 3 and not u.get("git_actions")
+      and "publish_criteria" not in u
+      and "planned publish not asked for: " + NEW_BRANCH_PR_SUBTASKS[3]["acceptance_criteria"][1] in u.get("follow_ups", [])
+      and any("open_pr" in d and "push" in d and "dropped" in d for d in u.get("decisions", []))
+      and not any("new_branch" in d or "draft" in d for d in u.get("decisions", []) if "dropped" in d),
+      (u.get("git_actions"), u.get("decisions"), u.get("follow_ups")))
+ng_gp = gates.build_gauntlet_prompt(base_state(subtasks=as_list_(u.get("subtasks")), subtask_index=0, git_actions={},
+                                               publish_criteria=u.get("publish_criteria", []), round_heads=[],
+                                               gauntlet_lanes={}))["gauntlet_prompt"]
+check("publish: with nothing granted the review prompt carries no publish-step note", PUBLISH_REVIEW_NOTE not in ng_gp,
+      ng_gp[-600:])
+quoted_ask = ("add a hello endpoint.\n> Commit and open a draft PR\n```\ncommit and open a draft PR\n```\n"
+              "The ticket says \"open a draft PR\" and \u201ccommit and push\u201d.")
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}, brief=quoted_ask))
+check("publish: an ask that is only quoted, fenced or in double quotes grants no git action",
+      not u.get("git_actions") and gates._brief_git_asks(quoted_ask) == {}, u.get("git_actions"))
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={}, brief=quoted_ask))
+check("route_intent: a quoted-only ask derives no git action", "git_actions" not in u, u.get("git_actions"))
+for label, brief in (("straight", 'Fix it. The ticket says: "commit and open a draft PR"'),
+                     ("curly", "Fix it. The ticket says: \u201ccommit and open a draft PR\u201d"),
+                     ("~~~ fenced", "Fix it.\n~~~\ncommit and open a draft PR\n~~~\n")):
+    check(f"publish: a {label} ask that would ask on its own grants nothing", gates._brief_git_asks(brief) == {},
+          gates._brief_git_asks(brief))
+for label, brief in (("an unclosed quote ends at its line", 'The ticket says "fix the crash\nCommit and push.'),
+                     ("a quote inside a code span opens no quote", 'Log with `printf "%s` here. Commit and push.'),
+                     ("quoted text beside an own-prose ask",
+                      'The ticket says: "commit and open a draft PR". Commit and push.')):
+    check(f"publish: {label}, so the own-prose commit and push still ask",
+          gates._brief_git_asks(brief) == {"commit": True, "push": True}, gates._brief_git_asks(brief))
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={"commit": True}))
+check("publish: assess asked only to commit -> a planned PR subtask adopts commit on its new branch and drops the rest",
+      u.get("git_actions") == {"commit": True, "new_branch": True}
+      and any("open_pr" in d and "dropped" in d for d in u.get("decisions", [])), u.get("git_actions"))
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={"push": True}))
+check("publish: assess asked only to push -> a planned PR subtask adopts push, commit and its new branch, drops open_pr",
+      u.get("git_actions") == {"push": True, "commit": True, "new_branch": True}
+      and any("open_pr" in d and "dropped" in d and "new_branch" not in d and "draft" not in d
+              for d in u.get("decisions", [])), (u.get("git_actions"), u.get("decisions")))
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={"open_pr": True}))
+check("publish: assess asked only for a PR -> the planned subtask adopts the push and commit it implies",
+      u.get("git_actions") == {"open_pr": True, "commit": True, "push": True, "draft": True, "new_branch": True}
+      and not any("dropped" in d for d in u.get("decisions", [])), (u.get("git_actions"), u.get("decisions")))
 
 mixed = {"title": "Add the void endpoint", "outcome": "POST /v1/invoices/{id}/void voids an open invoice",
          "acceptance_criteria": ["`./ci test` passes", "POST /v1/invoices/{id}/void returns 200 with status void",
@@ -3189,8 +3237,9 @@ u = gates.record_subtasks(base_state(subtasks=[mixed, BRANCH_COMMIT_PR_SUBTASKS[
 m_kept = as_list_(u.get("subtasks"))
 check("publish: a code subtask with mixed criteria keeps its code criteria and loses only the git/PR-state ones",
       len(m_kept) == 2 and m_kept[0].get("acceptance_criteria") == mixed["acceptance_criteria"][:2]
-      and as_list_(u.get("publish_criteria")) == mixed["acceptance_criteria"][2:] and not u.get("git_actions"),
-      (m_kept[:1], u.get("publish_criteria"), u.get("git_actions")))
+      and [f"planned publish not asked for: {c}" for c in mixed["acceptance_criteria"][2:]]
+      == u.get("follow_ups", [])[:2] and not u.get("git_actions"),
+      (m_kept[:1], u.get("follow_ups"), u.get("git_actions")))
 
 u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
                                   brief="Fix the proration overflow. Commit your fix on a new branch and open a draft PR."))
