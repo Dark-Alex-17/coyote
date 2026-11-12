@@ -60,6 +60,7 @@ PR_TRACKING_ENUM = ("ci", "review")
 VERIFY_CMD_SECS = 900     # gauntlet: each verification command <= 15 min
 VERIFY_SET_SECS = 3300    # gauntlet: the whole set <= 55 min
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes
+GATE2_AMEND_CHARS = 4 * TAIL_CHARS  # an oracle rejection reaches amend_plan whole up to this, then per item from its end
 
 # Fork constants (the ONLY script-level fork deltas; design doc section 7, D2/D5/D8).
 # Everything below this line down to the hard-trigger regex is fork text; the upstream
@@ -169,6 +170,43 @@ def truthy(v):
 def tail(text, n=TAIL_CHARS):
     text = text or ""
     return text if len(text) <= n else "... [trimmed] ...\n" + text[-n:]
+
+
+ITEM_START_RE = re.compile(r"^(?:\d+[.)]|[-*+]|#{1,6})\s")
+ITEM_HEAD_MIN = 160  # every item keeps at least this much of its start, even past the bound
+ITEM_TRIMMED = " ... [trimmed]"
+
+
+def trim_items(text, n=TAIL_CHARS):
+    """Bound a verdict or report to about n chars without dropping any item.
+
+    The text splits into a preamble and the items that start at column 0 (a numbered or
+    bulleted line, or a heading). Every block keeps its start and loses only its end, the
+    shortest blocks kept whole first, so item 1 survives however long the rest is.
+    """
+    text = text or ""
+    if len(text) <= n:
+        return text
+    blocks = []
+    for line in text.splitlines(keepends=True):
+        if not blocks or ITEM_START_RE.match(line):
+            blocks.append(line)
+        else:
+            blocks[-1] += line
+    budget = max(n - len(ITEM_TRIMMED) * len(blocks), 0)
+    alloc = [0] * len(blocks)
+    order = sorted(range(len(blocks)), key=lambda i: len(blocks[i]))
+    for rank, i in enumerate(order):
+        share = budget // (len(blocks) - rank)
+        alloc[i] = min(len(blocks[i]), max(share, ITEM_HEAD_MIN))
+        budget = max(budget - alloc[i], 0)
+    out = []
+    for block, keep in zip(blocks, alloc):
+        if keep >= len(block):
+            out.append(block)
+        else:
+            out.append(block[:keep].rstrip() + ITEM_TRIMMED + ("\n" if block.endswith("\n") else ""))
+    return "".join(out)
 
 
 def now_iso():

@@ -23,6 +23,7 @@ from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, AMEND_DESIGN_MAX, AMEND_GATE1_MAX, AMEND_GATE2_MAX, AMEND_REWORK_MAX, ARCHIVIST_AVAILABLE,
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
     CI_POLL_FAILS, CI_POLL_SLEEP,
+    GATE2_AMEND_CHARS,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONTINUE_RE, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
     DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX,
     GATE1_HOUSE_LINE, GH_CALL_SECS, GH_LOOP_SECS, IDIOM_LINE, IS_UPSTREAM, LOG_EVENT_LINE, MODE_ENUMS, MULTI_IS_GROUPS,
@@ -36,7 +37,7 @@ from _lib import (  # noqa: E402
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section, review_fault,
     raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
-    set_task_status, sh, snapshot, tail, task_by_id, task_dir_for, task_section, today, truthy, var,
+    set_task_status, sh, snapshot, tail, task_by_id, task_dir_for, task_section, today, trim_items, truthy, var,
     write_artifact, write_file,
 )
 
@@ -545,7 +546,7 @@ def _record_choice(state, u, answer, via=""):
     u["choice_index"] = idx + 1
     u["choice_forced"] = False
     ledger(state, u, f"choice: {esc.get('kind')}: question {idx + 1}/{len(queue)} answered ({entry['via']}): "
-                     f"{tail(entry['answer'], 200)}")
+                     f"{trim_items(entry['answer'], 200)}")
 
 
 def open_questions_gate(state):
@@ -793,7 +794,7 @@ def reseal_gate(state):
                 "amend_cap", f"This amendment went past {over} (A1 cap; {cycles} amendment cycles this run). "
                              "Allow one more amendment cycle, or stop?",
                 [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)],
-                evidence=tail(state.get("amend_summary", ""), 1500), hard_trigger=True,
+                evidence=trim_items(state.get("amend_summary", ""), 1500), hard_trigger=True,
                 data={"source": source}))
     u.update({"plan_revision": rev, "sealed": False, "gate2_verdict": "", "gate1_verdict": ""})
     snapshot(state, u, "reseal")
@@ -803,7 +804,7 @@ def reseal_gate(state):
 
 def _gate_prior(state, key):
     prior = state.get(key) or ""
-    return f"\n\nPrior verdict (the plan was amended since; re-audit the FULL plan, not the delta):\n{tail(prior, 3000)}" if prior else ""
+    return f"\n\nPrior verdict (the plan was amended since; re-audit the FULL plan, not the delta):\n{trim_items(prior, 3000)}" if prior else ""
 
 
 def gate1_build(state):
@@ -840,7 +841,7 @@ def gate1_route(state):
     if not text or text.startswith("Agent node failed") or "PLAN_GATE" not in text:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The gatekeeper produced no verdict (agent fault). Retry the gate, or abort?",
-            [option("Retry the gatekeeper", recommended=True), option("Abort the run")], evidence=tail(text, 1000),
+            [option("Retry the gatekeeper", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
             data={"gate": "gate1"}))
     m = re.search(r"PLAN_GATE:\s*(SEALED|LEAKY|FRICTION)", text)
     verdict = m.group(1) if m else "LEAKY"
@@ -868,7 +869,7 @@ def gate1_route(state):
             "gate1_stuck", "Gate 1 is still LEAKY on the SAME questions after one revise-and-re-seal retry (A1). "
                            "The gatekeeper verdict is attached. Answer the questions here, or stop?",
             [option("Stop and report", recommended=True), option("I will answer: (type the answers)")],
-            evidence=tail(text, 3000), hard_trigger=True))
+            evidence=trim_items(text, 3000), hard_trigger=True))
     ledger(state, u, f"gate1: LEAKY ({len(qs)} question lines, fp {fp}) -> answer_leaks")
     u["_next"] = "answer_leaks"
     return u
@@ -901,7 +902,7 @@ def leak_route(state):
     queue = as_list(state.get("choice_queue"))
     if state.get("choice_kind") == "leak_question" and queue:
         if as_int(state.get("choice_index")) < len(queue):
-            return _ask_choice(state, u, LEAK_HEADING, tail(state.get("gate1_result", ""), 1500))
+            return _ask_choice(state, u, LEAK_HEADING, trim_items(state.get("gate1_result", ""), 1500))
         return _leak_amend(state, u, [a for a in as_list(state.get("choice_answers")) if isinstance(a, dict)])
     reframed = state.get("choice_kind") == "leak_question" and truthy(state.get("choice_reframed"))
     items = [i for i in map(_leak_item, as_list(state.get("leak_unanswerable"))) if i]
@@ -947,7 +948,7 @@ def leak_route(state):
     if not askable:
         return _leak_amend(state, u, [])
     _start_choices(u, "leak_question", askable)
-    return _ask_choice(state, u, LEAK_HEADING, tail(state.get("gate1_result", ""), 1500))
+    return _ask_choice(state, u, LEAK_HEADING, trim_items(state.get("gate1_result", ""), 1500))
 
 
 def gate2_build(state):
@@ -973,7 +974,7 @@ def gate2_route(state):
     if not text or text.startswith("Agent node failed") or "PLAN_REVIEW" not in text:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The oracle produced no PLAN_REVIEW verdict (agent fault). Retry, or abort?",
-            [option("Retry the oracle review", recommended=True), option("Abort the run")], evidence=tail(text, 1000),
+            [option("Retry the oracle review", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
             data={"gate": "gate2"}))
     m = re.search(r"PLAN_REVIEW:\s*(OKAY|REJECT)", text)
     verdict = m.group(1) if m else "REJECT"
@@ -989,8 +990,9 @@ def gate2_route(state):
         return raise_escalation(state, u, escalation(
             "gate2_stuck", f"The oracle still REJECTS the plan after {STRIKE_LIMIT} fix rounds. Stop, or override and promote?",
             [option("Stop and report", recommended=True), option("Override: promote the plan as reviewed (recorded)")],
-            evidence=tail(text, 3000), hard_trigger=True))
-    queue_amendments(u, "gate2", [f"Oracle complaint (round {rejects}): {tail(text, 4000)}"])
+            evidence=trim_items(text, 3000), hard_trigger=True))
+    # whole, so every complaint reaches amend_plan; only a runaway verdict is bounded, per item from its end
+    queue_amendments(u, "gate2", [f"Oracle complaint (round {rejects}): {trim_items(text, GATE2_AMEND_CHARS)}"])
     ledger(state, u, f"gate2: REJECT round {rejects} -> amend_plan (re-seal follows, A3)")
     u["_next"] = "amend_plan"
     return u
@@ -1669,12 +1671,13 @@ def task_failed_route(state):
     opts = []
     if used < RERUN_ONCE:
         opts.append(option("Retry with the oracle's direction (one round)", recommended=not oracle.startswith("Agent node failed"),
-                           evidence=tail(oracle, 400)))
+                           evidence=trim_items(oracle, 400)))
     opts += [option("Re-scope: amend the plan/task (type the amendment)"), option("Abort this task and stop",
                                                                                    recommended=used >= RERUN_ONCE)]
     return raise_escalation(state, u, escalation(
         "task_failed", f"{task_id} failed after Sisyphus's own recovery. Oracle diagnosis attached. How to proceed?",
-        opts, evidence=tail(state.get("failure_evidence", ""), 2000) + "\n\nOracle:\n" + tail(oracle, 2000), hard_trigger=True))
+        opts, evidence=trim_items(state.get("failure_evidence", ""), 2000) + "\n\nOracle:\n" + trim_items(oracle, 2000),
+        hard_trigger=True))
 
 
 def _verification_commands(state):
@@ -3379,7 +3382,7 @@ def apply_answer(state):
             u["task_rounds"] = rounds
             u.update({"delegation_kind": "fix", "fix_source": "oracle", "fix_return_to": "verify",
                       "fix_items": ["Apply the oracle's direction (below) and complete the task"],
-                      "fix_note": "Oracle diagnosis:\n" + tail(state.get("oracle_result", ""), 4000)})
+                      "fix_note": "Oracle diagnosis:\n" + trim_items(state.get("oracle_result", ""), 4000)})
             u["_next"] = "compose_delegation"
         elif a == "rescope":
             queue_amendments(u, "rework", [f"Re-scope of {task.get('id')} after a failed implementation:\n{answer}"])

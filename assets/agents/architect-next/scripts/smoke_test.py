@@ -694,14 +694,15 @@ check("leak_route: framed unanswerable questions -> one multiple choice per ques
       and "1 of 2: priority of X vs Y?" in s["escalation"]["question"] and len(s["choice_queue"]) == 2
       and s["leak_pending_answers"] == [{"question": "a", "answer": "b"}], s)
 leak_asked = dict(s)
-VERDICT = "x" * 2000 + "\nGATE1: QUESTIONS priority of X vs Y?"
+VERDICT = "PLAN_GATE: LEAKY\n- " + "x" * 2000 + "\n- GATE1: QUESTIONS priority of X vs Y?"
 lv = base_state(gate1_result=VERDICT, leak_answers=[], leak_unanswerable=[LEAK_Q, LEAK_Q2])
 lv.update(gates.leak_route(lv))
 lv1 = lv["escalation"]["evidence"]
 lv.update(gates.apply_answer({**lv, "last_answer": "X first"}))
 lv.update(gates.leak_route(lv))
-check("leak_route: every leak_question escalation carries the gatekeeper verdict tail as its evidence",
-      lv1 == lv["escalation"]["evidence"] == gates.tail(VERDICT, 1500) and "GATE1: QUESTIONS" in lv1
+check("leak_route: every leak_question escalation carries the gatekeeper verdict, every item's start kept, as its evidence",
+      lv1 == lv["escalation"]["evidence"] == _lib.trim_items(VERDICT, 1500) and "GATE1: QUESTIONS" in lv1
+      and lv1.startswith("PLAN_GATE: LEAKY\n- xxx")
       and "2 of 2" in lv["escalation"]["question"], lv["escalation"])
 s.update(gates.apply_answer({**s, "last_answer": "X first"}))
 check("apply_answer: leak_question -> recorded through the queue -> leak_route", s["_next"] == "leak_route" and s["choice_index"] == 1)
@@ -867,6 +868,31 @@ s, steps = amend_chain(["design"] + ["leak"] * (_lib.AMEND_GATE1_MAX + 1))
 check("amend budgets: Gate 1 leaks with fresh questions every pass still end, on the Gate 1 budget",
       steps[-1] == "escalate_gate" and s["escalation"]["data"] == {"source": "gate1"}
       and s["amend_counts"]["gate1"] == _lib.AMEND_GATE1_MAX + 1, (steps, s.get("amend_counts")))
+
+# ---------------------------------------------------------------- oracle rejections reach amend_plan whole
+REJECT_ITEMS = [f"{k}. COMPLAINT-{k} line {k * 10}: " + f"detail {k} " * 400 + f"END-{k}" for k in range(1, 13)]
+REJECT_LONG = "PLAN_REVIEW: REJECT\n\n" + "\n".join(REJECT_ITEMS) + "\n"
+u = gates.gate2_route(base_state(gate2_result=REJECT_LONG, oracle_rejects=0))
+amendment = u["pending_amendments"][0]
+check("gate2_route: a long multi-item rejection -> every complaint's start reaches amend_plan, item 1 first, trimmed only at item ends",
+      all(f"{k}. COMPLAINT-{k} line {k * 10}:" in amendment for k in range(1, 13)) and "END-1" not in amendment
+      and amendment.index("COMPLAINT-1 ") < amendment.index("COMPLAINT-2 ") and "[trimmed] ...\n" not in amendment
+      and len(amendment) <= _lib.GATE2_AMEND_CHARS + 200 and u["amend_source"] == "gate2", len(amendment))
+REJECT_MID = "PLAN_REVIEW: REJECT\n\n" + "\n".join(REJECT_ITEMS[:4]) + "\n"
+u = gates.gate2_route(base_state(gate2_result=REJECT_MID, oracle_rejects=0))
+check("gate2_route: a rejection under the bound passes whole", u["pending_amendments"][0].endswith(REJECT_MID), len(REJECT_MID))
+TRIMMED = _lib.trim_items("intro\n" + "\n".join(REJECT_ITEMS), 3000)
+check("trim_items: each item keeps its start and loses its end; the preamble stays",
+      TRIMMED.startswith("intro\n") and all(f"COMPLAINT-{k} " in TRIMMED for k in range(1, 13))
+      and TRIMMED.count(" ... [trimmed]") == 12 and "END-" not in TRIMMED, TRIMMED[:300])
+check("trim_items: text within the bound is returned unchanged", _lib.trim_items("1. a\n2. b\n", 100) == "1. a\n2. b\n")
+check("trim_items: a short item stays whole beside a long one",
+      _lib.trim_items("1. short\n2. " + "x" * 5000, 1000).startswith("1. short\n2. xxx"))
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_counts={"gate2": _lib.AMEND_GATE2_MAX},
+                                 amend_summary="1. FIRST change\n" + "2. " + "y" * 4000))
+check("reseal_gate: the amend_cap evidence keeps the summary's first item", "1. FIRST change" in u["escalation"]["evidence"], u.get("escalation"))
+u = gates.gate1_build(base_state(gate1_result="PLAN_GATE: LEAKY\n1. FIRST-LEAK?\n" + "2. " + "z" * 5000))
+check("gate1_build: the prior verdict keeps its first item", "FIRST-LEAK" in u["gate1_prompt"], u["gate1_prompt"][-400:])
 
 # ---------------------------------------------------------------- promote (B6) with the stub task store
 u = gates.promote_verify(base_state(promote_retries=0))
