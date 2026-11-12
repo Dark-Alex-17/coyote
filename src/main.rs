@@ -180,10 +180,7 @@ async fn async_main() -> Result<()> {
 
     let log_path = setup_logger(cli.acp_server)?;
 
-    if run_cli_flag(&cli, inspection_only, mcp_inspect, vault_inspect)
-        .await?
-        .is_some()
-    {
+    if run_cli_flag(&cli, inspection_only, mcp_inspect, vault_inspect).await? {
         return Ok(());
     }
 
@@ -244,17 +241,17 @@ async fn async_main() -> Result<()> {
 }
 
 /// The CLI-only flag paths, in the order the flags take precedence; each
-/// finishes the run before any UI starts. `Ok(None)` means no such flag
+/// finishes the run before any UI starts. `Ok(false)` means no such flag
 /// was given and the caller goes on to the REPL or TUI.
 async fn run_cli_flag(
     cli: &Cli,
     inspection_only: bool,
     mcp_inspect: bool,
     vault_inspect: bool,
-) -> Result<Option<()>> {
+) -> Result<bool> {
     if let Some(path) = &cli.generate_models {
         catalog::generate_models_file(path).await?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(version) = &cli.update {
@@ -265,17 +262,17 @@ async fn run_cli_flag(
             config::run_self_update(version, force, &prompter, " or pass --force.")
         })
         .await??;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(name) = &cli.sandbox {
         sandbox::launch(name.clone(), cli.fresh)?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if cli.list_bundles {
         config::list_installed_bundles()?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(scope) = cli.memory_migrate {
@@ -285,7 +282,7 @@ async fn run_cli_flag(
         let report = memory_migrate::run(scope, cli.apply, round_chains)?;
         print!("{report}");
         report.into_result()?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if !inspection_only {
@@ -299,7 +296,7 @@ async fn run_cli_flag(
             cli.yes,
             " or pass --yes.",
         )?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(value) = cli.install.as_deref() {
@@ -313,17 +310,17 @@ async fn run_cli_flag(
                 prompter: &InquirePrompter::default(),
             },
         )?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(spec) = cli.update_bundle.as_deref() {
         config::update_bundle(spec, cli.yes, &InquirePrompter::default())?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(name) = cli.uninstall.as_deref() {
         config::uninstall_bundle(name, cli.yes, &InquirePrompter::default())?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(client_arg) = &cli.authenticate {
@@ -333,7 +330,7 @@ async fn run_cli_flag(
         let (client_name, provider) =
             resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
         oauth::run_oauth_flow(&*provider, &client_name, &prompter).await?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     if let Some(server_name) = &cli.auth_mcp {
@@ -385,7 +382,7 @@ async fn run_cli_flag(
         .await?;
         println!("Authentication saved. '{server_name}' is now available for use.");
 
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     let mcp_action =
@@ -405,7 +402,7 @@ async fn run_cli_flag(
 
         mcp::manage::handle(cli, &vault)?;
 
-        return Ok(Some(()));
+        return Ok(true);
     }
 
     let vault_flags = cli.add_secret.is_some()
@@ -422,10 +419,10 @@ async fn run_cli_flag(
         };
         let vault = Vault::init(&app_config)?;
         Vault::handle_vault_flags(cli, &vault, &InquirePrompter::default())?;
-        return Ok(Some(()));
+        return Ok(true);
     }
 
-    Ok(None)
+    Ok(false)
 }
 
 fn update_app_config(ctx: &mut RequestContext, update: impl FnOnce(&mut AppConfig)) {

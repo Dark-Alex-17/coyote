@@ -621,7 +621,7 @@ fn resolve_obsolete(
     Ok(keep_or_delete_choice(
         choice,
         sticky,
-        "Kept the obsolete files: the question was cancelled.",
+        "Kept the obsolete files",
         note,
     ))
 }
@@ -632,44 +632,64 @@ fn print_note(note: &str) {
     println!("{note}");
 }
 
-/// The keep-or-delete menu's answer, or `None` when there is none: the
-/// question was cancelled, or there is no human to answer it.
-fn select_keep_or_delete(prompter: &dyn Prompter, prompt: &str) -> Result<Option<String>> {
+/// Why a keep-or-delete menu produced no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoAnswer {
+    Cancelled,
+    NobodyToAsk,
+}
+
+impl NoAnswer {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Cancelled => "the question was cancelled",
+            Self::NobodyToAsk => "nobody could be asked",
+        }
+    }
+}
+
+/// The keep-or-delete menu's answer, or why there is none.
+fn select_keep_or_delete(
+    prompter: &dyn Prompter,
+    prompt: &str,
+) -> Result<Result<String, NoAnswer>> {
     let options = ["keep", "delete", "keep-all", "delete-all"]
         .map(str::to_string)
         .to_vec();
     match select_closed_or_cancel(prompter, prompt, options) {
-        Err(err) if NeedsHuman::caused(&err) => Ok(None),
-        answer => answer,
+        Ok(Some(answer)) => Ok(Ok(answer)),
+        Ok(None) => Ok(Err(NoAnswer::Cancelled)),
+        Err(err) if NeedsHuman::caused(&err) => Ok(Err(NoAnswer::NobodyToAsk)),
+        Err(err) => Err(err),
     }
 }
 
 /// The action behind a [`select_keep_or_delete`] answer. No answer is the
 /// keep-everything answer: it sticks for the rest of the loop and
-/// `cancelled_note` goes to `note` once.
+/// `kept_note`, completed with the reason, goes to `note` once.
 fn keep_or_delete_choice(
-    choice: Option<String>,
+    choice: Result<String, NoAnswer>,
     sticky: &mut Option<ObsoleteAction>,
-    cancelled_note: &str,
+    kept_note: &str,
     note: &mut dyn FnMut(&str),
 ) -> ObsoleteAction {
     match choice.as_deref() {
-        Some("keep") => ObsoleteAction::Keep,
-        Some("delete") => ObsoleteAction::Delete,
-        Some("keep-all") => {
+        Ok("keep") => ObsoleteAction::Keep,
+        Ok("delete") => ObsoleteAction::Delete,
+        Ok("keep-all") => {
             *sticky = Some(ObsoleteAction::Keep);
             ObsoleteAction::Keep
         }
-        Some("delete-all") => {
+        Ok("delete-all") => {
             *sticky = Some(ObsoleteAction::Delete);
             ObsoleteAction::Delete
         }
-        None => {
-            note(cancelled_note);
+        Err(why) => {
+            note(&format!("{kept_note}: {}.", why.reason()));
             *sticky = Some(ObsoleteAction::Keep);
             ObsoleteAction::Keep
         }
-        Some(_) => unreachable!("select_closed_or_cancel only hands back an offered option"),
+        Ok(_) => unreachable!("select_closed_or_cancel only hands back an offered option"),
     }
 }
 
@@ -767,7 +787,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
         if !conflict::menu_can_use_terminal() {
             return Err(conflict::refuse_non_interactive(
                 format_args!("uninstall bundle '{name}'"),
-                " or pass --yes to confirm.",
+                " or pass --yes.",
             ));
         }
         let ownership = format!(
@@ -1117,7 +1137,7 @@ fn resolve_uninstall_action(
     Ok(keep_or_delete_choice(
         choice,
         sticky,
-        "Kept the locally modified items: the question was cancelled.",
+        "Kept the locally modified items",
         note,
     ))
 }
@@ -3686,7 +3706,8 @@ mod tests {
     }
 
     /// Under the full-screen UI with no human to answer, the obsolete
-    /// file is kept, and so is every later one.
+    /// file is kept, and so is every later one; the note says nobody
+    /// could be asked.
     #[test]
     #[serial]
     fn resolve_obsolete_with_no_human_keeps_the_file() {
@@ -3704,14 +3725,12 @@ mod tests {
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
-        assert_eq!(
-            notes,
-            ["Kept the obsolete files: the question was cancelled."]
-        );
+        assert_eq!(notes, ["Kept the obsolete files: nobody could be asked."]);
     }
 
     /// On a terminal with no human to answer (a headless run), the
-    /// obsolete file is kept like a cancelled question keeps it.
+    /// obsolete file is kept like a cancelled question keeps it, and the
+    /// note says who was missing.
     #[test]
     #[serial]
     fn a_headless_obsolete_file_question_keeps_the_file() {
@@ -3730,10 +3749,7 @@ mod tests {
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
-        assert_eq!(
-            notes,
-            ["Kept the obsolete files: the question was cancelled."]
-        );
+        assert_eq!(notes, ["Kept the obsolete files: nobody could be asked."]);
     }
 
     #[test]
@@ -6504,10 +6520,10 @@ mod tests {
             message.starts_with("Refusing to uninstall bundle 'omc'"),
             "got: {message}"
         );
-        assert!(
-            message.contains("non-interactively. Re-run in a terminal or pass --yes to confirm."),
-            "got: {message}"
-        );
+        let (_, remedy) = message
+            .split_once("Re-run in a terminal")
+            .unwrap_or_else(|| panic!("got: {message}"));
+        assert_eq!(remedy, " or pass --yes.", "got: {message}");
         assert!(BundleStore::load().unwrap().get("omc").is_some());
     }
 
@@ -6653,7 +6669,8 @@ mod tests {
     }
 
     /// Under the full-screen UI with no human to answer, the modified
-    /// item is kept, and so is every later one.
+    /// item is kept, and so is every later one; the note says nobody
+    /// could be asked.
     #[test]
     #[serial]
     fn resolve_uninstall_action_with_no_human_keeps_the_file() {
@@ -6674,12 +6691,13 @@ mod tests {
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
         assert_eq!(
             notes,
-            ["Kept the locally modified items: the question was cancelled."]
+            ["Kept the locally modified items: nobody could be asked."]
         );
     }
 
     /// On a terminal with no human to answer (a headless run), the
-    /// modified item is kept like a cancelled question keeps it.
+    /// modified item is kept like a cancelled question keeps it, and the
+    /// note says who was missing.
     #[test]
     #[serial]
     fn a_headless_uninstall_question_keeps_the_file() {
@@ -6701,7 +6719,7 @@ mod tests {
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
         assert_eq!(
             notes,
-            ["Kept the locally modified items: the question was cancelled."]
+            ["Kept the locally modified items: nobody could be asked."]
         );
     }
 
@@ -6757,7 +6775,7 @@ mod tests {
         assert_eq!(question.sticky, Some(ObsoleteAction::Keep));
         assert_eq!(
             notes,
-            ["Kept the locally modified items: the question was cancelled."]
+            ["Kept the locally modified items: nobody could be asked."]
         );
         let _ = fs::remove_dir_all(&dir);
     }
