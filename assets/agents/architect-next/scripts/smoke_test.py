@@ -787,7 +787,8 @@ check("autonomy_gate: phase-gate -> promote_tasks (gates later)", gates.autonomy
 # ---------------------------------------------------------------- A1 budgets per amendment source
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="design", amend_counts={"design": _lib.AMEND_DESIGN_MAX}))
 check("reseal_gate: a source past its own budget -> amend_cap naming that source (hard trigger)",
-      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap" and u["escalation"]["data"] == {"source": "design"}
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap"
+      and u["escalation"]["data"] == {"source": "design", "over": ["source"]}
       and "design-round" in u["escalation"]["question"], u.get("escalation"))
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_cycles=_lib.AMEND_DESIGN_MAX + _lib.AMEND_GATE1_MAX,
                                  amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}))
@@ -795,13 +796,25 @@ check("reseal_gate: spent design and Gate 1 budgets leave the Gate 2 budget whol
       u["_next"] == "gate1_build" and u["amend_counts"]["gate2"] == 1 and u["amend_source"] == "", u)
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="", amend_counts={}))
 check("reseal_gate: an untagged amendment spends the rework budget", u["amend_counts"] == {"rework": 1}, u)
-u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)],
-                                                        data={"source": "gate1"}),
-                                  last_answer="Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1,
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="rework", amend_cycles=AMEND_CYCLES_MAX, amend_counts={}))
+check("reseal_gate: past the overall ceiling alone -> amend_cap naming the ceiling, not a source budget",
+      u["escalation"]["data"] == {"source": "rework", "over": ["ceiling"]} and "overall amendment ceiling" in u["escalation"]["question"]
+      and "rework" not in u["escalation"]["question"].split("ceiling")[0], u.get("escalation"))
+AMEND_CAP_OPTS = [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)]
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "gate1", "over": ["source"]}),
+                                  last_answer="Allow one more amendment cycle", amend_cycles=9,
                                   amend_counts={"gate1": _lib.AMEND_GATE1_MAX + 1, "design": 2}))
-check("apply_answer: amend_cap allow -> one more cycle of the capped source and under the ceiling, others untouched",
+check("apply_answer: amend_cap allow on a source budget -> one more cycle of that source, others and the total untouched",
       u["_next"] == "gate1_build" and u["amend_counts"] == {"gate1": _lib.AMEND_GATE1_MAX - 1, "design": 2}
-      and u["amend_cycles"] == AMEND_CYCLES_MAX - 1, u)
+      and "amend_cycles" not in u, u)
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "rework", "over": ["ceiling"]}),
+                                  last_answer="Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"rework": 1}))
+check("apply_answer: amend_cap allow on the ceiling -> one more cycle under the ceiling, the source count untouched",
+      u["amend_cycles"] == AMEND_CYCLES_MAX - 1 and u["amend_counts"] == {"rework": 1}, u)
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "gate2", "over": ["source"]}),
+                                  last_answer="Stop and report"))
+check("apply_answer: amend_cap stop -> end_blocked naming the budget that tripped",
+      u["_next"] == "end_blocked" and "Gate 2 rejection amendment budget" in u["failure_reason"], u.get("failure_reason"))
 
 AMEND_PLAN = os.path.join(TMP, "amend-chain-plan.md")
 
@@ -866,8 +879,14 @@ for run_id, events in AMEND_CAP_RUNS.items():
           (steps, s.get("amend_counts"), s.get("escalation", {}).get("question")))
 s, steps = amend_chain(["design"] + ["leak"] * (_lib.AMEND_GATE1_MAX + 1))
 check("amend budgets: Gate 1 leaks with fresh questions every pass still end, on the Gate 1 budget",
-      steps[-1] == "escalate_gate" and s["escalation"]["data"] == {"source": "gate1"}
+      steps[-1] == "escalate_gate" and s["escalation"]["data"] == {"source": "gate1", "over": ["source"]}
       and s["amend_counts"]["gate1"] == _lib.AMEND_GATE1_MAX + 1, (steps, s.get("amend_counts")))
+WORST = ["design"] * _lib.AMEND_DESIGN_MAX + ["leak", "leak", "seal", "reject"] * _lib.AMEND_GATE2_MAX + ["leak", "leak", "seal", "okay"]
+s, steps = amend_chain(WORST)
+check("amend budgets: every design round, two Gate 1 leaks per sealing and every oracle REJECT -> still promote_tasks",
+      steps[-1] == "promote_tasks" and "escalate_gate" not in steps
+      and s["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX, "gate2": _lib.AMEND_GATE2_MAX},
+      (steps[-6:], s.get("amend_counts"), s.get("escalation", {}).get("question")))
 
 # ---------------------------------------------------------------- oracle rejections reach amend_plan whole
 REJECT_ITEMS = [f"{k}. COMPLAINT-{k} line {k * 10}: " + f"detail {k} " * 400 + f"END-{k}" for k in range(1, 13)]
@@ -881,6 +900,30 @@ check("gate2_route: a long multi-item rejection -> every complaint's start reach
 REJECT_MID = "PLAN_REVIEW: REJECT\n\n" + "\n".join(REJECT_ITEMS[:4]) + "\n"
 u = gates.gate2_route(base_state(gate2_result=REJECT_MID, oracle_rejects=0))
 check("gate2_route: a rejection under the bound passes whole", u["pending_amendments"][0].endswith(REJECT_MID), len(REJECT_MID))
+REJECT_SHORT1 = "PLAN_REVIEW: REJECT\n\n1. SHORT-FIRST: line 3 names the wrong table\n" + "\n".join(REJECT_ITEMS[1:]) + "\n"
+u = gates.gate2_route(base_state(gate2_result=REJECT_SHORT1, oracle_rejects=0))
+check("gate2_route: a long rejection whose first complaint is short -> complaint 1 reaches amend_plan intact",
+      "1. SHORT-FIRST: line 3 names the wrong table\n" in u["pending_amendments"][0], u["pending_amendments"][0][:300])
+u = gates.gate2_route(base_state(gate2_result="Agent output, no verdict:\n" + "\n".join(REJECT_ITEMS)))
+check("gate2_route: gate_fault evidence keeps the first item of a long output, within the bound",
+      u["escalation"]["kind"] == "gate_fault" and "1. COMPLAINT-1 line 10:" in u["escalation"]["evidence"]
+      and len(u["escalation"]["evidence"]) <= 1000, u["escalation"]["evidence"][:300])
+MANY = "\n".join(f"- item {k}" for k in range(1000)) + "\n"
+TRIMMED_MANY = _lib.trim_items(MANY, 1000)
+check("trim_items: a thousand short items stay within the bound, the first kept, the rest counted",
+      len(TRIMMED_MANY) <= 1000 and TRIMMED_MANY.startswith("- item 0\n- item 1\n") and "more items trimmed]" in TRIMMED_MANY,
+      (len(TRIMMED_MANY), TRIMMED_MANY[-80:]))
+TRIMMED_50 = _lib.trim_items("\n".join(f"{k}. POINT-{k} " + "p" * 500 for k in range(1, 51)), 1000)
+check("trim_items: fifty long items in a small bound -> within the bound, item 1's start first",
+      len(TRIMMED_50) <= 1000 and TRIMMED_50.startswith("1. POINT-1 ppp"), (len(TRIMMED_50), TRIMMED_50[-80:]))
+TRIMMED_ONE = _lib.trim_items("1. " + "q" * 5000, 300)
+check("trim_items: a single item that fills the bound keeps its start",
+      len(TRIMMED_ONE) <= 300 and TRIMMED_ONE.startswith("1. qqq"), TRIMMED_ONE)
+RAW_VERDICT = "x" * 2000 + "\nGATE1: QUESTIONS priority of X vs Y?"
+TRIMMED_RAW = _lib.trim_items(RAW_VERDICT, 1500)
+check("trim_items: a text with no items keeps its start and its end, within the bound",
+      len(TRIMMED_RAW) <= 1500 and TRIMMED_RAW.startswith("xxx") and TRIMMED_RAW.endswith("GATE1: QUESTIONS priority of X vs Y?"),
+      TRIMMED_RAW[-80:])
 TRIMMED = _lib.trim_items("intro\n" + "\n".join(REJECT_ITEMS), 3000)
 check("trim_items: each item keeps its start and loses its end; the preamble stays",
       TRIMMED.startswith("intro\n") and all(f"COMPLAINT-{k} " in TRIMMED for k in range(1, 13))
@@ -1271,6 +1314,16 @@ u = gates.task_failed_route(base_state(current_task=T1, oracle_result="Cause: X.
 check("task_failed_route: escalation task_failed with the oracle-directed retry recommended (B8 unused)", u["escalation"]["kind"] == "task_failed" and u["escalation"]["options"][0]["recommended"] and u["escalation"]["hard_trigger"])
 u = gates.task_failed_route(base_state(current_task=T1, oracle_result="x", task_rounds={T1: {"retry_rounds": 1}}))
 check("task_failed_route: B8 used -> no retry option; abort recommended", all("Retry" not in o["text"] for o in u["escalation"]["options"]) and u["escalation"]["options"][-1]["recommended"])
+LONG_REPORT = "SISYPHUS_FAILED\n" + "\n".join(f"{k}. REPORT-ITEM-{k}: " + "r" * 900 for k in range(1, 9)) + "\n"
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=LONG_REPORT))
+check("route_delegate: a long failed report keeps its first item in failure_evidence, within the bound",
+      u["_next"] == "oracle_diagnose" and "1. REPORT-ITEM-1:" in u["failure_evidence"] and len(u["failure_evidence"]) <= 4000,
+      u.get("failure_evidence", "")[:200])
+LONG_ORACLE = "Cause:\n" + "\n".join(f"- ORACLE-POINT-{k}: " + "o" * 900 for k in range(1, 9)) + "\n"
+u = gates.task_failed_route(base_state(current_task=T1, oracle_result=LONG_ORACLE, failure_evidence=LONG_REPORT, task_rounds={}))
+check("task_failed_route: the evidence keeps the report's and the oracle's first items",
+      "1. REPORT-ITEM-1:" in u["escalation"]["evidence"] and "- ORACLE-POINT-1:" in u["escalation"]["evidence"]
+      and "- ORACLE-POINT-1:" in u["escalation"]["options"][0]["evidence"], u["escalation"]["evidence"][:300])
 
 # ---------------------------------------------------------------- verify_gate / route_verdict (B9, B10, B11)
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task"))
@@ -2332,6 +2385,8 @@ check("apply_answer: tasks_stuck skip -> follow-ups + phase_f_gate", u["_next"] 
 check("apply_answer: tasks_stuck stop -> end_blocked", AA("tasks_stuck", "Stop and report", tasks=tasks_with())["_next"] == "end_blocked")
 u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), oracle_result="do Y", task_rounds={})
 check("apply_answer: task_failed retry -> oracle-directed fix round (B8 side 1)", u["_next"] == "compose_delegation" and u["fix_source"] == "oracle" and u["task_rounds"][T1]["retry_rounds"] == 1)
+u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), oracle_result=LONG_ORACLE, task_rounds={})
+check("apply_answer: task_failed retry -> the fix note keeps the oracle's first point", "- ORACLE-POINT-1:" in u["fix_note"], u.get("fix_note", "")[:200])
 u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), task_rounds={T1: {"retry_rounds": 1}})
 check("apply_answer: task_failed retry at B8 -> abort path (task failed, end_aborted)", u["_next"] == "end_aborted")
 u = AA("task_failed", "Re-scope: amend the plan/task", current_task=T1, tasks=tasks_with())

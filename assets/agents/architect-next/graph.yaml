@@ -1484,7 +1484,7 @@ nodes:
       ## Task
       {{current_task}}
 
-      ## Evidence (the implementer's report, tail)
+      ## Evidence (the implementer's report, each item trimmed from its end)
       {{failure_evidence}}
 
       Plan: {{plan_path}}   Code repo: {{code_repo_path}}

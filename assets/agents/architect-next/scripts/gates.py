@@ -787,19 +787,27 @@ def reseal_gate(state):
         cap = AMEND_CAPS[source]
         ledger(state, u, f"amend: {source} cycle {counts[source]}/{cap}, run total {cycles}/{AMEND_CYCLES_MAX} "
                          f"({'plan changed' if changed else 'plan unchanged - amendment did not land'})")
-        over = (f"the {AMEND_SOURCE_LABELS[source]} amendment budget ({cap})" if counts[source] > cap
-                else f"the run's overall amendment ceiling ({AMEND_CYCLES_MAX})" if cycles > AMEND_CYCLES_MAX else "")
+        over = [k for k, hit in (("source", counts[source] > cap), ("ceiling", cycles > AMEND_CYCLES_MAX)) if hit]
         if over:
             return raise_escalation(state, u, escalation(
-                "amend_cap", f"This amendment went past {over} (A1 cap; {cycles} amendment cycles this run). "
-                             "Allow one more amendment cycle, or stop?",
+                "amend_cap", f"This amendment went past {_amend_cap_reason(source, over)} (A1 cap; {cycles} amendment "
+                             "cycles this run). Allow one more amendment cycle, or stop?",
                 [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)],
                 evidence=trim_items(state.get("amend_summary", ""), 1500), hard_trigger=True,
-                data={"source": source}))
+                data={"source": source, "over": over}))
     u.update({"plan_revision": rev, "sealed": False, "gate2_verdict": "", "gate1_verdict": ""})
     snapshot(state, u, "reseal")
     u["_next"] = "gate1_build"
     return u
+
+
+def _amend_cap_reason(source, over):
+    reasons = []
+    if "source" in over:
+        reasons.append(f"the {AMEND_SOURCE_LABELS.get(source, 'rework')} amendment budget ({AMEND_CAPS.get(source, AMEND_REWORK_MAX)})")
+    if "ceiling" in over:
+        reasons.append(f"the run's overall amendment ceiling ({AMEND_CYCLES_MAX})")
+    return " and ".join(reasons) or f"the A1 amendment cap ({AMEND_CYCLES_MAX})"
 
 
 def _gate_prior(state, key):
@@ -1636,17 +1644,17 @@ def route_delegate(state):
             raise_escalation(state, u, _relay_escalation({**state, **u}, task, d))
             u["last_answer_text"] = d["reply"]
             return u
-        u["failure_evidence"] = tail(text, 4000)
+        u["failure_evidence"] = trim_items(text, 4000)
         ledger(state, u, f"delegate: {task['id']} parked on a discussion with no run id to resume -> oracle diagnosis")
         u["_next"] = "oracle_diagnose"
         return u
     if _report_failed(text):
-        u["failure_evidence"] = tail(text, 4000)
+        u["failure_evidence"] = trim_items(text, 4000)
         ledger(state, u, f"delegate: {task['id']} reported failure / STOP -> oracle diagnosis")
         u["_next"] = "oracle_diagnose"
         return u
     if _answer_shaped(text):
-        u["failure_evidence"] = tail(text, 4000)
+        u["failure_evidence"] = trim_items(text, 4000)
         ledger(state, u, f"delegate: {task['id']} returned an answer (a run id, no HEAD SHA, no ledger section), not an "
                          "implementation report -> oracle diagnosis")
         u["_next"] = "oracle_diagnose"
@@ -3265,20 +3273,22 @@ def apply_answer(state):
         u["_next"] = "quality_bar_gate"
     elif kind == "amend_cap":
         if stop:
-            source = as_dict(esc.get("data")).get("source")
-            u["failure_reason"] = (f"stopped: the A1 amendment cap was reached ({AMEND_SOURCE_LABELS.get(source, 'run')} budget "
-                                   f"{AMEND_CAPS.get(source, AMEND_CYCLES_MAX)}, overall ceiling {AMEND_CYCLES_MAX})")
+            data = as_dict(esc.get("data"))
+            u["failure_reason"] = f"stopped: the plan went past {_amend_cap_reason(data.get('source'), as_list(data.get('over')))}"
             u["_next"] = "end_blocked"
         else:
-            # one more cycle of the source that hit its budget, and one more under the overall ceiling
-            source = as_dict(esc.get("data")).get("source")
+            # one more cycle of whatever tripped; an escalation that does not say clamps every budget
+            data = as_dict(esc.get("data"))
+            source, over = data.get("source"), as_list(data.get("over")) or ["source", "ceiling"]
             counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
-            if source in AMEND_CAPS:
-                counts[source] = min(counts.get(source, 0), AMEND_CAPS[source] - 1)
-            else:
-                counts = {k: min(v, AMEND_CAPS.get(k, v) - 1) for k, v in counts.items()}
+            if "source" in over:
+                if source in AMEND_CAPS:
+                    counts[source] = min(counts.get(source, 0), AMEND_CAPS[source] - 1)
+                else:
+                    counts = {k: min(v, AMEND_CAPS.get(k, v) - 1) for k, v in counts.items()}
             u["amend_counts"] = counts
-            u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
+            if "ceiling" in over:
+                u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
             u["_next"] = "gate1_build"
     elif kind == "gate1_stuck":
         # the free-text answers often mention stopping ("stop retrying on 5xx"), so only a stop reply stops

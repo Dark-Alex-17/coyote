@@ -538,9 +538,11 @@ fn smoke_env_restore_check_fails_when_the_runs_root_is_not_restored() {
 /// comment, the failed-read exclusion that keeps `_poll_permissions` from
 /// re-reading the same failing logins every poll, the ready-seed filter, the
 /// `status: consumed` write on a seed the run oriented on, and the hard
-/// trigger that keeps `draft_confirm` off the autonomous ladder. The rest of
-/// the intake guards run in the ignored tail below, which keeps this test near
-/// two minutes.
+/// trigger that keeps `draft_confirm` off the autonomous ladder, the
+/// per-source amendment budget in `reseal_gate`, and the whole oracle
+/// rejection `gate2_route` hands to `amend_plan`. The rest of the intake
+/// guards run in the ignored tail below, which keeps this test near two
+/// minutes.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
@@ -619,6 +621,20 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
                 "hard_trigger=False, tier3_ok=False, data={\"draft_path\": path}",
                 "draft_route: a good draft -> design-draft.md in the run dir with the title heading \
              prefixed, hard-trigger draft_confirm holding the draft",
+            ),
+            (
+                "amend-shared-cap",
+                "((\"source\", counts[source] > cap),",
+                "((\"source\", cycles > 3),",
+                "amend budgets: run 6451ba's ledger (design, 1 Gate 1 LEAKY, 2 Gate 2 REJECT) -> \
+             sealed, reviewed and on to promote_tasks, no amend_cap",
+            ),
+            (
+                "gate2-front-trim",
+                "{trim_items(text, GATE2_AMEND_CHARS)}",
+                "{tail(text, 4000)}",
+                "gate2_route: a long multi-item rejection -> every complaint's start reaches \
+             amend_plan, item 1 first, trimmed only at item ends",
             ),
         ],
     );
@@ -3024,10 +3040,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![48, 3729, 3738],
+        vec![48, 3739, 3748],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3729, 3738] {
+    for line in [3739, 3748] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4910,9 +4926,14 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 /// name, annotation (none carries one), the expression as written, and the
 /// value the module computes from it.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
-    ("AMEND_CYCLES_MAX", "", "4 * STRIKE_LIMIT", 12),
+    (
+        "AMEND_CYCLES_MAX",
+        "",
+        "AMEND_DESIGN_MAX + AMEND_GATE1_MAX + AMEND_GATE2_MAX + AMEND_REWORK_MAX",
+        18,
+    ),
     ("AMEND_DESIGN_MAX", "", "DESIGN_ROUNDS_MAX + 1", 4),
-    ("AMEND_GATE1_MAX", "", "2 * STRIKE_LIMIT", 6),
+    ("AMEND_GATE1_MAX", "", "2 * (STRIKE_LIMIT + 1)", 8),
     ("AMEND_GATE2_MAX", "", "STRIKE_LIMIT", 3),
     ("AMEND_REWORK_MAX", "", "STRIKE_LIMIT", 3),
     ("CHOICE_OPTIONS_MAX", "", "4", 4),
@@ -4929,6 +4950,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("GATE2_AMEND_CHARS", "", "4 * TAIL_CHARS", 24000),
     ("GH_CALL_SECS", "", "90", 90),
     ("GH_LOOP_SECS", "", "180", 180),
+    ("ITEM_HEAD_FLOOR", "", "40", 40),
     ("ITEM_HEAD_MIN", "", "160", 160),
     ("OWNER_POLL_MAX", "", "2", 2),
     ("OWNER_POLL_MINUTES", "", "25", 25),
