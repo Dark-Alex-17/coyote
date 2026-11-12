@@ -40241,13 +40241,14 @@ print(json.dumps({
         debris_git(&repo, &["add", "a.rs"]);
         debris_git(&repo, &["commit", "-qm", "c1"]);
 
-        // A bare spec (SHA or branch) costs one merge-base and one diff; a
-        // text-only diff never asks for attributes or config.
+        // A bare spec (SHA or branch) costs one merge-base, one rev-parse (is
+        // the spec a checkpoint on top of HEAD?) and one diff; a text-only
+        // diff never asks for attributes or config.
         let out = debris_traced_cli(&trace, &[&repo_str, &base]);
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             debris_git_census(&trace),
-            census(&[("diff", 1), ("merge-base", 1)]),
+            census(&[("diff", 1), ("merge-base", 1), ("rev-parse", 1)]),
             "bare SHA spec"
         );
         debris_git(&repo, &["branch", "basebr", &base]);
@@ -40255,7 +40256,7 @@ print(json.dumps({
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             debris_git_census(&trace),
-            census(&[("diff", 1), ("merge-base", 1)]),
+            census(&[("diff", 1), ("merge-base", 1), ("rev-parse", 1)]),
             "bare branch spec"
         );
         // A range spec needs no merge-base at all.

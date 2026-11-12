@@ -2847,6 +2847,8 @@ check("subtasks: a final review without parent criteria answers to every subtask
 check("subtasks: a skipped read-only subtask is named in skipped_reviews for the final report",
       any(x.startswith("subtask 1: no code change") for x in st.get("skipped_reviews") or []), st.get("skipped_reviews"))
 check("subtasks: the tree snapshot's git calls stay under the 30 s script-node default", 2 * getattr(gates, "WORKTREE_TREE_SECS", 30) < 30)
+check("subtasks: next_subtask's tree snapshot and diff-base commit stay under its node timeout",
+      5 * getattr(gates, "WORKTREE_TREE_SECS", 30) < node_timeout("next_subtask"))
 real_tree = getattr(gates, "_worktree_tree", lambda root: "")
 gates._worktree_tree = lambda root: ""
 unk = gates.review_gate(dict(ro, subtask_changed_files=["stale.go"]))
@@ -3226,6 +3228,123 @@ bad = next((r for r in as_list_(u.get("publish_checks")) if r.get("check") == "d
 bad_ok = bad.get("ok") is False and all(w in str(bad.get("detail")) for w in ("not a draft", "not the current branch", "empty body"))
 check("publish: a ready PR on another head with an empty body fails the draft PR check with all three reasons", bad_ok, bad)
 os.environ.pop("SISYPHUS_GH_PR_VIEW_CMD")
+
+# cb93f2: subtasks never commit, so a later subtask diffed against HEAD reviewed every earlier subtask's work too.
+SNAP_REPO = os.path.join(TMP, "snapshot-repo")
+os.makedirs(SNAP_REPO)
+
+
+def snap_git(*a):
+    return scratch_git(SNAP_REPO, *a)
+
+
+snap_git("init", "-q")
+for name in ("a.txt", "b.txt"):
+    open(os.path.join(SNAP_REPO, name), "w").write(f"{name}\n")
+snap_git("add", ".")
+snap_git("commit", "-q", "-m", "init")
+SNAP_OLD = snap_git("rev-parse", "HEAD")
+snap_git("branch", "behind")
+open(os.path.join(SNAP_REPO, "c.txt"), "w").write("c\n")
+snap_git("add", ".")
+snap_git("commit", "-q", "-m", "second")
+SNAP_HEAD = snap_git("rev-parse", "HEAD")
+snap = base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, base_sha=SNAP_HEAD, head_sha=SNAP_HEAD,
+                  intent="implementation", subtasks=[{"title": "A", "outcome": "edit a"}, {"title": "B", "outcome": "edit b"}],
+                  subtask_index=0, round_heads=[], gauntlet_lanes={})
+sub_step(snap, "next_subtask")
+open(os.path.join(SNAP_REPO, "a.txt"), "a").write("subtask 1\n")
+sub_step(snap, "next_subtask")
+snap_base = snap.get("base_sha") or ""
+snap_parent = subprocess.run(["git", "-C", SNAP_REPO, "rev-parse", f"{snap_base}^"], capture_output=True, text=True).stdout.strip()
+check("cb93f2: subtask 2's diff base is a snapshot commit on top of HEAD, not HEAD, and it is ledgered",
+      snap_base != SNAP_HEAD and snap_parent == SNAP_HEAD and snap.get("debt_base") == snap_base
+      and snap_git("rev-parse", "HEAD") == SNAP_HEAD and any("diff base is snapshot" in d for d in snap["decisions"]),
+      (snap_base, snap_parent, snap["decisions"][-3:]))
+open(os.path.join(SNAP_REPO, "b.txt"), "a").write("subtask 2\n")
+snap_diff = subprocess.run(["git", "-C", SNAP_REPO, "diff", "--name-only", snap_base], capture_output=True, text=True).stdout.split()
+check("cb93f2: the diff from subtask 2's base names only subtask 2's file", snap_diff == ["b.txt"], snap_diff)
+sub_step(snap, "build_gauntlet_prompt")
+check("cb93f2: the gauntlet's Diff line carries the snapshot and the round records its code tree",
+      f"Diff: {snap_base}" in snap.get("gauntlet_prompt", "")
+      and (snap.get("round_heads") or [{}])[-1].get("code_tree") == gates._worktree_tree(SNAP_REPO), snap.get("round_heads"))
+sys.path.insert(0, gates.SHARED_DIR)
+import debris  # noqa: E402
+check("cb93f2: debris keeps a checkpoint on top of HEAD, still takes the merge-base of a branch behind HEAD",
+      debris.normalize_base(SNAP_REPO, snap_base, 30) == snap_base
+      and debris.normalize_base(SNAP_REPO, "behind", 30) == SNAP_OLD
+      and debris.normalize_base(SNAP_REPO, "HEAD", 30) == SNAP_HEAD)
+sig = subprocess.run([sys.executable, os.path.join(gates.SHARED_DIR, "..", "review-gauntlet", "scripts", "signals.py")],
+                     capture_output=True, text=True,
+                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                          "GRAPH_STATE": json.dumps({"project_dir": SNAP_REPO, "diff_spec": snap_base})})
+sig_out = json.loads(sig.stdout or "{}")
+check("cb93f2: the gauntlet's signals diff a checkpoint directly: only subtask 2's file", sig_out.get("changed_files") == ["b.txt"],
+      sig.stdout[-400:] + sig.stderr[-400:])
+# a branch that moved past HEAD (a base the work has not caught up with) is a real base, never a checkpoint
+SNAP_AHEAD = snap_git("commit-tree", f"{SNAP_HEAD}^{{tree}}", "-p", SNAP_HEAD, "-m", "upstream")
+snap_git("branch", "ahead", SNAP_AHEAD)
+sig = subprocess.run([sys.executable, os.path.join(gates.SHARED_DIR, "..", "review-gauntlet", "scripts", "signals.py")],
+                     capture_output=True, text=True,
+                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                          "GRAPH_STATE": json.dumps({"project_dir": SNAP_REPO, "diff_spec": "ahead"})})
+check("cb93f2: a branch ahead of HEAD still diffs from its merge-base (HEAD), in debris and in the signals",
+      debris.normalize_base(SNAP_REPO, "ahead", 30) == SNAP_HEAD
+      and debris.normalize_base(SNAP_REPO, SNAP_AHEAD, 30) == SNAP_HEAD
+      and sorted(json.loads(sig.stdout or "{}").get("changed_files") or []) == ["a.txt", "b.txt"],
+      sig.stdout[-400:] + sig.stderr[-400:])
+
+# a6ec7b: the adversary blocked again on the same finding after a fix round that changed two test files, and the run
+# stopped after a single fix attempt.
+A6_FINDING = ("adversary: DIVERGES -- complaint 1: Gamed tests \u2014 py/tests/test_cli.py:236-247 "
+              "(test_export_lines_follow_invoice_export_order); root cause py/invoicing/repository.py:98 \u2014 The subtask "
+              "says rows follow invoice order (issued_at, id). This test adds inv_east (2024-05-01T01:00:00+02:00, which is "
+              "2024-04-30T23:00Z) and inv_west (2024-04-30T23:30:00-01:00, which is 2024-05-01T00:30Z), whose text order is "
+              "the reverse of their time order. Instead of checking the real order, it only checks that the --lines invoice "
+              "order matches `export csv`. Both outputs come from the same lexical `ORDER BY issued_at, id`, so the test is "
+              "circular.")
+A6_AGAIN = A6_FINDING.replace("test_cli.py:236-247", "test_cli.py:240-262").replace("repository.py:98", "repository.py:101")
+A6_OTHER = ("adversary: DIVERGES -- complaint 1: Scope drift / out-of-scope \u2014 httpapi/server.go:57, "
+            "httpapi/handlers.go:242-256 \u2014 In the same files it also adds a new public route, "
+            "`POST /v1/subscriptions/{id}/seats`, with its handler `handleChangeSeats` and a test, `TestChangeSeats`.")
+tree_1 = gates._worktree_tree(SNAP_REPO)
+open(os.path.join(SNAP_REPO, "b.txt"), "a").write("fix round 1\n")
+tree_2 = gates._worktree_tree(SNAP_REPO)
+open(os.path.join(SNAP_REPO, "b.txt"), "a").write("fix round 2\n")
+tree_3 = gates._worktree_tree(SNAP_REPO)
+
+
+def a6_triage(finding, trees, findings, streak, review_rounds=1):
+    heads = [{"round": i + 1, "head": SNAP_HEAD, "code_tree": t, "lane_blockers": {"adversary": [f]}}
+             for i, (t, f) in enumerate(zip(trees, findings))]
+    return gates.triage_route(base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, review_rounds=review_rounds,
+                                         triage=[{"finding": finding, "action": "fix", "lane": "adversary"}],
+                                         lane_block_streak={"adversary": streak}, round_heads=heads))
+
+
+u = gates.route_gauntlet(base_state(gauntlet_result=BLOCKED_REPLY, round_heads=[{"round": 1}]))
+check("a6ec7b: route_gauntlet records each round's blocker texts per lane",
+      (u.get("round_heads") or [{}])[-1].get("lane_blockers", {}).get("adversary") == [BLOCKED_REPLY.splitlines()[-1][2:]],
+      u.get("round_heads"))
+u = a6_triage(A6_AGAIN, [tree_1, tree_2], [A6_FINDING, A6_AGAIN], 1)
+check("a6ec7b: (i) same finding at the same HEAD but a changed code tree -> another fix round, not lane_stuck",
+      u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 2
+      and any("code changed" in d for d in u.get("decisions", [])), (u.get("_next"), u.get("escalation", {}).get("kind")))
+u = a6_triage(A6_AGAIN, [tree_1, tree_2, tree_3], [A6_FINDING, A6_AGAIN, A6_AGAIN], 2)
+check("a6ec7b: (ii) a third round on the same finding -> lane_stuck even though the code changed again",
+      u.get("escalation", {}).get("kind") == "lane_stuck", u.get("_next"))
+u = a6_triage(A6_AGAIN, [tree_2, tree_2], [A6_FINDING, A6_AGAIN], 1)
+check("a6ec7b: (iii) same finding over an unchanged code tree -> lane_stuck", u.get("escalation", {}).get("kind") == "lane_stuck",
+      u.get("_next"))
+u = a6_triage(A6_OTHER, [tree_2, tree_2], [A6_FINDING, A6_OTHER], 1)
+check("a6ec7b: (iv) a new class of finding over an unchanged tree -> the streak restarts and the fix round runs",
+      u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 1, (u.get("_next"), u.get("lane_block_streak")))
+u = a6_triage(A6_OTHER, [tree_2, tree_2], [A6_FINDING, A6_OTHER], 1, review_rounds=STRIKE_LIMIT)
+check("a6ec7b: (v) review rounds at the strike limit -> review_exhausted even right after a streak reset",
+      u.get("escalation", {}).get("kind") == "review_exhausted", u.get("_next"))
+findings_changed = getattr(gates, "_findings_changed", lambda a, b: None)
+same_kept = findings_changed([A6_FINDING], [A6_AGAIN]) is False and findings_changed([A6_FINDING], [A6_OTHER]) is True
+check("a6ec7b: moved line numbers are the same finding; a different complaint is a new one", same_kept)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

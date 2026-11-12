@@ -1388,6 +1388,11 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("architect-next").join("scripts"),
         &agents.join("architect-next").join("scripts"),
     );
+    // the diff-base rows run the gauntlet's own signals script on a checkpoint commit
+    copy_tree(
+        &agents_dir().join("review-gauntlet").join("scripts"),
+        &agents.join("review-gauntlet").join("scripts"),
+    );
     let copy = agents.join(CANDIDATE);
     copy_tree(&candidate_dir(), &copy);
     copy
@@ -3069,6 +3074,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ladder_judge", "timeout", 300),
     ("librarian_question", "max_attempts", 2),
     ("librarian_question", "timeout", 1800),
+    ("next_subtask", "timeout", 60),
     ("observability_gate", "timeout", 60),
     ("observability_pass", "max_iterations", 20),
     ("observability_pass", "timeout", 1200),

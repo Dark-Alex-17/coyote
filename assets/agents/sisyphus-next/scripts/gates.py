@@ -39,11 +39,16 @@ from _lib import raise_escalation as _raise_escalation  # noqa: E402
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 
 SUBTASK_FILES_SHOWN = 40     # files a per-subtask review prompt lists as the subtask's own
-# Each git call of _worktree_tree; two of them stay under the 30 s script-node default of next_subtask and
-# review_gate. A timeout reads as unknown: the review runs and a strikeout stashes as before.
+# Each git call of _worktree_tree and _snapshot_base. review_gate's two stay under the 30 s script-node default;
+# next_subtask makes five and its node allows 60 s. A timeout reads as unknown: the review runs and a strikeout
+# stashes as before.
 WORKTREE_TREE_SECS = 10
 GAUNTLET_LANES = ("code-review", "adversary", "security", "probe", "debris")
 RERUN_ONCE_LANES = ("adversary", "security", "probe")
+# The streak at which a re-run-once lane stops even though each fix round changed the code: one round past RERUN_ONCE.
+STUCK_CODE_CHANGED_CAP = RERUN_ONCE + 2
+# Below this overlap a lane's findings count as a new class, not the same complaint again.
+FINDINGS_SAME_JACCARD = 0.5
 OPERATIONAL_RE = re.compile(
     r"queue|consumer|producer|cron|scheduler|worker|metric|prometheus|job\b|alert|"
     r"endpoint|handler|route|webhook|retry|timeout|error",
@@ -842,9 +847,14 @@ def next_subtask(state):
     root = state.get("git_root") or state.get("project_dir") or "."
     head = git_out(root, "rev-parse", "HEAD", default="")
     if idx > 0:
-        # Later subtasks diff against the tree the previous one left behind.
         if head:
-            u["base_sha"], u["debt_base"] = head, head
+            base, err = _snapshot_base(root, head)
+            u["base_sha"], u["debt_base"] = base, base
+            if err:
+                ledger(state, u, f"subtask {idx + 1}: diff base snapshot failed ({err}); diffing against HEAD {head}")
+            elif base != head:
+                ledger(state, u, f"subtask {idx + 1}: diff base is snapshot {base} of the worktree on top of HEAD {head}, "
+                                 f"so earlier subtasks' uncommitted work stays out of this review")
     else:
         u["run_base_sha"] = state.get("run_base_sha") or state.get("base_sha") or ""
     # What the worktree held when the subtask started (uncommitted earlier subtasks included): the read-only check,
@@ -2425,6 +2435,45 @@ def _worktree_tree(root):
             os.unlink(tmp)
 
 
+def _snapshot_base(root, head):
+    """A commit of the tracked worktree on top of HEAD, so a later subtask's diff leaves out the earlier subtasks'
+    uncommitted work. Returns (sha, error): HEAD itself when nothing tracked changed, and HEAD with the reason when
+    git cannot build the commit. No ref is created or moved."""
+    index = git_out(root, "rev-parse", "--git-path", "index", default="")
+    if not head or not index:
+        return head, "no HEAD or index"
+    index = index if os.path.isabs(index) else os.path.join(root, index)
+    fd, tmp = tempfile.mkstemp(prefix="sx-index-")
+    os.close(fd)
+    # Only tracked and intent-to-add paths: a path committed in HEAD but untracked here would read as deleted.
+    env = {**os.environ, "GIT_INDEX_FILE": tmp, "GIT_AUTHOR_NAME": "sisyphus", "GIT_AUTHOR_EMAIL": "sisyphus@localhost",
+           "GIT_COMMITTER_NAME": "sisyphus", "GIT_COMMITTER_EMAIL": "sisyphus@localhost"}
+    try:
+        if os.path.isfile(index):
+            shutil.copyfile(index, tmp)
+        else:
+            os.unlink(tmp)
+        out = ""
+        for args in (["add", "-u"], ["write-tree"]):
+            p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env,
+                               timeout=WORKTREE_TREE_SECS)
+            if p.returncode != 0:
+                return head, f"git {args[0]}: {p.stderr.strip()[:200]}"
+            out = p.stdout.strip()
+        if out == git_out(root, "rev-parse", f"{head}^{{tree}}", default=""):
+            return head, ""
+        p = subprocess.run(["git", "-C", root, "commit-tree", out, "-p", head, "-m", "sisyphus subtask diff base",
+                            "--no-gpg-sign"], capture_output=True, text=True, env=env, timeout=WORKTREE_TREE_SECS)
+        if p.returncode != 0 or not p.stdout.strip():
+            return head, f"git commit-tree: {p.stderr.strip()[:200]}"
+        return p.stdout.strip(), ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return head, str(e)[:200]
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def _subtask_changes(state):
     """The files the current subtask changed outside the planning store, by content against its starting tree.
 
@@ -2549,7 +2598,7 @@ def build_gauntlet_prompt(state):
             note += f"\n{PROBE_HOUSE_NOTE}"
         lines += ["Local-run recipe / usage suites:", note]
     u["gauntlet_prompt"] = "\n".join(lines)
-    u["round_heads"] = rounds + [{"round": n, "head": head, "started": now_iso()}]
+    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": _worktree_tree(root), "started": now_iso()}]
     u["head_sha"] = head
     u["prior_review_decisions"] = "\n".join(_review_decisions(state))
     ledger(state, u, f"gauntlet: round {n} spawned @ {head or '(no git)'}")
@@ -2644,7 +2693,11 @@ def route_gauntlet(state):
         verdict, incomplete, lanes, details, blockers, attention = _parse_gauntlet(text)
     rounds = as_list(state.get("round_heads"))
     if rounds and isinstance(rounds[-1], dict):
+        lane_blockers = {}
+        for b in blockers:
+            lane_blockers.setdefault(_lane_of({}, b), []).append(b)
         rounds[-1].update({"verdict": verdict, "lanes": lanes, "lane_details": details, "incomplete": incomplete,
+                           "lane_blockers": lane_blockers,
                            "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
     merged_lanes = dict(as_dict(state.get("gauntlet_lanes")))
     merged_lanes.update(lanes)
@@ -2689,6 +2742,49 @@ def _lane_of(item, finding):
     if f.startswith("debris"):
         return "debris"
     return "code-review"
+
+
+def _finding_keys(texts):
+    """What identifies a lane's findings across rounds: cited paths without line numbers, backticked snippets and
+    quoted phrases, or the words of five or more letters when the findings cite none of those."""
+    text = "\n".join(str(t) for t in texts)
+    keys = set(re.findall(r"(?:[\w.-]+/)*[\w-]+\.[A-Za-z]\w{0,5}\b", text))
+    keys |= {f"`{s.strip()}`" for s in re.findall(r"`([^`\n]+)`", text) if s.strip()}
+    keys |= {f'"{s.strip().lower()}"' for s in re.findall(r"\"([^\"\n]{3,})\"", text) if s.strip()}
+    return keys or {w.lower() for w in re.findall(r"[A-Za-z]{5,}", text)}
+
+
+def _findings_changed(before, after):
+    """True when two rounds' findings of one lane share too little to be the same complaint."""
+    a, b = _finding_keys(before), _finding_keys(after)
+    if not a and not b:
+        return False
+    return len(a & b) / len(a | b) < FINDINGS_SAME_JACCARD
+
+
+def _code_changed(state, root, tree_before, tree_after):
+    """True when the reviewed code differs between two worktree trees; planning-store edits do not count, and a
+    missing tree or a git error reads as unchanged."""
+    if not tree_before or not tree_after or tree_before == tree_after:
+        return False
+    code, _, _ = git(root, "diff", "--quiet", tree_before, tree_after, "--", ".", *_plans_exclude(state, root))
+    return code == 1
+
+
+def _repeat_block(state, root, lane, fixes):
+    """How a lane that blocks again compares with its previous round: "new" findings, the same findings over
+    "changed" code, or the "same" findings over the same code."""
+    rounds = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict)]
+    if len(rounds) < 2:
+        return "same"
+    prev, cur = rounds[-2], rounds[-1]
+    before = as_list(as_dict(prev.get("lane_blockers")).get(lane))
+    after = as_list(as_dict(cur.get("lane_blockers")).get(lane)) or fixes
+    if before and _findings_changed(before, after):
+        return "new"
+    if _code_changed(state, root, prev.get("code_tree") or "", cur.get("code_tree") or ""):
+        return "changed"
+    return "same"
 
 
 def triage_route(state):
@@ -2742,9 +2838,19 @@ def triage_route(state):
     if fixes:
         rounds = as_int(state.get("review_rounds"))
         stuck = []
-        for lane in lanes_now:
+        root = state.get("git_root") or state.get("project_dir") or "."
+        for lane in sorted(lanes_now):
             streak[lane] = streak.get(lane, 0) + 1
-            if lane in RERUN_ONCE_LANES and streak[lane] > RERUN_ONCE:
+            if lane not in RERUN_ONCE_LANES or streak[lane] <= RERUN_ONCE:
+                continue
+            repeat = _repeat_block(state, root, lane, [f for l, f in fixes if l == lane])
+            if repeat == "new":
+                streak[lane] = 1
+                ledger(state, u, f"triage: {lane} blocks again on a new class of findings; its streak restarts")
+            elif repeat == "changed" and streak[lane] < STUCK_CODE_CHANGED_CAP:
+                ledger(state, u, f"triage: {lane} blocks again on the same findings but the code changed since its "
+                                 f"previous round; one more fix round (streak {streak[lane]})")
+            else:
                 stuck.append(lane)
         u["lane_block_streak"] = streak
         if stuck:

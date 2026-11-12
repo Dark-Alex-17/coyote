@@ -98,13 +98,23 @@ def git_diff(*args, timeout=60):
 def normalize_base(spec):
     """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
     commits that landed on the base after branching never surface as changes.
-    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    Explicit `..` ranges are the caller's choice and pass through untouched, and
+    so does a checkpoint commit on top of HEAD, whose merge-base would be HEAD."""
     if ".." in spec:
         return spec, ""
     try:
         base = git("merge-base", spec, "HEAD").strip()
     except Exception as e:  # noqa: BLE001
         return spec, f"no merge-base for {spec!r}: {e}; diffing against it directly"
+    try:
+        head, commit = git("rev-parse", "HEAD", f"{spec}^{{commit}}").split()
+        # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+        held = base == head != commit and bool(git("for-each-ref", "--count=1", "--contains", commit).strip())
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        head = commit = ""
+        held = True
+    if base == head != commit and not held:
+        return spec, f"diff spec {spec!r} is a checkpoint on top of HEAD; diffing against it directly"
     return base, f"diff spec {spec!r} normalized to merge-base {base[:12]} (three-dot semantics)"
 
 

@@ -55,7 +55,8 @@ if not state.get("consumer_surface"):
 def normalize_base(spec):
     """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
     commits that landed on the base after branching never surface as changes.
-    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    Explicit `..` ranges are the caller's choice and pass through untouched, and
+    so does a checkpoint commit on top of HEAD, whose merge-base would be HEAD."""
     if ".." in spec:
         return spec
     r = subprocess.run(
@@ -65,7 +66,28 @@ def normalize_base(spec):
         errors="replace",
         timeout=30,
     )
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else spec
+    if r.returncode != 0 or not r.stdout.strip():
+        return spec
+    base = r.stdout.strip()
+    p = subprocess.run(
+        ["git", "-C", proj, "rev-parse", "HEAD", f"{spec}^{{commit}}"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    head, commit = (p.stdout.split() + ["", ""])[:2] if p.returncode == 0 else ("", "")
+    if base != head or head == commit:
+        return base
+    # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+    held = subprocess.run(
+        ["git", "-C", proj, "for-each-ref", "--count=1", "--contains", commit],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    return spec if held.returncode == 0 and not held.stdout.strip() else base
 
 
 def diff_text():

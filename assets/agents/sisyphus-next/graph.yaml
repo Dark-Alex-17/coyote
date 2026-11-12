@@ -790,6 +790,7 @@ nodes:
     type: script
     description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish.
     script: scripts/next_subtask.py
+    timeout: 60
     fallback: end_failure
 
   # =====================================================================
