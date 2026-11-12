@@ -350,6 +350,16 @@ pub(crate) fn input(
     ask(prompter, req).and_then(PromptAnswer::into_text)
 }
 
+/// The default an input offers, as the text the widget shows: a
+/// string as it is, any other value (a number, a bool) rendered.
+pub(crate) fn input_default_text(req: &PromptRequest) -> Option<String> {
+    match req.default.as_ref()? {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 /// The question asked again after a rejected answer. The label stays so
 /// the field keeps its name under the TUI, where the modal is all the
 /// user sees; the reason comes first so it is read before answering.
@@ -403,7 +413,7 @@ impl InquirePrompter {
     }
 
     fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
-        let default = Self::input_default(req);
+        let default = input_default_text(req);
         let mut text = Text::new(&req.question);
         if let Some(default) = default.as_deref() {
             text = text.with_default(default);
@@ -412,16 +422,6 @@ impl InquirePrompter {
             text = text.with_help_message(help);
         }
         text.prompt().map(PromptAnswer::Text)
-    }
-
-    /// The default an input offers, as the text the widget shows: a
-    /// string as it is, any other value (a number, a bool) rendered.
-    fn input_default(req: &PromptRequest) -> Option<String> {
-        match req.default.as_ref()? {
-            Value::Null => None,
-            Value::String(text) => Some(text.clone()),
-            other => Some(other.to_string()),
-        }
     }
 
     fn password(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
@@ -726,22 +726,19 @@ mod tests {
             ..request(PromptAction::Input, None)
         };
         assert_eq!(
-            InquirePrompter::input_default(&input(Some(json!(1000)))).as_deref(),
+            input_default_text(&input(Some(json!(1000)))).as_deref(),
             Some("1000")
         );
         assert_eq!(
-            InquirePrompter::input_default(&input(Some(json!(true)))).as_deref(),
+            input_default_text(&input(Some(json!(true)))).as_deref(),
             Some("true")
         );
         assert_eq!(
-            InquirePrompter::input_default(&input(Some(json!("plain")))).as_deref(),
+            input_default_text(&input(Some(json!("plain")))).as_deref(),
             Some("plain")
         );
-        assert_eq!(
-            InquirePrompter::input_default(&input(Some(Value::Null))),
-            None
-        );
-        assert_eq!(InquirePrompter::input_default(&input(None)), None);
+        assert_eq!(input_default_text(&input(Some(Value::Null))), None);
+        assert_eq!(input_default_text(&input(None)), None);
     }
 
     /// Which widget a closed select gets depends on who asks: a command

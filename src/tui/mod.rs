@@ -23,7 +23,7 @@ mod transcript;
 
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
-use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest};
+use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, input_default_text};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{AbortSignal, create_abort_signal};
@@ -525,8 +525,8 @@ impl PendingPrompt {
                 // An input's default is shown as the placeholder, the way
                 // inquire's widget does: Enter alone accepts it and typing
                 // replaces it rather than appending to it.
-                if let Some(default) = req.default.as_ref().and_then(serde_json::Value::as_str) {
-                    field.set_placeholder_text(default);
+                if let Some(default) = input_default_text(&req) {
+                    field.set_placeholder_text(&default);
                     field.set_placeholder_style(DIM);
                 }
                 Some(field)
@@ -656,12 +656,7 @@ impl PendingPrompt {
         match self.req.action {
             PromptAction::Select => PromptAnswer::Selected(text),
             PromptAction::Input if text.is_empty() => {
-                let default = self
-                    .req
-                    .default
-                    .as_ref()
-                    .and_then(serde_json::Value::as_str);
-                PromptAnswer::Text(default.unwrap_or_default().to_string())
+                PromptAnswer::Text(input_default_text(&self.req).unwrap_or_default())
             }
             _ => PromptAnswer::Text(text),
         }
@@ -4909,6 +4904,26 @@ mod tests {
         assert_eq!(
             asker.join().unwrap().unwrap(),
             PromptAnswer::Text("yz".to_string())
+        );
+    }
+
+    /// A default that is not a string (a number, say) is still offered:
+    /// rendered as text in the field and sent back on a bare Enter.
+    #[test]
+    fn an_input_modal_offers_a_numeric_default_as_text() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest {
+            default: Some(serde_json::json!(1000)),
+            ..PromptRequest::new(PromptAction::Input, "Chunk size:", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert!(frame.contains("1000"), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text("1000".to_string())
         );
     }
 
