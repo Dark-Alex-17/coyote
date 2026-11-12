@@ -694,14 +694,15 @@ check("leak_route: framed unanswerable questions -> one multiple choice per ques
       and "1 of 2: priority of X vs Y?" in s["escalation"]["question"] and len(s["choice_queue"]) == 2
       and s["leak_pending_answers"] == [{"question": "a", "answer": "b"}], s)
 leak_asked = dict(s)
-VERDICT = "x" * 2000 + "\nGATE1: QUESTIONS priority of X vs Y?"
+VERDICT = "PLAN_GATE: LEAKY\n- " + "x" * 2000 + "\n- GATE1: QUESTIONS priority of X vs Y?"
 lv = base_state(gate1_result=VERDICT, leak_answers=[], leak_unanswerable=[LEAK_Q, LEAK_Q2])
 lv.update(gates.leak_route(lv))
 lv1 = lv["escalation"]["evidence"]
 lv.update(gates.apply_answer({**lv, "last_answer": "X first"}))
 lv.update(gates.leak_route(lv))
-check("leak_route: every leak_question escalation carries the gatekeeper verdict tail as its evidence",
-      lv1 == lv["escalation"]["evidence"] == gates.tail(VERDICT, 1500) and "GATE1: QUESTIONS" in lv1
+check("leak_route: every leak_question escalation carries the gatekeeper verdict, every item's start kept, as its evidence",
+      lv1 == lv["escalation"]["evidence"] == _lib.trim_items(VERDICT, 1500) and "GATE1: QUESTIONS" in lv1
+      and lv1.startswith("PLAN_GATE: LEAKY\n- xxx")
       and "2 of 2" in lv["escalation"]["question"], lv["escalation"])
 s.update(gates.apply_answer({**s, "last_answer": "X first"}))
 check("apply_answer: leak_question -> recorded through the queue -> leak_route", s["_next"] == "leak_route" and s["choice_index"] == 1)
@@ -782,6 +783,159 @@ u = gates.autonomy_gate(base_state(autonomy="plan-gate"))
 check("autonomy_gate: plan-gate -> approve_breakdown", u["_next"] == "approve_breakdown" and u["escalation"]["kind"] == "approve_breakdown")
 check("autonomy_gate: full -> promote_tasks", gates.autonomy_gate(base_state(autonomy="full"))["_next"] == "promote_tasks")
 check("autonomy_gate: phase-gate -> promote_tasks (gates later)", gates.autonomy_gate(base_state(autonomy="phase-gate"))["_next"] == "promote_tasks")
+
+# ---------------------------------------------------------------- A1 budgets per amendment source
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="design", amend_counts={"design": _lib.AMEND_DESIGN_MAX}))
+check("reseal_gate: a source past its own budget -> amend_cap naming that source (hard trigger)",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap"
+      and u["escalation"]["data"] == {"source": "design", "over": ["source"]}
+      and "design-round" in u["escalation"]["question"], u.get("escalation"))
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_cycles=_lib.AMEND_DESIGN_MAX + _lib.AMEND_GATE1_MAX,
+                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}))
+check("reseal_gate: spent design and Gate 1 budgets leave the Gate 2 budget whole -> gate1_build, gate2 cycle 1",
+      u["_next"] == "gate1_build" and u["amend_counts"]["gate2"] == 1 and u["amend_source"] == "", u)
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="", amend_counts={}))
+check("reseal_gate: an untagged amendment spends the rework budget", u["amend_counts"] == {"rework": 1}, u)
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="rework", amend_cycles=AMEND_CYCLES_MAX, amend_counts={}))
+check("reseal_gate: past the overall ceiling alone -> amend_cap naming the ceiling, not a source budget",
+      u["escalation"]["data"] == {"source": "rework", "over": ["ceiling"]} and "overall amendment ceiling" in u["escalation"]["question"]
+      and "rework" not in u["escalation"]["question"].split("ceiling")[0], u.get("escalation"))
+AMEND_CAP_OPTS = [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)]
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "gate1", "over": ["source"]}),
+                                  last_answer="Allow one more amendment cycle", amend_cycles=9,
+                                  amend_counts={"gate1": _lib.AMEND_GATE1_MAX + 1, "design": 2}))
+check("apply_answer: amend_cap allow on a source budget -> one more cycle of that source, others and the total untouched",
+      u["_next"] == "gate1_build" and u["amend_counts"] == {"gate1": _lib.AMEND_GATE1_MAX - 1, "design": 2}
+      and "amend_cycles" not in u, u)
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "rework", "over": ["ceiling"]}),
+                                  last_answer="Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"rework": 1}))
+check("apply_answer: amend_cap allow on the ceiling -> one more cycle under the ceiling, the source count untouched",
+      u["amend_cycles"] == AMEND_CYCLES_MAX - 1 and u["amend_counts"] == {"rework": 1}, u)
+u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "gate2", "over": ["source"]}),
+                                  last_answer="Stop and report"))
+check("apply_answer: amend_cap stop -> end_blocked naming the budget that tripped",
+      u["_next"] == "end_blocked" and "Gate 2 rejection amendment budget" in u["failure_reason"], u.get("failure_reason"))
+
+AMEND_PLAN = os.path.join(TMP, "amend-chain-plan.md")
+
+
+def amend_chain(events):
+    """Drive the planning gates through a run's ledger sequence; amend_plan is stood in for by an append to the plan."""
+    write(AMEND_PLAN, PLAN_TEXT)
+    s = base_state(plan_path=AMEND_PLAN, amend_cycles=0, amend_counts={}, amend_source="", oracle_rejects=0,
+                   leak_fingerprints=[], plan_revision="", design_rounds=1, after_reseal="", tasks=[])
+    steps = []
+
+    def run(gate, **over):
+        s.update(over)
+        s.update(gate(s))
+        steps.append(s["_next"])
+
+    def amend():
+        with open(AMEND_PLAN, "a") as f:
+            f.write(f"\n<!-- amendment {len(steps)} -->\n")
+        run(gates.reseal_gate)
+        if s["_next"] == "gate1_build":
+            run(gates.gate1_build)
+
+    for i, ev in enumerate(events):
+        if s.get("_next") == "escalate_gate":
+            break
+        if ev == "design":
+            run(gates.open_questions_gate, choice_kind="design_round", choice_queue=[{"question": "Which store?"}], choice_index=1,
+                choice_answers=[{"question": "Which store?", "answer": "pg"}])
+            amend()
+        elif ev == "leak":
+            run(gates.gate1_route, gate1_result=f"PLAN_GATE: LEAKY\n- Where does module {i} of the infra code go?")
+            run(gates.leak_route, leak_answers=[{"question": f"module {i}?", "answer": "infra/"}], leak_unanswerable=[])
+            amend()
+        elif ev == "seal":
+            run(gates.gate1_route, gate1_result="PLAN_GATE: SEALED")
+            run(gates.gate2_build)
+        elif ev == "reject":
+            run(gates.gate2_route, gate2_result=f"PLAN_REVIEW: REJECT\n1. line {i} is wrong")
+            amend()
+        elif ev == "okay":
+            run(gates.gate2_route, gate2_result="PLAN_REVIEW: OKAY")
+            run(gates.reseal_return)
+            run(gates.autonomy_gate)
+    return s, steps
+
+
+# the four parity runs that stopped on the shared amendment cap before any delegation, as their ledgers ran
+AMEND_CAP_RUNS = {
+    "6451ba": ["design", "leak", "seal", "reject", "seal", "reject", "seal", "okay"],
+    "8edf96": ["design", "leak", "leak", "seal", "reject", "seal", "okay"],
+    "3136b6": ["design", "leak", "seal", "reject", "seal", "reject", "seal", "okay"],
+    "be7e23": ["design", "leak", "leak", "seal", "reject", "seal", "okay"],
+}
+for run_id, events in AMEND_CAP_RUNS.items():
+    s, steps = amend_chain(events)
+    check(f"amend budgets: run {run_id}'s ledger (design, {events.count('leak')} Gate 1 LEAKY, {events.count('reject')} Gate 2 REJECT) "
+          "-> sealed, reviewed and on to promote_tasks, no amend_cap",
+          steps[-1] == "promote_tasks" and "escalate_gate" not in steps
+          and s["amend_counts"] == {"design": 1, "gate1": events.count("leak"), "gate2": events.count("reject")}
+          and any(f"amend: gate2 cycle {events.count('reject')}/{_lib.AMEND_GATE2_MAX}" in d for d in s["decisions"]),
+          (steps, s.get("amend_counts"), s.get("escalation", {}).get("question")))
+s, steps = amend_chain(["design"] + ["leak"] * (_lib.AMEND_GATE1_MAX + 1))
+check("amend budgets: Gate 1 leaks with fresh questions every pass still end, on the Gate 1 budget",
+      steps[-1] == "escalate_gate" and s["escalation"]["data"] == {"source": "gate1", "over": ["source"]}
+      and s["amend_counts"]["gate1"] == _lib.AMEND_GATE1_MAX + 1, (steps, s.get("amend_counts")))
+WORST = ["design"] * _lib.AMEND_DESIGN_MAX + ["leak", "leak", "seal", "reject"] * _lib.AMEND_GATE2_MAX + ["leak", "leak", "seal", "okay"]
+s, steps = amend_chain(WORST)
+check("amend budgets: every design round, two Gate 1 leaks per sealing and every oracle REJECT -> still promote_tasks",
+      steps[-1] == "promote_tasks" and "escalate_gate" not in steps
+      and s["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX, "gate2": _lib.AMEND_GATE2_MAX},
+      (steps[-6:], s.get("amend_counts"), s.get("escalation", {}).get("question")))
+
+# ---------------------------------------------------------------- oracle rejections reach amend_plan whole
+REJECT_ITEMS = [f"{k}. COMPLAINT-{k} line {k * 10}: " + f"detail {k} " * 400 + f"END-{k}" for k in range(1, 13)]
+REJECT_LONG = "PLAN_REVIEW: REJECT\n\n" + "\n".join(REJECT_ITEMS) + "\n"
+u = gates.gate2_route(base_state(gate2_result=REJECT_LONG, oracle_rejects=0))
+amendment = u["pending_amendments"][0]
+check("gate2_route: a long multi-item rejection -> every complaint's start reaches amend_plan, item 1 first, trimmed only at item ends",
+      all(f"{k}. COMPLAINT-{k} line {k * 10}:" in amendment for k in range(1, 13)) and "END-1" not in amendment
+      and amendment.index("COMPLAINT-1 ") < amendment.index("COMPLAINT-2 ") and "[trimmed] ...\n" not in amendment
+      and len(amendment) <= _lib.GATE2_AMEND_CHARS + 200 and u["amend_source"] == "gate2", len(amendment))
+REJECT_MID = "PLAN_REVIEW: REJECT\n\n" + "\n".join(REJECT_ITEMS[:4]) + "\n"
+u = gates.gate2_route(base_state(gate2_result=REJECT_MID, oracle_rejects=0))
+check("gate2_route: a rejection under the bound passes whole", u["pending_amendments"][0].endswith(REJECT_MID), len(REJECT_MID))
+REJECT_SHORT1 = "PLAN_REVIEW: REJECT\n\n1. SHORT-FIRST: line 3 names the wrong table\n" + "\n".join(REJECT_ITEMS[1:]) + "\n"
+u = gates.gate2_route(base_state(gate2_result=REJECT_SHORT1, oracle_rejects=0))
+check("gate2_route: a long rejection whose first complaint is short -> complaint 1 reaches amend_plan intact",
+      "1. SHORT-FIRST: line 3 names the wrong table\n" in u["pending_amendments"][0], u["pending_amendments"][0][:300])
+u = gates.gate2_route(base_state(gate2_result="Agent output, no verdict:\n" + "\n".join(REJECT_ITEMS)))
+check("gate2_route: gate_fault evidence keeps the first item of a long output, within the bound",
+      u["escalation"]["kind"] == "gate_fault" and "1. COMPLAINT-1 line 10:" in u["escalation"]["evidence"]
+      and len(u["escalation"]["evidence"]) <= 1000, u["escalation"]["evidence"][:300])
+MANY = "\n".join(f"- item {k}" for k in range(1000)) + "\n"
+TRIMMED_MANY = _lib.trim_items(MANY, 1000)
+check("trim_items: a thousand short items stay within the bound, the first kept, the rest counted",
+      len(TRIMMED_MANY) <= 1000 and TRIMMED_MANY.startswith("- item 0\n- item 1\n") and "more items trimmed]" in TRIMMED_MANY,
+      (len(TRIMMED_MANY), TRIMMED_MANY[-80:]))
+TRIMMED_50 = _lib.trim_items("\n".join(f"{k}. POINT-{k} " + "p" * 500 for k in range(1, 51)), 1000)
+check("trim_items: fifty long items in a small bound -> within the bound, item 1's start first",
+      len(TRIMMED_50) <= 1000 and TRIMMED_50.startswith("1. POINT-1 ppp"), (len(TRIMMED_50), TRIMMED_50[-80:]))
+TRIMMED_ONE = _lib.trim_items("1. " + "q" * 5000, 300)
+check("trim_items: a single item that fills the bound keeps its start",
+      len(TRIMMED_ONE) <= 300 and TRIMMED_ONE.startswith("1. qqq"), TRIMMED_ONE)
+RAW_VERDICT = "x" * 2000 + "\nGATE1: QUESTIONS priority of X vs Y?"
+TRIMMED_RAW = _lib.trim_items(RAW_VERDICT, 1500)
+check("trim_items: a text with no items keeps its start and its end, within the bound",
+      len(TRIMMED_RAW) <= 1500 and TRIMMED_RAW.startswith("xxx") and TRIMMED_RAW.endswith("GATE1: QUESTIONS priority of X vs Y?"),
+      TRIMMED_RAW[-80:])
+TRIMMED = _lib.trim_items("intro\n" + "\n".join(REJECT_ITEMS), 3000)
+check("trim_items: each item keeps its start and loses its end; the preamble stays",
+      TRIMMED.startswith("intro\n") and all(f"COMPLAINT-{k} " in TRIMMED for k in range(1, 13))
+      and TRIMMED.count(" ... [trimmed]") == 12 and "END-" not in TRIMMED, TRIMMED[:300])
+check("trim_items: text within the bound is returned unchanged", _lib.trim_items("1. a\n2. b\n", 100) == "1. a\n2. b\n")
+check("trim_items: a short item stays whole beside a long one",
+      _lib.trim_items("1. short\n2. " + "x" * 5000, 1000).startswith("1. short\n2. xxx"))
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_counts={"gate2": _lib.AMEND_GATE2_MAX},
+                                 amend_summary="1. FIRST change\n" + "2. " + "y" * 4000))
+check("reseal_gate: the amend_cap evidence keeps the summary's first item", "1. FIRST change" in u["escalation"]["evidence"], u.get("escalation"))
+u = gates.gate1_build(base_state(gate1_result="PLAN_GATE: LEAKY\n1. FIRST-LEAK?\n" + "2. " + "z" * 5000))
+check("gate1_build: the prior verdict keeps its first item", "FIRST-LEAK" in u["gate1_prompt"], u["gate1_prompt"][-400:])
 
 # ---------------------------------------------------------------- promote (B6) with the stub task store
 u = gates.promote_verify(base_state(promote_retries=0))
@@ -1160,6 +1314,16 @@ u = gates.task_failed_route(base_state(current_task=T1, oracle_result="Cause: X.
 check("task_failed_route: escalation task_failed with the oracle-directed retry recommended (B8 unused)", u["escalation"]["kind"] == "task_failed" and u["escalation"]["options"][0]["recommended"] and u["escalation"]["hard_trigger"])
 u = gates.task_failed_route(base_state(current_task=T1, oracle_result="x", task_rounds={T1: {"retry_rounds": 1}}))
 check("task_failed_route: B8 used -> no retry option; abort recommended", all("Retry" not in o["text"] for o in u["escalation"]["options"]) and u["escalation"]["options"][-1]["recommended"])
+LONG_REPORT = "SISYPHUS_FAILED\n" + "\n".join(f"{k}. REPORT-ITEM-{k}: " + "r" * 900 for k in range(1, 9)) + "\n"
+u = gates.route_delegate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, delegate_result=LONG_REPORT))
+check("route_delegate: a long failed report keeps its first item in failure_evidence, within the bound",
+      u["_next"] == "oracle_diagnose" and "1. REPORT-ITEM-1:" in u["failure_evidence"] and len(u["failure_evidence"]) <= 4000,
+      u.get("failure_evidence", "")[:200])
+LONG_ORACLE = "Cause:\n" + "\n".join(f"- ORACLE-POINT-{k}: " + "o" * 900 for k in range(1, 9)) + "\n"
+u = gates.task_failed_route(base_state(current_task=T1, oracle_result=LONG_ORACLE, failure_evidence=LONG_REPORT, task_rounds={}))
+check("task_failed_route: the evidence keeps the report's and the oracle's first items",
+      "1. REPORT-ITEM-1:" in u["escalation"]["evidence"] and "- ORACLE-POINT-1:" in u["escalation"]["evidence"]
+      and "- ORACLE-POINT-1:" in u["escalation"]["options"][0]["evidence"], u["escalation"]["evidence"][:300])
 
 # ---------------------------------------------------------------- verify_gate / route_verdict (B9, B10, B11)
 u = gates.verify_gate(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task"))
@@ -2195,8 +2359,10 @@ check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_ga
 u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))
 check("apply_answer: checklist_accept -> recorded through the queue -> checklist_round", u["_next"] == "checklist_round" and u["choice_index"] == 1)
 check("apply_answer: amend_cap stop -> end_blocked", AA("amend_cap", "Stop and report")["_next"] == "end_blocked")
-u = AA("amend_cap", "Allow one more amendment cycle")
-check("apply_answer: amend_cap allow -> one more cycle then gate1", u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1)
+u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"design": 9})
+check("apply_answer: amend_cap allow on an escalation with no source -> one more cycle of every source and the ceiling, then gate1",
+      u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1
+      and u["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX - 1}, u)
 check("apply_answer: gate1_stuck stop -> end_blocked", AA("gate1_stuck", "Stop and report")["_next"] == "end_blocked")
 u = AA("gate1_stuck", "infra goes in infra/; DB is pg")
 check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u["_next"] == "amend_plan" and u["leak_fingerprints"] == [])
@@ -2219,6 +2385,8 @@ check("apply_answer: tasks_stuck skip -> follow-ups + phase_f_gate", u["_next"] 
 check("apply_answer: tasks_stuck stop -> end_blocked", AA("tasks_stuck", "Stop and report", tasks=tasks_with())["_next"] == "end_blocked")
 u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), oracle_result="do Y", task_rounds={})
 check("apply_answer: task_failed retry -> oracle-directed fix round (B8 side 1)", u["_next"] == "compose_delegation" and u["fix_source"] == "oracle" and u["task_rounds"][T1]["retry_rounds"] == 1)
+u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), oracle_result=LONG_ORACLE, task_rounds={})
+check("apply_answer: task_failed retry -> the fix note keeps the oracle's first point", "- ORACLE-POINT-1:" in u["fix_note"], u.get("fix_note", "")[:200])
 u = AA("task_failed", "Retry with the oracle's direction (one round)", current_task=T1, tasks=tasks_with(), task_rounds={T1: {"retry_rounds": 1}})
 check("apply_answer: task_failed retry at B8 -> abort path (task failed, end_aborted)", u["_next"] == "end_aborted")
 u = AA("task_failed", "Re-scope: amend the plan/task", current_task=T1, tasks=tasks_with())

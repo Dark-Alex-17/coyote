@@ -226,6 +226,8 @@ initial_state:
   checklist_done: []
   pending_amendments: []
   amend_cycles: 0
+  amend_counts: {}
+  amend_source: ''
   amend_summary: ''
   amended: false
   after_reseal: ''
@@ -1175,7 +1177,7 @@ nodes:
   reseal_gate:
     id: reseal_gate
     type: script
-    description: A1 - count amendment cycles (3 per run -> owner); a mutated plan is unsealed and unreviewed; then Gate 1 over the FULL plan.
+    description: A1 - count amendment cycles per source (design, Gate 1 leaks, Gate 2 rejections, rework; each its own budget, under an overall ceiling -> owner); a mutated plan is unsealed and unreviewed; then Gate 1 over the FULL plan.
     script: scripts/reseal_gate.py
     fallback: end_failure
 
@@ -1482,7 +1484,7 @@ nodes:
       ## Task
       {{current_task}}
 
-      ## Evidence (the implementer's report, tail)
+      ## Evidence (the implementer's report, each item trimmed from its end)
       {{failure_evidence}}
 
       Plan: {{plan_path}}   Code repo: {{code_repo_path}}

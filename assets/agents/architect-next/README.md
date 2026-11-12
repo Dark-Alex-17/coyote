@@ -120,23 +120,23 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:621:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
-scripts/gates.py:46:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:3695:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:3704:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/_lib.py:687:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
+scripts/gates.py:48:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
+scripts/gates.py:3739:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:3748:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1207:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:1612:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:2233:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1371:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:1776:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:2401:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:621` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:687` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
-command), `gates.py:46` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:3695` and `:3704` are the English verb `make` in prompt prose, and
+command), `gates.py:48` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
+lockfile names), `gates.py:3739` and `:3748` are the English verb `make` in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -216,6 +216,28 @@ test-file paths (read only when the probe verdict is PASS, adoption capped at on
 When the reply carries a gauntlet header verdict, none of them can turn a BLOCKED into a
 PASS, or a PASS into anything but that one capped adopt round; the direct adversary lane
 has no header, so its `ADVERSARIAL_REVIEW:` line is the only verdict there.
+
+### Amendment budgets and evidence trimming
+
+Every `amend_plan` round is tagged with its source (`queue_amendments` in `gates.py`), and
+`reseal_gate` counts it in `amend_counts` against that source's own budget: `design` (design
+round answers and accepted checklist items, `AMEND_DESIGN_MAX`), `gate1` (leak answers and the
+owner's `gate1_stuck` answers, `AMEND_GATE1_MAX`), `gate2` (oracle rejections,
+`AMEND_GATE2_MAX`) and `rework` (plan-gate revisions, re-scopes, plan defects, probe recipes and
+integration findings, `AMEND_REWORK_MAX`; an untagged round counts here). `amend_cycles` is the
+run total under the overall ceiling `AMEND_CYCLES_MAX`, the sum of the source budgets, so it
+never cuts into one source's budget. Going past either raises `amend_cap` with the source and
+what tripped (`over`: `source`, `ceiling`) in its data, and "Allow one more amendment cycle"
+grants one more cycle of what tripped. A design round or a Gate 1 leak never spends a Gate 2
+chance.
+
+Oracle rejections reach `amend_plan` whole up to `GATE2_AMEND_CHARS`. Past that, and in the
+bounded verdict, report and summary evidence of the planning gates and the task-failure ask,
+`trim_items` (`_lib.py`) splits the text into its preamble and its column-0 items and trims
+each from its end, the shortest kept whole first, so every item's start survives (up to
+`ITEM_HEAD_MIN` characters of it while the bound has room). The result never exceeds the
+bound: when the items are too many for `ITEM_HEAD_FLOOR` characters each, the trailing ones
+are dropped with a count, and a text with no items keeps its start and its end.
 
 ## Verify
 

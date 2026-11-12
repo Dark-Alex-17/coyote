@@ -26,8 +26,14 @@ import time
 # ---------------------------------------------------------------- constants
 STRIKE_LIMIT = 3          # 3-strike family (B1, B5, B14, B16, B18, B22)
 RERUN_ONCE = 1            # re-run-once family (B3 retry, B4, B6, B9-B13, B17, B23)
-AMEND_CYCLES_MAX = 3      # A1: amendment cycles per run
 DESIGN_ROUNDS_MAX = STRIKE_LIMIT
+# A1: amendment cycles per run, budgeted per source so that one source never spends another's chances
+AMEND_DESIGN_MAX = DESIGN_ROUNDS_MAX + 1  # each design round's answers, plus the checklist round's accepted items
+AMEND_GATE1_MAX = 2 * (STRIKE_LIMIT + 1)  # the prose architect's 2 leak amend cycles per sealing: the first, and one per oracle REJECT
+AMEND_GATE2_MAX = STRIKE_LIMIT            # one amendment per oracle REJECT (B5)
+AMEND_REWORK_MAX = STRIKE_LIMIT           # owner revisions, re-scopes, plan defects, recipes, integration findings
+# the hard overall ceiling: the sum of the source budgets, so no source spends another's chances through it
+AMEND_CYCLES_MAX = AMEND_DESIGN_MAX + AMEND_GATE1_MAX + AMEND_GATE2_MAX + AMEND_REWORK_MAX
 CHOICE_OPTIONS_MIN = 2    # a multiple-choice question offers 2-4 options, one recommended
 CHOICE_OPTIONS_MAX = 4
 DISCUSSION_PARKS_MAX = 3  # times one multiple-choice question may park the run for a discussion
@@ -55,6 +61,7 @@ PR_TRACKING_ENUM = ("ci", "review")
 VERIFY_CMD_SECS = 900     # gauntlet: each verification command <= 15 min
 VERIFY_SET_SECS = 3300    # gauntlet: the whole set <= 55 min
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes
+GATE2_AMEND_CHARS = 4 * TAIL_CHARS  # an oracle rejection reaches amend_plan whole up to this, then per item from its end
 
 # Fork constants (the ONLY script-level fork deltas; design doc section 7, D2/D5/D8).
 # Everything below this line down to the hard-trigger regex is fork text; the upstream
@@ -164,6 +171,64 @@ def truthy(v):
 def tail(text, n=TAIL_CHARS):
     text = text or ""
     return text if len(text) <= n else "... [trimmed] ...\n" + text[-n:]
+
+
+ITEM_START_RE = re.compile(r"^(?:\d+[.)]|[-*+]|#{1,6})\s")
+ITEM_HEAD_MIN = 160    # each item keeps this much of its start while the bound has room for it
+ITEM_HEAD_FLOOR = 40   # below this per item, the trailing items are dropped with a count instead
+ITEM_TRIMMED = " ... [trimmed]"
+BLOCK_TRIMMED = "\n... [trimmed] ...\n"
+
+
+def trim_items(text, n=TAIL_CHARS):
+    """Bound a verdict or report to n chars, keeping the start of every item it can.
+
+    The text splits into a preamble and the items that start at column 0 (a numbered or
+    bulleted line, or a heading). Each block keeps its start and loses only its end, the
+    shortest kept whole first, so item 1's start survives however long the rest is. A text
+    with no items keeps its start and its end. When the items are too many for even
+    ITEM_HEAD_FLOOR characters each, the trailing ones are dropped with a count.
+    """
+    text = text or ""
+    if len(text) <= n:
+        return text
+    blocks = []
+    for line in text.splitlines(keepends=True):
+        if not blocks or ITEM_START_RE.match(line):
+            blocks.append(line)
+        else:
+            blocks[-1] += line
+    if len(blocks) == 1:
+        half = max(n - len(BLOCK_TRIMMED), 0) // 2
+        return text[:half] + BLOCK_TRIMMED + (text[-half:] if half else "")
+    floor = min(ITEM_HEAD_MIN, max(n // len(blocks) - len(ITEM_TRIMMED), ITEM_HEAD_FLOOR))
+    budget = max(n - len(ITEM_TRIMMED) * len(blocks), 0)
+    alloc = [0] * len(blocks)
+    order = sorted(range(len(blocks)), key=lambda i: len(blocks[i]))
+    for rank, i in enumerate(order):
+        share = budget // (len(blocks) - rank)
+        alloc[i] = min(len(blocks[i]), max(share, floor))
+        budget = max(budget - alloc[i], 0)
+    out = []
+    for block, keep in zip(blocks, alloc):
+        if keep >= len(block):
+            out.append(block)
+        else:
+            out.append(block[:keep].rstrip() + ITEM_TRIMMED + ("\n" if block.endswith("\n") else ""))
+    kept, size = [], 0
+    for i, piece in enumerate(out):
+        last = i == len(out) - 1
+        more = f"... [{len(out) - i} more items trimmed]\n"
+        if size + len(piece) + (0 if last else len(more)) > n:
+            if not kept:
+                # the first block's start survives even when it alone fills the bound
+                more = f"... [{len(out) - 1} more items trimmed]\n"
+                kept.append(piece[:max(n - len(more), 0)])
+            kept.append(more)
+            break
+        kept.append(piece)
+        size += len(piece)
+    return "".join(kept)
 
 
 def now_iso():
@@ -286,7 +351,8 @@ STATE_KEYS = (
     "run_id", "run_dir", "phase", "mode_vector", "code_repo_path", "tasks_root", "plans_root", "base_branch_name",
     "owner_name", "reference_root_path", "design_doc_path", "seed_path", "draft_path", "draft_rounds", "draft_feedback",
     "draft_text", "plan_path", "plan_slug", "plan_revision",
-    "amend_cycles", "leak_fingerprints", "oracle_rejects", "gate1_verdict", "gate2_verdict", "sealed",
+    "amend_cycles", "amend_counts", "amend_source", "leak_fingerprints", "oracle_rejects", "gate1_verdict",
+    "gate2_verdict", "sealed",
     "current_task", "current_unit", "run_branch", "group_index", "pending_fixes", "task_rounds",
     "batch_state", "wave_results", "pr_numbers", "ci_reruns", "ci_fix_strikes", "parked", "escalation",
     "autonomous_digest", "decisions", "follow_ups", "rejected_findings", "deferred_findings", "skipped_reviews",
