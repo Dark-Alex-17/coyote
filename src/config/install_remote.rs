@@ -789,13 +789,18 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
         }
     }
 
+    let mut question = UninstallQuestion {
+        assume_yes,
+        sticky: None,
+        prompter,
+        note: &mut print_note,
+    };
     let files = uninstall_owned_files(
         &mut store,
         &name,
         &record.files,
         &paths::config_dir(),
-        assume_yes,
-        prompter,
+        &mut question,
     )?;
 
     if files.tools_seen {
@@ -810,8 +815,7 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
         &name,
         &record.mcp_servers,
         &paths::mcp_config_file(),
-        assume_yes,
-        prompter,
+        &mut question,
     )?;
 
     let empty = store
@@ -891,7 +895,7 @@ fn select_uninstall_candidate(
                         "pick between the bundles matching '{spec}' ({})",
                         described.join(", ")
                     ),
-                    ", or pass the exact bundle name or source URL.",
+                    " or pass the exact bundle name or source URL.",
                 ));
             }
 
@@ -948,11 +952,9 @@ fn uninstall_owned_files(
     bundle: &str,
     files: &[FileRecord],
     config_dir: &Path,
-    assume_yes: bool,
-    prompter: &dyn Prompter,
+    question: &mut UninstallQuestion<'_>,
 ) -> Result<UninstallFileSummary> {
     let mut summary = UninstallFileSummary::default();
-    let mut sticky: Option<ObsoleteAction> = None;
     for file in files {
         if !is_safe_relative_path(&file.path) {
             eprintln!(
@@ -982,8 +984,7 @@ fn uninstall_owned_files(
         }
 
         let prompt = format!("File {} was modified locally after install", file.path);
-        let action =
-            resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter, &mut print_note)?;
+        let action = question.resolve(&prompt)?;
         apply_uninstall_file_action(
             store,
             bundle,
@@ -1067,6 +1068,28 @@ fn prune_empty_dirs(full: &Path, config_dir: &Path) {
     }
 }
 
+/// The keep-or-delete question an uninstall asks about every modified
+/// item, owned files and mcp.json entries alike: one keep-all answer
+/// settles the whole run and the kept note is printed once.
+struct UninstallQuestion<'a> {
+    assume_yes: bool,
+    sticky: Option<ObsoleteAction>,
+    prompter: &'a dyn Prompter,
+    note: &'a mut dyn FnMut(&str),
+}
+
+impl UninstallQuestion<'_> {
+    fn resolve(&mut self, prompt: &str) -> Result<ObsoleteAction> {
+        resolve_uninstall_action(
+            prompt,
+            self.assume_yes,
+            &mut self.sticky,
+            self.prompter,
+            self.note,
+        )
+    }
+}
+
 fn resolve_uninstall_action(
     prompt: &str,
     assume_yes: bool,
@@ -1100,8 +1123,7 @@ fn uninstall_mcp_entries(
     bundle: &str,
     servers: &[McpServerRecord],
     mcp_path: &Path,
-    assume_yes: bool,
-    prompter: &dyn Prompter,
+    question: &mut UninstallQuestion<'_>,
 ) -> Result<UninstallMcpSummary> {
     let mut summary = UninstallMcpSummary::default();
     if servers.is_empty() {
@@ -1139,7 +1161,6 @@ fn uninstall_mcp_entries(
 
     let mut changed = false;
     let mut released = Vec::new();
-    let mut sticky: Option<ObsoleteAction> = None;
     for server in servers {
         let key = server.effective_key().to_string();
         if server.action == McpAction::Replaced {
@@ -1166,7 +1187,7 @@ fn uninstall_mcp_entries(
                 "was modified locally after install"
             };
             let prompt = format!("MCP server '{key}' {reason}");
-            resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter, &mut print_note)?
+            question.resolve(&prompt)?
         };
         match action {
             ObsoleteAction::Keep => {
@@ -5816,7 +5837,7 @@ mod tests {
         );
         assert!(message.contains("omc-fork"), "got: {message}");
         assert!(
-            message.ends_with("Re-run in a terminal, or pass the exact bundle name or source URL."),
+            message.ends_with("Re-run in a terminal or pass the exact bundle name or source URL."),
             "got: {message}"
         );
         let store = BundleStore::load().unwrap();
@@ -5853,6 +5874,17 @@ mod tests {
             category: "macros".to_string(),
             sha256: hash_bytes(contents.as_bytes()),
             action: FileAction::New,
+        }
+    }
+
+    /// The uninstall question under `--yes`: never asked, so no prompter
+    /// is reached and `note` stays silent.
+    fn yes_to_all(note: &mut dyn FnMut(&str)) -> UninstallQuestion<'_> {
+        UninstallQuestion {
+            assume_yes: true,
+            sticky: None,
+            prompter: &HeadlessPrompter,
+            note,
         }
     }
 
@@ -5966,8 +5998,7 @@ mod tests {
             "omc",
             &files,
             &dir,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6001,8 +6032,7 @@ mod tests {
             "omc",
             &files,
             &dir,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6059,8 +6089,7 @@ mod tests {
             "omc",
             &files,
             &dir,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
         drop(restore);
@@ -6108,8 +6137,7 @@ mod tests {
             "omc",
             &files,
             &config_dir,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6146,8 +6174,7 @@ mod tests {
             "omc",
             &servers,
             &mcp,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6195,8 +6222,7 @@ mod tests {
             "omc",
             &servers,
             &mcp,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6245,8 +6271,7 @@ mod tests {
             "omc",
             &servers,
             &mcp,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6299,8 +6324,7 @@ mod tests {
             "omc",
             &servers,
             &mcp,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6338,8 +6362,7 @@ mod tests {
             "omc",
             &servers,
             &mcp,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6377,8 +6400,7 @@ mod tests {
             "omc",
             &servers,
             &mcp,
-            true,
-            &ScriptedPrompter::refusing(),
+            &mut yes_to_all(&mut |_| {}),
         )
         .unwrap();
 
@@ -6637,6 +6659,63 @@ mod tests {
         );
     }
 
+    /// A headless uninstall of a bundle with a modified file and a
+    /// modified mcp.json server keeps both and says so once: the first
+    /// unanswerable question settles the whole run.
+    #[test]
+    #[serial]
+    fn a_headless_uninstall_prints_the_kept_note_once() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let dir = fresh_temp_dir("uninst-headless-once-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        write_src(&dir, "macros/edited.yaml", "user edit");
+        store
+            .record_file("omc", owned_file_record("macros/edited.yaml", "original"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "edited"}}}"#,
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record(
+                    "srv",
+                    McpAction::Added,
+                    Some(hash_bytes(b"original")),
+                )],
+            )
+            .unwrap();
+        let record = store.get("omc").unwrap().clone();
+        let mut notes = Vec::new();
+        let mut question = UninstallQuestion {
+            assume_yes: false,
+            sticky: None,
+            prompter: &HeadlessPrompter,
+            note: &mut |note| notes.push(note.to_string()),
+        };
+
+        let files =
+            uninstall_owned_files(&mut store, "omc", &record.files, &dir, &mut question).unwrap();
+        let servers =
+            uninstall_mcp_entries(&mut store, "omc", &record.mcp_servers, &mcp, &mut question)
+                .unwrap();
+
+        assert_eq!(files.kept, 1);
+        assert_eq!(servers.kept, vec!["srv"]);
+        assert_eq!(question.sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: the question was cancelled."]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Closing the uninstall question keeps the modified file and keeps
     /// every later one without asking again; the note says so once.
     #[test]
@@ -6702,7 +6781,7 @@ mod tests {
             "got: {message}"
         );
         assert!(
-            message.ends_with("non-interactively. Re-run in a terminal, or pass the exact bundle name or source URL."),
+            message.ends_with("non-interactively. Re-run in a terminal or pass the exact bundle name or source URL."),
             "got: {message}"
         );
     }
