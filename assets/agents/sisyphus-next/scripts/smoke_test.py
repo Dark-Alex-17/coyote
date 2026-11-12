@@ -3131,6 +3131,7 @@ NEW_BRANCH_PR_SUBTASKS = [
 GIT_STATE_RE = getattr(gates, "GIT_STATE_RE", None)
 PUBLISH_REVIEW_NOTE = getattr(gates, "PUBLISH_REVIEW_NOTE", None)
 PUBLISH_ALL = {"commit": True, "push": True, "open_pr": True, "new_branch": True, "draft": True}
+PUBLISH_ASK = "add a hello endpoint. Commit on a new branch and open a draft PR."
 
 
 def as_list_(v):
@@ -3147,7 +3148,8 @@ def asks_all(actions):
 
 
 pub_dir = os.path.join(TMP, "runs", "publish-trailing")
-u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={}))
+u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={},
+                                     brief=PUBLISH_ASK))
 kept = as_list_(u.get("subtasks"))
 folded = as_list_(u.get("publish_criteria"))
 tasklog_exists = os.path.exists(os.path.join(pub_dir, "tasklog.md"))
@@ -3159,7 +3161,7 @@ check("publish: a trailing 'Branch, commit, and open draft PR' subtask folds int
       and "Branch, commit, and open draft PR" not in tasklog and any("folded into git_actions" in d for d in u.get("decisions", [])),
       (len(kept), u.get("git_actions"), folded))
 
-u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}))
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}, brief=PUBLISH_ASK))
 ef_kept = as_list_(u.get("subtasks"))
 check("publish: a trailing 'Commit on a new branch and open a draft PR' subtask folds into git_actions (4 -> 3 subtasks)",
       len(ef_kept) == 3 and asks_all(u.get("git_actions")) and not git_state_left(ef_kept)
@@ -3177,10 +3179,28 @@ check("publish: a final whole-task review carrying PR-body criteria drops them a
       "Add account and date filters" in gp and "`./ci test` passes" in gp and "new branch" not in gp
       and "PR body" not in gp and "PR description" not in gp and PUBLISH_REVIEW_NOTE is not None and PUBLISH_REVIEW_NOTE in gp, gp)
 
-u = gates.record_subtasks(base_state(subtasks=[NEW_BRANCH_PR_SUBTASKS[3]], top_level=True, git_actions={}))
+u = gates.record_subtasks(base_state(subtasks=[NEW_BRANCH_PR_SUBTASKS[3]], top_level=True, git_actions={}, brief=PUBLISH_ASK))
 check("publish: a plan that only publishes keeps one subtask for the brief",
-      [s.get("outcome") for s in as_list_(u.get("subtasks"))] == ["add a hello endpoint"] and asks_all(u.get("git_actions")),
+      [s.get("outcome") for s in as_list_(u.get("subtasks"))] == [PUBLISH_ASK] and asks_all(u.get("git_actions")),
       u.get("subtasks"))
+
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}))
+check("publish: a publish-only subtask nobody asked for still folds, adopts no git action and ledgers what it dropped",
+      len(as_list_(u.get("subtasks"))) == 3 and not u.get("git_actions")
+      and NEW_BRANCH_PR_SUBTASKS[3]["acceptance_criteria"][1] in as_list_(u.get("publish_criteria"))
+      and any("open_pr" in d and "push" in d and "dropped" in d for d in u.get("decisions", [])),
+      (u.get("git_actions"), u.get("decisions")))
+quoted_ask = ("add a hello endpoint.\n> Commit and open a draft PR\n```\ncommit and open a draft PR\n```\n"
+              "The ticket says \"open a draft PR\" and \u201ccommit and push\u201d.")
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}, brief=quoted_ask))
+check("publish: an ask that is only quoted, fenced or in double quotes grants no git action",
+      not u.get("git_actions") and gates._brief_git_asks(quoted_ask) == {}, u.get("git_actions"))
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={}, brief=quoted_ask))
+check("route_intent: a quoted-only ask derives no git action", "git_actions" not in u, u.get("git_actions"))
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={"commit": True}))
+check("publish: assess asked only to commit -> a planned PR subtask adopts commit and drops the rest",
+      u.get("git_actions") == {"commit": True}
+      and any("open_pr" in d and "dropped" in d for d in u.get("decisions", [])), u.get("git_actions"))
 
 mixed = {"title": "Add the void endpoint", "outcome": "POST /v1/invoices/{id}/void voids an open invoice",
          "acceptance_criteria": ["`./ci test` passes", "POST /v1/invoices/{id}/void returns 200 with status void",

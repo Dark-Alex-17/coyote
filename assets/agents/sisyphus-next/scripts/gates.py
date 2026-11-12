@@ -538,9 +538,10 @@ def _brief_git_asks(brief):
     """The git actions the brief's imperative clauses ask for.
 
     Only a clause that opens with the verb asks. A negation ("do not", "never") governs every later clause of its
-    sentence until a "but" or "instead" turns it, so "do not commit, push, or open a PR" asks nothing."""
+    sentence until a "but" or "instead" turns it, so "do not commit, push, or open a PR" asks nothing. Quoted or
+    pasted text is not the user asking, so it is read without those parts (see _own_prose)."""
     asks = {}
-    for sentence in re.split(r"[.!?;:\n]+", brief.replace("\u2019", "'")):
+    for sentence in re.split(r"[.!?;:\n]+", _own_prose(brief).replace("\u2019", "'")):
         negated = False
         for clause in re.split(r",\s*|\s+(?=(?:and|then|but)\s)", sentence):
             clause = re.sub(r"^(?:(?:and|then|or)\s+)+", "", clause.strip(), flags=re.I)
@@ -564,6 +565,25 @@ def _brief_git_asks(brief):
             if _NEW_BRANCH_RE.search(clause):
                 asks["new_branch"] = True
     return asks if asks.get("commit") else {}
+
+
+def _own_prose(brief):
+    """The brief without '>' quote lines, ``` or ~~~ fenced blocks, and text inside straight or curly double quotes.
+
+    An unclosed fence or quote swallows the rest of the brief."""
+    lines, fence = [], ""
+    for line in brief.splitlines():
+        stripped = line.lstrip()
+        if fence:
+            if stripped.startswith(fence):
+                fence = ""
+            continue
+        if stripped.startswith(("```", "~~~")):
+            fence = stripped[:3]
+            continue
+        if not stripped.startswith(">"):
+            lines.append(line)
+    return re.sub(r'"[^"]*(?:"|$)|\u201c[^\u201d]*(?:\u201d|$)', " ", "\n".join(lines))
 
 
 def _not_a_step_run(state):
@@ -794,8 +814,12 @@ def _publish_asks_in(text):
 
 
 def _fold_publish(state, u, subtasks):
-    """Publish-only subtasks become git_actions, and every git/PR-state criterion moves to publish_criteria."""
+    """Publish-only subtasks are folded away, and every git/PR-state criterion moves to publish_criteria.
+
+    The planner's word grants no git action: a folded subtask only adopts what assess or the brief already asks for,
+    so an injected or confused plan cannot push or open a PR unasked."""
     actions = dict(as_dict(state.get("git_actions")))
+    granted = _granted_git_actions(actions, _brief_git_asks(str(state.get("brief") or "")))
     publish = list(as_list(state.get("publish_criteria")))
     kept, moved = [], False
     for i, s in enumerate(subtasks, 1):
@@ -805,12 +829,18 @@ def _fold_publish(state, u, subtasks):
         if _publish_only(s, criteria, git_state):
             asked = _publish_asks_in(" ".join([str(title), str(s.get("outcome") or ""),
                                                str(s.get("constraints") or ""), *criteria]))
-            actions.update(asked)
+            adopted = {k: v for k, v in asked.items() if k in granted}
+            dropped = [k for k in asked if k not in granted]
+            actions.update(adopted)
             moving = dict.fromkeys([str(s.get("outcome") or "").strip(), *git_state])
             publish += [c for c in moving if c and c not in publish]
             moved = True
             ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}) only publishes -> folded into "
-                             f"git_actions ({', '.join(asked)}); its git/PR-state criteria go to the publish check")
+                             f"git_actions ({', '.join(adopted) or 'none adopted'}); its git/PR-state criteria go to "
+                             "the publish check")
+            if dropped:
+                ledger(state, u, f"subtasks: subtask {i} implies {', '.join(dropped)}, which neither assess nor the "
+                                 "brief asked for -> dropped")
             continue
         if git_state:
             s = {**s, "acceptance_criteria": [c for c in criteria if c not in git_state]}
@@ -827,6 +857,16 @@ def _fold_publish(state, u, subtasks):
         ledger(state, u, "subtasks: only publishing was planned -> one subtask for the brief")
         kept = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
     return kept
+
+
+def _granted_git_actions(*sources):
+    """The git actions any source asks for, with an open PR granting the push and commit it needs."""
+    granted = {k for src in sources for k, v in src.items() if truthy(v)}
+    if "open_pr" in granted:
+        granted.add("push")
+    if "push" in granted:
+        granted.add("commit")
+    return granted
 
 
 # Tests written ahead of the code they test: said in the title or outcome, or a criterion wants the suite red.
