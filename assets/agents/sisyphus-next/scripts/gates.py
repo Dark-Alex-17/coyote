@@ -568,9 +568,11 @@ def _brief_git_asks(brief):
 
 
 def _own_prose(brief):
-    """The brief without '>' quote lines, ``` or ~~~ fenced blocks, and text inside straight or curly double quotes.
+    """The brief without '>' quote lines, ``` or ~~~ fenced blocks, `code` spans, and text inside straight or curly
+    double quotes.
 
-    An unclosed fence or quote swallows the rest of the brief."""
+    An unclosed fence swallows the rest of the brief; an unclosed quote ends at its own line. Code spans go first, so
+    a quote character inside one opens no quote."""
     lines, fence = [], ""
     for line in brief.splitlines():
         stripped = line.lstrip()
@@ -583,7 +585,8 @@ def _own_prose(brief):
             continue
         if not stripped.startswith(">"):
             lines.append(line)
-    return re.sub(r'"[^"]*(?:"|$)|\u201c[^\u201d]*(?:\u201d|$)', " ", "\n".join(lines))
+    prose = re.sub(r"`[^`\n]*`", " ", "\n".join(lines))
+    return re.sub(r'"[^"\n]*(?:"|$)|\u201c[^\u201d\n]*(?:\u201d|$)', " ", prose, flags=re.M)
 
 
 def _not_a_step_run(state):
@@ -817,10 +820,14 @@ def _fold_publish(state, u, subtasks):
     """Publish-only subtasks are folded away, and every git/PR-state criterion moves to publish_criteria.
 
     The planner's word grants no git action: a folded subtask only adopts what assess or the brief already asks for,
-    so an injected or confused plan cannot push or open a PR unasked."""
+    so an injected or confused plan cannot push or open a PR unasked. Its modifiers ride along with the actions they
+    qualify, so a granted push still goes to the planned new branch rather than the current one. With nothing granted
+    there is no publish step to check the criteria, so they go to follow_ups instead."""
     actions = dict(as_dict(state.get("git_actions")))
     granted = _granted_git_actions(actions, _brief_git_asks(str(state.get("brief") or "")))
     publish = list(as_list(state.get("publish_criteria")))
+    known = len(publish)
+    dest = "the publish check" if granted else "follow_ups, as nothing asks to publish"
     kept, moved = [], False
     for i, s in enumerate(subtasks, 1):
         criteria = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
@@ -829,15 +836,17 @@ def _fold_publish(state, u, subtasks):
         if _publish_only(s, criteria, git_state):
             asked = _publish_asks_in(" ".join([str(title), str(s.get("outcome") or ""),
                                                str(s.get("constraints") or ""), *criteria]))
-            adopted = {k: v for k, v in asked.items() if k in granted}
-            dropped = [k for k in asked if k not in granted]
+            adopted = {k: v for k, v in asked.items() if k in granted and k not in _GIT_MODIFIERS}
+            adopted.update({k: v for k, v in asked.items()
+                            if any(a in adopted for a in _GIT_MODIFIERS.get(k, ()))})
+            dropped = [k for k in asked if k not in adopted and k not in _GIT_MODIFIERS]
             actions.update(adopted)
             moving = dict.fromkeys([str(s.get("outcome") or "").strip(), *git_state])
             publish += [c for c in moving if c and c not in publish]
             moved = True
             ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}) only publishes -> folded into "
                              f"git_actions ({', '.join(adopted) or 'none adopted'}); its git/PR-state criteria go to "
-                             "the publish check")
+                             f"{dest}")
             if dropped:
                 ledger(state, u, f"subtasks: subtask {i} implies {', '.join(dropped)}, which neither assess nor the "
                                  "brief asked for -> dropped")
@@ -847,12 +856,17 @@ def _fold_publish(state, u, subtasks):
             publish += [c for c in dict.fromkeys(git_state) if c not in publish]
             moved = True
             ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}): {len(git_state)} git/PR-state "
-                             "criteria moved to the publish check: "
+                             f"criteria moved to {dest}: "
                              + "; ".join(repr(_one_line(c, 120)) for c in git_state))
         kept.append(s)
     if not moved:
         return subtasks
-    u["git_actions"], u["publish_criteria"] = actions, publish
+    u["git_actions"] = actions
+    if granted:
+        u["publish_criteria"] = publish
+    else:
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+            f"planned publish not asked for: {c}" for c in publish[known:]]
     if not kept:
         ledger(state, u, "subtasks: only publishing was planned -> one subtask for the brief")
         kept = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
@@ -867,6 +881,10 @@ def _granted_git_actions(*sources):
     if "push" in granted:
         granted.add("commit")
     return granted
+
+
+# Modifiers qualify an action rather than being one: each is adopted with any action it qualifies and never alone.
+_GIT_MODIFIERS = {"new_branch": ("commit", "push", "open_pr"), "draft": ("open_pr",)}
 
 
 # Tests written ahead of the code they test: said in the title or outcome, or a criterion wants the suite red.
