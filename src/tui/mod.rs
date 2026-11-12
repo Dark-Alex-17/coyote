@@ -9164,6 +9164,7 @@ mod tests {
         for signature in [
             "pub fn ask(",
             "pub(crate) fn confirm(",
+            "pub(crate) fn confirm_or_cancel(",
             "pub(crate) fn confirm_with_help(",
             "pub(crate) fn select_closed(",
             "pub(crate) fn select_closed_or_cancel(",

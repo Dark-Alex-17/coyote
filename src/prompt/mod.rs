@@ -280,6 +280,23 @@ pub(crate) fn confirm(
     ask(prompter, req).and_then(PromptAnswer::into_confirmed)
 }
 
+/// [`confirm`] for a question where closing it is itself an answer:
+/// `Ok(None)` when the human cancelled instead of answering.
+pub(crate) fn confirm_or_cancel(
+    prompter: &dyn Prompter,
+    question: impl Into<String>,
+    default: bool,
+) -> Result<Option<bool>> {
+    let req = PromptRequest {
+        default: Some(json!(default)),
+        ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
+    };
+    match ask(prompter, req)? {
+        PromptAnswer::Cancelled => Ok(None),
+        answer => answer.into_confirmed().map(Some),
+    }
+}
+
 /// A confirm whose context was printed to stdout before the question.
 /// Under the TUI that output lands in the transcript, so the same text
 /// rides along as the request's help and the modal shows it as well.
