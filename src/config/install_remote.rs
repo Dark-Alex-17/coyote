@@ -810,6 +810,13 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -
         );
     }
 
+    // A delete-all answer was given about owned files and must not
+    // delete mcp.json servers it never mentioned; keep-all is the safe
+    // answer and stays.
+    if question.sticky == Some(ObsoleteAction::Delete) {
+        question.sticky = None;
+    }
+
     let mcp = uninstall_mcp_entries(
         &mut store,
         &name,
@@ -6753,6 +6760,80 @@ mod tests {
             ["Kept the locally modified items: the question was cancelled."]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A delete-all answer about the owned files does not carry into the
+    /// mcp.json loop: the modified server is asked about on its own and
+    /// a keep there keeps it.
+    #[test]
+    #[serial]
+    fn delete_all_on_the_files_loop_does_not_carry_into_the_mcp_loop() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("uninst-delete-all-files-only");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let edited = guard.path.join("macros/edited.yaml");
+        write_src(&guard.path, "macros/edited.yaml", "user edit");
+        store
+            .record_file("omc", owned_file_record("macros/edited.yaml", "original"))
+            .unwrap();
+        let mcp = paths::mcp_config_file();
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "edited"}}}"#,
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record(
+                    "srv",
+                    McpAction::Added,
+                    Some(hash_bytes(b"original")),
+                )],
+            )
+            .unwrap();
+        drop(store);
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Selected("delete-all".into()),
+            PromptAnswer::Selected("keep".into()),
+        ]);
+
+        uninstall_bundle("omc", false, &prompter).unwrap();
+
+        assert!(!edited.exists(), "delete-all must delete the owned file");
+        let servers: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(
+            servers["mcpServers"]["srv"].is_object(),
+            "keep must leave the server in mcp.json: {servers}"
+        );
+        let store = BundleStore::load().unwrap();
+        let record = store.get("omc").unwrap();
+        assert!(record.files.is_empty());
+        assert_eq!(record.mcp_servers.len(), 1);
+        let requests = prompter.requests();
+        let asked: Vec<(PromptAction, &str)> = requests
+            .iter()
+            .map(|req| (req.action, req.question.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (PromptAction::Confirm, "Uninstall bundle 'omc'?"),
+                (
+                    PromptAction::Select,
+                    "File macros/edited.yaml was modified locally after install"
+                ),
+                (
+                    PromptAction::Select,
+                    "MCP server 'srv' was modified locally after install"
+                ),
+            ]
+        );
     }
 
     /// Closing the uninstall question keeps the modified file and keeps
