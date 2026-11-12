@@ -4508,31 +4508,11 @@ fn a_tty_less_graph_agent_with_an_unbuilt_rag_node_is_refused_naming_the_node() 
 /// its log at `debug` level into `log`, so a test can read what a silent
 /// run recorded.
 fn run_ttyless_logging(dir: &Path, args: &[&str], log: &Path, what: &str) -> (bool, String) {
-    let mut cmd = ttyless_command(built_binary(), dir);
-    cmd.args(args)
-        .env("COYOTE_LOG_LEVEL", "debug")
-        .env("COYOTE_LOG_PATH", log)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    while child.try_wait().unwrap().is_none() {
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!(
-                "{what}: `coyote {}` with no terminal hung on a prompt",
-                args.join(" ")
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let out = child.wait_with_output().unwrap();
-    let everything = format!(
-        "--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    (out.status.success(), everything)
+    let env = [
+        ("COYOTE_LOG_LEVEL", "debug"),
+        ("COYOTE_LOG_PATH", log.to_str().unwrap()),
+    ];
+    run_ttyless_with_env(built_binary(), dir, args, &env, what)
 }
 
 /// The `[DEBUG]` lines of `log` that record `name` skipping its optional

@@ -2565,25 +2565,13 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
             .unwrap();
         let files_before = walk(&dir);
 
-        let mut cmd = ttyless_command(built_binary(), &dir);
-        cmd.args(["--macro", "asking"])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        let deadline = std::time::Instant::now() + PTY_DEADLINE;
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() > deadline {
-                let _ = child.kill();
-                panic!("{scenario}: `--macro` with `{step}` and no terminal hung on its prompt");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let out = child.wait_with_output().unwrap();
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        let everything = format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+        let (ok, everything) = run_ttyless(
+            &dir,
+            &["--macro", "asking"],
+            &format!("{scenario}: `--macro` with `{step}`"),
+        );
         assert!(
-            !out.status.success(),
+            !ok,
             "{scenario}: a refused tty-less `{step}` exited 0:\n{everything}"
         );
         match refused_action {
@@ -2615,7 +2603,7 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
             );
         }
         assert!(
-            !stdout.contains("log_path"),
+            !everything.contains("log_path"),
             "{scenario}: the macro went on to `.info` after the refused `{step}`:\n{everything}"
         );
     }

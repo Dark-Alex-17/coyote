@@ -213,13 +213,29 @@ pub fn run_ttyless(dir: &Path, args: &[&str], what: &str) -> (bool, String) {
 
 /// [`run_ttyless`] for a copy of the binary living elsewhere (the
 /// self-update path classifies the install by where the executable is).
+pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) -> (bool, String) {
+    run_ttyless_with_env(binary, dir, args, &[], what)
+}
+
+/// [`run_ttyless_binary`] with `extra_env` added to the shared
+/// environment (a log path, a level) for a test that reads back what a
+/// silent run recorded.
 /// Both pipes are drained on their own threads while the child runs, so
 /// a chatty child cannot block on a full pipe and be mistaken for a hang;
 /// a child that is still running at the deadline is killed, reaped and
 /// reported with whatever it had written by then.
-pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) -> (bool, String) {
+pub fn run_ttyless_with_env(
+    binary: &Path,
+    dir: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    what: &str,
+) -> (bool, String) {
     let mut cmd = ttyless_command(binary, dir);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .envs(extra_env.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
     let stdout = drain(child.stdout.take().unwrap());
     let stderr = drain(child.stderr.take().unwrap());
