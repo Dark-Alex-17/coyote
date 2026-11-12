@@ -7388,35 +7388,33 @@ impl RequestContext {
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
-                // `Rag::init` refuses the same way, but only after the
-                // previous temp rag is gone; refusing first keeps it.
                 if !crate::config::conflict::menu_can_use_terminal() {
                     return Err(Rag::refuse_init(super::TEMP_RAG_NAME));
                 }
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
+                // A temp rag is never saved, so the wizard can run with
+                // the previous one still on disk; it is removed only once
+                // the wizard has answered, so a refusal or a cancelled
+                // question keeps it.
+                let rag = Rag::init(
+                    &app,
+                    super::TEMP_RAG_NAME,
+                    &rag_path,
+                    &[],
+                    false,
+                    RagInitRun {
+                        abort_signal: abort_signal.clone(),
+                        sync_hooks,
+                        prompter: prompter.as_ref(),
+                    },
+                )
+                .await?;
                 if rag_path.exists() {
                     remove_file(&rag_path).with_context(|| {
                         format!("Failed to cleanup previous '{}' rag", super::TEMP_RAG_NAME)
                     })?;
                 }
-                (
-                    Arc::new(
-                        Rag::init(
-                            &app,
-                            super::TEMP_RAG_NAME,
-                            &rag_path,
-                            &[],
-                            false,
-                            RagInitRun {
-                                abort_signal: abort_signal.clone(),
-                                sync_hooks,
-                                prompter: prompter.as_ref(),
-                            },
-                        )
-                        .await?,
-                    ),
-                    None,
-                )
+                (Arc::new(rag), None)
             }
             Some(name) => {
                 let rag_path = self.rag_file(name);
@@ -11899,10 +11897,10 @@ mod tests {
         );
     }
 
-    /// `.rag` with no name removes the previous temp rag and rebuilds it
-    /// through the wizard; under the full-screen UI the wizard's first
-    /// question, the embedding model, is a closed select through the
-    /// prompter.
+    /// `.rag` with no name rebuilds the temp rag through the wizard;
+    /// under the full-screen UI the wizard's first question, the
+    /// embedding model, is a closed select through the prompter. A
+    /// rebuild that fails on it keeps the previous temp rag.
     #[test]
     #[serial]
     fn use_rag_under_the_tui_asks_through_the_prompter() {
@@ -11928,8 +11926,8 @@ mod tests {
         assert!(req.closed);
         assert!(!req.options.is_empty());
         assert!(
-            !rag_path.exists(),
-            "the rebuild kept the previous temp rag at {}",
+            rag_path.exists(),
+            "the failed rebuild removed the previous temp rag at {}",
             rag_path.display()
         );
         assert!(ctx.rag.is_none());
@@ -11962,6 +11960,41 @@ mod tests {
             rag_path.display()
         );
         assert!(scripted.requests().is_empty());
+        assert!(ctx.rag.is_none());
+    }
+
+    /// On a terminal with no human to answer (a headless run), the
+    /// wizard's first question is refused as a typed select, and the
+    /// previous temp rag is still there, byte for byte.
+    #[test]
+    #[serial]
+    fn use_rag_without_a_name_and_without_a_human_refuses_with_a_typed_select_and_keeps_the_temp_rag()
+     {
+        use crate::prompt::{HeadlessPrompter, NeedsHuman};
+
+        let _guard = TestConfigDirGuard::new();
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let mut ctx = create_test_ctx();
+        let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(&rag_path, "driver: yaml\n").unwrap();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+        let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
+        assert!(NeedsHuman::caused(&err), "{err}");
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Select))
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            read_to_string(&rag_path).unwrap(),
+            "driver: yaml\n",
+            "the refused rebuild touched the previous temp rag at {}",
+            rag_path.display()
+        );
         assert!(ctx.rag.is_none());
     }
 
