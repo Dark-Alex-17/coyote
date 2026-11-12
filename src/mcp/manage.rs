@@ -116,6 +116,7 @@ fn handle_remove(name: &str, scope: Option<McpScopeArg>, force: bool) -> Result<
         let ok = confirm_on_the_terminal(
             format_args!("remove MCP server '{name}'"),
             format!("Remove MCP server '{name}' from {}?", path.display()),
+            " or pass --mcp-force.",
         )?;
         if !ok {
             println!("Aborted.");
@@ -146,6 +147,7 @@ fn handle_add(cli: &Cli, name: &str, vault: &Vault) -> Result<()> {
                 "MCP server '{name}' already exists in {}. Overwrite?",
                 path.display()
             ),
+            " or pass --mcp-force.",
         )?;
         if !ok {
             println!("Aborted. Use --mcp-force to overwrite without prompting.");
@@ -164,10 +166,14 @@ fn handle_add(cli: &Cli, name: &str, vault: &Vault) -> Result<()> {
 
 /// A yes/no question on the terminal, defaulting to no. A run with
 /// nowhere to ask is refused in the shared shape rather than left on a
-/// widget nothing can answer.
-fn confirm_on_the_terminal(action: fmt::Arguments<'_>, question: String) -> Result<bool> {
+/// widget nothing can answer; `remedy` names the flag that skips it.
+fn confirm_on_the_terminal(
+    action: fmt::Arguments<'_>,
+    question: String,
+    remedy: &str,
+) -> Result<bool> {
     if !menu_can_use_terminal() {
-        return Err(refuse_non_interactive(action, "."));
+        return Err(refuse_non_interactive(action, remedy));
     }
     let prompter = crate::prompt::InquirePrompter::default();
     crate::prompt::confirm(&prompter, question, false)
@@ -567,7 +573,8 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Refusing to remove MCP server 'github' non-interactively. Re-run in a terminal."
+            "Refusing to remove MCP server 'github' non-interactively. \
+             Re-run in a terminal or pass --mcp-force."
         );
         assert_eq!(dir.mcp_json(), before);
     }
@@ -593,7 +600,8 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "Refusing to overwrite MCP server 'github' non-interactively. Re-run in a terminal."
+            "Refusing to overwrite MCP server 'github' non-interactively. \
+             Re-run in a terminal or pass --mcp-force."
         );
         assert_eq!(dir.mcp_json(), before);
     }

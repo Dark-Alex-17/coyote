@@ -3428,9 +3428,9 @@ fn a_headless_macro_bare_dot_rag_on_a_terminal_is_refused_with_the_typed_select_
 /// `--mcp-remove <name>` and `--mcp-add <name>` for a server that is
 /// already configured are confirms; with no terminal they are refused in
 /// the shared shape (`remove MCP server '<name>'` / `overwrite MCP server
-/// '<name>'`, remedy `.`), exit non-zero and leave mcp.json byte-for-byte
-/// as it was. A terminal on stdout with stdin from /dev/null is refused
-/// the same way.
+/// '<name>'`, remedy ` or pass --mcp-force.`), exit non-zero and leave
+/// mcp.json byte-for-byte as it was. A terminal on stdout with stdin from
+/// /dev/null is refused the same way.
 #[test]
 #[serial]
 fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mcp_json_alone() {
@@ -3460,7 +3460,7 @@ fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mc
     let (action, remedy) = refusal_shape(&out)
         .unwrap_or_else(|| panic!("`--mcp-remove` is not refused in the shared shape:\n{out}"));
     assert_eq!(action, "remove MCP server 'probe-srv-r7m'", "{out}");
-    assert_eq!(remedy, ".", "{out}");
+    assert_eq!(remedy, " or pass --mcp-force.", "{out}");
     assert!(
         !out.contains("Remove MCP server"),
         "the tty-less `--mcp-remove` asked anyway:\n{out}"
@@ -3484,7 +3484,7 @@ fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mc
         panic!("`--mcp-add` of an existing server is not refused in the shared shape:\n{out}")
     });
     assert_eq!(action, "overwrite MCP server 'probe-srv-r7m'", "{out}");
-    assert_eq!(remedy, ".", "{out}");
+    assert_eq!(remedy, " or pass --mcp-force.", "{out}");
     assert_eq!(
         fs::read(&mcp_json).unwrap(),
         before,
@@ -3510,7 +3510,7 @@ fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mc
         panic!("the piped-stdin `--mcp-remove` is not refused in the shared shape:\n{plain}")
     });
     assert_eq!(action, "remove MCP server 'probe-srv-r7m'", "{plain}");
-    assert_eq!(remedy, ".", "{plain}");
+    assert_eq!(remedy, " or pass --mcp-force.", "{plain}");
     assert_eq!(
         fs::read(&mcp_json).unwrap(),
         before,
