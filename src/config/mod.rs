@@ -579,7 +579,11 @@ pub fn install_assets(
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
         AssetCategory::Hooks => {
-            let mut sticky = StickyMode::None;
+            let mut sticky = if assume_yes {
+                StickyMode::KeepAll
+            } else {
+                StickyMode::None
+            };
             hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
             Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
             Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
@@ -2189,6 +2193,29 @@ hooks:
         let _script = prompt_script::install_non_interactive();
         install_builtins(&prompt_script::Scripted).unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
+        assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
+    }
+
+    /// `--install-builtins hooks --yes` on a terminal starts the hook
+    /// installers in keep-all mode: no conflict menu, local edits kept.
+    #[test]
+    #[serial_test::serial]
+    fn with_yes_a_hooks_reinstall_asks_nothing_and_keeps_a_local_edit() {
+        use crate::config::conflict::prompt_script;
+        use crate::prompt::ScriptedPrompter;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-hooks-yes");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        install_builtins(&prompt_script::Scripted).unwrap();
+        let notify = paths::hooks_dir().join("notify.sh");
+        fs::write(&notify, "# local edit").unwrap();
+
+        let _script = prompt_script::install(&[]);
+        let prompter = ScriptedPrompter::refusing();
+
+        install_assets(AssetCategory::Hooks, &prompter, true, ".").unwrap();
+
+        assert!(prompter.requests().is_empty());
         assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
     }
 

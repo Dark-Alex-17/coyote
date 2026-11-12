@@ -283,7 +283,7 @@ pub struct Cli {
         help_heading = "Installation & Updates"
     )]
     pub uninstall: Option<String>,
-    /// Proceed without prompts for --uninstall and --update-bundle (locally modified items are always kept) and for --install-builtins (bundled items are overwritten)
+    /// Proceed without questions for --uninstall, --update-bundle and --install-builtins; locally modified items are always kept
     #[arg(
         long,
         requires = "yes_scope",
