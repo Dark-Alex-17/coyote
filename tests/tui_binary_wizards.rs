@@ -271,6 +271,108 @@ fn dot_install_of_a_bundle_with_secrets_defers_every_secret_the_user_declines() 
     assert_tty_restored(&transcript);
 }
 
+// ---------------------------------------------------------------------
+// The very first run on a terminal: the config wizard's vault step with
+// the password file put somewhere other than the offered default.
+// ---------------------------------------------------------------------
+
+/// The first run ever (no config file) on a real terminal, answered up
+/// to the vault step with the local provider: the password-file Input
+/// offers a default path; typing a different one and a ten-plus
+/// character password creates the file THERE (mode 0600, the password
+/// as its bytes), the success line names the chosen path (`Password
+/// file '<chosen>' created.`), nothing lands at the offered default, and
+/// the wizard goes on to the API provider pick. Ctrl+C there leaves
+/// without writing a config file and with the tty restored.
+#[test]
+#[serial]
+fn the_first_run_wizard_creates_the_password_file_at_the_chosen_path_and_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_config_dir("first-run-chosen-password-file");
+    let _guard = TempDirGuard(dir.clone());
+    assert!(!dir.join("config.yaml").exists());
+    let chosen = dir.join("chosen-vault-pass");
+    let password = "twelve-chars-long";
+
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    pty.wait_for("create a new one?", PTY_DEADLINE)
+        .expect("the first run did not ask to create a config file");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.wait_for("secrets provider", PTY_DEADLINE)
+        .expect("the wizard did not ask which secrets provider to use");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.wait_for("create one now?", PTY_DEADLINE)
+        .expect("the wizard did not offer to create the password file");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    let path_at = pty.raw().len();
+    pty.wait_for("path to the password file to create", PTY_DEADLINE)
+        .expect("the wizard did not ask where to create the password file");
+    // The default is painted a moment after the label, so it is waited
+    // for rather than read off the first frame that shows the question.
+    pty.wait_for_after("coyote_password", path_at, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("the path question shows no default path: {e:?}"));
+    pty.read_for(Duration::from_millis(300));
+    pty.send(format!("{}\r", chosen.display()).as_bytes())
+        .unwrap();
+    pty.wait_for("encrypt all vault secrets", PTY_DEADLINE)
+        .expect("the wizard did not ask for the vault password");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(format!("{password}\r").as_bytes()).unwrap();
+    let created = pty
+        .wait_for("created.", PTY_DEADLINE)
+        .expect("the wizard never said the password file was created");
+    let expected = format!("Password file '{}' created.", chosen.display());
+    assert!(
+        squeezed(&created).contains(&squeezed(&expected)),
+        "the success line does not name the chosen path `{expected}`:\n{created}"
+    );
+    let default_line = created
+        .lines()
+        .find(|line| line.contains("created.") && line.contains("coyote_password"));
+    assert!(
+        default_line.is_none(),
+        "the success line names the default path, not the chosen one: {default_line:?}\n{created}"
+    );
+    assert_eq!(
+        fs::read_to_string(&chosen).ok().as_deref(),
+        Some(password),
+        "the chosen path does not hold the password typed:\n{created}"
+    );
+    assert_eq!(
+        fs::metadata(&chosen).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "the created password file is not private (0600):\n{created}"
+    );
+    let at_default: Vec<PathBuf> = walk(&dir)
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("coyote_password"))
+        .collect();
+    assert!(
+        at_default.is_empty(),
+        "a file landed at the default password path {at_default:?} though another was chosen:\n{created}"
+    );
+
+    pty.wait_for("API Provider", PTY_DEADLINE)
+        .expect("the wizard did not go on to the API provider pick");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x03").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_ne!(
+        exit_code(&transcript),
+        0,
+        "Ctrl+C on the provider pick exited 0:\n{transcript}"
+    );
+    assert!(
+        !dir.join("config.yaml").exists(),
+        "the interrupted wizard wrote config.yaml:\n{transcript}"
+    );
+    assert_tty_restored(&transcript);
+}
+
 /// The uninstall twin: `.uninstall <bundle>`, `y`, then Esc on the
 /// `was modified locally after install` Select modal keeps the edited
 /// file (the unmodified one is removed), the report still prints, one

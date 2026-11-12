@@ -3655,3 +3655,235 @@ fn tty_less_authenticate_with_two_oauth_clients_is_refused_naming_both_and_the_f
         "the named client was not the one authenticated:\n{out}"
     );
 }
+
+// ---------------------------------------------------------------------
+// The `--install-builtins` help sentence and the clap errors around it,
+// `.update` typed into a plain REPL whose stdin is /dev/null, and a
+// tty-less `--uninstall --yes` of a bundle with several modified items.
+// ---------------------------------------------------------------------
+
+/// The `--install-builtins` flag's help sentence as a first-time user
+/// reads it.
+const INSTALL_BUILTINS_HELP: &str = "Reinstall bundled assets for a category (asks before \
+                                     overwriting your local changes unless --yes)";
+
+/// `--help` carries the `--install-builtins` sentence; `--install <x>
+/// --yes` is a clap error (the two flags exclude each other), as is
+/// `--install-builtins x --yes` (not a category): both exit 2 before the
+/// config dir is touched, so a typo cannot install anything.
+#[test]
+#[serial]
+fn install_builtins_help_sentence_and_the_clap_errors_around_install_with_yes() {
+    let dir = fresh_config_dir("install-builtins-help-clap");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let files_before = walk(&dir);
+
+    let (ok, help) = run_ttyless(&dir, &["--help"], "--help");
+    assert!(ok, "{help}");
+    assert!(
+        squeezed(&help).contains(&squeezed(INSTALL_BUILTINS_HELP)),
+        "`--help` does not carry the `--install-builtins` sentence `{INSTALL_BUILTINS_HELP}`:\n{help}"
+    );
+
+    for (what, args) in [
+        ("`--install x --yes`", vec!["--install", "x", "--yes"]),
+        (
+            "`--install-builtins x --yes`",
+            vec!["--install-builtins", "x", "--yes"],
+        ),
+    ] {
+        let mut cmd = ttyless_command(built_binary(), &dir);
+        let output = cmd.args(&args).output().unwrap();
+        let out = format!(
+            "--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{what} is not a clap usage error (exit 2):\n{out}"
+        );
+        let plain = strip_ansi(&out);
+        assert!(
+            plain.contains("error:") && (plain.contains("--install") || plain.contains("--yes")),
+            "{what} does not report a clap error naming the flag:\n{out}"
+        );
+        assert!(
+            refusal_shape(&out).is_none(),
+            "{what} hit the no-human refusal instead of the argument check:\n{out}"
+        );
+    }
+    assert_eq!(
+        walk(&dir),
+        files_before,
+        "a rejected argument set still changed the config dir"
+    );
+}
+
+/// `.update` typed into the plain REPL on a terminal whose stdin is
+/// /dev/null (the line editor still reads the terminal): the Cargo
+/// install's `Update anyway?` has nothing to read an answer from, so it
+/// is refused in the shared shape with the REPL remedy (a bare period,
+/// not ` or pass --force.`), the confirm is never painted, the REPL goes
+/// on taking commands, `.exit` leaves with the tty restored and the
+/// binary is untouched.
+#[test]
+#[serial]
+fn dot_update_in_a_plain_repl_with_stdin_from_dev_null_is_refused_with_the_bare_remedy() {
+    let dir = fresh_config_dir("repl-update-stdin-null");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let cargo_copy = cargo_installed_binary(&dir);
+    let binary_before = fs::metadata(&cargo_copy).unwrap();
+
+    let mut pty = spawn_binary_under(
+        &cargo_copy,
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --repl",
+    );
+    pty.wait_for(")> ", PTY_DEADLINE).unwrap();
+    let from = pty.raw().len();
+    pty.send(b".update\r").unwrap();
+    let since = pty
+        .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
+        .expect("`.update` with stdin from /dev/null did not refuse");
+    assert_eq!(
+        refusal_shape(&since),
+        Some(("update a Cargo install".into(), ".".into())),
+        "the REPL `.update` refusal is not the shared shape with the bare remedy:\n{since}"
+    );
+    assert!(
+        !since.contains("Update anyway?") && !since.contains("--force"),
+        "the REPL `.update` painted the confirm or named the CLI flag:\n{since}"
+    );
+
+    // Let the line editor re-arm its prompt before the next command, so
+    // the keys are read by it rather than echoed by the cooked tty.
+    pty.read_for(Duration::from_millis(500));
+    let info_at = pty.raw().len();
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
+        .expect("the REPL stopped taking commands after the refused `.update`");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    let binary_after = fs::metadata(&cargo_copy).unwrap();
+    assert!(
+        binary_after.len() == binary_before.len()
+            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
+        "the refused `.update` touched the binary:\n{transcript}"
+    );
+}
+
+/// A bundle of three roles, installed with no terminal, then two of them
+/// edited locally. `--uninstall <bundle> --yes` with no terminal asks
+/// nothing and keeps every locally modified item (the `--yes` sentence):
+/// exit 0, no refusal, no keep/delete question, the untouched role gone,
+/// both edited roles still carrying their edits, one `kept modified
+/// file` ledger line per kept item, the summary counting `kept=2`, and
+/// no cancelled-question note (no question was asked). The record keeps
+/// the kept items, so the bundle is reported partially uninstalled.
+#[test]
+#[serial]
+fn a_tty_less_uninstall_with_yes_keeps_every_modified_item_and_prints_no_question_note() {
+    let dir = fresh_config_dir("ttyless-uninstall-yes-modified");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-u8k";
+    let repo = dir.join("bundle-src");
+    fs::create_dir_all(repo.join("roles")).unwrap();
+    fs::write(repo.join("coyote-bundle.yaml"), format!("name: {name}\n")).unwrap();
+    for role in ["one", "two", "three"] {
+        fs::write(
+            repo.join("roles").join(format!("{name}-{role}.md")),
+            format!("---\nmodel: fake:fake-model\n---\nYou are role {role}.\n"),
+        )
+        .unwrap();
+    }
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "bundle"]);
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", repo.to_str().unwrap()],
+        "tty-less install",
+    );
+    let roles = dir.join("roles");
+    let one = roles.join(format!("{name}-one.md"));
+    let two = roles.join(format!("{name}-two.md"));
+    let three = roles.join(format!("{name}-three.md"));
+    assert!(
+        ok && one.exists() && two.exists() && three.exists(),
+        "the tty-less install did not write the three roles:\n{out}"
+    );
+    let edited_one = format!("{}# edited one\n", fs::read_to_string(&one).unwrap());
+    let edited_two = format!("{}# edited two\n", fs::read_to_string(&two).unwrap());
+    fs::write(&one, &edited_one).unwrap();
+    fs::write(&two, &edited_two).unwrap();
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--uninstall", name, "--yes"],
+        "tty-less --uninstall --yes",
+    );
+    assert!(ok, "`--uninstall --yes` with no terminal failed:\n{out}");
+    assert!(
+        refusal_shape(&out).is_none(),
+        "`--yes` still refused:\n{out}"
+    );
+    for widget in [
+        "was modified locally after install",
+        "to move, enter to select",
+        "keep-all",
+        "? ",
+    ] {
+        assert!(
+            !out.contains(widget),
+            "`--yes` still asked (`{widget}`):\n{out}"
+        );
+    }
+    assert!(
+        !out.contains("Kept the locally modified items"),
+        "a cancelled-question note was printed though no question was asked:\n{out}"
+    );
+    assert_eq!(
+        out.matches("kept modified file").count(),
+        2,
+        "the ledger does not carry exactly one `kept modified file` line per kept item:\n{out}"
+    );
+    assert!(
+        out.contains(&format!("kept modified file roles/{name}-one.md"))
+            && out.contains(&format!("kept modified file roles/{name}-two.md")),
+        "the ledger does not name both kept roles:\n{out}"
+    );
+    assert!(
+        out.contains("deleted=1 kept=2"),
+        "the summary does not count one deleted and two kept files:\n{out}"
+    );
+    assert!(
+        out.contains("partially uninstalled"),
+        "the bundle with kept items is not reported partially uninstalled:\n{out}"
+    );
+    assert!(
+        !three.exists(),
+        "the untouched role survived `--uninstall --yes`:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&one).ok().as_deref(),
+        Some(edited_one.as_str()),
+        "the first edited role lost its edit:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(&two).ok().as_deref(),
+        Some(edited_two.as_str()),
+        "the second edited role lost its edit:\n{out}"
+    );
+}
