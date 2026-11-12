@@ -3009,13 +3009,139 @@ fn review_lane_diff_tools_reject_an_option_shaped_base() {
                     code, 0,
                     "{agent} {args:?}: stdout: {stdout}\nstderr: {stderr}"
                 );
+                let refusal = if args[1] == joined {
+                    "starts with '-'"
+                } else {
+                    "--base"
+                };
                 assert!(
-                    stderr.contains("--base"),
+                    stderr.contains(refusal),
                     "{agent} {args:?}: stderr: {stderr}"
                 );
             }
         }
     }
+}
+
+/// A repo's own config can point `diff.external` or a `.gitattributes`
+/// textconv driver at any program, and a lane's diff would run it. Every
+/// lane diffs with both turned off, with a `--base` and on each no-base
+/// fallback (staged, unstaged, `HEAD~1`), and still shows the real lines.
+#[cfg(unix)]
+#[test]
+fn review_lane_diff_tools_run_no_external_diff_or_textconv_driver() {
+    use std::os::unix::fs::PermissionsExt;
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("review-lane-diff-drivers");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    let ext_marker = dir.0.join("external-diff-ran");
+    let conv_marker = dir.0.join("textconv-ran");
+    let stub = |name: &str, body: String| {
+        let path = dir.0.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let ext = stub("ext-diff.sh", format!("touch '{}'\n", ext_marker.display()));
+    let conv = stub(
+        "textconv.sh",
+        format!("touch '{}'\ncat \"$1\"\n", conv_marker.display()),
+    );
+    git(&["init", "-q"]);
+    git(&["config", "diff.external", &ext]);
+    git(&["config", "diff.conv.textconv", &conv]);
+    fs::write(repo.join(".gitattributes"), "*.txt diff=conv\n").unwrap();
+    fs::write(repo.join("a.txt"), "first\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    fs::write(repo.join("a.txt"), "second\n").unwrap();
+    git(&["commit", "-qam", "second"]);
+    git(&["diff", "HEAD~1"]);
+    git(&["diff", "--no-ext-diff", "HEAD~1"]);
+    assert!(
+        ext_marker.exists() && conv_marker.exists(),
+        "the fixture's drivers must run under a plain git diff"
+    );
+    fs::remove_file(&ext_marker).unwrap();
+    fs::remove_file(&conv_marker).unwrap();
+    let prompt_utils = dir.0.join("prompt-utils.sh");
+    fs::write(
+        &prompt_utils,
+        "info() { echo \"$*\"; }\nwarn() { echo \"$*\"; }\n",
+    )
+    .unwrap();
+    let tools: Vec<(&str, &[&str], PathBuf)> = [
+        ("code-reviewer", &["get_diff", "get_changed_files"][..]),
+        ("domain-reviewer", &["get_diff"][..]),
+        ("security-reviewer", &["get_diff", "get_changed_files"][..]),
+        ("probe", &["get_diff", "get_changed_files"][..]),
+    ]
+    .into_iter()
+    .map(|(agent, commands)| (agent, commands, engine_built_tool(&dir.0, agent)))
+    .collect();
+    let check_all = |state: &str, minus: &str, plus: &str| {
+        for (agent, commands, tool) in &tools {
+            for command in commands.iter() {
+                for base in [None, Some("HEAD")] {
+                    if state == "clean" && base.is_some() {
+                        continue;
+                    }
+                    let mut args = vec![*command];
+                    if let Some(b) = base {
+                        args.extend(["--base", b]);
+                    }
+                    let (code, stdout, stderr) = run(bash()
+                        .arg(tool)
+                        .args(&args)
+                        .env("LLM_ROOT_DIR", dir.0.join("config"))
+                        .env("LLM_AGENT_ROOT_DIR", tool.parent().unwrap())
+                        .env("LLM_PROMPT_UTILS_FILE", &prompt_utils)
+                        .env("LLM_AGENT_VAR_PROJECT_DIR", &repo)
+                        .env("LLM_OUTPUT", "/dev/stdout")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .output()
+                        .expect("spawn bash"));
+                    let what = format!("{agent} {args:?} on a {state} tree");
+                    assert_eq!(code, 0, "{what}: stdout: {stdout}\nstderr: {stderr}");
+                    assert!(
+                        !ext_marker.exists() && !conv_marker.exists(),
+                        "{what} ran a diff driver (external: {}, textconv: {})",
+                        ext_marker.exists(),
+                        conv_marker.exists()
+                    );
+                    let shown = if *command == "get_diff" {
+                        stdout.lines().any(|l| l == format!("-{minus}"))
+                            && stdout.lines().any(|l| l == format!("+{plus}"))
+                    } else {
+                        stdout.contains("a.txt | 2 +-")
+                    };
+                    assert!(shown, "{what}: {stdout}");
+                }
+            }
+        }
+    };
+    check_all("clean", "first", "second");
+    fs::write(repo.join("a.txt"), "third\n").unwrap();
+    check_all("dirty", "second", "third");
+    git(&["add", "a.txt"]);
+    check_all("staged", "second", "third");
 }
 
 /// Without python3 on PATH the tool still answers, exit 0, with the
