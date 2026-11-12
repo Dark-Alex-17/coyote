@@ -2902,7 +2902,7 @@ fn a_tty_less_install_builtins_with_yes_reinstalls_every_bundled_file_without_as
 /// `--mcp-add` of a server whose env references a vault secret the vault
 /// does not hold, with no terminal at all and again with a terminal on
 /// stdout but stdin from /dev/null: refused in the shared shape before
-/// any `to vault now?` question, the remedy naming
+/// any `to the vault now?` question, the remedy naming
 /// `coyote --add-secret <NAME>`, and the server is not written. The same
 /// command without the placeholder succeeds, so the refusal is the
 /// secret's, not the vault's.
@@ -2943,7 +2943,7 @@ fn a_tty_less_mcp_add_needing_a_vault_secret_is_refused_naming_add_secret_before
         "the remedy does not name `coyote --add-secret PROBE_MCP_TOKEN_M4C`: {remedy:?}\n{out}"
     );
     assert!(
-        !out.contains("to vault now?") && !out.contains("Added MCP server"),
+        !out.contains("to the vault now?") && !out.contains("Added MCP server"),
         "the refused run asked or added the server anyway:\n{out}"
     );
     let mentions = walk(&dir)
@@ -2980,7 +2980,7 @@ fn a_tty_less_mcp_add_needing_a_vault_secret_is_refused_naming_add_secret_before
         "the piped-stdin refusal names {action:?} / {remedy:?}:\n{plain}"
     );
     assert!(
-        !plain.contains("to vault now?"),
+        !plain.contains("to the vault now?"),
         "the piped-stdin run asked on the terminal:\n{plain}"
     );
     assert_tty_restored(&plain);

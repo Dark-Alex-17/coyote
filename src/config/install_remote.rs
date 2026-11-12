@@ -2443,7 +2443,7 @@ fn prompt_for_each_secret(
     for (index, name) in missing.iter().enumerate() {
         let proceed = match crate::prompt::confirm(
             prompter,
-            format!("Add {{{{ {name} }}}} to vault now?"),
+            format!("Add {{{{ {name} }}}} to the vault now?"),
             false,
         ) {
             Ok(proceed) => proceed,
@@ -3461,7 +3461,7 @@ mod tests {
             assert_eq!(request.action, PromptAction::Confirm);
             assert_eq!(
                 request.question,
-                format!("Add {{{{ {name} }}}} to vault now?")
+                format!("Add {{{{ {name} }}}} to the vault now?")
             );
             assert_eq!(request.default, Some(serde_json::json!(false)));
         }
@@ -3545,7 +3545,7 @@ mod tests {
             vec![
                 (
                     PromptAction::Confirm,
-                    "Add {{ ACCEPT_SECRET_ONE }} to vault now?"
+                    "Add {{ ACCEPT_SECRET_ONE }} to the vault now?"
                 ),
                 (
                     PromptAction::Confirm,
@@ -3562,7 +3562,7 @@ mod tests {
                 (PromptAction::Password, "Enter the secret value:"),
                 (
                     PromptAction::Confirm,
-                    "Add {{ ACCEPT_SECRET_TWO }} to vault now?"
+                    "Add {{ ACCEPT_SECRET_TWO }} to the vault now?"
                 ),
                 (PromptAction::Password, "Enter the secret value:"),
             ]

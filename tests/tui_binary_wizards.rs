@@ -108,7 +108,7 @@ fn config_files_mentioning(dir: &Path, needle: &str) -> Vec<PathBuf> {
 const DEFERRED_SECRETS_NOTICE: &str = "still required by your MCP servers";
 
 /// `.install <local bundle>` whose mcp.json references two secrets the
-/// vault does not hold: under the UI each `Add {{ X }} to vault now?` is
+/// vault does not hold: under the UI each `Add {{ X }} to the vault now?` is
 /// a Confirm modal; declining both, the install completes, names both
 /// secrets as deferred, leaves the merged mcp.json and the bundle record
 /// behind (nothing half-applied), adds no secret to the vault, and the
@@ -141,8 +141,8 @@ fn dot_install_of_a_bundle_with_secrets_defers_every_secret_the_user_declines() 
         install_at,
         DEFERRED_SECRETS_NOTICE,
         &[
-            ("Add{{BUNDLE_SECRET_A}}tovaultnow?", b'n'),
-            ("Add{{BUNDLE_SECRET_B}}tovaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_A}}tothevaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_B}}tothevaultnow?", b'n'),
         ],
         "`.install` of a bundle with secrets",
     );
@@ -156,7 +156,7 @@ fn dot_install_of_a_bundle_with_secrets_defers_every_secret_the_user_declines() 
         );
     }
     assert!(
-        squeezed(&since_full).matches("tovaultnow?").count() >= 2,
+        squeezed(&since_full).matches("tothevaultnow?").count() >= 2,
         "the install did not ask about each secret in the modal:\n{since_full}"
     );
     assert!(
@@ -231,16 +231,16 @@ fn dot_install_of_a_bundle_with_secrets_defers_every_secret_the_user_declines() 
         "{{BUNDLE_SECRET_B}}{{BUNDLE_SECRET_C}}",
         &[
             ("Obsoletefile", b'1'),
-            ("Add{{BUNDLE_SECRET_A}}tovaultnow?", b'n'),
-            ("Add{{BUNDLE_SECRET_B}}tovaultnow?", b'n'),
-            ("Add{{BUNDLE_SECRET_C}}tovaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_A}}tothevaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_B}}tothevaultnow?", b'n'),
+            ("Add{{BUNDLE_SECRET_C}}tothevaultnow?", b'n'),
         ],
         "`.install <bundle>` update with a new secret",
     );
     pty.read_for(Duration::from_millis(800));
     let since_full = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
     assert!(
-        squeezed(&since_full).contains("Add{{BUNDLE_SECRET_C}}tovaultnow?"),
+        squeezed(&since_full).contains("Add{{BUNDLE_SECRET_C}}tothevaultnow?"),
         "the update did not ask about the new secret in the modal:\n{since_full}"
     );
     assert!(
