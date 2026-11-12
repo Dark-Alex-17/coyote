@@ -222,8 +222,9 @@ pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) 
 /// silent run recorded.
 /// Both pipes are drained on their own threads while the child runs, so
 /// a chatty child cannot block on a full pipe and be mistaken for a hang;
-/// a child that is still running at the deadline is killed, reaped and
-/// reported with whatever it had written by then.
+/// a child that is still running at the deadline is killed along with
+/// anything it spawned, reaped and reported with whatever it had written
+/// by then.
 pub fn run_ttyless_with_env(
     binary: &Path,
     dir: &Path,
@@ -245,13 +246,19 @@ pub fn run_ttyless_with_env(
             break status;
         }
         if std::time::Instant::now() > deadline {
+            // The child is a session leader (see `detached`), so its pid is
+            // the process group; a grandchild holding the pipes open would
+            // otherwise keep the readers blocked after the child is gone.
+            // SAFETY: kill takes no pointers; a stale pid is reported as an
+            // error, not UB.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.kill();
             let _ = child.wait();
             panic!(
                 "{what}: `coyote {}` with no terminal did not exit within {PTY_DEADLINE:?}; \
                  captured so far:\n{}",
                 args.join(" "),
-                both_streams(stdout, stderr)
+                both_streams_within(stdout, stderr, Duration::from_secs(2))
             );
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -275,6 +282,33 @@ fn both_streams(
         "--- stdout ---\n{}\n--- stderr ---\n{}",
         String::from_utf8_lossy(&stdout.join().unwrap()),
         String::from_utf8_lossy(&stderr.join().unwrap())
+    )
+}
+
+/// [`both_streams`] for a killed child: waits up to `patience` for the
+/// readers to see end-of-file and reports a stream that is still open as
+/// such, so the deadline panic cannot itself hang on a pipe an orphan
+/// still holds.
+fn both_streams_within(
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+    patience: Duration,
+) -> String {
+    let until = std::time::Instant::now() + patience;
+    while !(stdout.is_finished() && stderr.is_finished()) && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let finished = |reader: std::thread::JoinHandle<Vec<u8>>| {
+        if reader.is_finished() {
+            String::from_utf8_lossy(&reader.join().unwrap()).into_owned()
+        } else {
+            format!("<still open {patience:?} after the kill>")
+        }
+    };
+    format!(
+        "--- stdout ---\n{}\n--- stderr ---\n{}",
+        finished(stdout),
+        finished(stderr)
     )
 }
 
@@ -829,7 +863,9 @@ pub fn recording_editor(dir: &Path, launched: &Path) -> String {
 }
 
 /// Runs one git command in `repo`, with an identity so `commit` works on a
-/// machine without one.
+/// machine without one, and with the developer's global and system config
+/// shut out so signing, hook paths or a default branch name cannot leak
+/// into the fixture repo.
 pub fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
         .arg("-C")
@@ -839,10 +875,14 @@ pub fn git(repo: &Path, args: &[&str]) {
             "user.email=tests@example.invalid",
             "-c",
             "user.name=tests",
+            "-c",
+            "commit.gpgsign=false",
         ])
         .args(args)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status()

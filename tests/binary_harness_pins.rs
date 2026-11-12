@@ -37,6 +37,7 @@ const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const CONFIG_ENV: &str = ".env(\"COYOTE_CONFIG_DIR\"";
 const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
 const HARNESS_IMPORT: &str = concat!("use common::", "tui_harness");
+const HARNESS_PATH: &str = concat!("common::", "tui_harness::");
 const COMMAND_NEW: &str = concat!("Command::", "new(");
 const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
@@ -105,7 +106,7 @@ fn harness_users_spawn_only_through_the_harness_and_every_other_spawn_pins_both_
     for path in rust_sources(&tests_dir) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = read(&path);
-        if source.contains(HARNESS_IMPORT) {
+        if source.contains(HARNESS_IMPORT) || source.contains(HARNESS_PATH) {
             importers.push(name);
             continue;
         }

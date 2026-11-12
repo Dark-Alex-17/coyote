@@ -1246,27 +1246,6 @@ fn update_with_a_piped_stdout_and_a_tty_on_stdin_is_refused_in_the_shared_shape(
     assert_tty_restored(&on_tty);
 }
 
-/// An agent whose `username` variable has no default, so starting it asks
-/// for the value.
-fn write_agent_with_a_required_variable(dir: &Path, name: &str) {
-    let agent_dir = dir.join("agents").join(name);
-    fs::create_dir_all(&agent_dir).unwrap();
-    fs::write(
-        agent_dir.join("config.yaml"),
-        format!(
-            "name: {name}\n\
-             description: an agent with a variable\n\
-             version: 0.1.0\n\
-             instructions: |\n\
-             \x20 You are an assistant for {{{{username}}}}. Reply briefly.\n\
-             variables:\n\
-             \x20 - name: username\n\
-             \x20   description: Your user name\n"
-        ),
-    )
-    .unwrap();
-}
-
 /// `.agent <name>` in the plain REPL for an agent whose variable has no
 /// default: a blank Enter is re-asked with the reason as a sentence
 /// (`This field is required.`) instead of being taken, the next answer
@@ -1277,7 +1256,7 @@ fn dot_agent_needing_a_variable_in_the_plain_repl_reasks_a_blank_answer_with_the
     let dir = fresh_config_dir("agent-variable-repl");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
-    write_agent_with_a_required_variable(&dir, "vars-agent-p3r");
+    write_agent_needing_a_variable(&dir, "vars-agent-p3r");
     let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
