@@ -2936,6 +2936,88 @@ fn review_lane_get_diff_diffs_a_checkpoint_base_directly() {
     }
 }
 
+/// A `--base` that starts with `-` would reach git as a flag, and
+/// `--output=<path>` makes `git diff` write that file. argc already refuses
+/// `--base --output=<path>`, but `--base=--output=<path>` reaches the tool,
+/// so every lane's diff and stat commands refuse such a base before git runs.
+#[cfg(unix)]
+#[test]
+fn review_lane_diff_tools_reject_an_option_shaped_base() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("review-lane-option-base");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    fs::write(repo.join("a.txt"), "a\nchanged\n").unwrap();
+    let prompt_utils = dir.0.join("prompt-utils.sh");
+    fs::write(
+        &prompt_utils,
+        "info() { echo \"$*\"; }\nwarn() { echo \"$*\"; }\n",
+    )
+    .unwrap();
+    let target = dir.0.join("x");
+    let output = format!("--output={}", target.display());
+    let joined = format!("--base={output}");
+    for (agent, commands) in [
+        ("code-reviewer", &["get_diff", "get_changed_files"][..]),
+        ("domain-reviewer", &["get_diff"][..]),
+        ("security-reviewer", &["get_diff", "get_changed_files"][..]),
+        ("probe", &["get_diff", "get_changed_files"][..]),
+    ] {
+        let tool = engine_built_tool(&dir.0, agent);
+        for command in commands {
+            for args in [
+                vec![*command, "--base", output.as_str()],
+                vec![*command, joined.as_str()],
+            ] {
+                let (code, stdout, stderr) = run(bash()
+                    .arg(&tool)
+                    .args(&args)
+                    .env("LLM_ROOT_DIR", dir.0.join("config"))
+                    .env("LLM_AGENT_ROOT_DIR", tool.parent().unwrap())
+                    .env("LLM_PROMPT_UTILS_FILE", &prompt_utils)
+                    .env("LLM_AGENT_VAR_PROJECT_DIR", &repo)
+                    .env("LLM_OUTPUT", "/dev/stdout")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .output()
+                    .expect("spawn bash"));
+                assert!(
+                    !target.exists(),
+                    "{agent} {args:?}: an option-shaped base wrote {}",
+                    target.display()
+                );
+                assert_ne!(
+                    code, 0,
+                    "{agent} {args:?}: stdout: {stdout}\nstderr: {stderr}"
+                );
+                assert!(
+                    stderr.contains("--base"),
+                    "{agent} {args:?}: stderr: {stderr}"
+                );
+            }
+        }
+    }
+}
+
 /// Without python3 on PATH the tool still answers, exit 0, with the
 /// DEBT_SCAN_FAILED report and the manual pipeline to run instead.
 #[cfg(unix)]
