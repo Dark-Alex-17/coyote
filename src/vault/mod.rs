@@ -333,21 +333,21 @@ impl Vault {
         Ok(())
     }
 
-    pub fn handle_vault_flags(cli: Cli, vault: &Vault, prompter: &dyn Prompter) -> Result<()> {
-        if let Some(secret_name) = cli.add_secret {
-            vault.add_secret(&secret_name, prompter)?;
+    pub fn handle_vault_flags(cli: &Cli, vault: &Vault, prompter: &dyn Prompter) -> Result<()> {
+        if let Some(secret_name) = &cli.add_secret {
+            vault.add_secret(secret_name, prompter)?;
         }
 
-        if let Some(secret_name) = cli.get_secret {
-            vault.get_secret(&secret_name, true)?;
+        if let Some(secret_name) = &cli.get_secret {
+            vault.get_secret(secret_name, true)?;
         }
 
-        if let Some(secret_name) = cli.update_secret {
-            vault.update_secret(&secret_name, prompter)?;
+        if let Some(secret_name) = &cli.update_secret {
+            vault.update_secret(secret_name, prompter)?;
         }
 
-        if let Some(secret_name) = cli.delete_secret {
-            vault.delete_secret(&secret_name)?;
+        if let Some(secret_name) = &cli.delete_secret {
+            vault.delete_secret(secret_name)?;
         }
 
         if cli.list_secrets {
@@ -656,7 +656,7 @@ mod tests {
         // Pins the --list-secrets sandbox contract: rc=0 with an informational
         // readout instead of the hard failure the mutating flags keep. The
         // message goes straight to stdout, so only Ok is asserted here.
-        Vault::handle_vault_flags(cli, &vault, &ScriptedPrompter::refusing())
+        Vault::handle_vault_flags(&cli, &vault, &ScriptedPrompter::refusing())
             .expect("--list-secrets must succeed in sandbox mode");
     }
 }

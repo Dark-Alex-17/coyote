@@ -9091,7 +9091,7 @@ mod tests {
                 "default_prompter",
                 REPL_PROMPTER,
             ),
-            ("src/main.rs", "async_main", CLI_FLAGS),
+            ("src/main.rs", "run_cli_flag", CLI_FLAGS),
             ("src/main.rs", "shell_execute", CLI_ONLY),
             ("src/mcp/manage.rs", "confirm_on_the_terminal", CLI_ONLY),
             ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),

@@ -168,45 +168,6 @@ async fn async_main() -> Result<()> {
         || cli.list_skills
         || cli.list_sessions)
         && !cli.sync_models;
-    let vault_flags = cli.add_secret.is_some()
-        || cli.get_secret.is_some()
-        || cli.update_secret.is_some()
-        || cli.delete_secret.is_some()
-        || cli.list_secrets;
-
-    let log_path = setup_logger(cli.acp_server)?;
-
-    if let Some(path) = &cli.generate_models {
-        return catalog::generate_models_file(path).await;
-    }
-
-    if let Some(version) = &cli.update {
-        let version = version.clone();
-        let force = cli.force;
-        let prompter = InquirePrompter::default();
-        return tokio::task::spawn_blocking(move || {
-            config::run_self_update(version, force, &prompter)
-        })
-        .await?;
-    }
-
-    if let Some(name) = &cli.sandbox {
-        return sandbox::launch(name.clone(), cli.fresh);
-    }
-
-    if cli.list_bundles {
-        return config::list_installed_bundles();
-    }
-
-    if let Some(scope) = cli.memory_migrate {
-        let round_chains = memory_migrate::configured_round_chains().context(
-            "memory_round_chains could not be read; fix the config and rerun --memory-migrate",
-        )?;
-        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
-        print!("{report}");
-        return report.into_result();
-    }
-
     let mcp_inspect =
         cli.mcp_list && cli.mcp_get.is_none() && cli.mcp_remove.is_none() && cli.mcp_add.is_none();
     let vault_inspect = cli.list_secrets
@@ -216,131 +177,14 @@ async fn async_main() -> Result<()> {
         && cli.delete_secret.is_none();
     let inspection_only =
         (readout_flag || vault_inspect || mcp_inspect) && cli.agent.is_none() && cli.role.is_none();
-    if !inspection_only {
-        install_builtins(&InquirePrompter::default())?;
-    }
 
-    if let Some(category) = cli.install_builtins {
-        return config::install_assets(
-            category,
-            &InquirePrompter::default(),
-            cli.yes,
-            " or pass --yes.",
-        );
-    }
+    let log_path = setup_logger(cli.acp_server)?;
 
-    if let Some(value) = cli.install.as_deref() {
-        return config::install_or_update(
-            value,
-            cli.git_host.as_deref(),
-            cli.filter,
-            cli.install_force,
-            config::InstallIo {
-                prefix: config::CommandPrefix::default(),
-                prompter: &InquirePrompter::default(),
-            },
-        );
-    }
-
-    if let Some(spec) = cli.update_bundle.as_deref() {
-        return config::update_bundle(spec, cli.yes, &InquirePrompter::default());
-    }
-
-    if let Some(name) = cli.uninstall.as_deref() {
-        return config::uninstall_bundle(name, cli.yes, &InquirePrompter::default());
-    }
-
-    if let Some(client_arg) = &cli.authenticate {
-        let cfg = Config::load_with_interpolation(true, false).await?;
-        let app_config = AppConfig::from_config(cfg)?;
-        let prompter = InquirePrompter::default();
-        let (client_name, provider) =
-            resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
-        oauth::run_oauth_flow(&*provider, &client_name, &prompter).await?;
+    if run_cli_flag(&cli, inspection_only, mcp_inspect, vault_inspect)
+        .await?
+        .is_some()
+    {
         return Ok(());
-    }
-
-    if let Some(server_name) = &cli.auth_mcp {
-        let cfg = Config::load_with_interpolation(true, false).await?;
-        let app_config = AppConfig::from_config(cfg)?;
-        let vault = Vault::init(&app_config)?;
-        let mcp_path = paths::mcp_config_file();
-        if !mcp_path.exists() {
-            bail!(
-                "No MCP configuration file found at '{}'",
-                mcp_path.display()
-            );
-        }
-
-        let raw = tokio::fs::read_to_string(&mcp_path)
-            .await
-            .with_context(|| format!("Failed to read MCP config at '{}'", mcp_path.display()))?;
-
-        let (content, missing) = interpolate_secrets(&raw, &vault)?;
-        if !missing.is_empty() {
-            bail!(
-                "MCP config references vault secrets that are missing: {:?}",
-                missing
-            );
-        }
-
-        let mcp_config: McpServersConfig =
-            serde_json::from_str(&content).context("Failed to parse MCP config file")?;
-        let spec = mcp_config
-            .mcp_servers
-            .get(server_name.as_str())
-            .ok_or_else(|| anyhow!("MCP server '{server_name}' not found in mcp.json"))?;
-        if !spec.is_remote() {
-            bail!(
-                "MCP server '{server_name}' is a stdio server; OAuth is only supported for http/sse servers"
-            );
-        }
-
-        let url = spec.url.as_deref().expect("validated: remote spec has url");
-        let prompter = InquirePrompter::default();
-        mcp::oauth::run_mcp_oauth_flow(
-            server_name,
-            url,
-            spec.oauth.as_ref().and_then(|o| o.client_id.as_deref()),
-            spec.oauth.as_ref().and_then(|o| o.callback_port),
-            spec.oauth.as_ref().and_then(|o| o.redirect_host.as_deref()),
-            &prompter,
-        )
-        .await?;
-        println!("Authentication saved. '{server_name}' is now available for use.");
-
-        return Ok(());
-    }
-
-    let mcp_action =
-        cli.mcp_list || cli.mcp_get.is_some() || cli.mcp_remove.is_some() || cli.mcp_add.is_some();
-    if mcp_action {
-        let cfg = Config::load_with_interpolation(true, mcp_inspect).await?;
-        let app_config = if mcp_inspect {
-            AppConfig::from_config_lenient(cfg)?
-        } else {
-            AppConfig::from_config(cfg)?
-        };
-        let vault = if mcp_inspect {
-            Vault::init_lenient(&app_config)
-        } else {
-            Vault::init(&app_config)?
-        };
-
-        mcp::manage::handle(&cli, &vault)?;
-
-        return Ok(());
-    }
-
-    if vault_flags {
-        let cfg = Config::load_with_interpolation(true, vault_inspect).await?;
-        let app_config = if vault_inspect {
-            AppConfig::from_config_lenient(cfg)?
-        } else {
-            AppConfig::from_config(cfg)?
-        };
-        let vault = Vault::init(&app_config)?;
-        return Vault::handle_vault_flags(cli, &vault, &InquirePrompter::default());
     }
 
     let abort_signal = create_abort_signal();
@@ -397,6 +241,189 @@ async fn async_main() -> Result<()> {
         process::exit(1);
     }
     Ok(())
+}
+
+/// The CLI-only flag paths, in the order the flags take precedence; each
+/// finishes the run before any UI starts. `Ok(None)` means no such flag
+/// was given and the caller goes on to the REPL or TUI.
+async fn run_cli_flag(
+    cli: &Cli,
+    inspection_only: bool,
+    mcp_inspect: bool,
+    vault_inspect: bool,
+) -> Result<Option<()>> {
+    if let Some(path) = &cli.generate_models {
+        catalog::generate_models_file(path).await?;
+        return Ok(Some(()));
+    }
+
+    if let Some(version) = &cli.update {
+        let version = version.clone();
+        let force = cli.force;
+        let prompter = InquirePrompter::default();
+        tokio::task::spawn_blocking(move || config::run_self_update(version, force, &prompter))
+            .await??;
+        return Ok(Some(()));
+    }
+
+    if let Some(name) = &cli.sandbox {
+        sandbox::launch(name.clone(), cli.fresh)?;
+        return Ok(Some(()));
+    }
+
+    if cli.list_bundles {
+        config::list_installed_bundles()?;
+        return Ok(Some(()));
+    }
+
+    if let Some(scope) = cli.memory_migrate {
+        let round_chains = memory_migrate::configured_round_chains().context(
+            "memory_round_chains could not be read; fix the config and rerun --memory-migrate",
+        )?;
+        let report = memory_migrate::run(scope, cli.apply, round_chains)?;
+        print!("{report}");
+        report.into_result()?;
+        return Ok(Some(()));
+    }
+
+    if !inspection_only {
+        install_builtins(&InquirePrompter::default())?;
+    }
+
+    if let Some(category) = cli.install_builtins {
+        config::install_assets(
+            category,
+            &InquirePrompter::default(),
+            cli.yes,
+            " or pass --yes.",
+        )?;
+        return Ok(Some(()));
+    }
+
+    if let Some(value) = cli.install.as_deref() {
+        config::install_or_update(
+            value,
+            cli.git_host.as_deref(),
+            cli.filter,
+            cli.install_force,
+            config::InstallIo {
+                prefix: config::CommandPrefix::default(),
+                prompter: &InquirePrompter::default(),
+            },
+        )?;
+        return Ok(Some(()));
+    }
+
+    if let Some(spec) = cli.update_bundle.as_deref() {
+        config::update_bundle(spec, cli.yes, &InquirePrompter::default())?;
+        return Ok(Some(()));
+    }
+
+    if let Some(name) = cli.uninstall.as_deref() {
+        config::uninstall_bundle(name, cli.yes, &InquirePrompter::default())?;
+        return Ok(Some(()));
+    }
+
+    if let Some(client_arg) = &cli.authenticate {
+        let cfg = Config::load_with_interpolation(true, false).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let prompter = InquirePrompter::default();
+        let (client_name, provider) =
+            resolve_oauth_client(client_arg.as_deref(), &app_config.clients, &prompter)?;
+        oauth::run_oauth_flow(&*provider, &client_name, &prompter).await?;
+        return Ok(Some(()));
+    }
+
+    if let Some(server_name) = &cli.auth_mcp {
+        let cfg = Config::load_with_interpolation(true, false).await?;
+        let app_config = AppConfig::from_config(cfg)?;
+        let vault = Vault::init(&app_config)?;
+        let mcp_path = paths::mcp_config_file();
+        if !mcp_path.exists() {
+            bail!(
+                "No MCP configuration file found at '{}'",
+                mcp_path.display()
+            );
+        }
+
+        let raw = tokio::fs::read_to_string(&mcp_path)
+            .await
+            .with_context(|| format!("Failed to read MCP config at '{}'", mcp_path.display()))?;
+
+        let (content, missing) = interpolate_secrets(&raw, &vault)?;
+        if !missing.is_empty() {
+            bail!(
+                "MCP config references vault secrets that are missing: {:?}",
+                missing
+            );
+        }
+
+        let mcp_config: McpServersConfig =
+            serde_json::from_str(&content).context("Failed to parse MCP config file")?;
+        let spec = mcp_config
+            .mcp_servers
+            .get(server_name.as_str())
+            .ok_or_else(|| anyhow!("MCP server '{server_name}' not found in mcp.json"))?;
+        if !spec.is_remote() {
+            bail!(
+                "MCP server '{server_name}' is a stdio server; OAuth is only supported for http/sse servers"
+            );
+        }
+
+        let url = spec.url.as_deref().expect("validated: remote spec has url");
+        let prompter = InquirePrompter::default();
+        mcp::oauth::run_mcp_oauth_flow(
+            server_name,
+            url,
+            spec.oauth.as_ref().and_then(|o| o.client_id.as_deref()),
+            spec.oauth.as_ref().and_then(|o| o.callback_port),
+            spec.oauth.as_ref().and_then(|o| o.redirect_host.as_deref()),
+            &prompter,
+        )
+        .await?;
+        println!("Authentication saved. '{server_name}' is now available for use.");
+
+        return Ok(Some(()));
+    }
+
+    let mcp_action =
+        cli.mcp_list || cli.mcp_get.is_some() || cli.mcp_remove.is_some() || cli.mcp_add.is_some();
+    if mcp_action {
+        let cfg = Config::load_with_interpolation(true, mcp_inspect).await?;
+        let app_config = if mcp_inspect {
+            AppConfig::from_config_lenient(cfg)?
+        } else {
+            AppConfig::from_config(cfg)?
+        };
+        let vault = if mcp_inspect {
+            Vault::init_lenient(&app_config)
+        } else {
+            Vault::init(&app_config)?
+        };
+
+        mcp::manage::handle(cli, &vault)?;
+
+        return Ok(Some(()));
+    }
+
+    let vault_flags = cli.add_secret.is_some()
+        || cli.get_secret.is_some()
+        || cli.update_secret.is_some()
+        || cli.delete_secret.is_some()
+        || cli.list_secrets;
+    if vault_flags {
+        let cfg = Config::load_with_interpolation(true, vault_inspect).await?;
+        let app_config = if vault_inspect {
+            AppConfig::from_config_lenient(cfg)?
+        } else {
+            AppConfig::from_config(cfg)?
+        };
+        let vault = Vault::init(&app_config)?;
+        Vault::handle_vault_flags(cli, &vault, &InquirePrompter::default())?;
+        return Ok(Some(()));
+    }
+
+    Ok(None)
 }
 
 fn update_app_config(ctx: &mut RequestContext, update: impl FnOnce(&mut AppConfig)) {
