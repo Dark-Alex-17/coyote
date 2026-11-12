@@ -2462,23 +2462,24 @@ fn prompt_for_each_secret(
     let mut deferred = Vec::new();
 
     for (index, name) in missing.iter().enumerate() {
-        let proceed = match crate::prompt::confirm(
+        let answer = match crate::prompt::confirm_or_cancel(
             prompter,
             format!("Add {{{{ {name} }}}} to the vault now?"),
             false,
         ) {
-            Ok(proceed) => proceed,
-            // Nobody to answer: this and every later secret are deferred,
-            // the way answering no to each would; what was added so far
-            // is still reported.
-            Err(err) if NeedsHuman::caused(&err) => {
-                deferred.extend(missing[index..].iter().cloned());
-                break;
-            }
+            Err(err) if NeedsHuman::caused(&err) => None,
             Err(err) => {
                 return Err(err)
                     .with_context(|| format!("failed to read confirmation for secret '{name}'"));
             }
+            Ok(answer) => answer,
+        };
+        // Cancelled, or nobody to answer: this and every later secret are
+        // deferred, the way answering no to each would; what was added so
+        // far is still reported.
+        let Some(proceed) = answer else {
+            deferred.extend(missing[index..].iter().cloned());
+            break;
         };
         if !proceed {
             deferred.push(name.clone());
@@ -3600,6 +3601,44 @@ mod tests {
         assert_eq!(
             vault.get_secret("ACCEPT_SECRET_TWO", false).unwrap(),
             "secret-two"
+        );
+    }
+
+    /// Closing the vault question defers that secret and every later one
+    /// without asking again, and the vault is never touched.
+    #[test]
+    #[serial]
+    fn cancelling_the_vault_question_defers_this_and_every_later_secret() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-cancel");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "CANCEL_SECRET_ONE".to_string(),
+            "CANCEL_SECRET_TWO".to_string(),
+        ];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let (added, deferred) = prompt_for_each_secret(&missing, &prompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(
+            requests[0].question,
+            "Add {{ CANCEL_SECRET_ONE }} to the vault now?"
+        );
+        assert!(
+            !password_file.exists(),
+            "a cancelled question must not touch the vault"
         );
     }
 
