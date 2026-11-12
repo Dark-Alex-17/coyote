@@ -660,15 +660,16 @@ fn esc_on_the_incorporate_question_opens_no_session_and_the_next_n_seats_it_empt
     answer_and_expect_session(pty, b"n", name, true);
 }
 
-/// `.rag` with no name recreates the temporary rag, removing the previous
-/// one and then asking which embedding model and documents to use; under
-/// the UI the removal happens the same way and the embedding model is
-/// asked in the Select modal. Esc cancels it with no rag written in its
-/// place, the terminal is never released, and the UI keeps taking keys
-/// and leaves clean.
+/// `.rag` with no name recreates the temporary rag by asking which
+/// embedding model and documents to use, and removes the previous one
+/// only once the wizard has answered; under the UI the embedding model is
+/// asked in the Select modal while the seeded temp rag stays on disk
+/// untouched. Esc cancels it with the old temp rag still in place and
+/// byte-identical, the terminal is never released, and the UI keeps
+/// taking keys and leaves clean.
 #[test]
 #[serial]
-fn dot_rag_without_a_name_removes_the_temp_rag_and_asks_in_the_select_modal() {
+fn dot_rag_without_a_name_asks_in_the_select_modal_and_keeps_the_temp_rag_until_it_answers() {
     let dir = fresh_config_dir("modal-rag-temp");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
@@ -688,9 +689,10 @@ fn dot_rag_without_a_name_removes_the_temp_rag_and_asks_in_the_select_modal() {
         ".rag",
         &["Selectembeddingmodel:", "dry-embed-a", "dry-embed-b"],
     );
-    assert!(
-        !temp_rag.exists(),
-        "`.rag` asked with the previous temp rag {} still in place:\n{modal}",
+    assert_eq!(
+        fs::read_to_string(&temp_rag).ok().as_deref(),
+        Some(seeded),
+        "`.rag` removed or rewrote the temp rag {} before the modal was answered:\n{modal}",
         temp_rag.display()
     );
     esc_cancels_the_modal(&mut pty, ".rag");
@@ -703,9 +705,10 @@ fn dot_rag_without_a_name_removes_the_temp_rag_and_asks_in_the_select_modal() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
-    assert!(
-        !temp_rag.exists(),
-        "a temp rag was written by the time the UI left:\n{transcript}"
+    assert_eq!(
+        fs::read_to_string(&temp_rag).ok().as_deref(),
+        Some(seeded),
+        "the cancelled `.rag` removed or rewrote the temp rag by the time the UI left:\n{transcript}"
     );
 }
 
