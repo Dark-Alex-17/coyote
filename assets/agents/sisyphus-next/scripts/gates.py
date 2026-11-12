@@ -237,6 +237,8 @@ def intake(state):
         "base_sha": head,
         "head_sha": head,
         "debt_base": head,
+        # the publish check's new-branch test compares against it
+        "start_branch": git_out(root, "branch", "--show-current", default="") if root else "",
         "brief": brief,
         "parallel_mode": str(var(state, "parallel", "0")).strip() == "1",
         "discussion_run_id": "",
@@ -275,7 +277,7 @@ def intake(state):
                   "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
                   "skipped_reviews", "debt_left_behind", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
-                  "coder_result", "anomalies_log", "gauntlet_lanes"):
+                  "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         u["resume_note"] = (
@@ -503,6 +505,8 @@ def _narrow_scope(state, u, scope):
 def route_intent(state):
     u = {}
     harvest_anomalies(state, u, "assess")
+    if not truthy(state.get("resume_mode")):
+        _derive_git_actions(state, u)
     _route_intent(state, u)
     if state.get("handoff_path"):
         if u.get("_next") in WORK_STARTS and not truthy(state.get("assess_faulted")):
@@ -511,6 +515,50 @@ def route_intent(state):
             ledger(state, u, f"handoff: {state['handoff_path']} left ready (route_intent -> {u.get('_next')}, "
                              "no work started)")
     return u
+
+
+def _derive_git_actions(state, u):
+    """An explicit commit / push / PR ask in the brief that assess left out of git_actions."""
+    actions = as_dict(state.get("git_actions"))
+    if any(truthy(actions.get(k)) for k in ("commit", "push", "open_pr")):
+        return
+    asked = _brief_git_asks(str(state.get("brief") or ""))
+    if asked:
+        u["git_actions"] = {**actions, **asked}
+        ledger(state, u, f"git: assess asked no git action, but the brief asks for {', '.join(asked)} -> git_actions "
+                         "taken from the brief")
+
+
+def _brief_git_asks(brief):
+    """The git actions the brief's imperative clauses ask for.
+
+    Only a clause that opens with the verb asks. A negation ("do not", "never") governs every later clause of its
+    sentence until a "but" or "instead" turns it, so "do not commit, push, or open a PR" asks nothing."""
+    asks = {}
+    for sentence in re.split(r"[.!?;:\n]+", brief.replace("\u2019", "'")):
+        negated = False
+        for clause in re.split(r",\s*|\s+(?=(?:and|then|but)\s)", sentence):
+            clause = re.sub(r"^(?:(?:and|then|or)\s+)+", "", clause.strip(), flags=re.I)
+            if _TURN_RE.match(clause):
+                negated = False
+                clause = _TURN_RE.sub("", clause, count=1)
+            if _NEGATION_RE.match(clause):
+                negated = True
+            if negated:
+                continue
+            m = _ASK_CLAUSE_RE.match(clause)
+            if not m:
+                continue
+            verb = m.group(1).lower()
+            if verb == "commit":
+                asks["commit"] = True
+            elif verb == "push":
+                asks.update(commit=True, push=True)
+            elif verb in ("open", "create", "raise", "submit") and _PR_RE.search(clause):
+                asks.update(commit=True, push=True, open_pr=True, draft=True)
+            if _NEW_BRANCH_RE.search(clause):
+                asks["new_branch"] = True
+    return asks if asks.get("commit") else {}
 
 
 def _not_a_step_run(state):
@@ -647,6 +695,7 @@ def record_subtasks(state):
     u = {}
     harvest_anomalies(state, u, "plan_subtasks")
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
+    subtasks = _fold_publish(state, u, subtasks)
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
         if truthy(state.get("top_level")):
@@ -662,12 +711,101 @@ def record_subtasks(state):
         if s.get("constraints"):
             lines += [f"Constraints: {s['constraints']}", ""]
         lines += ["Acceptance criteria:"] + [f"- {c}" for c in as_list(s.get("acceptance_criteria"))] + [""]
+    publish = as_list(u.get("publish_criteria", state.get("publish_criteria")))
+    if publish:
+        lines += ["## Publish step (after review, checked by a script)", ""] + [f"- {c}" for c in publish] + [""]
     write_artifact(state.get("run_dir", ""), "tasklog.md", "\n".join(lines))
     u["subtasks"] = subtasks
     u["subtask_index"] = 0
     ledger(state, u, f"subtasks: {len(subtasks)} sealed in-run subtasks recorded")
     u["_next"] = "next_subtask"
     return u
+
+
+_PR = r"(?:(?-i:PRs?)|pull\s+requests?)"
+_PR_RE = re.compile(rf"\b{_PR}\b", re.I)
+# Git and PR state: the publish step makes it and a script checks it, so no review lane is asked to judge it.
+GIT_STATE_RE = re.compile(
+    r"\bgit\s+(?:status|branch|log|rev-parse|push)\b|\bgh\s+pr\b"
+    rf"|\b(?:draft|open|opened|opens|create|created|new|in\s+the|to\s+the)\s+{_PR}\b"
+    rf"|\b{_PR}\s+(?:body|description|title|is\s+(?:a\s+)?draft|is\s+open(?:ed)?|exists)\b"
+    r"|\b(?:new|feature|default)\s+branch\b|\bbranch\s+name\b|\b(?:pushed|committed)\b[^.;]{0,40}\bbranch\b"
+    r"|\bclean\s+(?:working\s+)?(?:tree|worktree)\b|\b(?:working\s+tree|worktree)\s+is\s+clean\b",
+    re.I,
+)
+_NEW_BRANCH_RE = re.compile(r"\b(?:new|feature|separate)\s+branch\b|\bnot\s+(?:on\s+|to\s+)?the\s+default\s+branch\b",
+                            re.I)
+_PUBLISH_WORK_RE = re.compile(rf"\b(?:commit\w*|branch\w*|push\w*)\b|\b{_PR}\b", re.I)
+_ASK_CLAUSE_RE = re.compile(r"(?:please\s+|also\s+|finally\s+)?(commit|push(?!\s+back)|open|create|raise|submit)\b",
+                            re.I)
+_NEGATION_RE = re.compile(r"(?:please\s+)?(?:do\s+not|don't|never|no|not|without)\b", re.I)
+_TURN_RE = re.compile(r"(?:but|instead)\s+(?:(?:and|then)\s+)?", re.I)
+# A verification-only criterion: a command or the tests / lint, said to pass, and nothing else asked.
+_VERIFY_SUBJECT_RE = re.compile(r"`[^`]*`|\b(?:tests?|lint)\b", re.I)
+_VERIFY_PASSES_RE = re.compile(r"\b(?:pass(?:es|ing)?|succeed(?:s|ed)?|green|exits?\s+(?:with\s+)?(?:code\s+)?0)\b", re.I)
+_VERIFY_FILLER_RE = re.compile(r"\b(?:the|all|and|both|still|on|at|in|of|final|branch|head|commit|existing|full|it|"
+                               r"they|again|cleanly)\b", re.I)
+PUBLISH_REVIEW_NOTE = ("Publishing (commit, branch, push, draft PR and its body) happens after this review in the run's "
+                       "publish step, is verified there by a script (git status, git branch, gh pr view), and is not "
+                       "part of this review.")
+
+
+def _verification_only(criterion):
+    text = str(criterion)
+    if not (_VERIFY_SUBJECT_RE.search(text) and _VERIFY_PASSES_RE.search(text)):
+        return False
+    rest = _VERIFY_FILLER_RE.sub(" ", _VERIFY_PASSES_RE.sub(" ", _VERIFY_SUBJECT_RE.sub(" ", text)))
+    return not re.search(r"\w", rest)
+
+
+def _publish_only(s, criteria, git_state):
+    """A subtask whose work is committing, branching, pushing or opening a PR, judged by git state alone."""
+    about = str(s.get("title") or "").strip() or str(s.get("outcome") or "")
+    return (bool(_PUBLISH_WORK_RE.search(about)) and bool(git_state)
+            and all(c in git_state or _verification_only(c) for c in criteria))
+
+
+def _publish_asks_in(text):
+    asks = {"commit": True, "draft": True}
+    if _PR_RE.search(text):
+        asks.update(push=True, open_pr=True)
+    elif re.search(r"\bpush", text, re.I):
+        asks["push"] = True
+    if _NEW_BRANCH_RE.search(text):
+        asks["new_branch"] = True
+    return asks
+
+
+def _fold_publish(state, u, subtasks):
+    """Publish-only subtasks become git_actions, and every git/PR-state criterion moves to publish_criteria."""
+    actions = dict(as_dict(state.get("git_actions")))
+    publish = list(as_list(state.get("publish_criteria")))
+    kept = []
+    for i, s in enumerate(subtasks, 1):
+        criteria = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
+        git_state = [c for c in criteria if GIT_STATE_RE.search(c)]
+        title = s.get("title") or s.get("outcome") or ""
+        if _publish_only(s, criteria, git_state):
+            asked = _publish_asks_in(" ".join([str(title), str(s.get("outcome") or ""),
+                                               str(s.get("constraints") or ""), *criteria]))
+            actions.update(asked)
+            publish += [o for o in [str(s.get("outcome") or "").strip()] if o] + git_state
+            ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}) only publishes -> folded into "
+                             f"git_actions ({', '.join(asked)}); its git/PR-state criteria go to the publish check")
+            continue
+        if git_state:
+            s = {**s, "acceptance_criteria": [c for c in criteria if c not in git_state]}
+            publish += git_state
+            ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}): {len(git_state)} git/PR-state "
+                             "criteria moved to the publish check")
+        kept.append(s)
+    if len(publish) == len(as_list(state.get("publish_criteria"))):
+        return subtasks
+    u["git_actions"], u["publish_criteria"] = actions, publish
+    if not kept:
+        ledger(state, u, "subtasks: only publishing was planned -> one subtask for the brief")
+        kept = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
+    return kept
 
 
 def next_subtask(state):
@@ -793,7 +931,7 @@ def _subtask_spec(state, files=None):
     lines = [f"Subtask {idx + 1}/{len(subtasks)}: {s.get('title', '')}".rstrip(), "", f"Outcome: {s.get('outcome', '')}"]
     if s.get("constraints"):
         lines.append(f"Constraints: {s['constraints']}")
-    ac = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
+    ac = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip() and not GIT_STATE_RE.search(str(c))]
     lines += ["", "Acceptance criteria:"] + ([f"- {c}" for c in ac] or ["- the outcome above, as stated"])
     lines += [f"AMENDED by the user: {a}" for a in as_list(s.get("amendments")) if str(a).strip()]
     if files:
@@ -2337,6 +2475,25 @@ def _code_tree_dirty(state, root):
     return bool(git_out(root, "status", "--porcelain", "--untracked-files=normal", *pathspec))
 
 
+def _strip_git_state(text):
+    """The spec without git/PR state: bullets that name it go whole, prose lines lose those sentences only.
+
+    Returns (text, how many bullets and sentences were dropped)."""
+    kept, dropped = [], 0
+    for line in text.splitlines():
+        if not GIT_STATE_RE.search(line):
+            kept.append(line)
+        elif re.match(r"\s*(?:[-*+]|\d+[.)])\s", line):
+            dropped += 1
+        else:
+            parts = re.split(r"(?<=[.!?])\s+", line)
+            left = [p for p in parts if not GIT_STATE_RE.search(p)]
+            dropped += len(parts) - len(left)
+            if left:
+                kept.append(" ".join(left))
+    return "\n".join(kept), dropped
+
+
 def build_gauntlet_prompt(state):
     u = {}
     root = state.get("git_root") or state.get("project_dir") or "."
@@ -2349,6 +2506,7 @@ def build_gauntlet_prompt(state):
              f"Project: {state.get('project_dir')}",
              f"Diff: {diff}",
              f"Rigor: {state.get('quality_rigor') or 'production'}   Security posture: {_posture(state)}"]
+    dropped = 0
     if _subtask_phase(state):
         files = state.get("subtask_changed_files")
         if not isinstance(files, list):
@@ -2360,6 +2518,7 @@ def build_gauntlet_prompt(state):
             # no parent criteria were stated: the whole task answers to every subtask's own criteria
             spec = "\n".join(f"- subtask {i}: {c}" for i, s in enumerate(as_list(state.get("subtasks")), 1)
                              for c in as_list(_subtask_at([s], 0).get("acceptance_criteria")) if str(c).strip())
+        spec, dropped = _strip_git_state(spec)
         if spec and truthy(state.get("final_review")):
             spec += (f"\n\nScope: the whole task, all {len(as_list(state.get('subtasks')))} subtasks, over the diff from "
                      "the run base: every acceptance criterion above must hold.")
@@ -2369,6 +2528,8 @@ def build_gauntlet_prompt(state):
                          "above are unchanged):\n" + "\n".join(f"- {a}" for a in amended))
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
+    if dropped or _publish_asks(state)["commit"]:
+        lines.append(PUBLISH_REVIEW_NOTE)
     if rounds:
         prior = _review_decisions(state)
         if prior:
@@ -2718,18 +2879,33 @@ def pr_gate(state):
                                  "Do NOT open a PR and do NOT change draft state."}
         u["_next"] = "git_ops"
         return u
-    task = {"kind": "publish", "return_to": "ci_gate",
-            "commit": truthy(actions.get("commit")) or truthy(actions.get("push")) or truthy(actions.get("open_pr")),
-            "push": truthy(actions.get("push")) or truthy(actions.get("open_pr")),
-            "open_pr": truthy(actions.get("open_pr")), "base": actions.get("base") or "",
-            "draft": True, "flip_ready": False,
-            "text": "Commit the task's work (task id in the message when the brief names one)"
-                    + (", push the CURRENT branch" if truthy(actions.get("push")) or truthy(actions.get("open_pr")) else "")
-                    + (f", open a DRAFT PR" + (f" with --base {actions.get('base')}" if actions.get("base") else "") if truthy(actions.get("open_pr")) else "")
-                    + ". Then post one '## Review round N @ <sha>' comment per round listed."}
+    asks = _publish_asks(state)
+    text = ("First create and switch to a new feature branch with a descriptive name (never the default branch). "
+            if asks["new_branch"] else "")
+    text += "Commit the task's work (task id in the message when the brief names one)"
+    if asks["push"]:
+        text += ", push THAT new branch and set its upstream" if asks["new_branch"] else ", push the CURRENT branch"
+    if asks["open_pr"]:
+        text += ", open a DRAFT PR" + (f" with --base {actions.get('base')}" if actions.get("base") else "")
+    text += ". Then post one '## Review round N @ <sha>' comment per round listed."
+    reqs = [str(c) for c in as_list(state.get("publish_criteria")) if str(c).strip()]
+    if reqs:
+        text += ("\n\nRequirements this publish must meet (the PR body included; a script checks the git and PR state "
+                 "afterwards):\n" + "\n".join(f"- {c}" for c in reqs))
+    task = {"kind": "publish", "return_to": "ci_gate", **asks, "base": actions.get("base") or "",
+            "draft": True, "flip_ready": False, "text": text}
     u["git_task"] = task
     u["_next"] = "check_inbox_final" if truthy(state.get("parallel_mode")) else "git_ops"
     return u
+
+
+def _publish_asks(state):
+    """What the publish step does: a PR implies a push and a push a commit; a parallel member never branches."""
+    actions = as_dict(state.get("git_actions"))
+    pr = truthy(actions.get("open_pr"))
+    push = pr or truthy(actions.get("push"))
+    return {"commit": push or truthy(actions.get("commit")), "push": push, "open_pr": pr,
+            "new_branch": truthy(actions.get("new_branch")) and not truthy(state.get("parallel_mode"))}
 
 
 def _review_update_text(state, pending):
@@ -2782,6 +2958,26 @@ def ci_gate(state):
     if ret != "ci_gate":
         u["_next"] = "final_report"
         return u
+    if task.get("kind") == "publish":
+        rows = _publish_checks(state)
+        failed = [r for r in rows if not r[1]]
+        tries = as_int(state.get("publish_retries"))
+        if failed and tries < RERUN_ONCE:
+            u["publish_retries"] = tries + 1
+            u["git_task"] = {**task, "text": f"{task.get('text') or ''}\n\nThe publish check after your last round "
+                                             "failed. Fix exactly these, then report again:\n"
+                                             + "\n".join(f"- {n}: {d}" for n, _, d in failed)}
+            ledger(state, u, f"publish: check failed ({', '.join(n for n, _, _ in failed)}) -> one more git_ops round")
+            u["_next"] = "git_ops"
+            return u
+        u["publish_checks"] = [{"check": n, "ok": ok, "detail": d} for n, ok, d in rows]
+        if failed:
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Publish check failed: {n}: {d}" for n, _, d in failed]
+            ledger(state, u, f"publish: check still failing after {tries} retry ({', '.join(n for n, _, _ in failed)}); "
+                             "recorded as follow-ups, the run goes on")
+        elif rows:
+            ledger(state, u, f"publish: every check passed ({', '.join(n for n, _, _ in rows)})")
     owns = task.get("open_pr") and not truthy(state.get("delegated"))
     u["ci_owner"] = bool(owns)
     if owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or ""):
@@ -2797,6 +2993,64 @@ def ci_gate(state):
             ledger(state, u, "review-watch: not started: PR lifecycle owned by the parent orchestrator")
         u["_next"] = "final_report"
     return u
+
+
+def _publish_checks(state):
+    """(name, ok, detail) rows for the git and PR state the publish step was asked to leave."""
+    asks = _publish_asks(state)
+    root = state.get("git_root") or state.get("project_dir") or "."
+    branch = git_out(root, "branch", "--show-current", default="")
+    rows = []
+    if asks["commit"]:
+        exclude = _plans_exclude(state, root)
+        code, out, err = git(root, "status", "--porcelain", "--untracked-files=normal",
+                             *(["--", ".", *exclude] if exclude else []))
+        dirty = [l.strip() for l in out.splitlines() if l.strip()]
+        if code:
+            detail = f"git status failed: {err.strip()}"
+        elif dirty:
+            detail = "uncommitted: " + ", ".join(dirty[:10]) + (f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else "")
+        else:
+            detail = "nothing left uncommitted"
+        rows.append(("clean worktree", code == 0 and not dirty, detail))
+    if asks["new_branch"]:
+        start = str(state.get("start_branch") or "")
+        default = git_out(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", default="")
+        default = default.split("/", 1)[1] if default.startswith("origin/") else default
+        ok = bool(branch) and branch != start and branch != default
+        rows.append(("new branch", ok, f"current {branch or '(detached HEAD)'}, run started on {start or '(unknown)'}, "
+                                       f"remote default {default or '(unknown)'}"))
+    if asks["push"]:
+        upstream = git_out(root, "rev-parse", "--verify", "--quiet", "@{upstream}", default="")
+        head = git_out(root, "rev-parse", "HEAD", default="")
+        rows.append(("pushed", bool(upstream) and upstream == head,
+                     f"upstream {upstream or '(none)'}, HEAD {head or '(none)'}"))
+    if asks["open_pr"]:
+        pr = _pr_view(state)
+        problems = ["gh pr view failed"] if pr is None else [
+            p for p, bad in (("not a draft", pr.get("isDraft") is not True),
+                             (f"head {pr.get('headRefName')!r} is not the current branch {branch!r}",
+                              pr.get("headRefName") != branch),
+                             ("empty body", not str(pr.get("body") or "").strip())) if bad]
+        rows.append(("draft PR", not problems, "; ".join(problems) or f"{pr.get('url') or 'PR'} is a draft on {branch}"))
+    return rows
+
+
+def _pr_view(state):
+    """The current branch's PR as `gh pr view` reports it, or None when it cannot say."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    cmd = os.environ.get("SISYPHUS_GH_PR_VIEW_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
+        else:
+            p = subprocess.run(["gh", "pr", "view", "--json", "url,isDraft,headRefName,body"],
+                               cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
+        doc = json.loads(p.stdout) if p.returncode == 0 else None
+        return doc if isinstance(doc, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _review_mode(state):
@@ -3729,6 +3983,9 @@ def _assemble_report(state, u, pre_publish=False):
                              + (" [" + "; ".join(f"{k}: {v}" for k, v in details.items()) + "]" if details else ""))
     if g("ci_status"):
         lines.append(f"- CI: {g('ci_status')}" + (" (flipped to ready)" if truthy(g("flip_ready", False)) else ""))
+    for c in as_list(g("publish_checks", [])):
+        if isinstance(c, dict):
+            lines.append(f"- publish check {c.get('check')}: {'ok' if c.get('ok') else 'FAILED'} ({c.get('detail')})")
     review = _review_mode(state)
     if review:
         lines.append(f"- PR review watch: {g('pr_review_status') or 'not started'} after "

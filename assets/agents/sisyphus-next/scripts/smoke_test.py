@@ -32,6 +32,9 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
+for _k in ("GRAPH_STATE", "GRAPH_STATE_FILE"):
+    # a graph runner's own state file would win over the GRAPH_STATE the entry rows pass
+    os.environ.pop(_k, None)
 SCRUBBED_SEAMS = ("SISYPHUS_CI_SLEEP", "SISYPHUS_REVIEW_SLEEP", "SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN")
 for _k in [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in SCRUBBED_SEAMS]:
     # a caller's seams would replace the battery's fixtures
@@ -2887,6 +2890,342 @@ gp1 = gates.build_gauntlet_prompt(single)["gauntlet_prompt"]
 single_ok = ("PARENT-AC-1" in gp1 and "Subtask " not in gp1 and "Scope:" not in gp1
              and gates.route_gauntlet(dict(single, gauntlet_result=PASS_REPLY, round_heads=[{}]))["_next"] == "observability_gate")
 check("subtasks: a single-subtask run is reviewed against the task's criteria as before, PASS -> observability", single_ok, gp1)
+
+# ---------------------------------------------------------------- publish criteria
+# The planned subtasks of two runs that stuck at their publish subtask, verbatim but for the project's
+# command runner, which is renamed to `./ci` so the fixtures name no toolchain.
+BRANCH_COMMIT_PR_SUBTASKS = [
+    {
+        "title": "Domain/store layer: void invoice and list invoices by subscription",
+        "outcome": "The store/service layer gains two operations. (a) VoidInvoice(id) runs in one transaction. It moves "
+                   "an `open` invoice to `void`. It returns a not-found error for an unknown id and a conflict error "
+                   "for a `paid` or `void` invoice, leaving the row unchanged in both cases. After voiding, if the "
+                   "invoice's subscription is `past_due` and has no other `open` invoice, the subscription goes back to "
+                   "`active`. This must use the same logic as the existing 'last open invoice paid' path: extract that "
+                   "logic into a shared helper rather than copying it. Subscriptions in any other status are left "
+                   "alone. (b) ListInvoicesBySubscription(subID) returns every invoice of the subscription, any status, "
+                   "with its lines, newest first by issued_at. It returns a not-found error for an unknown subscription "
+                   "and a non-nil empty slice when the subscription has no invoices.",
+        "constraints": "Reuse the existing error types and sentinels (not_found, conflict) and the existing invoice model, "
+                       "including lines. If the schema needs a `void` status value, add it through the repo's existing "
+                       "migration/schema mechanism. Do not change how the paid-invoice path behaves. Sort ties on issued_at "
+                       "deterministically, for example by id as a secondary key. Use the repo's existing transaction "
+                       "pattern so the status check and the update are atomic.",
+        "acceptance_criteria": [
+            "New unit tests cover: void of an open invoice; void of a paid invoice and of a void invoice "
+            "returning conflict with the row unchanged; void of an unknown id returning not found; past_due \u2192 "
+            "active when the last open invoice is voided; past_due unchanged when another open invoice remains; "
+            "active/canceled subscriptions unchanged; list ordering newest first across open/paid/void; list "
+            "returns an empty non-nil slice; list of an unknown subscription returns not found",
+            "Existing tests for the paid-invoice \u2192 active transition still pass after the shared helper is "
+            "extracted",
+            "`./ci test` passes",
+            "`./ci lint` passes",
+        ],
+    },
+    {
+        "title": "API: POST /v1/invoices/{id}/void",
+        "outcome": "A new route `POST /v1/invoices/{id}/void` takes no body and calls VoidInvoice. On success it "
+                   "returns 200 with the invoice serialized by the same serializer `GET /v1/invoices/{id}` uses, with "
+                   "`\"status\": \"void\"`. A paid or already void invoice returns 409 with error code `conflict`. An "
+                   "unknown id returns 404 with error code `not_found`.",
+        "constraints": "Register the route the same way the existing invoice routes are registered. Reuse the existing "
+                       "invoice JSON serializer and error-response helper. Do not add a new response shape. Ignore any "
+                       "request body.",
+        "acceptance_criteria": [
+            "HTTP handler tests show: 200 with status void; a later GET /v1/invoices/{id} returns status void; "
+            "409 with error code `conflict` for paid and for void invoices, and a GET afterwards shows them "
+            "unchanged; 404 with error code `not_found` for an unknown id",
+            "A handler test shows a past_due subscription becomes active after its only open invoice is voided "
+            "through the endpoint",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "API: GET /v1/subscriptions/{id}/invoices",
+        "outcome": "A new route `GET /v1/subscriptions/{id}/invoices` returns 200 with `{\"invoices\": [...]}`. Each "
+                   "entry uses the same serializer as `GET /v1/invoices/{id}`, lines included. Invoices are ordered "
+                   "newest first by issued_at, and every status is listed. A subscription with no invoices returns "
+                   "`{\"invoices\": []}`, never null. An unknown subscription returns 404 with error code `not_found`.",
+        "constraints": "Reuse the existing invoice serializer and error helper. The invoices list must always be "
+                       "initialized to a non-nil value so it encodes as `[]`.",
+        "acceptance_criteria": [
+            "Handler tests check: ordering by issued_at descending with open, paid and void invoices mixed; each "
+            "entry includes its lines and matches the shape of the single-invoice GET; the raw response body for "
+            "a subscription with no invoices contains `\"invoices\":[]`; 404 with error code `not_found` for an "
+            "unknown subscription",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "Webhook: handle invoice.voided on POST /v1/webhooks/provider",
+        "outcome": "The webhook dispatcher handles the `invoice.voided` event type. It parses `data.invoice_id` the "
+                   "same way `invoice.paid` does. An open invoice becomes void, the subscription recovery rule applies, "
+                   "and the response is 200 `{\"status\":\"processed\"}`. An invoice that is already void or paid is left "
+                   "as it is, and the event is still acknowledged as `processed`: a conflict from VoidInvoice is "
+                   "swallowed here. An unknown invoice id fails like the other invoice events (404, no event recorded, "
+                   "so the provider retries). Redelivery of an applied event is reported as a duplicate by the existing "
+                   "idempotency mechanism.",
+        "constraints": "Follow the structure of the existing invoice.paid handler and its event-recording/idempotency flow "
+                       "exactly. Do not record the event when the invoice is not found. Do not change the handling of other "
+                       "event types.",
+        "acceptance_criteria": [
+            "Webhook tests show: an open invoice becomes void and the response is `{\"status\":\"processed\"}`; a "
+            "past_due subscription becomes active when that was its only open invoice; already void and paid "
+            "invoices are unchanged and the response is still processed; an unknown invoice returns 404 and a "
+            "retry with the same event id is processed rather than treated as a duplicate; a redelivered applied "
+            "event gets the same duplicate response as other event types",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "CLI: billingctl invoices <subscription-id>",
+        "outcome": "`billingctl -db billing.db invoices <subscription-id>` prints a header line, then one line per "
+                   "invoice in the same order as the list API (newest first by issued_at). Each line shows the invoice "
+                   "id, its status, its total formatted with the CLI's existing money formatter (for example `36.00 "
+                   "USD`), and its issue date as `YYYY-MM-DD`. An unknown subscription exits with status 1 and an error "
+                   "on stderr. The usage text lists the new command.",
+        "constraints": "Reuse ListInvoicesBySubscription and the CLI's existing money formatter, table/column style and "
+                       "error/exit conventions. A missing subscription-id argument should follow the existing usage-error "
+                       "convention. Format issue dates in the same timezone the CLI already uses for dates, or UTC if it "
+                       "uses none.",
+        "acceptance_criteria": [
+            "CLI tests (or a scripted run against a temporary seeded db) show the header, then lines in "
+            "newest-first order containing the id, status, a total like `36.00 USD` and a date matching "
+            "`\\d{4}-\\d{2}-\\d{2}`",
+            "Running with an unknown subscription id exits with code 1 and prints the error on stderr, with "
+            "nothing on stdout apart from any header",
+            "The usage output (no args or -h) mentions `invoices`",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "Branch, commit, and open draft PR",
+        "outcome": "All changes are committed on a new feature branch, pushed, and opened as a draft PR. The PR "
+                   "description covers the four features, the shared past_due \u2192 active helper, and the test coverage.",
+        "constraints": "Branch from the current default branch. Do not push to the default branch. The PR must be a draft.",
+        "acceptance_criteria": [
+            "`./ci test` and `./ci lint` pass on the final commit",
+            "`git status` is clean and `git branch --show-current` is not the default branch",
+            "`gh pr view --json isDraft,headRefName` shows isDraft=true and the new branch",
+        ],
+    },
+]
+NEW_BRANCH_PR_SUBTASKS = [
+    {
+        "title": "Add --account, --issued-from and --issued-before filters to export",
+        "outcome": "`invoicing.cli export csv|json` accepts `--account ACCOUNT_ID`, `--issued-from YYYY-MM-DD` and "
+                   "`--issued-before YYYY-MM-DD`. `--issued-from` is inclusive from 00:00 UTC on that day. "
+                   "`--issued-before` is exclusive from 00:00 UTC on that day. Either date flag works on its own. All "
+                   "filters, including the existing `--status`, must all match (AND). The output format and the order "
+                   "(issued_at, then id) stay the same. Tests cover each filter alone, all filters together, both date "
+                   "boundaries (an invoice at exactly 00:00 UTC on the from day is kept; one at exactly 00:00 UTC on "
+                   "the before day is dropped), and issued_at values with a non-UTC offset if the data model allows "
+                   "them.",
+        "constraints": "Change only `py/invoicing` and its tests. Read the existing export code and invoice model first, "
+                       "and reuse the existing filtering and ordering path rather than adding a second one. Compare times "
+                       "in UTC, using the same timezone handling the codebase already uses for issued_at. A bad date gives "
+                       "an argparse-style usage error and a non-zero exit, not a traceback. Without the new flags, output "
+                       "must be byte-for-byte what it is today.",
+        "acceptance_criteria": [
+            "`./ci test` passes",
+            "New tests exist for `--account`, `--issued-from`, `--issued-before`, the combined filters and both "
+            "boundary instants, and they pass",
+            "`PYTHONPATH=py python3 -m invoicing.cli export csv --db <fixture> --account <id> --issued-from "
+            "2024-01-01 --issued-before 2024-04-01` prints only that account's Q1 2024 invoices, ordered by "
+            "issued_at then id",
+            "`PYTHONPATH=py python3 -m invoicing.cli export json --db <fixture> --issued-from not-a-date` exits "
+            "non-zero with a usage error",
+            "Running the export without the new flags gives the same output as before the change (existing tests "
+            "unchanged and passing)",
+        ],
+    },
+    {
+        "title": "Add the export csv --lines line-level output",
+        "outcome": "`export csv --lines` writes one row per invoice line. The header is exactly "
+                   "`invoice_id,account_id,currency,position,description,quantity,unit_amount_cents,amount_cents`. Rows "
+                   "follow the invoice order (issued_at, then id), then the line position. Invoices without lines "
+                   "contribute no rows. `--status`, `--account` and the date filters all apply. The existing formula "
+                   "protection applies to text cells: a leading `=`, `+`, `-`, `@`, tab or CR gets a leading single "
+                   "quote. Tests cover the header, ordering, invoices without lines, filters combined with --lines, and "
+                   "formula protection on a description.",
+        "constraints": "Depends on subtask 1's filter path. Reuse the existing CSV writer and its formula-protection helper "
+                       "rather than writing new ones. Using `--lines` with `json` must fail with a clear usage error and a "
+                       "non-zero exit; it must not be silently ignored. Report this choice in the PR. Plain `export csv` "
+                       "output is unchanged.",
+        "acceptance_criteria": [
+            "`./ci test` passes",
+            "The first line of `PYTHONPATH=py python3 -m invoicing.cli export csv --lines --db <fixture>` is "
+            "exactly "
+            "`invoice_id,account_id,currency,position,description,quantity,unit_amount_cents,amount_cents`",
+            "A test asserts that rows are ordered by invoice (issued_at, id) and then position, and that an "
+            "invoice with zero lines produces no rows",
+            "A test asserts that a line description starting with `=` (and one starting with `-`) is written "
+            "with a leading `'`",
+            "A test asserts that `--account` and the date filters narrow the `--lines` output",
+            "`export json --lines` exits non-zero with a usage error (tested)",
+        ],
+    },
+    {
+        "title": "Add reports.tax_by_month and the `report tax` command",
+        "outcome": "`invoicing.reports.tax_by_month(invoices)` returns a dict mapping `YYYY-MM` (the payment month in "
+                   "UTC) to a dict of currency to tax cents, with months in ascending order. It counts paid invoices "
+                   "only. A month with paid invoices but no tax still appears, with 0 for each currency it paid in. "
+                   "`PYTHONPATH=py python3 -m invoicing.cli report tax --db PATH` prints one `YYYY-MM<TAB>totals` line "
+                   "per month, oldest first. Totals list currencies alphabetically and use the existing report money "
+                   "formatter (e.g. `12.00 EUR, 3.40 USD`), the same as `report revenue`.",
+        "constraints": "Read how `report revenue` gets the payment month (field and UTC conversion) and the invoice tax "
+                       "field, and match them exactly. Reuse the revenue report's formatting and printing helpers. Ignore "
+                       "open and void invoices.",
+        "acceptance_criteria": [
+            "`./ci test` passes",
+            "Unit tests on `tax_by_month` cover: several months in ascending key order, several currencies, a "
+            "paid month with zero tax returning `{'USD': 0}`, open and void invoices excluded, and a payment "
+            "near midnight that is bucketed by its UTC month",
+            "A CLI test via `invoicing.cli.main(['report','tax','--db',path], out=buf)` checks the exact output, "
+            "including tab separators, alphabetical currencies and a `0.00 USD` month",
+            "`PYTHONPATH=py python3 -m invoicing.cli report tax --db <fixture>` exits 0 and its output layout "
+            "matches `report revenue`",
+        ],
+    },
+    {
+        "title": "Commit on a new branch and open a draft PR",
+        "outcome": "All changes are committed on a new feature branch, pushed, and opened as a draft PR. The PR "
+                   "description covers the four features, the `--lines`-with-json usage error, and the test commands "
+                   "that were run.",
+        "constraints": "Depends on subtasks 1\u20133. Don't commit to the default branch. Don't include unrelated files.",
+        "acceptance_criteria": [
+            "`./ci test` passes on the branch HEAD",
+            "`git branch --show-current` is not the default branch, and `git status --porcelain` is empty",
+            "`gh pr view --json isDraft,headRefName` shows `isDraft: true` with the new branch as head",
+        ],
+    },
+]
+# looked up by name so the battery still reports every row against gates that predate them
+GIT_STATE_RE = getattr(gates, "GIT_STATE_RE", None)
+PUBLISH_REVIEW_NOTE = getattr(gates, "PUBLISH_REVIEW_NOTE", None)
+PUBLISH_ALL = {"commit": True, "push": True, "open_pr": True, "new_branch": True, "draft": True}
+
+
+def as_list_(v):
+    return v if isinstance(v, list) else []
+
+
+def git_state_left(subtasks):
+    return GIT_STATE_RE is None or any(GIT_STATE_RE.search(str(c)) for s in subtasks
+                                       for c in as_list_(s.get("acceptance_criteria")))
+
+
+def asks_all(actions):
+    return isinstance(actions, dict) and all(actions.get(k) is True for k in PUBLISH_ALL)
+
+
+pub_dir = os.path.join(TMP, "runs", "publish-trailing")
+u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={}))
+kept = as_list_(u.get("subtasks"))
+folded = as_list_(u.get("publish_criteria"))
+tasklog = open(os.path.join(pub_dir, "tasklog.md")).read() if os.path.exists(os.path.join(pub_dir, "tasklog.md")) else ""
+check("publish: a trailing 'Branch, commit, and open draft PR' subtask folds into git_actions (6 -> 5 subtasks)",
+      len(kept) == 5 and asks_all(u.get("git_actions")) and not git_state_left(kept)
+      and BRANCH_COMMIT_PR_SUBTASKS[5]["acceptance_criteria"][1] in folded
+      and BRANCH_COMMIT_PR_SUBTASKS[5]["acceptance_criteria"][2] in folded
+      and "Branch, commit, and open draft PR" not in tasklog and any("folded into git_actions" in d for d in u.get("decisions", [])),
+      (len(kept), u.get("git_actions"), folded))
+
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}))
+ef_kept = as_list_(u.get("subtasks"))
+check("publish: a trailing 'Commit on a new branch and open a draft PR' subtask folds into git_actions (4 -> 3 subtasks)",
+      len(ef_kept) == 3 and asks_all(u.get("git_actions")) and not git_state_left(ef_kept)
+      and NEW_BRANCH_PR_SUBTASKS[3]["acceptance_criteria"][1] in as_list_(u.get("publish_criteria")),
+      (len(ef_kept), u.get("git_actions")))
+ef_spec = ("Add account and date filters and a --lines output to export, and a tax report. "
+           "Commit your fix on a new branch and open a draft PR.\n"
+           "- `./ci test` passes\n"
+           "- The PR body lists the four features\n"
+           "- The PR description names the --lines usage error")
+gp = gates.build_gauntlet_prompt(base_state(subtasks=ef_kept or NEW_BRANCH_PR_SUBTASKS, subtask_index=len(ef_kept), final_review=True,
+                                            spec_text=ef_spec, git_actions=u.get("git_actions") or {}, round_heads=[],
+                                            gauntlet_lanes={}))["gauntlet_prompt"]
+check("publish: a final whole-task review carrying PR-body criteria drops them and the commit/PR sentence and notes the publish step",
+      "Add account and date filters" in gp and "`./ci test` passes" in gp and "new branch" not in gp
+      and "PR body" not in gp and "PR description" not in gp and PUBLISH_REVIEW_NOTE is not None and PUBLISH_REVIEW_NOTE in gp, gp)
+
+u = gates.record_subtasks(base_state(subtasks=[NEW_BRANCH_PR_SUBTASKS[3]], top_level=True, git_actions={}))
+check("publish: a plan that only publishes keeps one subtask for the brief",
+      [s.get("outcome") for s in as_list_(u.get("subtasks"))] == ["add a hello endpoint"] and asks_all(u.get("git_actions")),
+      u.get("subtasks"))
+
+mixed = {"title": "Add the void endpoint", "outcome": "POST /v1/invoices/{id}/void voids an open invoice",
+         "acceptance_criteria": ["`./ci test` passes", "POST /v1/invoices/{id}/void returns 200 with status void",
+                                 "`git status` is clean", "The PR body lists the endpoint"]}
+u = gates.record_subtasks(base_state(subtasks=[mixed, BRANCH_COMMIT_PR_SUBTASKS[2]], top_level=True, git_actions={}))
+m_kept = as_list_(u.get("subtasks"))
+check("publish: a code subtask with mixed criteria keeps its code criteria and loses only the git/PR-state ones",
+      len(m_kept) == 2 and m_kept[0].get("acceptance_criteria") == mixed["acceptance_criteria"][:2]
+      and as_list_(u.get("publish_criteria")) == mixed["acceptance_criteria"][2:] and not u.get("git_actions"),
+      (m_kept[:1], u.get("publish_criteria"), u.get("git_actions")))
+
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                  brief="Fix the proration overflow. Commit your fix on a new branch and open a draft PR."))
+check("route_intent: an explicit 'commit on a new branch and open a draft PR' ask fills empty git_actions",
+      asks_all(u.get("git_actions")) and any("taken from the brief" in d for d in u.get("decisions", [])), u.get("git_actions"))
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                  brief="Fix the proration overflow. Do not commit or open a PR."))
+check("route_intent: a negated ask ('Do not commit or open a PR.') derives no git action", "git_actions" not in u, u.get("git_actions"))
+for negated_list in ("Fix the proration overflow. Do not commit, push, or open a PR.",
+                     "Fix the proration overflow and don't commit and push anything."):
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={}, brief=negated_list))
+    check(f"route_intent: a negation covers every item of its list ({negated_list!r}) -> no git action",
+          "git_actions" not in u, u.get("git_actions"))
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                  brief="Do not touch the API, but commit and open a draft PR."))
+check("route_intent: a 'but' after a negation asks again ('Do not touch the API, but commit and open a draft PR.')",
+      asks_all({**(u.get("git_actions") or {}), "new_branch": True}), u.get("git_actions"))
+
+PUB_REPO = os.path.join(TMP, "publish-repo")
+PUB_REMOTE = os.path.join(TMP, "publish-remote.git")
+os.makedirs(PUB_REPO)
+scratch_git(TMP, "init", "-q", "--bare", PUB_REMOTE)
+scratch_git(PUB_REPO, "init", "-q", "-b", "main")
+open(os.path.join(PUB_REPO, "README.md"), "w").write("# billing\n")
+scratch_git(PUB_REPO, "add", ".")
+scratch_git(PUB_REPO, "commit", "-q", "-m", "init")
+scratch_git(PUB_REPO, "remote", "add", "origin", PUB_REMOTE)
+scratch_git(PUB_REPO, "push", "-q", "-u", "origin", "main")
+scratch_git(PUB_REPO, "remote", "set-head", "origin", "main")
+scratch_git(PUB_REPO, "switch", "-q", "-c", "feat/void-invoices")
+open(os.path.join(PUB_REPO, "void.txt"), "w").write("void\n")
+scratch_git(PUB_REPO, "add", ".")
+scratch_git(PUB_REPO, "commit", "-q", "-m", "void invoices")
+scratch_git(PUB_REPO, "push", "-q", "-u", "origin", "feat/void-invoices")
+open(os.path.join(PUB_REPO, "stray.txt"), "w").write("left behind\n")
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"https://github.com/o/r/pull/9\", \"isDraft\": true, "
+                                         "\"headRefName\": \"feat/void-invoices\", \"body\": \"Voids invoices.\"}'")
+pub = base_state(project_dir=PUB_REPO, git_root=PUB_REPO, start_branch="main", git_actions=dict(PUBLISH_ALL),
+                 git_report="opened https://github.com/o/r/pull/9",
+                 git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True, "text": "Commit and open a draft PR."})
+u = gates.ci_gate(pub)
+retry = str(u["git_task"].get("text") or "") if isinstance(u.get("git_task"), dict) else ""
+check("publish: a dirty tree after git_ops -> exactly one more git_ops round naming only the failed check",
+      u.get("_next") == "git_ops" and u.get("publish_retries") == 1 and "clean worktree" in retry and "stray.txt" in retry
+      and not any(n in retry for n in ("- new branch", "- pushed", "- draft PR")), (u.get("_next"), retry[-300:]))
+u = gates.ci_gate(dict(pub, publish_retries=1))
+rows = as_list_(u.get("publish_checks"))
+check("publish: the check failing again -> the run goes on with a follow-up, never end_blocked",
+      u.get("_next") not in ("git_ops", "end_blocked") and any("clean worktree" in f for f in as_list_(u.get("follow_ups")))
+      and [r.get("check") for r in rows if not r.get("ok")] == ["clean worktree"],
+      (u.get("_next"), u.get("follow_ups"), rows))
+os.unlink(os.path.join(PUB_REPO, "stray.txt"))
+u = gates.ci_gate(pub)
+rows = as_list_(u.get("publish_checks"))
+check("publish: clean tree, new branch, upstream at HEAD and a draft PR on that branch -> every check ok, no retry",
+      u.get("_next") != "git_ops" and len(rows) == 4 and all(r.get("ok") for r in rows) and not u.get("follow_ups"), rows)
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"u\", \"isDraft\": false, \"headRefName\": \"main\", \"body\": \"\"}'")
+u = gates.ci_gate(dict(pub, publish_retries=1))
+bad = next((r for r in as_list_(u.get("publish_checks")) if r.get("check") == "draft PR"), {})
+bad_ok = bad.get("ok") is False and all(w in str(bad.get("detail")) for w in ("not a draft", "not the current branch", "empty body"))
+check("publish: a ready PR on another head with an empty body fails the draft PR check with all three reasons", bad_ok, bad)
+os.environ.pop("SISYPHUS_GH_PR_VIEW_CMD")
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
