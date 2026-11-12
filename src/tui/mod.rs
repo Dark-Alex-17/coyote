@@ -4343,16 +4343,8 @@ mod tests {
 
         let queue = NotificationQueue::new();
         queued::queue_user_message(&queue, "hello q9d-q");
-        // The sink is process-global; other tests publish prompts on it
-        // concurrently, so only this test's own events are judged.
-        let own_events = |sink: &crate::events::RecordingSink, token: &str| -> Vec<Event> {
-            sink.drain()
-                .into_iter()
-                .filter(|event| format!("{event:?}").contains(token))
-                .collect()
-        };
         assert_eq!(
-            own_events(&sink, "q9d-q"),
+            sink.drain(),
             vec![Event::QueuedInput {
                 text: "hello q9d-q".to_string()
             }]
@@ -4380,13 +4372,7 @@ mod tests {
                 },
             ]
         );
-        assert!(
-            !sink
-                .drain()
-                .iter()
-                .any(|event| matches!(event, Event::QueuedInput { text } if text == ".info")),
-            "a held command was announced as queued input"
-        );
+        assert!(sink.drain().is_empty());
         let frame = harness.draw();
         assert!(frame.contains("pending: 2"), "{frame}");
 
@@ -4616,6 +4602,7 @@ mod tests {
     /// the running turn reads, a task's notification stays for the exit
     /// work, and no task at all is nothing to purge.
     #[tokio::test]
+    #[serial]
     async fn purging_the_turn_queue_takes_only_the_users_lines() {
         let queue = Arc::new(NotificationQueue::new());
         queued::queue_user_message(&queue, "later");
@@ -4638,6 +4625,7 @@ mod tests {
     /// survives the reconcile even when the dropped one is still on the
     /// queue the turn hands back.
     #[test]
+    #[serial]
     fn a_line_queued_after_an_interrupt_survives_the_reconcile() {
         let mut harness = Harness::standalone(80, 24);
         let queue = NotificationQueue::new();
@@ -5656,6 +5644,53 @@ mod tests {
             squeezed(&rendered).contains(&squeezed(&question)),
             "{rendered}"
         );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('y')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+    }
+
+    /// A short confirm whose help text alone outgrows a 12-row frame is
+    /// clipped like a tall question: the legend offers only Esc and no
+    /// hotkey approves it until the terminal grows.
+    #[test]
+    fn a_confirm_whose_help_outgrows_a_short_frame_offers_only_esc() {
+        let mut harness = Harness::standalone(80, 12);
+        harness.app.begin_turn("reinstall", false);
+        let help = (1..=8)
+            .map(|n| format!("help sentence {n} explains what the reinstall overwrites and keeps"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let req = PromptRequest {
+            help: Some(help),
+            default: Some(serde_json::json!(false)),
+            ..PromptRequest::new(PromptAction::Confirm, "Continue?", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+
+        let rendered = harness.draw();
+        assert!(
+            squeezed(&rendered).contains(&squeezed(CLIPPED_HINT)),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("y = yes"), "{rendered}");
+        harness.clock.advance(HOTKEY_IDLE);
+        for key in [KeyCode::Char('y'), KeyCode::Enter] {
+            assert_eq!(harness.press(key), None);
+            assert_eq!(
+                harness.app.prompts.len(),
+                1,
+                "{key:?} answered a clipped confirm"
+            );
+        }
+        assert!(!asker.is_finished());
+
+        harness.resize(80, 30);
+        let rendered = harness.draw();
+        assert!(rendered.contains("help sentence 8"), "{rendered}");
+        assert!(!rendered.contains("enlarge the terminal"), "{rendered}");
         harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char('y')), None);
         assert_eq!(

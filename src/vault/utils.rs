@@ -225,6 +225,10 @@ pub fn create_vault_password_file(
     Ok(())
 }
 
+/// The first-run wizard's provider menu. It does not check for a
+/// terminal itself: its only caller, `create_config_file`, refuses a run
+/// with nowhere to ask before anything is drawn, and a prompter with no
+/// human behind it answers with a refusal this passes through.
 pub fn prompt_provider_choice(prompter: &dyn Prompter) -> Result<Option<SupportedProvider>> {
     let options = [
         "local - encrypted file on this machine",
