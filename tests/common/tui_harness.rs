@@ -222,9 +222,10 @@ pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) 
 /// silent run recorded.
 /// Both pipes are drained on their own threads while the child runs, so
 /// a chatty child cannot block on a full pipe and be mistaken for a hang;
-/// a child that is still running at the deadline is killed along with
-/// anything it spawned, reaped and reported with whatever it had written
-/// by then.
+/// a child that is still running at the deadline is killed, reaped and
+/// reported with whatever it had written by then. Either way anything
+/// the child spawned is killed with it, so a detached grandchild cannot
+/// hold the pipes open and stall the readers.
 pub fn run_ttyless_with_env(
     binary: &Path,
     dir: &Path,
@@ -246,12 +247,7 @@ pub fn run_ttyless_with_env(
             break status;
         }
         if std::time::Instant::now() > deadline {
-            // The child is a session leader (see `detached`), so its pid is
-            // the process group; a grandchild holding the pipes open would
-            // otherwise keep the readers blocked after the child is gone.
-            // SAFETY: kill takes no pointers; a stale pid is reported as an
-            // error, not UB.
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            kill_session_group(child.id());
             let _ = child.kill();
             let _ = child.wait();
             panic!(
@@ -263,7 +259,20 @@ pub fn run_ttyless_with_env(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    (status.success(), both_streams(stdout, stderr))
+    kill_session_group(child.id());
+    (
+        status.success(),
+        both_streams_within(stdout, stderr, PTY_DEADLINE),
+    )
+}
+
+/// SIGKILLs the process group the child leads (its pid, see `detached`):
+/// the child itself if still running and every grandchild it left
+/// behind. A group that is already gone is not an error worth reporting.
+fn kill_session_group(pid: u32) {
+    // SAFETY: kill takes no pointers; a stale pid is reported as an
+    // error, not UB.
+    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
 }
 
 fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
@@ -274,21 +283,10 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static) -> std::thread::JoinHand
     })
 }
 
-fn both_streams(
-    stdout: std::thread::JoinHandle<Vec<u8>>,
-    stderr: std::thread::JoinHandle<Vec<u8>>,
-) -> String {
-    format!(
-        "--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&stdout.join().unwrap()),
-        String::from_utf8_lossy(&stderr.join().unwrap())
-    )
-}
-
-/// [`both_streams`] for a killed child: waits up to `patience` for the
-/// readers to see end-of-file and reports a stream that is still open as
-/// such, so the deadline panic cannot itself hang on a pipe an orphan
-/// still holds.
+/// Both captured streams: waits up to `patience` for the readers to see
+/// end-of-file and reports a stream that is still open as such, so
+/// neither the result nor the deadline panic can hang on a pipe an
+/// orphan still holds.
 fn both_streams_within(
     stdout: std::thread::JoinHandle<Vec<u8>>,
     stderr: std::thread::JoinHandle<Vec<u8>>,

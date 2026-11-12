@@ -2554,6 +2554,67 @@ fn every_tty_less_refusal_has_one_shape_and_names_its_flag() {
     );
 }
 
+/// With no terminal, `--install` of a bundle whose mcp.json references
+/// secrets the vault lacks is not a refusal: nobody can answer `Add
+/// {{ X }} to the vault now?`, so every secret is deferred the way
+/// declining each would, the summary names them under the deferred
+/// notice, the merged mcp.json and the bundle record land, the vault
+/// gains no file, and the run exits 0.
+#[test]
+#[serial]
+fn a_tty_less_install_of_a_bundle_with_secrets_defers_them_all_and_still_lands_the_bundle() {
+    let dir = fresh_config_dir("ttyless-install-defers-secrets");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-c3s";
+    let secrets = ["SECRET_A", "SECRET_B"];
+    let repo = write_bundle_repo(&dir, name, &secrets);
+    let files_before = walk(&dir);
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", repo.to_str().unwrap()],
+        "tty-less install of a bundle with secrets",
+    );
+    assert!(
+        ok,
+        "a tty-less `--install` of a bundle with missing secrets did not exit 0:\n{out}"
+    );
+    assert!(
+        refusal_shape(&out).is_none() && !out.contains("to the vault now?"),
+        "the tty-less install refused or asked instead of deferring the secrets:\n{out}"
+    );
+    let notice_at = out
+        .find("still required by your MCP servers")
+        .unwrap_or_else(|| panic!("the install did not print the deferred-secrets notice:\n{out}"));
+    for secret in secrets {
+        assert!(
+            out[notice_at..].contains(&format!("{{{{ {secret} }}}}")),
+            "the deferred list does not name {secret}:\n{out}"
+        );
+    }
+
+    let mcp_json = fs::read_to_string(dir.join("mcp.json"))
+        .unwrap_or_else(|_| panic!("the merged mcp.json was not written:\n{out}"));
+    assert!(
+        mcp_json.contains("bundle-k7s-server") && secrets.iter().all(|s| mcp_json.contains(s)),
+        "the merged mcp.json lacks the bundle's server or its secret references:\n{mcp_json}"
+    );
+    assert!(
+        !new_files_named(&dir, &files_before, name).is_empty(),
+        "no file records the installed bundle `{name}`:\n{out}"
+    );
+    assert!(
+        dir.join("roles").join(format!("{name}-role.md")).exists(),
+        "the bundle's role was not installed:\n{out}"
+    );
+    let vault_files = new_files_named(&dir, &files_before, "vault");
+    assert!(
+        vault_files.is_empty(),
+        "deferring the secrets still wrote {vault_files:?}:\n{out}"
+    );
+}
+
 /// `--update` on a Cargo install with a terminal on stdout but stdin
 /// redirected from `/dev/null` (a pipeline feeding the command): the
 /// inquire confirm could paint but never read, so the update is refused

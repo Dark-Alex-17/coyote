@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -743,18 +744,90 @@ fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
     since(pty, at)
 }
 
+/// The screen `raw` leaves behind, replayed cell by cell. The painter
+/// moves the cursor (`CSI r;c H`) and writes only the cells that changed,
+/// so the stripped stream runs a row's name into its description; the
+/// replayed screen keeps the padding between them, in the shape the REPL
+/// completer paints its menu.
+fn painted_screen(raw: &[u8]) -> String {
+    let chars: Vec<char> = String::from_utf8_lossy(raw).chars().collect();
+    let mut rows: Vec<Vec<char>> = Vec::new();
+    let (mut row, mut col) = (0usize, 0usize);
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\x1b' if chars.get(i + 1) == Some(&'[') => {
+                let start = i + 2;
+                let mut end = start;
+                while matches!(chars.get(end), Some(c) if ('\x20'..='\x3f').contains(c)) {
+                    end += 1;
+                }
+                let params: String = chars[start..end].iter().collect();
+                match chars.get(end) {
+                    Some('H') => {
+                        let mut at = params.split(';').map(|n| n.parse::<usize>().unwrap_or(1));
+                        row = at.next().unwrap_or(1).saturating_sub(1);
+                        col = at.next().unwrap_or(1).saturating_sub(1);
+                    }
+                    Some('J') if params == "2" => rows.clear(),
+                    Some('K') => {
+                        if let Some(line) = rows.get_mut(row) {
+                            line.truncate(col);
+                        }
+                    }
+                    _ => {}
+                }
+                i = end + 1;
+            }
+            '\x1b' if matches!(chars.get(i + 1), Some(']' | 'P' | '_' | '^' | 'X')) => {
+                i += 2;
+                while !matches!(chars.get(i), None | Some('\x07' | '\x1b')) {
+                    i += 1;
+                }
+                i += if chars.get(i) == Some(&'\x1b') { 2 } else { 1 };
+            }
+            '\x1b' if matches!(chars.get(i + 1), Some(c) if ('\x20'..='\x2f').contains(c)) => {
+                i += 3
+            }
+            '\x1b' => i += 2,
+            '\r' => {
+                col = 0;
+                i += 1;
+            }
+            '\n' => {
+                row += 1;
+                i += 1;
+            }
+            c => {
+                if !c.is_control() {
+                    if rows.len() <= row {
+                        rows.resize(row + 1, Vec::new());
+                    }
+                    let line = &mut rows[row];
+                    if line.len() <= col {
+                        line.resize(col + 1, ' ');
+                    }
+                    line[col] = c;
+                    col += 1;
+                }
+                i += 1;
+            }
+        }
+    }
+    let lines: Vec<String> = rows.iter().map(|line| line.iter().collect()).collect();
+    lines.join("\n")
+}
+
 /// Types `<sigil>name` into an idle composer, nudges the width for a
-/// repaint, then closes the band and clears the draft. Returns every
-/// printable byte written from the typing on: the band's rows are
-/// painted whole when they first appear, while a later repaint may skip
-/// cells that did not change.
+/// repaint, then closes the band and clears the draft. Returns the screen
+/// as painted from the typing on (see `painted_screen`).
 fn palette_frame_for(pty: &mut Pty, sigil: char, name: &str, toggle: &mut bool) -> String {
     let typed_at = pty.raw().len();
     pty.send(format!("{sigil}{name}").as_bytes()).unwrap();
     pty.read_for(Duration::from_millis(400));
     *toggle = !*toggle;
     repainted_frame(pty, 60, if *toggle { 141 } else { 140 });
-    let frame = since(pty, typed_at);
+    let frame = painted_screen(&pty.raw()[typed_at..]);
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(200));
     pty.send(b"\x03").unwrap();
@@ -781,10 +854,21 @@ fn offers(frame: &str, sigil: char, c: &Candidate) -> bool {
     row_markers(sigil, c).iter().any(|m| flat.contains(m))
 }
 
+/// The palette rows painted in `frame`, parsed the way the REPL menu is:
+/// every `<sigil>name  description` row but the composer's own line,
+/// which reads as `typed` with nothing after it.
+fn palette_rows(frame: &str, sigil: char, typed: &str) -> Vec<Candidate> {
+    parse_sigil_rows(frame, sigil)
+        .into_iter()
+        .filter(|row| !(row.description.is_empty() && row.name == typed))
+        .collect()
+}
+
 /// Cold start under `sigil`: every candidate the REPL completer offers
-/// is a palette row when its name is typed, and the bare-sigil band's
-/// total (rows shown plus the `+N more` tail) equals the completer's
-/// count.
+/// is a palette row when its name is typed, every row the palette paints
+/// (bare or while a name is typed) is a completer candidate, and the
+/// bare-sigil band's total (rows shown plus the `+N more` tail) equals
+/// the completer's count.
 fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &str) {
     let repl_dir = fresh_config_dir(&format!("{scenario}-repl"));
     let _repl_guard = TempDirGuard(repl_dir.clone());
@@ -802,10 +886,8 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
     let mut toggle = false;
     let bare = palette_frame_for(&mut pty, sigil, "", &mut toggle);
     let bare_flat = squeezed(&bare);
-    let shown = listed
-        .iter()
-        .filter(|c| bare_flat.contains(&row_markers(sigil, c)[0]))
-        .count();
+    let mut painted = palette_rows(&bare, sigil, "");
+    let shown = painted.len();
     let more: usize = bare_flat
         .split("(+")
         .nth(1)
@@ -820,6 +902,7 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
         // torn frame from a row that is not offered.
         let offered = (0..2).any(|_| {
             let frame = palette_frame_for(&mut pty, sigil, &c.name, &mut toggle);
+            painted.extend(palette_rows(&frame, sigil, &c.name));
             offers(&frame, sigil, c)
         });
         if !offered {
@@ -836,12 +919,22 @@ fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &s
         missing.len(),
         listed.len()
     );
-    let completer_names: Vec<&str> = listed.iter().map(|c| c.name.as_str()).collect();
+    let completer_names: BTreeSet<&str> = listed.iter().map(|c| c.name.as_str()).collect();
+    let strangers: BTreeSet<&str> = painted
+        .iter()
+        .map(|row| row.name.as_str())
+        .filter(|name| !completer_names.contains(name))
+        .collect();
+    assert!(
+        strangers.is_empty(),
+        "under `{sigil}` the palette paints rows the REPL completer does not offer: \
+         {strangers:?}"
+    );
     assert_eq!(
         shown + more,
         listed.len(),
-        "under `{sigil}` the bare palette band counts {shown} rows + {more} more, the REPL \
-         completer offers {} commands: {completer_names:?}",
+        "under `{sigil}` the bare palette band paints {shown} rows + {more} more, the REPL \
+         completer offers {} commands: {completer_names:?}\n{bare}",
         listed.len()
     );
 }
