@@ -9,7 +9,7 @@ use crate::config::{
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
-use crate::prompt::{Prompter, select_closed, select_closed_or_cancel};
+use crate::prompt::{NeedsHuman, Prompter, select_closed, select_closed_or_cancel};
 use crate::utils;
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -603,8 +603,10 @@ fn resolve_obsolete(
         return Ok(action);
     }
 
-    // Keeping is the non-interactive answer: apply_plan has already
-    // written the update, so refusing here would leave it half done.
+    // No answer keeps everything, whether there is no terminal, the
+    // question is cancelled or nobody is there to answer it: apply_plan
+    // has already written the update, so refusing would leave it half
+    // done.
     if !conflict::menu_can_use_terminal() {
         return Ok(ObsoleteAction::Keep);
     }
@@ -612,7 +614,7 @@ fn resolve_obsolete(
     let prompt = format!(
         "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
     );
-    let choice = select_closed_or_cancel(prompter, &prompt, keep_or_delete_options())
+    let choice = select_keep_or_delete(prompter, &prompt)
         .with_context(|| "failed to read obsolete-file choice")?;
 
     Ok(keep_or_delete_choice(
@@ -622,15 +624,21 @@ fn resolve_obsolete(
     ))
 }
 
-fn keep_or_delete_options() -> Vec<String> {
-    ["keep", "delete", "keep-all", "delete-all"]
+/// The keep-or-delete menu's answer, or `None` when there is none: the
+/// question was cancelled, or there is no human to answer it.
+fn select_keep_or_delete(prompter: &dyn Prompter, prompt: &str) -> Result<Option<String>> {
+    let options = ["keep", "delete", "keep-all", "delete-all"]
         .map(str::to_string)
-        .to_vec()
+        .to_vec();
+    match select_closed_or_cancel(prompter, prompt, options) {
+        Err(err) if NeedsHuman::caused(&err) => Ok(None),
+        answer => answer,
+    }
 }
 
-/// The action behind one of [`keep_or_delete_options`]. A cancelled
-/// question is the keep-everything answer, like a run with no human: it
-/// sticks for the rest of the loop and `cancelled_note` is printed once.
+/// The action behind a [`select_keep_or_delete`] answer. No answer is the
+/// keep-everything answer: it sticks for the rest of the loop and
+/// `cancelled_note` is printed once.
 fn keep_or_delete_choice(
     choice: Option<String>,
     sticky: &mut Option<ObsoleteAction>,
@@ -1063,7 +1071,7 @@ fn resolve_uninstall_action(
         return Ok(action);
     }
 
-    let choice = select_closed_or_cancel(prompter, prompt, keep_or_delete_options())
+    let choice = select_keep_or_delete(prompter, prompt)
         .with_context(|| "failed to read uninstall choice")?;
     Ok(keep_or_delete_choice(
         choice,
@@ -2420,13 +2428,25 @@ fn prompt_for_each_secret(
     let mut added = Vec::new();
     let mut deferred = Vec::new();
 
-    for name in missing {
-        let proceed = crate::prompt::confirm(
+    for (index, name) in missing.iter().enumerate() {
+        let proceed = match crate::prompt::confirm(
             prompter,
             format!("Add {{{{ {name} }}}} to vault now?"),
             false,
-        )
-        .with_context(|| format!("failed to read confirmation for secret '{name}'"))?;
+        ) {
+            Ok(proceed) => proceed,
+            // Nobody to answer: this and every later secret are deferred,
+            // the way answering no to each would; what was added so far
+            // is still reported.
+            Err(err) if NeedsHuman::caused(&err) => {
+                deferred.extend(missing[index..].iter().cloned());
+                break;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read confirmation for secret '{name}'"));
+            }
+        };
         if !proceed {
             deferred.push(name.clone());
             continue;
@@ -3440,6 +3460,35 @@ mod tests {
         assert!(handle_missing_secrets(&missing, dot_io(&declined())).is_ok());
     }
 
+    /// With a terminal but no human to answer, every secret is deferred
+    /// and the vault is untouched, the same as declining each.
+    #[test]
+    #[serial]
+    fn a_headless_missing_secret_question_defers_every_secret() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-headless");
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "HEADLESS_SECRET_A".to_string(),
+            "HEADLESS_SECRET_B".to_string(),
+        ];
+
+        let (added, deferred) = partition_missing_secrets(&missing, &HeadlessPrompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        assert!(
+            !password_file.exists(),
+            "a run with no human must not touch the vault"
+        );
+    }
+
     /// Accepting every secret creates the password file once, on the
     /// first accepted secret, and stores each value: the first secret
     /// costs the create-file confirm, its path and the vault password;
@@ -3555,16 +3604,33 @@ mod tests {
         );
     }
 
+    /// Under the full-screen UI with no human to answer, the obsolete
+    /// file is kept, and so is every later one.
     #[test]
     #[serial]
-    fn resolve_obsolete_with_no_human_is_refused() {
+    fn resolve_obsolete_with_no_human_keeps_the_file() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let mut sticky = None;
 
-        let err = resolve_obsolete("macros/old.yaml", &mut sticky, &HeadlessPrompter).unwrap_err();
+        let action = resolve_obsolete("macros/old.yaml", &mut sticky, &HeadlessPrompter).unwrap();
 
-        assert!(NeedsHuman::caused(&err), "{err:#}");
-        assert_eq!(sticky, None);
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+    }
+
+    /// On a terminal with no human to answer (a headless run), the
+    /// obsolete file is kept like a cancelled question keeps it.
+    #[test]
+    #[serial]
+    fn a_headless_obsolete_file_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+
+        let action = resolve_obsolete("macros/old.yaml", &mut sticky, &HeadlessPrompter).unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
     }
 
     #[test]
@@ -6471,22 +6537,45 @@ mod tests {
         assert_eq!(action, ObsoleteAction::Keep);
     }
 
+    /// Under the full-screen UI with no human to answer, the modified
+    /// item is kept, and so is every later one.
     #[test]
     #[serial]
-    fn resolve_uninstall_action_with_no_human_is_refused() {
+    fn resolve_uninstall_action_with_no_human_keeps_the_file() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let mut sticky = None;
 
-        let err = resolve_uninstall_action(
+        let action = resolve_uninstall_action(
             "File macros/a.yaml was modified locally after install",
             false,
             &mut sticky,
             &HeadlessPrompter,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(NeedsHuman::caused(&err), "{err:#}");
-        assert_eq!(sticky, None);
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+    }
+
+    /// On a terminal with no human to answer (a headless run), the
+    /// modified item is kept like a cancelled question keeps it.
+    #[test]
+    #[serial]
+    fn a_headless_uninstall_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+
+        let action = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &HeadlessPrompter,
+        )
+        .unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
     }
 
     /// Closing the uninstall question keeps the modified file and keeps
