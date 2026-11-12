@@ -27418,6 +27418,93 @@ mod tests {
         assert!(!report.contains("adversary: PIPELINE-FAULT"), "{report}");
     }
 
+    /// A DIVERGES verdict hands the fixer the adversary's numbered
+    /// complaints, each a Blockers line of its own: wrapped items are joined,
+    /// more than 8 are capped with one line naming the rest, a runaway one is
+    /// clipped, and a report without a `Complaints:` block keeps the generic
+    /// blocker.
+    #[test]
+    fn gauntlet_verdict_gate_splits_adversary_complaints_into_blockers() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let blockers = |adversary: &str| -> Vec<String> {
+            let out = run_gauntlet_script(
+                "verdict_gate.py",
+                &gauntlet_lane_ran("adversary", adversary),
+            );
+            assert_eq!(out["gauntlet_verdict"], "BLOCKED", "{out}");
+            let report = out["gauntlet_report"].as_str().unwrap();
+            assert!(
+                report.contains("| adversary | BLOCKED | DIVERGES |"),
+                "{report}"
+            );
+            report
+                .lines()
+                .filter_map(|l| l.strip_prefix("- "))
+                .filter(|l| l.starts_with("adversary: DIVERGES"))
+                .map(str::to_string)
+                .collect()
+        };
+
+        assert_eq!(
+            blockers(GAUNTLET_ADVERSARY_DIVERGES),
+            ["adversary: DIVERGES -- complaint 1: c3: nothing in the diff does Z"]
+        );
+
+        let long = "x".repeat(900);
+        let mut many = String::from(
+            "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 2/4 met.\nDebris: clean (9 added line(s) scanned)\nComplaints:\n",
+        );
+        many.push_str("1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n");
+        many.push_str(
+            "2. Interface substitution -- api/h.go:20 --\n   the handler returns a map, not the struct\n",
+        );
+        many.push_str(&format!("3. Runaway {long}\n"));
+        many.push_str(
+            "4. The handler logs PIPELINE-FAULT on a review incomplete reply -- api/h.go:30\n",
+        );
+        for i in 5..=10 {
+            many.push_str(&format!("{i}. complaint number {i}\n"));
+        }
+        many.push_str("\nVerification runs:\n- [PASS] `true` -- exit 0\n");
+        let lines = blockers(&many);
+        assert_eq!(
+            lines.len(),
+            9,
+            "8 complaints and one line naming the rest: {lines:?}"
+        );
+        assert_eq!(
+            lines[0],
+            "adversary: DIVERGES -- complaint 1: Acceptance criterion \"two\" -- Unmet -- api/h.go:10"
+        );
+        assert_eq!(
+            lines[1],
+            "adversary: DIVERGES -- complaint 2: Interface substitution -- api/h.go:20 -- the handler returns a map, not the struct"
+        );
+        let runaway = lines[2].trim_start_matches("adversary: DIVERGES -- complaint 3: ");
+        assert!(
+            runaway.len() == 600 && runaway.ends_with("...") && runaway.starts_with("Runaway xxx"),
+            "{runaway}"
+        );
+        assert_eq!(
+            lines[3],
+            "adversary: DIVERGES -- complaint 4: The handler logs PIPELINE-FAULT on a review incomplete reply -- api/h.go:30"
+        );
+        assert_eq!(
+            lines[8],
+            "adversary: DIVERGES -- 2 more complaint(s): complaint number 9; complaint number 10"
+        );
+
+        assert_eq!(
+            blockers(
+                "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1 of 2 met\n- AC1: the endpoint returns 500\n"
+            ),
+            ["adversary: DIVERGES -- the implementation does not conform to the plan"]
+        );
+    }
+
     #[test]
     fn gauntlet_verdict_gate_malformed_attempts_keeps_lane_rows() {
         if !cmd_available("python3") {

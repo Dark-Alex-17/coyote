@@ -50,7 +50,7 @@ variables:
     description: Optional root directory holding sibling repos the conversation may read for cross-repo questions (consumers, legacy patterns, call sites). Empty = no sibling repos configured.
     default: ''
   - name: chat_agent_for
-    description: "Set by the graph author in the graph's `session.chat.variables` when this agent is attached as a session's chat lane ('architect' or 'sisyphus'); the engine forwards it and validates that it is declared here. Empty = standalone. Attached mode swaps the handoff protocol for DIRECT artifact updates (design docs/ledgers/logs in place; plan-shaped changes as amendment artifacts for the run's amend path - nothing skips the gatekeeper re-seal). Standalone default keeps the handoff behavior."
+    description: "Set by the graph author in the graph's `session.chat.variables` when this agent is attached as a session's chat lane ('architect' or 'sisyphus'); the engine forwards it and validates that it is declared here. Empty = standalone. Attached mode swaps the handoff protocol for DIRECT artifact updates (design docs/ledgers/logs in place; plan-shaped changes as amendment artifacts the user applies through the orchestrator - nothing skips the gatekeeper). Standalone default keeps the handoff behavior."
     default: ''
 
 mcp_servers:

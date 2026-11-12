@@ -93,8 +93,8 @@ def normalize_base(spec):
         return spec
 
 
-# Shared surface patterns: the primary diff, the re-review delta, AND any
-# downstream watch-round delta are classified with the SAME rules, so
+# Shared surface patterns: the primary diff and the re-review delta are
+# classified with the SAME rules, so
 # "would the delta alone have selected this lane" (build_items' narrowing
 # test) is answered on the same evidence basis the original selection used.
 # The one copy of the rules is agents/.shared/diff_signals.py: the constants

@@ -1,7 +1,7 @@
 """Shared lane-selection signals over a diff - the ONE copy of the rules.
 
 Consumers: review-gauntlet/scripts/signals.py (primary + re-review delta
-signals) and any downstream watch-round delta classifier. All consumers must
+signals) and any other diff classifier. All consumers must
 answer "would this diff alone have selected the lane" on the same evidence
 basis, so the surface patterns live here and nowhere else. Pure regex over the
 changed-file list and the ADDED lines; no git, no LLM.
@@ -47,7 +47,7 @@ MIGRATIONS_RE = r"migrations?/|\.sql$"
 # replay over three historical PR engagements showed exactly that shape. It is
 # deliberately NOT part of classify() so the gauntlet's signal set is
 # unchanged, and nothing calls tenancy_signal yet: it is kept here, shared-only,
-# ahead of the watch-round narrowing classifiers it is meant for, so they
+# ahead of any narrowing classifier that needs it, so they
 # import one definition instead of growing their own copy.
 TENANCY_ADDED_RE = (
     r"owner|ownership|tenant|org[_-]?id|account[_-]?id|customer[_-]?id"

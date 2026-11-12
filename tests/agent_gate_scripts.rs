@@ -1230,6 +1230,41 @@ fn engineer_instructions_render_reference_root_project_dir_and_handoff_path() {
     );
 }
 
+/// Every render of the engineer hands work to the shipped architect and
+/// sisyphus by path: no render names another orchestrator or relies on a run
+/// picking a handoff up, parking on a discussion, or re-sealing on its own.
+#[test]
+fn engineer_renders_name_only_the_shipped_vehicles() {
+    if tools_missing() {
+        return;
+    }
+    for chat_agent_for in ["", "architect", "sisyphus"] {
+        let (_, text) = render_engineer(&[
+            ("project_dir", "/work/repo"),
+            ("reference_root", ""),
+            ("chat_agent_for", chat_agent_for),
+        ]);
+        for stale in [
+            "-next",
+            "candidate",
+            "status: consumed",
+            "continue:",
+            "go ahead",
+            "re-seal",
+            "amend path",
+        ] {
+            assert!(
+                !text.contains(stale),
+                "engineer render (chat_agent_for={chat_agent_for:?}) names {stale:?}:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("plans/engineer-handoffs/<slug>.md"),
+            "engineer render (chat_agent_for={chat_agent_for:?}) lost the handoff path:\n{text}"
+        );
+    }
+}
+
 /// run_checks.py wraps each declared command in the `build_lock` prefix and
 /// records the prefix as `under`; without one (absent or empty) the record is
 /// unchanged. A failing command's exit status survives the wrapper. The
@@ -2842,7 +2877,7 @@ fn sisyphus_debt_scan_tool_without_python3_reports_the_manual_pipeline() {
 #[test]
 fn diff_signals_classify_leaves_the_tenancy_signal_out() {
     let source = fs::read_to_string(asset(".shared/diff_signals.py")).unwrap();
-    let no_caller = "nothing calls tenancy_signal yet: it is kept here, shared-only,\n# ahead of the watch-round";
+    let no_caller = "nothing calls tenancy_signal yet: it is kept here, shared-only,\n# ahead of any narrowing classifier";
     assert!(
         source.replace("\r\n", "\n").contains(no_caller),
         "diff_signals.py: missing {no_caller:?}"

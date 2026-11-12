@@ -149,7 +149,7 @@ Every `agent__spawn` result includes a session_id. Store it. A fix or follow-up 
 
 Before the FIRST coder spawn of a task, run `git rev-parse HEAD` and keep the SHA as the task's base commit (todo text / run-state memory); every `debt_scan` call passes it as `--base`.
 
-- Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault.
+- Coder returned `CODER_FAILED` -> resume the SAME session: "Fix: <last error>". Do NOT spawn a new coder. When `Last script error:` names a crashed gate, surface it instead of asking for a fix (see Coder Outcomes): that is an engine-side fault. A `TIMED OUT` gate is not a code failure either (see Coder Outcomes).
 - Follow-up question on an explore result → resume that explore's session.
 - Multi-turn with the same agent → always resume.
 
@@ -856,9 +856,9 @@ Confirm before changes that touch 5+ files. Don't over-prompt on trivial decisio
 
 The `coder` agent's graph enforces implement → verify_build → verify_tests → self_review → fix_loop internally. `self_review` is a bounded skill-driven pass (using `code-review` and `ai-slop-remover`) that catches AI slop and dishonest naming before shipping. It returns one of:
 
-- `CODER_COMPLETE` — build + tests green. Continue with follow-up todos.
+- `CODER_COMPLETE` — build green and no test failure beyond the pre-change baseline. Continue with follow-up todos. When the output carries `Pre-existing failures:`, the suite is still RED: the coder's test gate accepted it against the baseline it recorded before editing. Carry those ids into your report and never call the suite green. A resumed coder session records its baseline on the already-edited tree, so after a resume, any listed failure that is not red at the task's base commit is the coder's own regression, not a pre-existing one.
 - `CODER_REJECTED` — user rejected the plan at the approval gate. Do NOT re-spawn blindly; ask the user what to change.
-- `CODER_FAILED`: the fix budget ran out, a verification gate crashed twice, or a routing-gate script crashed. Failure output includes last build + test logs, and `Last script error:` names a crashed gate. Surface to user; consider spawning `oracle` for diagnosis. Resume the SAME coder session for fixes; a crashed gate is an engine-side fault to surface, not a code fix.
+- `CODER_FAILED`: the fix budget ran out, a verification gate crashed twice, a gate TIMED OUT, or a routing-gate script crashed. Failure output includes last build + test logs, and `Last script error:` names a crashed gate. Surface to user; consider spawning `oracle` for diagnosis. Resume the SAME coder session for fixes; a crashed gate is an engine-side fault to surface, not a code fix. A `TIMED OUT` gate is not a red run either: never send "Fix:" for it; re-spawn with a larger `test_timeout`/`build_timeout` or a narrower `test_command`, or surface it.
 
 ## Escalation Handling
 

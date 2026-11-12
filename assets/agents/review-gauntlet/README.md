@@ -48,7 +48,7 @@ those rules are *structure*:
   always runs; adversary runs when a spec/plan is present; security runs on
   attack-surface signals (auth/deps/exec paths or diff content - the surface
   rules come from `agents/.shared/diff_signals.py`, shared with any
-  downstream watch-round classifier; `signals.py` carries a byte-equal copy
+  other diff classifier; `signals.py` carries a byte-equal copy
   of its regex constants plus an inline fallback `classify`, held equal to
   the shared module by a test) or hardened
   posture; probe runs when consumer-facing surface changed *and* a local-run

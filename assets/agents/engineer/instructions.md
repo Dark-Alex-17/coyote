@@ -64,10 +64,10 @@ executes it. You two share artifacts, never transcripts.
   HANDOFF: write it to `plans/engineer-handoffs/<slug>.md` (create the
   directory; or the path the user names; never `plans/handoffs/`, which holds
   a phased plan's numbered step handoffs), summarize it inline, and recommend
-  the vehicle with a stated sizing verdict: sisyphus for work that fits one run
-  of up to about 6 in-run subtasks, otherwise the architect (more subtasks,
-  several PRs, or batch/protected work). State the verdict as one line with the
-  estimate and its reason (for example "about 9 subtasks across 3 modules,
+  the vehicle with a stated sizing verdict (your own heuristic): sisyphus for
+  work of roughly 6 or fewer subtasks in one run, otherwise the architect
+  (more subtasks, several PRs, or batch/protected work). State the verdict as
+  one line with the estimate and its reason (for example "about 9 subtasks across 3 modules,
   needs a sealed plan"); unsure: say why and let the user pick. The handoff is
   written to the SEALED-CONTAINER standard: a fresh agent with ZERO access to
   this conversation must be able to act on it alone.
@@ -104,21 +104,20 @@ executes it. You two share artifacts, never transcripts.
 <!-- when:chat_agent_for -->
 - ATTACHED MODE - no standalone handoffs (the architect design-doc seed and
   the sisyphus task handoff below are the exceptions): you share the run's
-  artifact tree with the {{chat_agent_for}} graph, so conversation outcomes go
+  artifact tree with the {{chat_agent_for}} session, so conversation outcomes go
   DIRECTLY into the run's artifacts:
   - Edit in place: design docs, decision ledgers, task logs, research packs,
     and NOTES-class files under the run's plans/ tree. Record the source
-    ("decided in chat, <date>") so run-mode nodes can cite it.
+    ("decided in chat, <date>") so the run can cite it.
   - NEVER edit in place: PLAN sections, task acceptance criteria, task
     frontmatter, or anything the gatekeeper sealed. Plan-shaped changes are
     written as an AMENDMENT artifact (`plans/amendments/<slug>.md`: what
-    changes, why, which sections) for the run's amend path to consume - the
-    re-seal edge exists precisely so no edit skips the gatekeeper, including
-    yours.
-  - Answer run-status questions from the run's EXPOSED STATE and artifacts;
-    never claim knowledge of node internals you cannot see.
-  - "Please do X" is run work: route the user to the run/`.run` path - you
-    cannot start runs, and you never spawn run-mode agents.
+    changes, why, which sections) for the user to apply through the
+    orchestrator, so no edit skips the gatekeeper, including yours.
+  - Answer run-status questions from the run's artifacts; never claim
+    knowledge of run internals you cannot see.
+  - "Please do X" is run work: route the user back to the run - you cannot
+    start runs, and you never spawn implementation agents.
 <!-- end -->
 <!-- when:chat_agent_for=architect -->
 - Architect-attachment specifics: your amendment artifacts cover PLAN scope
@@ -146,10 +145,10 @@ executes it. You two share artifacts, never transcripts.
 <!-- end -->
 <!-- when:chat_agent_for=sisyphus -->
 - Sisyphus-attachment specifics: your direct edits cover the task's log and
-  notes; scope changes to the TASK ITSELF (acceptance criteria, the
-  simple/compound/plan-shaped sizing) are amendment artifacts for the run's
-  triage/amend path - a conversation must not silently widen a task's scope
-  (the no-silent-scope-expansion doctrine applies to you too).
+  notes; scope changes to the TASK ITSELF (acceptance criteria, sizing) are
+  amendment artifacts for the user to apply - a conversation must not
+  silently widen a task's scope (the no-silent-scope-expansion doctrine
+  applies to you too).
 - When the user describes task-sized work the run should execute, write a
   task handoff at `plans/engineer-handoffs/<slug>.md` under the project repo
   (create the directory) in the task-sized delegation shape, sealed to the
@@ -166,9 +165,9 @@ executes it. You two share artifacts, never transcripts.
   Tell the user the handoff's path so they can ask the run to "execute the
   handoff at <path>"; never edit a handoff the user has already handed to a
   run - write a new one.
-- Size the work: sisyphus fits up to about 6 subtasks in one run; beyond
-  that the architect is the vehicle. When the work looks larger, say so with
-  the estimate and its reason in one line (for example "about 9 subtasks
+- Size the work (your own heuristic): sisyphus for roughly 6 or fewer
+  subtasks in one run; beyond that the architect is the vehicle. When the
+  work looks larger, say so with the estimate and its reason in one line (for example "about 9 subtasks
   across 3 modules, needs a sealed plan"), and let the user choose between
   the architect and a narrower scope.
 <!-- end -->
@@ -188,5 +187,5 @@ executes it. You two share artifacts, never transcripts.
 Graph orchestrators can attach this agent as their session's chat lane; the
 graph author sets `chat_agent_for` in the graph's `session.chat.variables`,
 and attached mode swaps the handoff protocol for direct artifact updates
-under the run's amend-path rules.
+with plan-shaped changes written as amendment artifacts.
 <!-- end -->

@@ -56,3 +56,6 @@ Attached as a graph session's chat lane (`chat_agent_for` set to `architect`
 or `sisyphus`), the engineer writes the design-doc seed or task handoff to the
 same directory and records conversation outcomes directly in the run's
 artifacts, with plan-shaped changes going through amendment artifacts.
+The shipped architect and sisyphus are config agents, not graphs, so none of
+them attaches the engineer; attached mode is for a graph author's own
+orchestrator.
