@@ -8076,36 +8076,12 @@
     cache_read_price: 0.113
     max_output_tokens: 131072
     supports_function_calling: true
-  - name: bytedance-seed/seed-1.6
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.25
-    output_price: 2.0
-    max_output_tokens: 32768
-    supports_vision: true
-    supports_function_calling: true
-  - name: bytedance-seed/seed-1.6-flash
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.075
-    output_price: 0.3
-    max_output_tokens: 32768
-    supports_vision: true
-    supports_function_calling: true
   - name: bytedance-seed/seed-2-1-turbo
     type: chat
     max_input_tokens: 262144
     input_price: 0.5
     output_price: 2.5
     max_output_tokens: 235929
-    supports_vision: true
-    supports_function_calling: true
-  - name: bytedance-seed/seed-2.0-code
-    type: chat
-    max_input_tokens: 262144
-    input_price: 0.5
-    output_price: 3.0
-    max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
   - name: bytedance-seed/seed-2.0-lite
@@ -8287,9 +8263,9 @@
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.051
-    output_price: 0.567
-    cache_read_price: 0.018
+    input_price: 0.006
+    output_price: 0.5
+    cache_read_price: 0.005
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -8721,7 +8697,7 @@
     type: chat
     max_input_tokens: 131072
     input_price: 0.08
-    output_price: 0.45
+    output_price: 0.35
     cache_read_price: 0.04
     max_output_tokens: 117964
     supports_vision: true
@@ -8790,7 +8766,7 @@
     type: chat
     max_input_tokens: 131072
     input_price: 0.06
-    output_price: 0.25
+    output_price: 0.15
     cache_read_price: 0.015
     max_output_tokens: 117964
     supports_function_calling: true
@@ -9083,9 +9059,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.15
-    output_price: 0.6
-    cache_read_price: 0.015
+    input_price: 0.075
+    output_price: 0.3
+    cache_read_price: 0.0075
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -10090,10 +10066,10 @@
   - name: openai/gpt-5.6-sol
     type: chat
     max_input_tokens: 1050000
-    input_price: 4.0
-    output_price: 20.0
-    cache_read_price: 0.4
-    cache_write_price: 5.0
+    input_price: 4.4
+    output_price: 22.0
+    cache_read_price: 0.44
+    cache_write_price: 5.5
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
@@ -10842,9 +10818,10 @@
   - name: qwen/qwen3.5-9b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.17
-    output_price: 0.25
-    max_output_tokens: 235929
+    input_price: 0.167
+    output_price: 0.245
+    cache_read_price: 0.15
+    max_output_tokens: 40960
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-flash-02-23
@@ -11278,6 +11255,15 @@
     max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
+  - name: unbiased/pareto-26.10-preview
+    type: chat
+    max_input_tokens: 1048576
+    input_price: 0.8
+    output_price: 3.2
+    cache_read_price: 0.03
+    max_output_tokens: 131072
+    supports_vision: true
+    supports_function_calling: true
   - name: unbiased/pareto-26.9
     type: chat
     max_input_tokens: 262144
@@ -11525,9 +11511,9 @@
   - name: z-ai/glm-5.1
     type: chat
     max_input_tokens: 204800
-    input_price: 1.33
-    output_price: 4.18
-    cache_read_price: 0.247
+    input_price: 1.4
+    output_price: 4.4
+    cache_read_price: 0.26
     max_output_tokens: 131072
     supports_function_calling: true
   - name: z-ai/glm-5.2
@@ -11541,9 +11527,9 @@
   - name: z-ai/glm-5.2:batch
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.527
+    input_price: 0.35
     output_price: 1.075
-    cache_read_price: 0.178
+    cache_read_price: 0.118
     max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3
@@ -11601,10 +11587,10 @@
   - name: z-ai/glm-5.3:batch
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.45
-    output_price: 2.0
-    cache_read_price: 0.1
-    max_output_tokens: 131072
+    input_price: 0.35
+    output_price: 1.075
+    cache_read_price: 0.118
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5v-turbo
     type: chat
