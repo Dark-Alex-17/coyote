@@ -554,12 +554,12 @@ def _brief_git_asks(brief):
             m = _ASK_CLAUSE_RE.match(clause)
             if not m:
                 continue
-            verb = m.group(1).lower()
+            verb = next(g for g in m.groups() if g).lower()
             if verb == "commit":
                 asks["commit"] = True
             elif verb == "push":
                 asks.update(commit=True, push=True)
-            elif verb in ("open", "create", "raise", "submit") and _PR_RE.search(clause):
+            else:
                 asks.update(commit=True, push=True, open_pr=True, draft=True)
             if _NEW_BRANCH_RE.search(clause):
                 asks["new_branch"] = True
@@ -730,20 +730,31 @@ def record_subtasks(state):
 
 _PR = r"(?:(?-i:PRs?)|pull\s+requests?)"
 _PR_RE = re.compile(rf"\b{_PR}\b", re.I)
+# "branch" is code as often as git ("the default branch of the match"), so a branch counts only in git context.
+_GIT_NEAR = rf"\b(?:commit\w*|push\w*|{_PR}|git|checkout)\b"
 # Git and PR state: the publish step makes it and a script checks it, so no review lane is asked to judge it.
 GIT_STATE_RE = re.compile(
     r"\bgit\s+(?:status|branch|log|rev-parse|push)\b|\bgh\s+pr\b"
     rf"|\b(?:draft|open|opened|opens|create|created|new|in\s+the|to\s+the)\s+{_PR}\b"
     rf"|\b{_PR}\s+(?:body|description|title|is\s+(?:a\s+)?draft|is\s+open(?:ed)?|exists)\b"
-    r"|\b(?:new|feature|default)\s+branch\b|\bbranch\s+name\b|\b(?:pushed|committed)\b[^.;]{0,40}\bbranch\b"
+    r"|\b(?:on|to|from|onto)\s+(?:a|the)\s+(?:new|feature|default)\s+branch\b|\bnot\s+the\s+default\s+branch\b"
+    rf"|\b(?:new|feature)\s+branch\b(?=[^.;]{{0,60}}{_GIT_NEAR})|{_GIT_NEAR}[^.;]{{0,60}}\b(?:new|feature)\s+branch\b"
+    rf"|\bbranch\s+name\b(?=[^.;]{{0,60}}{_GIT_NEAR})|{_GIT_NEAR}[^.;]{{0,60}}\bbranch\s+name\b"
+    r"|\b(?:pushed|committed)\b[^.;]{0,40}\bbranch\b"
     r"|\bclean\s+(?:working\s+)?(?:tree|worktree)\b|\b(?:working\s+tree|worktree)\s+is\s+clean\b",
     re.I,
 )
 _NEW_BRANCH_RE = re.compile(r"\b(?:new|feature|separate)\s+branch\b|\bnot\s+(?:on\s+|to\s+)?the\s+default\s+branch\b",
                             re.I)
 _PUBLISH_WORK_RE = re.compile(rf"\b(?:commit\w*|branch\w*|push\w*)\b|\b{_PR}\b", re.I)
-_ASK_CLAUSE_RE = re.compile(r"(?:please\s+|also\s+|finally\s+)?(commit|push(?!\s+back)|open|create|raise|submit)\b",
-                            re.I)
+# The verb asks only with a git object after it: "Commit messages must ..." or "Open PRs older than ..." ask nothing.
+_ASK_CLAUSE_RE = re.compile(
+    r"(?:please\s+|also\s+|finally\s+)?(?:"
+    r"(commit)(?:\s+(?:(?:your|the|this|these|all|it|my|our)\s+)?(?:changes|work|fix|it|everything)\b"
+    r"|\s+(?:on|to)\s+(?:a|the)\s+(?:new\s+|feature\s+)?branch\b|\s*$)"
+    r"|(push)(?:\s+(?:(?:the|this|your|a|it)\s+)?branch\b|\s+(?:it\s+)?to\s+(?:origin|the\s+remote)\b|\s+it\s*$|\s*$)"
+    r"|(open|create|raise|submit)\s+(?:(?:a|the)\s+)?(?:draft\s+)?(?:(?-i:PR)|pull\s+request)\b(?!\s+template))",
+    re.I)
 _NEGATION_RE = re.compile(r"(?:please\s+)?(?:do\s+not|don't|never|no|not|without)\b", re.I)
 _TURN_RE = re.compile(r"(?:but|instead)\s+(?:(?:and|then)\s+)?", re.I)
 # A verification-only criterion: a command or the tests / lint, said to pass, and nothing else asked.
@@ -786,7 +797,7 @@ def _fold_publish(state, u, subtasks):
     """Publish-only subtasks become git_actions, and every git/PR-state criterion moves to publish_criteria."""
     actions = dict(as_dict(state.get("git_actions")))
     publish = list(as_list(state.get("publish_criteria")))
-    kept = []
+    kept, moved = [], False
     for i, s in enumerate(subtasks, 1):
         criteria = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
         git_state = [c for c in criteria if GIT_STATE_RE.search(c)]
@@ -795,17 +806,21 @@ def _fold_publish(state, u, subtasks):
             asked = _publish_asks_in(" ".join([str(title), str(s.get("outcome") or ""),
                                                str(s.get("constraints") or ""), *criteria]))
             actions.update(asked)
-            publish += [o for o in [str(s.get("outcome") or "").strip()] if o] + git_state
+            moving = dict.fromkeys([str(s.get("outcome") or "").strip(), *git_state])
+            publish += [c for c in moving if c and c not in publish]
+            moved = True
             ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}) only publishes -> folded into "
                              f"git_actions ({', '.join(asked)}); its git/PR-state criteria go to the publish check")
             continue
         if git_state:
             s = {**s, "acceptance_criteria": [c for c in criteria if c not in git_state]}
-            publish += git_state
+            publish += [c for c in dict.fromkeys(git_state) if c not in publish]
+            moved = True
             ledger(state, u, f"subtasks: subtask {i} ({_one_line(title, 80)}): {len(git_state)} git/PR-state "
-                             "criteria moved to the publish check")
+                             "criteria moved to the publish check: "
+                             + "; ".join(repr(_one_line(c, 120)) for c in git_state))
         kept.append(s)
-    if len(publish) == len(as_list(state.get("publish_criteria"))):
+    if not moved:
         return subtasks
     u["git_actions"], u["publish_criteria"] = actions, publish
     if not kept:
@@ -820,17 +835,23 @@ _TESTS_FIRST_RE = re.compile(r"\b(?:failing|red)\s+(?:\w+\s+){0,2}?(?:tests?|spe
 _EXPECTS_FAIL_RE = re.compile(r"\b(?:tests?|suite|specs?)\b[^.;]{0,60}?\b(?:fails?|failing|(?:is|goes|turns?)\s+red)\b",
                               re.I)
 _NOT_RE = re.compile(r"\b(?:no|not|never|without|none)\b|n't\b", re.I)
+# Failure that is not the end state ("fails without the fix", "fails before, passes after") wants the suite green.
+_FAIL_QUALIFIER_RE = re.compile(r"\b(?:without|before|until|unless)\b", re.I)
+_PASS_RE = re.compile(r"\bpass(?:es|ed|ing)?\b", re.I)
+_FIXES_FAILING_RE = re.compile(r"\bfix(?:es|ing)?\s+(?:\w+\s+){0,2}?(?:failing|red|broken)\b", re.I)
 # The tests-only fence of a split ("only test files change", "no production code") contradicts the merged subtask.
 _TESTS_ONLY_RE = re.compile(r"\bonly\s+(?:the\s+)?(?:new\s+)?\S*test\S*\s+files?\b|\bproduction\s+code\b", re.I)
 
 
 def _expects_failure(criterion):
-    m = _EXPECTS_FAIL_RE.search(str(criterion))
-    return bool(m) and not _NOT_RE.search(m.group(0))
+    text = str(criterion)
+    m = _EXPECTS_FAIL_RE.search(text)
+    return (bool(m) and not _NOT_RE.search(m.group(0)) and not _FAIL_QUALIFIER_RE.search(text)
+            and not _PASS_RE.search(text, m.end()))
 
 
 def _tests_first(s):
-    about = f"{s.get('title') or ''}\n{s.get('outcome') or ''}"
+    about = _FIXES_FAILING_RE.sub(" ", f"{s.get('title') or ''}\n{s.get('outcome') or ''}")
     return bool(_TESTS_FIRST_RE.search(about)) or any(_expects_failure(c) for c in as_list(s.get("acceptance_criteria")))
 
 
@@ -842,7 +863,7 @@ def _with_tests(tests, s):
     return {**s, "title": f"{s.get('title') or ''} (with its regression tests)".strip(),
             "outcome": " ".join(o for o in [str(tests.get("outcome") or "").strip(), str(s.get("outcome") or "").strip()] if o),
             "constraints": " ".join(c for c in [" ".join(fence), str(s.get("constraints") or "").strip()] if c),
-            "acceptance_criteria": keep + as_list(s.get("acceptance_criteria"))}
+            "acceptance_criteria": list(dict.fromkeys(str(c) for c in keep + as_list(s.get("acceptance_criteria"))))}
 
 
 def _merge_tests_first(state, u, subtasks):
@@ -983,14 +1004,16 @@ def _subtask_at(subtasks, idx):
 
 
 def _subtask_spec(state, files=None):
-    """The current subtask's own scope and acceptance criteria, as the per-subtask review checks them."""
+    """The current subtask's own scope and acceptance criteria, as the per-subtask review checks them, and how many
+    git/PR-state criteria were left out of it."""
     subtasks = as_list(state.get("subtasks"))
     idx = max(as_int(state.get("subtask_index")) - 1, 0)
     s = _subtask_at(subtasks, idx)
     lines = [f"Subtask {idx + 1}/{len(subtasks)}: {s.get('title', '')}".rstrip(), "", f"Outcome: {s.get('outcome', '')}"]
     if s.get("constraints"):
         lines.append(f"Constraints: {s['constraints']}")
-    ac = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip() and not GIT_STATE_RE.search(str(c))]
+    stated = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
+    ac = [c for c in stated if not GIT_STATE_RE.search(c)]
     lines += ["", "Acceptance criteria:"] + ([f"- {c}" for c in ac] or ["- the outcome above, as stated"])
     lines += [f"AMENDED by the user: {a}" for a in as_list(s.get("amendments")) if str(a).strip()]
     if files:
@@ -1002,7 +1025,7 @@ def _subtask_spec(state, files=None):
                   "Later subtasks deliver the rest of the parent task, and one final whole-task review checks every "
                   "parent acceptance criterion after the last subtask, so work that belongs to a later subtask is "
                   "not missing here."]
-    return "\n".join(lines)
+    return "\n".join(lines), len(stated) - len(ac)
 
 
 # ====================================================================== 2.2
@@ -1580,13 +1603,17 @@ def choice_reask(state):
 
 
 def _answered(state, choices, default=None):
-    """The key whose words the answer starts with, else the first key whose words it contains, else default."""
-    ans = (state.get("last_answer") or "").strip().lower()
+    """The key whose words the answer starts with, else the first key whose words it contains, else default.
+
+    An answer naming an option is read by that option's text alone, so a note after it cannot outvote the pick."""
+    ans = (state.get("last_answer") or "").strip()
+    named = _named_option(ans, as_dict(state.get("escalation")).get("options") or [])
+    said = (named or ans).lower()
     for key, words in choices.items():
-        if any(ans.startswith(w) for w in words):
+        if any(said.startswith(w) for w in words):
             return key
     for key, words in choices.items():
-        if any(w in ans for w in words):
+        if any(w in said for w in words):
             return key
     return default
 
@@ -1604,10 +1631,33 @@ def _whole_reply_stop(answer, options=(), stop_options=None):
     With `stop_options`, only those option texts count as a stop (an escalation whose options another node wrote).
     """
     bare = re.sub(r"[\W_]+$", "", (answer or "").strip().lower())
-    picked = _exact_option(answer or "", list(options)) if options else None
+    picked = _named_option(answer, list(options)) if options else None
     if stop_options is not None:
         return bare in STOP_REPLIES or bool(picked and picked in stop_options)
     return bare in STOP_REPLIES or bool(picked and picked.lower().startswith(("stop", "abort")))
+
+
+def _named_option(answer, options):
+    """The option an answer names: by its number, exactly, or as "<option text>: <note>" (a pick with its note)."""
+    answer = (answer or "").strip()
+    picked = split_option_reply(answer, options)[0] or _exact_option(answer, options)
+    if picked:
+        return picked
+    low = answer.lower()
+    return next((o.get("text") for o in options
+                 if o.get("text", "").strip() and low.startswith(o["text"].strip().lower() + ":")), None)
+
+
+_CONTINUE_WORD_RE = re.compile(r"\b(?:continue|treat|amendment|amended|proceed|advance)\b")
+
+
+def _says_continue(said):
+    """The first continue word decides: it continues unless a negation precedes it in its clause."""
+    for clause in re.split(r"[.;,:!?()\n\u2014\u2013]|\s-\s", said.replace("\u2019", "'")):
+        m = _CONTINUE_WORD_RE.search(clause)
+        if m:
+            return not _NOT_RE.search(clause[:m.start()])
+    return False
 
 
 def apply_answer(state):
@@ -1778,11 +1828,10 @@ def apply_answer(state):
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "plan_defect":
         # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a reply that is or leads
-        # with a stop stops; a reply naming no side at all stays the conservative stop
-        said = (split_option_reply(answer, options)[0] or answer).strip().lower()
+        # with a stop stops; a reply naming no side at all, or negating its continue ("do not proceed"), stops
+        said = (_named_option(answer, options) or answer).strip().lower()
         leads_stop = stop or said.startswith(("stop", "abort"))
-        goes_on = any(w in said for w in ("continue", "treat", "amendment", "amended", "proceed", "advance"))
-        a = "continue" if goes_on and not leads_stop else "stop"
+        a = "continue" if _says_continue(said) and not leads_stop else "stop"
         if a == "continue" and _subtask_phase(state):
             # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
             subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
@@ -2492,16 +2541,16 @@ def _snapshot_base(root, head):
     if not head or not index:
         return head, "no HEAD or index"
     index = index if os.path.isabs(index) else os.path.join(root, index)
+    if not os.path.isfile(index):
+        # with no index, `add -u` stages nothing and the diff base would be an empty tree
+        return head, f"no index file at {index}"
     fd, tmp = tempfile.mkstemp(prefix="sx-index-")
     os.close(fd)
     # Only tracked and intent-to-add paths: a path committed in HEAD but untracked here would read as deleted.
     env = {**os.environ, "GIT_INDEX_FILE": tmp, "GIT_AUTHOR_NAME": "sisyphus", "GIT_AUTHOR_EMAIL": "sisyphus@localhost",
            "GIT_COMMITTER_NAME": "sisyphus", "GIT_COMMITTER_EMAIL": "sisyphus@localhost"}
     try:
-        if os.path.isfile(index):
-            shutil.copyfile(index, tmp)
-        else:
-            os.unlink(tmp)
+        shutil.copyfile(index, tmp)
         out = ""
         for args in (["add", "-u"], ["write-tree"]):
             p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env,
@@ -2609,7 +2658,7 @@ def build_gauntlet_prompt(state):
         files = state.get("subtask_changed_files")
         if not isinstance(files, list):
             files = (_subtask_changes(state) or {}).get("files")
-        spec = _subtask_spec(state, files)
+        spec, dropped = _subtask_spec(state, files)
     else:
         spec = (state.get("spec_text") or "").strip()
         if not spec and truthy(state.get("final_review")):
@@ -2626,7 +2675,7 @@ def build_gauntlet_prompt(state):
                          "above are unchanged):\n" + "\n".join(f"- {a}" for a in amended))
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
-    if dropped or _publish_asks(state)["commit"]:
+    if dropped or as_list(state.get("publish_criteria")) or _publish_asks(state)["commit"]:
         lines.append(PUBLISH_REVIEW_NOTE)
     if rounds:
         prior = _review_decisions(state)
@@ -2816,7 +2865,8 @@ def _code_changed(state, root, tree_before, tree_after):
     missing tree or a git error reads as unchanged."""
     if not tree_before or not tree_after or tree_before == tree_after:
         return False
-    code, _, _ = git(root, "diff", "--quiet", tree_before, tree_after, "--", ".", *_plans_exclude(state, root))
+    code, _, _ = git(root, "diff", "--quiet", tree_before, tree_after, "--", ".", *_plans_exclude(state, root),
+                     timeout=WORKTREE_TREE_SECS)
     return code == 1
 
 
@@ -3119,9 +3169,11 @@ def ci_gate(state):
         tries = as_int(state.get("publish_retries"))
         if failed and tries < RERUN_ONCE:
             u["publish_retries"] = tries + 1
-            u["git_task"] = {**task, "text": f"{task.get('text') or ''}\n\nThe publish check after your last round "
-                                             "failed. Fix exactly these, then report again:\n"
-                                             + "\n".join(f"- {n}: {d}" for n, _, d in failed)}
+            # the first round already branched and commented, so the retry names only what is still wrong
+            u["git_task"] = {**task, "text": "The publish check after your last round failed. Fix exactly these, then "
+                                             "report again:\n" + "\n".join(f"- {n}: {d}" for n, _, d in failed)
+                                             + "\n\ndo not create another branch; do not post the review-round "
+                                               "comments again"}
             ledger(state, u, f"publish: check failed ({', '.join(n for n, _, _ in failed)}) -> one more git_ops round")
             u["_next"] = "git_ops"
             return u
@@ -4141,6 +4193,9 @@ def _assemble_report(state, u, pre_publish=False):
     for c in as_list(g("publish_checks", [])):
         if isinstance(c, dict):
             lines.append(f"- publish check {c.get('check')}: {'ok' if c.get('ok') else 'FAILED'} ({c.get('detail')})")
+    if not pre_publish and as_list(g("publish_checks", [])):
+        lines += [f"- publish requirement: {c} (handed to the publish step, not script-checked)"
+                  for c in as_list(g("publish_criteria", [])) if str(c).strip()]
     review = _review_mode(state)
     if review:
         lines.append(f"- PR review watch: {g('pr_review_status') or 'not started'} after "

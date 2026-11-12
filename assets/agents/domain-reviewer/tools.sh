@@ -12,11 +12,22 @@ _project_dir() {
 
 # Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so
 # commits that landed on the base after branching never surface as changes.
-# Explicit `..` ranges pass through. Returns nonzero when no merge-base exists.
+# Explicit `..` ranges pass through, and so does a checkpoint commit on top of
+# HEAD that no ref holds, whose merge-base would be HEAD. Returns nonzero when
+# no merge-base exists.
 _resolve_base() {
-  local project_dir="$1" base="$2" mb
+  local project_dir="$1" base="$2" mb head commit held
   case "${base}" in *..*) printf '%s' "${base}"; return ;; esac
   if mb=$(cd "${project_dir}" && git merge-base "${base}" HEAD 2>/dev/null) && [[ -n "${mb}" ]]; then
+    head=$(cd "${project_dir}" && git rev-parse HEAD 2>/dev/null) || head=""
+    commit=$(cd "${project_dir}" && git rev-parse --verify --quiet "${base}^{commit}" 2>/dev/null) || commit=""
+    if [[ -n "${head}" && -n "${commit}" && "${mb}" == "${head}" && "${commit}" != "${head}" ]]; then
+      # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+      if held=$(cd "${project_dir}" && git for-each-ref --count=1 --contains "${commit}" 2>/dev/null) && [[ -z "${held}" ]]; then
+        printf '%s' "${base}"
+        return
+      fi
+    fi
     printf '%s' "${mb}"
   else
     printf '%s' "${base}"

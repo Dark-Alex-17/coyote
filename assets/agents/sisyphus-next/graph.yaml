@@ -553,9 +553,9 @@ nodes:
       fix together with its regression tests is simple, even when it touches a
       few files or its size is unclear; compound only when the request asks for
       several independent changes, so a bug fix is never compound for being
-      unsure. Unsure between simple and compound: compound. Unsure between
-      compound and plan_shaped: compound; plan_shaped only when the evidence
-      shows it. Never silently ambitious.
+      unsure. Otherwise, unsure between simple and compound: compound. Unsure
+      between compound and plan_shaped: compound; plan_shaped only when the
+      evidence shows it. Never silently ambitious.
 
       State the sizing verdict for every implementation: sizing_reason is ONE line
       naming the evidence (for example "about 9 subtasks across 3 modules, needs a

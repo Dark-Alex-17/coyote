@@ -573,10 +573,10 @@ check("interpret_route -> apply_answer: an accepted free-form instruction keeps 
 s2, u = chain(base_state(escalation=pd, last_answer_text="stop"), "parse_answer", "apply_answer")
 check("apply_answer: a whole-reply stop is a stop", u["_next"] == "end_blocked" and aa("plan_defect", "Stop.")["_next"] == "end_blocked")
 PD_CONT = pd["options"][1]["text"]
-check("858ae4: match_option reads a leading option number with any separator and free text after it",
+check("answers: match_option reads a leading option number with any separator and free text after it",
       all(_lib.match_option(t, pd["options"]) == PD_CONT for t in ("2", "2.", "2)", "2:", "2 - amendment: x", "2: x", "2) x",
                                                                   "2 \u2014 x", "2\u2013x", "Option 2 - x")))
-check("858ae4: split_option_reply keeps the free text, rejects out-of-range numbers and leaves prose alone",
+check("answers: split_option_reply keeps the free text, rejects out-of-range numbers and leaves prose alone",
       _lib.split_option_reply("2 \u2014 amendment: x", pd["options"]) == (PD_CONT, "amendment: x")
       and _lib.split_option_reply("Option 2", pd["options"]) == (PD_CONT, "")
       and _lib.split_option_reply("3 - x", pd["options"]) == (None, "3 - x") and _lib.match_option("3 - x", pd["options"]) is None
@@ -587,23 +587,47 @@ PD_REPLY = ("2 \u2014 amendment: for subtask 1/4, the full test run failing is e
 PD_SUBTASKS = [{"title": f"subtask {i}", "outcome": "o"} for i in range(1, 5)]
 s2, u = chain(base_state(escalation=pd, consult_result=f"...\nCONSULT: ANSWER {PD_REPLY}", subtasks=PD_SUBTASKS,
                          subtask_index=1, spec_text="AC"), "consult_route", "apply_answer")
-check("858ae4: a navigator pick with an em-dash amendment continues on subtask 1 with the amendment, never end_blocked",
+check("answers: a navigator pick with an em-dash amendment continues on subtask 1 with the amendment, never end_blocked",
       s2["last_answer"].startswith(PD_CONT) and "only _test.go files changed" in s2["last_answer"]
       and u["_next"] == "build_gauntlet_prompt" and "only _test.go files changed" in s2["subtasks"][0]["amendments"][0]
       and not s2["subtasks"][1].get("amendments"), u.get("_next"))
 u = gates.ladder_route(base_state(escalation=pd, ladder_resolution="ruling", ladder_choice="2: drop the vet criterion"))
-check("858ae4: a ladder ruling naming an option number keeps its amendment",
+check("answers: a ladder ruling naming an option number keeps its amendment",
       u["_next"] == "apply_answer" and u["last_answer"] == f"{PD_CONT}: drop the vet criterion")
-check("858ae4: plan_defect stop option, its number and a bare stop -> end_blocked",
+check("answers: plan_defect stop option, its number and a bare stop -> end_blocked",
       all(gates.apply_answer(base_state(escalation=pd, last_answer=a))["_next"] == "end_blocked"
           for a in ("Stop; the plan needs amending (report it)", "1", "stop")))
-check("858ae4: plan_defect raw numbered reply with an em-dash amendment continues",
+check("answers: plan_defect raw numbered reply with an em-dash amendment continues",
       aa("plan_defect", "2 \u2014 amendment: vet exit 0 is enough", spec_text="AC")["_next"] == "build_gauntlet_prompt"
       and gates.apply_answer(base_state(escalation=pd, last_answer="2 \u2014 amendment: x", spec_text="AC"))["_next"]
       == "build_gauntlet_prompt")
-check("858ae4: a typed numbered pick with free text is interpreted, never truncated to the option",
+check("answers: a typed numbered pick with free text is interpreted, never truncated to the option",
       all(gates.parse_answer(base_state(escalation=e, last_answer_text=t))["_next"] == "interpret_reply"
           for e in (pd, {**pd, "data": {"multiple_choice": True}}) for t in ("2 - only for the read path", "Option 2: reads only")))
+check("answers: plan_defect replies that negate their continue word stop, with or without the options",
+      all(gates.apply_answer(base_state(escalation=e, last_answer=a, spec_text="AC"))["_next"] == "end_blocked"
+          for e in (pd, escalation("plan_defect", "q", []))
+          for a in ("Do not continue, the plan is wrong", "don't proceed", "no, discontinue",
+                    "Stop - do not continue", "1 - stop, don't proceed", "stop; the amendment is wrong")))
+check("answers: the navigator's numbered amendment still continues once continue words are read at word boundaries",
+      aa("plan_defect", f"{PD_CONT}: {PD_REPLY[4:]}", spec_text="AC")["_next"] == "build_gauntlet_prompt")
+for kind, opts, pick in (
+        ("engine_fault", [option("Retry the coder round", True), option("Abort this task")], "2 - abort, retrying won't help"),
+        ("strikeout", [option("Abort and report (code left in a working state)", True), option("One more fix round anyway"),
+                       option("Accept the findings unresolved and proceed")], "1 - abort, one more round won't help"),
+        ("review_incomplete", [option("Retry the review again"), option("Accept NEEDS-HUMAN: proceed without it"),
+                               option("Abort this task")], "3 - abort, retrying won't help")):
+    esc_k = escalation(kind, "q", opts)
+    s2, u = chain(base_state(escalation=esc_k, ladder_resolution="ruling", ladder_choice=pick), "ladder_route", "apply_answer")
+    check(f"answers: {kind}: a stop pick with a note ({pick!r}) aborts, whatever the note's words say",
+          s2.get("last_answer", "").startswith(opts[int(pick[0]) - 1]["text"] + ": ") and u["_next"] == "end_aborted",
+          (s2.get("last_answer"), u.get("_next")))
+keep = escalation("design_ask", "q", [option("Adopt the pattern (one more coder round introduces it)"),
+                                      option("Keep the code as shipped (answer recorded, no change)")])
+u = gates.apply_answer(base_state(escalation=keep, last_answer=f"{keep['options'][1]['text']}: yes, adopt it later",
+                                  design_ask_rounds=0))
+check("answers: a named option decides over the words of its note (keep, though the note says adopt)",
+      u["_next"] == "review_gate", u.get("_next"))
 u = gates.interpret_route(base_state(escalation=pd, last_answer_text="x", reply_verdict="instruction", reply_instruction="path",
                                      reply_value=old))
 check("interpret_route: an instruction the kind does not accept -> unclear, never applied, ledgered",
@@ -3126,9 +3150,10 @@ pub_dir = os.path.join(TMP, "runs", "publish-trailing")
 u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={}))
 kept = as_list_(u.get("subtasks"))
 folded = as_list_(u.get("publish_criteria"))
-tasklog = open(os.path.join(pub_dir, "tasklog.md")).read() if os.path.exists(os.path.join(pub_dir, "tasklog.md")) else ""
+tasklog_exists = os.path.exists(os.path.join(pub_dir, "tasklog.md"))
+tasklog = open(os.path.join(pub_dir, "tasklog.md")).read() if tasklog_exists else ""
 check("publish: a trailing 'Branch, commit, and open draft PR' subtask folds into git_actions (6 -> 5 subtasks)",
-      len(kept) == 5 and asks_all(u.get("git_actions")) and not git_state_left(kept)
+      tasklog_exists and len(kept) == 5 and asks_all(u.get("git_actions")) and not git_state_left(kept)
       and BRANCH_COMMIT_PR_SUBTASKS[5]["acceptance_criteria"][1] in folded
       and BRANCH_COMMIT_PR_SUBTASKS[5]["acceptance_criteria"][2] in folded
       and "Branch, commit, and open draft PR" not in tasklog and any("folded into git_actions" in d for d in u.get("decisions", [])),
@@ -3183,6 +3208,32 @@ u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_
                                   brief="Do not touch the API, but commit and open a draft PR."))
 check("route_intent: a 'but' after a negation asks again ('Do not touch the API, but commit and open a draft PR.')",
       asks_all({**(u.get("git_actions") or {}), "new_branch": True}), u.get("git_actions"))
+for prose in ("Push notifications should fire when a build fails.", "Commit messages must follow conventional commits.",
+              "Open PRs older than 30 days are closed.", "Create a pull request template."):
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                      brief=f"Add the nightly job. {prose}"))
+    check(f"route_intent: a verb with no git object after it ({prose!r}) asks for no git action",
+          "git_actions" not in u, u.get("git_actions"))
+
+code_branches = ["the default branch of the match returns 400", "add a new branch to the parser for empty input"]
+branchy = {"title": "Route empty input", "outcome": "Empty input takes its own path",
+           "acceptance_criteria": ["`./ci test` passes", *code_branches]}
+u = gates.record_subtasks(base_state(subtasks=[branchy, BRANCH_COMMIT_PR_SUBTASKS[2]], top_level=True, git_actions={}))
+b_kept = as_list_(u.get("subtasks"))
+b_spec, _ = gates._strip_git_state("\n".join(f"- {c}" for c in code_branches))
+check("publish: code criteria about a match or parser branch stay in the subtask and in a final-review spec",
+      b_kept[0].get("acceptance_criteria") == branchy["acceptance_criteria"]
+      and not any(c in as_list_(u.get("publish_criteria")) for c in code_branches)
+      and all(c in b_spec for c in code_branches), (b_kept[:1], u.get("publish_criteria"), b_spec))
+u = gates.record_subtasks(base_state(subtasks=[mixed, BRANCH_COMMIT_PR_SUBTASKS[2]], top_level=True, git_actions={}))
+check("publish: each git/PR-state criterion that moves is ledgered verbatim",
+      any("'`git status` is clean'" in d and "'The PR body lists the endpoint'" in d for d in u.get("decisions", [])),
+      u.get("decisions"))
+git_sub = base_state(subtasks=[{"title": "A", "outcome": "a", "acceptance_criteria": ["a works", "`git status` is clean"]},
+                               {"title": "B", "outcome": "b"}], subtask_index=1, subtask_changed_files=[], git_actions={})
+gp = gates.build_gauntlet_prompt(git_sub)["gauntlet_prompt"]
+check("publish: a subtask review whose git-state criterion was filtered drops it and carries the publish note",
+      "`git status` is clean" not in gp and "- a works" in gp and gates.PUBLISH_REVIEW_NOTE in gp, gp[-600:])
 
 PUB_REPO = os.path.join(TMP, "publish-repo")
 PUB_REMOTE = os.path.join(TMP, "publish-remote.git")
@@ -3211,6 +3262,9 @@ retry = str(u["git_task"].get("text") or "") if isinstance(u.get("git_task"), di
 check("publish: a dirty tree after git_ops -> exactly one more git_ops round naming only the failed check",
       u.get("_next") == "git_ops" and u.get("publish_retries") == 1 and "clean worktree" in retry and "stray.txt" in retry
       and not any(n in retry for n in ("- new branch", "- pushed", "- draft PR")), (u.get("_next"), retry[-300:]))
+check("publish: the retry text is the failed checks plus the no-new-branch, no-repost rule, never the first publish text",
+      "Commit and open a draft PR." not in retry
+      and retry.rstrip().endswith("do not create another branch; do not post the review-round comments again"), retry)
 u = gates.ci_gate(dict(pub, publish_retries=1))
 rows = as_list_(u.get("publish_checks"))
 check("publish: the check failing again -> the run goes on with a follow-up, never end_blocked",
@@ -3222,6 +3276,14 @@ u = gates.ci_gate(pub)
 rows = as_list_(u.get("publish_checks"))
 check("publish: clean tree, new branch, upstream at HEAD and a draft PR on that branch -> every check ok, no retry",
       u.get("_next") != "git_ops" and len(rows) == 4 and all(r.get("ok") for r in rows) and not u.get("follow_ups"), rows)
+report = gates.final_report(base_state(publish_checks=u.get("publish_checks"),
+                                       publish_criteria=["PR body describes the migration"]))["report"]
+check("publish: the final report lists each publish requirement as handed to the publish step, not script-checked",
+      "- publish requirement: PR body describes the migration (handed to the publish step, not script-checked)" in report
+      and "- publish check draft PR: ok" in report, report[-800:])
+report = gates.final_report(base_state(publish_checks=[], publish_criteria=["PR body describes the migration"]))["report"]
+check("publish: no publish step ran (graph default publish_checks: []) -> no publish requirement rows",
+      "- publish requirement:" not in report, report[-800:])
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"u\", \"isDraft\": false, \"headRefName\": \"main\", \"body\": \"\"}'")
 u = gates.ci_gate(dict(pub, publish_retries=1))
 bad = next((r for r in as_list_(u.get("publish_checks")) if r.get("check") == "draft PR"), {})
@@ -3229,7 +3291,7 @@ bad_ok = bad.get("ok") is False and all(w in str(bad.get("detail")) for w in ("n
 check("publish: a ready PR on another head with an empty body fails the draft PR check with all three reasons", bad_ok, bad)
 os.environ.pop("SISYPHUS_GH_PR_VIEW_CMD")
 
-# cb93f2: subtasks never commit, so a later subtask diffed against HEAD reviewed every earlier subtask's work too.
+# Subtasks never commit, so a later subtask diffed against HEAD reviewed every earlier subtask's work too.
 SNAP_REPO = os.path.join(TMP, "snapshot-repo")
 os.makedirs(SNAP_REPO)
 
@@ -3254,47 +3316,70 @@ snap = base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, base_sha=SNAP_HEAD,
                   subtask_index=0, round_heads=[], gauntlet_lanes={})
 sub_step(snap, "next_subtask")
 open(os.path.join(SNAP_REPO, "a.txt"), "a").write("subtask 1\n")
+snap_refs = snap_git("for-each-ref")
 sub_step(snap, "next_subtask")
 snap_base = snap.get("base_sha") or ""
 snap_parent = subprocess.run(["git", "-C", SNAP_REPO, "rev-parse", f"{snap_base}^"], capture_output=True, text=True).stdout.strip()
-check("cb93f2: subtask 2's diff base is a snapshot commit on top of HEAD, not HEAD, and it is ledgered",
+check("diff base: subtask 2's diff base is a snapshot commit on top of HEAD, not HEAD, and it is ledgered",
       snap_base != SNAP_HEAD and snap_parent == SNAP_HEAD and snap.get("debt_base") == snap_base
       and snap_git("rev-parse", "HEAD") == SNAP_HEAD and any("diff base is snapshot" in d for d in snap["decisions"]),
       (snap_base, snap_parent, snap["decisions"][-3:]))
+check("diff base: taking the snapshot creates and moves no ref", snap_git("for-each-ref") == snap_refs)
 open(os.path.join(SNAP_REPO, "b.txt"), "a").write("subtask 2\n")
 snap_diff = subprocess.run(["git", "-C", SNAP_REPO, "diff", "--name-only", snap_base], capture_output=True, text=True).stdout.split()
-check("cb93f2: the diff from subtask 2's base names only subtask 2's file", snap_diff == ["b.txt"], snap_diff)
+check("diff base: the diff from subtask 2's base names only subtask 2's file", snap_diff == ["b.txt"], snap_diff)
 sub_step(snap, "build_gauntlet_prompt")
-check("cb93f2: the gauntlet's Diff line carries the snapshot and the round records its code tree",
+check("diff base: the gauntlet's Diff line carries the snapshot and the round records its code tree",
       f"Diff: {snap_base}" in snap.get("gauntlet_prompt", "")
       and (snap.get("round_heads") or [{}])[-1].get("code_tree") == gates._worktree_tree(SNAP_REPO), snap.get("round_heads"))
 sys.path.insert(0, gates.SHARED_DIR)
 import debris  # noqa: E402
-check("cb93f2: debris keeps a checkpoint on top of HEAD, still takes the merge-base of a branch behind HEAD",
+check("diff base: debris keeps a checkpoint on top of HEAD, still takes the merge-base of a branch behind HEAD",
       debris.normalize_base(SNAP_REPO, snap_base, 30) == snap_base
       and debris.normalize_base(SNAP_REPO, "behind", 30) == SNAP_OLD
       and debris.normalize_base(SNAP_REPO, "HEAD", 30) == SNAP_HEAD)
 sig = subprocess.run([sys.executable, os.path.join(gates.SHARED_DIR, "..", "review-gauntlet", "scripts", "signals.py")],
-                     capture_output=True, text=True,
+                     capture_output=True, text=True, timeout=60,
                      env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
                           "GRAPH_STATE": json.dumps({"project_dir": SNAP_REPO, "diff_spec": snap_base})})
 sig_out = json.loads(sig.stdout or "{}")
-check("cb93f2: the gauntlet's signals diff a checkpoint directly: only subtask 2's file", sig_out.get("changed_files") == ["b.txt"],
+check("diff base: the gauntlet's signals diff a checkpoint directly: only subtask 2's file", sig_out.get("changed_files") == ["b.txt"],
       sig.stdout[-400:] + sig.stderr[-400:])
 # a branch that moved past HEAD (a base the work has not caught up with) is a real base, never a checkpoint
 SNAP_AHEAD = snap_git("commit-tree", f"{SNAP_HEAD}^{{tree}}", "-p", SNAP_HEAD, "-m", "upstream")
 snap_git("branch", "ahead", SNAP_AHEAD)
 sig = subprocess.run([sys.executable, os.path.join(gates.SHARED_DIR, "..", "review-gauntlet", "scripts", "signals.py")],
-                     capture_output=True, text=True,
+                     capture_output=True, text=True, timeout=60,
                      env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
                           "GRAPH_STATE": json.dumps({"project_dir": SNAP_REPO, "diff_spec": "ahead"})})
-check("cb93f2: a branch ahead of HEAD still diffs from its merge-base (HEAD), in debris and in the signals",
+check("diff base: a branch ahead of HEAD still diffs from its merge-base (HEAD), in debris and in the signals",
       debris.normalize_base(SNAP_REPO, "ahead", 30) == SNAP_HEAD
       and debris.normalize_base(SNAP_REPO, SNAP_AHEAD, 30) == SNAP_HEAD
       and sorted(json.loads(sig.stdout or "{}").get("changed_files") or []) == ["a.txt", "b.txt"],
       sig.stdout[-400:] + sig.stderr[-400:])
+CLEAN_REPO = os.path.join(TMP, "snapshot-clean-repo")
+os.makedirs(CLEAN_REPO)
+scratch_git(CLEAN_REPO, "init", "-q")
+open(os.path.join(CLEAN_REPO, "a.txt"), "w").write("a\n")
+scratch_git(CLEAN_REPO, "add", ".")
+scratch_git(CLEAN_REPO, "commit", "-q", "-m", "init")
+CLEAN_HEAD = scratch_git(CLEAN_REPO, "rev-parse", "HEAD")
+clean = base_state(project_dir=CLEAN_REPO, git_root=CLEAN_REPO, intent="implementation", subtask_index=1,
+                   subtasks=[{"title": "A", "outcome": "a"}, {"title": "B", "outcome": "b"}])
+u = gates.next_subtask(clean)
+check("diff base: a later subtask over an unchanged tracked worktree diffs against HEAD itself",
+      u.get("base_sha") == CLEAN_HEAD and not any("snapshot" in d for d in u.get("decisions", [])), u.get("decisions"))
+os.rename(os.path.join(CLEAN_REPO, ".git", "index"), os.path.join(CLEAN_REPO, ".git", "index.away"))
+open(os.path.join(CLEAN_REPO, "a.txt"), "a").write("edited\n")
+u = gates.next_subtask(clean)
+os.rename(os.path.join(CLEAN_REPO, ".git", "index.away"), os.path.join(CLEAN_REPO, ".git", "index"))
+check("diff base: a missing index file -> HEAD with the 'diff base snapshot failed' ledger line, never an empty tree",
+      u.get("base_sha") == CLEAN_HEAD and any("diff base snapshot failed" in d for d in u.get("decisions", [])),
+      (u.get("base_sha"), u.get("decisions")))
+check("diff base: a git_root that is not a repo -> the given HEAD and a reason",
+      gates._snapshot_base(TMP, CLEAN_HEAD)[0] == CLEAN_HEAD and gates._snapshot_base(TMP, CLEAN_HEAD)[1])
 
-# a6ec7b: the adversary blocked again on the same finding after a fix round that changed two test files, and the run
+# The adversary blocked again on the same finding after a fix round that changed two test files, and the run
 # stopped after a single fix attempt.
 A6_FINDING = ("adversary: DIVERGES -- complaint 1: Gamed tests \u2014 py/tests/test_cli.py:236-247 "
               "(test_export_lines_follow_invoice_export_order); root cause py/invoicing/repository.py:98 \u2014 The subtask "
@@ -3323,28 +3408,28 @@ def a6_triage(finding, trees, findings, streak, review_rounds=1):
 
 
 u = gates.route_gauntlet(base_state(gauntlet_result=BLOCKED_REPLY, round_heads=[{"round": 1}]))
-check("a6ec7b: route_gauntlet records each round's blocker texts per lane",
+check("lane_stuck: route_gauntlet records each round's blocker texts per lane",
       (u.get("round_heads") or [{}])[-1].get("lane_blockers", {}).get("adversary") == [BLOCKED_REPLY.splitlines()[-1][2:]],
       u.get("round_heads"))
 u = a6_triage(A6_AGAIN, [tree_1, tree_2], [A6_FINDING, A6_AGAIN], 1)
-check("a6ec7b: (i) same finding at the same HEAD but a changed code tree -> another fix round, not lane_stuck",
+check("lane_stuck: (i) same finding at the same HEAD but a changed code tree -> another fix round, not lane_stuck",
       u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 2
       and any("code changed" in d for d in u.get("decisions", [])), (u.get("_next"), u.get("escalation", {}).get("kind")))
 u = a6_triage(A6_AGAIN, [tree_1, tree_2, tree_3], [A6_FINDING, A6_AGAIN, A6_AGAIN], 2)
-check("a6ec7b: (ii) a third round on the same finding -> lane_stuck even though the code changed again",
+check("lane_stuck: (ii) a third round on the same finding -> lane_stuck even though the code changed again",
       u.get("escalation", {}).get("kind") == "lane_stuck", u.get("_next"))
 u = a6_triage(A6_AGAIN, [tree_2, tree_2], [A6_FINDING, A6_AGAIN], 1)
-check("a6ec7b: (iii) same finding over an unchanged code tree -> lane_stuck", u.get("escalation", {}).get("kind") == "lane_stuck",
+check("lane_stuck: (iii) same finding over an unchanged code tree -> lane_stuck", u.get("escalation", {}).get("kind") == "lane_stuck",
       u.get("_next"))
 u = a6_triage(A6_OTHER, [tree_2, tree_2], [A6_FINDING, A6_OTHER], 1)
-check("a6ec7b: (iv) a new class of finding over an unchanged tree -> the streak restarts and the fix round runs",
+check("lane_stuck: (iv) a new class of finding over an unchanged tree -> the streak restarts and the fix round runs",
       u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 1, (u.get("_next"), u.get("lane_block_streak")))
 u = a6_triage(A6_OTHER, [tree_2, tree_2], [A6_FINDING, A6_OTHER], 1, review_rounds=STRIKE_LIMIT)
-check("a6ec7b: (v) review rounds at the strike limit -> review_exhausted even right after a streak reset",
+check("lane_stuck: (v) review rounds at the strike limit -> review_exhausted even right after a streak reset",
       u.get("escalation", {}).get("kind") == "review_exhausted", u.get("_next"))
 findings_changed = getattr(gates, "_findings_changed", lambda a, b: None)
 same_kept = findings_changed([A6_FINDING], [A6_AGAIN]) is False and findings_changed([A6_FINDING], [A6_OTHER]) is True
-check("a6ec7b: moved line numbers are the same finding; a different complaint is a new one", same_kept)
+check("lane_stuck: moved line numbers are the same finding; a different complaint is a new one", same_kept)
 
 BILLING_ANCHOR_SUBTASKS = [
     {
@@ -3424,11 +3509,13 @@ u = gates.record_subtasks(base_state(subtasks=BILLING_ANCHOR_SUBTASKS, top_level
 ba_kept = as_list_(u.get("subtasks"))
 ba_first = ba_kept[0] if ba_kept else {}
 ba_criteria = as_list_(ba_first.get("acceptance_criteria"))
-check("858ae4: failing tests, two fixes and a publish step -> 2 subtasks, the tests merged into the first fix",
+check("subtasks: failing tests, two fixes and a publish step -> 2 subtasks, the tests merged into the first fix",
       len(ba_kept) == 2 and ba_first.get("title", "").endswith("(with its regression tests)")
       and ba_first.get("outcome", "").startswith(BILLING_ANCHOR_SUBTASKS[0]["outcome"])
       and ba_first.get("outcome", "").endswith(BILLING_ANCHOR_SUBTASKS[1]["outcome"])
-      and ba_criteria[:1] == ["`./ci vet` passes"] and ba_criteria[1:] == BILLING_ANCHOR_SUBTASKS[1]["acceptance_criteria"]
+      and ba_criteria == ["`./ci vet` passes"] + [c for c in BILLING_ANCHOR_SUBTASKS[1]["acceptance_criteria"]
+                                                  if c != "`./ci vet` passes"]
+      and len(set(ba_criteria)) == len(ba_criteria)
       and not any(re.search(r"\bfails\b|only test files", c) for c in ba_criteria)
       and "production code" not in ba_first.get("constraints", "")
       and BILLING_ANCHOR_SUBTASKS[1]["constraints"] in ba_first.get("constraints", "")
@@ -3439,28 +3526,44 @@ u = gates.record_subtasks(base_state(subtasks=BILLING_ANCHOR_SUBTASKS[:2], top_l
 one = as_list_(u.get("subtasks"))
 u0 = gates.next_subtask(base_state(subtasks=one, subtask_index=0, intent="implementation"))
 u1 = gates.next_subtask(base_state(subtasks=one, subtask_index=1))
-check("858ae4: tests plus their fix merge into one subtask that runs as simple work, with no final whole-task review",
+check("subtasks: tests plus their fix merge into one subtask that runs as simple work, with no final whole-task review",
       len(one) == 1 and not u0.get("current_task", "").startswith("Subtask ") and u1.get("_next") == "final_report"
       and not u1.get("final_review"), (len(one), u0.get("current_task", "")[:80], u1.get("_next")))
 
 trailing = [BILLING_ANCHOR_SUBTASKS[1], BILLING_ANCHOR_SUBTASKS[0]]
 u = gates.record_subtasks(base_state(subtasks=trailing, top_level=True, git_actions={}))
-check("858ae4: a tests-first subtask that comes last is kept as it is",
+check("subtasks: a tests-first subtask that comes last is kept as it is",
       as_list_(u.get("subtasks")) == trailing and not any("merged into" in d for d in u.get("decisions", [])),
       u.get("subtasks"))
 
 pin = {"title": "Pin the month-end cases", "outcome": "Failing tests pin every month-end case in the request.",
        "acceptance_criteria": ["`./ci vet` passes"]}
 u = gates.record_subtasks(base_state(subtasks=[pin] + BILLING_ANCHOR_SUBTASKS[1:3], top_level=True, git_actions={}))
-check("858ae4: the merged tests' wording does not pull the subtask after the fix into the merge too",
+check("subtasks: the merged tests' wording does not pull the subtask after the fix into the merge too",
       [s.get("title") for s in as_list_(u.get("subtasks"))]
       == [BILLING_ANCHOR_SUBTASKS[1]["title"] + " (with its regression tests)", BILLING_ANCHOR_SUBTASKS[2]["title"]],
       u.get("subtasks"))
 
+guarded = {"title": "Guard the parser against empty input", "outcome": "Empty input returns an error.",
+           "acceptance_criteria": ["A regression test that fails without the fix now passes", "`./ci test` passes"]}
+fix_red = {"title": "Fix the failing tests in the parser", "outcome": "The parser tests pass again.",
+           "acceptance_criteria": ["`./ci test` passes"]}
+fix_next = BILLING_ANCHOR_SUBTASKS[1]
+u = gates.record_subtasks(base_state(subtasks=[guarded, fix_red, fix_next], top_level=True, git_actions={}))
+check("subtasks: a test that fails only without the fix, and a title that fixes failing tests, are not tests-first",
+      as_list_(u.get("subtasks")) == [guarded, fix_red, fix_next] and not any("merged into" in d for d in u.get("decisions", [])),
+      u.get("subtasks"))
+red_then = {"title": "Add failing tests for empty input", "outcome": "Tests pin the empty-input case.",
+            "acceptance_criteria": ["The new test fails before the fix and passes after it", "`./ci test` fails"]}
+u = gates.record_subtasks(base_state(subtasks=[red_then, guarded], top_level=True, git_actions={}))
+check("subtasks: a fail-before / pass-after criterion survives the merge; a criterion that ends red does not",
+      as_list_(as_list_(u.get("subtasks"))[0].get("acceptance_criteria"))
+      == ["The new test fails before the fix and passes after it"] + guarded["acceptance_criteria"], u.get("subtasks"))
+
 plain = BILLING_ANCHOR_SUBTASKS[1:3]
 u = gates.record_subtasks(base_state(subtasks=plain, top_level=True, git_actions={}))
 plain_kept = as_list_(u.get("subtasks")) == plain and not any("merged into" in d for d in u.get("decisions", []))
-check("858ae4: a plain two-subtask plan with no tests-first subtask is unchanged", plain_kept, u.get("subtasks"))
+check("subtasks: a plain two-subtask plan with no tests-first subtask is unchanged", plain_kept, u.get("subtasks"))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

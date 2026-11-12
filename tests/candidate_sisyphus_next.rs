@@ -5745,7 +5745,9 @@ fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
     ];
     for needle in [
         "a top-level run asks the user with your verdict",
-        "Unsure between simple and compound: compound.",
+        "A bug fix together with its regression tests is simple, even when it touches a few files or its size \
+         is unclear; compound only when the request asks for several independent changes, so a bug fix is never \
+         compound for being unsure. Otherwise, unsure between simple and compound: compound.",
         "Unsure between compound and plan_shaped: compound; plan_shaped only when the evidence shows it.",
         "sizing_reason is ONE line naming the evidence",
         "subtask_estimate the estimated number of subtasks",
