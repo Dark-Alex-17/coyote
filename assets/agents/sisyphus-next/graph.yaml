@@ -129,6 +129,7 @@ initial_state:
   base_sha: ''
   head_sha: ''
   git_root: ''
+  start_branch: ''
   delegated: false
   top_level: true
   parallel_mode: false
@@ -174,6 +175,7 @@ initial_state:
   verification_commands: '[]'
   local_run_recipe: ''
   git_actions: {}
+  publish_criteria: []
   pr_base_branch: ''
   external_feedback: []
   batch_plan_defect: ''
@@ -308,6 +310,8 @@ initial_state:
   # --- publish / CI ---
   git_report: ''
   git_task: ''
+  publish_retries: 0
+  publish_checks: []
   ci_owner: false
   ci_polls: 0
   ci_poll_fails: 0
@@ -545,10 +549,13 @@ nodes:
       compound = an ordered breakdown of at most 6 subtasks in one PR, each
       sealable with executable acceptance criteria; plan_shaped = more than 6
       subtasks, cross-PR sequencing, or batch/protected semantics - that wants an
-      architect run, and a top-level run asks the user with your verdict. Unsure
-      between simple and compound: compound. Unsure between compound and
-      plan_shaped: compound; plan_shaped only when the evidence shows it. Never
-      silently ambitious.
+      architect run, and a top-level run asks the user with your verdict. A bug
+      fix together with its regression tests is simple, even when it touches a
+      few files or its size is unclear; compound only when the request asks for
+      several independent changes, so a bug fix is never compound for being
+      unsure. Otherwise, unsure between simple and compound: compound. Unsure
+      between compound and plan_shaped: compound; plan_shaped only when the
+      evidence shows it. Never silently ambitious.
 
       State the sizing verdict for every implementation: sizing_reason is ONE line
       naming the evidence (for example "about 9 subtasks across 3 modules, needs a
@@ -585,8 +592,10 @@ nodes:
       shared stacks or services.
 
       git_actions: what the message explicitly asks for among commit, push,
-      open_pr (with base branch and draft); absent keys mean NOT asked - commits
-      and PRs never happen unasked. external_feedback: human / third-party
+      open_pr (with base branch and draft) and new_branch; absent keys mean NOT
+      asked - commits and PRs never happen unasked. "Commit on a new branch and
+      open a draft PR" means commit, push, open_pr, new_branch and draft, all
+      true. external_feedback: human / third-party
       review comments the message asks you to address (verbatim items), else [].
 
       When review_cadence is batch: if the acceptance criteria are not executable
@@ -675,6 +684,7 @@ nodes:
             open_pr: { type: boolean }
             base: { type: string }
             draft: { type: boolean }
+            new_branch: { type: boolean }
         external_feedback:
           type: array
           items: { type: string }
@@ -722,6 +732,15 @@ nodes:
       than 6 subtasks, cross-PR sequencing, or batch/protected semantics, return
       an empty list and say why in plan_shaped_reason - that is plan-shaped work
       for the architect, by definition. Never invent a shadow plan format.
+      Never plan a subtask for committing, branching, pushing or opening a PR,
+      and never put git or PR state (git status, branch names, the PR body or
+      its draft state) in acceptance criteria: the run publishes after review
+      in its own step, and a script checks that step.
+      Never split tests from the code they test (no failing-tests-first
+      subtask): a subtask writes its tests together with the code that makes
+      them pass, and every subtask's acceptance criteria hold, green, when it
+      ends. Prefer the fewest subtasks that keep each one sealed; a small
+      request may be one subtask.
       When a sizing note is present, the user chose to do plan-shaped work here:
       fit it into at most 6 subtasks if that is at all possible.
     prompt: |
@@ -779,6 +798,7 @@ nodes:
     type: script
     description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish.
     script: scripts/next_subtask.py
+    timeout: 60
     fallback: end_failure
 
   # =====================================================================
@@ -2079,8 +2099,12 @@ nodes:
   ci_gate:
     id: ci_gate
     type: script
-    description: Watch checks only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
+    description: >-
+      Check the publish step's git and PR state (one git_ops retry, then follow-ups, never a stop); watch checks
+      only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
     script: scripts/ci_gate.py
+    # one GH_CALL_SECS read (90) for the PR check, a few local git calls and a margin
+    timeout: 150
     fallback: final_report
 
   ci_poll:

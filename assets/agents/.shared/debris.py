@@ -507,13 +507,26 @@ def triage_binaries(project_dir, diff_text, timeout=GIT_TIMEOUT):
 def normalize_base(project_dir, spec, timeout):
     """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
     commits that landed on the base after branching never surface as changes.
-    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    Explicit `..` ranges are the caller's choice and pass through untouched, and
+    so does a checkpoint commit on top of HEAD, whose merge-base would be HEAD."""
     if ".." in spec:
         return spec
     try:
-        return git(project_dir, "merge-base", spec, "HEAD", timeout=timeout).strip()
+        base = git(project_dir, "merge-base", spec, "HEAD", timeout=timeout).strip()
     except Exception:  # noqa: BLE001 -- the plain diff below reports the real error
         return spec
+    try:
+        head, commit = git(project_dir, "rev-parse", "HEAD", f"{spec}^{{commit}}", timeout=timeout).split()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    if base != head or head == commit:
+        return base
+    try:
+        # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+        held = git(project_dir, "for-each-ref", "--count=1", "--contains", commit, timeout=timeout).strip()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    return base if held else spec
 
 
 def diff_text_for(project_dir, spec, timeout=GIT_TIMEOUT, exclude=()):

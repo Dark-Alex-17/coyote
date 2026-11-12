@@ -32,6 +32,9 @@ os.makedirs(os.environ["HOME"], exist_ok=True)
 for _k in [k for k in os.environ if k.startswith("LLM_AGENT_VAR_")]:
     # the battery must not inherit the agent variables of whoever runs it
     os.environ.pop(_k)
+for _k in ("GRAPH_STATE", "GRAPH_STATE_FILE"):
+    # a graph runner's own state file would win over the GRAPH_STATE the entry rows pass
+    os.environ.pop(_k, None)
 SCRUBBED_SEAMS = ("SISYPHUS_CI_SLEEP", "SISYPHUS_REVIEW_SLEEP", "SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN")
 for _k in [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in SCRUBBED_SEAMS]:
     # a caller's seams would replace the battery's fixtures
@@ -569,6 +572,62 @@ check("interpret_route -> apply_answer: an accepted free-form instruction keeps 
       u["_next"] == "build_gauntlet_prompt" and text in s2["spec_text"] and s2["reply_interpreted"] is False)
 s2, u = chain(base_state(escalation=pd, last_answer_text="stop"), "parse_answer", "apply_answer")
 check("apply_answer: a whole-reply stop is a stop", u["_next"] == "end_blocked" and aa("plan_defect", "Stop.")["_next"] == "end_blocked")
+PD_CONT = pd["options"][1]["text"]
+check("answers: match_option reads a leading option number with any separator and free text after it",
+      all(_lib.match_option(t, pd["options"]) == PD_CONT for t in ("2", "2.", "2)", "2:", "2 - amendment: x", "2: x", "2) x",
+                                                                  "2 \u2014 x", "2\u2013x", "Option 2 - x")))
+check("answers: split_option_reply keeps the free text, rejects out-of-range numbers and leaves prose alone",
+      _lib.split_option_reply("2 \u2014 amendment: x", pd["options"]) == (PD_CONT, "amendment: x")
+      and _lib.split_option_reply("Option 2", pd["options"]) == (PD_CONT, "")
+      and _lib.split_option_reply("3 - x", pd["options"]) == (None, "3 - x") and _lib.match_option("3 - x", pd["options"]) is None
+      and _lib.match_option("0", pd["options"]) is None and _lib.match_option("please keep going with it", pd["options"]) is None)
+PD_REPLY = ("2 \u2014 amendment: for subtask 1/4, the full test run failing is expected; it conforms when vet exits 0, the only "
+            "failures are the new TestIntervalNext/TestRenewKeepsMonthEndAnchor/TestTrialEndingOnMonthEndRenewsToMonthEnd "
+            "cases, and only _test.go files changed (all verified); advance to subtask 2/4")
+PD_SUBTASKS = [{"title": f"subtask {i}", "outcome": "o"} for i in range(1, 5)]
+s2, u = chain(base_state(escalation=pd, consult_result=f"...\nCONSULT: ANSWER {PD_REPLY}", subtasks=PD_SUBTASKS,
+                         subtask_index=1, spec_text="AC"), "consult_route", "apply_answer")
+check("answers: a navigator pick with an em-dash amendment continues on subtask 1 with the amendment, never end_blocked",
+      s2["last_answer"].startswith(PD_CONT) and "only _test.go files changed" in s2["last_answer"]
+      and u["_next"] == "build_gauntlet_prompt" and "only _test.go files changed" in s2["subtasks"][0]["amendments"][0]
+      and not s2["subtasks"][1].get("amendments"), u.get("_next"))
+u = gates.ladder_route(base_state(escalation=pd, ladder_resolution="ruling", ladder_choice="2: drop the vet criterion"))
+check("answers: a ladder ruling naming an option number keeps its amendment",
+      u["_next"] == "apply_answer" and u["last_answer"] == f"{PD_CONT}: drop the vet criterion")
+check("answers: plan_defect stop option, its number and a bare stop -> end_blocked",
+      all(gates.apply_answer(base_state(escalation=pd, last_answer=a))["_next"] == "end_blocked"
+          for a in ("Stop; the plan needs amending (report it)", "1", "stop")))
+check("answers: plan_defect raw numbered reply with an em-dash amendment continues",
+      aa("plan_defect", "2 \u2014 amendment: vet exit 0 is enough", spec_text="AC")["_next"] == "build_gauntlet_prompt"
+      and gates.apply_answer(base_state(escalation=pd, last_answer="2 \u2014 amendment: x", spec_text="AC"))["_next"]
+      == "build_gauntlet_prompt")
+check("answers: a typed numbered pick with free text is interpreted, never truncated to the option",
+      all(gates.parse_answer(base_state(escalation=e, last_answer_text=t))["_next"] == "interpret_reply"
+          for e in (pd, {**pd, "data": {"multiple_choice": True}}) for t in ("2 - only for the read path", "Option 2: reads only")))
+check("answers: plan_defect replies that negate their continue word stop, with or without the options",
+      all(gates.apply_answer(base_state(escalation=e, last_answer=a, spec_text="AC"))["_next"] == "end_blocked"
+          for e in (pd, escalation("plan_defect", "q", []))
+          for a in ("Do not continue, the plan is wrong", "don't proceed", "no, discontinue",
+                    "Stop - do not continue", "1 - stop, don't proceed", "stop; the amendment is wrong")))
+check("answers: the navigator's numbered amendment still continues once continue words are read at word boundaries",
+      aa("plan_defect", f"{PD_CONT}: {PD_REPLY[4:]}", spec_text="AC")["_next"] == "build_gauntlet_prompt")
+for kind, opts, pick in (
+        ("engine_fault", [option("Retry the coder round", True), option("Abort this task")], "2 - abort, retrying won't help"),
+        ("strikeout", [option("Abort and report (code left in a working state)", True), option("One more fix round anyway"),
+                       option("Accept the findings unresolved and proceed")], "1 - abort, one more round won't help"),
+        ("review_incomplete", [option("Retry the review again"), option("Accept NEEDS-HUMAN: proceed without it"),
+                               option("Abort this task")], "3 - abort, retrying won't help")):
+    esc_k = escalation(kind, "q", opts)
+    s2, u = chain(base_state(escalation=esc_k, ladder_resolution="ruling", ladder_choice=pick), "ladder_route", "apply_answer")
+    check(f"answers: {kind}: a stop pick with a note ({pick!r}) aborts, whatever the note's words say",
+          s2.get("last_answer", "").startswith(opts[int(pick[0]) - 1]["text"] + ": ") and u["_next"] == "end_aborted",
+          (s2.get("last_answer"), u.get("_next")))
+keep = escalation("design_ask", "q", [option("Adopt the pattern (one more coder round introduces it)"),
+                                      option("Keep the code as shipped (answer recorded, no change)")])
+u = gates.apply_answer(base_state(escalation=keep, last_answer=f"{keep['options'][1]['text']}: yes, adopt it later",
+                                  design_ask_rounds=0))
+check("answers: a named option decides over the words of its note (keep, though the note says adopt)",
+      u["_next"] == "review_gate", u.get("_next"))
 u = gates.interpret_route(base_state(escalation=pd, last_answer_text="x", reply_verdict="instruction", reply_instruction="path",
                                      reply_value=old))
 check("interpret_route: an instruction the kind does not accept -> unclear, never applied, ledgered",
@@ -2812,6 +2871,8 @@ check("subtasks: a final review without parent criteria answers to every subtask
 check("subtasks: a skipped read-only subtask is named in skipped_reviews for the final report",
       any(x.startswith("subtask 1: no code change") for x in st.get("skipped_reviews") or []), st.get("skipped_reviews"))
 check("subtasks: the tree snapshot's git calls stay under the 30 s script-node default", 2 * getattr(gates, "WORKTREE_TREE_SECS", 30) < 30)
+check("subtasks: next_subtask's tree snapshot and diff-base commit stay under its node timeout",
+      5 * getattr(gates, "WORKTREE_TREE_SECS", 30) < node_timeout("next_subtask"))
 real_tree = getattr(gates, "_worktree_tree", lambda root: "")
 gates._worktree_tree = lambda root: ""
 unk = gates.review_gate(dict(ro, subtask_changed_files=["stale.go"]))
@@ -2855,6 +2916,654 @@ gp1 = gates.build_gauntlet_prompt(single)["gauntlet_prompt"]
 single_ok = ("PARENT-AC-1" in gp1 and "Subtask " not in gp1 and "Scope:" not in gp1
              and gates.route_gauntlet(dict(single, gauntlet_result=PASS_REPLY, round_heads=[{}]))["_next"] == "observability_gate")
 check("subtasks: a single-subtask run is reviewed against the task's criteria as before, PASS -> observability", single_ok, gp1)
+
+# ---------------------------------------------------------------- publish criteria
+# The planned subtasks of two runs that stuck at their publish subtask, verbatim but for the project's
+# command runner, which is renamed to `./ci` so the fixtures name no toolchain.
+BRANCH_COMMIT_PR_SUBTASKS = [
+    {
+        "title": "Domain/store layer: void invoice and list invoices by subscription",
+        "outcome": "The store/service layer gains two operations. (a) VoidInvoice(id) runs in one transaction. It moves "
+                   "an `open` invoice to `void`. It returns a not-found error for an unknown id and a conflict error "
+                   "for a `paid` or `void` invoice, leaving the row unchanged in both cases. After voiding, if the "
+                   "invoice's subscription is `past_due` and has no other `open` invoice, the subscription goes back to "
+                   "`active`. This must use the same logic as the existing 'last open invoice paid' path: extract that "
+                   "logic into a shared helper rather than copying it. Subscriptions in any other status are left "
+                   "alone. (b) ListInvoicesBySubscription(subID) returns every invoice of the subscription, any status, "
+                   "with its lines, newest first by issued_at. It returns a not-found error for an unknown subscription "
+                   "and a non-nil empty slice when the subscription has no invoices.",
+        "constraints": "Reuse the existing error types and sentinels (not_found, conflict) and the existing invoice model, "
+                       "including lines. If the schema needs a `void` status value, add it through the repo's existing "
+                       "migration/schema mechanism. Do not change how the paid-invoice path behaves. Sort ties on issued_at "
+                       "deterministically, for example by id as a secondary key. Use the repo's existing transaction "
+                       "pattern so the status check and the update are atomic.",
+        "acceptance_criteria": [
+            "New unit tests cover: void of an open invoice; void of a paid invoice and of a void invoice "
+            "returning conflict with the row unchanged; void of an unknown id returning not found; past_due \u2192 "
+            "active when the last open invoice is voided; past_due unchanged when another open invoice remains; "
+            "active/canceled subscriptions unchanged; list ordering newest first across open/paid/void; list "
+            "returns an empty non-nil slice; list of an unknown subscription returns not found",
+            "Existing tests for the paid-invoice \u2192 active transition still pass after the shared helper is "
+            "extracted",
+            "`./ci test` passes",
+            "`./ci lint` passes",
+        ],
+    },
+    {
+        "title": "API: POST /v1/invoices/{id}/void",
+        "outcome": "A new route `POST /v1/invoices/{id}/void` takes no body and calls VoidInvoice. On success it "
+                   "returns 200 with the invoice serialized by the same serializer `GET /v1/invoices/{id}` uses, with "
+                   "`\"status\": \"void\"`. A paid or already void invoice returns 409 with error code `conflict`. An "
+                   "unknown id returns 404 with error code `not_found`.",
+        "constraints": "Register the route the same way the existing invoice routes are registered. Reuse the existing "
+                       "invoice JSON serializer and error-response helper. Do not add a new response shape. Ignore any "
+                       "request body.",
+        "acceptance_criteria": [
+            "HTTP handler tests show: 200 with status void; a later GET /v1/invoices/{id} returns status void; "
+            "409 with error code `conflict` for paid and for void invoices, and a GET afterwards shows them "
+            "unchanged; 404 with error code `not_found` for an unknown id",
+            "A handler test shows a past_due subscription becomes active after its only open invoice is voided "
+            "through the endpoint",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "API: GET /v1/subscriptions/{id}/invoices",
+        "outcome": "A new route `GET /v1/subscriptions/{id}/invoices` returns 200 with `{\"invoices\": [...]}`. Each "
+                   "entry uses the same serializer as `GET /v1/invoices/{id}`, lines included. Invoices are ordered "
+                   "newest first by issued_at, and every status is listed. A subscription with no invoices returns "
+                   "`{\"invoices\": []}`, never null. An unknown subscription returns 404 with error code `not_found`.",
+        "constraints": "Reuse the existing invoice serializer and error helper. The invoices list must always be "
+                       "initialized to a non-nil value so it encodes as `[]`.",
+        "acceptance_criteria": [
+            "Handler tests check: ordering by issued_at descending with open, paid and void invoices mixed; each "
+            "entry includes its lines and matches the shape of the single-invoice GET; the raw response body for "
+            "a subscription with no invoices contains `\"invoices\":[]`; 404 with error code `not_found` for an "
+            "unknown subscription",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "Webhook: handle invoice.voided on POST /v1/webhooks/provider",
+        "outcome": "The webhook dispatcher handles the `invoice.voided` event type. It parses `data.invoice_id` the "
+                   "same way `invoice.paid` does. An open invoice becomes void, the subscription recovery rule applies, "
+                   "and the response is 200 `{\"status\":\"processed\"}`. An invoice that is already void or paid is left "
+                   "as it is, and the event is still acknowledged as `processed`: a conflict from VoidInvoice is "
+                   "swallowed here. An unknown invoice id fails like the other invoice events (404, no event recorded, "
+                   "so the provider retries). Redelivery of an applied event is reported as a duplicate by the existing "
+                   "idempotency mechanism.",
+        "constraints": "Follow the structure of the existing invoice.paid handler and its event-recording/idempotency flow "
+                       "exactly. Do not record the event when the invoice is not found. Do not change the handling of other "
+                       "event types.",
+        "acceptance_criteria": [
+            "Webhook tests show: an open invoice becomes void and the response is `{\"status\":\"processed\"}`; a "
+            "past_due subscription becomes active when that was its only open invoice; already void and paid "
+            "invoices are unchanged and the response is still processed; an unknown invoice returns 404 and a "
+            "retry with the same event id is processed rather than treated as a duplicate; a redelivered applied "
+            "event gets the same duplicate response as other event types",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "CLI: billingctl invoices <subscription-id>",
+        "outcome": "`billingctl -db billing.db invoices <subscription-id>` prints a header line, then one line per "
+                   "invoice in the same order as the list API (newest first by issued_at). Each line shows the invoice "
+                   "id, its status, its total formatted with the CLI's existing money formatter (for example `36.00 "
+                   "USD`), and its issue date as `YYYY-MM-DD`. An unknown subscription exits with status 1 and an error "
+                   "on stderr. The usage text lists the new command.",
+        "constraints": "Reuse ListInvoicesBySubscription and the CLI's existing money formatter, table/column style and "
+                       "error/exit conventions. A missing subscription-id argument should follow the existing usage-error "
+                       "convention. Format issue dates in the same timezone the CLI already uses for dates, or UTC if it "
+                       "uses none.",
+        "acceptance_criteria": [
+            "CLI tests (or a scripted run against a temporary seeded db) show the header, then lines in "
+            "newest-first order containing the id, status, a total like `36.00 USD` and a date matching "
+            "`\\d{4}-\\d{2}-\\d{2}`",
+            "Running with an unknown subscription id exits with code 1 and prints the error on stderr, with "
+            "nothing on stdout apart from any header",
+            "The usage output (no args or -h) mentions `invoices`",
+            "`./ci test` and `./ci lint` pass",
+        ],
+    },
+    {
+        "title": "Branch, commit, and open draft PR",
+        "outcome": "All changes are committed on a new feature branch, pushed, and opened as a draft PR. The PR "
+                   "description covers the four features, the shared past_due \u2192 active helper, and the test coverage.",
+        "constraints": "Branch from the current default branch. Do not push to the default branch. The PR must be a draft.",
+        "acceptance_criteria": [
+            "`./ci test` and `./ci lint` pass on the final commit",
+            "`git status` is clean and `git branch --show-current` is not the default branch",
+            "`gh pr view --json isDraft,headRefName` shows isDraft=true and the new branch",
+        ],
+    },
+]
+NEW_BRANCH_PR_SUBTASKS = [
+    {
+        "title": "Add --account, --issued-from and --issued-before filters to export",
+        "outcome": "`invoicing.cli export csv|json` accepts `--account ACCOUNT_ID`, `--issued-from YYYY-MM-DD` and "
+                   "`--issued-before YYYY-MM-DD`. `--issued-from` is inclusive from 00:00 UTC on that day. "
+                   "`--issued-before` is exclusive from 00:00 UTC on that day. Either date flag works on its own. All "
+                   "filters, including the existing `--status`, must all match (AND). The output format and the order "
+                   "(issued_at, then id) stay the same. Tests cover each filter alone, all filters together, both date "
+                   "boundaries (an invoice at exactly 00:00 UTC on the from day is kept; one at exactly 00:00 UTC on "
+                   "the before day is dropped), and issued_at values with a non-UTC offset if the data model allows "
+                   "them.",
+        "constraints": "Change only `py/invoicing` and its tests. Read the existing export code and invoice model first, "
+                       "and reuse the existing filtering and ordering path rather than adding a second one. Compare times "
+                       "in UTC, using the same timezone handling the codebase already uses for issued_at. A bad date gives "
+                       "an argparse-style usage error and a non-zero exit, not a traceback. Without the new flags, output "
+                       "must be byte-for-byte what it is today.",
+        "acceptance_criteria": [
+            "`./ci test` passes",
+            "New tests exist for `--account`, `--issued-from`, `--issued-before`, the combined filters and both "
+            "boundary instants, and they pass",
+            "`PYTHONPATH=py python3 -m invoicing.cli export csv --db <fixture> --account <id> --issued-from "
+            "2024-01-01 --issued-before 2024-04-01` prints only that account's Q1 2024 invoices, ordered by "
+            "issued_at then id",
+            "`PYTHONPATH=py python3 -m invoicing.cli export json --db <fixture> --issued-from not-a-date` exits "
+            "non-zero with a usage error",
+            "Running the export without the new flags gives the same output as before the change (existing tests "
+            "unchanged and passing)",
+        ],
+    },
+    {
+        "title": "Add the export csv --lines line-level output",
+        "outcome": "`export csv --lines` writes one row per invoice line. The header is exactly "
+                   "`invoice_id,account_id,currency,position,description,quantity,unit_amount_cents,amount_cents`. Rows "
+                   "follow the invoice order (issued_at, then id), then the line position. Invoices without lines "
+                   "contribute no rows. `--status`, `--account` and the date filters all apply. The existing formula "
+                   "protection applies to text cells: a leading `=`, `+`, `-`, `@`, tab or CR gets a leading single "
+                   "quote. Tests cover the header, ordering, invoices without lines, filters combined with --lines, and "
+                   "formula protection on a description.",
+        "constraints": "Depends on subtask 1's filter path. Reuse the existing CSV writer and its formula-protection helper "
+                       "rather than writing new ones. Using `--lines` with `json` must fail with a clear usage error and a "
+                       "non-zero exit; it must not be silently ignored. Report this choice in the PR. Plain `export csv` "
+                       "output is unchanged.",
+        "acceptance_criteria": [
+            "`./ci test` passes",
+            "The first line of `PYTHONPATH=py python3 -m invoicing.cli export csv --lines --db <fixture>` is "
+            "exactly "
+            "`invoice_id,account_id,currency,position,description,quantity,unit_amount_cents,amount_cents`",
+            "A test asserts that rows are ordered by invoice (issued_at, id) and then position, and that an "
+            "invoice with zero lines produces no rows",
+            "A test asserts that a line description starting with `=` (and one starting with `-`) is written "
+            "with a leading `'`",
+            "A test asserts that `--account` and the date filters narrow the `--lines` output",
+            "`export json --lines` exits non-zero with a usage error (tested)",
+        ],
+    },
+    {
+        "title": "Add reports.tax_by_month and the `report tax` command",
+        "outcome": "`invoicing.reports.tax_by_month(invoices)` returns a dict mapping `YYYY-MM` (the payment month in "
+                   "UTC) to a dict of currency to tax cents, with months in ascending order. It counts paid invoices "
+                   "only. A month with paid invoices but no tax still appears, with 0 for each currency it paid in. "
+                   "`PYTHONPATH=py python3 -m invoicing.cli report tax --db PATH` prints one `YYYY-MM<TAB>totals` line "
+                   "per month, oldest first. Totals list currencies alphabetically and use the existing report money "
+                   "formatter (e.g. `12.00 EUR, 3.40 USD`), the same as `report revenue`.",
+        "constraints": "Read how `report revenue` gets the payment month (field and UTC conversion) and the invoice tax "
+                       "field, and match them exactly. Reuse the revenue report's formatting and printing helpers. Ignore "
+                       "open and void invoices.",
+        "acceptance_criteria": [
+            "`./ci test` passes",
+            "Unit tests on `tax_by_month` cover: several months in ascending key order, several currencies, a "
+            "paid month with zero tax returning `{'USD': 0}`, open and void invoices excluded, and a payment "
+            "near midnight that is bucketed by its UTC month",
+            "A CLI test via `invoicing.cli.main(['report','tax','--db',path], out=buf)` checks the exact output, "
+            "including tab separators, alphabetical currencies and a `0.00 USD` month",
+            "`PYTHONPATH=py python3 -m invoicing.cli report tax --db <fixture>` exits 0 and its output layout "
+            "matches `report revenue`",
+        ],
+    },
+    {
+        "title": "Commit on a new branch and open a draft PR",
+        "outcome": "All changes are committed on a new feature branch, pushed, and opened as a draft PR. The PR "
+                   "description covers the four features, the `--lines`-with-json usage error, and the test commands "
+                   "that were run.",
+        "constraints": "Depends on subtasks 1\u20133. Don't commit to the default branch. Don't include unrelated files.",
+        "acceptance_criteria": [
+            "`./ci test` passes on the branch HEAD",
+            "`git branch --show-current` is not the default branch, and `git status --porcelain` is empty",
+            "`gh pr view --json isDraft,headRefName` shows `isDraft: true` with the new branch as head",
+        ],
+    },
+]
+# looked up by name so the battery still reports every row against gates that predate them
+GIT_STATE_RE = getattr(gates, "GIT_STATE_RE", None)
+PUBLISH_REVIEW_NOTE = getattr(gates, "PUBLISH_REVIEW_NOTE", None)
+PUBLISH_ALL = {"commit": True, "push": True, "open_pr": True, "new_branch": True, "draft": True}
+
+
+def as_list_(v):
+    return v if isinstance(v, list) else []
+
+
+def git_state_left(subtasks):
+    return GIT_STATE_RE is None or any(GIT_STATE_RE.search(str(c)) for s in subtasks
+                                       for c in as_list_(s.get("acceptance_criteria")))
+
+
+def asks_all(actions):
+    return isinstance(actions, dict) and all(actions.get(k) is True for k in PUBLISH_ALL)
+
+
+pub_dir = os.path.join(TMP, "runs", "publish-trailing")
+u = gates.record_subtasks(base_state(subtasks=BRANCH_COMMIT_PR_SUBTASKS, top_level=True, run_dir=pub_dir, git_actions={}))
+kept = as_list_(u.get("subtasks"))
+folded = as_list_(u.get("publish_criteria"))
+tasklog_exists = os.path.exists(os.path.join(pub_dir, "tasklog.md"))
+tasklog = open(os.path.join(pub_dir, "tasklog.md")).read() if tasklog_exists else ""
+check("publish: a trailing 'Branch, commit, and open draft PR' subtask folds into git_actions (6 -> 5 subtasks)",
+      tasklog_exists and len(kept) == 5 and asks_all(u.get("git_actions")) and not git_state_left(kept)
+      and BRANCH_COMMIT_PR_SUBTASKS[5]["acceptance_criteria"][1] in folded
+      and BRANCH_COMMIT_PR_SUBTASKS[5]["acceptance_criteria"][2] in folded
+      and "Branch, commit, and open draft PR" not in tasklog and any("folded into git_actions" in d for d in u.get("decisions", [])),
+      (len(kept), u.get("git_actions"), folded))
+
+u = gates.record_subtasks(base_state(subtasks=NEW_BRANCH_PR_SUBTASKS, top_level=True, git_actions={}))
+ef_kept = as_list_(u.get("subtasks"))
+check("publish: a trailing 'Commit on a new branch and open a draft PR' subtask folds into git_actions (4 -> 3 subtasks)",
+      len(ef_kept) == 3 and asks_all(u.get("git_actions")) and not git_state_left(ef_kept)
+      and NEW_BRANCH_PR_SUBTASKS[3]["acceptance_criteria"][1] in as_list_(u.get("publish_criteria")),
+      (len(ef_kept), u.get("git_actions")))
+ef_spec = ("Add account and date filters and a --lines output to export, and a tax report. "
+           "Commit your fix on a new branch and open a draft PR.\n"
+           "- `./ci test` passes\n"
+           "- The PR body lists the four features\n"
+           "- The PR description names the --lines usage error")
+gp = gates.build_gauntlet_prompt(base_state(subtasks=ef_kept or NEW_BRANCH_PR_SUBTASKS, subtask_index=len(ef_kept), final_review=True,
+                                            spec_text=ef_spec, git_actions=u.get("git_actions") or {}, round_heads=[],
+                                            gauntlet_lanes={}))["gauntlet_prompt"]
+check("publish: a final whole-task review carrying PR-body criteria drops them and the commit/PR sentence and notes the publish step",
+      "Add account and date filters" in gp and "`./ci test` passes" in gp and "new branch" not in gp
+      and "PR body" not in gp and "PR description" not in gp and PUBLISH_REVIEW_NOTE is not None and PUBLISH_REVIEW_NOTE in gp, gp)
+
+u = gates.record_subtasks(base_state(subtasks=[NEW_BRANCH_PR_SUBTASKS[3]], top_level=True, git_actions={}))
+check("publish: a plan that only publishes keeps one subtask for the brief",
+      [s.get("outcome") for s in as_list_(u.get("subtasks"))] == ["add a hello endpoint"] and asks_all(u.get("git_actions")),
+      u.get("subtasks"))
+
+mixed = {"title": "Add the void endpoint", "outcome": "POST /v1/invoices/{id}/void voids an open invoice",
+         "acceptance_criteria": ["`./ci test` passes", "POST /v1/invoices/{id}/void returns 200 with status void",
+                                 "`git status` is clean", "The PR body lists the endpoint"]}
+u = gates.record_subtasks(base_state(subtasks=[mixed, BRANCH_COMMIT_PR_SUBTASKS[2]], top_level=True, git_actions={}))
+m_kept = as_list_(u.get("subtasks"))
+check("publish: a code subtask with mixed criteria keeps its code criteria and loses only the git/PR-state ones",
+      len(m_kept) == 2 and m_kept[0].get("acceptance_criteria") == mixed["acceptance_criteria"][:2]
+      and as_list_(u.get("publish_criteria")) == mixed["acceptance_criteria"][2:] and not u.get("git_actions"),
+      (m_kept[:1], u.get("publish_criteria"), u.get("git_actions")))
+
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                  brief="Fix the proration overflow. Commit your fix on a new branch and open a draft PR."))
+check("route_intent: an explicit 'commit on a new branch and open a draft PR' ask fills empty git_actions",
+      asks_all(u.get("git_actions")) and any("taken from the brief" in d for d in u.get("decisions", [])), u.get("git_actions"))
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                  brief="Fix the proration overflow. Do not commit or open a PR."))
+check("route_intent: a negated ask ('Do not commit or open a PR.') derives no git action", "git_actions" not in u, u.get("git_actions"))
+for negated_list in ("Fix the proration overflow. Do not commit, push, or open a PR.",
+                     "Fix the proration overflow and don't commit and push anything."):
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={}, brief=negated_list))
+    check(f"route_intent: a negation covers every item of its list ({negated_list!r}) -> no git action",
+          "git_actions" not in u, u.get("git_actions"))
+u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                  brief="Do not touch the API, but commit and open a draft PR."))
+check("route_intent: a 'but' after a negation asks again ('Do not touch the API, but commit and open a draft PR.')",
+      asks_all({**(u.get("git_actions") or {}), "new_branch": True}), u.get("git_actions"))
+for prose in ("Push notifications should fire when a build fails.", "Commit messages must follow conventional commits.",
+              "Open PRs older than 30 days are closed.", "Create a pull request template."):
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", git_actions={},
+                                      brief=f"Add the nightly job. {prose}"))
+    check(f"route_intent: a verb with no git object after it ({prose!r}) asks for no git action",
+          "git_actions" not in u, u.get("git_actions"))
+
+code_branches = ["the default branch of the match returns 400", "add a new branch to the parser for empty input"]
+branchy = {"title": "Route empty input", "outcome": "Empty input takes its own path",
+           "acceptance_criteria": ["`./ci test` passes", *code_branches]}
+u = gates.record_subtasks(base_state(subtasks=[branchy, BRANCH_COMMIT_PR_SUBTASKS[2]], top_level=True, git_actions={}))
+b_kept = as_list_(u.get("subtasks"))
+b_spec, _ = gates._strip_git_state("\n".join(f"- {c}" for c in code_branches))
+check("publish: code criteria about a match or parser branch stay in the subtask and in a final-review spec",
+      b_kept[0].get("acceptance_criteria") == branchy["acceptance_criteria"]
+      and not any(c in as_list_(u.get("publish_criteria")) for c in code_branches)
+      and all(c in b_spec for c in code_branches), (b_kept[:1], u.get("publish_criteria"), b_spec))
+u = gates.record_subtasks(base_state(subtasks=[mixed, BRANCH_COMMIT_PR_SUBTASKS[2]], top_level=True, git_actions={}))
+check("publish: each git/PR-state criterion that moves is ledgered verbatim",
+      any("'`git status` is clean'" in d and "'The PR body lists the endpoint'" in d for d in u.get("decisions", [])),
+      u.get("decisions"))
+git_sub = base_state(subtasks=[{"title": "A", "outcome": "a", "acceptance_criteria": ["a works", "`git status` is clean"]},
+                               {"title": "B", "outcome": "b"}], subtask_index=1, subtask_changed_files=[], git_actions={})
+gp = gates.build_gauntlet_prompt(git_sub)["gauntlet_prompt"]
+check("publish: a subtask review whose git-state criterion was filtered drops it and carries the publish note",
+      "`git status` is clean" not in gp and "- a works" in gp and gates.PUBLISH_REVIEW_NOTE in gp, gp[-600:])
+
+PUB_REPO = os.path.join(TMP, "publish-repo")
+PUB_REMOTE = os.path.join(TMP, "publish-remote.git")
+os.makedirs(PUB_REPO)
+scratch_git(TMP, "init", "-q", "--bare", PUB_REMOTE)
+scratch_git(PUB_REPO, "init", "-q", "-b", "main")
+open(os.path.join(PUB_REPO, "README.md"), "w").write("# billing\n")
+scratch_git(PUB_REPO, "add", ".")
+scratch_git(PUB_REPO, "commit", "-q", "-m", "init")
+scratch_git(PUB_REPO, "remote", "add", "origin", PUB_REMOTE)
+scratch_git(PUB_REPO, "push", "-q", "-u", "origin", "main")
+scratch_git(PUB_REPO, "remote", "set-head", "origin", "main")
+scratch_git(PUB_REPO, "switch", "-q", "-c", "feat/void-invoices")
+open(os.path.join(PUB_REPO, "void.txt"), "w").write("void\n")
+scratch_git(PUB_REPO, "add", ".")
+scratch_git(PUB_REPO, "commit", "-q", "-m", "void invoices")
+scratch_git(PUB_REPO, "push", "-q", "-u", "origin", "feat/void-invoices")
+open(os.path.join(PUB_REPO, "stray.txt"), "w").write("left behind\n")
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"https://github.com/o/r/pull/9\", \"isDraft\": true, "
+                                         "\"headRefName\": \"feat/void-invoices\", \"body\": \"Voids invoices.\"}'")
+pub = base_state(project_dir=PUB_REPO, git_root=PUB_REPO, start_branch="main", git_actions=dict(PUBLISH_ALL),
+                 git_report="opened https://github.com/o/r/pull/9",
+                 git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True, "text": "Commit and open a draft PR."})
+u = gates.ci_gate(pub)
+retry = str(u["git_task"].get("text") or "") if isinstance(u.get("git_task"), dict) else ""
+check("publish: a dirty tree after git_ops -> exactly one more git_ops round naming only the failed check",
+      u.get("_next") == "git_ops" and u.get("publish_retries") == 1 and "clean worktree" in retry and "stray.txt" in retry
+      and not any(n in retry for n in ("- new branch", "- pushed", "- draft PR")), (u.get("_next"), retry[-300:]))
+check("publish: the retry text is the failed checks plus the no-new-branch, no-repost rule, never the first publish text",
+      "Commit and open a draft PR." not in retry
+      and retry.rstrip().endswith("do not create another branch; do not post the review-round comments again"), retry)
+u = gates.ci_gate(dict(pub, publish_retries=1))
+rows = as_list_(u.get("publish_checks"))
+check("publish: the check failing again -> the run goes on with a follow-up, never end_blocked",
+      u.get("_next") not in ("git_ops", "end_blocked") and any("clean worktree" in f for f in as_list_(u.get("follow_ups")))
+      and [r.get("check") for r in rows if not r.get("ok")] == ["clean worktree"],
+      (u.get("_next"), u.get("follow_ups"), rows))
+os.unlink(os.path.join(PUB_REPO, "stray.txt"))
+u = gates.ci_gate(pub)
+rows = as_list_(u.get("publish_checks"))
+check("publish: clean tree, new branch, upstream at HEAD and a draft PR on that branch -> every check ok, no retry",
+      u.get("_next") != "git_ops" and len(rows) == 4 and all(r.get("ok") for r in rows) and not u.get("follow_ups"), rows)
+report = gates.final_report(base_state(publish_checks=u.get("publish_checks"),
+                                       publish_criteria=["PR body describes the migration"]))["report"]
+check("publish: the final report lists each publish requirement as handed to the publish step, not script-checked",
+      "- publish requirement: PR body describes the migration (handed to the publish step, not script-checked)" in report
+      and "- publish check draft PR: ok" in report, report[-800:])
+report = gates.final_report(base_state(publish_checks=[], publish_criteria=["PR body describes the migration"]))["report"]
+check("publish: no publish step ran (graph default publish_checks: []) -> no publish requirement rows",
+      "- publish requirement:" not in report, report[-800:])
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"u\", \"isDraft\": false, \"headRefName\": \"main\", \"body\": \"\"}'")
+u = gates.ci_gate(dict(pub, publish_retries=1))
+bad = next((r for r in as_list_(u.get("publish_checks")) if r.get("check") == "draft PR"), {})
+bad_ok = bad.get("ok") is False and all(w in str(bad.get("detail")) for w in ("not a draft", "not the current branch", "empty body"))
+check("publish: a ready PR on another head with an empty body fails the draft PR check with all three reasons", bad_ok, bad)
+os.environ.pop("SISYPHUS_GH_PR_VIEW_CMD")
+
+# Subtasks never commit, so a later subtask diffed against HEAD reviewed every earlier subtask's work too.
+SNAP_REPO = os.path.join(TMP, "snapshot-repo")
+os.makedirs(SNAP_REPO)
+
+
+def snap_git(*a):
+    return scratch_git(SNAP_REPO, *a)
+
+
+snap_git("init", "-q")
+for name in ("a.txt", "b.txt"):
+    open(os.path.join(SNAP_REPO, name), "w").write(f"{name}\n")
+snap_git("add", ".")
+snap_git("commit", "-q", "-m", "init")
+SNAP_OLD = snap_git("rev-parse", "HEAD")
+snap_git("branch", "behind")
+open(os.path.join(SNAP_REPO, "c.txt"), "w").write("c\n")
+snap_git("add", ".")
+snap_git("commit", "-q", "-m", "second")
+SNAP_HEAD = snap_git("rev-parse", "HEAD")
+snap = base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, base_sha=SNAP_HEAD, head_sha=SNAP_HEAD,
+                  intent="implementation", subtasks=[{"title": "A", "outcome": "edit a"}, {"title": "B", "outcome": "edit b"}],
+                  subtask_index=0, round_heads=[], gauntlet_lanes={})
+sub_step(snap, "next_subtask")
+open(os.path.join(SNAP_REPO, "a.txt"), "a").write("subtask 1\n")
+snap_refs = snap_git("for-each-ref")
+sub_step(snap, "next_subtask")
+snap_base = snap.get("base_sha") or ""
+snap_parent = subprocess.run(["git", "-C", SNAP_REPO, "rev-parse", f"{snap_base}^"], capture_output=True, text=True).stdout.strip()
+check("diff base: subtask 2's diff base is a snapshot commit on top of HEAD, not HEAD, and it is ledgered",
+      snap_base != SNAP_HEAD and snap_parent == SNAP_HEAD and snap.get("debt_base") == snap_base
+      and snap_git("rev-parse", "HEAD") == SNAP_HEAD and any("diff base is snapshot" in d for d in snap["decisions"]),
+      (snap_base, snap_parent, snap["decisions"][-3:]))
+check("diff base: taking the snapshot creates and moves no ref", snap_git("for-each-ref") == snap_refs)
+open(os.path.join(SNAP_REPO, "b.txt"), "a").write("subtask 2\n")
+snap_diff = subprocess.run(["git", "-C", SNAP_REPO, "diff", "--name-only", snap_base], capture_output=True, text=True).stdout.split()
+check("diff base: the diff from subtask 2's base names only subtask 2's file", snap_diff == ["b.txt"], snap_diff)
+sub_step(snap, "build_gauntlet_prompt")
+check("diff base: the gauntlet's Diff line carries the snapshot and the round records its code tree",
+      f"Diff: {snap_base}" in snap.get("gauntlet_prompt", "")
+      and (snap.get("round_heads") or [{}])[-1].get("code_tree") == gates._worktree_tree(SNAP_REPO), snap.get("round_heads"))
+sys.path.insert(0, gates.SHARED_DIR)
+import debris  # noqa: E402
+check("diff base: debris keeps a checkpoint on top of HEAD, still takes the merge-base of a branch behind HEAD",
+      debris.normalize_base(SNAP_REPO, snap_base, 30) == snap_base
+      and debris.normalize_base(SNAP_REPO, "behind", 30) == SNAP_OLD
+      and debris.normalize_base(SNAP_REPO, "HEAD", 30) == SNAP_HEAD)
+sig = subprocess.run([sys.executable, os.path.join(gates.SHARED_DIR, "..", "review-gauntlet", "scripts", "signals.py")],
+                     capture_output=True, text=True, timeout=60,
+                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                          "GRAPH_STATE": json.dumps({"project_dir": SNAP_REPO, "diff_spec": snap_base})})
+sig_out = json.loads(sig.stdout or "{}")
+check("diff base: the gauntlet's signals diff a checkpoint directly: only subtask 2's file", sig_out.get("changed_files") == ["b.txt"],
+      sig.stdout[-400:] + sig.stderr[-400:])
+# a branch that moved past HEAD (a base the work has not caught up with) is a real base, never a checkpoint
+SNAP_AHEAD = snap_git("commit-tree", f"{SNAP_HEAD}^{{tree}}", "-p", SNAP_HEAD, "-m", "upstream")
+snap_git("branch", "ahead", SNAP_AHEAD)
+sig = subprocess.run([sys.executable, os.path.join(gates.SHARED_DIR, "..", "review-gauntlet", "scripts", "signals.py")],
+                     capture_output=True, text=True, timeout=60,
+                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                          "GRAPH_STATE": json.dumps({"project_dir": SNAP_REPO, "diff_spec": "ahead"})})
+check("diff base: a branch ahead of HEAD still diffs from its merge-base (HEAD), in debris and in the signals",
+      debris.normalize_base(SNAP_REPO, "ahead", 30) == SNAP_HEAD
+      and debris.normalize_base(SNAP_REPO, SNAP_AHEAD, 30) == SNAP_HEAD
+      and sorted(json.loads(sig.stdout or "{}").get("changed_files") or []) == ["a.txt", "b.txt"],
+      sig.stdout[-400:] + sig.stderr[-400:])
+CLEAN_REPO = os.path.join(TMP, "snapshot-clean-repo")
+os.makedirs(CLEAN_REPO)
+scratch_git(CLEAN_REPO, "init", "-q")
+open(os.path.join(CLEAN_REPO, "a.txt"), "w").write("a\n")
+scratch_git(CLEAN_REPO, "add", ".")
+scratch_git(CLEAN_REPO, "commit", "-q", "-m", "init")
+CLEAN_HEAD = scratch_git(CLEAN_REPO, "rev-parse", "HEAD")
+clean = base_state(project_dir=CLEAN_REPO, git_root=CLEAN_REPO, intent="implementation", subtask_index=1,
+                   subtasks=[{"title": "A", "outcome": "a"}, {"title": "B", "outcome": "b"}])
+u = gates.next_subtask(clean)
+check("diff base: a later subtask over an unchanged tracked worktree diffs against HEAD itself",
+      u.get("base_sha") == CLEAN_HEAD and not any("snapshot" in d for d in u.get("decisions", [])), u.get("decisions"))
+os.rename(os.path.join(CLEAN_REPO, ".git", "index"), os.path.join(CLEAN_REPO, ".git", "index.away"))
+open(os.path.join(CLEAN_REPO, "a.txt"), "a").write("edited\n")
+u = gates.next_subtask(clean)
+os.rename(os.path.join(CLEAN_REPO, ".git", "index.away"), os.path.join(CLEAN_REPO, ".git", "index"))
+check("diff base: a missing index file -> HEAD with the 'diff base snapshot failed' ledger line, never an empty tree",
+      u.get("base_sha") == CLEAN_HEAD and any("diff base snapshot failed" in d for d in u.get("decisions", [])),
+      (u.get("base_sha"), u.get("decisions")))
+check("diff base: a git_root that is not a repo -> the given HEAD and a reason",
+      gates._snapshot_base(TMP, CLEAN_HEAD)[0] == CLEAN_HEAD and gates._snapshot_base(TMP, CLEAN_HEAD)[1])
+
+# The adversary blocked again on the same finding after a fix round that changed two test files, and the run
+# stopped after a single fix attempt.
+A6_FINDING = ("adversary: DIVERGES -- complaint 1: Gamed tests \u2014 py/tests/test_cli.py:236-247 "
+              "(test_export_lines_follow_invoice_export_order); root cause py/invoicing/repository.py:98 \u2014 The subtask "
+              "says rows follow invoice order (issued_at, id). This test adds inv_east (2024-05-01T01:00:00+02:00, which is "
+              "2024-04-30T23:00Z) and inv_west (2024-04-30T23:30:00-01:00, which is 2024-05-01T00:30Z), whose text order is "
+              "the reverse of their time order. Instead of checking the real order, it only checks that the --lines invoice "
+              "order matches `export csv`. Both outputs come from the same lexical `ORDER BY issued_at, id`, so the test is "
+              "circular.")
+A6_AGAIN = A6_FINDING.replace("test_cli.py:236-247", "test_cli.py:240-262").replace("repository.py:98", "repository.py:101")
+A6_OTHER = ("adversary: DIVERGES -- complaint 1: Scope drift / out-of-scope \u2014 httpapi/server.go:57, "
+            "httpapi/handlers.go:242-256 \u2014 In the same files it also adds a new public route, "
+            "`POST /v1/subscriptions/{id}/seats`, with its handler `handleChangeSeats` and a test, `TestChangeSeats`.")
+tree_1 = gates._worktree_tree(SNAP_REPO)
+open(os.path.join(SNAP_REPO, "b.txt"), "a").write("fix round 1\n")
+tree_2 = gates._worktree_tree(SNAP_REPO)
+open(os.path.join(SNAP_REPO, "b.txt"), "a").write("fix round 2\n")
+tree_3 = gates._worktree_tree(SNAP_REPO)
+
+
+def a6_triage(finding, trees, findings, streak, review_rounds=1):
+    heads = [{"round": i + 1, "head": SNAP_HEAD, "code_tree": t, "lane_blockers": {"adversary": [f]}}
+             for i, (t, f) in enumerate(zip(trees, findings))]
+    return gates.triage_route(base_state(project_dir=SNAP_REPO, git_root=SNAP_REPO, review_rounds=review_rounds,
+                                         triage=[{"finding": finding, "action": "fix", "lane": "adversary"}],
+                                         lane_block_streak={"adversary": streak}, round_heads=heads))
+
+
+u = gates.route_gauntlet(base_state(gauntlet_result=BLOCKED_REPLY, round_heads=[{"round": 1}]))
+check("lane_stuck: route_gauntlet records each round's blocker texts per lane",
+      (u.get("round_heads") or [{}])[-1].get("lane_blockers", {}).get("adversary") == [BLOCKED_REPLY.splitlines()[-1][2:]],
+      u.get("round_heads"))
+u = a6_triage(A6_AGAIN, [tree_1, tree_2], [A6_FINDING, A6_AGAIN], 1)
+check("lane_stuck: (i) same finding at the same HEAD but a changed code tree -> another fix round, not lane_stuck",
+      u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 2
+      and any("code changed" in d for d in u.get("decisions", [])), (u.get("_next"), u.get("escalation", {}).get("kind")))
+u = a6_triage(A6_AGAIN, [tree_1, tree_2, tree_3], [A6_FINDING, A6_AGAIN, A6_AGAIN], 2)
+check("lane_stuck: (ii) a third round on the same finding -> lane_stuck even though the code changed again",
+      u.get("escalation", {}).get("kind") == "lane_stuck", u.get("_next"))
+u = a6_triage(A6_AGAIN, [tree_2, tree_2], [A6_FINDING, A6_AGAIN], 1)
+check("lane_stuck: (iii) same finding over an unchanged code tree -> lane_stuck", u.get("escalation", {}).get("kind") == "lane_stuck",
+      u.get("_next"))
+u = a6_triage(A6_OTHER, [tree_2, tree_2], [A6_FINDING, A6_OTHER], 1)
+check("lane_stuck: (iv) a new class of finding over an unchanged tree -> the streak restarts and the fix round runs",
+      u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 1, (u.get("_next"), u.get("lane_block_streak")))
+u = a6_triage(A6_OTHER, [tree_2, tree_2], [A6_FINDING, A6_OTHER], 1, review_rounds=STRIKE_LIMIT)
+check("lane_stuck: (v) review rounds at the strike limit -> review_exhausted even right after a streak reset",
+      u.get("escalation", {}).get("kind") == "review_exhausted", u.get("_next"))
+findings_changed = getattr(gates, "_findings_changed", lambda a, b: None)
+same_kept = findings_changed([A6_FINDING], [A6_AGAIN]) is False and findings_changed([A6_FINDING], [A6_OTHER]) is True
+check("lane_stuck: moved line numbers are the same finding; a different complaint is a new one", same_kept)
+
+BILLING_ANCHOR_SUBTASKS = [
+    {
+        "title": "Add failing regression tests for month-end and leap-day periods",
+        "outcome": ("Table-driven tests in the billing package's test files cover every case in the request. Interval.Next "
+                    "cases: IntervalMonth.Next(2024-01-31 09:30Z, 31) is 2024-02-29 09:30Z. IntervalMonth.Next(2024-03-31, "
+                    "31) is 2024-04-30. IntervalMonth.Next(2024-02-29, 31) is 2024-03-31. IntervalMonth.Next(2024-04-30, "
+                    "31) is 2024-05-31. IntervalYear.Next(2024-02-29, 29) is 2025-02-28. IntervalYear.Next(2027-02-28, "
+                    "29) is 2028-02-29. The time of day is kept in every case. Service tests use testdb.Seeded, "
+                    "clock.NewManual at 2024-01-31 09:30 UTC, the seeded `team` plan and billing.Config{PaymentTermsDays: "
+                    "14}. They check that Create gives PeriodEnd 2024-02-29 09:30Z. Each Renew, after Manual.Set to the "
+                    "previous PeriodEnd, goes Feb 29, then Mar 31, then Apr 30, then May 31. BillingAnchorDay stays 31 "
+                    "throughout, and each Result.Invoice.PeriodEnd equals Subscription.PeriodEnd. A trial test with "
+                    "billing.Config{TrialDays: 30} checks that the trial ends Jan 31 with StatusTrialing until Renew. On "
+                    "Renew, the first paid PeriodEnd is Feb 29, not Mar 2."),
+        "constraints": ("Use only the public API named in the request (billing.NewService, Create, Renew, CreateParams, "
+                        "Interval.Next, testdb.Seeded, clock.NewManual/Manual.Set). Don't change production code in this "
+                        "subtask. Follow the existing test style in the package."),
+        "acceptance_criteria": [
+            "`./ci vet` passes",
+            ("`./ci test` fails, and the only failures are the new month-end/leap-day test cases (for example, the "
+             "output shows 2024-03-02 where 2024-02-29 was expected)"),
+            "Running `git diff --stat` shows that only test files changed",
+        ],
+    },
+    {
+        "title": "Fix Interval.Next to clamp to month end and use the anchor day",
+        "outcome": ("Interval.Next(t, anchorDay) works out the target month first: the following month for IntervalMonth, "
+                    "or the same month of the next year for IntervalYear. It does not use time.AddDate overflow. The day "
+                    "is min(anchorDay, number of days in the target month). Hour, minute, second, nanosecond and location "
+                    "come from t. Because the day always comes from anchorDay, not from t.Day(), a clamped period never "
+                    "shifts later ones."),
+        "constraints": ("Keep the Interval.Next signature and its public behaviour for days that don't clamp. Handle "
+                        "anchorDay values 1 to 31 and December rolling into the next year. Don't change the meaning of any "
+                        "other Interval value."),
+        "acceptance_criteria": [
+            "`./ci test -run Next` passes, covering all Interval.Next cases from subtask 1",
+            "`./ci test` passes, or the only remaining failures are the service-level tests that subtask 3 fixes",
+            "`./ci vet` passes",
+        ],
+    },
+    {
+        "title": "Make Service.Create/Renew and trial conversion use the anchor rule",
+        "outcome": ("Service.Create sets BillingAnchorDay from the start date and computes PeriodEnd with "
+                    "Interval.Next(start, BillingAnchorDay). Service.Renew computes the next PeriodEnd with "
+                    "Interval.Next(prevPeriodEnd, sub.BillingAnchorDay) and never writes BillingAnchorDay. A trial that "
+                    "ends Jan 31 stays in StatusTrialing until Renew. On Renew it converts to a paid period that ends on "
+                    "Feb 29 and keeps the anchor. Every Result.Invoice gets the same PeriodEnd as the subscription it was "
+                    "issued for."),
+        "constraints": ("Find and remove any separate date arithmetic, such as AddDate, in the service or store code paths. "
+                        "Don't change the PaymentTermsDays or due-date semantics, and don't change the store schema unless "
+                        "that is truly needed. Keep the README rule exactly as stated."),
+        "acceptance_criteria": [
+            "`./ci test` passes, including every new test from subtask 1",
+            ("Searching the billing package with `grep -rn 'AddDate' .` shows no period-end calculation outside "
+             "Interval.Next (any remaining hits are unrelated, such as payment-terms due dates)"),
+            "`./ci vet` passes",
+        ],
+    },
+    {
+        "title": "Commit on a new branch and open a draft PR",
+        "outcome": ("The tests and the fix are committed on a new branch created from the current default branch, for "
+                    "example fix/billing-month-end-periods. The branch is pushed and a draft PR is open. The PR describes "
+                    "the bug with the reported examples (2024-01-31 \u2192 2024-03-02, Mar 31 \u2192 May 1, drift to the "
+                    "29th/30th, leap-year annual cases, trial conversion), the clamp-to-anchor rule, and the tests added."),
+        "constraints": ("Don't commit to or push to the default branch directly. Don't include unrelated changes. The PR "
+                        "must be a draft."),
+        "acceptance_criteria": [
+            "`git branch --show-current` prints the new branch name, not main/master",
+            "`./ci test` passes on the committed HEAD (`git status --porcelain` is empty)",
+            "`gh pr view --json isDraft,headRefName` shows isDraft=true and the new branch name",
+        ],
+    },
+]
+
+u = gates.record_subtasks(base_state(subtasks=BILLING_ANCHOR_SUBTASKS, top_level=True, git_actions={}))
+ba_kept = as_list_(u.get("subtasks"))
+ba_first = ba_kept[0] if ba_kept else {}
+ba_criteria = as_list_(ba_first.get("acceptance_criteria"))
+check("subtasks: failing tests, two fixes and a publish step -> 2 subtasks, the tests merged into the first fix",
+      len(ba_kept) == 2 and ba_first.get("title", "").endswith("(with its regression tests)")
+      and ba_first.get("outcome", "").startswith(BILLING_ANCHOR_SUBTASKS[0]["outcome"])
+      and ba_first.get("outcome", "").endswith(BILLING_ANCHOR_SUBTASKS[1]["outcome"])
+      and ba_criteria == ["`./ci vet` passes"] + [c for c in BILLING_ANCHOR_SUBTASKS[1]["acceptance_criteria"]
+                                                  if c != "`./ci vet` passes"]
+      and len(set(ba_criteria)) == len(ba_criteria)
+      and not any(re.search(r"\bfails\b|only test files", c) for c in ba_criteria)
+      and "production code" not in ba_first.get("constraints", "")
+      and BILLING_ANCHOR_SUBTASKS[1]["constraints"] in ba_first.get("constraints", "")
+      and any("merged into subtask 2" in d for d in u.get("decisions", [])),
+      (len(ba_kept), ba_first, u.get("decisions")))
+
+u = gates.record_subtasks(base_state(subtasks=BILLING_ANCHOR_SUBTASKS[:2], top_level=True, git_actions={}))
+one = as_list_(u.get("subtasks"))
+u0 = gates.next_subtask(base_state(subtasks=one, subtask_index=0, intent="implementation"))
+u1 = gates.next_subtask(base_state(subtasks=one, subtask_index=1))
+check("subtasks: tests plus their fix merge into one subtask that runs as simple work, with no final whole-task review",
+      len(one) == 1 and not u0.get("current_task", "").startswith("Subtask ") and u1.get("_next") == "final_report"
+      and not u1.get("final_review"), (len(one), u0.get("current_task", "")[:80], u1.get("_next")))
+
+trailing = [BILLING_ANCHOR_SUBTASKS[1], BILLING_ANCHOR_SUBTASKS[0]]
+u = gates.record_subtasks(base_state(subtasks=trailing, top_level=True, git_actions={}))
+check("subtasks: a tests-first subtask that comes last is kept as it is",
+      as_list_(u.get("subtasks")) == trailing and not any("merged into" in d for d in u.get("decisions", [])),
+      u.get("subtasks"))
+
+pin = {"title": "Pin the month-end cases", "outcome": "Failing tests pin every month-end case in the request.",
+       "acceptance_criteria": ["`./ci vet` passes"]}
+u = gates.record_subtasks(base_state(subtasks=[pin] + BILLING_ANCHOR_SUBTASKS[1:3], top_level=True, git_actions={}))
+check("subtasks: the merged tests' wording does not pull the subtask after the fix into the merge too",
+      [s.get("title") for s in as_list_(u.get("subtasks"))]
+      == [BILLING_ANCHOR_SUBTASKS[1]["title"] + " (with its regression tests)", BILLING_ANCHOR_SUBTASKS[2]["title"]],
+      u.get("subtasks"))
+
+guarded = {"title": "Guard the parser against empty input", "outcome": "Empty input returns an error.",
+           "acceptance_criteria": ["A regression test that fails without the fix now passes", "`./ci test` passes"]}
+fix_red = {"title": "Fix the failing tests in the parser", "outcome": "The parser tests pass again.",
+           "acceptance_criteria": ["`./ci test` passes"]}
+fix_next = BILLING_ANCHOR_SUBTASKS[1]
+u = gates.record_subtasks(base_state(subtasks=[guarded, fix_red, fix_next], top_level=True, git_actions={}))
+check("subtasks: a test that fails only without the fix, and a title that fixes failing tests, are not tests-first",
+      as_list_(u.get("subtasks")) == [guarded, fix_red, fix_next] and not any("merged into" in d for d in u.get("decisions", [])),
+      u.get("subtasks"))
+red_then = {"title": "Add failing tests for empty input", "outcome": "Tests pin the empty-input case.",
+            "acceptance_criteria": ["The new test fails before the fix and passes after it", "`./ci test` fails"]}
+u = gates.record_subtasks(base_state(subtasks=[red_then, guarded], top_level=True, git_actions={}))
+check("subtasks: a fail-before / pass-after criterion survives the merge; a criterion that ends red does not",
+      as_list_(as_list_(u.get("subtasks"))[0].get("acceptance_criteria"))
+      == ["The new test fails before the fix and passes after it"] + guarded["acceptance_criteria"], u.get("subtasks"))
+
+plain = BILLING_ANCHOR_SUBTASKS[1:3]
+u = gates.record_subtasks(base_state(subtasks=plain, top_level=True, git_actions={}))
+plain_kept = as_list_(u.get("subtasks")) == plain and not any("merged into" in d for d in u.get("decisions", []))
+check("subtasks: a plain two-subtask plan with no tests-first subtask is unchanged", plain_kept, u.get("subtasks"))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

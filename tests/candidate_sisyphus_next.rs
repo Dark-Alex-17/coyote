@@ -1388,6 +1388,11 @@ fn scratch_candidate_copy(scratch: &TempDirGuard) -> PathBuf {
         &agents_dir().join("architect-next").join("scripts"),
         &agents.join("architect-next").join("scripts"),
     );
+    // the diff-base rows run the gauntlet's own signals script on a checkpoint commit
+    copy_tree(
+        &agents_dir().join("review-gauntlet").join("scripts"),
+        &agents.join("review-gauntlet").join("scripts"),
+    );
     let copy = agents.join(CANDIDATE);
     copy_tree(&candidate_dir(), &copy);
     copy
@@ -3044,6 +3049,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("check_inbox_pre", "timeout", 300),
     ("ci_apply", "timeout", 300),
     ("ci_diagnose", "timeout", 600),
+    ("ci_gate", "timeout", 150),
     ("ci_poll", "timeout", 180),
     ("ci_route", "timeout", 300),
     ("compose_brief", "timeout", 600),
@@ -3068,6 +3074,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("ladder_judge", "timeout", 300),
     ("librarian_question", "max_attempts", 2),
     ("librarian_question", "timeout", 1800),
+    ("next_subtask", "timeout", 60),
     ("observability_gate", "timeout", 60),
     ("observability_pass", "max_iterations", 20),
     ("observability_pass", "timeout", 1200),
@@ -3122,6 +3129,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "pr_review_rounds",
     "pr_review_started_at",
     "pr_review_watch_polls",
+    "publish_retries",
     "reask_rounds",
     "rejected_rounds",
     "review_rounds",
@@ -5737,7 +5745,9 @@ fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
     ];
     for needle in [
         "a top-level run asks the user with your verdict",
-        "Unsure between simple and compound: compound.",
+        "A bug fix together with its regression tests is simple, even when it touches a few files or its size \
+         is unclear; compound only when the request asks for several independent changes, so a bug fix is never \
+         compound for being unsure. Otherwise, unsure between simple and compound: compound.",
         "Unsure between compound and plan_shaped: compound; plan_shaped only when the evidence shows it.",
         "sizing_reason is ONE line naming the evidence",
         "subtask_estimate the estimated number of subtasks",

@@ -30728,6 +30728,119 @@ print(json.dumps({
         let _ = remove_dir_all(&repo);
     }
 
+    /// `diverged_pr_repo` with an earlier subtask's uncommitted edit to
+    /// pr.txt held in a checkpoint commit on top of HEAD, the latest
+    /// subtask's edit to base.txt in the worktree, a branch `ahead` one
+    /// commit past HEAD and a branch `behind` at the fork point. Returns the
+    /// repo, HEAD, the checkpoint and the fork point.
+    fn checkpoint_repo() -> (PathBuf, String, String, String) {
+        let repo = diverged_pr_repo();
+        let head = debris_git(&repo, &["rev-parse", "HEAD"]);
+        let fork = debris_git(&repo, &["merge-base", "main", "HEAD"]);
+        write(repo.join("pr.txt"), "p\nearlier subtask\n").unwrap();
+        debris_git(&repo, &["add", "-u"]);
+        let tree = debris_git(&repo, &["write-tree"]);
+        let checkpoint = debris_git(
+            &repo,
+            &["commit-tree", &tree, "-p", &head, "-m", "checkpoint"],
+        );
+        let ahead = debris_git(
+            &repo,
+            &[
+                "commit-tree",
+                &format!("{head}^{{tree}}"),
+                "-p",
+                &head,
+                "-m",
+                "upstream",
+            ],
+        );
+        debris_git(&repo, &["branch", "ahead", &ahead]);
+        debris_git(&repo, &["branch", "behind", &fork]);
+        write(repo.join("base.txt"), "a\nlatest subtask\n").unwrap();
+        (repo, head, checkpoint, fork)
+    }
+
+    /// A checkpoint on top of HEAD that no ref holds is diffed directly, with
+    /// a note; a branch ahead of HEAD still diffs from HEAD and a branch
+    /// behind it from the fork point, in facts.py, diff_facts.py and
+    /// downstream_sweep.py alike.
+    #[test]
+    fn review_scripts_keep_a_checkpoint_base_and_normalize_branches() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let (repo, head, checkpoint, fork) = checkpoint_repo();
+        let project_dir = repo.to_string_lossy().to_string();
+        let trace = utils::temp_file("-checkpoint-sweep-trace-", "");
+        let trace_str = trace.to_string_lossy().to_string();
+        for (spec, resolved, files, note) in [
+            (
+                checkpoint.as_str(),
+                checkpoint.as_str(),
+                vec!["base.txt"],
+                "is a checkpoint on top of HEAD",
+            ),
+            (
+                "ahead",
+                head.as_str(),
+                vec!["base.txt", "pr.txt"],
+                "normalized to merge-base",
+            ),
+            (
+                "behind",
+                fork.as_str(),
+                vec!["base.txt", "pr.txt"],
+                "normalized to merge-base",
+            ),
+        ] {
+            let state = json!({"project_dir_in": project_dir, "diff_spec": spec});
+            let reviewer = run_code_reviewer_script("facts.py", &state);
+            assert_eq!(
+                reviewer["resolved_diff_spec"], resolved,
+                "facts.py {spec}: {reviewer}"
+            );
+            assert_eq!(
+                changed_files(&reviewer),
+                files,
+                "facts.py {spec}: {reviewer}"
+            );
+            assert!(
+                reviewer["facts_note"]
+                    .as_str()
+                    .is_some_and(|n| n.contains(note)),
+                "facts.py {spec} must note {note:?}: {reviewer}"
+            );
+            let adversary = run_adversary_script("diff_facts.py", &state);
+            assert_eq!(
+                changed_files(&adversary),
+                files,
+                "diff_facts.py {spec}: {adversary}"
+            );
+            assert!(
+                adversary["diff_note"]
+                    .as_str()
+                    .is_some_and(|n| n.contains(note)),
+                "diff_facts.py {spec} must note {note:?}: {adversary}"
+            );
+            let _ = std::fs::remove_file(&trace);
+            let sweep = run_code_reviewer_script_env(
+                "downstream_sweep.py",
+                &json!({"project_dir": project_dir, "resolved_diff_spec": spec, "consumer_surface": true}),
+                &[("GIT_TRACE", &trace_str)],
+            );
+            let trace_text = std::fs::read_to_string(&trace).unwrap_or_default();
+            let call = format!("built-in: git diff {REVIEW_DIFF_FLAGS} {resolved} --");
+            assert!(
+                trace_text.lines().any(|l| l.ends_with(&call)),
+                "downstream_sweep.py {spec} must issue `{call}`: {sweep}\n{trace_text}"
+            );
+        }
+        let _ = std::fs::remove_file(&trace);
+        let _ = remove_dir_all(&repo);
+    }
+
     #[test]
     fn code_reviewer_synthesize_retries_and_fails_closed() {
         use crate::graph::{GraphParser, NodeType};
@@ -40241,13 +40354,14 @@ print(json.dumps({
         debris_git(&repo, &["add", "a.rs"]);
         debris_git(&repo, &["commit", "-qm", "c1"]);
 
-        // A bare spec (SHA or branch) costs one merge-base and one diff; a
-        // text-only diff never asks for attributes or config.
+        // A bare spec (SHA or branch) costs one merge-base, one rev-parse (is
+        // the spec a checkpoint on top of HEAD?) and one diff; a text-only
+        // diff never asks for attributes or config.
         let out = debris_traced_cli(&trace, &[&repo_str, &base]);
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             debris_git_census(&trace),
-            census(&[("diff", 1), ("merge-base", 1)]),
+            census(&[("diff", 1), ("merge-base", 1), ("rev-parse", 1)]),
             "bare SHA spec"
         );
         debris_git(&repo, &["branch", "basebr", &base]);
@@ -40255,7 +40369,7 @@ print(json.dumps({
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             debris_git_census(&trace),
-            census(&[("diff", 1), ("merge-base", 1)]),
+            census(&[("diff", 1), ("merge-base", 1), ("rev-parse", 1)]),
             "bare branch spec"
         );
         // A range spec needs no merge-base at all.
