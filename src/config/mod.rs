@@ -837,7 +837,7 @@ impl Config {
                     if inspection {
                         return Ok(Self::default());
                     }
-                    if *IS_STDOUT_TERMINAL {
+                    if conflict::menu_can_use_terminal() {
                         create_config_file(&config_path).await?;
                     }
                     Self::load_from_file(&config_path)?

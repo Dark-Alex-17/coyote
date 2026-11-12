@@ -2721,6 +2721,59 @@ nodes: {}
         assert_eq!(req.default, Some(json!(true)));
     }
 
+    /// Accepting the RAG question under the full-screen UI goes on to
+    /// build the knowledge base through the same prompter: its first
+    /// question is the embedding model, a closed select. Building the
+    /// base itself needs an embedding model to call, so the pin answers
+    /// that select with an option it does not offer and stops there.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn accepting_the_rag_confirm_under_the_tui_goes_on_to_build_the_knowledge_base() {
+        let _guard = TestConfigDirGuard::new("agent-rag-accept");
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let name = unique("rag_accept");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\n"),
+        )
+        .unwrap();
+
+        let app_state = AppState::test_default();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Selected("not-an-offered-model".to_string()),
+        ]));
+        let err = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("is not one of the offered options"),
+            "{err}"
+        );
+        let [confirm, select] = prompter.requests().try_into().unwrap();
+        assert_eq!(confirm.action, PromptAction::Confirm);
+        assert_eq!(
+            confirm.question,
+            "The agent has documents attached, init RAG?"
+        );
+        assert_eq!(select.action, PromptAction::Select);
+        assert_eq!(select.question, "Select embedding model:");
+        assert!(select.closed);
+        assert!(!select.options.is_empty());
+    }
+
     /// Without a terminal the RAG question is skipped rather than
     /// refused: the agent starts without its knowledge base and nothing
     /// is asked.

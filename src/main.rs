@@ -1019,7 +1019,7 @@ fn resolve_oauth_client(
                             "pick between the OAuth-capable clients ({})",
                             candidates.join(", ")
                         ),
-                        "; or pass --authenticate <CLIENT_NAME>.",
+                        " or pass --authenticate <CLIENT_NAME>.",
                     ));
                 }
                 let choice = crate::prompt::select_closed(
@@ -1082,6 +1082,7 @@ mod tests {
     #[serial]
     fn resolve_oauth_client_without_a_tty_is_refused_before_any_prompt() {
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let clients = [oauth_client("work"), oauth_client("home")];
         let prompter = ScriptedPrompter::refusing();
 
@@ -1095,7 +1096,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.ends_with("; or pass --authenticate <CLIENT_NAME>."),
+            message.ends_with("Re-run in a terminal or pass --authenticate <CLIENT_NAME>."),
             "{message}"
         );
         assert!(prompter.requests().is_empty());

@@ -4868,6 +4868,39 @@ mod tests {
         );
     }
 
+    /// A confirm's and a password's help ride along into the modal under
+    /// the question, the way an input's does.
+    #[test]
+    fn confirm_and_password_modals_draw_their_help_under_the_question() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest {
+            help: Some("Reinstalling overwrites every bundled macro.".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, "Continue?", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert!(frame.contains("Continue?"), "{frame}");
+        assert!(
+            frame.contains("Reinstalling overwrites every bundled macro."),
+            "{frame}"
+        );
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+
+        let req = PromptRequest {
+            help: Some("Stored encrypted in the vault.".to_string()),
+            ..PromptRequest::new(PromptAction::Password, "Token:", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert!(frame.contains("Token:"), "{frame}");
+        assert!(frame.contains("Stored encrypted in the vault."), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
     /// An input's default sits dimmed in the empty field as a placeholder,
     /// so Enter alone accepts it and typing replaces it; its help line
     /// sits dimmed between the question and the field.
@@ -9060,8 +9093,7 @@ mod tests {
             ),
             ("src/main.rs", "async_main", CLI_FLAGS),
             ("src/main.rs", "shell_execute", CLI_ONLY),
-            ("src/mcp/manage.rs", "handle_remove", CLI_ONLY),
-            ("src/mcp/manage.rs", "handle_add", CLI_ONLY),
+            ("src/mcp/manage.rs", "confirm_on_the_terminal", CLI_ONLY),
             ("src/mcp/manage.rs", "provision_secrets", CLI_ONLY),
             ("src/prompt/mod.rs", "select", REPL_PROMPTER),
             ("src/prompt/mod.rs", "input", REPL_PROMPTER),

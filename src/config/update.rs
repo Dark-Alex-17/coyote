@@ -157,7 +157,9 @@ fn update_binary_at(
         );
     }
 
-    let interactive = io::stdin().is_terminal();
+    // The bar redraws with carriage returns, which the full-screen UI's
+    // captured stdout would show as a wall of frames.
+    let interactive = !crate::tui::active() && io::stdin().is_terminal();
     let mut builder = Update::configure();
     builder
         .repo_owner("Dark-Alex-17")

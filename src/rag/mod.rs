@@ -3101,6 +3101,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn a_failed_document_without_a_tty_aborts_the_sync_without_asking() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-no-tty-failed-doc");
         let prompter = ScriptedPrompter::refusing();

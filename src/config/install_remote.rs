@@ -571,7 +571,7 @@ fn handle_obsolete_files(
         let action = match (modified, agent_definition_conflict(&path, &planned)) {
             (false, _) => ObsoleteAction::Delete,
             (true, true) => ObsoleteAction::Backup,
-            (true, false) => resolve_obsolete(&path, &mut sticky, prompter)?,
+            (true, false) => resolve_obsolete(&path, &mut sticky, prompter, &mut print_note)?,
         };
         apply_obsolete_action(store, bundle, &path, &full, &config_dir, action, modified)?;
     }
@@ -598,6 +598,7 @@ fn resolve_obsolete(
     path: &str,
     sticky: &mut Option<ObsoleteAction>,
     prompter: &dyn Prompter,
+    note: &mut dyn FnMut(&str),
 ) -> Result<ObsoleteAction> {
     if let Some(action) = *sticky {
         return Ok(action);
@@ -621,7 +622,14 @@ fn resolve_obsolete(
         choice,
         sticky,
         "Kept the obsolete files: the question was cancelled.",
+        note,
     ))
+}
+
+/// The note sink the menu loops hand to [`resolve_obsolete`] and
+/// [`resolve_uninstall_action`]: one line on stdout.
+fn print_note(note: &str) {
+    println!("{note}");
 }
 
 /// The keep-or-delete menu's answer, or `None` when there is none: the
@@ -638,11 +646,12 @@ fn select_keep_or_delete(prompter: &dyn Prompter, prompt: &str) -> Result<Option
 
 /// The action behind a [`select_keep_or_delete`] answer. No answer is the
 /// keep-everything answer: it sticks for the rest of the loop and
-/// `cancelled_note` is printed once.
+/// `cancelled_note` goes to `note` once.
 fn keep_or_delete_choice(
     choice: Option<String>,
     sticky: &mut Option<ObsoleteAction>,
     cancelled_note: &str,
+    note: &mut dyn FnMut(&str),
 ) -> ObsoleteAction {
     match choice.as_deref() {
         Some("keep") => ObsoleteAction::Keep,
@@ -656,7 +665,7 @@ fn keep_or_delete_choice(
             ObsoleteAction::Delete
         }
         None => {
-            println!("{cancelled_note}");
+            note(cancelled_note);
             *sticky = Some(ObsoleteAction::Keep);
             ObsoleteAction::Keep
         }
@@ -973,7 +982,8 @@ fn uninstall_owned_files(
         }
 
         let prompt = format!("File {} was modified locally after install", file.path);
-        let action = resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter)?;
+        let action =
+            resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter, &mut print_note)?;
         apply_uninstall_file_action(
             store,
             bundle,
@@ -1062,6 +1072,7 @@ fn resolve_uninstall_action(
     assume_yes: bool,
     sticky: &mut Option<ObsoleteAction>,
     prompter: &dyn Prompter,
+    note: &mut dyn FnMut(&str),
 ) -> Result<ObsoleteAction> {
     if assume_yes || !conflict::menu_can_use_terminal() {
         return Ok(ObsoleteAction::Keep);
@@ -1077,6 +1088,7 @@ fn resolve_uninstall_action(
         choice,
         sticky,
         "Kept the locally modified items: the question was cancelled.",
+        note,
     ))
 }
 
@@ -1154,7 +1166,7 @@ fn uninstall_mcp_entries(
                 "was modified locally after install"
             };
             let prompt = format!("MCP server '{key}' {reason}");
-            resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter)?
+            resolve_uninstall_action(&prompt, assume_yes, &mut sticky, prompter, &mut print_note)?
         };
         match action {
             ObsoleteAction::Keep => {
@@ -3582,11 +3594,13 @@ mod tests {
             PromptAnswer::Selected("keep-all".into()),
         ]);
 
-        let action = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter).unwrap();
+        let action =
+            resolve_obsolete("macros/old.yaml", &mut sticky, &prompter, &mut |_| {}).unwrap();
         assert_eq!(action, ObsoleteAction::Delete);
         assert_eq!(sticky, None);
 
-        let action = resolve_obsolete("macros/older.yaml", &mut sticky, &prompter).unwrap();
+        let action =
+            resolve_obsolete("macros/older.yaml", &mut sticky, &prompter, &mut |_| {}).unwrap();
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
 
@@ -3611,11 +3625,22 @@ mod tests {
     fn resolve_obsolete_with_no_human_keeps_the_file() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let mut sticky = None;
+        let mut notes = Vec::new();
 
-        let action = resolve_obsolete("macros/old.yaml", &mut sticky, &HeadlessPrompter).unwrap();
+        let action = resolve_obsolete(
+            "macros/old.yaml",
+            &mut sticky,
+            &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the obsolete files: the question was cancelled."]
+        );
     }
 
     /// On a terminal with no human to answer (a headless run), the
@@ -3626,11 +3651,22 @@ mod tests {
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
+        let mut notes = Vec::new();
 
-        let action = resolve_obsolete("macros/old.yaml", &mut sticky, &HeadlessPrompter).unwrap();
+        let action = resolve_obsolete(
+            "macros/old.yaml",
+            &mut sticky,
+            &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the obsolete files: the question was cancelled."]
+        );
     }
 
     #[test]
@@ -3644,6 +3680,7 @@ mod tests {
             "macros/old.yaml",
             &mut sticky,
             &ScriptedPrompter::refusing(),
+            &mut |_| {},
         )
         .unwrap();
 
@@ -3652,7 +3689,7 @@ mod tests {
     }
 
     /// Closing the obsolete-file question keeps the file and keeps every
-    /// later one without asking again.
+    /// later one without asking again; the note says so once.
     #[test]
     #[serial]
     fn cancelling_the_obsolete_file_question_keeps_the_file() {
@@ -3660,13 +3697,20 @@ mod tests {
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut notes = Vec::new();
+        let mut note = |note: &str| notes.push(note.to_string());
 
-        let first = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter).unwrap();
-        let second = resolve_obsolete("macros/older.yaml", &mut sticky, &prompter).unwrap();
+        let first = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter, &mut note).unwrap();
+        let second =
+            resolve_obsolete("macros/older.yaml", &mut sticky, &prompter, &mut note).unwrap();
 
         assert_eq!(first, ObsoleteAction::Keep);
         assert_eq!(second, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the obsolete files: the question was cancelled."]
+        );
         assert_eq!(prompter.requests().len(), 1);
     }
 
@@ -6499,6 +6543,7 @@ mod tests {
             false,
             &mut sticky,
             &prompter,
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(action, ObsoleteAction::Delete);
@@ -6509,6 +6554,7 @@ mod tests {
             false,
             &mut sticky,
             &prompter,
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(action, ObsoleteAction::Delete);
@@ -6532,6 +6578,7 @@ mod tests {
             true,
             &mut None,
             &ScriptedPrompter::refusing(),
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(action, ObsoleteAction::Keep);
@@ -6544,17 +6591,23 @@ mod tests {
     fn resolve_uninstall_action_with_no_human_keeps_the_file() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let mut sticky = None;
+        let mut notes = Vec::new();
 
         let action = resolve_uninstall_action(
             "File macros/a.yaml was modified locally after install",
             false,
             &mut sticky,
             &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
         )
         .unwrap();
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: the question was cancelled."]
+        );
     }
 
     /// On a terminal with no human to answer (a headless run), the
@@ -6565,21 +6618,27 @@ mod tests {
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
+        let mut notes = Vec::new();
 
         let action = resolve_uninstall_action(
             "File macros/a.yaml was modified locally after install",
             false,
             &mut sticky,
             &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
         )
         .unwrap();
 
         assert_eq!(action, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: the question was cancelled."]
+        );
     }
 
     /// Closing the uninstall question keeps the modified file and keeps
-    /// every later one without asking again.
+    /// every later one without asking again; the note says so once.
     #[test]
     #[serial]
     fn cancelling_the_uninstall_question_keeps_the_file() {
@@ -6587,12 +6646,15 @@ mod tests {
         let _script = conflict::prompt_script::install(&[]);
         let mut sticky = None;
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut notes = Vec::new();
+        let mut note = |note: &str| notes.push(note.to_string());
 
         let first = resolve_uninstall_action(
             "File macros/a.yaml was modified locally after install",
             false,
             &mut sticky,
             &prompter,
+            &mut note,
         )
         .unwrap();
         let second = resolve_uninstall_action(
@@ -6600,6 +6662,7 @@ mod tests {
             false,
             &mut sticky,
             &prompter,
+            &mut note,
         )
         .unwrap();
 
@@ -6607,6 +6670,10 @@ mod tests {
         assert_eq!(second, ObsoleteAction::Keep);
         assert_eq!(sticky, Some(ObsoleteAction::Keep));
         assert_eq!(prompter.requests().len(), 1);
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: the question was cancelled."]
+        );
     }
 
     #[test]

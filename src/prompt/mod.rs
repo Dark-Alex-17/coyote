@@ -398,8 +398,7 @@ impl InquirePrompter {
     /// movement hint as help), and only an open one offers the custom row.
     fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let select = Select::new(&req.question, Self::select_options(req));
-        if req.closed && req.tool.is_none() {
-            // command menus: bare select
+        if Self::is_command_menu(req) {
             return select.prompt().map(PromptAnswer::Selected);
         }
         let mut answer = select
@@ -410,6 +409,13 @@ impl InquirePrompter {
             answer = Text::new("Custom response:").prompt()?;
         }
         Ok(PromptAnswer::Selected(answer))
+    }
+
+    /// A closed select no tool asked for is a command menu, which takes
+    /// inquire's bare select; a tool's select keeps the REPL styling its
+    /// selects always had.
+    fn is_command_menu(req: &PromptRequest) -> bool {
+        req.closed && req.tool.is_none()
     }
 
     fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
@@ -743,16 +749,27 @@ mod tests {
 
     /// Which widget a closed select gets depends on who asks: a command
     /// menu takes inquire's bare select, a tool keeps the REPL styling
-    /// its selects always had. Pinned on the source, since the widget
-    /// only exists on a terminal.
+    /// its selects always had. The widget only exists on a terminal, so
+    /// the two branches are pinned on the source, split at the guard.
     #[test]
     fn a_closed_tool_select_keeps_the_filterless_help_styling() {
+        let closed = |tool: Option<&str>| PromptRequest {
+            closed: true,
+            ..request(PromptAction::Select, tool)
+        };
+        assert!(InquirePrompter::is_command_menu(&closed(None)));
+        assert!(!InquirePrompter::is_command_menu(&closed(Some("probe"))));
+        assert!(!InquirePrompter::is_command_menu(&request(
+            PromptAction::Select,
+            None
+        )));
+
         let source = include_str!("mod.rs");
         let start = source.find("fn select(req: &PromptRequest)").unwrap();
         let body = &source[start..];
         let body = &body[..body.find("\n    }\n").unwrap()];
-        let (_, after_marker) = body.split_once("// command menus: bare select").unwrap();
-        let (bare, styled) = after_marker.split_once("\n        }\n").unwrap();
+        let (_, after_guard) = body.split_once("if Self::is_command_menu(req) {").unwrap();
+        let (bare, styled) = after_guard.split_once("\n        }\n").unwrap();
         assert!(bare.contains("select.prompt()"), "{bare}");
         assert!(styled.contains(".prompt()"), "{styled}");
         for needle in [
