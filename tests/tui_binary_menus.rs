@@ -3865,3 +3865,79 @@ fn a_tty_less_uninstall_with_yes_keeps_every_modified_item_and_prints_no_questio
         "the second edited role lost its edit:\n{out}"
     );
 }
+
+/// `--uninstall <bundle>` without `--yes` and without a human: with no
+/// terminal at all, and again with a tty on stdout but stdin from
+/// /dev/null, the refusal is the shared shape whose remedy is exactly
+/// ` or pass --yes.`, the exit code is non-zero, no `Uninstall bundle?`
+/// is painted, and every owned file and the record stay.
+#[test]
+#[serial]
+fn a_tty_less_uninstall_refusal_ends_with_the_yes_remedy_whatever_stdout_is() {
+    let dir = fresh_config_dir("ttyless-uninstall-remedy");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-r9y";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", repo.to_str().unwrap()],
+        "tty-less install",
+    );
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    assert!(
+        ok && role.exists(),
+        "the tty-less install did not proceed:\n{out}"
+    );
+    let files_before = walk(&dir);
+    let expected = (
+        format!("uninstall bundle '{name}'"),
+        " or pass --yes.".to_string(),
+    );
+
+    let (ok, out) = run_ttyless(&dir, &["--uninstall", name], "tty-less uninstall");
+    assert!(
+        !ok,
+        "a tty-less `--uninstall` without `--yes` exited 0:\n{out}"
+    );
+    assert_eq!(
+        refusal_shape(&out),
+        Some(expected.clone()),
+        "the tty-less uninstall refusal is not the shared shape with the `--yes` remedy:\n{out}"
+    );
+    assert!(
+        !out.contains("Uninstall bundle") && !out.contains("owns"),
+        "the refused run painted the question or its footprint line:\n{out}"
+    );
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/null",
+        &format!(" --uninstall {name}"),
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "`--uninstall` with a tty on stdout but no tty on stdin exited 0:\n{plain}"
+    );
+    assert_eq!(
+        refusal_shape(&plain),
+        Some(expected),
+        "the stdout-tty/stdin-pipe uninstall refusal is not the shared shape with the `--yes` remedy:\n{plain}"
+    );
+    assert!(
+        !plain.contains("Uninstall bundle '") && !plain.contains("(y/N)"),
+        "a tty on stdout alone was enough to paint the question:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+    assert_eq!(
+        walk(&dir),
+        files_before,
+        "a refused uninstall changed the config dir"
+    );
+}

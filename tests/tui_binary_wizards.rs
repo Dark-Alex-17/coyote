@@ -3510,3 +3510,360 @@ fn dot_install_of_a_builtin_category_in_the_plain_repl_confirms_on_enter_not_on_
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------
+// Esc on a vault-secret modal defers the rest, and a delete-all answer
+// about owned files never reaches the mcp.json servers, while keep-all
+// does.
+// ---------------------------------------------------------------------
+
+/// Rewrites the merged `mcp.json` so the bundle's server entry differs
+/// from the one the install recorded (its `k7s` argument gains a
+/// suffix); the uninstall then sees a locally modified server.
+fn edit_the_bundle_server_in_mcp_json(dir: &Path) -> String {
+    let path = dir.join("mcp.json");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("\"k7s\""),
+        "the merged mcp.json does not carry the bundle server's `k7s` argument:\n{text}"
+    );
+    let edited = text.replace("\"k7s\"", "\"k7s-edited-locally\"");
+    fs::write(&path, &edited).unwrap();
+    edited
+}
+
+/// `.install <local bundle>` whose mcp.json references three secrets:
+/// Esc on the first `Add {{ X }} to the vault now?` modal defers THAT
+/// secret and every later one (no modal for B or C), the notice lists
+/// all three, the bundle is installed and recorded with its server
+/// merged, nothing reached the vault and the UI stays live. Asked again
+/// by `.install <bundle>` (an update from the same source), `n` on A and
+/// Esc on B leaves C unasked and all three listed once more.
+#[test]
+#[serial]
+fn esc_on_a_vault_secret_modal_defers_that_and_every_later_secret_and_keeps_the_install() {
+    let dir = fresh_config_dir("install-esc-defers-secrets");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-e9s";
+    let secrets = ["BUNDLE_SECRET_A", "BUNDLE_SECRET_B", "BUNDLE_SECRET_C"];
+    let repo = write_bundle_repo(&dir, name, &secrets);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        install_at,
+        ".install (first secret)",
+        &["Add{{BUNDLE_SECRET_A}}tothevaultnow?", "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        DEFERRED_SECRETS_NOTICE,
+        "the deferred-secrets notice after Esc on the first secret modal",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    let flat = squeezed(&since);
+    for later in ["BUNDLE_SECRET_B", "BUNDLE_SECRET_C"] {
+        assert!(
+            !flat.contains(&format!("Add{{{{{later}}}}}tothevaultnow?")),
+            "Esc on the first secret modal still asked about {later}:\n{since}"
+        );
+    }
+    assert!(
+        flat.contains("{{BUNDLE_SECRET_A}}{{BUNDLE_SECRET_B}}{{BUNDLE_SECRET_C}}"),
+        "the notice does not list all three deferred secrets in order:\n{since}"
+    );
+    assert!(
+        !flat.contains("thequestionwascancelled") && !flat.contains("nobodycouldbeasked"),
+        "a deferred secret printed a kept note (the summary alone reports deferred secrets):\n{since}"
+    );
+    assert!(!since.contains("exit="), "`.install` quit the UI:\n{since}");
+    for role in ["role", "obsolete"] {
+        let installed = dir.join("roles").join(format!("{name}-{role}.md"));
+        assert!(
+            installed.exists(),
+            "the bundle's {role} file was not installed at {}:\n{since}",
+            installed.display()
+        );
+    }
+    let mcp_files = config_files_mentioning(&dir, "bundle-k7s-server");
+    assert!(
+        mcp_files
+            .iter()
+            .any(|path| path.file_name().is_some_and(|f| f == "mcp.json")),
+        "the merged mcp.json does not hold the bundle's server: {mcp_files:?}\n{since}"
+    );
+    assert!(
+        !new_files_named(&dir, &files_before, name).is_empty(),
+        "no file records the installed bundle `{name}`:\n{since}"
+    );
+    let secret_holders = config_files_mentioning(&dir, "BUNDLE_SECRET_A");
+    assert!(
+        secret_holders
+            .iter()
+            .all(|path| path.file_name().is_some_and(|f| f == "mcp.json")),
+        "a file other than mcp.json holds BUNDLE_SECRET_A (a vault write?): {secret_holders:?}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a secret question released the terminal:\n{since}"
+    );
+
+    // The update from the same source asks about every secret again:
+    // `n` defers A alone, Esc on B defers B and C together.
+    let update_at = pty.raw().len();
+    pty.send(format!(".install {name}\r").as_bytes()).unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        update_at,
+        ".install <bundle> (first secret again)",
+        &["Add{{BUNDLE_SECRET_A}}tothevaultnow?", "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"n").unwrap();
+    // The second secret's modal differs from the first by one letter, so
+    // the painter sends only that cell; a resize forces the whole frame.
+    pty.read_for(Duration::from_millis(500));
+    let answered_at = pty.raw().len();
+    pty.resize(60, 139).unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        answered_at,
+        ".install <bundle> (second secret)",
+        &["Add{{BUNDLE_SECRET_B}}tothevaultnow?", "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "{{BUNDLE_SECRET_B}}{{BUNDLE_SECRET_C}}",
+        "the deferred list of the update after `n` then Esc",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[update_at..]));
+    let flat = squeezed(&since);
+    assert!(
+        !flat.contains("Add{{BUNDLE_SECRET_C}}tothevaultnow?"),
+        "Esc on the second secret modal still asked about the third secret:\n{since}"
+    );
+    assert!(
+        flat.contains("{{BUNDLE_SECRET_A}}{{BUNDLE_SECRET_B}}{{BUNDLE_SECRET_C}}"),
+        "the update's notice does not list all three deferred secrets:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "a secret question of the update released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "the deferred secrets");
+}
+
+/// `.uninstall <bundle>` of a bundle whose role AND mcp.json server were
+/// both edited after install: `delete-all` on the file modal deletes the
+/// owned files but does NOT carry into the mcp.json loop, so the server
+/// gets its own `MCP server '<key>' was modified locally after install`
+/// modal. Esc there keeps the server, prints exactly one `Kept the
+/// locally modified items: the question was cancelled.` note, the
+/// summary counts `deleted=2 kept=0` files and `removed=0 kept=1`
+/// servers, the bundle is partially uninstalled and the UI stays live.
+#[test]
+#[serial]
+fn delete_all_on_the_uninstall_file_modal_does_not_carry_into_the_mcp_server_modal() {
+    let dir = fresh_config_dir("uninstall-delete-all-mcp");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-d9m";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    install_bundle_without_questions(&mut pty, &repo);
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    let edited = dir.join("roles").join(format!("{name}-obsolete.md"));
+    fs::write(&edited, EDITED_OBSOLETE).unwrap();
+    let edited_mcp = edit_the_bundle_server_in_mcp_json(&dir);
+
+    let at = pty.raw().len();
+    pty.send(format!(".uninstall {name}\r").as_bytes()).unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        at,
+        ".uninstall",
+        &[&format!("Uninstall bundle '{name}'?"), "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        at,
+        ".uninstall (modified file)",
+        &[
+            &format!("Fileroles/{name}-obsolete.mdwasmodifiedlocallyafterinstall"),
+            "delete-all",
+        ],
+    );
+    pty.read_for(HOTKEY_GAP);
+    let files_answered_at = pty.raw().len();
+    pty.send(b"4").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        files_answered_at,
+        ".uninstall (modified server)",
+        &[
+            "MCPserver'bundle-k7s-server'wasmodifiedlocallyafterinstall",
+            "keep",
+            "delete-all",
+        ],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "the question was cancelled",
+        "the note after Esc on the modified-server modal",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..]));
+    let flat = squeezed(&since);
+    assert_eq!(
+        flat.matches("Keptthelocallymodifieditems:thequestionwascancelled.")
+            .count(),
+        1,
+        "the cancelled note was printed more or less than once:\n{since}"
+    );
+    assert!(
+        !flat.contains("nobodycouldbeasked"),
+        "the Esc note reads as the headless one:\n{since}"
+    );
+    assert!(
+        flat.contains("keptserver'bundle-k7s-server'")
+            && flat.contains("mcpservers:removed=0kept=1")
+            && flat.contains("files:deleted=2kept=0"),
+        "delete-all on the files carried into the servers, or the summary disagrees:\n{since}"
+    );
+    assert!(
+        flat.contains("partiallyuninstalled"),
+        "the bundle with a kept server is not reported partially uninstalled:\n{since}"
+    );
+    assert!(
+        !role.exists() && !edited.exists(),
+        "delete-all on the file modal left an owned file behind:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).ok().as_deref(),
+        Some(edited_mcp.as_str()),
+        "the kept server was rewritten or removed:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "an uninstall question released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "the cancelled server question");
+}
+
+/// The keep-all twin: with both roles and the server edited, `keep-all`
+/// on the first file modal settles the whole run: no second file modal,
+/// no server modal, no kept note (an answer was given), two `kept
+/// modified file` lines, the server kept and the summary saying so.
+#[test]
+#[serial]
+fn keep_all_on_the_uninstall_file_modal_carries_into_the_mcp_server_loop_without_asking() {
+    let dir = fresh_config_dir("uninstall-keep-all-mcp");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-k9m";
+    let repo = write_bundle_repo(&dir, name, &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    install_bundle_without_questions(&mut pty, &repo);
+    let role = dir.join("roles").join(format!("{name}-role.md"));
+    let obsolete = dir.join("roles").join(format!("{name}-obsolete.md"));
+    let edited_role = format!("{}# edited\n", fs::read_to_string(&role).unwrap());
+    fs::write(&role, &edited_role).unwrap();
+    fs::write(&obsolete, EDITED_OBSOLETE).unwrap();
+    let edited_mcp = edit_the_bundle_server_in_mcp_json(&dir);
+
+    let at = pty.raw().len();
+    pty.send(format!(".uninstall {name}\r").as_bytes()).unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        at,
+        ".uninstall",
+        &[&format!("Uninstall bundle '{name}'?"), "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        at,
+        ".uninstall (first modified file)",
+        &["wasmodifiedlocallyafterinstall", "keep-all"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    let answered_at = pty.raw().len();
+    pty.send(b"3").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "mcp servers: removed=0 kept=1",
+        "the uninstall summary after keep-all",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[answered_at..]));
+    let flat = squeezed(&since);
+    assert!(
+        !flat.contains("MCPserver'bundle-k7s-server'wasmodifiedlocallyafterinstall")
+            && !flat.contains("Esc=cancel"),
+        "keep-all did not carry into the mcp.json loop (another modal came up):\n{since}"
+    );
+    assert!(
+        !flat.contains("Keptthelocallymodifieditems"),
+        "a kept note was printed though keep-all was answered:\n{since}"
+    );
+    assert_eq!(
+        flat.matches("keptmodifiedfile").count(),
+        2,
+        "the ledger does not carry one `kept modified file` line per kept role:\n{since}"
+    );
+    assert!(
+        flat.contains("keptserver'bundle-k7s-server'") && flat.contains("files:deleted=0kept=2"),
+        "the summary does not show every item kept:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&role).ok().as_deref(),
+        Some(edited_role.as_str()),
+        "keep-all lost the first role's edit:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(&obsolete).ok().as_deref(),
+        Some(EDITED_OBSOLETE),
+        "keep-all lost the second role's edit:\n{since}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).ok().as_deref(),
+        Some(edited_mcp.as_str()),
+        "keep-all rewrote or removed the kept server:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "an uninstall question released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "keep-all on the uninstall");
+}
