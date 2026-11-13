@@ -20282,6 +20282,7 @@ mod tests {
         /// `clear` asks first and a no changes nothing; a yes empties the person's view,
         /// says how many the model still has to read, and leaves those for it. Clearing
         /// an empty view asks nothing, and what arrives afterwards is shown new.
+        #[cfg(unix)]
         #[test]
         #[serial]
         fn inbox_clear_asks_then_empties_the_view_and_leaves_the_model_its_unread() {
@@ -20354,6 +20355,7 @@ mod tests {
         /// A message that lands while the `clear` question is open was never counted, so
         /// it is neither cleared nor hidden: the next look shows it, new. The question
         /// says how many of the counted messages the person has not seen.
+        #[cfg(unix)]
         #[test]
         #[serial]
         fn inbox_clear_leaves_a_message_that_lands_while_it_asks() {
