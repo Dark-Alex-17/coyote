@@ -1192,15 +1192,15 @@ fn a_tty_less_agent_with_missing_required_variables_lists_them_instead_of_asking
 }
 
 // ---------------------------------------------------------------------
-// Pins that fit this half's budget: the piped-stdout update refusal, the
-// re-asked agent variable in the plain REPL and the tty-less bare `.rag`.
+// The piped-stdout update refusal, the re-asked agent variable in the
+// plain REPL and the tty-less bare `.rag`.
 // ---------------------------------------------------------------------
 
 /// `--update` on a Cargo install with stdin on the terminal but stdout
 /// redirected to a file (a user capturing the output): the confirm has
 /// nowhere to paint, so the update is refused in the shared shape naming
-/// `--force` (accepted plain-REPL delta), exits non-zero, never asks
-/// `Update anyway?`, and the binary is untouched.
+/// `--force`, exits non-zero, never asks `Update anyway?`, and the binary
+/// is untouched.
 #[test]
 #[serial]
 fn update_with_a_piped_stdout_and_a_tty_on_stdin_is_refused_in_the_shared_shape() {
@@ -4257,7 +4257,7 @@ const REPL_INSTALL_REMEDY: &str = ", with --force (installs).";
 /// ships under a different definition, so the merge hits a conflict.
 fn write_conflicting_local_mcp_server(dir: &Path) -> String {
     let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
-                 \"args\": [\"local-definition-r10\"], \"env\": {}}}}\n";
+                 \"args\": [\"local-definition-m10\"], \"env\": {}}}}\n";
     fs::write(dir.join("mcp.json"), local).unwrap();
     local.to_string()
 }
@@ -4428,7 +4428,7 @@ fn a_headless_macro_dot_install_at_an_mcp_conflict_keeps_the_local_server_saying
         &[("COYOTE_UI", "repl")],
         WAIT_WRAPPER,
         "/dev/tty",
-        " --headless --macro install-k7s probe-r10",
+        " --headless --macro install-k7s macro-m10",
     );
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let plain = strip_ansi(&transcript);

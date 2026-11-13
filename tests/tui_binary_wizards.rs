@@ -1237,7 +1237,7 @@ fn dot_rebuild_rag_with_a_failing_document_asks_continue_in_the_confirm_modal_an
     let dir = fresh_config_dir("rebuild-rag-failed-doc");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_a_failing_loader(&dir);
-    let name = "kb-r8";
+    let name = "kb-w8";
     let (rag_path, seeded) = seed_rag_with_a_failing_document(&dir, name);
     let mut pty = spawn_tui(&dir, &[]);
 
@@ -1327,7 +1327,7 @@ fn dot_rebuild_rag_with_a_failing_document_and_y_goes_on_to_report_the_empty_cor
     let dir = fresh_config_dir("rebuild-rag-failed-doc-y");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_a_failing_loader(&dir);
-    let name = "kb-r8";
+    let name = "kb-w8";
     let (rag_path, seeded) = seed_rag_with_a_failing_document(&dir, name);
     let mut pty = spawn_tui(&dir, &[]);
 
@@ -1381,7 +1381,7 @@ fn dot_rebuild_rag_with_a_failing_document_and_y_goes_on_to_report_the_empty_cor
 /// through a menu.
 fn write_conflicting_local_mcp(dir: &Path) -> String {
     let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
-                 \"args\": [\"local-definition-r8\"], \"env\": {}}}}\n";
+                 \"args\": [\"local-definition-w8\"], \"env\": {}}}}\n";
     fs::write(dir.join("mcp.json"), local).unwrap();
     local.to_string()
 }
@@ -1740,7 +1740,7 @@ fn an_error_notice_echoing_escapes_and_a_zero_width_space_is_drawn_as_plain_word
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
-    let mut paste = b"\x1b[200~.file /nonexistent-r9/".to_vec();
+    let mut paste = b"\x1b[200~.file /nonexistent-w9/".to_vec();
     paste.extend_from_slice(ESCAPED_PATH);
     paste.extend_from_slice(b"\x1b[201~");
     pty.send(&paste).unwrap();
@@ -1766,12 +1766,12 @@ fn an_error_notice_echoing_escapes_and_a_zero_width_space_is_drawn_as_plain_word
         (
             "the command header",
             &header_squeezed,
-            "/nonexistent-r9/see-red-zw-link-end-q3u",
+            "/nonexistent-w9/see-red-zw-link-end-q3u",
         ),
         (
             "the error notice",
             &error_squeezed,
-            "/nonexistent-r9/see-red-zw-inknd-q3u",
+            "/nonexistent-w9/see-red-zw-inknd-q3u",
         ),
     ] {
         for leaked in ["[31m", "[0m", "]8;;", "x.invalid"] {
@@ -1840,7 +1840,7 @@ fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
-    answer_field_modal(&mut pty, "probe-r9-session");
+    answer_field_modal(&mut pty, "saved-w9-session");
     // The painter skips cells that were already blank, so the words of a
     // line can reach the stream without the spaces between them.
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
@@ -1895,8 +1895,8 @@ fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
     assert!(
         walk(&dir)
             .into_iter()
-            .any(|p| p.file_name().is_some_and(|n| n == "probe-r9-session.yaml")),
-        "no probe-r9-session.yaml was written under {dir:?}:\n{transcript}"
+            .any(|p| p.file_name().is_some_and(|n| n == "saved-w9-session.yaml")),
+        "no saved-w9-session.yaml was written under {dir:?}:\n{transcript}"
     );
 }
 
@@ -1924,7 +1924,7 @@ fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen(
     pty.send(b"y").unwrap();
     pty.wait_for("ession name", PTY_DEADLINE).unwrap();
     let named_at = pty.raw().len();
-    answer_field_modal(&mut pty, "probe-r9-exit");
+    answer_field_modal(&mut pty, "saved-w9-exit");
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
@@ -1948,14 +1948,14 @@ fn dot_exit_saving_the_session_on_y_carries_the_saved_line_to_the_normal_screen(
     );
     let after_leave = strip_ansi(&String::from_utf8_lossy(&pty.raw()[left_at..]));
     assert!(
-        after_leave.contains("probe-r9-exit.yaml"),
+        after_leave.contains("saved-w9-exit.yaml"),
         "the confirmation does not name the written file:\n{after_leave}"
     );
     assert!(
         walk(&dir)
             .into_iter()
-            .any(|p| p.file_name().is_some_and(|n| n == "probe-r9-exit.yaml")),
-        "no probe-r9-exit.yaml was written under {dir:?}:\n{transcript}"
+            .any(|p| p.file_name().is_some_and(|n| n == "saved-w9-exit.yaml")),
+        "no saved-w9-exit.yaml was written under {dir:?}:\n{transcript}"
     );
 }
 
@@ -3014,11 +3014,11 @@ fn dot_vault_add_with_an_empty_password_modal_is_reasked_and_esc_stores_nothing(
 }
 
 // ---------------------------------------------------------------------------
-// The REPL deltas seen from the real binary (a tool's list question
-// keeps its arrow help and its custom row;
-// the asset-overwrite warning is an Enter-answered confirm; a blank
-// required agent variable is re-asked with its reason), and the tty-less
-// `.rag` with no name that refuses before it touches the temp rag.
+// Seen from the real binary: a tool's list question keeps its arrow help
+// and its custom row, the asset-overwrite warning is an Enter-answered
+// confirm, a blank required agent variable is re-asked with its reason,
+// and a tty-less `.rag` with no name refuses before it touches the temp
+// rag.
 // ---------------------------------------------------------------------------
 
 /// A tool that asks the human to pick one of three entries through the
