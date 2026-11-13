@@ -1726,7 +1726,10 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
     };
     match answering {
         Answering::Peer(destination) => {
-            out_text(&sending_notice(&destination));
+            out_path_text(
+                &sending_notice(&ctx.app.mesh.who_at(&destination), &destination)
+                    .render(live_prefix()),
+            );
             if let Some(attachment) = &attachment {
                 out_path_text(&attaching_notice(attachment, &destination));
             }
@@ -1744,7 +1747,10 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
         }
         Answering::OwnQuestion(correlation) => {
             let destination = &correlation.record.peer_destination;
-            out_text(&sending_notice(destination));
+            out_path_text(
+                &sending_notice(&ctx.app.mesh.who_at(destination), destination)
+                    .render(live_prefix()),
+            );
             if let Some(attachment) = &attachment {
                 out_path_text(&attaching_notice(attachment, destination));
             }
@@ -6159,7 +6165,13 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             GrantKind::OneOff { ttl: args.for_ }
         }
     };
-    out_text(&sending_notice(&record.peer_destination));
+    out_path_text(
+        &sending_notice(
+            &ctx.app.mesh.who_at(&record.peer_destination),
+            &record.peer_destination,
+        )
+        .render(live_prefix()),
+    );
     result_follows();
     let report = ctx
         .app
@@ -6198,7 +6210,13 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     ctx.app.mesh.sweep_expired_pending(now);
     let record = open_access_request(ctx, id, now)?;
     let id = &record.id;
-    out_text(&sending_notice(&record.peer_destination));
+    out_path_text(
+        &sending_notice(
+            &ctx.app.mesh.who_at(&record.peer_destination),
+            &record.peer_destination,
+        )
+        .render(live_prefix()),
+    );
     result_follows();
     let report = ctx.app.mesh.access().refuse(id).await?;
     out_text(&format!(
@@ -9526,10 +9544,13 @@ fn via_text(via: PeerVia) -> &'static str {
     }
 }
 
-fn sending_notice(destination: &str) -> String {
-    format!(
-        "Sending your answer to {} over the mesh...",
-        short(destination)
+/// The progress line before an answer goes out, the session named `who`, its
+/// `<user> / <session>`, quoted as it stands with the short hash after it.
+fn sending_notice(who: &str, destination: &str) -> NoticeText {
+    NoticeText::from_template(
+        "Sending your answer to {who} ({dest8}) over the mesh...",
+        &[("dest8", short(destination))],
+        &[("who", who)],
     )
 }
 
@@ -18913,9 +18934,9 @@ mod tests {
     #[test]
     fn send_notices_name_the_destination_and_the_audience() {
         let destination = "ab".repeat(16);
-        let notice = sending_notice(&destination);
+        let notice = sending_notice("Ann / laptop", &destination).plain();
         assert!(notice.contains("Sending"), "{notice}");
-        assert!(notice.contains("abababab"), "{notice}");
+        assert!(notice.contains("Ann / laptop (abababab)"), "{notice}");
         assert!(!notice.contains(&destination), "{notice}");
         assert!(BROADCAST_NOTICE.contains("every session you trust"));
         assert!(BROADCAST_NOTICE.contains("not trusted receive nothing"));
@@ -27357,7 +27378,9 @@ mod tests {
                             "  may I read the plan?",
                             "  envoy asks: Share the plan?",
                             "  answer: .mesh envoy answer p1 \"<text>\"",
-                            sending_notice(&asker_peer).as_str(),
+                            sending_notice(&ctx.app.mesh.who_at(&asker_peer), &asker_peer)
+                                .plain()
+                                .as_str(),
                         ],
                         "{out:?}"
                     );
@@ -27379,7 +27402,11 @@ mod tests {
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
                     assert!(out[0].starts_with(&inbound_header), "{out:?}");
-                    assert_eq!(out[4], sending_notice(&asker_peer), "{out:?}");
+                    assert_eq!(
+                        out[4],
+                        sending_notice(&ctx.app.mesh.who_at(&asker_peer), &asker_peer).plain(),
+                        "{out:?}"
+                    );
                     drop(script);
 
                     // Cancelled, then blank: the block, the nothing-sent line, no notice;
@@ -27544,7 +27571,11 @@ mod tests {
                     let out = stdout_lines()[before..].join("\n");
                     let out: Vec<&str> = out.lines().collect();
                     assert!(out[0].starts_with(&inbound_header), "{out:?}");
-                    assert_eq!(out[4], sending_notice(&asker_peer), "{out:?}");
+                    assert_eq!(
+                        out[4],
+                        sending_notice(&ctx.app.mesh.who_at(&asker_peer), &asker_peer).plain(),
+                        "{out:?}"
+                    );
                     drop(script);
 
                     // `"   "` on a terminal, then a blank prompt: the nothing-sent line
@@ -39482,7 +39513,11 @@ mod tests {
             }
 
             fn sending(fx: &PeerFixture) -> String {
-                format!("Sending your answer to {} over the mesh...", fx.dest())
+                format!(
+                    "Sending your answer to {} ({}) over the mesh...",
+                    fx.who(),
+                    fx.dest()
+                )
             }
 
             mod share_verbs {

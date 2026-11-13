@@ -5305,7 +5305,6 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     for (what, line) in [
         ("status", &status),
         ("knock", &knock),
-        ("sending_notice", &sending),
         ("declining_notice", &declining),
     ] {
         assert_eq!(
@@ -5314,6 +5313,16 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             "the {what} progress line fills one destination: {line:?}"
         );
     }
+    assert!(
+        sending.contains("{who} ({dest8})"),
+        "the sending_notice progress line names the session as user / session before its short hash: {sending:?}"
+    );
+    let sending_span = format!(
+        "`{}`",
+        sending
+            .replace("{who}", "<user> / <session>")
+            .replace("{dest8}", "<dest8>")
+    );
     assert!(
         fetch.contains("{shown}") && fetch.contains("{named}") && fetch.matches("{}").count() == 1,
         "the fetch progress line fills the path, the session's name and the timeout: {fetch:?}"
@@ -5386,7 +5395,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
                 format!("`{}`", knock.replace("{}", "<who>")),
                 request_span.clone(),
                 fetch_span("<path>"),
-                span(&sending),
+                sending_span.clone(),
                 span(&declining),
                 route_span.clone(),
             ],
@@ -5397,7 +5406,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             vec![
                 request_span.clone(),
                 fetch_span("docs/guide.md"),
-                span(&sending),
+                sending_span.clone(),
                 route_span.clone(),
             ],
         ),
