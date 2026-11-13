@@ -2346,7 +2346,7 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
     let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
     pty.wait_for(")> ", PTY_DEADLINE).unwrap();
     let mut shapes = Vec::new();
-    for (command, action_prefix, remedy_needle) in [
+    for (command, action_prefix, expected_remedy) in [
         (".rag".to_string(), "initialize RAG knowledge base", "."),
         (
             ".vault add repl-secret-r7k".to_string(),
@@ -2356,12 +2356,12 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
         (
             format!(".install {}", conflicting_repo.display()),
             "overwrite local file ",
-            ", with --force (installs).",
+            REPL_CONFLICT_REMEDY,
         ),
         (
             format!(".uninstall {installed}"),
             "uninstall bundle 'bundle-r7k'",
-            "--yes",
+            " or pass --yes.",
         ),
     ] {
         let from = pty.raw().len();
@@ -2375,10 +2375,7 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
             action.starts_with(action_prefix),
             "`{command}` names the action {action:?}, not `{action_prefix}...`:\n{since}"
         );
-        assert!(
-            remedy.contains(remedy_needle),
-            "`{command}` remedy {remedy:?} does not name `{remedy_needle}`:\n{since}"
-        );
+        assert_eq!(remedy, expected_remedy, "`{command}`:\n{since}");
         for widget in ["Enter the secret value", "keep-all", "Continue?", "? "] {
             assert!(
                 !since.contains(widget),

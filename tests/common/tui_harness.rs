@@ -778,7 +778,7 @@ pub fn wait_for_the_modal(
     command: &str,
     modal_markers: &[&str],
 ) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
     let markers: Vec<String> = modal_markers
         .iter()
         .map(|marker| squeezed(marker))
@@ -794,7 +794,7 @@ pub fn wait_for_the_modal(
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "`{command}` did not raise the modal showing {modal_markers:?} within 10s:\n{since}"
+            "`{command}` did not raise the modal showing {modal_markers:?} within {PTY_DEADLINE:?}:\n{since}"
         );
     };
     assert_eq!(
@@ -849,7 +849,7 @@ pub fn open_session_after_a_turn(dir: &Path, name: &str) -> (Pty, FakeLlm) {
     pty.read_for(Duration::from_millis(500));
     let asked_at = pty.raw().len();
     pty.send(format!(".session {name}\r").as_bytes()).unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
     loop {
         pty.read_for(Duration::from_millis(200));
         let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
@@ -858,7 +858,7 @@ pub fn open_session_after_a_turn(dir: &Path, name: &str) -> (Pty, FakeLlm) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "`.session` after a turn did not ask about the last exchange within 10s:\n{since}"
+            "`.session` after a turn did not ask about the last exchange within {PTY_DEADLINE:?}:\n{since}"
         );
     }
     pty.read_for(HOTKEY_GAP);

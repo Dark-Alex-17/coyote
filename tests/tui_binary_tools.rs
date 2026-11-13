@@ -1,11 +1,11 @@
 //! Real-process checks of the questions a tool asks through the prompt
-//! protocol: a tool's list, checkbox and input questions become modals
-//! on a real tty and inquire prompts in the plain REPL, an open select
-//! hands typed text back to the tool, and text a tool or a reply paints
-//! (format characters, palette colours) reaches the terminal as plain
-//! words; alongside them, the confirm a rebuild over a failing document
-//! asks, the select an MCP server conflict asks during `.install`, and
-//! the `init RAG?` question an agent with documents asks when it starts.
+//! protocol: its confirm, list, checkbox and input questions as modals
+//! under the UI and inquire prompts in the plain REPL, and what the tool
+//! gets back for a typed, exact-option or blank answer on the custom row.
+//! Next to them: the confirm a rebuild over a failing document asks, the
+//! select an MCP server conflict asks during `.install`, the `init RAG?`
+//! question an agent with documents asks when it starts, and the `.rag`
+//! wizard and macro steps that reach those questions.
 //! Each case runs the binary on a pseudo-terminal under a bash wrapper
 //! that reports the exit code and `stty -a` afterwards, so the file is
 //! unix-only. The cases run one at a time: each spawn forks a session
@@ -28,7 +28,7 @@ use serial_test::serial;
 // ---------------------------------------------------------------------------
 // A tool question carrying invisible format characters, a reply in palette
 // grey, a rebuild whose document fails to load, and an MCP conflict on
-// `.install` under the UI and headless.
+// `.install` under the UI and with stdout redirected.
 // ---------------------------------------------------------------------------
 
 /// The UTF-8 of each format character the question below carries, so the
@@ -546,11 +546,8 @@ fn an_install_with_stdout_redirected_and_a_conflicting_mcp_server_is_refused_nam
 }
 
 // ---------------------------------------------------------------------------
-// Seen from the real binary: a tool's list question keeps its arrow help
-// and its custom row, the asset-overwrite warning is an Enter-answered
-// confirm, a blank required agent variable is re-asked with its reason,
-// and a tty-less `.rag` with no name refuses before it touches the temp
-// rag.
+// A tool's list question keeps its arrow help and its custom row, and the
+// asset-overwrite warning of `.install` is an Enter-answered confirm.
 // ---------------------------------------------------------------------------
 
 /// A tool that asks the human to pick one of three entries through the
@@ -858,8 +855,8 @@ fn dot_install_of_a_builtin_category_in_the_plain_repl_confirms_on_enter_not_on_
 // ---------------------------------------------------------------------
 // A tool's open select answered with typed text in the plain REPL and
 // from a Python tool under the UI, two MCP conflicts where the first is
-// cancelled, and a tool Input question whose default is the empty
-// string.
+// cancelled, a tool input question whose default is the empty string,
+// and a tool checkbox question in both interfaces.
 // ---------------------------------------------------------------------
 
 /// Text a user might type on the custom row: inner spaces, both quote
@@ -1382,11 +1379,13 @@ fn a_tools_checkbox_question_stays_closed_with_no_custom_row_in_either_interface
 }
 
 // ---------------------------------------------------------------------------
-// `Agent::init`'s "init RAG?" question. An agent with
-// `documents:` attached asks whether to build its knowledge base when it
-// starts; under the UI the question is the Confirm modal, in the plain
-// REPL it is the inquire confirm it always was, and without a terminal
-// the agent starts without RAG, silently.
+// `Agent::init`'s "init RAG?" question. An agent with `documents:`
+// attached asks whether to build its knowledge base when it starts; under
+// the UI the question is the Confirm modal, in the plain REPL it is the
+// inquire confirm it always was, and without a terminal the agent starts
+// without RAG, silently. Then a tty-less macro step that would ask, and
+// the `.rag` wizard's questions under the UI and in the plain REPL.
+// ---------------------------------------------------------------------------
 
 /// `.agent <name>` for an agent with documents asks `init RAG?` in the
 /// Confirm modal (no raw `(Y/n)` prompt, no retired notice, terminal
@@ -1841,7 +1840,8 @@ fn dot_rag_for_a_new_rag_in_the_plain_repl_asks_with_inquire_and_esc_writes_noth
 // ---------------------------------------------------------------------
 // What the bash `list` helper hands back for the three kinds of typed
 // answer: text that looks like an index, the exact text of an offered
-// entry, and a blank answer; and the Python `select` for a blank one.
+// entry, and a blank answer under the UI and in the plain REPL; and the
+// Python `select` for a blank one.
 // ---------------------------------------------------------------------
 
 /// Opens the custom row of the recording list tool under the UI, types

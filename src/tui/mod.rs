@@ -9348,7 +9348,11 @@ mod tests {
                 "run_loader_command",
                 LOADER_STDIN_CLOSED,
             ),
-            ("src/utils/input.rs", "read_single_key", CLI_ONLY),
+            (
+                "src/utils/input.rs",
+                "read_single_key",
+                "its sole caller is shell_execute (-e), a CLI flow; the process never reaches a UI",
+            ),
         ];
         let readers = keyboard_readers();
         assert!(!readers.is_empty());
