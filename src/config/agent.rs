@@ -25,9 +25,7 @@ use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
-use crate::prompt::{
-    NeedsHuman, Prompter, confirm, confirm_or_cancel, human_present, required_input,
-};
+use crate::prompt::{NeedsHuman, Prompter, confirm, human_present, required_input};
 use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
@@ -404,14 +402,14 @@ impl Agent {
             let mut ans = false;
             if menu_can_use_terminal() {
                 // The knowledge base is optional, so a run with no human
-                // to ask, or one that closes the question, declines it
-                // instead of failing.
-                ans = match confirm_or_cancel(
+                // to ask declines it instead of failing. Closing the
+                // question still cancels the agent init.
+                ans = match confirm(
                     prompter.as_ref(),
                     "The agent has documents attached, init RAG?",
                     true,
                 ) {
-                    Ok(answer) => answer.unwrap_or(false),
+                    Ok(answer) => answer,
                     Err(e) if NeedsHuman::caused(&e) => {
                         debug!(
                             "Agent '{name}' has documents but no human to ask about RAG; starting without it"
@@ -2713,11 +2711,11 @@ nodes: {}
         assert_eq!(req.default, Some(json!(true)));
     }
 
-    /// Closing the optional RAG question is a decline: the agent starts
-    /// without its knowledge base rather than failing.
+    /// Closing the optional RAG question cancels the agent init; only a
+    /// "no" starts the agent without its knowledge base.
     #[tokio::test]
     #[serial_test::serial]
-    async fn cancelling_the_rag_confirm_under_the_tui_starts_without_rag() {
+    async fn cancelling_the_rag_confirm_cancels_the_agent_init() {
         let _guard = TestConfigDirGuard::new("agent-rag-cancel");
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let name = unique("rag_cancel");
@@ -2731,7 +2729,7 @@ nodes: {}
 
         let app_state = AppState::test_default();
         let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
-        let agent = Agent::init(
+        let err = Agent::init(
             &app_state.config,
             &app_state,
             &Model::default(),
@@ -2741,9 +2739,10 @@ nodes: {}
             Arc::clone(&prompter) as Arc<dyn Prompter>,
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
-        assert!(agent.rag().is_none());
+        assert!(crate::prompt::PromptCancelled::caused(&err));
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
         let [req] = prompter.requests().try_into().unwrap();
         assert_eq!(req.action, PromptAction::Confirm);
         assert_eq!(req.question, "The agent has documents attached, init RAG?");
