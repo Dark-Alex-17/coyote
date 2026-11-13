@@ -526,7 +526,7 @@ impl PendingPrompt {
                 // inquire's widget does: Enter alone accepts it and typing
                 // replaces it rather than appending to it.
                 if let Some(default) = input_default_text(&req) {
-                    field.set_placeholder_text(&default);
+                    field.set_placeholder_text(render::plain_text(&default).replace('\n', " "));
                     field.set_placeholder_style(DIM);
                 }
                 Some(field)
@@ -4985,6 +4985,29 @@ mod tests {
         assert_eq!(
             asker.join().unwrap().unwrap(),
             PromptAnswer::Text("1000".to_string())
+        );
+    }
+
+    /// A default carrying a terminal escape is drawn without it, yet a
+    /// bare Enter still sends the default exactly as the tool gave it.
+    #[test]
+    fn an_input_modal_draws_its_default_without_escapes() {
+        let mut harness = Harness::standalone(80, 24);
+        let raw = "\x1b]0;title\x07keep-me";
+        let req = PromptRequest {
+            default: Some(serde_json::json!(raw)),
+            ..PromptRequest::new(PromptAction::Input, "Name:", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let frame = harness.draw();
+        assert!(frame.contains("keep-me"), "{frame}");
+        assert!(!frame.contains('\x1b'), "{frame:?}");
+        assert!(!frame.contains("title"), "{frame:?}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Text(raw.to_string())
         );
     }
 

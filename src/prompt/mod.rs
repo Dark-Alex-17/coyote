@@ -420,6 +420,13 @@ pub(crate) fn input_default_text(req: &PromptRequest) -> Option<String> {
     }
 }
 
+/// The text an input shows in place of a default whose raw form carries
+/// escapes or line breaks; `None` when the default can be shown as it is.
+fn input_hint(default: &str) -> Option<String> {
+    let shown = crate::tui::plain_text(default).replace('\n', " ");
+    (shown != default).then_some(shown)
+}
+
 /// The question asked again after a rejected answer. The label stays so
 /// the field keeps its name under the TUI, where the modal is all the
 /// user sees; the reason comes first so it is read before answering.
@@ -480,14 +487,23 @@ impl InquirePrompter {
 
     fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let default = input_default_text(req);
+        let hint = default.as_deref().and_then(input_hint);
         let mut text = Text::new(&req.question);
-        if let Some(default) = default.as_deref() {
-            text = text.with_default(default);
+        match (hint.as_deref(), default.as_deref()) {
+            (Some(hint), _) => text = text.with_placeholder(hint),
+            (None, Some(default)) => text = text.with_default(default),
+            (None, None) => {}
         }
         if let Some(help) = req.help.as_deref() {
             text = text.with_help_message(help);
         }
-        text.prompt().map(PromptAnswer::Text)
+        let answer = text.prompt()?;
+        // A placeholder is only drawn, so Enter alone is mapped to the raw
+        // default here, as inquire does for a default it was given.
+        Ok(PromptAnswer::Text(match default {
+            Some(default) if hint.is_some() && answer.is_empty() => default,
+            _ => answer,
+        }))
     }
 
     fn password(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
@@ -816,6 +832,18 @@ mod tests {
             ..request(PromptAction::Input, Some("tool-x"))
         };
         assert_eq!(input_default_text(&req), None);
+    }
+
+    /// An ordinary default keeps inquire's own default; one with escapes
+    /// or line breaks is shown scrubbed instead.
+    #[test]
+    fn an_input_default_with_escapes_is_hinted_scrubbed() {
+        assert_eq!(input_hint("plain default"), None);
+        assert_eq!(
+            input_hint("\x1b]0;title\x07keep-me").as_deref(),
+            Some("keep-me")
+        );
+        assert_eq!(input_hint("one\ntwo").as_deref(), Some("one two"));
     }
 
     /// Which widget a select gets depends on who asks: a closed command
