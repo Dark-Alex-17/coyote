@@ -8995,12 +8995,6 @@ mod tests {
     /// Every function outside this module whose body makes one of the
     /// [`NEEDLES`] calls.
     fn keyboard_readers() -> Vec<KeyboardReader> {
-        fn at_word_start(line: &str, at: usize) -> bool {
-            line[..at]
-                .chars()
-                .next_back()
-                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
-        }
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let src = root.join("src");
         let mut readers: Vec<KeyboardReader> = Vec::new();
@@ -9009,47 +9003,108 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                if line.trim_start().starts_with("//") {
-                    continue;
-                }
-                let hit = NEEDLES.iter().any(|needle| {
-                    line.match_indices(needle)
-                        .any(|(at, _)| at_word_start(line, at))
-                });
-                if !hit {
-                    continue;
-                }
-                let fn_index = (0..=index)
-                    .rev()
-                    .find(|i| declared_fn(lines[*i]).is_some())
-                    .unwrap_or_else(|| {
-                        panic!("{}:{} is outside any fn", path.display(), index + 1)
-                    });
-                let fn_line = lines[fn_index];
-                let indent = &fn_line[..fn_line.len() - fn_line.trim_start().len()];
-                let close = format!("{indent}}}");
-                let body_end = (fn_index..lines.len())
-                    .find(|i| lines[*i] == close || (*i == fn_index && fn_line.ends_with('}')))
-                    .unwrap();
-                let body = lines[fn_index..=body_end].join("\n");
-                let file = path.strip_prefix(root).unwrap().display().to_string();
-                let function = declared_fn(fn_line).unwrap().to_string();
-                if readers
-                    .iter()
-                    .any(|r| r.file == file && r.function == function)
-                {
-                    continue;
-                }
-                readers.push(KeyboardReader {
-                    gated: body.contains("crate::tui::active()"),
-                    file,
-                    function,
-                });
-            }
+            let file = path.strip_prefix(root).unwrap().display().to_string();
+            readers.extend(classify_readers(&file, &text));
         }
         readers
+    }
+
+    /// The functions in `source` (the text of `file`) whose body makes one
+    /// of the [`NEEDLES`] calls, each once, with whether the body checks
+    /// the TUI flag. Comments do not count on either side: a needle in
+    /// one is not a reader, and a gate named only in one is no gate.
+    fn classify_readers(file: &str, source: &str) -> Vec<KeyboardReader> {
+        fn at_word_start(line: &str, at: usize) -> bool {
+            line[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+        }
+        fn without_comment(line: &str) -> &str {
+            match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            }
+        }
+        let lines: Vec<&str> = source.lines().collect();
+        let mut readers: Vec<KeyboardReader> = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            let hit = NEEDLES.iter().any(|needle| {
+                line.match_indices(needle)
+                    .any(|(at, _)| at_word_start(line, at))
+            });
+            if !hit {
+                continue;
+            }
+            let fn_index = (0..=index)
+                .rev()
+                .find(|i| declared_fn(lines[*i]).is_some())
+                .unwrap_or_else(|| panic!("{file}:{} is outside any fn", index + 1));
+            let fn_line = lines[fn_index];
+            let indent = &fn_line[..fn_line.len() - fn_line.trim_start().len()];
+            let close = format!("{indent}}}");
+            let body_end = (fn_index..lines.len())
+                .find(|i| lines[*i] == close || (*i == fn_index && fn_line.ends_with('}')))
+                .unwrap();
+            let body = lines[fn_index..=body_end]
+                .iter()
+                .map(|line| without_comment(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let function = declared_fn(fn_line).unwrap().to_string();
+            if readers.iter().any(|r| r.function == function) {
+                continue;
+            }
+            readers.push(KeyboardReader {
+                gated: body.contains("crate::tui::active()"),
+                file: file.to_string(),
+                function,
+            });
+        }
+        readers
+    }
+
+    #[test]
+    fn a_bare_inquire_builder_is_an_ungated_reader() {
+        let readers = classify_readers(
+            "src/probe.rs",
+            "fn fresh() { Select::new(\"q\", vec![]).prompt(); }\n",
+        );
+        let [reader] = readers.as_slice() else {
+            panic!("{} readers", readers.len());
+        };
+        assert_eq!(reader.file, "src/probe.rs");
+        assert_eq!(reader.function, "fresh");
+        assert!(!reader.gated);
+    }
+
+    #[test]
+    fn a_real_tui_gate_marks_the_reader_gated() {
+        let readers = classify_readers(
+            "src/probe.rs",
+            "fn fresh() {\n    if crate::tui::active() {\n        return;\n    }\n    Select::new(\"q\", vec![]).prompt();\n}\n",
+        );
+        let [reader] = readers.as_slice() else {
+            panic!("{} readers", readers.len());
+        };
+        assert_eq!(reader.function, "fresh");
+        assert!(reader.gated);
+    }
+
+    #[test]
+    fn a_gate_mentioned_only_in_a_comment_does_not_count() {
+        let readers = classify_readers(
+            "src/probe.rs",
+            "fn fresh() {\n    // crate::tui::active() is checked by the caller\n    Select::new(\"q\", vec![]).prompt(); // not crate::tui::active()\n}\n",
+        );
+        let [reader] = readers.as_slice() else {
+            panic!("{} readers", readers.len());
+        };
+        assert_eq!(reader.function, "fresh");
+        assert!(!reader.gated);
     }
 
     /// Every direct keyboard reader outside this module either checks the
