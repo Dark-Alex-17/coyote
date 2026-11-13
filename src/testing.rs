@@ -373,12 +373,13 @@ impl TempLocalVault {
         }
     }
 
-    /// Whether the provider has written its secrets file.
+    /// Whether the provider has written its secrets file, which it keeps
+    /// at `<XDG_CONFIG_HOME>/<app>/vault.yml`.
     pub(crate) fn has_secrets_file(&self) -> bool {
         std::fs::read_dir(&self.dir)
             .unwrap()
             .flatten()
-            .any(|entry| entry.path().is_dir())
+            .any(|entry| entry.path().join("vault.yml").is_file())
     }
 }
 
@@ -558,10 +559,26 @@ pub(crate) fn read_all(reader: &mut File) -> String {
 }
 
 mod tests {
-    use super::{ScratchDirGuard, TempNeedleGuard, TestConfigDirGuard, is_outside_system32};
+    use super::{
+        ScratchDirGuard, TempLocalVault, TempNeedleGuard, TestConfigDirGuard, is_outside_system32,
+    };
     use crate::utils;
     use serial_test::serial;
     use std::path::Path;
+
+    /// Only a `vault.yml` under an app dir is the secrets file; an app
+    /// dir alone is not.
+    #[test]
+    #[serial]
+    fn a_local_vault_has_a_secrets_file_only_once_vault_yml_exists() {
+        let store = TempLocalVault::new("testing-secrets-file");
+        let app_dir = store.dir.join("some-app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        assert!(!store.has_secrets_file());
+
+        std::fs::write(app_dir.join("vault.yml"), "{}\n").unwrap();
+        assert!(store.has_secrets_file());
+    }
 
     #[test]
     fn is_outside_system32_reads_windows_and_unix_paths() {
