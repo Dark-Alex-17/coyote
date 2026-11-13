@@ -13,7 +13,9 @@
 # guard_path. confirm returns a bool, select the index of the chosen option,
 # checkbox the chosen indices in option order, input and password the text.
 # Through the prompt channel a select may instead return the free text the
-# user typed (a str) when they answered with one of their own.
+# user typed (a str) when they answered with one of their own; typing an
+# option's exact text returns its index, and an empty or whitespace-only
+# answer returns None like a cancel.
 #
 # When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 # writes one request line to the tool's stdout and reads the answer line back
@@ -131,7 +133,9 @@ def _prompt_channel(action, question, options):
                 break
 
     answer = reply.get("answer")
-    if answer is None:
+    if answer is None or (
+        action == "select" and isinstance(answer, str) and answer not in options and not answer.strip()
+    ):
         return None
     mapped = _map_answer(action, answer, options)
     if mapped is None:

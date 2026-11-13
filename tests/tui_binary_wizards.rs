@@ -3023,7 +3023,8 @@ fn dot_vault_add_with_an_empty_password_modal_is_reasked_and_esc_stores_nothing(
 
 /// A tool that asks the human to pick one of three entries through the
 /// prompt helpers' `list` and records the index (or typed text) it got
-/// back.
+/// back, and next to it the helper's exit status: 0 for an index, 2 for
+/// typed text.
 const RECORDING_LIST_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Ask the user to pick one entry and record the index.\n\
@@ -3035,9 +3036,10 @@ const RECORDING_LIST_TOOL: &str = "#!/usr/bin/env bash\n\
     source \"$LLM_PROMPT_UTILS_FILE\"\n\
     \n\
     main() {\n\
-    \x20   local out v\n\
+    \x20   local out v rc=0\n\
     \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
-    \x20   v=\"$(list \"Pick one entry q7l-q\" alpha-q7l beta-q7l gamma-q7l)\"\n\
+    \x20   v=\"$(list \"Pick one entry q7l-q\" alpha-q7l beta-q7l gamma-q7l)\" || rc=$?\n\
+    \x20   printf '%s' \"$rc\" > \"$out-rc\"\n\
     \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
     \x20   echo \"fixture picked: ${v:-cancelled} q7l-r\" >> \"$LLM_OUTPUT\"\n\
     }\n";
@@ -3055,6 +3057,11 @@ fn list_tool_turn(dir: &Path) -> (FakeLlm, PathBuf) {
     write_fake_llm_config(dir, &fake);
     write_tool(dir, "fixture_list_rec.sh", RECORDING_LIST_TOOL);
     (fake, out)
+}
+
+/// The `list` exit status the recording tool saw for the answer at `out`.
+fn list_exit_status(out: &Path) -> String {
+    fs::read_to_string(format!("{}-rc", out.display())).unwrap()
 }
 
 /// A tool's `list` question in the plain REPL is the inquire select it
@@ -3115,6 +3122,11 @@ fn a_tools_list_question_in_the_plain_repl_is_an_open_select_keeping_the_arrow_h
         "Down then Enter on the list did not reach the tool as the second entry (a typed \
          letter must not filter the list):\n{transcript}"
     );
+    assert_eq!(
+        list_exit_status(&out),
+        "0",
+        "the chosen entry did not reach the tool with the index status:\n{transcript}"
+    );
     assert_eq!(fake.served(), 2, "{transcript}");
 
     pty.read_for(Duration::from_millis(300));
@@ -3169,6 +3181,11 @@ fn a_tools_list_question_under_the_ui_takes_typed_text_from_the_custom_row() {
         fs::read_to_string(&out).unwrap().trim(),
         "typed-by-hand-x7q",
         "the text typed on the custom row did not reach the tool verbatim:\n{transcript}"
+    );
+    assert_eq!(
+        list_exit_status(&out),
+        "2",
+        "typed text did not reach the tool with the custom-answer status:\n{transcript}"
     );
     assert_eq!(fake.served(), 2, "{transcript}");
     assert!(
@@ -3998,8 +4015,8 @@ const TYPED_CUSTOM_ANSWER: &str = "my \"own\" pick $HOME 'x11' back\\slash";
 
 /// `list` in the plain REPL: the `Other (custom)` row opens the
 /// `Custom response:` text prompt, and the text typed there reaches the
-/// bash tool verbatim (the helper prints it as is) and the model sees
-/// it in the tool's output.
+/// bash tool verbatim (the helper prints it as is and exits 2) and the
+/// model sees it in the tool's output.
 #[test]
 #[serial]
 fn a_tools_list_question_in_the_plain_repl_opens_custom_response_and_passes_the_typed_text_verbatim()
@@ -4034,6 +4051,11 @@ fn a_tools_list_question_in_the_plain_repl_opens_custom_response_and_passes_the_
         fs::read_to_string(&out).unwrap(),
         TYPED_CUSTOM_ANSWER,
         "the text typed at `Custom response:` did not reach the tool verbatim:\n{transcript}"
+    );
+    assert_eq!(
+        list_exit_status(&out),
+        "2",
+        "typed text did not reach the tool with the custom-answer status:\n{transcript}"
     );
     assert_eq!(fake.served(), 2, "{transcript}");
     // The tool's output reaches the model as the `output` field of the

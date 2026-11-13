@@ -28,8 +28,11 @@
 # one prompt at a time: never run two helpers concurrently (background
 # subshells) in the same tool, or they will swallow each other's replies.
 # Under Git Bash or Cygwin the reply pipe is opened through its /proc path.
-# Through the channel, list prints the index of the chosen option, or the
-# free text the user typed when they answered with one of their own.
+# Through the channel, list prints the index of the chosen option and exits
+# 0; typing an option's exact text counts as choosing it. When the user
+# typed an answer of their own, list prints that text as is and exits 2, so
+# a typed "1" is never mistaken for index 1. An empty or whitespace-only
+# answer is a cancel: exit 1, nothing printed.
 #
 # COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
 # nobody can; tools may branch on it before asking. Under "tui" only the
@@ -197,7 +200,9 @@ _coyote_prompt_map() {
 
 # _coyote_prompt <action> <question> [options...]
 # Returns 1 and prints nothing when the prompt was cancelled, the channel
-# closed, or the reply is not usable, so callers fail closed.
+# closed, or the reply is not usable, so callers fail closed. A select
+# answered with text of the user's own returns 2, or 1 when that text is
+# blank.
 _coyote_prompt() {
   declare action="$1"
   declare question="$2"
@@ -238,6 +243,12 @@ _coyote_prompt() {
   if ! answer="$(_coyote_prompt_map "$action" "$reply" "$options")"; then
     show_error "prompt reply unusable"
     return 1
+  fi
+  if [[ "$action" == select ]] && ! printf '%s' "$reply" | jq -e --argjson options "$options" \
+    '.answer as $a | $options | index($a) != null' >/dev/null; then
+    [[ -n "${answer//[[:space:]]/}" ]] || return 1
+    printf '%s' "$answer"
+    return 2
   fi
   printf '%s' "$answer"
 }

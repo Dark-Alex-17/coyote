@@ -1095,7 +1095,8 @@ impl ToolPrompter {
 /// `null`, so the tool fails closed instead of hanging or acting on a bad
 /// value. Chosen options go back as the raw text the tool sent, since that
 /// is what the tool matches its answer against; a select answer that is
-/// not an offered option is free text the user typed and goes back as is.
+/// not an offered option is free text the user typed and goes back as is,
+/// unless it is blank, which answers `null` like a cancel.
 pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed: ParsedRequest) {
     let ParsedRequest { req, raw_options } = parsed;
     let id = req.id.clone();
@@ -1124,7 +1125,11 @@ pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed
         Ok(PromptAnswer::Selected(choice))
             if action == PromptAction::Select && !options.is_empty() =>
         {
-            json!(raw(choice).unwrap_or_else(|| choice.clone()))
+            match raw(choice) {
+                Some(raw) => json!(raw),
+                None if choice.trim().is_empty() => Value::Null,
+                None => json!(choice),
+            }
         }
         Ok(PromptAnswer::Checked(choices))
             if action == PromptAction::Checkbox && !options.is_empty() =>
@@ -1837,6 +1842,24 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         );
 
         assert_eq!(reply, json!({"id": id, "answer": "typed by hand"}));
+    }
+
+    #[test]
+    #[serial]
+    fn blank_select_answer_outside_the_options_is_replied_as_null() {
+        for blank in ["", "   "] {
+            let mut req =
+                PromptRequest::new(PromptAction::Select, "Pick? opt-b1k", Origin::detached());
+            req.options = vec!["a".to_string(), "b".to_string()];
+            let id = req.id.clone();
+
+            let reply = reply_for(
+                ScriptedPrompter::new(vec![PromptAnswer::Selected(blank.to_string())]),
+                req,
+            );
+
+            assert_eq!(reply, json!({"id": id, "answer": null}), "{blank:?}");
+        }
     }
 
     #[test]
@@ -2719,7 +2742,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         }
 
         #[test]
-        fn list_prints_the_index_of_the_chosen_option_and_typed_text_as_is() {
+        fn list_prints_the_index_of_the_chosen_option_and_typed_text_as_is_with_exit_two() {
             require_tools();
             let dir = scratch_dir("list");
             let run = run_helper(
@@ -2738,7 +2761,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert_eq!(run.other_lines(), vec!["v=[1] rc=0"]);
 
             // An answer that is not one of the offered options is text the
-            // user typed, so it is printed as is.
+            // user typed, so it is printed as is and the exit status tells
+            // it apart from an index.
             let run = run_helper(
                 &dir,
                 Some(&[json!("typed by hand")]),
@@ -2747,11 +2771,63 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             );
             assert_eq!(
                 run.other_lines(),
-                vec!["v=[typed by hand] rc=0"],
+                vec!["v=[typed by hand] rc=2"],
                 "{}",
                 run.stdout
             );
             assert!(run.stderr.is_empty(), "{}", run.stderr);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn list_answered_with_a_typed_digit_exits_two_so_it_is_not_an_index() {
+            require_tools();
+            let dir = scratch_dir("list-digit");
+            let run = run_helper(
+                &dir,
+                Some(&[json!("1")]),
+                &capture("list \"Pick\" a b c"),
+                false,
+            );
+            assert_eq!(run.other_lines(), vec!["v=[1] rc=2"], "{}", run.stdout);
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn list_answered_with_an_options_exact_text_prints_its_index() {
+            require_tools();
+            let dir = scratch_dir("list-exact");
+            let run = run_helper(
+                &dir,
+                Some(&[json!("two words")]),
+                &capture("list \"Pick\" one \"two words\" three"),
+                false,
+            );
+            assert_eq!(run.other_lines(), vec!["v=[1] rc=0"], "{}", run.stdout);
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn list_answered_with_blank_text_is_a_cancel() {
+            require_tools();
+            let dir = scratch_dir("list-blank");
+            for blank in ["", "  \t "] {
+                let run = run_helper(
+                    &dir,
+                    Some(&[json!(blank)]),
+                    &capture("list \"Pick\" a b c"),
+                    false,
+                );
+                assert_eq!(
+                    run.other_lines(),
+                    vec!["v=[] rc=1"],
+                    "{blank:?}: {}",
+                    run.stdout
+                );
+                assert!(run.stderr.is_empty(), "{blank:?}: {}", run.stderr);
+            }
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -4385,7 +4461,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
         /// What a language prints for the two booleans, a missing answer,
         /// the checkbox indices and a select answered with typed text;
-        /// everything else prints the same.
+        /// everything else prints the same. A select answered with blank
+        /// text prints the missing answer.
         struct Contract {
             confirm_true: &'static str,
             confirm_false: &'static str,
@@ -4425,6 +4502,16 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let run = eval(select, Some(&[json!("typed by hand")]), false);
             assert_eq!(run.printed, vec![shape.typed], "{}", run.stderr);
             assert!(run.stderr.is_empty(), "{}", run.stderr);
+
+            for blank in ["", "  \t "] {
+                let run = eval(select, Some(&[json!(blank)]), false);
+                assert_eq!(run.printed, vec![shape.none], "{blank:?}: {}", run.stderr);
+                assert!(
+                    run.stderr.is_empty(),
+                    "blank is a silent cancel: {}",
+                    run.stderr
+                );
+            }
 
             let run = eval(confirm, None, false);
             assert_eq!(run.printed, vec![shape.none], "{}", run.stderr);

@@ -20,7 +20,8 @@
 // chosen indices in option order, input and password the text. All of them
 // are synchronous. Through the prompt channel a select may instead return
 // the free text the user typed (a string) when they answered with one of
-// their own.
+// their own; typing an option's exact text returns its index, and an empty
+// or whitespace-only answer returns null like a cancel.
 //
 // When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 // writes one request line to the tool's stdout and reads the answer line back
@@ -205,6 +206,9 @@ function promptChannel(action: Action, question: string, options: string[]): Ans
 
   const answer = reply.answer;
   if (answer === null || answer === undefined) {
+    return null;
+  }
+  if (action === "select" && typeof answer === "string" && !options.includes(answer) && answer.trim() === "") {
     return null;
   }
   const mapped = mapAnswer(action, answer, options);
