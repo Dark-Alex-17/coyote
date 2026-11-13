@@ -1119,3 +1119,38 @@ pub fn secure_vault_password_file(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(dir.join("vault-pass"), fs::Permissions::from_mode(0o600)).unwrap();
 }
+
+/// The notice the UI used to print instead of asking, gone now that the
+/// question is a modal.
+pub const RETIRED_RAG_NOTICE: &str = "starting without RAG";
+
+/// Starts the UI on an agent-with-documents config and sends `.agent
+/// <name>`; hands back the pty and the byte offset the command was sent
+/// at once the Confirm modal asking `init RAG?` is on screen.
+pub fn open_the_init_rag_modal(dir: &Path, name: &str) -> (Pty, usize) {
+    write_dry_run_config_with_embeddings(dir);
+    write_agent_with_documents(dir, name);
+    let mut pty = spawn_tui(dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(40, 120).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let before = pty.raw().len();
+    let command = format!(".agent {name}");
+    pty.send(format!("{command}\r").as_bytes()).unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        before,
+        &command,
+        &[&squeezed(INIT_RAG_QUESTION), "y=yes"],
+    );
+    assert!(
+        !squeezed(&modal).contains("(Y/n)") && !squeezed(&modal).contains("(y/N)"),
+        "`init RAG?` was asked on the raw tty, not in the modal:\n{modal}"
+    );
+    assert!(
+        !modal.contains(RETIRED_RAG_NOTICE),
+        "the retired `{RETIRED_RAG_NOTICE}` notice was printed under the UI:\n{modal}"
+    );
+    (pty, before)
+}
