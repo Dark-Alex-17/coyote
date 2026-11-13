@@ -27398,9 +27398,12 @@ mod tests {
                             "  may I read the plan?",
                             "  envoy asks: Share the plan?",
                             "  answer: .mesh envoy answer p1 \"<text>\"",
-                            sending_notice(&ctx.app.mesh.who_at(&asker_peer), &asker_peer)
-                                .plain()
-                                .as_str(),
+                            sending_notice(
+                                &ctx.app.mesh.who(&"ef".repeat(16), &asker_peer),
+                                &asker_peer
+                            )
+                            .plain()
+                            .as_str(),
                         ],
                         "{out:?}"
                     );
@@ -27424,7 +27427,11 @@ mod tests {
                     assert!(out[0].starts_with(&inbound_header), "{out:?}");
                     assert_eq!(
                         out[4],
-                        sending_notice(&ctx.app.mesh.who_at(&asker_peer), &asker_peer).plain(),
+                        sending_notice(
+                            &ctx.app.mesh.who(&"ef".repeat(16), &asker_peer),
+                            &asker_peer
+                        )
+                        .plain(),
                         "{out:?}"
                     );
                     drop(script);
@@ -27593,7 +27600,11 @@ mod tests {
                     assert!(out[0].starts_with(&inbound_header), "{out:?}");
                     assert_eq!(
                         out[4],
-                        sending_notice(&ctx.app.mesh.who_at(&asker_peer), &asker_peer).plain(),
+                        sending_notice(
+                            &ctx.app.mesh.who(&"ef".repeat(16), &asker_peer),
+                            &asker_peer
+                        )
+                        .plain(),
                         "{out:?}"
                     );
                     drop(script);
