@@ -4126,12 +4126,11 @@ impl RequestContext {
 
     pub fn new_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         if self.macro_flag {
-            // A macro step never opens an editor; with no human on the run
-            // the refusal says who is missing rather than a bare `No role`.
-            // It is raised before any prompt is built, as a typed Creating
-            // refusal naming what could not be created; the prompter is never
-            // reached, which
-            // `a_macro_step_creating_a_role_or_macro_names_the_missing_human_when_headless` pins.
+            // `.role <new>` inside a macro step never opens an editor. With
+            // no human on the run the refusal names what could not be
+            // created and who is missing, raised before any prompt is built
+            // so the prompter is never reached; an interactive macro keeps
+            // the terse `No role`.
             if !human_present() {
                 return Err(NeedsHuman::for_creating("role", name).into());
             }
@@ -4257,8 +4256,8 @@ impl RequestContext {
             bail!("'{name}' is a reserved macro name");
         }
         if self.macro_flag {
-            // The same pre-prompt Creating refusal as `new_role`, pinned by
-            // the same test: nothing reaches the prompter.
+            // `.macro <new>` inside a macro step: the same pre-prompt
+            // refusal as `new_role`, nothing reaches the prompter.
             if !human_present() {
                 return Err(NeedsHuman::for_creating("macro", name).into());
             }
