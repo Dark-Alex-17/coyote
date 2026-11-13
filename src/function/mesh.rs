@@ -160,10 +160,10 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
         FunctionDeclaration {
             name: format!("{MESH_FUNCTION_PREFIX}send"),
             description: format!(
-                "send = fire-and-forget; the reply, if any, lands in the inbox. \
-                 Send a one-way message to a trusted session. Delivered over a link when the session is \
+                "send = nothing to collect; the reply, if any, lands in the inbox in the message's thread. \
+                 Send a message to a trusted session. Delivered over a link when the session is \
                  reachable, otherwise held by a propagation node until it next fetches (`via` says which). \
-                 No reply is expected; use mesh__ask when you need one. To answer a question a peer asked \
+                 Nothing waits on its reply; use mesh__ask when you need one to collect. To answer a question a peer asked \
                  (an inbox message with `kind: \"ask\"`), pass its `message_id` as `in_reply_to` and send \
                  to its `from`. A send with in_reply_to and kind: \"note\" is an interim note on an open \
                  question, not an answer, and is never envoy-handled. Only sessions trusted for messaging \
@@ -3144,7 +3144,9 @@ mod tests {
         assert!(ask.contains("`next_action: mesh__collect --id <id>`"));
         let send = by_name("send");
         assert!(
-            send.starts_with("send = fire-and-forget; the reply, if any, lands in the inbox. "),
+            send.starts_with(
+                "send = nothing to collect; the reply, if any, lands in the inbox in the message's thread. "
+            ),
             "{send}"
         );
         assert!(

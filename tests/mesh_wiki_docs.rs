@@ -800,7 +800,7 @@ fn the_mesh_page_says_a_graph_session_chat_turn_follows_the_global_mesh() {
 fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_open_with() {
     let declarations = fn_body("src/function/mesh.rs", "mesh_function_declarations");
     for opener in [
-        "\"send = fire-and-forget; the reply, if any, lands in the inbox. ",
+        "\"send = nothing to collect; the reply, if any, lands in the inbox in the message's thread. ",
         "\"ask = expect exactly one reply; collect it with mesh__collect. ",
         "\"collect = read the one reply to a mesh__ask question. ",
     ] {
@@ -821,7 +821,7 @@ fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_op
     let Some(wiki) = wiki_dir() else { return };
     let page = flat(&read(wiki.join("Mesh.md")));
     for sentence in [
-        "send = fire-and-forget, the reply (if any) lands in the inbox;",
+        "send = nothing to collect, the reply (if any) lands in the inbox in the message's thread;",
         "ask = expect exactly one reply, collect it with `mesh__collect`;",
         "a send with `in_reply_to` and `kind: \"note\"` = an interim note on an open question, not an answer, never envoy-handled.",
         "`kind` (`reply` or `note`, with `in_reply_to`)",
@@ -6716,8 +6716,9 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
 /// `## envoy` lead (the text before its first `###`) says the card is served and the brief never
 /// is and points at the Mesh page, the `.mesh on` preview sample shows the status-card
 /// line and the auto brief line `render_on_preview` pushes and the prose under it quotes
-/// the off row, and the `.mesh messaging send` section says a message is fire-and-forget with
-/// the reply landing in the inbox.
+/// the off row, and the `.mesh messaging send` section says nothing waits on a message, its
+/// reply landing in the inbox in the message's thread while `.mesh messaging sent` lists it as
+/// `sent`.
 #[test]
 fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_preview_split() {
     let mode_lines = string_literals(&fn_body("src/repl/mesh.rs", "brief_mode_line"));
@@ -6910,11 +6911,45 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         &page,
         "### `.mesh messaging send`",
     ));
-    for needle in ["fire-and-forget", "lands in your inbox", "`mesh__ask`"] {
+    for needle in [
+        "Nothing waits on a message",
+        "lands in your inbox",
+        "as a `reply` in the message's thread",
+        "the state `sent`",
+        "`mesh__ask`",
+    ] {
         assert!(
             message.contains(needle),
             "Mesh-Commands.md's `.mesh messaging send` section does not carry {needle:?}:\n{message}"
         );
+    }
+}
+
+/// The walkthroughs show the envoy's answer to a sent message arriving as a reply in the
+/// message's thread, and no Mesh page still says only `mesh__ask` opens a correlation.
+#[test]
+fn the_walkthroughs_show_a_messages_answer_as_a_reply_in_its_thread() {
+    let Some(wiki) = wiki_dir() else { return };
+    let deployment = flat(&section(
+        "Mesh-Deployment.md",
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## Two sessions on one host",
+    ));
+    for needle in [
+        "`[mesh:reply] <A's name> replies: ...`",
+        "`reply . from <A's name> (<dest8>) . direct . HH:MM UTC . thread <id8>`",
+        "`<id8>` being the id the `Sent` line named",
+    ] {
+        assert!(
+            deployment.contains(needle),
+            "Mesh-Deployment.md's Two sessions on one host does not carry {needle:?}:\n{deployment}"
+        );
+    }
+    for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md", "Mesh-Platform-Support.md"] {
+        let text = flat(&read(wiki.join(page)));
+        for stale in ["only `mesh__ask`", "opened no question", "asked no question", "fire-and-forget"] {
+            assert!(!text.contains(stale), "{page} still says {stale:?}");
+        }
     }
 }
 
@@ -7258,8 +7293,13 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
     assert_eq!(
         outbound,
-        ["open", "escalated: the peer's human has been asked", "sent",],
-        "QuestionRow::outbound's state words and label moved"
+        [
+            "sent",
+            "open",
+            "escalated: the peer's human has been asked",
+            "sent",
+        ],
+        "QuestionRow::outbound's state words (an open message's first) and label moved"
     );
     assert!(
         method_body("src/repl/mesh.rs", "outbound")
@@ -7268,7 +7308,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     let awaiting = const_str("src/repl/mesh.rs", "AWAITING_THE_MODEL");
     assert_eq!(awaiting, "answered, awaiting the model");
-    let outbound: Vec<String> = [outbound[0].clone(), outbound[1].clone(), awaiting]
+    let outbound: Vec<String> = [outbound[1].clone(), outbound[2].clone(), awaiting]
         .into_iter()
         .collect();
     let inbound = string_literals(&method_body("src/repl/mesh.rs", "inbound"));
@@ -7590,6 +7630,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "the paths and the reason are never printed here".to_string(),
     ];
     needles.extend(outbound[..3].iter().map(|word| format!("`{word}`")));
+    needles.push("in the state `sent` until its reply arrives".to_string());
     needles.extend(sections.iter().map(|(title, _)| format!("`{title}`")));
     for needle in &needles {
         assert!(
