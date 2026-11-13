@@ -5926,7 +5926,7 @@ impl MeshSlot {
                 let words = reply.capped_words(PEER_LINE_MAX_CHARS);
                 let mut text = NoticeText::default()
                     .frame("you answered ")
-                    .peer(self.who_at(&record.peer_destination))
+                    .peer(self.who(&record.peer_identity, &record.peer_destination))
                     .frame(format!(" ({dest8}): "))
                     .peer(words.text);
                 if words.cut {
@@ -11358,7 +11358,8 @@ mod tests {
         );
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 1);
-        let who = slot.who_at(&hex_lower(&PEER_INSTANCE));
+        let record = inbound_record("a-1");
+        let who = slot.who(&record.peer_identity, &record.peer_destination);
         assert_eq!(
             pushed[0].text.plain(),
             format!("you answered {who} ({dest8}): yes, merge it")
@@ -11385,7 +11386,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(kept.chars().count(), PEER_LINE_MAX_CHARS - 1);
-        let who = slot.who_at(&hex_lower(&PEER_INSTANCE));
+        let record = inbound_record("a-1");
+        let who = slot.who(&record.peer_identity, &record.peer_destination);
         assert_eq!(
             pushed[0].text.plain(),
             format!("you answered {who} ({dest8}): {kept}... (full text: .mesh messaging inbox)")

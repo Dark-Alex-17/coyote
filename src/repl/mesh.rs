@@ -1675,7 +1675,7 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
     };
     let outbound = ctx.app.mesh.correlations().get(id);
     let route = answer_route(inbound.is_some(), outbound.is_some());
-    let (row, answering) = match (route, inbound, outbound) {
+    let (row, answering, who) = match (route, inbound, outbound) {
         (AnswerRoute::Inbound, Some(record), _) if !record.is_expired(now) => {
             if record.kind == InboundKind::Access {
                 return Err(access_not_a_question(id));
@@ -1691,8 +1691,9 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 .mesh
                 .who(&record.peer_identity, &record.peer_destination);
             (
-                QuestionRow::inbound(&record, name, now),
+                QuestionRow::inbound(&record, name.clone(), now),
                 Answering::Peer(record.peer_destination),
+                name,
             )
         }
         (AnswerRoute::Outbound, _, Some(correlation)) => {
@@ -1704,8 +1705,9 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 &correlation.record.peer_destination,
             );
             (
-                QuestionRow::outbound(&correlation.record, name),
+                QuestionRow::outbound(&correlation.record, name.clone()),
                 Answering::OwnQuestion(Box::new(correlation)),
+                name,
             )
         }
         _ => return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id))),
@@ -1726,10 +1728,7 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
     };
     match answering {
         Answering::Peer(destination) => {
-            out_path_text(
-                &sending_notice(&ctx.app.mesh.who_at(&destination), &destination)
-                    .render(live_prefix()),
-            );
+            out_path_text(&sending_notice(&who, &destination).render(live_prefix()));
             if let Some(attachment) = &attachment {
                 out_path_text(&attaching_notice(attachment, &destination));
             }
@@ -1747,10 +1746,7 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
         }
         Answering::OwnQuestion(correlation) => {
             let destination = &correlation.record.peer_destination;
-            out_path_text(
-                &sending_notice(&ctx.app.mesh.who_at(destination), destination)
-                    .render(live_prefix()),
-            );
+            out_path_text(&sending_notice(&who, destination).render(live_prefix()));
             if let Some(attachment) = &attachment {
                 out_path_text(&attaching_notice(attachment, destination));
             }

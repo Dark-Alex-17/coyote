@@ -2305,8 +2305,9 @@ fn mesh_cache_dir_and_instance_id(temp_root: &Path) -> (PathBuf, String) {
 /// `.mesh envoy answer <id>` with no text prints the question block with its `answer:`
 /// footer carrying the full id and opens the `Your answer:` prompt: Esc cancels it to
 /// the `Nothing was sent:` line naming the one-line form, with nothing sent and the
-/// question still filed; a typed answer goes out as `Sending your answer to <dest8>`
-/// and comes back refused, the peer being untrusted, with the question filed again.
+/// question still filed; a typed answer goes out as `Sending your answer to <user> /
+/// <session> (<dest8>)` and comes back refused, the peer being untrusted, with the
+/// question filed again.
 #[test]
 fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() {
     let relay = SilentRelay::start();
@@ -2433,10 +2434,17 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     session.send(format!(".mesh envoy answer {id}\r")).unwrap();
     wait_for(&mut session, "Your answer:");
     session.send("no\r").unwrap();
-    let mut sent = strip_escapes(&wait_for(
+    let (before, matched) = wait_for_match(
         &mut session,
-        &literally(&format!("Sending your answer to {dest8} over the mesh...")),
-    ));
+        &literally(&format!("({dest8}) over the mesh...")),
+    );
+    let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
+    assert!(
+        sent.contains(&format!(
+            "Sending your answer to {who} ({dest8}) over the mesh..."
+        )),
+        "the notice names the session as user / session before its hash: {sent:?}"
+    );
     sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
     assert!(
         sent.contains(&format!(
@@ -2608,8 +2616,9 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
 /// `.mesh envoy questions` lists them as two numbered entries under one `Waiting for YOU (2)`
 /// header, and the entry without framing has no `envoy asks:` row. Answering one with
 /// the text ON THE LINE prints its question block, opens no `Your answer:` prompt, then
-/// `Sending your answer to <dest8> over the mesh...`, one empty line, and the result
-/// (refused: the peer is untrusted). After a typed `.mesh off --yes` the bare
+/// `Sending your answer to <user> / <session> (<dest8>) over the mesh...`, one empty
+/// line, and the result (refused: the peer is untrusted). After a typed `.mesh off --yes`
+/// the bare
 /// `.mesh envoy answer <id>` and the one-line form are both refused by the `.mesh on` teaching
 /// line before any block or prompt, nothing is sent, and the store file is
 /// byte-identical afterwards.
@@ -2719,7 +2728,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
         .unwrap();
     let (before, matched) = wait_for_match(
         &mut session,
-        &literally(&format!("Sending your answer to {dest8} over the mesh...")),
+        &literally(&format!("({dest8}) over the mesh...")),
     );
     let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
     sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
@@ -2746,6 +2755,11 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
         .position(|line| line.starts_with("Sending your answer to "))
         .unwrap();
     assert!(notice_at > header_at + 2, "the block comes first: {sent:?}");
+    assert_eq!(
+        lines[notice_at],
+        format!("Sending your answer to {who} ({dest8}) over the mesh..."),
+        "the notice names the session as user / session before its hash: {sent:?}"
+    );
     assert_eq!(
         lines[notice_at + 1],
         "",
