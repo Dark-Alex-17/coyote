@@ -951,6 +951,13 @@ pub const CLI_INSTALL_REMEDY: &str = ", with --install-force (installs), or with
 /// The remedy a `.install` refusal in the plain REPL ends with.
 pub const REPL_CONFLICT_REMEDY: &str = ", with --force (installs).";
 
+/// The head of the refusal an `.install` with no one to ask gives at the
+/// conflicting MCP server `write_conflicting_local_mcp_server` seeds.
+pub const MCP_CONFLICT_REFUSAL: &str =
+    "Refusing to merge the already-installed MCP server 'bundle-k7s-server' non-interactively";
+/// Where every no-terminal refusal sends the user.
+pub const TERMINAL_HINT: &str = "Re-run in a terminal";
+
 /// Whether an SGR sequence sets a foreground, background or underline
 /// colour (the 16 named colours, their bright twins, or a 38/48/58
 /// extended-colour introducer).
