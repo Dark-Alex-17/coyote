@@ -14,9 +14,9 @@ use crate::mesh::fetch::{
     spent_attachment_tool_message,
 };
 use crate::mesh::message::{
-    Departure, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END, HELD_REPLY_FOR_DEPARTED, OutboundPeer,
-    PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, RecipientOutcome, Route, SendError,
-    collect_next_action, left_mesh_hint, unreachable_head,
+    CHECK_INBOX_NEXT_ACTION, Departure, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END,
+    HELD_REPLY_FOR_DEPARTED, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind,
+    RecipientOutcome, Route, SendError, collect_next_action, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
     CorrelationKind, DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION,
@@ -1414,6 +1414,11 @@ fn name_open_question(slot: &MeshSlot, id: &str, result: &mut Value) {
 
 async fn wait_for_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Value {
     let correlations = ctx.app.mesh.correlations();
+    if let Some(correlation) = correlations.get(id)
+        && correlation.record.kind == CorrelationKind::Message
+    {
+        return message_has_nothing_to_collect(id, &correlation.record.thread);
+    }
     let deadline = tokio::time::Instant::now() + timeout;
     let outcome = loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1525,6 +1530,20 @@ fn asked_by_another_session(ctx: &RequestContext, id: &str) -> Option<Value> {
         "id": id,
         "message": message,
     }))
+}
+
+/// A message's reply is never parked for collection: it closes the correlation and
+/// lands in the inbox in the message's thread, so there is nothing to wait for here.
+fn message_has_nothing_to_collect(id: &str, thread: &str) -> Value {
+    json!({
+        "status": "message",
+        "id": id,
+        "thread": thread,
+        "next_action": CHECK_INBOX_NEXT_ACTION,
+        "message": format!(
+            "'{id}' is a message, not a question, so it has nothing to collect; its reply lands in the inbox in thread {thread}. Read it with mesh__check_inbox."
+        ),
+    })
 }
 
 /// The answer was there when the wait ended and gone by the time this call reached for
@@ -2842,6 +2861,10 @@ mod tests {
     }
 
     fn open_question(slot: &MeshSlot, id: &str) {
+        open_correlation(slot, id, CorrelationKind::Ask);
+    }
+
+    fn open_correlation(slot: &MeshSlot, id: &str, kind: CorrelationKind) {
         let now = SystemTime::now();
         slot.correlations()
             .open(PendingRecord {
@@ -2855,7 +2878,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
-                kind: CorrelationKind::Ask,
+                kind,
             })
             .unwrap();
     }
@@ -4174,6 +4197,31 @@ mod tests {
             "The reply to 'q1' was collected by another call before this one could read it. mesh__check_inbox lists what is still waiting."
         );
         assert!(lost.get("next_action").is_none(), "{lost}");
+    }
+
+    #[tokio::test]
+    async fn collect_on_an_open_message_returns_at_once_and_points_at_the_inbox() {
+        let ctx = plain_ctx();
+        let slot = Arc::clone(&ctx.app.mesh);
+        open_correlation(&slot, "m1", CorrelationKind::Message);
+
+        let started = std::time::Instant::now();
+        let collected = handle_collect(&ctx, &json!({"id": "m1", "timeout_secs": 600}))
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a message is not waited on: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(collected["status"], "message", "{collected}");
+        assert_eq!(collected["thread"], "m1", "{collected}");
+        assert_eq!(collected["next_action"], "mesh__check_inbox", "{collected}");
+        assert_eq!(
+            collected["message"],
+            "'m1' is a message, not a question, so it has nothing to collect; its reply lands in the inbox in thread m1. Read it with mesh__check_inbox."
+        );
+        assert!(slot.correlations().is_open("m1"), "collect closes nothing");
     }
 
     #[tokio::test]
