@@ -1778,6 +1778,68 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// A responder that stops answering after its announce leaves each link request
+    /// unanswered. Every link that runs out its activation is closed when the request
+    /// fails, so the next request links afresh instead of being handed the dead link
+    /// until the transport's own establishment timeout retires it; two requests sharing
+    /// one such link both end in the activation timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_that_never_activates_is_closed_so_the_next_request_opens_a_fresh_one() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        responder.stop().await;
+        let mut events = requester.transport.out_link_events();
+        let options = RequestOptions {
+            link_timeout: Duration::from_secs(1),
+            ..RequestOptions::default()
+        };
+        let attempt = || {
+            link::request(
+                &requester.transport,
+                &requester.identity,
+                &desc,
+                "/echo",
+                requester.envelope(Value::Nil),
+                options,
+            )
+        };
+        let closed_links = |events: &mut broadcast::Receiver<LinkEventData>| {
+            let mut closed = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                if matches!(event.event, LinkEvent::Closed) {
+                    closed.push(event.id);
+                }
+            }
+            closed
+        };
+
+        let (first, second) = tokio::join!(attempt(), attempt());
+        for err in [first.unwrap_err(), second.unwrap_err()] {
+            assert!(
+                matches!(err, RequestError::LinkActivationTimeout { .. }),
+                "{err:?}"
+            );
+        }
+        let closed_first = closed_links(&mut events);
+        assert!(
+            !closed_first.is_empty(),
+            "the link that never activated must be closed when the request fails"
+        );
+
+        let err = attempt().await.unwrap_err();
+        assert!(
+            matches!(err, RequestError::LinkActivationTimeout { .. }),
+            "{err:?}"
+        );
+        let closed_next = closed_links(&mut events);
+        assert!(
+            !closed_next.is_empty() && closed_next.iter().all(|id| !closed_first.contains(id)),
+            "the second request must link afresh, not reuse {closed_first:?}: {closed_next:?}"
+        );
+        assert_eq!(recorder.seen_count(), 0);
+        requester.stop().await;
+    }
+
     /// The handler sees the peer's identity only once the peer has proven it on the link;
     /// before that the request reaches it anonymous.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

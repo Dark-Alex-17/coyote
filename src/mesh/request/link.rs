@@ -28,6 +28,9 @@ use tokio::time::{Instant, timeout_at};
 pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling on link establishment, before the request itself is sent.
 pub(crate) const DEFAULT_LINK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on taking the lock of a link that never activated in order to close it. The
+/// request has already failed by then, so this only bounds how long its error waits.
+const UNACTIVATED_LINK_CLOSE_WAIT: Duration = Duration::from_secs(1);
 
 /// `path_requested` says the caller already sent a path request for the destination
 /// during this request, so a link that finds no path fails without asking again.
@@ -304,6 +307,9 @@ pub(crate) async fn link_to(
 /// request, or one already spent, fails at once instead, so one request never stacks two
 /// waits and no request is sent that nothing would wait on. Either way a
 /// destination still without a path fails as `LinkNotOpened` naming no known path.
+///
+/// A link whose activation runs out is closed if it is still pending, so the next request
+/// sends a link request of its own instead of being handed the same dead link.
 pub(crate) async fn open_link(
     transport: &Transport,
     destination: &DestinationDesc,
@@ -352,18 +358,23 @@ pub(crate) async fn open_link(
         }
         Err(err) => return Err(no_link(err)),
     };
-    let activation = deadline
+    let expired = match deadline
         .bound_activation(
             path,
             await_link_activation(transport, &link, deadline.remaining()),
         )
-        .await?;
-    match activation {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::TimedOut => {
-            return Err(deadline.activation_expired(path));
+        .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(err)) if err.kind() == ErrorKind::TimedOut => {
+            Some(deadline.activation_expired(path))
         }
-        Err(err) => return Err(RequestError::LinkNotOpened(err.to_string())),
+        Ok(Err(err)) => return Err(RequestError::LinkNotOpened(err.to_string())),
+        Err(err) => Some(err),
+    };
+    if let Some(err) = expired {
+        close_if_never_activated(&link, path, &destination_hex).await;
+        return Err(err);
     }
     let link_id = deadline
         .bound_locally(path, async { *link.lock().await.id() })
@@ -374,6 +385,41 @@ pub(crate) async fn open_link(
         short(&destination_hex)
     );
     Ok(link)
+}
+
+/// The transport hands every request to a destination its one out-link that is not
+/// closed, so a link whose link request was lost would be reused, and fail each request
+/// again, until the transport's own establishment timeout retires it. Only a link still
+/// pending or in its handshake is closed: one that came up meanwhile may be serving a
+/// concurrent request. A concurrent request still waiting on the closed link ends in its
+/// own activation timeout, since a closed link never activates.
+async fn close_if_never_activated(
+    link: &Arc<tokio::sync::Mutex<Link>>,
+    path: &str,
+    destination_hex: &str,
+) {
+    let closed = Deadline::after(UNACTIVATED_LINK_CLOSE_WAIT)
+        .bound_locally(path, async {
+            let mut link = link.lock().await;
+            if !link.status().not_yet_active() {
+                return None;
+            }
+            link.close();
+            Some(*link.id())
+        })
+        .await;
+    match closed {
+        Ok(Some(link_id)) => debug!(
+            "Mesh closed link {} to destination {}, which never activated",
+            link_id.to_hex_string(),
+            short(destination_hex)
+        ),
+        Ok(None) => {}
+        Err(err) => debug!(
+            "Mesh could not close the unactivated link to destination {}: {err}",
+            short(destination_hex)
+        ),
+    }
 }
 
 /// Proves `identity` to the far end of `link`, which then sees `PeerIdentified`. `path` is
