@@ -2490,7 +2490,7 @@ mod naming_tests {
         .await;
         assert_eq!(
             result["message"],
-            "Coworker A / abababab did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+            "Coworker A / abababab did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text."
         );
     }
 
@@ -5067,7 +5067,7 @@ mod tests {
         assert_eq!(
             unknown["message"],
             format!(
-                "{} did not serve `docs/plan.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.",
+                "{} did not serve `docs/plan.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text.",
                 short(&peer)
             )
         );
@@ -5103,7 +5103,7 @@ mod tests {
         assert_eq!(
             fetched["message"],
             format!(
-                "`docs/plan.md` was a one-time attachment from {} and you already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human. That copy is no longer at that path.",
+                "`docs/plan.md` was a one-time attachment from {} and you already fetched it; read it at `already_staged_at`. A fresh copy needs that session to attach it again; the mesh__request_access call in next_action asks its human. That copy is no longer at that path.",
                 short(&peer)
             )
         );
@@ -10099,7 +10099,7 @@ mod tests {
             assert_eq!(
                 unknown["message"],
                 format!(
-                    "{who} did not serve `other/thing.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                    "{who} did not serve `other/thing.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text."
                 ),
                 "{unknown}"
             );
@@ -10158,7 +10158,7 @@ mod tests {
             assert_eq!(
                 rotated_away["message"],
                 format!(
-                    "{who} did not serve `{SHARED_PATH}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                    "{who} did not serve `{SHARED_PATH}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text."
                 ),
                 "{rotated_away}"
             );
@@ -10441,7 +10441,7 @@ mod tests {
                 assert_eq!(
                     refused["message"],
                     format!(
-                        "{who} did not serve `{path}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                        "{who} did not serve `{path}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text."
                     ),
                     "{unreadable}: {refused}"
                 );
@@ -10667,7 +10667,7 @@ mod tests {
             assert_eq!(
                 denied["message"],
                 format!(
-                    "{who} did not serve `docs/refused.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+                    "{who} did not serve `docs/refused.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text."
                 ),
                 "a denial leaves nothing this node could explain with"
             );

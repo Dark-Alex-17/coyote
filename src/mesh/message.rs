@@ -1688,8 +1688,8 @@ impl Departure {
 pub(crate) const HELD_FOR_DEPARTED: &str = "; held at the propagation node, delivered to any of ";
 /// The end of `held_sentence`, after the second naming.
 pub(crate) const HELD_FOR_DEPARTED_END: &str = "'s sessions when one syncs";
-/// The words after the peer's status in `held_reply_sentence`: a held reply is taken
-/// only by the session whose question or thread it answers.
+/// The words after the peer's status when a held reply is reported: a held reply is
+/// taken only by the session whose question or thread it answers.
 pub(crate) const HELD_REPLY_FOR_DEPARTED: &str =
     "; held at the propagation node, delivered to the session that asked when it syncs";
 
@@ -1707,13 +1707,6 @@ pub(crate) fn held_sentence(name: &str, departure: Departure, now: SystemTime) -
         "{name}{}{HELD_FOR_DEPARTED}{name}{HELD_FOR_DEPARTED_END}",
         departure.status(now)
     )
-}
-
-/// `held_sentence` for a reply, which only the session that asked takes off the node:
-/// `bob left 2h ago; held at the propagation node, delivered to the session that asked
-/// when it syncs`.
-pub(crate) fn held_reply_sentence(name: &str, departure: Departure, now: SystemTime) -> String {
-    format!("{name}{}{HELD_REPLY_FOR_DEPARTED}", departure.status(now))
 }
 
 /// Timeouts for one send: the direct attempt, then the fallback post, which

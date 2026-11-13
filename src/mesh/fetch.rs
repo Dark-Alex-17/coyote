@@ -1499,14 +1499,14 @@ pub(crate) fn not_shared_sentence(
 pub(crate) fn not_shared_tool_message(peer: &str, shown: &str, reason: &NotSharedReason) -> String {
     match reason {
         NotSharedReason::AlreadyFetched { .. } => format!(
-            "`{shown}` was a one-time attachment from {peer} and you already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+            "`{shown}` was a one-time attachment from {peer} and you already fetched it; read it at `already_staged_at`. A fresh copy needs that session to attach it again; the mesh__request_access call in next_action asks its human."
         ),
         NotSharedReason::GrantExpired { expires } => format!(
             "The grant for `{shown}` from {peer} expired at {expires}; ask again with the mesh__request_access call in next_action; its human decides.",
             expires = rfc3339_utc(*expires)
         ),
         NotSharedReason::PeerWithoutFetch | NotSharedReason::Unknown => format!(
-            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text."
         ),
     }
 }
@@ -3727,7 +3727,7 @@ mod tests {
     fn the_tool_message_gives_the_model_one_next_step_per_reason() {
         let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let message = |reason| not_shared_tool_message("abcd1234", "docs/a.md", &reason);
-        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
+        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask that session's envoy for the file in free text.";
         assert_eq!(message(NotSharedReason::Unknown), unknown);
         assert_eq!(
             message(NotSharedReason::PeerWithoutFetch),
@@ -3739,7 +3739,7 @@ mod tests {
                 message_id: "m-1".to_string(),
                 staged: PathBuf::from("/inbox/peer/docs/a.md"),
             }),
-            "`docs/a.md` was a one-time attachment from abcd1234 and you already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+            "`docs/a.md` was a one-time attachment from abcd1234 and you already fetched it; read it at `already_staged_at`. A fresh copy needs that session to attach it again; the mesh__request_access call in next_action asks its human."
         );
         assert_eq!(
             message(NotSharedReason::GrantExpired { expires }),
@@ -3764,6 +3764,47 @@ mod tests {
                 "{reason:?} names the call once"
             );
         }
+    }
+
+    /// The REPL's `not_shared` sentence and the tool's message open each reason with the
+    /// same words and speak of sessions and their users, never of a peer.
+    #[test]
+    fn the_not_shared_sentence_and_tool_message_read_as_twins() {
+        let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let fetched = NotSharedReason::AlreadyFetched {
+            message_id: "m-1".to_string(),
+            staged: PathBuf::from("/inbox/abcd1234/docs/a.md"),
+        };
+        for (reason, head) in [
+            (
+                NotSharedReason::Unknown,
+                "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. ".to_string(),
+            ),
+            (
+                fetched,
+                "`docs/a.md` was a one-time attachment from abcd1234 and you already fetched it".to_string(),
+            ),
+            (
+                NotSharedReason::GrantExpired { expires },
+                format!(
+                    "The grant for `docs/a.md` from abcd1234 expired at {}; ask again with ",
+                    rfc3339_utc(expires)
+                ),
+            ),
+        ] {
+            let sentence =
+                not_shared_sentence("abcd1234", "docs/a.md", "docs/a.md", &reason).plain();
+            let message = not_shared_tool_message("abcd1234", "docs/a.md", &reason);
+            for text in [&sentence, &message] {
+                assert!(text.starts_with(&head), "{reason:?}: {text}");
+                assert!(!text.to_ascii_lowercase().contains("peer"), "{text}");
+            }
+        }
+        let message = not_shared_tool_message("abcd1234", "docs/a.md", &NotSharedReason::Unknown);
+        assert!(
+            message.ends_with("Do not ask that session's envoy for the file in free text."),
+            "{message}"
+        );
     }
 
     #[test]

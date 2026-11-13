@@ -24,10 +24,10 @@ use crate::mesh::knock::{
 };
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KnockRecord};
 use crate::mesh::message::{
-    BroadcastOutcome, Disposition, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END, OutboundPeer,
-    PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part, PartLimits, PeerKind, PeerMessage, PeerVia,
-    RawPart, RecipientOutcome, Route, SendError, SendOutcome, held_reply_sentence, held_sentence,
-    is_wire_id, left_mesh_hint, unreachable_head,
+    BroadcastOutcome, Disposition, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END,
+    HELD_REPLY_FOR_DEPARTED, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
+    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, Route, SendError,
+    SendOutcome, held_sentence, is_wire_id, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
@@ -1755,14 +1755,13 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 parts_of(attachment),
                 &runtime.part_limits(),
             )?;
+            let name = runtime.who_at(destination).to_string();
             let outcome = runtime
                 .send_peer_lending_reference(destination, &out)
                 .await
-                .map_err(|err| {
-                    quoted_send_failure(err, &runtime.who_at(destination).to_string())
-                })?;
+                .map_err(|err| quoted_send_failure(err, &name))?;
             out_path_text(
-                &own_reply_sent_line(&outcome, destination, id, SystemTime::now())
+                &own_reply_sent_line(&outcome, destination, &name, id, SystemTime::now())
                     .render(live_prefix()),
             );
         }
@@ -1771,18 +1770,20 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
 }
 
 /// `reply_sent_line` for a follow-up on this node's own question, saying, when the peer
-/// had gone, that the propagation node holds it for the session that asked.
+/// had gone, that the propagation node holds it for the session that asked. `name` is how
+/// the session goes by here, quoted as it stands.
 fn own_reply_sent_line(
     outcome: &SendOutcome,
     destination: &str,
+    name: &str,
     id: &str,
     now: SystemTime,
 ) -> NoticeText {
-    let line = reply_sent_line(&outcome.id, destination, id, via_text(outcome.via));
+    let line = reply_sent_line(&outcome.id, destination, name, id, via_text(outcome.via));
     match outcome.departed {
-        Some(departed) => line.frame(format!(
-            " {}. {SEE_WHEN_IT_IS_BACK}",
-            held_reply_sentence(short(destination), departed, now)
+        Some(departed) => line.frame(" ").peer(name).frame(format!(
+            "{}{HELD_REPLY_FOR_DEPARTED}. {SEE_WHEN_IT_IS_BACK}",
+            departed.status(now)
         )),
         None => line,
     }
@@ -1795,15 +1796,15 @@ fn answered_line(id: &str) -> NoticeText {
 
 /// The line a reply into one of this node's own questions ends with, the question's id
 /// quoted as `.mesh messaging sent` lists it.
-fn reply_sent_line(sent: &str, destination: &str, id: &str, via: &str) -> NoticeText {
+fn reply_sent_line(sent: &str, destination: &str, name: &str, id: &str, via: &str) -> NoticeText {
     NoticeText::from_template(
-        "Sent {sent} to {destination} as a reply to {id} (via {via}).",
+        "Sent {sent} to {name} ({destination}) as a reply to {id} (via {via}).",
         &[
             ("sent", short(sent)),
             ("destination", short(destination)),
             ("via", via),
         ],
-        &[("id", short(id))],
+        &[("name", name), ("id", short(id))],
     )
 }
 
@@ -2124,9 +2125,15 @@ mod dismiss_and_answer_line_tests {
                 "Answered .vault.",
             ),
             (
-                reply_sent_line("abcdef0123456789", DESTINATION, ".vault", "direct"),
-                "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via direct).",
-                "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via direct).",
+                reply_sent_line(
+                    "abcdef0123456789",
+                    DESTINATION,
+                    ".bob / .review",
+                    ".vault",
+                    "direct",
+                ),
+                "Sent abcdef01 to .bob / .review (1a2b3c4d) as a reply to .vault (via direct).",
+                "Sent abcdef01 to .bob / .review (1a2b3c4d) as a reply to .vault (via direct).",
             ),
             {
                 let now = SystemTime::now();
@@ -2138,9 +2145,9 @@ mod dismiss_and_answer_line_tests {
                     )),
                 };
                 (
-                    own_reply_sent_line(&held, DESTINATION, ".vault", now),
-                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. .mesh people list shows when it announces again.",
-                    "Sent abcdef01 to 1a2b3c4d as a reply to .vault (via store-and-forward). 1a2b3c4d left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. /mesh people list shows when it announces again.",
+                    own_reply_sent_line(&held, DESTINATION, ".bob / .review", ".vault", now),
+                    "Sent abcdef01 to .bob / .review (1a2b3c4d) as a reply to .vault (via store-and-forward). .bob / .review left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. .mesh people list shows when it announces again.",
+                    "Sent abcdef01 to .bob / .review (1a2b3c4d) as a reply to .vault (via store-and-forward). .bob / .review left 3h ago; held at the propagation node, delivered to the session that asked when it syncs. /mesh people list shows when it announces again.",
                 )
             },
         ]
@@ -2310,14 +2317,28 @@ fn sent_line(
     user: &str,
     now: SystemTime,
 ) -> NoticeText {
-    let head = format!("Sent {} to {}", short(&outcome.id), short(destination));
     match outcome.departed {
-        Some(departed) => NoticeText::from(format!("{head}: "))
-            .peer(name)
-            .frame(format!("{}{HELD_FOR_DEPARTED}", departed.status(now)))
-            .peer(user)
-            .frame(format!("{HELD_FOR_DEPARTED_END}. {SEE_WHEN_IT_IS_BACK}")),
-        None => NoticeText::from(format!("{head} (via {}).", via_text(outcome.via))),
+        Some(departed) => NoticeText::from_template(
+            "Sent {sent} to {name} ({destination}): ",
+            &[
+                ("sent", short(&outcome.id)),
+                ("destination", short(destination)),
+            ],
+            &[("name", name)],
+        )
+        .peer(name)
+        .frame(format!("{}{HELD_FOR_DEPARTED}", departed.status(now)))
+        .peer(user)
+        .frame(format!("{HELD_FOR_DEPARTED_END}. {SEE_WHEN_IT_IS_BACK}")),
+        None => NoticeText::from_template(
+            "Sent {sent} to {name} ({destination}, via {via}).",
+            &[
+                ("sent", short(&outcome.id)),
+                ("destination", short(destination)),
+                ("via", via_text(outcome.via)),
+            ],
+            &[("name", name)],
+        ),
     }
 }
 
@@ -13437,11 +13458,11 @@ mod tests {
             let line = sent_line(&left, DEST, ".bob / review", ".bob", now);
             assert_eq!(
                 line.plain(),
-                "Sent 01234567 to fedcba98: .bob / review left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh people list shows when it announces again."
+                "Sent 01234567 to .bob / review (fedcba98): .bob / review left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. .mesh people list shows when it announces again."
             );
             assert_eq!(
                 line.render(CommandPrefix::Slash),
-                "Sent 01234567 to fedcba98: .bob / review left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh people list shows when it announces again.",
+                "Sent 01234567 to .bob / review (fedcba98): .bob / review left 2h ago; held at the propagation node, delivered to any of .bob's sessions when one syncs. /mesh people list shows when it announces again.",
                 "the name is quoted as it stands under any prefix; the hint follows it"
             );
             assert_eq!(
@@ -13453,7 +13474,7 @@ mod tests {
                     now
                 )
                 .plain(),
-                "Sent 01234567 to fedcba98 (via store-and-forward)."
+                "Sent 01234567 to bob / review (fedcba98, via store-and-forward)."
             );
             assert_eq!(
                 sent_line(
@@ -13464,8 +13485,28 @@ mod tests {
                     now
                 )
                 .plain(),
-                "Sent 01234567 to fedcba98 (via direct)."
+                "Sent 01234567 to bob / review (fedcba98, via direct)."
             );
+        }
+
+        /// The plain `.mesh messaging send` line names the session before its short hash,
+        /// the name quoted as it stands under any prefix.
+        #[test]
+        fn a_sent_message_names_the_session_before_the_hash() {
+            let line = sent_line(
+                &SendOutcome {
+                    id: ID.to_string(),
+                    via: PeerVia::Direct,
+                    departed: None,
+                },
+                DEST,
+                ".bob / .review",
+                ".bob",
+                SystemTime::now(),
+            );
+            let expected = "Sent 01234567 to .bob / .review (fedcba98, via direct).";
+            assert_eq!(line.plain(), expected);
+            assert_eq!(line.render(CommandPrefix::Slash), expected);
         }
 
         /// An open question whose peer said it left reads `peer left <age>` beside its
@@ -36395,7 +36436,10 @@ mod tests {
                     .await
                     .unwrap();
                     timings.push((".mesh messaging send", started_at.elapsed()));
-                    assert!(out.contains(&format!(" to {}: ", short(&peer))), "{out}");
+                    assert!(
+                        out.contains(&format!(" to Tia / {0} ({0}): ", short(&peer))),
+                        "{out}"
+                    );
                     assert!(
                         held_for(&out, &format!("Tia / {}", short(&peer)), "Tia"),
                         "{out}"
@@ -39198,6 +39242,13 @@ mod tests {
 
                 fn dest(&self) -> String {
                     short(&self.stub.destination_hex()).to_string()
+                }
+
+                fn who(&self) -> String {
+                    self.started
+                        .runtime
+                        .who_at(&self.stub.destination_hex())
+                        .to_string()
                 }
 
                 fn pending_ids(&self) -> Vec<String> {
@@ -51959,7 +52010,12 @@ mod tests {
                 fn sent_line(fx: &PeerFixture) -> String {
                     let seen = fx.stub.seen();
                     assert_eq!(seen.len(), 1, "{seen:?}");
-                    format!("Sent {} to {} (via direct).", short(&seen[0].id), fx.dest())
+                    format!(
+                        "Sent {} to {} ({}, via direct).",
+                        short(&seen[0].id),
+                        fx.who(),
+                        fx.dest()
+                    )
                 }
 
                 #[test]
@@ -52137,8 +52193,9 @@ mod tests {
                                 reference_line("big.bin", 1025, &to),
                                 String::new(),
                                 format!(
-                                    "Sent {} to {} as a reply to q1 (via direct).",
+                                    "Sent {} to {} ({}) as a reply to q1 (via direct).",
                                     short(&seen[0].id),
+                                    fx.who(),
                                     fx.dest()
                                 ),
                             ],
