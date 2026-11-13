@@ -45,6 +45,17 @@ pub(crate) struct InstallIo<'a> {
     pub(crate) remedy: &'static str,
 }
 
+impl InstallIo<'_> {
+    /// The flag that forces a remote install where this caller reads it.
+    fn force_flag(&self) -> &'static str {
+        if self.remedy == REPL_CONFLICT_REMEDY {
+            "--force"
+        } else {
+            "--install-force"
+        }
+    }
+}
+
 #[cfg(test)]
 fn install_remote(
     git_url: &str,
@@ -314,7 +325,10 @@ pub fn install_or_update(
         }
         InstallTarget::InstalledBundle => {
             if filter.is_some() || force {
-                bail!("--filter/--install-force only apply to remote installs, not bundle updates");
+                bail!(
+                    "--filter/{} only apply to remote installs, not bundle updates",
+                    io.force_flag()
+                );
             }
             update_bundle_with_io(value, false, io)
         }
@@ -2283,6 +2297,7 @@ fn merge_mcp_json(
         missing_secrets: Vec::new(),
     };
     let mut to_validate: Vec<String> = Vec::new();
+    let mut unanswered = false;
 
     for (name, remote_server) in remote_config.mcp_servers {
         if let Some(local_server) = merged.mcp_servers.get(&name) {
@@ -2292,7 +2307,14 @@ fn merge_mcp_json(
             let action = if auto_take.contains(&name) {
                 McpConflictAction::TakeRemote
             } else {
-                resolve_mcp_conflict(&name, force, assume_yes, io, &mut print_note)?
+                resolve_mcp_conflict(
+                    &name,
+                    force,
+                    assume_yes,
+                    io,
+                    &mut unanswered,
+                    &mut print_note,
+                )?
             };
             match action {
                 McpConflictAction::KeepLocal => report.kept_local.push(name),
@@ -2362,19 +2384,22 @@ fn merge_mcp_json(
 
 /// The answer to an MCP server the remote and the local mcp.json both
 /// define differently. No answer (the question closed, or nobody to ask
-/// it) keeps the local server, and `note` gets one line saying so; a
-/// run with no terminal at all is refused before the question.
+/// it) keeps the local server, and `note` gets one line saying so; that
+/// sticks through `unanswered`, so later conflicts of the same merge keep
+/// theirs without asking or noting again. A run with no terminal at all
+/// is refused before the question.
 fn resolve_mcp_conflict(
     name: &str,
     force: bool,
     assume_yes: bool,
     io: InstallIo<'_>,
+    unanswered: &mut bool,
     note: &mut dyn FnMut(&str),
 ) -> Result<McpConflictAction> {
     if force {
         return Ok(McpConflictAction::TakeRemote);
     }
-    if assume_yes {
+    if assume_yes || *unanswered {
         return Ok(McpConflictAction::KeepLocal);
     }
     if !conflict::menu_can_use_terminal() {
@@ -2396,8 +2421,12 @@ fn resolve_mcp_conflict(
         ],
     ) {
         Ok(Some(choice)) => choice,
-        Ok(None) => return Ok(keep_local_unanswered(name, NoAnswer::Cancelled, note)),
+        Ok(None) => {
+            *unanswered = true;
+            return Ok(keep_local_unanswered(name, NoAnswer::Cancelled, note));
+        }
         Err(err) if NeedsHuman::caused(&err) => {
+            *unanswered = true;
             return Ok(keep_local_unanswered(name, NoAnswer::NobodyToAsk, note));
         }
         Err(err) => return Err(err).with_context(|| "failed to read MCP conflict choice"),
@@ -3392,9 +3421,14 @@ mod tests {
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
         let mut notes = Vec::new();
 
-        let action = resolve_mcp_conflict("alpha", false, false, dot_io(&prompter), &mut |note| {
-            notes.push(note.to_string())
-        })
+        let action = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&prompter),
+            &mut false,
+            &mut |note| notes.push(note.to_string()),
+        )
         .unwrap();
 
         assert_eq!(action, McpConflictAction::KeepLocal);
@@ -3403,6 +3437,63 @@ mod tests {
             ["Kept the local MCP server 'alpha': the question was cancelled."]
         );
         assert_eq!(prompter.requests().len(), 1);
+    }
+
+    /// An unanswered MCP conflict question sticks for the rest of the
+    /// merge: the next conflicting server keeps its local copy without a
+    /// second question or a second note.
+    #[test]
+    #[serial]
+    fn an_unanswered_mcp_conflict_keeps_every_later_conflict_local_without_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut unanswered = false;
+        let mut notes = Vec::new();
+
+        for name in ["alpha", "beta"] {
+            let action = resolve_mcp_conflict(
+                name,
+                false,
+                false,
+                dot_io(&prompter),
+                &mut unanswered,
+                &mut |note| notes.push(note.to_string()),
+            )
+            .unwrap();
+            assert_eq!(action, McpConflictAction::KeepLocal, "{name}");
+        }
+
+        assert_eq!(
+            notes,
+            ["Kept the local MCP server 'alpha': the question was cancelled."]
+        );
+        assert_eq!(prompter.requests().len(), 1);
+
+        let _guard = TestVaultConfigGuard::new("merge-sticky-cancel");
+        let dir = fresh_temp_dir("merge-sticky-cancel-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(
+            &target,
+            r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL-A"}, "beta": {"type": "stdio", "command": "LOCAL-B"}}}"#,
+        );
+        write_mcp(&remote, FIXTURE_REMOTE);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&prompter),
+        )
+        .unwrap();
+
+        assert_eq!(report.kept_local, vec!["alpha", "beta"]);
+        assert_eq!(prompter.requests().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// With a terminal but no human to answer, the MCP conflict menu's
@@ -3420,6 +3511,7 @@ mod tests {
             false,
             false,
             dot_io(&HeadlessPrompter),
+            &mut false,
             &mut |note| notes.push(note.to_string()),
         )
         .unwrap();
@@ -3437,6 +3529,7 @@ mod tests {
             false,
             false,
             dot_io(&HeadlessPrompter),
+            &mut false,
             &mut |_| unreachable!("a refusal before the question leaves no note"),
         )
         .unwrap_err();
@@ -5829,7 +5922,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn install_or_update_rejects_remote_flags_for_updates() {
+    fn install_or_update_rejects_remote_flags_for_updates_naming_the_callers_force_flag() {
         let _guard = TestVaultConfigGuard::new("iou-flags");
         let src_root = fresh_temp_dir("iou-flags-src-");
         let repo = src_root.join("bundle");
@@ -5852,9 +5945,9 @@ mod tests {
             dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("only apply to remote installs"),
-            "got: {err}"
+        assert_eq!(
+            err.to_string(),
+            "--filter/--install-force only apply to remote installs, not bundle updates"
         );
 
         let err = install_or_update(
@@ -5862,12 +5955,15 @@ mod tests {
             None,
             None,
             true,
-            dot_io(&ScriptedPrompter::refusing()),
+            InstallIo {
+                remedy: REPL_CONFLICT_REMEDY,
+                ..dot_io(&ScriptedPrompter::refusing())
+            },
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("only apply to remote installs"),
-            "got: {err}"
+        assert_eq!(
+            err.to_string(),
+            "--filter/--force only apply to remote installs, not bundle updates"
         );
         let _ = fs::remove_dir_all(&src_root);
     }
