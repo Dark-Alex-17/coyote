@@ -3902,7 +3902,7 @@ fn verify_binding(
     let expected = destination_address(&name_hash, &identity);
     if !bool::from(expected.as_slice().ct_eq(claimed.as_slice())) {
         bail!(
-            "Destination {destination} does not match identity {} in {source} (that identity would announce {}); nothing was trusted.",
+            "Session {destination} does not belong to user {} in {source} (that user's key would announce {}); nothing was trusted.",
             identity.to_hex_string(),
             expected.to_hex_string()
         );
@@ -4487,7 +4487,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("does not match"), "{err}");
+        assert!(err.contains("does not belong to user"), "{err}");
         assert_eq!(fx.file_bytes(), None);
     }
 
@@ -4628,7 +4628,7 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("does not match identity"), "{err}");
+        assert!(err.contains("does not belong to user"), "{err}");
         assert!(err.contains("knock cache"), "{err}");
         assert!(fx.store.records().is_empty());
         assert_eq!(fx.file_bytes(), None);

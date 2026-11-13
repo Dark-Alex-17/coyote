@@ -3325,10 +3325,7 @@ fn the_enabled_line_names_the_session_entered_later_on_every_surface() {
         })
         .collect();
     off_lines.push(format!("`{}` before the semicolon", stays_off.trim()));
-    off_lines.push(
-        "Leaving the mesh: the session that owns this node's instance id is being exited."
-            .to_string(),
-    );
+    off_lines.push("Leaving the mesh: the session it runs for is being exited.".to_string());
     prose(
         "Mesh-Commands.md",
         &off_lines.iter().map(String::as_str).collect::<Vec<_>>()[..],
@@ -4945,7 +4942,7 @@ fn boxed_table(label: &str, sample: &str) -> Vec<Vec<String>> {
 /// The `.mesh config show` sample on the Commands page is the key/value table
 /// `render_info_table` draws, with its header, and shows an `interfaces[0]` row as
 /// `interface_row` formats it: label, two spaces, state. The rows are the node's state,
-/// `identity` first and the propagation nodes last, with no `node` or `selection` row
+/// `user hash` first and the propagation nodes last, with no `node` or `selection` row
 /// and no history row a fresh node has nothing to put in; the prose around it carries
 /// the node-off line and the loopback `reach` text, and the selection rule lives on the
 /// Deployment page, which the Mesh page points at.
@@ -5001,9 +4998,9 @@ fn the_commands_page_info_sample_is_the_key_value_table_the_code_draws() {
     assert_eq!(
         keys,
         [
-            "identity",
-            "destination",
-            "instance",
+            "user hash",
+            "session hash",
+            "session id",
             "interfaces[0]",
             "joined",
             "last announce",
@@ -6747,7 +6744,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         .expect("status confirms a set objective")
         .replace("{objective}", "<objective>");
     assert!(
-        objective.contains("in this node's status card")
+        objective.contains("in your status card")
             && objective.contains("; unless brief mode is off, your envoy also answers from it.")
             && !objective.contains("served"),
         "the objective confirmation names the card peers get and says the envoy answers from the objective, without calling the brief served or seen: {objective:?}"
@@ -7826,7 +7823,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         "dismiss_all no longer prints DRY_RUN_NOTHING_CHANGED:\n{all_source}"
     );
     let none_open =
-        "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about.";
+        "No open questions to dismiss; `.mesh envoy questions` lists what you know about.";
     let confirm_silent = "Dismiss {open_questions} without telling the askers?";
     let confirm_told = "Dismiss {open_questions}? Each asker hears that {HUMAN_DECLINED}.";
     let telling_all = "Telling {} that you declined over the mesh...";
@@ -7886,16 +7883,16 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     let own_source = fn_body("src/repl/mesh.rs", "asked_by_this_node");
     let own = string_literals(&own_source)
         .into_iter()
-        .find(|literal| literal.contains("this node asked"))
+        .find(|literal| literal.contains("you asked"))
         .expect("asked_by_this_node words this node's own question with one literal");
     assert_eq!(
         own,
-        " is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
+        " is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
     );
     assert_in_source_order(
         "asked_by_this_node",
         &own_source,
-        &[".peer(id)", r#"" is a question this node asked"#],
+        &[".peer(id)", r#"" is a question you asked"#],
     );
     let own = format!("{{id}}{own}");
     let unknown_source = fn_body("src/repl/mesh.rs", "no_open_question");
@@ -7904,7 +7901,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         unknown_runs,
         [
             "No open question has id ",
-            ". `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
+            ". `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
         ]
     );
     assert_in_source_order(
@@ -8223,7 +8220,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     ));
     for needle in [
         "whole or as any 8 or more of its first characters, as `.mesh envoy answer` takes it",
-        "An id of a question this node asked is refused with the line `.mesh envoy dismiss` gives it.",
+        "An id of a question you asked is refused with the line `.mesh envoy dismiss` gives it.",
     ] {
         assert!(
             grant.contains(needle),
@@ -9192,9 +9189,9 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
     );
     let local_tail = string_literals(&fn_body("src/repl/mesh.rs", "fetch"))
         .into_iter()
-        .find(|literal| literal.contains("answered from this node's own records"))
+        .find(|literal| literal.contains("answered from your own records"))
         .and_then(|literal| literal.strip_prefix(' ').map(str::to_string))
-        .expect("the REPL's fetch says a spent attachment was answered from this node's records")
+        .expect("the REPL's fetch says a spent attachment was answered from your own records")
         .replace("{peer}", "<dest8>");
     assert!(
         local_tail.contains("mesh__list"),
@@ -9807,13 +9804,13 @@ fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
             "if size > limit",
             "unservable(",
             "shown,",
-            "this node serves at most",
+            "you serve at most",
         ],
     );
     let size_reason = string_literals(&refuse)
         .into_iter()
-        .find(|literal| literal.contains("this node serves at most {limit} bytes"))
-        .expect("refuse_unservable formats the size pre-flight naming this node's limit");
+        .find(|literal| literal.contains("you serve at most {limit} bytes"))
+        .expect("refuse_unservable formats the size pre-flight naming your limit");
     let unservable = fn_body("src/repl/mesh.rs", "unservable");
     assert_in_source_order(
         "unservable",
@@ -10353,4 +10350,67 @@ fn mesh_deployment_says_why_the_shipped_propagation_node_announces_every_61_minu
             "Mesh-Deployment.md's propagation-node section still says {stale:?}"
         );
     }
+}
+
+/// The line a silent peer leaves opens `no answer from "<user> / <session>" (<dest8>)`,
+/// the peer named by `named_peer`, and the pages that explain trust quote that opening;
+/// the line a busy peer sends back ends on the one-at-a-time rule the Commands page
+/// quotes. The code side is checked on every run.
+#[test]
+fn the_pages_quote_the_no_answer_and_throttled_lines_as_the_code_words_them() {
+    let error = read(repo_root().join("src/mesh/request/error.rs"));
+    let no_answer = error
+        .split_once("impl fmt::Display for NoAnswer {")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| string_literals(body))
+        .expect("src/mesh/request/error.rs implements Display for NoAnswer");
+    let head = "no answer from {}: most likely it has not trusted this session ({own}).";
+    assert!(
+        no_answer
+            .first()
+            .is_some_and(|literal| literal.starts_with(head)),
+        "NoAnswer no longer opens {head:?}: {no_answer:?}"
+    );
+    let named = string_literals(&method_body("src/mesh/request/error.rs", "named_peer"));
+    assert_eq!(
+        named.first().map(String::as_str),
+        Some("\"{}\" ({dest8})"),
+        "named_peer no longer quotes the name before the short hash: {named:?}"
+    );
+    let quoted_head = head
+        .replace("{}", "\"<user> / <session>\" (<dest8>)")
+        .replace("{own}", "<hash>");
+
+    let message = read(repo_root().join("src/mesh/message.rs"));
+    let throttled = message
+        .split_once("Self::Throttled { destination } => write!(")
+        .and_then(|(_, rest)| rest.split_once("),\n"))
+        .map(|(body, _)| string_literals(body))
+        .expect("src/mesh/message.rs words SendError::Throttled");
+    let tail = "refused it: it is already answering a message from you (one at a time per user). Try again in a minute.";
+    assert!(
+        throttled
+            .first()
+            .is_some_and(|literal| literal.contains(tail)),
+        "SendError::Throttled no longer says {tail:?}: {throttled:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for (label, page) in [
+        ("Mesh-Commands.md", commands.clone()),
+        (
+            "Mesh-Trust-Model.md",
+            flat(&read(wiki.join("Mesh-Trust-Model.md"))),
+        ),
+    ] {
+        assert!(
+            page.contains(&quoted_head),
+            "{label} does not quote the no-answer line as {quoted_head:?}"
+        );
+    }
+    assert!(
+        commands.contains(tail),
+        "Mesh-Commands.md does not quote the throttled line's {tail:?}"
+    );
 }

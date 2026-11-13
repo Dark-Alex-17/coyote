@@ -1496,7 +1496,7 @@ impl fmt::Display for SendError {
                 max,
             } => write!(
                 f,
-                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
+                "Session {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 describe_version(*found)
             ),
             Self::NoPropagationNode => write!(
@@ -2667,7 +2667,7 @@ impl FirstContactMiss {
 
 pub(crate) fn unanswered_path_request(destination: &str) -> String {
     format!(
-        "{} did not answer a path request within {} s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
+        "{} did not answer a path request within {} s: it is not on any interface you joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
         short(destination),
         PATH_REQUEST_TIMEOUT.as_secs()
     )
@@ -5170,14 +5170,14 @@ mod tests {
         assert_eq!(
             incompatible(Some(2)),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
+                "Session {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 hash_of("d")
             )
         );
         assert_eq!(
             incompatible(None),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
+                "Session {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 hash_of("d")
             )
         );

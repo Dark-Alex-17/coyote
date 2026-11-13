@@ -443,7 +443,7 @@ impl fmt::Display for AccessError {
                 max,
             } => write!(
                 f,
-                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
+                "Session {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 describe_version(*found)
             ),
             Self::NoPropagationNode => write!(
@@ -6042,7 +6042,7 @@ mod tests {
             }
             .to_string(),
             format!(
-                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
+                "Session {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; `.mesh people list` names which.",
                 destination()
             )
         );

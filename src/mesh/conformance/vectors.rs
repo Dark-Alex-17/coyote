@@ -1266,7 +1266,7 @@ fn dest_vectors() -> Vec<Vector> {
                 )
                 .to_hex_string();
                 ensure(
-                    err.contains("does not match"),
+                    err.contains("does not belong to user"),
                     format!("refusal text: {err}"),
                 )?;
                 ensure(

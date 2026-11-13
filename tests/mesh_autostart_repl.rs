@@ -78,10 +78,8 @@ const ON_PREVIEW: &str = "Joining the mesh for session";
 const STAYS_OFF: &str = "it stays off for the rest of this run";
 const STAYS_OFF_PATTERN: &str = r"it stays off for the rest of this run";
 /// What `.exit session` prints while the node runs.
-const LEAVING: &str =
-    "Leaving the mesh: the session that owns this node's instance id is being exited.";
-const LEAVING_PATTERN: &str =
-    r"Leaving the mesh: the session that owns this node's instance id is being exited\.";
+const LEAVING: &str = "Leaving the mesh: the session it runs for is being exited.";
+const LEAVING_PATTERN: &str = r"Leaving the mesh: the session it runs for is being exited\.";
 const NEEDS_SESSION: &str = "Mesh needs a session";
 const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
 /// `MESH_OFF` as a regex, for waiting on it.
@@ -1935,7 +1933,7 @@ fn trust_verbs_at_a_cold_prompt_write_only_what_they_name_and_forget_is_no_alias
     // The verb that line names asks the mesh for the unheard hash first; nothing on the
     // relay answers for it, so it is refused and writes nothing.
     let expected = format!(
-        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
+        "{} did not answer a path request within 5 s: it is not on any interface you joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
         &dest[..8]
     );
     let out = trust_verb(
@@ -2168,7 +2166,7 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
         &mut session,
         &format!(".mesh envoy dismiss {old_q}"),
         &literally(&format!(
-            "No open question has id {old_q}. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
+            "No open question has id {old_q}. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
         )),
         SESSION_PROMPT,
     );
@@ -2221,7 +2219,7 @@ fn dismiss_and_refuse_of_an_expired_unswept_row_announce_it_once_then_refuse_at_
         &mut session,
         &format!(".mesh files refuse {old_a}"),
         &literally(&format!(
-            "No open access request has id {old_a}. `.mesh files requests` lists the ones this node knows about."
+            "No open access request has id {old_a}. `.mesh files requests` lists the ones you know about."
         )),
         SESSION_PROMPT,
     );
@@ -2336,7 +2334,7 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
         &mut session,
         ".mesh envoy answer nope",
         &literally(
-            "No open question has id nope. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.",
+            "No open question has id nope. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about.",
         ),
         SESSION_PROMPT,
     );
@@ -3017,7 +3015,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
         .unwrap_or_else(|| panic!("{info}"));
     let identity = keys
         .iter()
-        .position(|key| *key == "identity")
+        .position(|key| *key == "user hash")
         .unwrap_or_else(|| panic!("{info}"));
     assert!(
         reach < identity,
@@ -3415,7 +3413,7 @@ fn untrust_of_an_instance_under_an_identity_grant_refuses_at_a_cold_prompt_and_b
     // The verb that line names asks the mesh for the unheard hash first; nothing answers,
     // so the grant stands and no record is written.
     let expected = format!(
-        "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
+        "{} did not answer a path request within 5 s: it is not on any interface you joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
         &dest[..8]
     );
     let out = trust_verb(
@@ -4025,8 +4023,8 @@ fn seconds_of(text: &str) -> Option<u64> {
 /// the bare `.mesh config show` table reads `joined` as an age and `last announce` as the start
 /// announce's age with the heartbeat's first tick one period (61 minutes) away, so a fresh
 /// node reads `<n>s ago (next in 1h)`; a fresh identity with nothing marked shows no
-/// `identity predecessors` and no `key changes` row, and no `node` or `selection` row either,
-/// the node facts running in the fixed order from `identity` to `propagation_nodes`. After a
+/// `earlier user hashes` and no `key changes` row, and no `node` or `selection` row either,
+/// the node facts running in the fixed order from `user hash` to `propagation_nodes`. After a
 /// typed `.mesh off --yes` the same command prints the `node: off - .mesh on joins` line
 /// before a table that keeps the configured `interfaces[0]` row, ends on `reach` keyed on the
 /// config (the loopback relay reads as the local rnsd), and holds no node fact.
@@ -4053,14 +4051,14 @@ fn an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away
     let keys = table.keys();
     let identity = keys
         .iter()
-        .position(|key| *key == "identity")
+        .position(|key| *key == "user hash")
         .unwrap_or_else(|| panic!("{info}"));
     assert_eq!(
         &keys[identity..],
         [
-            "identity",
-            "destination",
-            "instance",
+            "user hash",
+            "session hash",
+            "session id",
             "interfaces[0]",
             "joined",
             "last announce",
@@ -4136,9 +4134,9 @@ fn an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away
     );
     for fact in [
         "node",
-        "identity",
-        "destination",
-        "instance",
+        "user hash",
+        "session hash",
+        "session id",
         "joined",
         "last announce",
         "envoy memory",
@@ -4182,7 +4180,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     wait_for(&mut session, SESSION_PROMPT);
     probe.wait_for_marker("MESH_STARTED");
 
-    let unknown = "No open question has id nope. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.";
+    let unknown = "No open question has id nope. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about.";
     let (_, refused) = command_row_and_transcript(
         &mut session,
         ".mesh envoy dismiss nope",
@@ -4585,7 +4583,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
         &mut session,
         ".mesh envoy dismiss --all --dry-run",
         &literally(
-            "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about.",
+            "No open questions to dismiss; `.mesh envoy questions` lists what you know about.",
         ),
         SESSION_PROMPT,
     );
@@ -5887,7 +5885,7 @@ fn people_addressing_against_heard_sessions_refuses_a_user_with_two_and_reaches_
     ] {
         let out = people_command(&mut mine, &line);
         check(
-            out.contains("who: Maki / laptop") && out.contains(&format!("destination: {one}")),
+            out.contains("who: Maki / laptop") && out.contains(&format!("session hash: {one}")),
             &format!("{line} reaches the named session"),
             &out,
         );
@@ -6606,4 +6604,54 @@ fn a_revoked_user_stays_known_and_their_request_to_be_trusted_reads_user_slash_s
     let status = exit_clean(&mut mine);
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Result lines speak of users and sessions: the refusal a session-less `.mesh on`
+/// prints and the line a set objective prints say neither "this node" nor
+/// "destination" nor "instance"; only a group help's "Under the hood" paragraph does.
+#[test]
+fn result_lines_at_a_cold_prompt_say_session_not_this_node_or_destination() {
+    const BANNED: [&str; 5] = ["this node", "identity", "destination", "instance", "knock"];
+    let relay = SilentRelay::start();
+    let probe = Probe::new("result-words", false, &[relay.port]);
+    let mut session = spawn_repl(probe.command());
+    wait_for(&mut session, BARE_PROMPT);
+
+    let mut failures = Vec::new();
+    let mut check = |what: &str, out: &str| {
+        let row = out
+            .lines()
+            .find(|line| line.contains(what))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        for word in BANNED {
+            if row.contains(word) {
+                failures.push(format!("{word:?} in the result line: {row}"));
+            }
+        }
+    };
+
+    let (_, refused) =
+        command_row_and_transcript(&mut session, ".mesh on", NEEDS_SESSION, BARE_PROMPT);
+    check(NEEDS_SESSION, &refused);
+
+    session.send(".session probe\r").expect("enter a session");
+    wait_for(&mut session, SESSION_PROMPT);
+    command_prints(
+        &mut session,
+        ".mesh on --yes",
+        JOINED_PROBE_PATTERN,
+        SESSION_PROMPT,
+    );
+    let (_, set) = command_row_and_transcript(
+        &mut session,
+        ".mesh status \"probe objective\"",
+        r"Objective set to",
+        SESSION_PROMPT,
+    );
+    check("Objective set to", &set);
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

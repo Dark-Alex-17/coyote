@@ -239,13 +239,13 @@ fn a_reference_the_serving_side_would_not_serve_is_refused() -> Result<(), Strin
     refused_with(
         fx.attach("docs/private.md", false, 1024),
         &[
-            "`docs/private.md` would travel as a reference, which this node would not serve (a deny rule names it); lift the rule first; nothing was sent.",
+            "`docs/private.md` would travel as a reference, which you would not serve (a deny rule names it); lift the rule first; nothing was sent.",
         ],
     )?;
     refused_with(
         fx.attach(".env", true, 1024),
         &[
-            "`.env` would travel as a reference, which this node would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
+            "`.env` would travel as a reference, which you would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
         ],
     )
 }

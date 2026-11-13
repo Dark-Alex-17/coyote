@@ -329,8 +329,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
-const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
-const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
+const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the key is replaced only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
+const BROADCAST_NOTICE: &str = "This sends a bulletin to every session you trust that has a known path right now. Sessions you have not trusted receive nothing.";
 const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a session you do not trust.";
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a session you do not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from sessions you trust.";
@@ -546,7 +546,7 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
         .map(|session| session.name().to_string())
     else {
         bail!(
-            "Mesh needs a session: this node's destination is derived from an id kept in the session file. Run `.session <name>` first."
+            "Mesh needs a session: your address on the mesh comes from an id kept in the session file. Run `.session <name>` first."
         );
     };
     let cwd = env::current_dir()?;
@@ -623,7 +623,7 @@ async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     }
     let question =
-        "Turn mesh off? Peers lose this node and the mesh__* tools leave the tool catalog.";
+        "Turn mesh off? Other sessions lose this one and the mesh__* tools leave the tool catalog.";
     if !confirm_or_flag(question, "--yes", args.has("--yes"))? {
         out_text("Mesh stays on.");
         return Ok(());
@@ -664,7 +664,7 @@ pub(crate) async fn before_session_left(ctx: &mut RequestContext) -> Result<()> 
 }
 
 pub(crate) const LEAVING_FOR_SESSION_EXIT: &str =
-    "Leaving the mesh: the session that owns this node's instance id is being exited.";
+    "Leaving the mesh: the session it runs for is being exited.";
 
 /// Stops the node and takes the mesh__* tools out of the catalogs; the caller decides
 /// what the in-memory `mesh.enabled` becomes.
@@ -1087,7 +1087,7 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     if matches!(knock, KnockLookup::Unreadable) {
         err_path_text(
             &NoticeText::from(
-                "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh access requests` reports the error.",
+                "The list of requests to be trusted could not be read, so whether this session asked is unknown; `.mesh access requests` reports the error.",
             )
             .render(live_prefix()),
         );
@@ -1109,7 +1109,7 @@ fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 .mesh
                 .set_objective_override(Some(objective.to_string()));
             out_text(&ctx.render_hints(&format!(
-                "Objective set to \"{objective}\" for this session; peers that ask see it in this node's status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
+                "Objective set to \"{objective}\" for this session; peers that ask see it in your status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
             )));
         }
         StatusArg::Clear => {
@@ -1450,7 +1450,7 @@ fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<(
     let instance_id = runtime.current_instance_id();
     if inbox_root.file_name() != Some(std::ffi::OsStr::new(instance_id.as_str())) {
         bail!(
-            "'{}' is not this instance's inbox directory; nothing was removed.",
+            "'{}' is not this session's inbox directory; nothing was removed.",
             inbox_root.display()
         );
     }
@@ -1944,7 +1944,7 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
     if questions.is_empty() {
         out_path_text(
             &NoticeText::from(
-                "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about.",
+                "No open questions to dismiss; `.mesh envoy questions` lists what you know about.",
             )
             .render(live_prefix()),
         );
@@ -2190,7 +2190,7 @@ fn asked_by_this_node(id: &str) -> anyhow::Error {
     QuotingError::wrap(
         NoticeText::default()
             .peer(id)
-            .frame(" is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."),
+            .frame(" is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."),
     )
 }
 
@@ -2200,7 +2200,7 @@ fn no_open_question(id: &str) -> anyhow::Error {
         NoticeText::default()
             .frame("No open question has id ")
             .peer(id)
-            .frame(". `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."),
+            .frame(". `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."),
     )
 }
 
@@ -2209,7 +2209,7 @@ fn escalated_not_asked(id: &str) -> anyhow::Error {
     QuotingError::wrap(
         NoticeText::default()
             .peer(id)
-            .frame(" is a question a peer escalated to you, not one this node asked; answer it with `.mesh envoy answer ")
+            .frame(" is a question a peer escalated to you, not one you asked; answer it with `.mesh envoy answer ")
             .peer(id)
             .frame(" \"<text>\"`."),
     )
@@ -2220,7 +2220,7 @@ fn asked_not_escalated(id: &str) -> anyhow::Error {
     QuotingError::wrap(
         NoticeText::default()
             .peer(id)
-            .frame(" is a question this node asked, not one escalated to you; follow up on it with `.mesh messaging follow-up ")
+            .frame(" is a question you asked, not one escalated to you; follow up on it with `.mesh messaging follow-up ")
             .peer(id)
             .frame(" \"<text>\"`."),
     )
@@ -2378,31 +2378,46 @@ fn quoted_send_failure(err: anyhow::Error, who: &str) -> anyhow::Error {
         ),
         _ => return err,
     };
-    let text = err.to_string();
-    match text.strip_prefix(lead.as_str()) {
-        Some(tail) => {
-            let dest8 = short(&destination);
-            let hash = if who.ends_with(&format!("/ {dest8}")) {
-                String::new()
-            } else {
-                format!(" ({dest8})")
-            };
-            QuotingError::wrap(
-                NoticeText::from(word)
-                    .peer(who)
-                    .frame(format!("{hash}{tail}")),
-            )
-        }
-        None => err,
-    }
+    session_led(&err.to_string(), &lead, word, who, &destination).unwrap_or(err)
 }
 
-fn quoted_access_failure(err: AccessError) -> anyhow::Error {
-    match &err {
-        AccessError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
-        AccessError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
-        _ => anyhow!(err.to_string()),
-    }
+/// `text` opened on `word` and `who` in place of `lead`, `who` quoted as it stands and the
+/// short hash after it unless `who` already ends on it; `None` when `text` does not open
+/// on `lead`.
+fn session_led(
+    text: &str,
+    lead: &str,
+    word: &str,
+    who: &str,
+    destination: &str,
+) -> Option<anyhow::Error> {
+    let tail = text.strip_prefix(lead)?;
+    let dest8 = short(destination);
+    let hash = if who.ends_with(&format!("/ {dest8}")) {
+        String::new()
+    } else {
+        format!(" ({dest8})")
+    };
+    Some(QuotingError::wrap(
+        NoticeText::from(word)
+            .peer(who)
+            .frame(format!("{hash}{tail}")),
+    ))
+}
+
+/// An access request failure as the REPL shows it: a peer-side refusal quoted as
+/// `quoted_peer_side` quotes it, and a busy or unreachable session named by `who`, its
+/// `<user> / <session>` name, as `quoted_send_failure` names it.
+fn quoted_access_failure(err: AccessError, destination: &str, who: &str) -> anyhow::Error {
+    let (word, lead) = match &err {
+        AccessError::NotTrustedByPeer(refusal) => return quoted_peer_side(&err, refusal),
+        AccessError::NoAnswer(no_answer) => return quoted_peer_side(&err, no_answer),
+        AccessError::Throttled { destination } => ("", short(destination).to_string()),
+        AccessError::UnknownDestination { .. } => ("Session ", "The session".to_string()),
+        _ => return anyhow!(err.to_string()),
+    };
+    let text = err.to_string();
+    session_led(&text, &lead, word, who, destination).unwrap_or_else(|| anyhow!(text))
 }
 
 fn quoted_fetch_failure(err: FileFetchError) -> anyhow::Error {
@@ -2468,6 +2483,40 @@ mod peer_side_refusal_tests {
         assert_eq!(other.to_string(), SendError::NotRunning.to_string());
     }
 
+    /// An access request to a busy or unreachable session names it the way a send does.
+    #[test]
+    fn a_busy_or_unreachable_access_session_is_named_by_user_and_session() {
+        let destination = "ab".repeat(16);
+        let busy = quoted_access_failure(
+            AccessError::Throttled {
+                destination: destination.clone(),
+            },
+            &destination,
+            "Ann / laptop",
+        );
+        assert_eq!(
+            busy.to_string(),
+            "Ann / laptop (abababab) refused it: it is busy with a request from you (one at a time per user). Try again in a minute."
+        );
+        let unreachable = quoted_access_failure(
+            AccessError::UnknownDestination {
+                recently_seen: false,
+            },
+            &destination,
+            "Ann / laptop",
+        );
+        let text = unreachable.to_string();
+        assert!(
+            text.starts_with(
+                "Session Ann / laptop (abababab) could not be reached: you asked the network"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains(&destination), "{text}");
+        let other = quoted_access_failure(AccessError::NotRunning, &destination, "Ann / laptop");
+        assert_eq!(other.to_string(), AccessError::NotRunning.to_string());
+    }
+
     fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
         command_error_text(
             &MeshVerbError::wrap(err.context("`.mesh files fetch` failed")),
@@ -2488,7 +2537,13 @@ mod peer_side_refusal_tests {
                 refused.clone(),
             ),
             (
-                || quoted_access_failure(AccessError::NotTrustedByPeer(refusal())),
+                || {
+                    quoted_access_failure(
+                        AccessError::NotTrustedByPeer(refusal()),
+                        &"ab".repeat(16),
+                        "unused",
+                    )
+                },
                 refused.clone(),
             ),
             (
@@ -2529,12 +2584,19 @@ mod peer_side_refusal_tests {
         let today = err.to_string();
         assert_eq!(
             shown_as(
-                quoted_access_failure(AccessError::NoAnswer(no_answer.clone())),
+                quoted_access_failure(
+                    AccessError::NoAnswer(no_answer.clone()),
+                    &"ab".repeat(16),
+                    "unused"
+                ),
                 CommandPrefix::Dot
             ),
             shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
         );
-        let slash = shown_as(quoted_access_failure(err), CommandPrefix::Slash);
+        let slash = shown_as(
+            quoted_access_failure(err, &"ab".repeat(16), "unused"),
+            CommandPrefix::Slash,
+        );
         let tail = today.strip_prefix(&no_answer.to_string()).unwrap();
         assert!(
             slash.ends_with(&format!(
@@ -2866,7 +2928,7 @@ pub(crate) fn attachment(
     if !opened_the_judged_file(&metadata, &canonical) {
         return Err(attach_path_error(
             &shown,
-            " changed under this node while it was being read; nothing was sent.",
+            " changed while it was being read; nothing was sent.",
         ));
     }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
@@ -2940,7 +3002,7 @@ pub(crate) fn attachment(
         return Err(attach_path_error(
             &shown,
             format!(
-                " is {} and this node serves at most {serving_limit} bytes by reference; nothing was sent.",
+                " is {} and you serve at most {serving_limit} bytes by reference; nothing was sent.",
                 human_size(size)
             ),
         ));
@@ -2955,7 +3017,7 @@ pub(crate) fn attachment(
         return Err(attach_path_error(
             &shown,
             format!(
-                " would travel as a reference, which this node would not serve ({reason}); lift the rule first; nothing was sent."
+                " would travel as a reference, which you would not serve ({reason}); lift the rule first; nothing was sent."
             ),
         ));
     }
@@ -3380,7 +3442,7 @@ async fn send_request(
     };
     let Ok(outcome) = joined else {
         bail!(
-            "The access request to {d8} stopped before it could finish; nothing more is known about it. `.mesh files requests` and `.mesh messaging inbox` show what reached this node; try `.mesh files request` again."
+            "The access request to {d8} stopped before it could finish; nothing more is known about it. `.mesh files requests` and `.mesh messaging inbox` show what reached you; try `.mesh files request` again."
         );
     };
     match outcome {
@@ -3390,7 +3452,13 @@ async fn send_request(
             &valid.paths,
             live_prefix(),
         )),
-        Err(err) => return Err(quoted_access_failure(err)),
+        Err(err) => {
+            return Err(quoted_access_failure(
+                err,
+                destination,
+                &runtime.who_at(destination).to_string(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3421,7 +3489,7 @@ fn request_outcome_line(
         AccessOutcome::Granted { expires } => {
             let until = match grant_expires_at(*expires) {
                 Some(at) => format!("granted until {}", rfc3339_utc(at)),
-                None => "granted, until a time this node cannot read".to_string(),
+                None => "granted, until a time you cannot read".to_string(),
             };
             let fetch = prefix.render_hints(".mesh files fetch");
             let first = paths.first().map_or("", String::as_str);
@@ -3525,7 +3593,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     ) {
         return Err(QuotingError::wrap(
             not_shared_refusal(peer, &shown, &args.path, &reason).frame(format!(
-                " This was answered from this node's own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}."
+                " This was answered from your own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}."
             )),
         ));
     }
@@ -3839,11 +3907,11 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         let mut lines = vec![match &args.scope {
             ForgetScope::All => "The envoy remembers nothing.".to_string(),
             ForgetScope::Identity(identity) => format!(
-                "The envoy remembers nothing of identity {}{reach}.",
+                "The envoy remembers nothing of user {}{reach}.",
                 short(identity)
             ),
             ForgetScope::Thread { identity, thread } => format!(
-                "The envoy remembers no thread '{thread}' of identity {}{reach}.",
+                "The envoy remembers no thread '{thread}' of user {}{reach}.",
                 short(identity)
             ),
         }];
@@ -3874,7 +3942,7 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 parts.push(format!(
                     "{} of {}",
                     conversations(preview.count),
-                    plural(remembered.by_identity.len(), "identity", "identities")
+                    plural(remembered.by_identity.len(), "user", "users")
                 ));
             }
             if orphans > 0 {
@@ -3887,14 +3955,14 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         ForgetScope::Identity(identity) => {
             format!(
-                "{} of identity {}",
+                "{} of user {}",
                 conversations(preview.count),
                 short(identity)
             )
         }
         ForgetScope::Thread { identity, thread } => {
             format!(
-                "the remembered thread '{thread}' of identity {}",
+                "the remembered thread '{thread}' of user {}",
                 short(identity)
             )
         }
@@ -3973,7 +4041,7 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let records = if forgotten.removed > preview.count {
         format!(
-            " ({} across the instance stores)",
+            " ({} across your sessions' stores)",
             plural(forgotten.removed, "record", "records")
         )
     } else {
@@ -4040,7 +4108,7 @@ fn parse_memory_forget_args(
         let identity = resolve_known(ctx, &target, HashKind::Identity, remembered)?;
         match thread {
             Some(thread) if !is_wire_id(&thread) => bail!(
-                "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh envoy memory forget <identity> --dry-run` lists them. {}",
+                "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh envoy memory forget <user> --dry-run` lists them. {}",
                 render_verb_help("envoy", "memory")
             ),
             Some(thread) => ForgetScope::Thread { identity, thread },
@@ -4819,7 +4887,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .knock_gate()
         .cache()
         .list(now)
-        .context("The knock cache could not be read")?
+        .context("The list of requests to be trusted could not be read")?
         .into_iter()
         .filter(|knock| knock.identity_hash == identity)
         .count();
@@ -5229,15 +5297,15 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 Err(err) => unread_trust_preview(&config_dir, &err),
             };
             let lines = [
-                format!("Rotating the mesh identity replaces {old}:"),
-                "  a new identity is minted and written over mesh/identity.key; the old private key is not kept".to_string(),
+                format!("Rotating your mesh key replaces {old}:"),
+                "  a new key is minted and written over mesh/identity.key; the old private key is not kept".to_string(),
                 format!(
-                    "  the old identity hash is appended to mesh/{} ({recorded} recorded so far)",
+                    "  the old user hash is appended to mesh/{} ({recorded} recorded so far)",
                     identity::PREDECESSORS_FILE
                 ),
-                "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
+                "  your session id is unchanged, so the session announces a new address under the new key".to_string(),
                 "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
-                "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh access trust again after verifying the new hash out of band".to_string(),
+                "  every user who trusted you or your sessions now sees a stranger and must run .mesh access trust again after verifying the new hash out of band".to_string(),
             ];
             let text = NoticeText::default()
                 .frame(format!("{}\n  ", lines.join("\n")))
@@ -5248,7 +5316,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             out_path_text(&text.render(live_prefix()));
         }
         Some(token) if token != expected => bail!(
-            "'{token}' is not the token for identity {}; run .mesh config rotate-identity --confirm {expected}",
+            "'{token}' is not the token for key {}; run .mesh config rotate-identity --confirm {expected}",
             short(&old)
         ),
         Some(_) => {
@@ -5260,7 +5328,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 trust.rotate_self_trust(&old, new, SystemTime::now())
             });
             let mut text = format!(
-                "Rotated the mesh identity: {} -> {new}.\nPredecessors recorded: {}. Run .mesh on to announce the new identity; peers must re-trust it.",
+                "Rotated your mesh key: {} -> {new}.\nPredecessors recorded: {}. Run .mesh on to announce the new key; peers must re-trust it.",
                 rotation.old_fingerprint, rotation.predecessors
             );
             if let Ok(own_trust) = &moved {
@@ -5274,12 +5342,12 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     NoticeText::default()
                         .frame("Your trust list at ")
                         .peer(trust_path.clone())
-                        .frame(" was not updated for the new identity (")
+                        .frame(" was not updated for the new key (")
                         .peer(format!("{err:#}"))
                         .frame("), so it is not trusted and your sessions on this config dir cannot message each other yet. Make the file readable and writable again (fix or move ")
                         .peer(trust_path)
                         .frame(format!(
-                            "), then run .mesh on, then .mesh access trust user {new}; .mesh access revoke user {old} withdraws the old identity's \"{SELF_TRUST_LABEL}\" grant if the list still holds it."
+                            "), then run .mesh on, then .mesh access trust user {new}; .mesh access revoke user {old} withdraws the old key's \"{SELF_TRUST_LABEL}\" grant if the list still holds it."
                         )),
                 ));
             }
@@ -5304,22 +5372,22 @@ fn rotation_self_trust_preview(own_trust: SelfTrustRotation) -> String {
             retired: true,
             ..
         } => format!(
-            "your own trust list retires the old identity's \"{SELF_TRUST_LABEL}\" grant, which no key can use once the old private key is gone, and trusts the new identity as \"{SELF_TRUST_LABEL}\" in its place, so your sessions on this config dir can still message each other; its other entries stay"
+            "your own trust list retires the old key's \"{SELF_TRUST_LABEL}\" grant, which no key can use once the old private key is gone, and trusts the new key as \"{SELF_TRUST_LABEL}\" in its place, so your sessions on this config dir can still message each other; its other entries stay"
         ),
         SelfTrustRotation {
             granted: true,
             retired: false,
             ..
         } => format!(
-            "your own trust list keeps its entries and trusts the new identity as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other"
+            "your own trust list keeps its entries and trusts the new key as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other"
         ),
         SelfTrustRotation {
             blocked_old: true, ..
         } => format!(
-            "your own trust list keeps its entries and does not trust the new identity, because the old identity is blocked on it and so holds no \"{SELF_TRUST_LABEL}\" grant to move; {next}"
+            "your own trust list keeps its entries and does not trust the new key, because the old key is blocked on it and so holds no \"{SELF_TRUST_LABEL}\" grant to move; {next}"
         ),
         SelfTrustRotation { .. } => format!(
-            "your own trust list keeps its entries and does not trust the new identity, because the old identity holds no \"{SELF_TRUST_LABEL}\" grant; {next}"
+            "your own trust list keeps its entries and does not trust the new key, because the old key holds no \"{SELF_TRUST_LABEL}\" grant; {next}"
         ),
     }
 }
@@ -5348,14 +5416,14 @@ fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
             retired: true,
             ..
         } => format!(
-            "Retired the old identity's \"{SELF_TRUST_LABEL}\" grant and trusted the new identity {new_short} as \"{SELF_TRUST_LABEL}\" in its place, so your sessions on this config dir can message each other."
+            "Retired the old key's \"{SELF_TRUST_LABEL}\" grant and trusted the new key {new_short} as \"{SELF_TRUST_LABEL}\" in its place, so your sessions on this config dir can message each other."
         ),
         SelfTrustRotation {
             granted: true,
             retired: false,
             ..
         } => format!(
-            "Trusted the new identity {new_short} as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other."
+            "Trusted the new key {new_short} as \"{SELF_TRUST_LABEL}\", so your sessions on this config dir can message each other."
         ),
         SelfTrustRotation {
             blocked_new: true,
@@ -5363,24 +5431,24 @@ fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
             ..
         } => {
             let what = if retired {
-                format!("Retired the old identity's \"{SELF_TRUST_LABEL}\" grant; the")
+                format!("Retired the old key's \"{SELF_TRUST_LABEL}\" grant; the")
             } else {
                 "The".to_string()
             };
             format!(
-                "{what} new identity {new_short} is blocked on your trust list, so it was not trusted. {next} .mesh access unblock user {new} --yes and .mesh access trust user {new}."
+                "{what} new key {new_short} is blocked on your trust list, so it was not trusted. {next} .mesh access unblock user {new} --yes and .mesh access trust user {new}."
             )
         }
         SelfTrustRotation { retired: true, .. } => format!(
-            "Retired the old identity's \"{SELF_TRUST_LABEL}\" grant; the new identity {new_short} already held a grant for all destinations, so your sessions on this config dir can message each other."
+            "Retired the old key's \"{SELF_TRUST_LABEL}\" grant; the new key {new_short} already held a grant for every session, so your sessions on this config dir can message each other."
         ),
         SelfTrustRotation {
             blocked_old: true, ..
         } => format!(
-            "The new identity {new_short} is not trusted, because the old identity was blocked on your trust list and so held no \"{SELF_TRUST_LABEL}\" grant to move. {next} .mesh access trust user {new}."
+            "The new key {new_short} is not trusted, because the old key was blocked on your trust list and so held no \"{SELF_TRUST_LABEL}\" grant to move. {next} .mesh access trust user {new}."
         ),
         SelfTrustRotation { .. } => format!(
-            "The new identity {new_short} is not trusted, because the old identity held no \"{SELF_TRUST_LABEL}\" grant. {next} .mesh access trust user {new}."
+            "The new key {new_short} is not trusted, because the old key held no \"{SELF_TRUST_LABEL}\" grant. {next} .mesh access trust user {new}."
         ),
     }
 }
@@ -5972,7 +6040,7 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let kind = match &target {
         Some(target) => {
             out_path_text(&format!(
-                "Will write to {}: allow {} for identity {}.",
+                "Will write to {}: allow {} for user {}.",
                 target.written_to(),
                 listed_paths(&record.paths),
                 short(&record.peer_identity)
@@ -6068,7 +6136,7 @@ fn no_open_access_request(id: &str) -> anyhow::Error {
         NoticeText::default()
             .frame("No open access request has id ")
             .peer(id)
-            .frame(". `.mesh files requests` lists the ones this node knows about."),
+            .frame(". `.mesh files requests` lists the ones you know about."),
     )
 }
 
@@ -6114,7 +6182,7 @@ fn refuse_unservable(
             return Err(unservable(
                 shown,
                 format!(
-                    "it is {} and this node serves at most {limit} bytes",
+                    "it is {} and you serve at most {limit} bytes",
                     human_size(size)
                 ),
                 id,
@@ -6259,7 +6327,7 @@ mod peer_text_prefix_tests {
             let missing = shown_under_slash(no_open_access_request(".session"));
             assert!(
                 missing.ends_with(
-                    "No open access request has id .session. `/mesh files requests` lists the ones this node knows about."
+                    "No open access request has id .session. `/mesh files requests` lists the ones you know about."
                 ),
                 "{missing}"
             );
@@ -6834,7 +6902,7 @@ fn root_case(ctx: &RequestContext, root: &Path) -> Result<Option<bool>> {
             .map(Some)
             .ok_or_else(|| {
                 anyhow!(
-                    "The share root {} could not be probed, so this node serves nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
+                    "The share root {} could not be probed, so you serve nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
                     root.display()
                 )
             }),
@@ -7261,9 +7329,9 @@ fn pending_clear_clause(shown: &[String], matches: &[(String, Option<InboundKind
     }
     if !asked.is_empty() {
         let what = if asked.len() == 1 {
-            "is a question this node asked"
+            "is a question you asked"
         } else {
-            "are questions this node asked"
+            "are questions you asked"
         };
         clauses.push(
             join_and_text(quoted_ids(&asked)).frame(format!(" {what}, which no verb clears")),
@@ -10235,9 +10303,15 @@ mod help_output_tests {
         for (group, verb, _, summary) in COMMANDS {
             let note = verb_help_note(group, verb)
                 .unwrap_or_else(|| panic!("{group} {verb} has no --help sentences"));
-            let sentences = format!("{summary}. {note}").matches(['.', '?']).count();
+            // A sentence ends at a `.` or `?` before a space, or at the very end; the dots
+            // inside `.mesh` or `config.yaml` end nothing.
+            let text = format!("{summary}. {note}");
+            let sentences = text.matches(". ").count() + text.matches("? ").count() + 1;
             assert!(note.ends_with('.'), "{group} {verb}: {note}");
-            assert!(!note.is_empty() && sentences >= 2, "{group} {verb}: {note}");
+            assert!(
+                (2..=3).contains(&sentences),
+                "{group} {verb} reads as {sentences} sentences: {text}"
+            );
         }
     }
 
@@ -10270,6 +10344,315 @@ mod help_output_tests {
                 assert!(!text.contains(word), "{word:?} in a help line: {text}");
             }
         }
+    }
+
+    /// One token of Rust source, as far as `shown_literals` needs to tell them apart.
+    enum Token {
+        Word(String),
+        Punct(char),
+        Literal(String),
+    }
+
+    /// The tokens of `source`, each with the line it starts on. Comments and char
+    /// literals are dropped and a lifetime's quote reads as nothing, so a `'"'` or a
+    /// `'a` never opens a string; raw strings are read whole.
+    fn tokens(source: &str) -> Vec<(usize, Token)> {
+        let chars: Vec<char> = source.chars().collect();
+        let mut tokens = Vec::new();
+        let (mut at, mut line) = (0, 1);
+        while let Some(&c) = chars.get(at) {
+            let start = line;
+            if c == '\n' {
+                line += 1;
+                at += 1;
+            } else if c.is_whitespace() {
+                at += 1;
+            } else if c == '/' && chars.get(at + 1) == Some(&'/') {
+                while chars.get(at).is_some_and(|c| *c != '\n') {
+                    at += 1;
+                }
+            } else if c == '\'' {
+                at = match (chars.get(at + 1), chars.get(at + 2)) {
+                    (Some('\\'), _) => {
+                        at + 4
+                            + chars[at + 3..]
+                                .iter()
+                                .position(|c| *c == '\'')
+                                .expect("an escaped char literal closes")
+                    }
+                    (_, Some('\'')) => at + 3,
+                    _ => at + 1,
+                };
+            } else if c == '"' {
+                let (value, end) = cooked_literal(&chars, at + 1, &mut line);
+                tokens.push((start, Token::Literal(value)));
+                at = end;
+            } else if c.is_alphanumeric() || c == '_' {
+                let end = at
+                    + chars[at..]
+                        .iter()
+                        .position(|c| !(c.is_alphanumeric() || *c == '_'))
+                        .unwrap_or(chars.len() - at);
+                let word: String = chars[at..end].iter().collect();
+                let hashes = chars[end..].iter().take_while(|c| **c == '#').count();
+                if matches!(word.as_str(), "r" | "br") && chars.get(end + hashes) == Some(&'"') {
+                    let body = end + hashes + 1;
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let rest: String = chars[body..].iter().collect();
+                    let len = rest.find(&close).expect("a raw string closes");
+                    let value = &rest[..len];
+                    line += value.matches('\n').count();
+                    tokens.push((start, Token::Literal(value.to_string())));
+                    at = body + value.chars().count() + close.len();
+                } else {
+                    tokens.push((start, Token::Word(word)));
+                    at = end;
+                }
+            } else {
+                tokens.push((start, Token::Punct(c)));
+                at += 1;
+            }
+        }
+        tokens
+    }
+
+    /// The value of the string literal whose body starts at `at`, escapes applied, and
+    /// the index just past its closing quote; `line` counts the newlines it spans.
+    fn cooked_literal(chars: &[char], mut at: usize, line: &mut usize) -> (String, usize) {
+        let mut value = String::new();
+        loop {
+            match chars[at] {
+                '"' => return (value, at + 1),
+                '\\' => {
+                    at += 1;
+                    match chars[at] {
+                        '\n' => {
+                            while chars[at].is_whitespace() {
+                                if chars[at] == '\n' {
+                                    *line += 1;
+                                }
+                                at += 1;
+                            }
+                            continue;
+                        }
+                        'n' => value.push('\n'),
+                        'r' => value.push('\r'),
+                        't' => value.push('\t'),
+                        '0' => value.push('\0'),
+                        'u' => {
+                            let close = at
+                                + chars[at..]
+                                    .iter()
+                                    .position(|c| *c == '}')
+                                    .expect("a unicode escape closes");
+                            let hex: String = chars[at + 2..close].iter().collect();
+                            value.push(
+                                char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap(),
+                            );
+                            at = close;
+                        }
+                        'x' => {
+                            let hex: String = chars[at + 1..at + 3].iter().collect();
+                            value.push(char::from(u8::from_str_radix(&hex, 16).unwrap()));
+                            at += 2;
+                        }
+                        escaped @ ('"' | '\\' | '\'') => value.push(escaped),
+                        other => panic!("unexpected escape \\{other} on line {line}"),
+                    }
+                    at += 1;
+                }
+                c => {
+                    if c == '\n' {
+                        *line += 1;
+                    }
+                    value.push(c);
+                    at += 1;
+                }
+            }
+        }
+    }
+
+    /// The string literals of `source` a user can read, as `(line, text)`: every literal
+    /// outside the `#[cfg(test)]` items, the log macros, the `*_UNDER_THE_HOOD` and
+    /// `group_under_the_hood` paragraphs, and the keys a `NoticeText::from_template` call
+    /// names its placeholders by.
+    fn shown_literals(source: &str) -> Vec<(usize, String)> {
+        let tokens = tokens(source);
+        let punct = |at: usize, wanted: char| matches!(tokens.get(at), Some((_, Token::Punct(c))) if *c == wanted);
+        let word = |at: usize| match tokens.get(at) {
+            Some((_, Token::Word(word))) => word.as_str(),
+            _ => "",
+        };
+        let closing = |open: usize| {
+            let mut depth = 0usize;
+            for (at, (_, token)) in tokens.iter().enumerate().skip(open) {
+                match token {
+                    Token::Punct('(' | '[' | '{') => depth += 1,
+                    Token::Punct(')' | ']' | '}') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return at + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("the bracket on line {} never closes", tokens[open].0);
+        };
+        let next_of = |from: usize, ends: &[char]| {
+            (from..tokens.len())
+                .find(|at| ends.iter().any(|end| punct(*at, *end)))
+                .expect("the item ends")
+        };
+        let mut literals = Vec::new();
+        let mut template_ends = 0;
+        let mut at = 0;
+        while at < tokens.len() {
+            let cfg_test = punct(at, '#')
+                && punct(at + 1, '[')
+                && word(at + 2) == "cfg"
+                && punct(at + 3, '(')
+                && word(at + 4) == "test"
+                && punct(at + 5, ')')
+                && punct(at + 6, ']');
+            if cfg_test {
+                let end = next_of(at + 7, &[';', '{']);
+                at = if punct(end, '{') {
+                    closing(end)
+                } else {
+                    end + 1
+                };
+                continue;
+            }
+            if matches!(word(at), "debug" | "info" | "warn" | "error" | "trace")
+                && punct(at + 1, '!')
+                && punct(at + 2, '(')
+            {
+                at = closing(at + 2);
+                continue;
+            }
+            if word(at) == "const" && word(at + 1).ends_with("_UNDER_THE_HOOD") {
+                at = next_of(at, &[';']) + 1;
+                continue;
+            }
+            if word(at) == "fn" && word(at + 1) == "group_under_the_hood" {
+                at = closing(next_of(at, &['{']));
+                continue;
+            }
+            if word(at) == "from_template" && punct(at + 1, '(') {
+                template_ends = closing(at + 1);
+            }
+            if let (line, Token::Literal(literal)) = &tokens[at] {
+                let template_key = at < template_ends
+                    && punct(at - 1, '(')
+                    && punct(at + 1, ',')
+                    && literal.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+                if !template_key {
+                    literals.push((*line, literal.clone()));
+                }
+            }
+            at += 1;
+        }
+        literals
+    }
+
+    /// `literal` lowercased, without the tokens that spell a protocol word but are not
+    /// prose: a format placeholder such as `{identity}`, filled at run time with a hash or
+    /// a name; the `rotate-identity` verb and its `rotate-<identity-short>` token; and the
+    /// key's file name, `mesh/identity.key`.
+    fn prose_of(literal: &str) -> String {
+        let mut prose = String::new();
+        let mut rest = [
+            "rotate-identity",
+            "rotate-<identity-short>",
+            "mesh/identity.key",
+        ]
+        .iter()
+        .fold(literal.to_ascii_lowercase(), |text, token| {
+            text.replace(token, "")
+        });
+        while let Some(open) = rest.find('{') {
+            prose.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let name = after.split([':', '}']).next().unwrap_or_default();
+            let placeholder = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                && after.contains('}');
+            rest = if placeholder {
+                after[after.find('}').unwrap() + 1..].to_string()
+            } else {
+                prose.push('{');
+                after.to_string()
+            };
+        }
+        prose + &rest
+    }
+
+    const PROTOCOL_WORDS: [&str; 6] = [
+        "this node",
+        "identity",
+        "identities",
+        "destination",
+        "instance",
+        "knock",
+    ];
+
+    /// `line: word in literal` for each literal of `source` a user reads that spells a
+    /// protocol word.
+    fn protocol_word_hits(source: &str) -> Vec<String> {
+        shown_literals(source)
+            .into_iter()
+            .filter_map(|(line, literal)| {
+                let prose = prose_of(&literal);
+                PROTOCOL_WORDS
+                    .iter()
+                    .find(|word| prose.contains(*word))
+                    .map(|word| format!("{line}: {word:?} in {literal:?}"))
+            })
+            .collect()
+    }
+
+    /// The help's rule holds for every line the REPL prints: no result, refusal or
+    /// question in this file says this node, identity, destination, instance or knock.
+    /// The scan reads this file's own literals, so a line that slips back fails here.
+    #[test]
+    fn no_shown_literal_says_this_node_identity_destination_instance_or_knock() {
+        let fixture = r##"
+fn shown() {
+    debug!("this node is quiet");
+    bail!("Rotate with .mesh config rotate-identity --confirm rotate-<identity-short>; {identity} lives in mesh/identity.key");
+    let row = NoticeText::from_template("to {destination}", &[("destination", d)], &[]);
+    let c = ('"', 'a', '\'');
+    out_text(r#"the "instance" stays"#);
+    out_text("It knocked\
+        twice.");
+}
+const PEOPLE_UNDER_THE_HOOD: &str = "a session is a destination";
+#[cfg(test)]
+mod tests {
+    const HIDDEN: &str = "this node";
+}
+"##;
+        assert_eq!(
+            protocol_word_hits(fixture),
+            [
+                "7: \"instance\" in \"the \\\"instance\\\" stays\"",
+                "8: \"knock\" in \"It knockedtwice.\"",
+            ],
+            "the scan misreads its fixture"
+        );
+
+        let source = include_str!("mesh.rs");
+        let read = shown_literals(source).len();
+        assert!(read > 1000, "the scan read only {read} literals");
+        let hits = protocol_word_hits(source);
+        assert!(
+            hits.is_empty(),
+            "src/repl/mesh.rs prints protocol words a user should not read:\n{}",
+            hits.join("\n")
+        );
     }
 
     #[test]
@@ -10438,7 +10821,7 @@ fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
             "`user <who>` covers every session of theirs, now and later; `session <who>` that one session. `.mesh access help` shows which access command fits."
         }
         ("access", "revoke") => {
-            "They are refused from then on, and a request they send shows in `.mesh access requests`. Revoking a user prints a token first, which you pass back with --confirm."
+            "They are refused from then on, and a request they send shows in `.mesh access requests`; revoking a user prints a token first, which you pass back with --confirm."
         }
         ("access", "block") => {
             "Their requests to be trusted are dropped without a word. A blocked session stays refused whatever its user's standing."
@@ -10462,7 +10845,7 @@ fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
             "Each trusted session gets the same text; sessions you have not trusted get nothing. Replies land in your inbox."
         }
         ("messaging", "inbox") => {
-            "Reading takes nothing away: the model reads the same messages with mesh__check_inbox and keeps its own place. `clear` removes what you and the model have both read and hides the rest from you; the model still gets them. The inbox lasts for this session only."
+            "Reading takes nothing away: the model reads the same messages with mesh__check_inbox and keeps its own place. `clear` removes what you and the model have both read and hides the rest from you; the model still gets them, and the inbox lasts for this session only."
         }
         ("messaging", "sync") => {
             "Messages sent while this session was away wait on a propagation node until it is asked. Joining asks once and a timer asks again; this asks now."
@@ -10672,7 +11055,8 @@ fn render_on_preview(
         "What leaves this machine:".to_string(),
     ];
     lines.push(if config.announce {
-        "  announce: this node's destination hash and protocol version, repeated while the mesh is on".to_string()
+        "  announce: your session's address and protocol version, repeated while the mesh is on"
+            .to_string()
     } else {
         "  announce: nothing until you contact a peer (announce: false)".to_string()
     });
@@ -10683,7 +11067,7 @@ fn render_on_preview(
                 .to_string()
         }
         (true, interval) => format!(
-            "  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every {interval} s; .mesh messaging sync runs one now"
+            "  propagation sync: your session identifies itself to the nearest propagation node heard, at join and every {interval} s; .mesh messaging sync runs one now"
         ),
     });
     lines.push(match &config.display_name {
@@ -10725,7 +11109,7 @@ fn render_on_preview(
     }
     if fresh {
         lines.push(
-            "  fresh id: this session gets a new mesh id and destination; peers that trusted the old destination must trust the new one".to_string(),
+            "  fresh id: this session gets a new mesh id and address; whoever trusted the old address must trust the new one".to_string(),
         );
     }
     lines.push("To whom:".to_string());
@@ -10745,7 +11129,7 @@ fn on_question(config: &MeshConfig) -> String {
             .map(ToString::to_string)
             .collect();
         format!(
-            "This node will be WORLD-VISIBLE through {}: anyone reaching that relay can see its announce and knock on it. Join anyway?",
+            "Your session will be WORLD-VISIBLE through {}: anyone reaching that relay can see its announce and ask you to trust them. Join anyway?",
             relays.join(", ")
         )
     } else {
@@ -10796,7 +11180,7 @@ fn joined_line(session_name: &str, destination: &str, fresh: bool) -> String {
 /// config dir gets the grant with its first key and needs no telling.
 fn self_trust_notice(identity: &str) -> String {
     format!(
-        "Trusted your own identity {} as \"{SELF_TRUST_LABEL}\", so your other sessions on this config dir can message this one; .mesh access revoke user {identity} takes the grant back.",
+        "Trusted your own user {} as \"{SELF_TRUST_LABEL}\", so your other sessions on this config dir can message this one; .mesh access revoke user {identity} takes the grant back.",
         short(identity)
     )
 }
@@ -11644,7 +12028,7 @@ fn superseded_line(old: &BindingConflict, identity_grants_all: bool) -> String {
         )
     };
     format!(
-        "  This instance was trusted before as {destination} under another identity; that record's key-change mark is cleared. {standing}"
+        "  This session was trusted before as {destination} under another user's key; that record's key-change mark is cleared. {standing}"
     )
 }
 
@@ -11793,12 +12177,12 @@ fn node_fact_rows(
 ) -> Vec<(String, String)> {
     let mut rows = Vec::new();
     let mut row = |name: &str, value: String| rows.push((name.to_string(), value));
-    row("identity", runtime.fingerprint().to_string());
+    row("user hash", runtime.fingerprint().to_string());
     if let Some(text) = predecessors_text(predecessors, now) {
-        row("identity predecessors", text);
+        row("earlier user hashes", text);
     }
-    row("destination", runtime.current_destination_hash());
-    row("instance", runtime.current_instance_id());
+    row("session hash", runtime.current_destination_hash());
+    row("session id", runtime.current_instance_id());
     for (i, status) in runtime.interface_states().iter().enumerate() {
         let (name, value) = interface_row(i, status);
         row(&name, value);
@@ -11821,7 +12205,7 @@ fn node_fact_rows(
         row(
             "key changes",
             format!(
-                "{key_changes} instance(s) announced under another identity; see .mesh people list"
+                "{key_changes} session(s) announced under another user's key; see .mesh people list"
             ),
         );
     }
@@ -11873,7 +12257,7 @@ fn envoy_memory_text(runtime: &MeshRuntime) -> String {
         Ok((conversations, identities)) => format!(
             "{}, {}",
             plural(conversations, "conversation", "conversations"),
-            plural(identities, "identity", "identities")
+            plural(identities, "user", "users")
         ),
         Err(err) => format!("unreadable: {}", redact_hashes(&err.to_string())),
     }
@@ -11962,10 +12346,10 @@ fn render_peer_detail(
     trust: &str,
     now: SystemTime,
 ) -> NoticeText {
-    let mut lines = vec![NoticeText::from(format!("destination: {destination}"))];
+    let mut lines = vec![NoticeText::from(format!("session hash: {destination}"))];
     let name_row = |name: Option<&str>| NoticeText::from("name: ").peer(name_label(name));
     if let Some(peer) = peer {
-        lines.push(format!("identity: {}", peer.identity_hash).into());
+        lines.push(format!("user hash: {}", peer.identity_hash).into());
         lines.push(name_row(peer.display_name.as_deref()));
         lines.push(format!("trust: {trust}").into());
         lines.push(format!("protocol: {}", peer.protocol_version).into());
@@ -11988,22 +12372,27 @@ fn render_peer_detail(
     match knock {
         KnockLookup::Knocked(knock) => {
             if peer.is_none() {
-                lines.push(format!("identity: {}", knock.identity_hash).into());
+                lines.push(format!("user hash: {}", knock.identity_hash).into());
                 lines.push(name_row(knock.display_name.as_deref()));
-                lines.push(format!("trust: {trust} (seen only in its knock)").into());
+                lines.push(
+                    format!("trust: {trust} (seen only in its request to be trusted)").into(),
+                );
             }
             let age = parse_rfc3339(&knock.received_at)
                 .map(|then| age_text(now, then))
                 .unwrap_or_else(|| "unknown".to_string());
             lines.push(
-                NoticeText::from(format!("knocked: {age}, intro: ")).peer(
+                NoticeText::from(format!("asked to be trusted: {age}, intro: ")).peer(
                     peer_line(knock.intro.as_deref(), KNOCK_INTRO_MAX_CHARS)
                         .unwrap_or_else(|| "(none)".to_string()),
                 ),
             );
         }
-        KnockLookup::NotKnocked => lines.push("knocked: no".into()),
-        KnockLookup::Unreadable => lines.push("knocked: unknown (knock cache unreadable)".into()),
+        KnockLookup::NotKnocked => lines.push("asked to be trusted: no".into()),
+        KnockLookup::Unreadable => lines.push(
+            "asked to be trusted: unknown (the list of requests to be trusted is unreadable)"
+                .into(),
+        ),
     }
     lines.push("Names and intros are peer-supplied text.".into());
     joined_text(lines, "\n")
@@ -12211,7 +12600,7 @@ fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'stati
         (_, Disposition::Escalated) => "the peer asked its human; the answer comes later",
         (_, Disposition::Refused) => "the peer declined to answer",
         (_, Disposition::BudgetExhausted) => {
-            "the peer's envoy is out of budget for this node; wait before asking again"
+            "the peer's envoy is out of budget for you; wait before asking again"
         }
     }
 }
@@ -12658,7 +13047,7 @@ fn pending_entry(
 /// this node's own hints follow the prefix.
 fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) -> NoticeText {
     if outcome.recipients.is_empty() {
-        return "No trusted peer has a known path right now; nothing was sent. `.mesh people list` lists what this node has heard from.".into();
+        return "No trusted peer has a known path right now; nothing was sent. `.mesh people list` lists the sessions you have heard.".into();
     }
     let mut report = NoticeText::default();
     for recipient in &outcome.recipients {
@@ -13156,7 +13545,7 @@ mod tests {
                         &["docs/a.md", "docs/b.md"],
                         CommandPrefix::Dot
                     ),
-                    "request 01234567 to fedcba98: granted, until a time this node cannot read: .mesh files fetch fedcba98 docs/a.md, then the same for the other 1 path(s).",
+                    "request 01234567 to fedcba98: granted, until a time you cannot read: .mesh files fetch fedcba98 docs/a.md, then the same for the other 1 path(s).",
                     "{unreadable}"
                 );
             }
@@ -13173,7 +13562,7 @@ mod tests {
                     &[".vault"],
                     CommandPrefix::Slash
                 ),
-                "request 01234567 to fedcba98: granted, until a time this node cannot read: /mesh files fetch fedcba98 .vault"
+                "request 01234567 to fedcba98: granted, until a time you cannot read: /mesh files fetch fedcba98 .vault"
             );
             assert_eq!(
                 line(
@@ -14013,7 +14402,7 @@ mod tests {
         assert!(text.contains("announce:"), "{text}");
         assert!(
             text.contains(
-                "\n  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every 300 s; .mesh messaging sync runs one now\n"
+                "\n  propagation sync: your session identifies itself to the nearest propagation node heard, at join and every 300 s; .mesh messaging sync runs one now\n"
             ),
             "{text}"
         );
@@ -14052,7 +14441,7 @@ mod tests {
         );
         assert!(text.contains("display name: none"), "{text}");
         assert!(
-            text.contains("fresh id: this session gets a new mesh id and destination"),
+            text.contains("fresh id: this session gets a new mesh id and address"),
             "{text}"
         );
 
@@ -14944,9 +15333,9 @@ mod tests {
     #[test]
     fn info_table_snapshot() {
         let rows = [
-            ("identity", "<identity hash>"),
-            ("destination", "<destination hash>"),
-            ("instance", "<instance id>"),
+            ("user hash", "<user hash>"),
+            ("session hash", "<session hash>"),
+            ("session id", "<session id>"),
             ("interfaces[0]", "local rnsd at 127.0.0.1:37428  connected"),
             ("joined", "<age>"),
             ("last announce", "<age> (next in <span>)"),
@@ -15000,11 +15389,11 @@ mod tests {
     const INFO_SNAPSHOT: &str = r#"┌───────────────────┬──────────────────────────────────────────┐
 │ key               ┆ value                                    │
 ╞═══════════════════╪══════════════════════════════════════════╡
-│ identity          ┆ <identity hash>                          │
+│ user hash         ┆ <user hash>                              │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ destination       ┆ <destination hash>                       │
+│ session hash      ┆ <session hash>                           │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ instance          ┆ <instance id>                            │
+│ session id        ┆ <session id>                             │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ interfaces[0]     ┆ local rnsd at 127.0.0.1:37428  connected │
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
@@ -15883,11 +16272,11 @@ mod tests {
         )
         .plain();
         assert!(
-            text.starts_with(&format!("destination: {destination}\n")),
+            text.starts_with(&format!("session hash: {destination}\n")),
             "{text}"
         );
         assert!(text.contains("trust: trusted"), "{text}");
-        assert!(text.contains("knocked: no"), "{text}");
+        assert!(text.contains("asked to be trusted: no"), "{text}");
 
         let text = render_peer_detail(
             &destination,
@@ -15899,7 +16288,9 @@ mod tests {
         )
         .plain();
         assert!(
-            text.contains("knocked: unknown (knock cache unreadable)"),
+            text.contains(
+                "asked to be trusted: unknown (the list of requests to be trusted is unreadable)"
+            ),
             "{text}"
         );
 
@@ -15922,7 +16313,9 @@ mod tests {
             )
             .plain();
             assert!(
-                text.contains(&format!("trust: {label} (seen only in its knock)")),
+                text.contains(&format!(
+                    "trust: {label} (seen only in its request to be trusted)"
+                )),
                 "{text}"
             );
             assert_eq!(text.matches("trust:").count(), 1, "{text}");
@@ -15941,10 +16334,10 @@ mod tests {
             now,
         )
         .plain();
-        assert_eq!(text.matches("identity:").count(), 1, "{text}");
+        assert_eq!(text.matches("user hash:").count(), 1, "{text}");
         assert!(text.contains("name: Ann"), "{text}");
         assert!(
-            text.contains("knocked:") && text.contains("intro: hi"),
+            text.contains("asked to be trusted:") && text.contains("intro: hi"),
             "{text}"
         );
     }
@@ -16010,7 +16403,7 @@ mod tests {
             assert_eq!(
                 dot,
                 format!(
-                    "destination: {destination}\nidentity: {}\nname: .session\ntrust: untrusted (seen only in its knock)\nknocked: {age}, intro: .mesh access trust x\nNames and intros are peer-supplied text.",
+                    "session hash: {destination}\nuser hash: {}\nname: .session\ntrust: untrusted (seen only in its request to be trusted)\nasked to be trusted: {age}, intro: .mesh access trust x\nNames and intros are peer-supplied text.",
                     "ef".repeat(16)
                 )
             );
@@ -16413,7 +16806,7 @@ mod tests {
             indented_lines(blocks[0]),
             [
                 "not now",
-                "disposition: budget_exhausted (the peer's envoy is out of budget for this node; wait before asking again)",
+                "disposition: budget_exhausted (the peer's envoy is out of budget for you; wait before asking again)",
                 "retry after: 90 s",
             ],
             "{text}"
@@ -17564,7 +17957,7 @@ mod tests {
                             (".session:b", None),
                         ]),
                     ),
-                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `.mesh envoy dismiss --all` clears .session, and .session:a leaves `.mesh files requests` when it expires, and .session:b is a question this node asked, which no verb clears.",
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `.mesh envoy dismiss --all` clears .session, and .session:a leaves `.mesh files requests` when it expires, and .session:b is a question you asked, which no verb clears.",
                 ),
             ];
             for (refused, dot) in cases {
@@ -17591,7 +17984,7 @@ mod tests {
             );
             assert!(
                 slashed.ends_with(
-                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `/mesh envoy dismiss --all` clears .session, and .session:a leaves `/mesh files requests` when it expires, and .session:b is a question this node asked, which no verb clears."
+                    "'.session' is a whole pending id and also how .session:a, .session:b begin, so it cannot pick one; `/mesh envoy dismiss --all` clears .session, and .session:a leaves `/mesh files requests` when it expires, and .session:b is a question you asked, which no verb clears."
                 ),
                 "{slashed}"
             );
@@ -17624,13 +18017,13 @@ mod tests {
             vec![
                 (
                     no_open_question(".vault"),
-                    "No open question has id .vault. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.",
-                    "No open question has id .vault. `/mesh envoy questions` and `/mesh messaging sent` list the ones this node knows about.",
+                    "No open question has id .vault. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about.",
+                    "No open question has id .vault. `/mesh envoy questions` and `/mesh messaging sent` list the ones you know about.",
                 ),
                 (
                     asked_by_this_node(".vault"),
-                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
-                    ".vault is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh messaging sent` shows it until then.",
+                    ".vault is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
+                    ".vault is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh messaging sent` shows it until then.",
                 ),
                 (
                     access_not_a_question(".vault"),
@@ -17881,7 +18274,7 @@ mod tests {
             ];
             assert_eq!(
                 resolve_pending_id("q1", held).unwrap_err().to_string(),
-                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one; q1 leaves `.mesh files requests` when it expires, and q10 is a question this node asked, which no verb clears."
+                "'q1' is a whole pending id and also how q10 begins, so it cannot pick one; q1 leaves `.mesh files requests` when it expires, and q10 is a question you asked, which no verb clears."
             );
         }
 
@@ -18314,7 +18707,7 @@ mod tests {
         assert!(notice.contains("Sending"), "{notice}");
         assert!(notice.contains("abababab"), "{notice}");
         assert!(!notice.contains(&destination), "{notice}");
-        assert!(BROADCAST_NOTICE.contains("every peer this node trusts"));
+        assert!(BROADCAST_NOTICE.contains("every session you trust"));
         assert!(BROADCAST_NOTICE.contains("not trusted receive nothing"));
     }
 
@@ -19272,7 +19665,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh status \"ship the widget\"")).unwrap();
             assert_eq!(
                 out,
-                "Objective set to \"ship the widget\" for this session; peers that ask see it in this node's status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
+                "Objective set to \"ship the widget\" for this session; peers that ask see it in your status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
             );
         }
 
@@ -20530,7 +20923,7 @@ mod tests {
             let err = run_async(autostart(&mut ctx)).unwrap_err().to_string();
             assert_eq!(
                 err,
-                "Mesh needs a session: this node's destination is derived from an id kept in the session file. Run `.session <name>` first."
+                "Mesh needs a session: your address on the mesh comes from an id kept in the session file. Run `.session <name>` first."
             );
             assert!(ctx.app.mesh.get().is_none());
 
@@ -21018,7 +21411,7 @@ mod tests {
             );
             let out = stdout_lines().join("\n");
             assert!(
-                out.contains(&format!("Rotated the mesh identity: {old} -> {now}.")),
+                out.contains(&format!("Rotated your mesh key: {old} -> {now}.")),
                 "{out}"
             );
             assert!(out.contains("Predecessors recorded: 1."), "{out}");
@@ -21090,7 +21483,7 @@ mod tests {
                 assert_eq!(
                     text,
                     format!(
-                        "Trusted your own identity abababab as \"this node\", so your other sessions on this config dir can message this one; .mesh access revoke user {identity} takes the grant back."
+                        "Trusted your own user abababab as \"this node\", so your other sessions on this config dir can message this one; .mesh access revoke user {identity} takes the grant back."
                     )
                 );
                 assert!(text.is_ascii());
@@ -21127,7 +21520,7 @@ mod tests {
                 let out = stdout_lines().join("\n");
                 assert!(
                     out.contains(&format!(
-                        "Trusted the new identity {} as \"this node\", so your sessions on this config dir can message each other.",
+                        "Trusted the new key {} as \"this node\", so your sessions on this config dir can message each other.",
                         short(&new)
                     )),
                     "{out}"
@@ -21177,7 +21570,7 @@ mod tests {
                     assert!(
                         !fresh
                             .iter()
-                            .any(|line| line.starts_with("Trusted your own identity")),
+                            .any(|line| line.starts_with("Trusted your own user")),
                         "{fresh:?}"
                     );
                     relay_handle.abort();
@@ -21228,7 +21621,7 @@ mod tests {
                 let (dry_run, out) = rotate_twice(&mut ctx, &old);
 
                 assert!(
-                    dry_run.contains("retires the old identity's \"this node\" grant"),
+                    dry_run.contains("retires the old key's \"this node\" grant"),
                     "{dry_run}"
                 );
                 let new = current();
@@ -21248,7 +21641,7 @@ mod tests {
                 );
                 assert!(
                     out.contains(&format!(
-                        "Retired the old identity's \"this node\" grant and trusted the new identity {} as \"this node\" in its place",
+                        "Retired the old key's \"this node\" grant and trusted the new key {} as \"this node\" in its place",
                         short(&new)
                     )),
                     "{out}"
@@ -21272,13 +21665,10 @@ mod tests {
 
                 let (dry_run, out) = rotate_twice(&mut ctx, &old);
 
-                assert!(
-                    dry_run.contains("does not trust the new identity"),
-                    "{dry_run}"
-                );
+                assert!(dry_run.contains("does not trust the new key"), "{dry_run}");
                 assert!(dry_run.contains(".mesh access trust user"), "{dry_run}");
                 assert!(
-                    dry_run.contains("because the old identity holds no \"this node\" grant; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust user <the new hash the rotation prints>"),
+                    dry_run.contains("because the old key holds no \"this node\" grant; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust user <the new hash the rotation prints>"),
                     "{dry_run}"
                 );
                 let new = current();
@@ -21376,12 +21766,12 @@ mod tests {
                 };
                 assert_eq!(
                     rotation_self_trust_preview(blocked_old),
-                    "your own trust list keeps its entries and does not trust the new identity, because the old identity is blocked on it and so holds no \"this node\" grant to move; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust user <the new hash the rotation prints>"
+                    "your own trust list keeps its entries and does not trust the new key, because the old key is blocked on it and so holds no \"this node\" grant to move; to let your sessions on this config dir message each other after rotating, run .mesh on, then .mesh access trust user <the new hash the rotation prints>"
                 );
                 assert_eq!(
                     rotated_self_trust_text(&new, blocked_old),
                     format!(
-                        "The new identity abababab is not trusted, because the old identity was blocked on your trust list and so held no \"this node\" grant to move. To let your sessions on this config dir message each other, run .mesh on, then .mesh access trust user {new}."
+                        "The new key abababab is not trusted, because the old key was blocked on your trust list and so held no \"this node\" grant to move. To let your sessions on this config dir message each other, run .mesh on, then .mesh access trust user {new}."
                     )
                 );
                 let never_seeded = SelfTrustRotation {
@@ -21392,11 +21782,11 @@ mod tests {
                 };
                 assert_eq!(
                     rotation_self_trust_preview(never_seeded),
-                    "your own trust list keeps its entries and trusts the new identity as \"this node\", so your sessions on this config dir can message each other"
+                    "your own trust list keeps its entries and trusts the new key as \"this node\", so your sessions on this config dir can message each other"
                 );
                 assert_eq!(
                     rotated_self_trust_text(&new, never_seeded),
-                    "Trusted the new identity abababab as \"this node\", so your sessions on this config dir can message each other."
+                    "Trusted the new key abababab as \"this node\", so your sessions on this config dir can message each other."
                 );
                 assert_eq!(
                     rotated_self_trust_text(
@@ -21408,7 +21798,7 @@ mod tests {
                             blocked_new: false,
                         }
                     ),
-                    "Retired the old identity's \"this node\" grant; the new identity abababab already held a grant for all destinations, so your sessions on this config dir can message each other."
+                    "Retired the old key's \"this node\" grant; the new key abababab already held a grant for every session, so your sessions on this config dir can message each other."
                 );
             }
 
@@ -21427,12 +21817,12 @@ mod tests {
                     );
                     assert!(
                         text.contains(&format!(
-                            "new identity abababab is blocked on your trust list, so it was not trusted. To let your sessions on this config dir message each other, run .mesh on, then .mesh access unblock user {new} --yes and .mesh access trust user {new}."
+                            "new key abababab is blocked on your trust list, so it was not trusted. To let your sessions on this config dir message each other, run .mesh on, then .mesh access unblock user {new} --yes and .mesh access trust user {new}."
                         )),
                         "{text}"
                     );
                     assert_eq!(
-                        text.starts_with("Retired the old identity's \"this node\" grant"),
+                        text.starts_with("Retired the old key's \"this node\" grant"),
                         retired,
                         "{text}"
                     );
@@ -23393,9 +23783,9 @@ mod tests {
                         !out.starts_with("node:"),
                         "nothing says the node is off while it is on: {out}"
                     );
-                    assert_eq!(row("instance"), runtime.current_instance_id(), "{out}");
+                    assert_eq!(row("session id"), runtime.current_instance_id(), "{out}");
                     assert_eq!(
-                        row("destination"),
+                        row("session hash"),
                         runtime.current_destination_hash(),
                         "{out}"
                     );
@@ -23433,7 +23823,7 @@ mod tests {
                         .into_iter()
                         .map(|row| (row[0].clone(), row[1].clone()))
                         .collect();
-                    let first = rows.iter().position(|(key, _)| key == "identity").unwrap();
+                    let first = rows.iter().position(|(key, _)| key == "user hash").unwrap();
                     let last = rows
                         .iter()
                         .rposition(|(key, _)| key.starts_with("propagation_nodes"))
@@ -23443,9 +23833,9 @@ mod tests {
                         .iter()
                         .map(|(key, value)| {
                             let value = match key.as_str() {
-                                "identity" => "<identity hash>".to_string(),
-                                "destination" => "<destination hash>".to_string(),
-                                "instance" => "<instance id>".to_string(),
+                                "user hash" => "<user hash>".to_string(),
+                                "session hash" => "<session hash>".to_string(),
+                                "session id" => "<session id>".to_string(),
                                 "interfaces[0]" => {
                                     value.replacen(&live_label, "local rnsd at 127.0.0.1:37428", 1)
                                 }
@@ -23573,7 +23963,7 @@ mod tests {
                     let runtime = started.runtime.clone();
 
                     let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
-                    assert!(!has_info_row(&out, "identity predecessors"), "{out}");
+                    assert!(!has_info_row(&out, "earlier user hashes"), "{out}");
                     assert!(!has_info_row(&out, "key changes"), "{out}");
 
                     let path = identity::identity_path();
@@ -23596,7 +23986,7 @@ mod tests {
                     );
 
                     let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
-                    let predecessors = info_row(&out, "identity predecessors");
+                    let predecessors = info_row(&out, "earlier user hashes");
                     assert!(
                         predecessors
                             .starts_with(&format!("1 (latest {} rotated ", short(&retired))),
@@ -23605,13 +23995,13 @@ mod tests {
                     assert!(predecessors.ends_with("s ago)"), "{out}");
                     assert_eq!(
                         info_row(&out, "key changes"),
-                        "1 instance(s) announced under another identity; see .mesh people list",
+                        "1 session(s) announced under another user's key; see .mesh people list",
                         "{out}"
                     );
 
                     fs::write(identity::predecessors_path(&path), "not json\n").unwrap();
                     let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
-                    let row = info_row(&out, "identity predecessors");
+                    let row = info_row(&out, "earlier user hashes");
                     assert!(row.starts_with("unreadable: "), "{out}");
                     assert!(row.contains(identity::PREDECESSORS_FILE), "{out}");
                     assert!(
@@ -23644,7 +24034,7 @@ mod tests {
                     };
 
                     let rows = node_fact_rows(&runtime, Ok(&[]), now);
-                    for absent in ["identity predecessors", "key changes", "node", "selection"] {
+                    for absent in ["earlier user hashes", "key changes", "node", "selection"] {
                         assert!(
                             !keys(&rows).iter().any(|key| key == absent),
                             "a {absent} row with nothing to say: {rows:?}"
@@ -23660,7 +24050,7 @@ mod tests {
                     let rows = node_fact_rows(&runtime, Ok(&retired), now);
                     let predecessors = rows
                         .iter()
-                        .find(|(key, _)| key == "identity predecessors")
+                        .find(|(key, _)| key == "earlier user hashes")
                         .unwrap_or_else(|| panic!("{rows:?}"));
                     assert!(predecessors.1.starts_with("1 ("), "{rows:?}");
                     assert!(predecessors.1.ends_with("rotated 1m ago)"), "{rows:?}");
@@ -23689,10 +24079,10 @@ mod tests {
                         .iter()
                         .find(|(key, _)| key == "key changes")
                         .unwrap_or_else(|| panic!("{rows:?}"));
-                    assert!(key_changes.1.starts_with("1 instance(s)"), "{rows:?}");
+                    assert!(key_changes.1.starts_with("1 session(s)"), "{rows:?}");
                     assert!(key_changes.1.ends_with("see .mesh people list"), "{rows:?}");
                     assert!(
-                        !keys(&rows).iter().any(|key| key == "identity predecessors"),
+                        !keys(&rows).iter().any(|key| key == "earlier user hashes"),
                         "{rows:?}"
                     );
 
@@ -23742,7 +24132,7 @@ mod tests {
             }
 
             /// When both history rows have something to say they sit where the Commands
-            /// page puts them: `identity predecessors` right after `identity`, `key
+            /// page puts them: `earlier user hashes` right after `user hash`, `key
             /// changes` right after `last announce`, and the whole fact list reads in the
             /// fixed order. A predecessor file that cannot be read is reported in the same
             /// slot, never hidden as if nothing had been retired.
@@ -23788,10 +24178,10 @@ mod tests {
                     assert_eq!(
                         keys(&rows),
                         [
-                            "identity",
-                            "identity predecessors",
-                            "destination",
-                            "instance",
+                            "user hash",
+                            "earlier user hashes",
+                            "session hash",
+                            "session id",
                             "interfaces[0]",
                             "joined",
                             "last announce",
@@ -23808,17 +24198,17 @@ mod tests {
                     );
                     assert_eq!(
                         rows[7].1,
-                        "1 instance(s) announced under another identity; see .mesh people list",
+                        "1 session(s) announced under another user's key; see .mesh people list",
                         "{rows:?}"
                     );
 
                     let unreadable = anyhow!("permission denied");
                     let rows = node_fact_rows(&runtime, Err(&unreadable), now);
-                    assert_eq!(rows[0].0, "identity", "{rows:?}");
+                    assert_eq!(rows[0].0, "user hash", "{rows:?}");
                     assert_eq!(
                         rows[1],
                         (
-                            "identity predecessors".to_string(),
+                            "earlier user hashes".to_string(),
                             "unreadable: permission denied".to_string()
                         ),
                         "an unreadable predecessor file is reported in its slot: {rows:?}"
@@ -23903,9 +24293,9 @@ mod tests {
                     expected.extend(
                         [
                             "reach",
-                            "identity",
-                            "destination",
-                            "instance",
+                            "user hash",
+                            "session hash",
+                            "session id",
                             "interfaces[0]",
                             "joined",
                             "last announce",
@@ -23990,13 +24380,13 @@ mod tests {
                     let out = out_of(&mut ctx, ".mesh status").await.unwrap();
                     assert_eq!(
                         status_envoy_memory(&out),
-                        "0 conversations, 0 identities",
+                        "0 conversations, 0 users",
                         "{out}"
                     );
                     let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&out, "envoy memory"),
-                        "0 conversations, 0 identities",
+                        "0 conversations, 0 users",
                         "{out}"
                     );
 
@@ -24010,11 +24400,7 @@ mod tests {
                         )
                         .unwrap();
                     let out = out_of(&mut ctx, ".mesh status").await.unwrap();
-                    assert_eq!(
-                        status_envoy_memory(&out),
-                        "1 conversation, 1 identity",
-                        "{out}"
-                    );
+                    assert_eq!(status_envoy_memory(&out), "1 conversation, 1 user", "{out}");
 
                     store
                         .save(
@@ -24037,13 +24423,13 @@ mod tests {
                     let out = out_of(&mut ctx, ".mesh status").await.unwrap();
                     assert_eq!(
                         status_envoy_memory(&out),
-                        "3 conversations, 2 identities",
+                        "3 conversations, 2 users",
                         "{out}"
                     );
                     let out = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert_eq!(
                         info_row(&out, "envoy memory"),
-                        "3 conversations, 2 identities",
+                        "3 conversations, 2 users",
                         "{out}"
                     );
 
@@ -24111,7 +24497,7 @@ mod tests {
                     assert!(out.contains("added"), "{out}");
                     assert!(
                         out.contains(&format!(
-                            "trusted before as {old_dest} under another identity"
+                            "trusted before as {old_dest} under another user's key"
                         )),
                         "{out}"
                     );
@@ -24196,7 +24582,7 @@ mod tests {
                     assert!(out.contains("added"), "{out}");
                     assert!(
                         out.contains(&format!(
-                            "trusted before as {old_dest} under another identity; that record's key-change mark is cleared. The old key stays refused there; .mesh access unblock session {old_dest} lifts the block, .mesh access forget user {old_identity} erases the old key, the block on it included."
+                            "trusted before as {old_dest} under another user's key; that record's key-change mark is cleared. The old key stays refused there; .mesh access unblock session {old_dest} lifts the block, .mesh access forget user {old_identity} erases the old key, the block on it included."
                         )),
                         "{out}"
                     );
@@ -24403,7 +24789,7 @@ mod tests {
                     assert!(out.contains("added"), "{out}");
                     assert!(
                         out.contains(&format!(
-                            "trusted before as {old_dest} under another identity"
+                            "trusted before as {old_dest} under another user's key"
                         )),
                         "{out}"
                     );
@@ -25143,7 +25529,7 @@ mod tests {
                             );
                             assert!(
                                 out.lines()
-                                    .any(|line| line == format!("destination: {dest}")),
+                                    .any(|line| line == format!("session hash: {dest}")),
                                 "protection {protection}: {out}"
                             );
                         }
@@ -27827,7 +28213,8 @@ mod tests {
                         .map(|(_, text)| text)
                         .collect();
                     assert!(
-                        warned.iter().any(|line| line.contains("knock cache")),
+                        warned.iter().any(|line| line
+                            .contains("The list of requests to be trusted could not be read")),
                         "the unreadable cache is reported on stderr: {warned:?}"
                     );
 
@@ -28154,11 +28541,13 @@ mod tests {
                     let out = stdout_lines();
                     assert!(out.iter().any(|line| line.contains(&knocker)), "{out:?}");
                     assert!(out.iter().any(|line| line.contains("Kip")), "{out:?}");
-                    assert!(out.iter().any(|line| line.contains("knocked:")), "{out:?}");
                     assert!(
-                        out.iter()
-                            .flat_map(|text| text.lines())
-                            .any(|line| line == "trust: untrusted (seen only in its knock)"),
+                        out.iter().any(|line| line.contains("asked to be trusted:")),
+                        "{out:?}"
+                    );
+                    assert!(
+                        out.iter().flat_map(|text| text.lines()).any(|line| line
+                            == "trust: untrusted (seen only in its request to be trusted)"),
                         "{out:?}"
                     );
 
@@ -28167,7 +28556,8 @@ mod tests {
                         .unwrap();
                     assert!(
                         out.lines()
-                            .any(|line| line == "trust: known (seen only in its knock)"),
+                            .any(|line| line
+                                == "trust: known (seen only in its request to be trusted)"),
                         "{out}"
                     );
 
@@ -32723,7 +33113,7 @@ mod tests {
                     assert_eq!(
                         out,
                         format!(
-                            "Forgetting 1 remembered conversation of identity {}:\n  a-forked\nForgot 1 remembered conversation of identity {}.",
+                            "Forgetting 1 remembered conversation of user {}:\n  a-forked\nForgot 1 remembered conversation of user {}.",
                             short(&id_a),
                             short(&id_a)
                         )
@@ -37216,10 +37606,10 @@ mod tests {
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
-                        assert!(out.contains(&format!("destination: {to_a}")), "{out}");
+                        assert!(out.contains(&format!("session hash: {to_a}")), "{out}");
                         assert!(
                             out.contains(&format!(
-                                "identity: {}",
+                                "user hash: {}",
                                 fx.b.runtime.peers().get(&to_a).unwrap().identity_hash
                             )),
                             "{out}"
@@ -37329,7 +37719,7 @@ mod tests {
                         assert_eq!(
                             unanswered_path_request(&unheard),
                             format!(
-                                "{} did not answer a path request within 5 s: it is not on any interface this node joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
+                                "{} did not answer a path request within 5 s: it is not on any interface you joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
                                 short(&unheard)
                             )
                         );
@@ -37549,7 +37939,7 @@ mod tests {
                             .await
                             .unwrap();
                         assert!(out.contains(&fx.waiting_line()), "{out}");
-                        assert!(out.contains(&format!("destination: {to_a}")), "{out}");
+                        assert!(out.contains(&format!("session hash: {to_a}")), "{out}");
 
                         let peers = out_of(&mut fx.ctx, ".mesh people list").await.unwrap();
                         assert!(peers.contains(short(&to_a)), "{peers}");
@@ -43075,7 +43465,7 @@ mod tests {
                             return;
                         }
                         let sentence = format!(
-                            "The share root {} could not be probed, so this node serves nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
+                            "The share root {} could not be probed, so you serve nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
                             fx.root.path.display()
                         );
 
@@ -43180,7 +43570,7 @@ mod tests {
                             return;
                         }
                         let sentence = format!(
-                            "The share root {} could not be probed, so this node serves nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
+                            "The share root {} could not be probed, so you serve nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
                             fx.root.path.display()
                         );
 
@@ -46586,7 +46976,7 @@ mod tests {
                             assert_eq!(
                                 out.last().unwrap(),
                                 &format!(
-                                    "request {} to {dest}: granted, until a time this node cannot read: .mesh files fetch {dest} docs/a.md",
+                                    "request {} to {dest}: granted, until a time you cannot read: .mesh files fetch {dest} docs/a.md",
                                     short(&asked.id)
                                 )
                             );
@@ -46944,7 +47334,7 @@ mod tests {
                             lines,
                             [
                                 format!(
-                                    "Will write to {}: allow `src/x.rs`, `docs/y.md` for identity {}.",
+                                    "Will write to {}: allow `src/x.rs`, `docs/y.md` for user {}.",
                                     global.display(),
                                     short(&identity)
                                 ),
@@ -47105,7 +47495,7 @@ mod tests {
                         fs::write(root.join("docs/big.bin"), vec![0u8; 4_194_305]).unwrap();
                         fx.file("a-1", InboundKind::Access, &["docs/big.bin"]);
 
-                        let expected = "`docs/big.bin` would not be served even once granted (it is 4.2 MB and this node serves at most 4194304 bytes); refuse the request with `.mesh files refuse a-1`, or lift the rule first.";
+                        let expected = "`docs/big.bin` would not be served even once granted (it is 4.2 MB and you serve at most 4194304 bytes); refuse the request with `.mesh files refuse a-1`, or lift the rule first.";
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant a-1").await,
@@ -47262,7 +47652,7 @@ mod tests {
                         assert!(fx.pending_ids().is_empty());
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant a-1").await,
-                            "No open access request has id a-1. `.mesh files requests` lists the ones this node knows about."
+                            "No open access request has id a-1. `.mesh files requests` lists the ones you know about."
                         );
                         fx.stop().await;
                     });
@@ -47432,11 +47822,11 @@ mod tests {
                             ),
                             (
                                 ".mesh files grant a-9",
-                                "No open access request has id a-9. `.mesh files requests` lists the ones this node knows about.".to_string(),
+                                "No open access request has id a-9. `.mesh files requests` lists the ones you know about.".to_string(),
                             ),
                             (
                                 ".mesh files refuse a-9",
-                                "No open access request has id a-9. `.mesh files requests` lists the ones this node knows about.".to_string(),
+                                "No open access request has id a-9. `.mesh files requests` lists the ones you know about.".to_string(),
                             ),
                             (
                                 ".mesh files refuse a-1 --yes",
@@ -47694,7 +48084,7 @@ mod tests {
                         ] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "No open access request has id a-1. `.mesh files requests` lists the ones this node knows about.",
+                                "No open access request has id a-1. `.mesh files requests` lists the ones you know about.",
                                 "{line}"
                             );
                         }
@@ -48107,7 +48497,7 @@ mod tests {
                             out.lines()
                                 .next()
                                 .unwrap()
-                                .contains(&format!("for identity {}.", short(&b_identity))),
+                                .contains(&format!("for user {}.", short(&b_identity))),
                             "{out}"
                         );
                         assert!(locations.workspace.exists());
@@ -48614,7 +49004,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant 320b8f7b").await,
                             format!(
-                                "{SECOND} is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
+                                "{SECOND} is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
                             )
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -48638,7 +49028,7 @@ mod tests {
                             refusal(&mut fx.ctx, &format!(".mesh envoy answer {SECOND} \"x\""))
                                 .await,
                             format!(
-                                "{SECOND} is a question this node asked, not one escalated to you; follow up on it with `.mesh messaging follow-up {SECOND} \"<text>\"`."
+                                "{SECOND} is a question you asked, not one escalated to you; follow up on it with `.mesh messaging follow-up {SECOND} \"<text>\"`."
                             )
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -48659,7 +49049,7 @@ mod tests {
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh messaging follow-up q-1 \"x\"").await,
-                            "q-1 is a question a peer escalated to you, not one this node asked; answer it with `.mesh envoy answer q-1 \"<text>\"`."
+                            "q-1 is a question a peer escalated to you, not one you asked; answer it with `.mesh envoy answer q-1 \"<text>\"`."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert_eq!(fx.pending_ids(), ["q-1"]);
@@ -48821,7 +49211,7 @@ mod tests {
                         let before = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh envoy dismiss p1").await,
-                            "No open question has id p1. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
+                            "No open question has id p1. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
                         );
                         assert_eq!(stdout_lines().len(), before, "nothing printed");
                         fx.stop().await;
@@ -48897,7 +49287,7 @@ mod tests {
                         for line in [".mesh envoy dismiss q1", ".mesh envoy dismiss q1 --silent"] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "q1 is a question this node asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
+                                "q1 is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
                                 "{line}"
                             );
                         }
@@ -49044,7 +49434,7 @@ mod tests {
                             .unwrap();
                         assert_eq!(
                             out,
-                            "No open questions to dismiss; `.mesh envoy questions` lists what this node knows about."
+                            "No open questions to dismiss; `.mesh envoy questions` lists what you know about."
                         );
 
                         fx.file("p3", InboundKind::Question, &[]);
@@ -49636,7 +50026,7 @@ mod tests {
 
                         assert_eq!(
                             err,
-                            "No open question has id old-q. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
+                            "No open question has id old-q. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
                         );
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         assert!(
@@ -49668,7 +50058,7 @@ mod tests {
 
                         assert_eq!(
                             err,
-                            "No open access request has id old-a. `.mesh files requests` lists the ones this node knows about."
+                            "No open access request has id old-a. `.mesh files requests` lists the ones you know about."
                         );
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         assert!(
@@ -49800,12 +50190,12 @@ mod tests {
                         };
                         let no_question = |id: &str| {
                             format!(
-                                "No open question has id {id}. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about."
+                                "No open question has id {id}. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
                             )
                         };
                         let no_access = |id: &str| {
                             format!(
-                                "No open access request has id {id}. `.mesh files requests` lists the ones this node knows about."
+                                "No open access request has id {id}. `.mesh files requests` lists the ones you know about."
                             )
                         };
                         let cases: [(&str, InboundKind, String, String); 5] = [
@@ -50653,8 +51043,8 @@ mod tests {
                             fx.stop().await;
                             return;
                         }
-                        let no_access = "No open access request has id old-a. `.mesh files requests` lists the ones this node knows about.";
-                        let no_question = "No open question has id old-q. `.mesh envoy questions` and `.mesh messaging sent` list the ones this node knows about.";
+                        let no_access = "No open access request has id old-a. `.mesh files requests` lists the ones you know about.";
+                        let no_question = "No open question has id old-q. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about.";
                         let cases = [
                             (".mesh files grant old-a", no_access),
                             (".mesh files refuse old-a", no_access),
@@ -52222,7 +52612,7 @@ mod tests {
                         let printed = stdout_lines().len();
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
-                            "`big.bin` is 2 KB and this node serves at most 2048 bytes by reference; nothing was sent."
+                            "`big.bin` is 2 KB and you serve at most 2048 bytes by reference; nothing was sent."
                         );
                         assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -52289,7 +52679,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`past.bin` is 4.2 MB and this node serves at most {max_bytes} bytes by reference; nothing was sent."
+                                "`past.bin` is 4.2 MB and you serve at most {max_bytes} bytes by reference; nothing was sent."
                             )
                         );
                         assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
@@ -52325,11 +52715,11 @@ mod tests {
                         for (args, expected) in [
                             (
                                 "--attach docs/private.md",
-                                "`docs/private.md` would travel as a reference, which this node would not serve (a deny rule names it); lift the rule first; nothing was sent.",
+                                "`docs/private.md` would travel as a reference, which you would not serve (a deny rule names it); lift the rule first; nothing was sent.",
                             ),
                             (
                                 "--attach .env --force",
-                                "`.env` would travel as a reference, which this node would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
+                                "`.env` would travel as a reference, which you would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
                             ),
                         ] {
                             let line = format!(".mesh messaging send {to} --yes \"x\" {args}");
@@ -53257,7 +53647,7 @@ mod tests {
                                 .await;
                         assert_eq!(
                             err,
-                            "`big.bin` is 2 KB and this node serves at most 2048 bytes by reference; nothing was sent."
+                            "`big.bin` is 2 KB and you serve at most 2048 bytes by reference; nothing was sent."
                         );
                         assert_eq!(&stdout_lines()[printed..], &[] as &[String]);
 
@@ -53839,7 +54229,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. This was answered from your own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -53857,7 +54247,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from this node's own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
+                                "`docs/a.md` was a one-time attachment from {dest} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from your own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -54003,7 +54393,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest8} if you need a fresh copy. This was answered from this node's own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest8}.",
+                                "`docs/a.md` was a one-time attachment from {dest8} and this node already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest8} if you need a fresh copy. This was answered from your own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest8}.",
                                 dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"
@@ -55323,8 +55713,7 @@ mod tests {
 
             #[cfg(unix)]
             fn all_question() -> String {
-                "Forget 3 remembered conversations of 2 identities? This cannot be undone."
-                    .to_string()
+                "Forget 3 remembered conversations of 2 users? This cannot be undone.".to_string()
             }
 
             fn all_rows() -> [String; 2] {
@@ -55383,7 +55772,7 @@ mod tests {
                         assert_eq!(
                             out.lines().collect::<Vec<_>>(),
                             [
-                                "Would forget 3 remembered conversations of 2 identities:",
+                                "Would forget 3 remembered conversations of 2 users:",
                                 row_a.as_str(),
                                 row_b.as_str(),
                                 DRY_RUN_NOTHING_CHANGED,
@@ -55430,10 +55819,10 @@ mod tests {
                         assert_eq!(
                             out.lines().collect::<Vec<_>>(),
                             [
-                                "Forgetting 3 remembered conversations of 2 identities:",
+                                "Forgetting 3 remembered conversations of 2 users:",
                                 row_a.as_str(),
                                 row_b.as_str(),
-                                "Forgot 3 remembered conversations of 2 identities (4 records across the instance stores).",
+                                "Forgot 3 remembered conversations of 2 users (4 records across your sessions' stores).",
                             ],
                             "the count the operator confirmed is the one reported; a thread two instances remember is one conversation held in two records: {out}"
                         );
@@ -55503,7 +55892,7 @@ mod tests {
                         assert_eq!(
                             out,
                             format!(
-                                "Would forget the remembered thread 'a-first' of identity {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
+                                "Would forget the remembered thread 'a-first' of user {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
                             )
                         );
                         let out = out_of(
@@ -55515,7 +55904,7 @@ mod tests {
                         assert_eq!(
                             out,
                             format!(
-                                "Would forget 2 remembered conversations of identity {short_a}:\n  a-first\n  a-second\n{DRY_RUN_NOTHING_CHANGED}"
+                                "Would forget 2 remembered conversations of user {short_a}:\n  a-first\n  a-second\n{DRY_RUN_NOTHING_CHANGED}"
                             )
                         );
                         assert_eq!(remembered(&cache_dir), seeded());
@@ -55531,9 +55920,7 @@ mod tests {
                         .unwrap();
                         assert_eq!(
                             out,
-                            format!(
-                                "Forgot the remembered thread 'a-second' of identity {short_a}."
-                            ),
+                            format!("Forgot the remembered thread 'a-second' of user {short_a}."),
                             "the identity is taken in either case"
                         );
                         assert_eq!(
@@ -55551,7 +55938,7 @@ mod tests {
                         assert_eq!(
                             out,
                             format!(
-                                "Forgetting 1 remembered conversation of identity {short_a}:\n  a-first\nForgot 1 remembered conversation of identity {short_a} (2 records across the instance stores)."
+                                "Forgetting 1 remembered conversation of user {short_a}:\n  a-first\nForgot 1 remembered conversation of user {short_a} (2 records across your sessions' stores)."
                             ),
                             "a-first was in both stores, which is still the one conversation that was confirmed"
                         );
@@ -55590,7 +55977,7 @@ mod tests {
                         out.lines().last(),
                         Some(
                             format!(
-                                "Forgot 2 remembered conversations of identity {} (3 records across the instance stores).",
+                                "Forgot 2 remembered conversations of user {} (3 records across your sessions' stores).",
                                 short(ID_A)
                             )
                             .as_str()
@@ -55633,11 +56020,8 @@ mod tests {
                 assert_eq!(
                     out.lines().last(),
                     Some(
-                        format!(
-                            "Forgot 1 remembered conversation of identity {}.",
-                            short(ID_B)
-                        )
-                        .as_str()
+                        format!("Forgot 1 remembered conversation of user {}.", short(ID_B))
+                            .as_str()
                     ),
                     "{out}"
                 );
@@ -55682,7 +56066,7 @@ mod tests {
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
-                        "Would forget 3 remembered conversations of 2 identities:",
+                        "Would forget 3 remembered conversations of 2 users:",
                         row_a.as_str(),
                         row_b.as_str(),
                         DRY_RUN_NOTHING_CHANGED,
@@ -55709,11 +56093,11 @@ mod tests {
                     ),
                     (
                         format!(".mesh envoy memory forget {ID_A}"),
-                        format!("The envoy remembers nothing of identity {short_a}."),
+                        format!("The envoy remembers nothing of user {short_a}."),
                     ),
                     (
                         format!(".mesh envoy memory forget {ID_A} a-first"),
-                        format!("The envoy remembers no thread 'a-first' of identity {short_a}."),
+                        format!("The envoy remembers no thread 'a-first' of user {short_a}."),
                     ),
                 ] {
                     let out = run_async(out_of(&mut ctx, &line)).unwrap();
@@ -55762,7 +56146,7 @@ mod tests {
                         &format!(".mesh envoy memory forget {ID_A} \"bad thread!\"")
                     ),
                     format!(
-                        "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh envoy memory forget <identity> --dry-run` lists them. {usage}"
+                        "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh envoy memory forget <user> --dry-run` lists them. {usage}"
                     )
                 );
                 run_async(run(&mut ctx, ".mesh envoy memory forget")).unwrap();
@@ -56015,11 +56399,8 @@ mod tests {
                     assert_eq!(
                         out.lines().last(),
                         Some(
-                            format!(
-                                "Forgot 1 remembered conversation of identity {}.",
-                                short(ID_A)
-                            )
-                            .as_str()
+                            format!("Forgot 1 remembered conversation of user {}.", short(ID_A))
+                                .as_str()
                         ),
                         "{out}"
                     );
@@ -56068,7 +56449,7 @@ mod tests {
                     assert_eq!(
                         out,
                         format!(
-                            "Would forget the remembered thread 'a-first' of identity {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
+                            "Would forget the remembered thread 'a-first' of user {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
                         ),
                         "a dry run writes nothing, so nothing is refused"
                     );
@@ -56100,7 +56481,7 @@ mod tests {
                     assert_eq!(
                         out.lines().collect::<Vec<_>>(),
                         [
-                            "Forgetting 3 remembered conversations of 2 identities:",
+                            "Forgetting 3 remembered conversations of 2 users:",
                             row_a.as_str(),
                             row_b.as_str(),
                             "Forgot 1 record, but 2 remembered conversations could not be forgotten; see the log for the store that refused, then run .mesh envoy memory forget all again.",
@@ -56121,7 +56502,7 @@ mod tests {
                         run_async(out_of(&mut ctx, ".mesh envoy memory forget all --yes")).unwrap();
                     assert_eq!(
                         out.lines().last(),
-                        Some("Forgot 2 remembered conversations of 2 identities."),
+                        Some("Forgot 2 remembered conversations of 2 users."),
                         "two records are two conversations, so no record-count suffix: {out}"
                     );
                     assert!(remembered(&cache_dir).is_empty());
@@ -56154,7 +56535,7 @@ mod tests {
                 assert_eq!(
                     out.lines().next(),
                     Some(
-                        "Would forget 3 remembered conversations of 2 identities and 1 record file that no index names:"
+                        "Would forget 3 remembered conversations of 2 users and 1 record file that no index names:"
                     ),
                     "an unindexed record is counted as a record file, not a conversation: {out}"
                 );
@@ -56169,7 +56550,7 @@ mod tests {
                         out.lines().last(),
                         Some(
                             format!(
-                                "Forgot 2 remembered conversations of identity {} (3 records across the instance stores).",
+                                "Forgot 2 remembered conversations of user {} (3 records across your sessions' stores).",
                                 short(ID_A)
                             )
                             .as_str()
@@ -56186,7 +56567,7 @@ mod tests {
                 assert_eq!(
                     out.lines().last(),
                     Some(
-                        "Forgot 1 remembered conversation of 1 identity and 1 record file that no index names."
+                        "Forgot 1 remembered conversation of 1 user and 1 record file that no index names."
                     ),
                     "{out}"
                 );
@@ -56229,7 +56610,7 @@ mod tests {
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
-                        "Would forget 3 remembered conversations of 2 identities and 1 store whose index cannot be read:",
+                        "Would forget 3 remembered conversations of 2 users and 1 store whose index cannot be read:",
                         row_a.as_str(),
                         row_b.as_str(),
                         DRY_RUN_NOTHING_CHANGED,
@@ -56245,7 +56626,7 @@ mod tests {
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
-                        format!("Would forget 2 remembered conversations of identity {short_a}:")
+                        format!("Would forget 2 remembered conversations of user {short_a}:")
                             .as_str(),
                         "  a-first",
                         "  a-second",
@@ -56265,7 +56646,7 @@ mod tests {
                         [
                             note,
                             format!(
-                                "Forgot 2 remembered conversations of identity {short_a} (3 records across the instance stores)."
+                                "Forgot 2 remembered conversations of user {short_a} (3 records across your sessions' stores)."
                             )
                             .as_str(),
                         ],
@@ -56286,7 +56667,7 @@ mod tests {
                 assert_eq!(
                     out.lines().last(),
                     Some(
-                        "Forgot 1 remembered conversation of 1 identity and 1 store whose index cannot be read (2 records across the instance stores)."
+                        "Forgot 1 remembered conversation of 1 user and 1 store whose index cannot be read (2 records across your sessions' stores)."
                     ),
                     "the unread store's record file is counted among the records: {out}"
                 );
@@ -56326,7 +56707,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(
                     out,
-                    format!("The envoy remembers nothing of identity {}.", short(ID_A)),
+                    format!("The envoy remembers nothing of user {}.", short(ID_A)),
                     "a record no index names is nobody's conversation"
                 );
 
@@ -56384,7 +56765,7 @@ mod tests {
                 assert_eq!(
                     out,
                     format!(
-                        "The envoy remembers nothing of identity {short_b} in the stores that can be read.\n{note}"
+                        "The envoy remembers nothing of user {short_b} in the stores that can be read.\n{note}"
                     )
                 );
 
@@ -56396,7 +56777,7 @@ mod tests {
                 assert_eq!(
                     out,
                     format!(
-                        "The envoy remembers no thread 'x' of identity {short_b} in the stores that can be read.\n{note}"
+                        "The envoy remembers no thread 'x' of user {short_b} in the stores that can be read.\n{note}"
                     ),
                     "nothing is asked or written, --yes or not"
                 );
@@ -56482,7 +56863,7 @@ mod tests {
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
-                        "Would forget 3 remembered conversations of 2 identities, 1 record file that no index names and 1 store whose index cannot be read:",
+                        "Would forget 3 remembered conversations of 2 users, 1 record file that no index names and 1 store whose index cannot be read:",
                         row_a.as_str(),
                         row_b.as_str(),
                         DRY_RUN_NOTHING_CHANGED,
@@ -56494,7 +56875,7 @@ mod tests {
                 let last = out.lines().last().unwrap_or_default();
                 assert!(
                     last.starts_with(
-                        "Forgot 3 remembered conversations of 2 identities, 1 record file that no index names and 1 store whose index cannot be read"
+                        "Forgot 3 remembered conversations of 2 users, 1 record file that no index names and 1 store whose index cannot be read"
                     ),
                     "{out}"
                 );
@@ -56535,10 +56916,8 @@ mod tests {
                 assert_eq!(
                     out.lines().collect::<Vec<_>>(),
                     [
-                        format!(
-                            "Would forget the remembered thread 'a-first' of identity {short_a}."
-                        )
-                        .as_str(),
+                        format!("Would forget the remembered thread 'a-first' of user {short_a}.")
+                            .as_str(),
                         note,
                         DRY_RUN_NOTHING_CHANGED,
                     ],
@@ -56554,7 +56933,7 @@ mod tests {
                     out.lines().collect::<Vec<_>>(),
                     [
                         format!(
-                            "Forgot the remembered thread 'a-first' of identity {short_a} (2 records across the instance stores)."
+                            "Forgot the remembered thread 'a-first' of user {short_a} (2 records across your sessions' stores)."
                         )
                         .as_str(),
                         note,
@@ -56638,7 +57017,7 @@ mod tests {
                     assert_eq!(
                         out.lines().collect::<Vec<_>>(),
                         [
-                            "Would forget 3 remembered conversations of 2 identities:",
+                            "Would forget 3 remembered conversations of 2 users:",
                             row_a.as_str(),
                             row_b.as_str(),
                             DRY_RUN_NOTHING_CHANGED,
@@ -56651,7 +57030,7 @@ mod tests {
                     assert_eq!(
                         out.lines().last(),
                         Some(
-                            "Forgot 3 remembered conversations of 2 identities (4 records across the instance stores)."
+                            "Forgot 3 remembered conversations of 2 users (4 records across your sessions' stores)."
                         ),
                         "{out}"
                     );

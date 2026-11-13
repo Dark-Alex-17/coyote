@@ -19027,6 +19027,57 @@ mod tests {
         use super::*;
         use crate::mesh::trust::IdentityStanding;
 
+        /// A silence is worded for a line that reaches the model outside a fence, so it
+        /// names the session by your own names or its hashes: the user and session names
+        /// the peer advertised, which the REPL's namer does show, never reach the sentence
+        /// or its `next_action`.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn no_answer_never_names_the_peer_by_the_names_it_advertised() {
+            let started = started_runtime("node-no-answer-advertised").await;
+            let runtime = started.runtime.clone();
+            let identity = hex_lower(&[0x31; 16]);
+            let origin = [3u8; NAME_HASH_LEN];
+            let destination =
+                destination_address(&origin, &parse_hash(&identity).unwrap()).to_hex_string();
+            runtime.peers().observe(
+                PeerSighting {
+                    destination_hash: destination.clone(),
+                    identity_hash: identity.clone(),
+                    name_hash: hex_lower(&origin),
+                    public_key: None,
+                    display_name: None,
+                    protocol_version: MESH_PROTOCOL_VERSION,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            let advertised = ["Zephyrine", "quasar-desk"];
+            assert!(
+                runtime
+                    .trust()
+                    .record_advertised(
+                        &identity,
+                        &destination,
+                        Some(advertised[0]),
+                        Some(advertised[1])
+                    )
+                    .unwrap()
+            );
+            let shown = runtime.who_at(&destination).to_string();
+            assert_eq!(shown, format!("{} / {}", advertised[0], advertised[1]));
+
+            let no_answer = runtime.no_answer(&destination);
+            for text in [no_answer.to_string(), no_answer.next_action()] {
+                for name in advertised {
+                    assert!(!text.contains(name), "{name} reached the silence: {text}");
+                }
+                assert!(text.contains(short(&destination)), "{text}");
+            }
+
+            runtime.shutdown().await.unwrap();
+            started.relay_handle.abort();
+        }
+
         /// Your named sessions come first in destination order, then `you`, then each
         /// user's and session's name; a user carries every session the peer table proves
         /// is theirs and every one the trust list bound to them, even once its row aged
