@@ -290,7 +290,9 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             description: format!(
                 "Read the messages and bulletins trusted sessions have sent this session that you \
                  have not read yet, oldest first, grouped under `threads` by sender and thread, plus the ids of \
-                 answered questions still awaiting mesh__collect. Each message and thread names its sender \
+                 answered questions still awaiting mesh__collect, and under `escalated` your open questions \
+                 and messages whose peer has asked its human, each with its `id` and `kind` (`ask` or \
+                 `message`; only an ask is collected). Each message and thread names its sender \
                  by `from` (the session hash to answer), `user` and `session`. \
                  Reading takes nothing from the user, who keeps their own view of the inbox. \
                  To answer a message with `kind: \"ask\"`, call mesh__send to its `from` with its \
@@ -1615,10 +1617,10 @@ fn handle_check_inbox(slot: &MeshSlot) -> Value {
         .filter(|correlation| correlation.reply.is_some())
         .map(|correlation| correlation.record.id.as_str())
         .collect();
-    let escalated: Vec<&str> = correlations
+    let escalated: Vec<Value> = correlations
         .iter()
         .filter(|correlation| correlation.record.state == PendingState::Escalated)
-        .map(|correlation| correlation.record.id.as_str())
+        .map(|correlation| json!({ "id": correlation.record.id, "kind": correlation.record.kind }))
         .collect();
     let mut result = json!({
         "messages": messages,
@@ -4224,6 +4226,32 @@ mod tests {
         assert!(slot.correlations().is_open("m1"), "collect closes nothing");
     }
 
+    #[test]
+    fn check_inbox_tags_each_escalated_id_with_its_kind() {
+        let slot = MeshSlot::default();
+        open_question(&slot, "q1");
+        open_correlation(&slot, "m1", CorrelationKind::Message);
+        for id in ["q1", "m1"] {
+            slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+                disposition: Some(Disposition::Escalated),
+                ..raw_message(PeerKind::Reply, &format!("r-{id}"), Some(id))
+            }));
+        }
+
+        let mut escalated = handle_check_inbox(&slot)["escalated"]
+            .as_array()
+            .unwrap()
+            .clone();
+        escalated.sort_by_key(|entry| entry["id"].to_string());
+        assert_eq!(
+            escalated,
+            vec![
+                json!({"id": "m1", "kind": "message"}),
+                json!({"id": "q1", "kind": "ask"}),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn collect_reports_escalated_for_an_escalated_question() {
         let ctx = plain_ctx();
@@ -4258,7 +4286,10 @@ mod tests {
             slot.correlations().get("q1").unwrap().record.state,
             PendingState::Escalated
         );
-        assert_eq!(handle_check_inbox(&slot)["escalated"], json!(["q1"]));
+        assert_eq!(
+            handle_check_inbox(&slot)["escalated"],
+            json!([{"id": "q1", "kind": "ask"}])
+        );
     }
 
     /// The realistic order: the asker is already blocked in `mesh__collect`
@@ -4359,7 +4390,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(escalated["status"], "escalated", "{escalated}");
-        assert_eq!(handle_check_inbox(&slot)["escalated"], json!(["q1"]));
+        assert_eq!(
+            handle_check_inbox(&slot)["escalated"],
+            json!([{"id": "q1", "kind": "ask"}])
+        );
 
         slot.deliver_peer(PeerMessage::new(RawPeerMessage {
             disposition: Some(Disposition::BudgetExhausted),
@@ -4555,14 +4589,14 @@ mod tests {
             "{inbox}"
         );
         assert_eq!(inbox["messages"][1]["payload"]["thread"], "m1");
-        assert_eq!(inbox["escalated"], json!(["q1"]));
+        assert_eq!(inbox["escalated"], json!([{"id": "q1", "kind": "ask"}]));
         assert_eq!(inbox["answered_awaiting_collect"], json!([]));
 
         let again = handle_check_inbox(&slot);
         assert_eq!(again["threads"], json!([]));
         assert_eq!(
             again["escalated"],
-            json!(["q1"]),
+            json!([{"id": "q1", "kind": "ask"}]),
             "still asked of the human"
         );
     }
@@ -10995,7 +11029,14 @@ mod tests {
             let mut both = ids.clone();
             both.sort();
             let both: Vec<String> = both.iter().map(|id| json!(id).to_string()).collect();
-            assert_eq!(sorted_ids(&inbox["escalated"]), both, "{inbox}");
+            let escalated_ids: Vec<Value> = inbox["escalated"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .inspect(|entry| assert_eq!(entry["kind"], "ask", "{inbox}"))
+                .map(|entry| entry["id"].clone())
+                .collect();
+            assert_eq!(sorted_ids(&json!(escalated_ids)), both, "{inbox}");
             assert_eq!(inbox["answered_awaiting_collect"], json!([]), "{inbox}");
             for id in &ids {
                 let waited = handle_mesh_tool(

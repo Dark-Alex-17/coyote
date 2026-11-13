@@ -8519,7 +8519,11 @@ mod tests {
         })
         .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
-        assert_eq!(inbox["escalated"], json!([id]), "{inbox}");
+        assert_eq!(
+            inbox["escalated"],
+            json!([{"id": id, "kind": "ask"}]),
+            "{inbox}"
+        );
         assert_eq!(inbox["count"], 1, "{inbox}");
         let notice = &inbox["messages"][0]["payload"];
         assert_eq!(notice["kind"], "reply", "{inbox}");
@@ -8688,7 +8692,11 @@ mod tests {
         })
         .await;
         let inbox = peer.tool("check_inbox", json!({})).await;
-        assert_eq!(inbox["escalated"], json!([id]), "{inbox}");
+        assert_eq!(
+            inbox["escalated"],
+            json!([{"id": id, "kind": "ask"}]),
+            "{inbox}"
+        );
         assert_eq!(inbox["count"], 1, "{inbox}");
         let notice = &inbox["messages"][0]["payload"];
         assert_eq!(notice["kind"], "reply", "{inbox}");
@@ -9568,7 +9576,7 @@ mod tests {
         );
         assert_eq!(
             inbox["escalated"],
-            json!([id]),
+            json!([{"id": id, "kind": "ask"}]),
             "the question stays escalated after the escalation message: {inbox}"
         );
         assert!(!runner.holds(&id));
