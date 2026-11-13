@@ -4429,13 +4429,17 @@ mod tests {
         slot.deliver_peer(peer_message(PeerKind::Message, "m3", None));
         open_question(&slot, "q1");
         open_question(&slot, "q2");
-        assert!(slot.correlations().answer(
-            "q1",
-            PeerMessage::new(RawPeerMessage {
-                disposition: Some(Disposition::Escalated),
-                ..raw_message(PeerKind::Reply, "r1", Some("q1"))
-            })
-        ));
+        assert!(
+            slot.correlations()
+                .answer(
+                    "q1",
+                    PeerMessage::new(RawPeerMessage {
+                        disposition: Some(Disposition::Escalated),
+                        ..raw_message(PeerKind::Reply, "r1", Some("q1"))
+                    })
+                )
+                .is_some()
+        );
 
         let inbox = handle_check_inbox(&slot);
         assert_eq!(inbox["count"], 3);

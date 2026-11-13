@@ -48,8 +48,8 @@ use crate::mesh::peers::{
     PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
-    Correlations, InboundKind, InboundRecord, InboundStore, OtherSessionAsk, PendingRecord,
-    PendingStore, access_not_a_question, other_sessions_asked,
+    Answered, CorrelationKind, Correlations, InboundKind, InboundRecord, InboundStore,
+    OtherSessionAsk, PendingRecord, PendingStore, access_not_a_question, other_sessions_asked,
 };
 use crate::mesh::people::{Namer, People, Who, YOU};
 use crate::mesh::propagation::{
@@ -5090,7 +5090,8 @@ impl MeshSlot {
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
         self.remember_received_thread(message.thread());
-        let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
+        let for_envoy =
+            answered.is_none() && envoy_bound(message.kind, message.in_reply_to.as_deref());
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
         let received = ReceivedFacts::of(&message);
         let routed = match envoy {
@@ -5349,7 +5350,7 @@ impl MeshSlot {
         let identity = original.source_identity.clone();
         let destination = original.source_destination.clone();
         let via = original.via;
-        self.deliver_to_inbox(original, false);
+        self.deliver_to_inbox(original, None);
         let who = || self.who(&identity, &destination);
         self.surface_refusal(&identity, refusal, who, RefusalPath::Filed(via));
     }
@@ -5586,7 +5587,7 @@ impl MeshSlot {
             ),
         );
         let id8 = short(&original.source_identity).to_string();
-        self.file_in_inbox(original, false);
+        self.file_in_inbox(original, None);
         self.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(id8),
@@ -5928,16 +5929,16 @@ impl MeshSlot {
         });
     }
 
-    /// Matches a reply to the question of ours it answers; a reply that named no thread
-    /// inherits the question's, on the filed answer and the delivered copy alike, but
-    /// only once `answer` has taken it. A reply that answers nothing is downgraded to a
-    /// message, since to this node it is one, and sheds the thread, disposition and
-    /// retry hint a reply earns and a message cannot carry; `true` when it matched. An
-    /// escalated reply matches without closing the question, so a pending access
-    /// request it names stays filed for the decision that follows.
-    fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
+    /// Matches a reply to the question or message of ours it answers; a reply that named
+    /// no thread inherits the correlation's, on the filed answer and the delivered copy
+    /// alike, but only once `answer` has taken it. A reply that answers nothing is
+    /// downgraded to a message, since to this node it is one, and sheds the thread,
+    /// disposition and retry hint a reply earns and a message cannot carry; `Some` says
+    /// what the match did. An escalated reply matches without closing the question, so
+    /// a pending access request it names stays filed for the decision that follows.
+    fn answer_correlation(&self, message: &mut PeerMessage) -> Option<Answered> {
         if message.kind != PeerKind::Reply {
-            return false;
+            return None;
         }
         let answered = match message.in_reply_to.as_deref() {
             Some(id) => {
@@ -5947,7 +5948,7 @@ impl MeshSlot {
                 }
                 let thread = reply.thread.clone();
                 let answered = self.correlations.answer(id, reply);
-                if answered {
+                if answered.is_some() {
                     message.thread = thread;
                     if message.disposition() != Disposition::Escalated
                         && let Some(runtime) = self.get()
@@ -5957,9 +5958,9 @@ impl MeshSlot {
                 }
                 answered
             }
-            None => false,
+            None => None,
         };
-        if !answered {
+        if answered.is_none() {
             debug!(
                 "Mesh reply {} from {} answers no open question of ours; delivering it as a message",
                 message.message_id,
@@ -6092,10 +6093,10 @@ impl MeshSlot {
     /// The inbox path: the message lands in the inbox, the model is told what arrived
     /// and what to call, and the person at the keyboard gets one line. The id in the
     /// model's note is as `file_in_inbox` mints it.
-    fn deliver_to_inbox(&self, message: PeerMessage, answered: bool) {
+    fn deliver_to_inbox(&self, message: PeerMessage, answered: Option<Answered>) {
         let id8 = short(&message.source_identity).to_string();
         let text = self.file_in_inbox(message, answered);
-        let source = if answered {
+        let source = if answered.is_some() {
             Source::Reply
         } else {
             Source::Message
@@ -6116,28 +6117,34 @@ impl MeshSlot {
     /// correlation id, anything else (a message, an ask or a bulletin, each its own
     /// event) by `peer:<instance>`, so no peer-chosen text reaches the note. An
     /// escalated reply has no answer to collect yet, so its note points at the inbox
-    /// rather than at a `mesh__collect` that would block for its whole timeout.
-    fn file_in_inbox(&self, message: PeerMessage, answered: bool) -> NoticeText {
+    /// rather than at a `mesh__collect` that would block for its whole timeout, and so
+    /// does a reply to one of our messages, which nothing collects.
+    fn file_in_inbox(&self, message: PeerMessage, answered: Option<Answered>) -> NoticeText {
         let text = message.summary_line(self.who_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
         let (event, id, next_action) = match (answered, message.kind) {
-            (true, _) if message.disposition == Some(Disposition::Escalated) => (
+            (Some(Answered::Escalated), _) => (
                 "peer_escalated",
                 message.in_reply_to.clone().unwrap_or_default(),
                 CHECK_INBOX_NEXT_ACTION.to_string(),
             ),
-            (true, _) => {
+            (Some(Answered::ClosedMessage), _) => (
+                "peer_reply",
+                message.in_reply_to.clone().unwrap_or_default(),
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
+            (Some(Answered::Collectable), _) => {
                 let id = message.in_reply_to.clone().unwrap_or_default();
                 let next_action = collect_next_action(&id);
                 ("peer_reply", id, next_action)
             }
-            (false, PeerKind::Bulletin) => (
+            (None, PeerKind::Bulletin) => (
                 "peer_bulletin",
                 local_id,
                 CHECK_INBOX_NEXT_ACTION.to_string(),
             ),
-            (false, PeerKind::Ask) => ("peer_ask", local_id, CHECK_INBOX_NEXT_ACTION.to_string()),
-            (false, _) => (
+            (None, PeerKind::Ask) => ("peer_ask", local_id, CHECK_INBOX_NEXT_ACTION.to_string()),
+            (None, _) => (
                 "peer_message",
                 local_id,
                 CHECK_INBOX_NEXT_ACTION.to_string(),
@@ -6690,6 +6697,7 @@ impl PeerSurface for MeshSlot {
             .map(|correlation| correlation.record)
             .filter(|record| {
                 record.state.awaits_reply()
+                    && record.kind == CorrelationKind::Ask
                     && record.peer_destination.eq_ignore_ascii_case(&destination)
             })
             .collect();
@@ -6957,8 +6965,8 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::peers::{PEER_TABLE_VERSION, PeerTableFile};
     use crate::mesh::pending::{
-        CorrelationKind, DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind,
-        InboundRecord, PENDING_RECORD_VERSION, PendingState,
+        DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+        PENDING_RECORD_VERSION, PendingState,
     };
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::request::{
@@ -7576,8 +7584,9 @@ mod tests {
         );
     }
 
-    /// Only a question still waiting on that peer counts: one already answered, or one
-    /// asked of another instance, gives no line; an open one gives exactly one.
+    /// Only a question still waiting on that peer counts: one already answered, one
+    /// asked of another instance, or a message still awaiting its reply gives no line;
+    /// an open question gives exactly one.
     #[test]
     fn a_returning_peer_is_announced_only_for_its_own_open_questions() {
         let slot = MeshSlot::default();
@@ -7594,6 +7603,12 @@ mod tests {
             .open(PendingRecord {
                 peer_destination: "ef".repeat(16),
                 ..pending("elsewhere")
+            })
+            .unwrap();
+        slot.correlations()
+            .open(PendingRecord {
+                kind: CorrelationKind::Message,
+                ..pending("message")
             })
             .unwrap();
 
@@ -9186,7 +9201,7 @@ mod tests {
         let mut escalation = peer_message(PeerKind::Reply, "esc-1", Some("q-ours"));
         escalation.disposition = Some(Disposition::Escalated);
         assert!(
-            slot.correlations().answer("q-ours", escalation),
+            slot.correlations().answer("q-ours", escalation).is_some(),
             "the asked identity's escalation is the one it earns"
         );
         assert_eq!(
@@ -9199,10 +9214,12 @@ mod tests {
             "the answer to an escalated question is still admitted"
         );
         assert!(
-            slot.correlations().answer(
-                "q-ours",
-                peer_message(PeerKind::Reply, "reply-1", Some("q-ours"))
-            ),
+            slot.correlations()
+                .answer(
+                    "q-ours",
+                    peer_message(PeerKind::Reply, "reply-1", Some("q-ours"))
+                )
+                .is_some(),
             "the asked identity's reply closes the question"
         );
         assert_eq!(

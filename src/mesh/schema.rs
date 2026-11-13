@@ -158,6 +158,7 @@ mod tests {
         // Fieldless enums, serialized as bare strings.
         ("pending.rs", "PendingState"),
         ("pending.rs", "InboundKind"),
+        ("pending.rs", "CorrelationKind"),
         ("message.rs", "PeerKind"),
         ("message.rs", "PeerVia"),
         ("message.rs", "Disposition"),

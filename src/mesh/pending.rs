@@ -409,17 +409,25 @@ fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {
 }
 
 /// Expired first, then past `PENDING_MAX_ENTRIES` the oldest answered records, then the
-/// oldest still awaiting a reply; `records` is newest first.
+/// oldest messages still awaiting a reply, then the oldest questions; `records` is newest
+/// first. A message's reply is filed like any other once its correlation is gone, so
+/// losing one costs less than losing a question's.
 fn evict(records: &mut Vec<PendingRecord>, now: SystemTime) -> usize {
     let before = records.len();
     records.retain(|record| !is_expired(record, now));
     let mut over = records.len().saturating_sub(PENDING_MAX_ENTRIES);
-    let mut index = records.len();
-    while over > 0 && index > 0 {
-        index -= 1;
-        if records[index].state == PendingState::Answered {
-            records.remove(index);
-            over -= 1;
+    let first_to_go: [fn(&PendingRecord) -> bool; 2] = [
+        |record: &PendingRecord| record.state == PendingState::Answered,
+        |record: &PendingRecord| record.kind == CorrelationKind::Message,
+    ];
+    for goes in first_to_go {
+        let mut index = records.len();
+        while over > 0 && index > 0 {
+            index -= 1;
+            if goes(&records[index]) {
+                records.remove(index);
+                over -= 1;
+            }
         }
     }
     records.truncate(records.len() - over);
@@ -977,6 +985,17 @@ pub(crate) enum WaitOutcome {
     Unknown,
 }
 
+/// What an accepted reply did to the correlation it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answered {
+    /// A question's answer, filed until `take_answer` collects it.
+    Collectable,
+    /// A message's reply: nothing collects one, so the correlation is gone.
+    ClosedMessage,
+    /// The peer's human has been asked; the correlation still waits.
+    Escalated,
+}
+
 #[derive(Default)]
 struct CorrelationState {
     store: Option<PendingStore>,
@@ -1091,18 +1110,18 @@ impl Correlations {
         })
     }
 
-    /// `true` when `in_reply_to` named a question still awaiting a reply, asked of
-    /// `reply`'s identity. An `Escalated` reply moves an `Open` question to `Escalated`
-    /// and keeps waiting; any other closes it with `reply` as its answer, on disk too so
-    /// it survives to the next process uncollected. A reply from any other identity, one
-    /// to a question already answered, or a second `Escalated` reply to a question
-    /// already escalated does not match: it is an ordinary message.
-    pub(crate) fn answer(&self, in_reply_to: &str, reply: PeerMessage) -> bool {
+    /// `Some` when `in_reply_to` named a correlation still awaiting a reply, opened with
+    /// `reply`'s identity. An `Escalated` reply moves an `Open` one to `Escalated` and
+    /// keeps waiting; any other closes it. A question keeps `reply` as its answer, on
+    /// disk too so it survives to the next process uncollected; a message is forgotten,
+    /// in memory and on disk, since its reply is filed in the inbox and nothing
+    /// collects it. A reply from any other identity, one to a question already
+    /// answered, or a second `Escalated` reply to one already escalated does not match:
+    /// it is an ordinary message.
+    pub(crate) fn answer(&self, in_reply_to: &str, reply: PeerMessage) -> Option<Answered> {
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
-        let Some(entry) = entries.get_mut(in_reply_to) else {
-            return false;
-        };
+        let entry = entries.get_mut(in_reply_to)?;
         if !entry.record.state.accepts(reply.disposition()) {
             debug!(
                 "Mesh reply {} from {} names question {in_reply_to}, which is already {}; treating it as a message",
@@ -1114,7 +1133,7 @@ impl Correlations {
                     "answered"
                 }
             );
-            return false;
+            return None;
         }
         if !entry
             .record
@@ -1127,16 +1146,30 @@ impl Correlations {
                 short(&reply.source_identity),
                 short(&entry.record.peer_identity)
             );
-            return false;
+            return None;
         }
-        if reply.disposition() == Disposition::Escalated {
+        let answered = if reply.disposition() == Disposition::Escalated {
             entry.record.state = PendingState::Escalated;
+            Answered::Escalated
+        } else if entry.record.kind == CorrelationKind::Message {
+            Answered::ClosedMessage
         } else {
             entry.record.state = PendingState::Answered;
             entry.record.reply = Some(reply.clone());
             entry.reply = Some(reply);
-        }
-        if let Some(store) = store
+            Answered::Collectable
+        };
+        if answered == Answered::ClosedMessage {
+            entries.remove(in_reply_to);
+            if let Some(store) = store
+                && let Err(err) = store.remove(in_reply_to)
+            {
+                warn!(
+                    "Mesh message {in_reply_to} was replied to but could not be removed from disk: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+            }
+        } else if let Some(store) = store
             && let Err(err) = store.upsert(entry.record.clone(), SystemTime::now())
         {
             warn!(
@@ -1146,7 +1179,7 @@ impl Correlations {
         }
         drop(state);
         self.changed.notify_waiters();
-        true
+        Some(answered)
     }
 
     /// Waits up to `timeout` for the reply to `id`. Nothing is removed: the reply is
@@ -2775,7 +2808,10 @@ mod tests {
             tokio::spawn(async move { correlations.wait("q1", Duration::from_secs(10)).await })
         };
         tokio::task::yield_now().await;
-        assert!(correlations.answer("q1", reply_to("q1")));
+        assert_eq!(
+            correlations.answer("q1", reply_to("q1")),
+            Some(Answered::Collectable)
+        );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), waiter)
                 .await
@@ -2806,7 +2842,7 @@ mod tests {
             .unwrap();
         *correlations.between_read_and_await.lock() =
             Some(Box::new(|correlations: &Correlations| {
-                assert!(correlations.answer("q1", reply_to("q1")));
+                assert!(correlations.answer("q1", reply_to("q1")).is_some());
             }));
         let started = tokio::time::Instant::now();
 
@@ -2831,10 +2867,13 @@ mod tests {
             .open(record("q1", t(1_000), PendingState::Open))
             .unwrap();
 
-        assert!(!correlations.answer("q2", reply_to("q2")));
-        assert!(correlations.answer("q1", reply_to("q1")));
+        assert_eq!(correlations.answer("q2", reply_to("q2")), None);
+        assert_eq!(
+            correlations.answer("q1", reply_to("q1")),
+            Some(Answered::Collectable)
+        );
         assert!(
-            !correlations.answer("q1", reply_to("q1")),
+            correlations.answer("q1", reply_to("q1")).is_none(),
             "the first answer stands"
         );
         assert_eq!(
@@ -2854,14 +2893,56 @@ mod tests {
         let mut impostor = reply_to("q1");
         impostor.source_identity = hex_lower(&[0xee; 16]);
 
-        assert!(!correlations.answer("q1", impostor));
+        assert_eq!(correlations.answer("q1", impostor), None);
         assert!(correlations.is_open("q1"), "the question is still waiting");
 
         let mut upper = reply_to("q1");
         upper.source_identity = upper.source_identity.to_ascii_uppercase();
         assert!(
-            correlations.answer("q1", upper),
+            correlations.answer("q1", upper).is_some(),
             "the identity compare is case-insensitive"
+        );
+    }
+
+    /// A message's escalation keeps it waiting, on disk too; the reply that follows
+    /// closes it, in memory and on disk, and leaves nothing to collect.
+    #[test]
+    fn a_reply_to_a_message_closes_it_and_an_escalation_keeps_it_open() {
+        let tmp = TempDir::new("pending-message-closes");
+        let now = SystemTime::now();
+        let correlations = Correlations::new();
+        correlations
+            .attach_store(PendingStore::new(&tmp.path, "inst"), now)
+            .unwrap();
+        correlations
+            .open(PendingRecord {
+                kind: CorrelationKind::Message,
+                ..record("m1", now, PendingState::Open)
+            })
+            .unwrap();
+        let on_disk = || ids(&PendingStore::new(&tmp.path, "inst").list(now).unwrap()).join(",");
+
+        assert_eq!(
+            correlations.answer("m1", reply_with("m1", Disposition::Escalated, None)),
+            Some(Answered::Escalated)
+        );
+        assert_eq!(
+            correlations.get("m1").unwrap().record.state,
+            PendingState::Escalated
+        );
+        assert_eq!(on_disk(), "m1");
+
+        assert_eq!(
+            correlations.answer("m1", reply_to("m1")),
+            Some(Answered::ClosedMessage)
+        );
+        assert!(correlations.get("m1").is_none());
+        assert_eq!(on_disk(), "", "the store forgets it too");
+        assert_eq!(correlations.take_answer("m1"), None);
+        assert_eq!(
+            correlations.answer("m1", reply_to("m1")),
+            None,
+            "a second reply answers nothing"
         );
     }
 
@@ -2886,7 +2967,7 @@ mod tests {
                 PendingState::Open,
             ))
             .unwrap();
-        assert!(first.answer("answered", reply_to("answered")));
+        assert!(first.answer("answered", reply_to("answered")).is_some());
         first
             .open(record(
                 "collected",
@@ -2894,7 +2975,7 @@ mod tests {
                 PendingState::Open,
             ))
             .unwrap();
-        assert!(first.answer("collected", reply_to("collected")));
+        assert!(first.answer("collected", reply_to("collected")).is_some());
         assert!(first.take_answer("collected").is_some());
         drop(first);
         // An answered record on disk with no reply persisted beside it: nothing to collect.
@@ -2923,7 +3004,7 @@ mod tests {
             ids(&PendingStore::new(&tmp.path, "inst").list(now).unwrap()),
             vec!["open"]
         );
-        assert!(second.answer("open", reply_to("open")));
+        assert!(second.answer("open", reply_to("open")).is_some());
         let on_disk = PendingStore::new(&tmp.path, "inst").list(now).unwrap();
         assert_eq!(on_disk[0].state, PendingState::Answered);
         assert_eq!(on_disk[0].reply, Some(reply_to("open")));
@@ -3037,7 +3118,11 @@ mod tests {
         correlations
             .open(record("answered", now, PendingState::Open))
             .unwrap();
-        assert!(correlations.answer("answered", reply_to("answered")));
+        assert!(
+            correlations
+                .answer("answered", reply_to("answered"))
+                .is_some()
+        );
 
         assert!(correlations.abandon("failed"));
         assert!(!correlations.abandon("failed"), "already gone");
@@ -3064,7 +3149,10 @@ mod tests {
             .unwrap();
         first.open(record("q1", now, PendingState::Open)).unwrap();
 
-        assert!(first.answer("q1", reply_with("q1", Disposition::Escalated, None)));
+        assert_eq!(
+            first.answer("q1", reply_with("q1", Disposition::Escalated, None)),
+            Some(Answered::Escalated)
+        );
 
         let listed = first.list();
         assert_eq!(listed.len(), 1);
@@ -3096,7 +3184,10 @@ mod tests {
         assert!(second.accepts_reply_from("q1", &identity, Disposition::Answered));
 
         let answer = reply_with("q1", Disposition::Answered, None);
-        assert!(second.answer("q1", answer.clone()));
+        assert_eq!(
+            second.answer("q1", answer.clone()),
+            Some(Answered::Collectable)
+        );
         assert_eq!(
             second.wait("q1", Duration::from_millis(10)).await,
             WaitOutcome::Replied(Box::new(answer.clone()))
@@ -3117,14 +3208,19 @@ mod tests {
         correlations
             .open(record("q1", now, PendingState::Open))
             .unwrap();
-        assert!(correlations.answer("q1", reply_with("q1", Disposition::Escalated, None)));
+        assert_eq!(
+            correlations.answer("q1", reply_with("q1", Disposition::Escalated, None)),
+            Some(Answered::Escalated)
+        );
         let store_file = mesh_cache_dir(&tmp.path).join("pending-inst.jsonl");
         assert!(store_file.is_file());
         fs::remove_file(&store_file).unwrap();
 
         assert!(!correlations.accepts_reply_from("q1", &identity, Disposition::Escalated));
         assert!(
-            !correlations.answer("q1", reply_with("q1", Disposition::Escalated, None)),
+            correlations
+                .answer("q1", reply_with("q1", Disposition::Escalated, None))
+                .is_none(),
             "escalation is one-shot"
         );
         assert!(
@@ -3146,7 +3242,11 @@ mod tests {
                 "{disposition:?} still closes an escalated question"
             );
         }
-        assert!(correlations.answer("q1", reply_with("q1", Disposition::Answered, None)));
+        assert!(
+            correlations
+                .answer("q1", reply_with("q1", Disposition::Answered, None))
+                .is_some()
+        );
         assert_eq!(
             correlations.get("q1").unwrap().record.state,
             PendingState::Answered
@@ -3160,7 +3260,10 @@ mod tests {
             .open(record("q1", t(1_000), PendingState::Open))
             .unwrap();
 
-        assert!(correlations.answer("q1", reply_with("q1", disposition, Some(retry_after))));
+        assert_eq!(
+            correlations.answer("q1", reply_with("q1", disposition, Some(retry_after))),
+            Some(Answered::Collectable)
+        );
 
         assert_eq!(
             correlations.get("q1").unwrap().record.state,
@@ -3168,7 +3271,9 @@ mod tests {
         );
         assert!(!correlations.is_open("q1"));
         assert!(
-            !correlations.answer("q1", reply_with("q1", Disposition::Answered, None)),
+            correlations
+                .answer("q1", reply_with("q1", Disposition::Answered, None))
+                .is_none(),
             "the question is closed to a second reply"
         );
         let reply = correlations.take_answer("q1").unwrap();
