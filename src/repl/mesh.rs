@@ -36444,7 +36444,11 @@ mod tests {
                             .unwrap_or_else(|| panic!("{tool}: no left_secs_ago in {result}"));
                         assert!(secs < 120, "{tool}: {result}");
                         assert!(
-                            held(departed["message"].as_str().unwrap_or_default(), &peer),
+                            held_for(
+                                departed["message"].as_str().unwrap_or_default(),
+                                &format!("Tia / {}", short(&peer)),
+                                "Tia"
+                            ),
                             "{tool}: {result}"
                         );
                         assert_eq!(result["via"], "store_and_forward", "{tool}: {result}");
@@ -36462,7 +36466,7 @@ mod tests {
                     assert_eq!(result["departed"]["state"], "left", "{result}");
                     let message = result["departed"]["message"].as_str().unwrap_or_default();
                     assert!(
-                        message.starts_with(&format!("{peer} left "))
+                        message.starts_with(&format!("Tia / {} left ", short(&peer)))
                             && message.ends_with(
                                 "s ago; held at the propagation node, delivered to the session that asked when it syncs"
                             ),
@@ -36479,9 +36483,10 @@ mod tests {
                     .await
                     .unwrap();
                     assert!(
-                        held(
+                        held_for(
                             result["departed"]["message"].as_str().unwrap_or_default(),
-                            &peer
+                            &format!("Tia / {}", short(&peer)),
+                            "Tia"
                         ),
                         "{result}"
                     );
@@ -36588,13 +36593,11 @@ mod tests {
                     );
                     let message = result["departed"]["message"].as_str().unwrap();
                     assert!(
-                        message.starts_with(&format!("{peer} has no route")),
+                        message.starts_with(&format!("Tia / {} has no route", short(&peer))),
                         "{message}"
                     );
                     assert!(
-                        message.ends_with(&format!(
-                            "delivered to any of {peer}'s sessions when one syncs"
-                        )),
+                        message.ends_with("delivered to any of Tia's sessions when one syncs"),
                         "{message}"
                     );
                     pn.next_received().await;
