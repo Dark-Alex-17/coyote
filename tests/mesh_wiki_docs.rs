@@ -267,7 +267,7 @@ fn wiki_command_rows(page: &str) -> Vec<(String, String, String)> {
             "command table row has {} cells: {row:?}",
             cells.len()
         );
-        if cells[0] == "Command" || cells[0].chars().all(|c| c == '-') {
+        if cells[0] == "Command" || (!cells[0].is_empty() && cells[0].chars().all(|c| c == '-')) {
             continue;
         }
         let path = unbacktick(&cells[0], "command").to_string();
@@ -4418,7 +4418,7 @@ mod first_contact_wiki_pins {
         let not_coyote = literal_with(
             "src/mesh/message.rs answered_not_as_coyote",
             &fn_body("src/mesh/message.rs", "answered_not_as_coyote"),
-            "it is not a Coyote session",
+            "but not as a Coyote session",
         )
         .replacen("{}", "<dest8>", 1);
         [waiting, unanswered, not_coyote]
@@ -6713,7 +6713,7 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
 /// the `.mesh envoy brief` section quotes each per-mode line `brief_mode_line` returns and the
 /// bare-brief sentence under `off`, the `.mesh status` section quotes the objective
 /// confirmation `status` prints (with `<objective>` in the placeholder's place), the
-/// `## The status card and the brief` lead says the card is served and the brief never
+/// `## envoy` lead (the text before its first `###`) says the card is served and the brief never
 /// is and points at the Mesh page, the `.mesh on` preview sample shows the status-card
 /// line and the auto brief line `render_on_preview` pushes and the prose under it quotes
 /// the off row, and the `.mesh messaging send` section says a message is fire-and-forget with
@@ -6881,7 +6881,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         "Mesh-Commands.md's `.mesh status` section does not quote the objective confirmation {objective:?}:\n{status}"
     );
     let envoy = section("Mesh-Commands.md", &page, "## envoy");
-    let lead = flat(envoy.split("\n### ").next().unwrap_or_default());
+    let lead = flat(envoy.split("\n### ").next().unwrap());
     for needle in [
         "served to trusted sessions",
         "never served as such",
@@ -7100,7 +7100,7 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         "`reply to <id8>`",
         "`answering <id8>`",
         "`from_self: true`",
-        "marked when this node files them",
+        "marked when your session files them",
         "`you -> <user> / <session> (<dest8>)`",
         "you typed the answer with `.mesh envoy answer`",
         "`from unknown ()`",
@@ -9067,11 +9067,11 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
         .find(row)
         .unwrap_or_else(|| panic!("{label}'s TAB note does not quote the row {row}"));
     for needle in [
-        "borrows no name and reads its short hashes, `unnamed` for the user when no identity is known",
+        "borrows no name and reads its short hashes, `unnamed` for the user when no user is known",
         "`heard never`",
-        "offered once, with its newest knock's age",
-        "A knocker's row ends with its intro",
-        "a destination the peer table also holds reads from the peer table and carries no intro",
+        "offered once, with its newest request's age",
+        "The row of a session asking to be trusted ends with its intro",
+        "a session the peer table also holds reads from the peer table and carries no intro",
     ] {
         assert!(
             commands[row_at..].contains(needle),
@@ -9215,7 +9215,7 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         "not_shared_sentence renders four sentences: {literals:?}"
     );
     for needle in [
-        "a peer never says which",
+        "a session never says which",
         "already fetched it",
         "The grant for `{shown}` from {peer} expired at {expires}",
         "does not share files",
@@ -10481,4 +10481,84 @@ fn the_pages_quote_the_no_answer_and_throttled_lines_as_the_code_words_them() {
         commands.contains(tail),
         "Mesh-Commands.md does not quote the throttled line's {tail:?}"
     );
+}
+
+/// The tails a `.mesh files fetch` and a `.mesh messaging send` to a session you do not
+/// trust end with, quoted on the pages that describe them exactly as the REPL prints them,
+/// in session words.
+#[test]
+fn the_untrusted_fetch_and_send_tails_on_the_wiki_are_the_ones_the_repl_prints() {
+    let Some(wiki) = wiki_dir() else { return };
+    for (name, pages) in [
+        (
+            "FETCH_REFUSAL_TAIL",
+            &["Mesh-Commands.md", "Mesh-File-Sharing.md"][..],
+        ),
+        ("MESSAGE_REFUSAL_TAIL", &["Mesh-Commands.md"][..]),
+    ] {
+        let tail = const_str("src/repl/mesh.rs", name);
+        assert!(
+            !tail.contains("this node") && !tail.contains("destination"),
+            "{name} speaks of nodes or destinations: {tail:?}"
+        );
+        for page in pages {
+            let text = read(wiki.join(page));
+            assert!(
+                text.contains(&tail),
+                "{page} does not quote the {name} line {tail:?}"
+            );
+        }
+    }
+    for page in ["Mesh-Commands.md", "Mesh-File-Sharing.md"] {
+        let text = read(wiki.join(page));
+        for old in [
+            "Nothing is fetched from a destination this node does not trust.",
+            "Nothing is sent to a destination this node does not trust.",
+        ] {
+            assert!(!text.contains(old), "{page} still quotes {old:?}");
+        }
+    }
+}
+
+/// The Trust Model page speaks of users and sessions; the protocol's own words (identity,
+/// destination, instance, knock, node) appear in its prose only under its last section,
+/// `## Under the hood`. Quoted output in code spans and fences keeps the code's wording, and
+/// the stored grant label `"this node"` is quoted as the trust file holds it.
+#[test]
+fn the_trust_model_keeps_protocol_words_under_the_hood() {
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Trust-Model.md"));
+    let marker = "\n## Under the hood\n";
+    let at = page
+        .find(marker)
+        .expect("Mesh-Trust-Model.md has an `## Under the hood` section");
+    assert!(
+        !page[at + marker.len()..].contains("\n## "),
+        "`## Under the hood` is not the last section of Mesh-Trust-Model.md"
+    );
+    let mut hits = Vec::new();
+    for (line, text) in markdown_prose_lines(&blockquote_prose(&page[..at])) {
+        let mut text = text.replace("\"this node\"", "").to_ascii_lowercase();
+        while let Some(open) = text.find("](") {
+            let close = text[open..]
+                .find(')')
+                .map_or(text.len(), |end| open + end + 1);
+            text.replace_range(open..close, " ");
+        }
+        for word in [
+            "identit",
+            "destination",
+            "instance",
+            "knock",
+            "node's",
+            "this node",
+        ] {
+            if text.contains(word) {
+                hits.push(format!(
+                    "Mesh-Trust-Model.md:{line}: spells {word:?}: {text}"
+                ));
+            }
+        }
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
 }

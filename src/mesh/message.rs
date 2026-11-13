@@ -2651,7 +2651,7 @@ mod left_mesh_hint_tests {
 pub(crate) enum FirstContactMiss {
     /// Nothing announced the destination within `PATH_REQUEST_TIMEOUT`.
     NoAnswer,
-    /// The destination announced, but the announce was not one a Coyote node sends.
+    /// The destination announced, but the announce was not one a Coyote session sends.
     NotCoyote,
 }
 
@@ -2675,9 +2675,36 @@ pub(crate) fn unanswered_path_request(destination: &str) -> String {
 
 pub(crate) fn answered_not_as_coyote(destination: &str) -> String {
     format!(
-        "Session {} answered, but it is not a Coyote session; check the hash.",
+        "{} answered, but not as a Coyote session; check the hash.",
         short(destination)
     )
+}
+
+#[cfg(test)]
+mod first_contact_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn both_first_contact_refusals_name_the_session_in_session_words() {
+        let destination = "4b".repeat(16);
+        assert_eq!(
+            FirstContactMiss::NotCoyote.refusal(&destination),
+            "4b4b4b4b answered, but not as a Coyote session; check the hash."
+        );
+        assert_eq!(
+            FirstContactMiss::NoAnswer.refusal(&destination),
+            format!(
+                "Session 4b4b4b4b did not answer within {} s: it may not be running, it may be on a network you have not joined, or it may not have announced itself yet (after a relay restart nothing can reach it until it does). Check the hash, or wait until it shows in `.mesh people list`.",
+                PATH_REQUEST_TIMEOUT.as_secs()
+            )
+        );
+        for miss in [FirstContactMiss::NoAnswer, FirstContactMiss::NotCoyote] {
+            let text = miss.refusal(&destination).to_ascii_lowercase();
+            for word in ["node", "instance", "knock", "path request", "destination"] {
+                assert!(!text.contains(word), "{word:?}: {text}");
+            }
+        }
+    }
 }
 
 /// The cause part of `unreachable_head`, for a refusal that does not name the destination.

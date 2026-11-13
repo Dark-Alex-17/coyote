@@ -1484,7 +1484,7 @@ pub(crate) fn not_shared_sentence(
             &[],
         ),
         NotSharedReason::Unknown => NoticeText::from_template(
-            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {peer} to run .mesh files allow {path}, or let the model request access with mesh__request_access.",
+            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {peer} to run .mesh files allow {path}, or let the model request access with mesh__request_access.",
             &[("peer", peer)],
             &paths,
         ),
@@ -1506,7 +1506,7 @@ pub(crate) fn not_shared_tool_message(peer: &str, shown: &str, reason: &NotShare
             expires = rfc3339_utc(*expires)
         ),
         NotSharedReason::PeerWithoutFetch | NotSharedReason::Unknown => format!(
-            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
         ),
     }
 }
@@ -3653,7 +3653,7 @@ mod tests {
             |reason| not_shared_sentence("abcd1234", "docs/a.md", "docs/a.md", &reason).plain();
         assert_eq!(
             sentence(NotSharedReason::Unknown),
-            "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of abcd1234 to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access."
+            "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of abcd1234 to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access."
         );
         assert_eq!(
             sentence(NotSharedReason::AlreadyFetched {
@@ -3698,7 +3698,7 @@ mod tests {
             let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
             let sentence = |reason| not_shared_sentence("abcd1234", ".vault", ".session", &reason);
             let unknown = sentence(NotSharedReason::Unknown);
-            let today = "abcd1234 did not serve `.vault`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of abcd1234 to run .mesh files allow .session, or let the model request access with mesh__request_access.";
+            let today = "abcd1234 did not serve `.vault`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of abcd1234 to run .mesh files allow .session, or let the model request access with mesh__request_access.";
             assert_eq!(unknown.render(CommandPrefix::Dot), today);
             assert_eq!(
                 unknown.render(CommandPrefix::Slash),
@@ -3727,7 +3727,7 @@ mod tests {
     fn the_tool_message_gives_the_model_one_next_step_per_reason() {
         let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let message = |reason| not_shared_tool_message("abcd1234", "docs/a.md", &reason);
-        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
+        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
         assert_eq!(message(NotSharedReason::Unknown), unknown);
         assert_eq!(
             message(NotSharedReason::PeerWithoutFetch),

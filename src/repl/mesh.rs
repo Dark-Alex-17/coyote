@@ -54183,7 +54183,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             )
                         );
@@ -54299,7 +54299,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "a last card without the fetch capability explains nothing: the peer answered"
@@ -54385,7 +54385,7 @@ mod tests {
                         assert_eq!(
                             sentence,
                             format!(
-                                "{0} did not serve `docs/heart.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow {raw}, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/heart.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow {raw}, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             )
                         );
@@ -54508,7 +54508,7 @@ mod tests {
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/b.md"))
                                 .await,
                             format!(
-                                "{0} did not serve `docs/b.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow docs/b.md, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/b.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/b.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "a grant that has not run out explains nothing"
@@ -54630,7 +54630,7 @@ mod tests {
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
                                 .await,
                             format!(
-                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "a spent grant is not an expired one"
@@ -54756,7 +54756,7 @@ mod tests {
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
                                 .await,
                             format!(
-                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "the fetched copy was the old identity's lend, so nothing explains the refusal"
@@ -54798,7 +54798,7 @@ mod tests {
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} docs/a.md"))
                                 .await,
                             format!(
-                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
+                                "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
                                 fx.dest()
                             ),
                             "the old lend is gone from memory too, so nothing explains the refusal"
