@@ -167,7 +167,7 @@ impl PromptAnswer {
 
     fn mismatch(self, expected: PromptAction) -> anyhow::Error {
         match self {
-            PromptAnswer::Cancelled => anyhow!("Operation was canceled by the user"),
+            PromptAnswer::Cancelled => PromptCancelled.into(),
             // Only the headless prompter answers a confirm with text (its
             // `needs_human` JSON), so the refusal is what the caller sees.
             PromptAnswer::Text(_) if expected == PromptAction::Confirm => {
@@ -177,6 +177,27 @@ impl PromptAnswer {
         }
     }
 }
+
+/// The error a cancelled prompt becomes for a caller that wanted an
+/// answer rather than the cancel itself.
+#[derive(Debug)]
+pub(crate) struct PromptCancelled;
+
+impl PromptCancelled {
+    /// Whether `err` is, or wraps through `context`, a cancelled prompt.
+    pub(crate) fn caused(err: &anyhow::Error) -> bool {
+        err.chain()
+            .any(|cause| cause.downcast_ref::<PromptCancelled>().is_some())
+    }
+}
+
+impl fmt::Display for PromptCancelled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Operation was canceled by the user")
+    }
+}
+
+impl std::error::Error for PromptCancelled {}
 
 /// Answers a [`PromptRequest`] on behalf of the human. Synchronous: callers
 /// sit on the REPL thread or inside a blocking tool, and a prompter that
@@ -999,6 +1020,24 @@ mod tests {
             .unwrap_err();
         assert!(NeedsHuman::caused(&err));
         assert!(!NeedsHuman::caused(&anyhow!("no tty here")));
+    }
+
+    #[test]
+    fn a_cancel_is_recognised_under_added_context() {
+        use anyhow::Context;
+        let err = PromptAnswer::Cancelled
+            .into_text()
+            .context("while asking for a path")
+            .unwrap_err();
+        assert!(PromptCancelled::caused(&err));
+        assert_eq!(
+            err.root_cause().to_string(),
+            "Operation was canceled by the user"
+        );
+        assert!(!PromptCancelled::caused(&anyhow!("no tty here")));
+        assert!(!PromptCancelled::caused(
+            &NeedsHuman::Prompt(PromptAction::Input).into()
+        ));
     }
 
     #[test]

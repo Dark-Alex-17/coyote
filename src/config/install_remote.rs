@@ -9,7 +9,9 @@ use crate::config::{
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
-use crate::prompt::{NeedsHuman, Prompter, select_closed, select_closed_or_cancel};
+use crate::prompt::{
+    NeedsHuman, PromptCancelled, Prompter, select_closed, select_closed_or_cancel,
+};
 use crate::utils;
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
@@ -2489,45 +2491,77 @@ fn prompt_for_each_secret(
     let mut deferred = Vec::new();
 
     for (index, name) in missing.iter().enumerate() {
-        let answer = match crate::prompt::confirm_or_cancel(
-            prompter,
-            format!("Add {{{{ {name} }}}} to the vault now?"),
-            false,
-        ) {
-            Err(err) if NeedsHuman::caused(&err) => None,
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to read confirmation for secret '{name}'"));
-            }
-            Ok(answer) => answer,
-        };
-        // Cancelled, or nobody to answer: this and every later secret are
-        // deferred, the way answering no to each would; what was added so
-        // far is still reported.
-        let Some(proceed) = answer else {
-            deferred.extend(missing[index..].iter().cloned());
-            break;
-        };
-        if !proceed {
-            deferred.push(name.clone());
-            continue;
-        }
-        if !password_file_ensured {
-            create_vault_password_file(&mut vault, prompter, &mut print_note)
-                .context("Failed to initialize the vault password file")?;
-            password_file_ensured = true;
-        }
-
-        match vault.add_secret(name, prompter) {
-            Ok(()) => added.push(name.clone()),
-            Err(e) => {
-                eprintln!("Failed to add '{name}' to vault: {e:#}");
-                deferred.push(name.clone());
+        match offer_secret(&mut vault, name, prompter, &mut password_file_ensured)? {
+            SecretOffer::Added => added.push(name.clone()),
+            SecretOffer::Deferred => deferred.push(name.clone()),
+            SecretOffer::Unanswered => {
+                deferred.extend(missing[index..].iter().cloned());
+                break;
             }
         }
     }
 
     Ok((added, deferred))
+}
+
+/// What offering one missing secret to the vault came to.
+enum SecretOffer {
+    Added,
+    /// Declined, or the vault would not take it: this secret waits for
+    /// the summary and the next one is offered.
+    Deferred,
+    /// Cancelled, or nobody to answer, at any of its questions (the
+    /// offer, the password file wizard, the value): this and every later
+    /// secret are deferred, the way answering no to each would, and what
+    /// was added so far is still reported.
+    Unanswered,
+}
+
+fn offer_secret(
+    vault: &mut Vault,
+    name: &str,
+    prompter: &dyn Prompter,
+    password_file_ensured: &mut bool,
+) -> Result<SecretOffer> {
+    let proceed = match crate::prompt::confirm_or_cancel(
+        prompter,
+        format!("Add {{{{ {name} }}}} to the vault now?"),
+        false,
+    ) {
+        Ok(Some(proceed)) => proceed,
+        Ok(None) => return Ok(SecretOffer::Unanswered),
+        Err(err) if left_unanswered(&err) => return Ok(SecretOffer::Unanswered),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read confirmation for secret '{name}'"));
+        }
+    };
+    if !proceed {
+        return Ok(SecretOffer::Deferred);
+    }
+    if !*password_file_ensured {
+        match create_vault_password_file(vault, prompter, &mut print_note) {
+            Ok(()) => *password_file_ensured = true,
+            Err(err) if left_unanswered(&err) => return Ok(SecretOffer::Unanswered),
+            Err(err) => {
+                return Err(err.context("Failed to initialize the vault password file"));
+            }
+        }
+    }
+    match vault.add_secret(name, prompter) {
+        Ok(()) => Ok(SecretOffer::Added),
+        Err(err) if left_unanswered(&err) => Ok(SecretOffer::Unanswered),
+        Err(err) => {
+            eprintln!("Failed to add '{name}' to vault: {err:#}");
+            Ok(SecretOffer::Deferred)
+        }
+    }
+}
+
+/// Whether `err` is a question that got no answer: cancelled, or asked
+/// on a run with no human to ask.
+fn left_unanswered(err: &anyhow::Error) -> bool {
+    PromptCancelled::caused(err) || NeedsHuman::caused(err)
 }
 
 fn print_secret_summary(added: &[String], deferred: &[String], prefix: CommandPrefix) {
@@ -3666,6 +3700,56 @@ mod tests {
         assert!(
             !password_file.exists(),
             "a cancelled question must not touch the vault"
+        );
+    }
+
+    /// Esc inside the vault wizard a first accepted secret opens (here on
+    /// the password file path) is the same answer as Esc on the offer:
+    /// that secret and every later one are deferred, nothing more is
+    /// asked, and no password file is written.
+    #[test]
+    #[serial]
+    fn cancelling_inside_the_vault_wizard_defers_this_and_every_later_secret() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-cancel-inside");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "INSIDE_SECRET_ONE".to_string(),
+            "INSIDE_SECRET_TWO".to_string(),
+        ];
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Cancelled,
+        ]);
+
+        let (added, deferred) = prompt_for_each_secret(&missing, &prompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        let asked: Vec<String> = prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "Add {{ INSIDE_SECRET_ONE }} to the vault now?",
+                "No password file configured. Do you want to create one now?",
+                "Enter the path to the password file to create:",
+            ]
+        );
+        assert!(
+            !password_file.exists(),
+            "a cancelled wizard must not write the password file"
         );
     }
 
