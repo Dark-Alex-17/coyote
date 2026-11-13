@@ -36837,7 +36837,7 @@ mod tests {
             /// and mesh__send does not wait at all.
             #[test]
             #[serial]
-            fn a_send_to_a_peer_with_no_route_and_no_path_is_held_without_a_wait() {
+            fn a_send_to_a_peer_with_no_route_and_no_path_is_held_without_a_full_path_wait() {
                 use crate::function::mesh::handle_mesh_tool;
                 use crate::mesh::PATH_REQUEST_TIMEOUT;
 
