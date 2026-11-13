@@ -24,9 +24,12 @@
 //!    spawns lands in the developer's real config or cache.
 //!
 //! The list is also the census: the set of files under `tests/` whose
-//! source imports the shared harness must equal it, so a new importer has
-//! to be listed (and so put under the first rule) and a listed file that
-//! stops importing is noticed.
+//! code names the shared harness must equal it, so a new importer has to
+//! be listed (and so put under the first rule) and a listed file that
+//! stops importing is noticed. A file names the harness when the module
+//! name appears outside comments and `mod` declarations, whichever path
+//! it is reached by (`use common::{pty, tui_harness::*}`,
+//! `crate::common::tui_harness`, `super::tui_harness`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,8 +39,7 @@ use std::path::{Path, PathBuf};
 const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const CONFIG_ENV: &str = ".env(\"COYOTE_CONFIG_DIR\"";
 const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
-const HARNESS_IMPORT: &str = concat!("use common::", "tui_harness");
-const HARNESS_PATH: &str = concat!("common::", "tui_harness::");
+const HARNESS: &str = concat!("tui_", "harness");
 const COMMAND_NEW: &str = concat!("Command::", "new(");
 const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
@@ -73,69 +75,161 @@ fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The source without its comment lines and `mod` declarations: a doc
+/// comment pointing at the harness, or `common/mod.rs` declaring it, names
+/// the module without using it.
+fn code_only(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            let declares_module =
+                (line.starts_with("mod ") || line.starts_with("pub mod ")) && line.ends_with(';');
+            !(line.starts_with("//") || declares_module)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn uses_harness(source: &str) -> bool {
+    code_only(source).contains(HARNESS)
+}
+
+/// Spawn sites, `COYOTE_CONFIG_DIR` sites and `COYOTE_CACHE_DIR` sites.
+fn site_counts(source: &str) -> [usize; 3] {
+    [SPAWN_SITE, CONFIG_ENV, CACHE_ENV].map(|needle| source.matches(needle).count())
+}
+
+/// Everything `name` gets wrong under the rule its source puts it under,
+/// plus its standing in the census.
+fn violations(name: &str, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let listed = HARNESS_USERS.contains(&name);
+    if uses_harness(source) {
+        if !listed {
+            out.push(
+                "imports the shared harness but is not listed in HARNESS_USERS; list it so it \
+                 spawns only through the harness"
+                    .to_string(),
+            );
+        }
+        for (at, _) in source.match_indices(COMMAND_NEW) {
+            let argument = source[at + COMMAND_NEW.len()..].trim_start();
+            if !argument.starts_with('"') {
+                out.push(format!(
+                    "`{COMMAND_NEW}{}` runs a program that is not a string literal; the built \
+                     binary is spawned only through the shared harness (`spawn_tui*`, \
+                     `spawn_binary_under`, `ttyless_command`, `run_ttyless*`)",
+                    argument.split(')').next().unwrap_or_default()
+                ));
+            }
+        }
+        for needle in BARE_SPAWNS {
+            if source.contains(needle) {
+                out.push(format!(
+                    "spawns with `{needle}` around the shared harness; use its spawn functions \
+                     (`spawn_tui*`, `spawn_binary_under`, `ttyless_command`, `run_ttyless*`) \
+                     instead"
+                ));
+            }
+        }
+        return out;
+    }
+    if listed {
+        out.push("is listed in HARNESS_USERS but does not import the shared harness".to_string());
+    }
+    let [spawn_sites, config_sites, cache_sites] = site_counts(source);
+    if spawn_sites == 0 && config_sites == 0 && cache_sites == 0 {
+        return out;
+    }
+    if spawn_sites != config_sites || config_sites != cache_sites {
+        out.push(format!(
+            "{spawn_sites} binary spawn(s), {config_sites} COYOTE_CONFIG_DIR site(s), \
+             {cache_sites} COYOTE_CACHE_DIR site(s); every spawn of the binary must pin both dirs"
+        ));
+    }
+    out
+}
+
 #[test]
 fn harness_users_spawn_only_through_the_harness_and_every_other_spawn_pins_both_dirs() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    for name in HARNESS_USERS {
-        let path = tests_dir.join(name);
-        let source = read(&path);
-        for (at, _) in source.match_indices(COMMAND_NEW) {
-            let argument = source[at + COMMAND_NEW.len()..].trim_start();
-            assert!(
-                argument.starts_with('"'),
-                "{}: `{COMMAND_NEW}{}` runs a program that is not a string literal; the \
-                 built binary is spawned only through the shared harness (`spawn_tui*`, \
-                 `spawn_binary_under`, `ttyless_command`, `run_ttyless*`)",
-                path.display(),
-                argument.split(')').next().unwrap_or_default()
-            );
-        }
-        for needle in BARE_SPAWNS {
-            assert!(
-                !source.contains(needle),
-                "{}: spawns with `{needle}` around the shared harness; use its spawn \
-                 functions (`spawn_tui*`, `spawn_binary_under`, `ttyless_command`, \
-                 `run_ttyless*`) instead",
-                path.display()
-            );
-        }
-    }
-
-    let mut importers = Vec::new();
+    let mut found = Vec::new();
     let mut self_contained = Vec::new();
     for path in rust_sources(&tests_dir) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = read(&path);
-        if source.contains(HARNESS_IMPORT) || source.contains(HARNESS_PATH) {
-            importers.push(name);
-            continue;
-        }
-        if HARNESS_USERS.contains(&name.as_str()) {
-            continue;
-        }
-        let spawn_sites = source.matches(SPAWN_SITE).count();
-        let config_sites = source.matches(CONFIG_ENV).count();
-        let cache_sites = source.matches(CACHE_ENV).count();
-        if spawn_sites == 0 && config_sites == 0 && cache_sites == 0 {
-            continue;
-        }
-        assert!(
-            spawn_sites == config_sites && config_sites == cache_sites,
-            "{}: {spawn_sites} binary spawn(s), {config_sites} COYOTE_CONFIG_DIR site(s), \
-             {cache_sites} COYOTE_CACHE_DIR site(s); every spawn of the binary must pin both dirs",
-            path.display()
+        found.extend(
+            violations(&name, &source)
+                .into_iter()
+                .map(|violation| format!("{}: {violation}", path.display())),
         );
-        self_contained.push(name);
+        if !uses_harness(&source) && site_counts(&source).iter().any(|&n| n > 0) {
+            self_contained.push(name);
+        }
     }
-    importers.sort();
-    assert_eq!(
-        importers, HARNESS_USERS,
-        "the files importing the shared harness are not the ones listed in HARNESS_USERS; \
-         a new importer must be listed (and so spawn only through the harness), and a \
-         listed file must import it"
-    );
+    assert!(found.is_empty(), "{}", found.join("\n"));
     assert!(
         self_contained.len() >= SELF_CONTAINED_FLOOR,
         "expected the known self-contained binary harnesses to be scanned, found {self_contained:?}"
     );
+}
+
+#[test]
+fn a_harness_user_spawning_a_non_literal_program_is_named_once() {
+    let source = format!("use common::{HARNESS}::*;\n{COMMAND_NEW}&binary).arg(\"--help\");\n");
+    let found = violations(HARNESS_USERS[0], &source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains(&format!("`{COMMAND_NEW}&binary`")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_harness_user_opening_its_own_pty_is_flagged() {
+    let source = format!(
+        "use common::{{pty, {HARNESS}::*}};\nlet pty = {}\"bash\");\n",
+        BARE_SPAWNS[1]
+    );
+    let found = violations(HARNESS_USERS[1], &source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains(BARE_SPAWNS[1]), "{found:?}");
+}
+
+#[test]
+fn a_self_contained_suite_pinning_fewer_dirs_than_it_spawns_is_flagged() {
+    let source = format!(
+        "let a = env!(\"{SPAWN_SITE}\");\nlet b = env!(\"{SPAWN_SITE}\");\ncmd{CONFIG_ENV}, dir);\n"
+    );
+    let found = violations("self_contained.rs", &source);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("2 binary spawn(s), 1 COYOTE_CONFIG_DIR site(s), 0 COYOTE_CACHE_DIR"),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_harness_user_spawning_only_literal_programs_through_the_harness_is_clean() {
+    let source = format!(
+        "use common::{{pty, {HARNESS}::*}};\n\
+         let out = {COMMAND_NEW}\"git\").arg(\"status\").output();\n\
+         let tui = spawn_tui(&dir);\n"
+    );
+    let found = violations(HARNESS_USERS[2], &source);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
+fn a_file_naming_the_harness_only_in_a_comment_is_not_a_user() {
+    let source = format!(
+        "//! Mirrors the bash wrapper `tests/common/{HARNESS}.rs` holds.\n\
+         // crate::common::{HARNESS} is not imported here.\n\
+         let pty = {}\"bash\");\n",
+        BARE_SPAWNS[1]
+    );
+    assert!(!uses_harness(&source));
+    let found = violations("lone.rs", &source);
+    assert!(found.is_empty(), "{found:?}");
 }
