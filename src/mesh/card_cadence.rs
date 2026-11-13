@@ -23,11 +23,13 @@ pub(crate) const CARD_FETCH_MIN_INTERVAL: Duration = Duration::from_secs(10 * 60
 /// What prompted a background card fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CardTrigger {
-    /// This node granted trust that covers the session.
+    /// The trust store recorded a grant that covers the session, the owner's included;
+    /// asked only when the session served this node.
     Granted,
     /// The owner granted it trust with `.mesh access trust`: asked once whether or not
     /// it ever served this node, since the owner has just chosen to trust it and the card
-    /// is what names it.
+    /// is what names it. It comes alongside the store's `Granted`; the interval keeps the
+    /// two to one fetch.
     OwnerGranted,
     /// The session announced or answered a path request; only the first time a session
     /// is heard in a run counts, and a card or message it served counts as heard.
@@ -149,6 +151,12 @@ impl CardCadence {
         self.state.lock().heard.insert(destination.to_string());
     }
 
+    /// An admitted fetch sent nothing (no path or no route was known), so the interval
+    /// it took is given back: the next trigger may ask.
+    pub(crate) fn unasked(&self, destination: &str) {
+        self.state.lock().last_asked.remove(destination);
+    }
+
     #[cfg(test)]
     pub(crate) fn is_refused(&self, destination: &str) -> bool {
         self.state.lock().refused.contains(destination)
@@ -200,32 +208,20 @@ pub(crate) async fn drive_card_cadence(
         let Some(runtime) = runtime.upgrade() else {
             break;
         };
-        let destinations: Vec<String> = match grant.destination_hash {
-            Some(destination) => vec![destination],
-            None => runtime
-                .peers()
-                .snapshot()
-                .into_iter()
-                .filter(|row| row.identity_hash == grant.identity_hash)
-                .map(|row| row.destination_hash)
-                .collect(),
-        };
-        for destination in destinations {
+        for destination in
+            runtime.sessions_a_grant_covers(&grant.identity_hash, grant.destination_hash.as_deref())
+        {
             runtime.consider_card_fetch(&destination, CardTrigger::Granted);
         }
     }
 }
 
 impl MeshRuntime {
-    /// The owner granted trust with `.mesh access trust`: one background card fetch to
-    /// `destination`, or to every session of `identity` the peer table holds when no
-    /// destination is named, whether or not they ever served this node.
-    pub(crate) fn fetch_cards_after_owner_grant(
-        self: &Arc<Self>,
-        identity: &str,
-        destination: Option<&str>,
-    ) {
-        let destinations: Vec<String> = match destination {
+    /// The sessions a grant covers: its one destination, or every session of `identity`
+    /// the peer table holds when it names none. A session the peer table does not hold
+    /// is not asked for its card.
+    fn sessions_a_grant_covers(&self, identity: &str, destination: Option<&str>) -> Vec<String> {
+        match destination {
             Some(destination) => vec![destination.to_string()],
             None => self
                 .peers()
@@ -234,8 +230,19 @@ impl MeshRuntime {
                 .filter(|row| row.identity_hash == identity)
                 .map(|row| row.destination_hash)
                 .collect(),
-        };
-        for destination in destinations {
+        }
+    }
+
+    /// The owner granted trust with `.mesh access trust`: one background card fetch to
+    /// `destination`, or to every session of `identity` the peer table holds when no
+    /// destination is named, whether or not they ever served this node. A session the
+    /// peer table does not hold, or one with no known path, is not asked.
+    pub(crate) fn fetch_cards_after_owner_grant(
+        self: &Arc<Self>,
+        identity: &str,
+        destination: Option<&str>,
+    ) {
+        for destination in self.sessions_a_grant_covers(identity, destination) {
             self.consider_card_fetch(&destination, CardTrigger::OwnerGranted);
         }
     }
@@ -290,10 +297,12 @@ impl MeshRuntime {
         let dest8 = short(destination);
         if !self.path_known(destination).await {
             debug!("Mesh background status card for {dest8} ({trigger:?}) skipped: no path");
+            self.card_cadence().unasked(destination);
             return;
         }
         let Some(desc) = self.resolve_destination_cached(destination).await else {
             debug!("Mesh background status card for {dest8} ({trigger:?}) skipped: no route");
+            self.card_cadence().unasked(destination);
             return;
         };
         let route = Route::unasked(desc);
@@ -342,6 +351,16 @@ mod tests {
         assert!(
             !cadence.admit(&other, CardTrigger::Heard, true),
             "a refusal still stops the announces"
+        );
+        assert!(
+            cadence.admit(&other, CardTrigger::OwnerGranted, false),
+            "the owner's grant lifts the refusal and asks again after the interval"
+        );
+        assert!(!cadence.is_refused(&other));
+        cadence.unasked(&other);
+        assert!(
+            cadence.admit(&other, CardTrigger::OwnerGranted, false),
+            "a fetch that sent nothing gives its interval back"
         );
     }
 

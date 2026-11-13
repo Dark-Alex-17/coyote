@@ -3891,13 +3891,13 @@ fn verify_binding(
     source: &str,
 ) -> Result<AddressHash> {
     let name_hash = decode_name_hash(name_hash).ok_or_else(|| {
-        anyhow!("The name hash {source} holds for {destination} is unreadable; wait until it is heard again.")
+        anyhow!("The session name hash {source} holds for session {destination} is unreadable; wait until it is heard again.")
     })?;
     let identity = parse_hash(identity_hash).ok_or_else(|| {
-        anyhow!("The identity hash {source} holds for {destination} is unreadable; wait until it is heard again.")
+        anyhow!("The user hash {source} holds for session {destination} is unreadable; wait until it is heard again.")
     })?;
     let claimed = parse_hash(destination).ok_or_else(|| {
-        anyhow!("'{destination}' is not a destination hash: expected 32 hex characters.")
+        anyhow!("'{destination}' is not a session hash: expected 32 hex characters.")
     })?;
     let expected = destination_address(&name_hash, &identity);
     if !bool::from(expected.as_slice().ct_eq(claimed.as_slice())) {

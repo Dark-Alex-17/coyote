@@ -323,7 +323,7 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "config",
         "rotate-identity",
-        ".mesh config rotate-identity [--dry-run|--confirm rotate-<identity-short>]",
+        ".mesh config rotate-identity [--dry-run|--confirm rotate-<key-short>]",
         "Mint a new mesh key while the mesh is off; everyone who trusted you must trust the new one",
     ),
 ];
@@ -5281,7 +5281,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     )?;
     if args.yes {
         bail!(
-            "`.mesh config rotate-identity` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+            "`.mesh config rotate-identity` takes `--confirm rotate-<key-short>` from a dry run, not `--yes`."
         );
     }
     if let Some(token) = args.positional.first() {
@@ -10346,10 +10346,7 @@ mod help_output_tests {
         }
         texts.push(joined_line("review", &"ab".repeat(16), true));
         for text in texts {
-            let text = text
-                .replace("rotate-identity", "")
-                .replace("rotate-<identity-short>", "")
-                .to_ascii_lowercase();
+            let text = text.replace("rotate-identity", "").to_ascii_lowercase();
             for word in ["this node", "identity", "destination", "instance", "knock"] {
                 assert!(!text.contains(word), "{word:?} in a help line: {text}");
             }
@@ -10568,19 +10565,15 @@ mod help_output_tests {
 
     /// `literal` lowercased, without the tokens that spell a protocol word but are not
     /// prose: a format placeholder such as `{identity}`, filled at run time with a hash or
-    /// a name; the `rotate-identity` verb and its `rotate-<identity-short>` token; and the
-    /// key's file name, `mesh/identity.key`.
+    /// a name; the `rotate-identity` verb, which keeps its name; and the key's file name,
+    /// `mesh/identity.key`.
     fn prose_of(literal: &str) -> String {
         let mut prose = String::new();
-        let mut rest = [
-            "rotate-identity",
-            "rotate-<identity-short>",
-            "mesh/identity.key",
-        ]
-        .iter()
-        .fold(literal.to_ascii_lowercase(), |text, token| {
-            text.replace(token, "")
-        });
+        let mut rest = ["rotate-identity", "mesh/identity.key"]
+            .iter()
+            .fold(literal.to_ascii_lowercase(), |text, token| {
+                text.replace(token, "")
+            });
         while let Some(open) = rest.find('{') {
             prose.push_str(&rest[..open]);
             let after = &rest[open + 1..];
@@ -10632,7 +10625,7 @@ mod help_output_tests {
         let fixture = r##"
 fn shown() {
     debug!("this node is quiet");
-    bail!("Rotate with .mesh config rotate-identity --confirm rotate-<identity-short>; {identity} lives in mesh/identity.key");
+    bail!("Rotate with .mesh config rotate-identity --confirm rotate-<key-short>; {identity} lives in mesh/identity.key");
     let row = NoticeText::from_template("to {destination}", &[("destination", d)], &[]);
     let c = ('"', 'a', '\'');
     out_text(r#"the "instance" stays"#);
@@ -21441,7 +21434,7 @@ mod tests {
             let err = err_of(&mut ctx, ".mesh config rotate-identity --yes");
             assert_eq!(
                 err,
-                "`.mesh config rotate-identity` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+                "`.mesh config rotate-identity` takes `--confirm rotate-<key-short>` from a dry run, not `--yes`."
             );
             assert_eq!(fs::read(&path).unwrap(), before);
 
@@ -35365,8 +35358,6 @@ mod tests {
                 });
             }
 
-            /// `access trust --identity` is a mutating verb like the rest: without a terminal it refuses
-            /// naming the flag, and declined at the prompt it writes nothing.
             /// B hears A, which trusts B but has never served B a card or a message; B's
             /// owner trusts A with `access trust session` or `access trust user`, and
             /// within seconds B has asked A for its card once and keeps the session name A
@@ -35457,6 +35448,8 @@ mod tests {
                 owner_grant_fetches_the_card("repl-mesh-grant-card-user", true);
             }
 
+            /// `access trust user` is a mutating verb like the rest: without a terminal it
+            /// refuses naming the flag, and declined at the prompt it writes nothing.
             #[test]
             #[serial]
             fn trust_identity_without_a_terminal_or_declined_writes_nothing() {

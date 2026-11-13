@@ -1272,7 +1272,7 @@ fn dest_vectors() -> Vec<Vector> {
                 ensure(
                     err.contains(&would_announce),
                     format!(
-                        "refusal does not name the destination the identity would announce: {err}"
+                        "refusal does not name the session the user's key would announce: {err}"
                     ),
                 )?;
                 same("nothing trusted", recorded, Vec::<String>::new())

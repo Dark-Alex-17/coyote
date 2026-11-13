@@ -10273,7 +10273,7 @@ fn the_deployment_page_rung_one_and_the_two_laptop_walk_run_through_type_local()
         "This walkthrough is stage 1 of the mesh test plan; re-run it after changing `mesh.interfaces`.",
         "Both sessions attach to their host's rnsd over its shared instance, so no `private` entry pointing at the daemon's 4242 listener is needed.",
         "With `enabled: true` the REPL joins by itself and prints one line:",
-        "`.mesh config show` lists the whole identity, destination and instance hashes and the interfaces that came up (`local rnsd at 127.0.0.1:37428 connected`; on Linux and Android `local rnsd at @rns/default`, the abstract socket, in place of the address).",
+        "`.mesh config show` lists your whole user hash, session hash and session id and the interfaces that came up (`local rnsd at 127.0.0.1:37428 connected`; on Linux and Android `local rnsd at @rns/default`, the abstract socket, in place of the address).",
         "`Local rnsd at 127.0.0.1:37428 (type: local) is not reachable`",
     ] {
         assert!(

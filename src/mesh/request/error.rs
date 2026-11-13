@@ -127,12 +127,12 @@ impl fmt::Display for RequestError {
             }
             Self::LocalTimeout { after, .. } => write!(
                 f,
-                "This node could not hand the request to its own mesh link within {:.1}s",
+                "Your session could not hand the request to its own mesh link within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::IdentifyTimeout { after, .. } => write!(
                 f,
-                "This node could not prove its identity to the peer within {:.1}s",
+                "Your session could not prove who it is to the peer within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::ResponseIncomplete { after, .. } => write!(

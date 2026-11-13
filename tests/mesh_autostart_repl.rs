@@ -6655,3 +6655,518 @@ fn result_lines_at_a_cold_prompt_say_session_not_this_node_or_destination() {
     assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// The words only a group's one "Under the hood" paragraph may say.
+const HELP_BANNED_WORDS: [&str; 5] = ["this node", "identity", "destination", "instance", "knock"];
+
+/// The groups and the verbs each lists, as the Mesh-Commands wiki table names them.
+const MESH_GROUPS: [(&str, &[&str]); 6] = [
+    ("people", &["list", "name", "info", "status"]),
+    (
+        "access",
+        &[
+            "trust", "revoke", "block", "unblock", "forget", "requests", "ask",
+        ],
+    ),
+    (
+        "messaging",
+        &["send", "broadcast", "inbox", "sync", "sent", "follow-up"],
+    ),
+    (
+        "envoy",
+        &["brief", "memory", "questions", "answer", "dismiss"],
+    ),
+    (
+        "files",
+        &[
+            "list", "allow", "deny", "unshare", "requests", "grant", "refuse", "request", "fetch",
+        ],
+    ),
+    ("config", &["show", "rotate-identity"]),
+];
+
+/// `people_command` waiting on the regex `prompt` and keeping the transcript as UTF-8,
+/// so the help tables' box-drawing characters survive: everything the command printed
+/// after the echoed line, through the next prompt.
+fn transcript_at(session: &mut Target, line: &str, prompt: &str) -> String {
+    session.send(format!("{line}\r")).expect("type the command");
+    let query = b"\x1b[6n";
+    let mut seen = Vec::new();
+    let mut asked = false;
+    loop {
+        let captures = session
+            .expect(Any([Regex(prompt), Regex(CURSOR_POSITION_QUERY)]))
+            .unwrap_or_else(|err| panic!("waiting for the prompt after {line:?}: {err}"));
+        let involved = captures.as_bytes().to_vec();
+        let mut from = 0;
+        while let Some(at) = involved[from..]
+            .windows(query.len())
+            .position(|window| window == query)
+        {
+            let at = from + at;
+            session
+                .send(cursor_position_reply(&involved[..at]))
+                .expect("reply to the cursor position query");
+            from = at + query.len();
+            asked = true;
+        }
+        let prompt_seen = captures.get(0).unwrap_or_default() != query;
+        seen.extend_from_slice(&involved);
+        if prompt_seen && asked {
+            let text = utf8_text(&seen);
+            return match text.find("\r\n") {
+                Some(at) => text[at + 2..].to_string(),
+                None => text,
+            };
+        }
+    }
+}
+
+/// The rows of every bordered table in `text`, a wrapped cell's continuation lines
+/// folded into the row they continue.
+fn all_table_rows(text: &str) -> Vec<Vec<String>> {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut continues = false;
+    for line in transcript_lines(text) {
+        let line = line.trim();
+        if line.starts_with('┌') || line.starts_with('└') {
+            continues = false;
+            continue;
+        }
+        if !line.starts_with('│') {
+            continue;
+        }
+        let cells = table_cells(line);
+        if continues && cells.first().is_some_and(String::is_empty) {
+            let row = rows.last_mut().unwrap();
+            for (cell, more) in row.iter_mut().zip(cells) {
+                if !more.is_empty() {
+                    cell.push(' ');
+                    cell.push_str(&more);
+                }
+            }
+        } else {
+            rows.push(cells);
+            continues = true;
+        }
+    }
+    rows
+}
+
+/// A row's first cell as the bare command word: backticks, a `.mesh <group>` prefix and
+/// any arguments dropped.
+fn command_word(cell: &str, group: &str) -> String {
+    let cell = cell.replace('`', "");
+    let cell = cell.trim();
+    let cell = cell
+        .strip_prefix(&format!(".mesh {group} "))
+        .or_else(|| cell.strip_prefix(".mesh "))
+        .unwrap_or(cell);
+    cell.split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `text` with its "Under the hood" paragraph (the line naming it through the next
+/// blank line) cut out, and how many such paragraphs it held.
+fn without_under_the_hood(text: &str) -> (String, usize) {
+    let mut kept = String::new();
+    let mut paragraphs = 0;
+    let mut inside = false;
+    for line in transcript_lines(text) {
+        if line.to_ascii_lowercase().contains("under the hood") {
+            paragraphs += 1;
+            inside = true;
+            continue;
+        }
+        if inside && line.trim().is_empty() {
+            inside = false;
+        }
+        if !inside {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    (kept, paragraphs)
+}
+
+/// The banned words `text` says, ignoring `allowed` (a verb's own name).
+fn banned_words_in(text: &str, allowed: &str) -> Vec<&'static str> {
+    let lower = text.to_ascii_lowercase().replace(allowed, "");
+    HELP_BANNED_WORDS
+        .into_iter()
+        .filter(|word| lower.contains(word))
+        .collect()
+}
+
+/// `.mesh help` at a cold prompt is a table of the groups, one line each,
+/// and a short table of the concepts (users, sessions, envoys, trust, the propagation
+/// node as where messages wait while a session is away), in user and session words.
+#[test]
+fn mesh_help_at_a_cold_prompt_is_a_group_table_and_a_concepts_table() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("help-top", false, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+
+    let out = transcript_at(&mut session, ".mesh help", SESSION_PROMPT);
+    let mut failures = Vec::new();
+    let tables = transcript_lines(&out)
+        .iter()
+        .filter(|line| line.trim().starts_with('┌'))
+        .count();
+    if tables < 2 {
+        failures.push(format!("a groups table and a concepts table, got {tables}"));
+    }
+    let rows = all_table_rows(&out);
+    for (group, _) in MESH_GROUPS {
+        let lines = rows
+            .iter()
+            .filter(|row| {
+                row.first().is_some_and(|cell| {
+                    cell.replace('`', "").starts_with(".mesh ") && command_word(cell, "") == group
+                })
+            })
+            .count();
+        if lines != 1 {
+            failures.push(format!("group {group} has {lines} row(s), expected one"));
+        }
+    }
+    let lower = out.to_ascii_lowercase();
+    for concept in ["user", "session", "envoy", "trust", "propagation node"] {
+        if !lower.contains(concept) {
+            failures.push(format!("the concepts do not mention {concept:?}"));
+        }
+    }
+    let propagation = rows
+        .iter()
+        .map(|row| row.join(" ").to_ascii_lowercase())
+        .find(|row| row.contains("propagation node"));
+    match propagation {
+        Some(row) if row.contains("wait") => {}
+        other => failures.push(format!(
+            "the propagation node row says where messages wait: {other:?}"
+        )),
+    }
+    let (plain, _) = without_under_the_hood(&out);
+    let banned = banned_words_in(&plain, "rotate-identity");
+    if !banned.is_empty() {
+        failures.push(format!("`.mesh help` says {banned:?}"));
+    }
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}\n\n{out}", failures.join("\n"));
+}
+
+/// `.mesh <group>`, `.mesh <group> help`, `.mesh <group> --help` and
+/// `.mesh help <group>` print the same thing: the group's commands as a table, its
+/// concepts, and exactly one "Under the hood" paragraph, the only place the protocol
+/// words appear; `people help` carries the people-list states.
+#[test]
+fn every_group_help_is_one_table_of_its_commands_with_one_under_the_hood_paragraph() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("help-groups", false, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+
+    let mut failures = Vec::new();
+    for (group, verbs) in MESH_GROUPS {
+        let spellings = [
+            format!(".mesh {group}"),
+            format!(".mesh {group} help"),
+            format!(".mesh {group} --help"),
+            format!(".mesh help {group}"),
+        ];
+        // A pty in cooked mode may double a line's `\r`; what the user sees is the same.
+        let outs: Vec<String> = spellings
+            .iter()
+            .map(|line| transcript_at(&mut session, line, SESSION_PROMPT).replace('\r', ""))
+            .collect();
+        let base = outs[0].trim();
+        for (line, out) in spellings.iter().zip(&outs).skip(1) {
+            if out.trim() != base {
+                failures.push(format!(
+                    "`{line}` differs from `.mesh {group}`:\n{out}\n---\n{base}"
+                ));
+            }
+        }
+        let rows = all_table_rows(base);
+        for verb in verbs {
+            if !rows.iter().any(|row| {
+                row.first()
+                    .is_some_and(|cell| command_word(cell, group) == *verb)
+            }) {
+                failures.push(format!("`.mesh {group}` lists no {verb} row:\n{base}"));
+            }
+        }
+        let (plain, paragraphs) = without_under_the_hood(base);
+        if paragraphs != 1 {
+            failures.push(format!(
+                "`.mesh {group}` has {paragraphs} Under the hood paragraph(s):\n{base}"
+            ));
+        }
+        let banned = banned_words_in(&plain, "rotate-identity");
+        if !banned.is_empty() {
+            failures.push(format!(
+                "`.mesh {group}` says {banned:?} outside Under the hood:\n{plain}"
+            ));
+        }
+        if group == "people" {
+            for state in ["trusted", "known", "blocked (session)", "blocked (user)"] {
+                if !base.contains(state) {
+                    failures.push(format!("`.mesh people help` does not explain {state:?}"));
+                }
+            }
+        }
+    }
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// The sentences of `text` outside its backtick spans and usage lines; the one-line
+/// summary under the usage counts as one whether or not it ends in a full stop.
+fn prose_sentences(text: &str) -> usize {
+    let mut prose = String::new();
+    let mut unterminated_lines = 0;
+    for line in transcript_lines(text) {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.to_ascii_lowercase().starts_with("usage")
+            || trimmed.starts_with(".mesh ")
+            || trimmed.starts_with("dry-model)")
+            || trimmed.starts_with("dryrun:")
+        {
+            continue;
+        }
+        if !trimmed.ends_with(['.', '?', '!']) {
+            unterminated_lines += 1;
+        }
+        prose.push_str(trimmed);
+        prose.push(' ');
+    }
+    let mut outside = String::new();
+    for (at, piece) in prose.split('`').enumerate() {
+        if at % 2 == 0 {
+            outside.push_str(piece);
+        } else {
+            outside.push('X');
+        }
+    }
+    let chars: Vec<char> = outside.chars().collect();
+    unterminated_lines
+        + (0..chars.len())
+            .filter(|&i| {
+                matches!(chars[i], '.' | '?' | '!')
+                    && chars.get(i + 1).is_none_or(|next| next.is_whitespace())
+            })
+            .count()
+}
+
+/// `<group> <verb> --help` is the usage and two or three plain sentences,
+/// in user and session words; `envoy brief --help` says the brief is what the envoy may
+/// tell other sessions (objective, status card, your note), answering without
+/// interrupting you.
+#[test]
+fn verb_help_is_usage_and_two_or_three_sentences_and_the_brief_help_says_what_it_shares() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("help-verbs", false, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+
+    let mut failures = Vec::new();
+    for (group, verb) in [
+        ("people", "name"),
+        ("people", "status"),
+        ("access", "trust"),
+        ("access", "ask"),
+        ("messaging", "send"),
+        ("messaging", "sync"),
+        ("envoy", "brief"),
+        ("envoy", "dismiss"),
+        ("files", "fetch"),
+        ("config", "show"),
+    ] {
+        let line = format!(".mesh {group} {verb} --help");
+        let out = transcript_at(&mut session, &line, SESSION_PROMPT);
+        if !out.contains(&format!(".mesh {group} {verb}")) {
+            failures.push(format!("`{line}` shows no usage:\n{out}"));
+        }
+        let sentences = prose_sentences(&out);
+        if !(2..=3).contains(&sentences) {
+            failures.push(format!("`{line}` has {sentences} sentence(s):\n{out}"));
+        }
+        let banned = banned_words_in(&out, "rotate-identity");
+        if !banned.is_empty() {
+            failures.push(format!("`{line}` says {banned:?}:\n{out}"));
+        }
+        if verb == "brief" {
+            let lower = out.to_ascii_lowercase();
+            for word in [
+                "objective",
+                "status card",
+                "note",
+                "interrupt",
+                "other sessions",
+            ] {
+                if !lower.contains(word) {
+                    failures.push(format!("`{line}` does not mention {word:?}:\n{out}"));
+                }
+            }
+        }
+    }
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// A typed `.mesh on` keeps the privacy preview and its warnings but ends
+/// with the one joined line in place of the old summary block.
+#[test]
+fn a_typed_mesh_on_ends_its_preview_with_the_one_joined_line_and_no_summary_block() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("on-one-line", false, &[relay.port]);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+
+    let out = transcript_at(&mut session, ".mesh on --yes", SESSION_PROMPT);
+    let lines = transcript_lines(&out);
+    let after: Vec<&str> = lines
+        .iter()
+        .copied()
+        .skip_while(|line| !line.starts_with("Turn it off again with"))
+        .skip(1)
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty() && !line.starts_with("dryrun:"))
+        .collect();
+    let joined = after
+        .iter()
+        .filter(|line| is_joined_line(line, "probe"))
+        .count();
+    let other: Vec<&&str> = after
+        .iter()
+        .filter(|line| {
+            !is_joined_line(line, "probe") && !line.to_ascii_uppercase().starts_with("WARNING")
+        })
+        .collect();
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(out.contains(ON_PREVIEW), "the preview stays: {out}");
+    assert_eq!(joined, 1, "one joined line after the preview: {out}");
+    assert!(
+        other.is_empty(),
+        "nothing but the joined line and warnings after the preview: {other:?}\n{out}"
+    );
+}
+
+/// On two running nodes on one real rnsd, session `review`
+/// trusts this session but never served it anything; the owner's
+/// `.mesh access trust session <it> --yes` or `.mesh access trust user <them> --yes`
+/// fetches its card within seconds, so `.mesh people list` names it `<user> / review`.
+#[test]
+fn the_owners_trust_grant_fetches_the_card_of_a_session_that_never_served_it() {
+    for by_user in [false, true] {
+        let label = if by_user {
+            "grant-user"
+        } else {
+            "grant-session"
+        };
+        let Some(relay) = RnsdRelay::start(label) else {
+            eprintln!("skipped: no rnsd on the PATH");
+            return;
+        };
+        let review_prompt = session_prompt("review");
+        let them = Probe::new(&format!("{label}-them"), true, &[relay.port]).with_announce();
+        let mut command = them.command();
+        command.args(["--session", "review"]);
+        let mut theirs = spawn_repl(command);
+        wait_for(&mut theirs, &review_prompt);
+        them.wait_for_marker("MESH_STARTED");
+        let me = Probe::new(&format!("{label}-me"), true, &[relay.port]).with_announce();
+        let mut command = me.command();
+        command.args(["--session", "probe"]);
+        let mut mine = spawn_repl(command);
+        wait_for(&mut mine, SESSION_PROMPT);
+        me.wait_for_marker("MESH_STARTED");
+        let their_id = them.own_identity();
+        let their8 = their_id[..8].to_string();
+        let my8 = me.own_identity()[..8].to_string();
+
+        let heard = |session: &mut Target, prompt: &str, user8: &str| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let list = transcript_at(session, ".mesh people list", prompt);
+                if let Some(dest8) = sessions_of(&list, user8).into_iter().next() {
+                    return dest8;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the announce never arrived: {list}"
+                );
+                thread::sleep(Duration::from_secs(1));
+            }
+        };
+        let their_dest8 = heard(&mut mine, SESSION_PROMPT, &their8);
+        let my_dest8 = heard(&mut theirs, &review_prompt, &my8);
+
+        let out = transcript_at(
+            &mut theirs,
+            &format!(".mesh access trust session {my_dest8} --yes"),
+            &review_prompt,
+        );
+        assert!(out.contains("Trusted "), "they trust this session: {out}");
+        thread::sleep(Duration::from_secs(3));
+        let hashes = format!("{their8} / {their_dest8}");
+        let session_cell = |list: &str| {
+            all_table_rows(list)
+                .into_iter()
+                .find(|row| row.last().is_some_and(|cell| *cell == hashes))
+                .and_then(|row| row.get(1).cloned())
+        };
+        let before = transcript_at(&mut mine, ".mesh people list", SESSION_PROMPT);
+        assert_eq!(
+            session_cell(&before).as_deref(),
+            Some(their_dest8.as_str()),
+            "{label}: no card fetched before the grant, so the session reads its hash: {before}"
+        );
+
+        let grant = if by_user {
+            format!(".mesh access trust user {their8} --yes")
+        } else {
+            format!(".mesh access trust session {their_dest8} --yes")
+        };
+        let out = transcript_at(&mut mine, &grant, SESSION_PROMPT);
+        assert!(out.contains("Trusted "), "{grant}: {out}");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut list;
+        loop {
+            list = transcript_at(&mut mine, ".mesh people list", SESSION_PROMPT);
+            if session_cell(&list).as_deref() == Some("review") || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_secs(1));
+        }
+
+        let _ = exit_clean(&mut theirs);
+        let status = exit_clean(&mut mine);
+        assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+        assert_eq!(
+            session_cell(&list).as_deref(),
+            Some("review"),
+            "{grant}: the grant fetched the card, so the session is named review: {list}"
+        );
+    }
+}

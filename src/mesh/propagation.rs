@@ -252,12 +252,12 @@ impl fmt::Display for PropagationError {
             ),
             Self::Link(RequestError::LocalTimeout { after, .. }) => write!(
                 f,
-                "This node could not hand the message to its own link to the propagation node within {:.1}s",
+                "Your session could not hand the message to its own link to the propagation node within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::Link(RequestError::IdentifyTimeout { after, .. }) => write!(
                 f,
-                "This node could not prove its identity to the propagation node within {:.1}s",
+                "Your session could not prove who it is to the propagation node within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::Link(RequestError::ResponseIncomplete { after, .. }) => write!(
