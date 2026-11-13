@@ -12,6 +12,8 @@
 # Helpers: confirm, select, checkbox, input, password, guard_operation,
 # guard_path. confirm returns a bool, select the index of the chosen option,
 # checkbox the chosen indices in option order, input and password the text.
+# Through the prompt channel a select may instead return the free text the
+# user typed (a str) when they answered with one of their own.
 #
 # When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 # writes one request line to the tool's stdout and reads the answer line back
@@ -81,8 +83,8 @@ def _map_answer(action, answer, options):
     if action == "confirm":
         return answer if isinstance(answer, bool) else None
     if action == "select":
-        if isinstance(answer, str) and answer in options:
-            return options.index(answer)
+        if isinstance(answer, str):
+            return options.index(answer) if answer in options else answer
         return None
     if action == "checkbox":
         if not isinstance(answer, list) or any(item not in options for item in answer):

@@ -1091,10 +1091,11 @@ impl ToolPrompter {
 }
 
 /// Asks and writes the reply line. A prompter failure, an answer of the
-/// wrong shape or a choice outside the offered options all answer `null`,
-/// so the tool fails closed instead of hanging or acting on a bad value.
-/// Chosen options go back as the raw text the tool sent, since that is what
-/// the tool matches its answer against.
+/// wrong shape or a checkbox choice outside the offered options all answer
+/// `null`, so the tool fails closed instead of hanging or acting on a bad
+/// value. Chosen options go back as the raw text the tool sent, since that
+/// is what the tool matches its answer against; a select answer that is
+/// not an offered option is free text the user typed and goes back as is.
 pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed: ParsedRequest) {
     let ParsedRequest { req, raw_options } = parsed;
     let id = req.id.clone();
@@ -1123,15 +1124,7 @@ pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed
         Ok(PromptAnswer::Selected(choice))
             if action == PromptAction::Select && !options.is_empty() =>
         {
-            match raw(choice) {
-                Some(raw) => json!(raw),
-                None => {
-                    warn!(
-                        "Tool '{tool}' prompt '{id}': answer '{choice}' is not one of the offered options; answering null"
-                    );
-                    Value::Null
-                }
-            }
+            json!(raw(choice).unwrap_or_else(|| choice.clone()))
         }
         Ok(PromptAnswer::Checked(choices))
             if action == PromptAction::Checkbox && !options.is_empty() =>
@@ -1250,9 +1243,9 @@ pub(crate) fn parse_request(
             job_id,
             origin,
             help: None,
-            // The answer is mapped back to the raw option by index, so a
-            // custom answer could never reach the tool: the select is closed.
-            closed: action == PromptAction::Select && !raw_options.is_empty(),
+            // A picked option is mapped back to the raw text by index; the
+            // custom row's typed text goes back to the tool verbatim.
+            closed: false,
         },
         raw_options,
     })
@@ -1689,7 +1682,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         assert_eq!(req.tool.as_deref(), Some("tool-x"));
         assert_eq!(req.call_id.as_deref(), Some("call-1"));
         assert_eq!(req.job_id.as_deref(), Some("job_1"));
-        assert!(req.closed);
+        assert!(!req.closed);
 
         for bad in [
             r#"{"coyote_prompt": not-json}"#,
@@ -1717,8 +1710,21 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         assert!(!req.closed);
     }
 
-    /// `closed` is a select's property; a checkbox with options is not
-    /// a closed select.
+    /// A tool's select with options stays open, so the human can type an
+    /// answer the tool did not offer.
+    #[test]
+    fn parse_request_leaves_a_select_with_options_open() {
+        let line = r#"{"coyote_prompt": {"id": "p1", "action": "select", "question": "q", "options": ["a", "b"]}}"#;
+
+        let req = parse_request(line.as_bytes(), "t", None, None, Origin::detached())
+            .unwrap()
+            .req;
+
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.options, vec!["a", "b"]);
+        assert!(!req.closed);
+    }
+
     #[test]
     fn parse_request_leaves_a_checkbox_with_options_open() {
         let line = r#"{"coyote_prompt": {"id": "p1", "action": "checkbox", "question": "q", "options": ["a", "b"]}}"#;
@@ -1820,17 +1826,17 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
 
     #[test]
     #[serial]
-    fn select_answer_outside_the_options_is_answered_null() {
+    fn select_answer_outside_the_options_is_replied_as_typed() {
         let mut req = PromptRequest::new(PromptAction::Select, "Pick? opt-x7x", Origin::detached());
         req.options = vec!["a".to_string(), "b".to_string()];
         let id = req.id.clone();
 
         let reply = reply_for(
-            ScriptedPrompter::new(vec![PromptAnswer::Selected("zzz".to_string())]),
+            ScriptedPrompter::new(vec![PromptAnswer::Selected("typed by hand".to_string())]),
             req,
         );
 
-        assert_eq!(reply, json!({"id": id, "answer": null}));
+        assert_eq!(reply, json!({"id": id, "answer": "typed by hand"}));
     }
 
     #[test]
@@ -2713,7 +2719,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         }
 
         #[test]
-        fn list_prints_the_index_of_the_chosen_option_and_rejects_unknown_ones() {
+        fn list_prints_the_index_of_the_chosen_option_and_typed_text_as_is() {
             require_tools();
             let dir = scratch_dir("list");
             let run = run_helper(
@@ -2731,20 +2737,21 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             );
             assert_eq!(run.other_lines(), vec!["v=[1] rc=0"]);
 
-            // An answer that is not one of the offered options cannot be mapped to
-            // an index: the helper fails closed instead of printing something.
+            // An answer that is not one of the offered options is text the
+            // user typed, so it is printed as is.
             let run = run_helper(
                 &dir,
-                Some(&[json!("zzz")]),
+                Some(&[json!("typed by hand")]),
                 &capture("list \"Pick\" a b c"),
                 false,
             );
-            assert_eq!(run.other_lines(), vec!["v=[] rc=1"], "{}", run.stdout);
-            assert!(
-                run.stderr.contains("prompt reply unusable"),
+            assert_eq!(
+                run.other_lines(),
+                vec!["v=[typed by hand] rc=0"],
                 "{}",
-                run.stderr
+                run.stdout
             );
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -4376,13 +4383,15 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert_eq!(run.printed, vec![none], "{}", run.stderr);
         }
 
-        /// What a language prints for the two booleans, a missing answer
-        /// and the checkbox indices; everything else prints the same.
+        /// What a language prints for the two booleans, a missing answer,
+        /// the checkbox indices and a select answered with typed text;
+        /// everything else prints the same.
         struct Contract {
             confirm_true: &'static str,
             confirm_false: &'static str,
             none: &'static str,
             checked: &'static str,
+            typed: &'static str,
         }
 
         fn check_contract(eval: impl Fn(&str, Option<&[Value]>, bool) -> Run, shape: &Contract) {
@@ -4413,13 +4422,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let run = eval(confirm, Some(&[json!(true)]), true);
             assert_eq!(run.printed, vec![shape.confirm_true], "{}", run.stderr);
 
-            let run = eval(select, Some(&[json!("zzz")]), false);
-            assert_eq!(run.printed, vec![shape.none], "{}", run.stderr);
-            assert!(
-                run.stderr.contains("prompt reply unusable"),
-                "{}",
-                run.stderr
-            );
+            let run = eval(select, Some(&[json!("typed by hand")]), false);
+            assert_eq!(run.printed, vec![shape.typed], "{}", run.stderr);
+            assert!(run.stderr.is_empty(), "{}", run.stderr);
 
             let run = eval(confirm, None, false);
             assert_eq!(run.printed, vec![shape.none], "{}", run.stderr);
@@ -5133,6 +5138,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                         confirm_false: "False",
                         none: "None",
                         checked: "[0, 2]",
+                        typed: "typed by hand",
                     },
                 );
             }
@@ -5280,6 +5286,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                         confirm_false: "false",
                         none: "null",
                         checked: "[0,2]",
+                        typed: "\"typed by hand\"",
                     },
                 );
                 fs::remove_dir_all(&dir).ok();

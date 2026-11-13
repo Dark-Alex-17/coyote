@@ -805,18 +805,25 @@ mod tests {
         assert_eq!(input_default_text(&input(None)), None);
     }
 
-    /// Which widget a closed select gets depends on who asks: a command
-    /// menu takes inquire's bare select, a tool keeps the REPL styling
-    /// its selects always had. The widget only exists on a terminal, so
-    /// the two branches are pinned on the source, split at the guard.
+    /// Which widget a select gets depends on who asks: a closed command
+    /// menu takes inquire's bare select, a tool's open select keeps the
+    /// REPL styling its selects always had plus the custom row. The
+    /// widget only exists on a terminal, so the two branches are pinned
+    /// on the source, split at the guard.
     #[test]
-    fn a_closed_tool_select_keeps_the_filterless_help_styling() {
+    fn an_open_tool_select_keeps_the_filterless_help_styling_and_the_custom_row() {
         let closed = |tool: Option<&str>| PromptRequest {
             closed: true,
             ..request(PromptAction::Select, tool)
         };
+        let tool_select = request(PromptAction::Select, Some("tool-x"));
         assert!(InquirePrompter::is_command_menu(&closed(None)));
-        assert!(!InquirePrompter::is_command_menu(&closed(Some("probe"))));
+        assert!(!InquirePrompter::is_command_menu(&closed(Some("tool-x"))));
+        assert!(!InquirePrompter::is_command_menu(&tool_select));
+        assert_eq!(
+            InquirePrompter::select_options(&tool_select),
+            vec!["a", "b", CUSTOM_MULTI_CHOICE_ANSWER_OPTION]
+        );
         assert!(!InquirePrompter::is_command_menu(&request(
             PromptAction::Select,
             None
@@ -833,6 +840,7 @@ mod tests {
         for needle in [
             ".without_filtering()",
             "\"↑↓ to move, enter to select\"", // debris-exempt: inquire help text reused verbatim
+            "\"Custom response:\"",
         ] {
             assert!(!bare.contains(needle), "{needle} in:\n{bare}");
             assert!(styled.contains(needle), "{needle} missing from:\n{styled}");

@@ -574,6 +574,27 @@ mod tests {
         assert_eq!(req.origin, Origin::from(&ctx));
     }
 
+    /// The built-in select is open on both prompters, so an answer the
+    /// options did not offer comes back as typed.
+    #[tokio::test]
+    #[serial]
+    async fn direct_select_is_open_and_returns_a_typed_answer() {
+        let (mut ctx, prompter) =
+            scripted_ctx(vec![PromptAnswer::Selected("typed by hand".to_string())]);
+        let v = handle_user_tool(
+            &mut ctx,
+            "user__select",
+            &json!({"question": "pick one sel-4k9", "options": ["a", "b"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, json!({ "answer": "typed by hand" }));
+
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert!(!req.closed);
+    }
+
     #[tokio::test]
     #[serial]
     async fn direct_confirm_round_trips_through_the_prompter() {

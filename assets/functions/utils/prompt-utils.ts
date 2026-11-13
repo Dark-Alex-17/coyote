@@ -18,7 +18,9 @@
 // guardPath (also exported as guard_operation and guard_path). confirm
 // returns a boolean, select the index of the chosen option, checkbox the
 // chosen indices in option order, input and password the text. All of them
-// are synchronous.
+// are synchronous. Through the prompt channel a select may instead return
+// the free text the user typed (a string) when they answered with one of
+// their own.
 //
 // When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 // writes one request line to the tool's stdout and reads the answer line back
@@ -133,9 +135,10 @@ function mapAnswer(action: Action, answer: unknown, options: string[]): Answer {
     case "confirm":
       return typeof answer === "boolean" ? answer : null;
     case "select":
-      return typeof answer === "string" && options.includes(answer)
-        ? options.indexOf(answer)
-        : null;
+      if (typeof answer !== "string") {
+        return null;
+      }
+      return options.includes(answer) ? options.indexOf(answer) : answer;
     case "checkbox": {
       if (!Array.isArray(answer) || !answer.every((item) => options.includes(item))) {
         return null;
@@ -361,10 +364,10 @@ export function confirm(question: string): boolean | null {
   return line.trim().toLowerCase().startsWith("y");
 }
 
-export function select(question: string, options: string[]): number | null {
+export function select(question: string, options: string[]): number | string | null {
   options = options.map(String);
   if (channelEnabled()) {
-    return promptChannel("select", question, options) as number | null;
+    return promptChannel("select", question, options) as number | string | null;
   }
   const line = ttyList(question, options);
   return line === null ? null : parseIndex(line.trim(), options);

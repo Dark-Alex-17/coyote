@@ -28,6 +28,8 @@
 # one prompt at a time: never run two helpers concurrently (background
 # subshells) in the same tool, or they will swallow each other's replies.
 # Under Git Bash or Cygwin the reply pipe is opened through its /proc path.
+# Through the channel, list prints the index of the chosen option, or the
+# free text the user typed when they answered with one of their own.
 #
 # COYOTE_UI is "repl" or "tui" when a human can answer and "headless" when
 # nobody can; tools may branch on it before asking. Under "tui" only the
@@ -163,8 +165,9 @@ _coyote_prompt_send() {
 
 # _coyote_prompt_map <action> <reply-line> <options-json>
 # Prints the answer in the same shape the terminal helpers print: confirm 1/0,
-# select the option index, checkbox the checked indices, input/password the
-# text. Fails when the answer does not fit the action.
+# select the option index (or, when the user typed an answer of their own,
+# that text as is), checkbox the checked indices, input/password the text.
+# Fails when the answer does not fit the action.
 _coyote_prompt_map() {
   declare action="$1"
   declare reply="$2"
@@ -176,7 +179,7 @@ _coyote_prompt_map() {
       ;;
     select)
       printf '%s' "$reply" | jq -er --argjson options "$options" \
-        'if (.answer | type) == "string" then (.answer as $a | $options | index($a)) else empty end'
+        'if (.answer | type) == "string" then (.answer as $a | ($options | index($a)) // $a) else empty end'
       ;;
     checkbox)
       printf '%s' "$reply" | jq -er --argjson options "$options" \

@@ -3018,14 +3018,15 @@ fn dot_vault_add_with_an_empty_password_modal_is_reasked_and_esc_stores_nothing(
 
 // ---------------------------------------------------------------------------
 // The REPL deltas seen from the real binary (a tool's list question
-// keeps its arrow help and loses only the custom row;
+// keeps its arrow help and its custom row;
 // the asset-overwrite warning is an Enter-answered confirm; a blank
 // required agent variable is re-asked with its reason), and the tty-less
 // `.rag` with no name that refuses before it touches the temp rag.
 // ---------------------------------------------------------------------------
 
 /// A tool that asks the human to pick one of three entries through the
-/// prompt helpers' `list` and records the index it got back.
+/// prompt helpers' `list` and records the index (or typed text) it got
+/// back.
 const RECORDING_LIST_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Ask the user to pick one entry and record the index.\n\
@@ -3060,14 +3061,14 @@ fn list_tool_turn(dir: &Path) -> (FakeLlm, PathBuf) {
 }
 
 /// A tool's `list` question in the plain REPL is the inquire select it
-/// always was, minus the dead `Other (custom)` row: the three entries
-/// are listed under the question with the `to move, enter to select`
-/// help, a typed letter does not filter the list (Down then Enter still
-/// lands on the second entry, not on the only one starting with that
-/// letter), the index flows back to the tool and the turn completes.
+/// always was: the three entries and the `Other (custom)` row are listed
+/// under the question with the `to move, enter to select` help, a typed
+/// letter does not filter the list (Down then Enter still lands on the
+/// second entry, not on the only one starting with that letter), the
+/// index flows back to the tool and the turn completes.
 #[test]
 #[serial]
-fn a_tools_list_question_in_the_plain_repl_is_a_closed_select_keeping_the_arrow_help() {
+fn a_tools_list_question_in_the_plain_repl_is_an_open_select_keeping_the_arrow_help() {
     let dir = fresh_config_dir("tool-list-repl");
     let _guard = TempDirGuard(dir.clone());
     let (fake, out) = list_tool_turn(&dir);
@@ -3090,8 +3091,8 @@ fn a_tools_list_question_in_the_plain_repl_is_a_closed_select_keeping_the_arrow_
         );
     }
     assert!(
-        !asked.contains("Other (custom)"),
-        "a tool's list question still offers the free-text row:\n{asked}"
+        asked.contains("Other (custom)"),
+        "a tool's list question does not offer the free-text row:\n{asked}"
     );
     assert!(
         asked.contains("to move, enter to select"),
@@ -3127,12 +3128,12 @@ fn a_tools_list_question_in_the_plain_repl_is_a_closed_select_keeping_the_arrow_
 }
 
 /// The same tool's `list` question under the UI is the Select modal with
-/// exactly the tool's entries (no `Other (custom)` row), the terminal is
-/// never released, Down then Enter answers it with the second entry and
-/// the index flows back to the tool.
+/// the tool's entries and the `Other (custom)` row, the terminal is never
+/// released, and text typed on the custom row flows back to the tool
+/// verbatim.
 #[test]
 #[serial]
-fn a_tools_list_question_under_the_ui_is_a_closed_select_modal_without_the_custom_row() {
+fn a_tools_list_question_under_the_ui_takes_typed_text_from_the_custom_row() {
     let dir = fresh_config_dir("tool-list-modal");
     let _guard = TempDirGuard(dir.clone());
     let (fake, out) = list_tool_turn(&dir);
@@ -3141,7 +3142,7 @@ fn a_tools_list_question_under_the_ui_is_a_closed_select_modal_without_the_custo
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let asked_at = pty.raw().len();
     pty.send(b"call the list tool\r").unwrap();
-    let modal = wait_for_the_modal(
+    wait_for_the_modal(
         &mut pty,
         asked_at,
         "the list tool",
@@ -3150,26 +3151,34 @@ fn a_tools_list_question_under_the_ui_is_a_closed_select_modal_without_the_custo
             "alpha-q7l",
             "beta-q7l",
             "gamma-q7l",
+            "Other (custom)",
             "Up/Down=move",
         ],
     );
-    assert!(
-        !modal.contains("Other (custom)"),
-        "the Select modal of a tool's list question offers the free-text row:\n{modal}"
-    );
 
     pty.read_for(HOTKEY_GAP);
-    pty.send(b"\x1b[B").unwrap();
-    pty.read_for(Duration::from_millis(400));
+    for _ in 0..3 {
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+    pty.send(b"\r").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"typed-by-hand-x7q").unwrap();
+    pty.read_for(HOTKEY_GAP);
     pty.send(b"\r").unwrap();
     wait_for_file(&mut pty, &out, "the tool's recorded answer");
     let transcript = wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
     assert_eq!(
         fs::read_to_string(&out).unwrap().trim(),
-        "1",
-        "Down then Enter on the Select modal did not reach the tool as the second entry:\n{transcript}"
+        "typed-by-hand-x7q",
+        "the text typed on the custom row did not reach the tool verbatim:\n{transcript}"
     );
     assert_eq!(fake.served(), 2, "{transcript}");
+    assert!(
+        fake.bodies()[1].contains("fixture picked: typed-by-hand-x7q q7l-r"),
+        "the tool's output handed to the model does not carry the typed text:\n{:?}",
+        fake.bodies()
+    );
 
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
