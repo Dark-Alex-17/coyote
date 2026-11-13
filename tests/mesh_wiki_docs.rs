@@ -6945,9 +6945,19 @@ fn the_walkthroughs_show_a_messages_answer_as_a_reply_in_its_thread() {
             "Mesh-Deployment.md's Two sessions on one host does not carry {needle:?}:\n{deployment}"
         );
     }
-    for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md", "Mesh-Platform-Support.md"] {
+    for page in [
+        "Mesh.md",
+        "Mesh-Commands.md",
+        "Mesh-Deployment.md",
+        "Mesh-Platform-Support.md",
+    ] {
         let text = flat(&read(wiki.join(page)));
-        for stale in ["only `mesh__ask`", "opened no question", "asked no question", "fire-and-forget"] {
+        for stale in [
+            "only `mesh__ask`",
+            "opened no question",
+            "asked no question",
+            "fire-and-forget",
+        ] {
             assert!(!text.contains(stale), "{page} still says {stale:?}");
         }
     }

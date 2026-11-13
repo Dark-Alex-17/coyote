@@ -2303,7 +2303,10 @@ async fn message(
         &out,
         SystemTime::now(),
     );
-    let outcome = match runtime.send_peer_lending_reference(&destination, &out).await {
+    let outcome = match runtime
+        .send_peer_lending_reference(&destination, &out)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(err) => {
             ctx.app.mesh.correlations().abandon(&out.id);
