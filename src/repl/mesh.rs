@@ -3664,6 +3664,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let shown = shown_pattern(&args.path);
     let peer = short(&destination);
+    let named = format!("{} ({peer})", runtime.who_at(&destination));
     if let Some(reason) = spent_attachment(
         runtime.memory(),
         &destination,
@@ -3672,9 +3673,13 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         SystemTime::now(),
     ) {
         return Err(QuotingError::wrap(
-            not_shared_refusal(peer, &shown, &args.path, &reason).frame(format!(
-                " This was answered from your own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}."
-            )),
+            not_shared_refusal(&named, peer, &shown, &args.path, &reason).then(
+                NoticeText::from_template(
+                    " This was answered from your own records without asking {peer}; if {peer} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {peer}.",
+                    &[],
+                    &[("peer", &named)],
+                ),
+            ),
         ));
     }
     let route = match route_to(&runtime, &destination, abort_signal).await {
@@ -3692,7 +3697,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         }
     };
     out_path_text(&format!(
-        "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
+        "Fetching `{shown}` from {named} over the mesh (up to {} s)...",
         FILE_FETCH_REQUEST_TIMEOUT.as_secs()
     ));
     result_follows();
@@ -3706,13 +3711,13 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     match outcome {
         Ok(Fetched::Staged { path, size, sha256 }) => {
             out_path_text(&format!(
-                "Staged `{shown}` from {peer}: {size} bytes, sha256 {}, at {}.",
+                "Staged `{shown}` from {named}: {size} bytes, sha256 {}, at {}.",
                 hex_lower(&sha256),
                 path.display()
             ));
             out_path_text(
                 &NoticeText::from(
-                    "The file is the peer's; move it into the tree yourself if you want it there.",
+                    "The file is that session's; move it into the tree yourself if you want it there.",
                 )
                 .render(live_prefix()),
             );
@@ -3729,7 +3734,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
                 SystemTime::now(),
             );
             return Err(QuotingError::wrap(not_shared_refusal(
-                peer, &shown, &args.path, &reason,
+                &named, peer, &shown, &args.path, &reason,
             )));
         }
         Ok(Fetched::InvalidPath { rule }) => {
@@ -3740,6 +3745,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         }
         Err(FileFetchError::NotServed) => {
             return Err(QuotingError::wrap(not_shared_sentence(
+                &named,
                 peer,
                 &shown,
                 &args.path,
@@ -3844,8 +3850,14 @@ mod fetch_path_refusal_tests {
 
 /// The refusal for a path the peer did not serve, read against what this node knows,
 /// with the gone-copy tail when an already fetched copy has since been removed.
-fn not_shared_refusal(peer: &str, shown: &str, path: &str, reason: &NotSharedReason) -> NoticeText {
-    let sentence = not_shared_sentence(peer, shown, path, reason);
+fn not_shared_refusal(
+    peer: &str,
+    dest8: &str,
+    shown: &str,
+    path: &str,
+    reason: &NotSharedReason,
+) -> NoticeText {
+    let sentence = not_shared_sentence(peer, dest8, shown, path, reason);
     if let NotSharedReason::AlreadyFetched { staged, .. } = reason
         && !staged.is_file()
     {
@@ -3864,7 +3876,7 @@ mod not_shared_refusal_tests {
             message_id: "m-1".to_string(),
             staged: PathBuf::from("/nonexistent/.vault"),
         };
-        let refusal = not_shared_refusal("abcd1234", ".session", ".session", &reason);
+        let refusal = not_shared_refusal("abcd1234", "abcd1234", ".session", ".session", &reason);
         let today = "`.session` was a one-time attachment from abcd1234 and you already fetched it (staged at /nonexistent/.vault). Ask for it again with .mesh messaging send abcd1234 if you need a fresh copy. That copy is no longer at that path.";
         assert_eq!(refusal.render(CommandPrefix::Dot), today);
         assert_eq!(
@@ -54407,10 +54419,16 @@ mod tests {
                         short(&self.stub.destination_hex()).to_string()
                     }
 
+                    /// The session as the fetch lines name it, `<user> / <session> (<dest8>)`.
+                    fn named(&self) -> String {
+                        let to = self.stub.destination_hex();
+                        format!("{} ({})", self.started.runtime.who_at(&to), self.dest())
+                    }
+
                     fn fetching(&self, path: &str) -> String {
                         format!(
                             "Fetching `{path}` from {} over the mesh (up to {} s)...",
-                            self.dest(),
+                            self.named(),
                             FILE_FETCH_REQUEST_TIMEOUT.as_secs()
                         )
                     }
@@ -54474,11 +54492,11 @@ mod tests {
                                 String::new(),
                                 format!(
                                     "Staged `docs/a.md` from {}: 4 bytes, sha256 {}, at {}.",
-                                    fx.dest(),
+                                    fx.named(),
                                     hex_lower(&Sha256::digest(bytes)),
                                     staged.display()
                                 ),
-                                "The file is the peer's; move it into the tree yourself if you want it there."
+                                "The file is that session's; move it into the tree yourself if you want it there."
                                     .to_string(),
                             ],
                             "{out}"
@@ -54554,7 +54572,7 @@ mod tests {
                             refusal(&mut fx.ctx, &line).await,
                             format!(
                                 "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             )
                         );
 
@@ -54598,7 +54616,8 @@ mod tests {
                         assert_eq!(
                             refusal(&mut bare.ctx, &line).await,
                             format!(
-                                "{dest} does not share files; it may run an older Coyote or have sharing off. .mesh people info {dest} shows what its last status card advertises; ask the user of {dest} to upgrade or turn sharing on, then try again.",
+                                "{who} does not share files; it may run an older Coyote or have sharing off. .mesh people info {dest} shows what its last status card advertises; ask the user of {who} to upgrade or turn sharing on, then try again.",
+                                who = bare.named(),
                                 dest = bare.dest()
                             )
                         );
@@ -54670,7 +54689,7 @@ mod tests {
                             refusal(&mut fx.ctx, &line).await,
                             format!(
                                 "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             ),
                             "a last card without the fetch capability explains nothing: the peer answered"
                         );
@@ -54682,7 +54701,7 @@ mod tests {
                             refusal(&mut fx.ctx, &line).await,
                             format!(
                                 "The grant for `docs/a.md` from {0} expired at {1}; ask again with mesh__request_access, or ask the user of {0} to run .mesh files allow docs/a.md.",
-                                fx.dest(),
+                                fx.named(),
                                 rfc3339_utc(past)
                             ),
                             "an expired grant is read before the generic sentence"
@@ -54698,7 +54717,8 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and you already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. This was answered from your own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
+                                "`docs/a.md` was a one-time attachment from {who} and you already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. This was answered from your own records without asking {who}; if {who} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {who}.",
+                                who = fx.named(),
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -54716,7 +54736,8 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest} and you already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from your own records without asking {dest}; if {dest} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest}.",
+                                "`docs/a.md` was a one-time attachment from {who} and you already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest} if you need a fresh copy. That copy is no longer at that path. This was answered from your own records without asking {who}; if {who} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {who}.",
+                                who = fx.named(),
                                 dest = fx.dest(),
                                 staged = staged.display()
                             ),
@@ -54756,7 +54777,7 @@ mod tests {
                             sentence,
                             format!(
                                 "{0} did not serve `docs/heart.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow {raw}, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             )
                         );
                         assert_eq!(
@@ -54862,7 +54883,8 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`docs/a.md` was a one-time attachment from {dest8} and you already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest8} if you need a fresh copy. This was answered from your own records without asking {dest8}; if {dest8} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {dest8}.",
+                                "`docs/a.md` was a one-time attachment from {who} and you already fetched it (staged at {staged}). Ask for it again with .mesh messaging send {dest8} if you need a fresh copy. This was answered from your own records without asking {who}; if {who} now shares it some other way, a mesh__list call from the model that lists the path (following its cursor if needed) lets the next fetch ask {who}.",
+                                who = fx.named(),
                                 dest8 = fx.dest()
                             ),
                             "the refusal names the path the Staged line printed"
@@ -54879,7 +54901,7 @@ mod tests {
                                 .await,
                             format!(
                                 "{0} did not serve `docs/b.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/b.md, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             ),
                             "a grant that has not run out explains nothing"
                         );
@@ -55001,7 +55023,7 @@ mod tests {
                                 .await,
                             format!(
                                 "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             ),
                             "a spent grant is not an expired one"
                         );
@@ -55127,7 +55149,7 @@ mod tests {
                                 .await,
                             format!(
                                 "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             ),
                             "the fetched copy was the old identity's lend, so nothing explains the refusal"
                         );
@@ -55169,7 +55191,7 @@ mod tests {
                                 .await,
                             format!(
                                 "{0} did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a session never says which. To get it, ask the user of {0} to run .mesh files allow docs/a.md, or let the model request access with mesh__request_access.",
-                                fx.dest()
+                                fx.named()
                             ),
                             "the old lend is gone from memory too, so nothing explains the refusal"
                         );

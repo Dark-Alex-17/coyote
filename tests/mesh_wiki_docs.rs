@@ -5315,8 +5315,8 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         );
     }
     assert!(
-        fetch.contains("{shown}") && fetch.contains("{peer}") && fetch.matches("{}").count() == 1,
-        "the fetch progress line fills the path, the peer and the timeout: {fetch:?}"
+        fetch.contains("{shown}") && fetch.contains("{named}") && fetch.matches("{}").count() == 1,
+        "the fetch progress line fills the path, the session's name and the timeout: {fetch:?}"
     );
     assert_eq!(
         request.matches("{}").count(),
@@ -5336,7 +5336,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             "`` {} ``",
             fetch
                 .replace("{shown}", shown)
-                .replace("{peer}", "<dest8>")
+                .replace("{named}", "<user> / <session> (<dest8>)")
                 .replace("{}", &fetch_secs)
         )
     };
@@ -9318,14 +9318,14 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         .find(|literal| literal.contains("answered from your own records"))
         .and_then(|literal| literal.strip_prefix(' ').map(str::to_string))
         .expect("the REPL's fetch says a spent attachment was answered from your own records")
-        .replace("{peer}", "<dest8>");
+        .replace("{peer}", "<user> / <session> (<dest8>)");
     assert!(
         local_tail.contains("mesh__list"),
         "the local answer no longer names the mesh__list refresh: {local_tail}"
     );
     for literal in [
-        ".mesh messaging send {peer}",
-        ".mesh people info {peer}",
+        ".mesh messaging send {dest8}",
+        ".mesh people info {dest8}",
         ".mesh files allow {path}",
         "mesh__request_access",
     ] {
@@ -9363,7 +9363,8 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
         let fetch = flat(&section(label, &page, "### `.mesh files fetch`"));
         for literal in &literals {
             let expected = literal
-                .replace("{peer}", "<dest8>")
+                .replace("{peer}", "<user> / <session> (<dest8>)")
+                .replace("{dest8}", "<dest8>")
                 .replace("{shown}", path)
                 .replace("{path}", path)
                 .replace("{staged}", "<inbox path>")
@@ -9382,6 +9383,17 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
             fetch.contains(&gone),
             "{label}'s `.mesh files fetch` section does not say {gone:?}:\n{fetch}"
         );
+        for line in [
+            format!("Fetching `{path}` from <user> / <session> (<dest8>) over the mesh"),
+            format!("Staged `{path}` from <user> / <session> (<dest8>): "),
+            "`The file is that session's; move it into the tree yourself if you want it there.`"
+                .to_string(),
+        ] {
+            assert!(
+                fetch.contains(&line),
+                "{label}'s `.mesh files fetch` section does not quote {line:?}:\n{fetch}"
+            );
+        }
         for needle in [
             local_tail.as_str(),
             "before any `Fetching ...` line and without asking the peer",
