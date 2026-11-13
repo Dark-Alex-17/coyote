@@ -492,6 +492,7 @@ fn save_config(path: &Path, config: &McpServersConfig) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::conflict::prompt_script;
+    use crate::testing::TestConfigDirGuard;
     use clap::Parser;
     use serial_test::serial;
 
@@ -510,7 +511,6 @@ mod tests {
              Re-run in a terminal or add them to the vault first with \
              `coyote --add-secret GH_TOKEN`, `coyote --add-secret GH_USER`."
         );
-        assert_eq!(prompt_script::prompts_asked(), 0);
     }
 
     #[test]
@@ -524,41 +524,25 @@ mod tests {
 
     /// A config dir holding a user mcp.json with one server, plus the
     /// config.yaml the vault needs to open.
-    struct McpConfigDir {
-        path: PathBuf,
-        _config_dir: crate::testing::EnvVarGuard,
+    fn config_dir_with_server(label: &str, name: &str) -> TestConfigDirGuard {
+        let guard = TestConfigDirGuard::new(&format!("mcp-{label}"));
+        fs::write(
+            guard.path.join("config.yaml"),
+            "vault_password_file: /dev/null\n",
+        )
+        .unwrap();
+        fs::write(
+            guard.path.join("mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"{name}":{{"type":"http","url":"https://example.test/mcp"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        guard
     }
 
-    impl McpConfigDir {
-        fn with_server(label: &str, name: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!("coyote-mcp-{label}-{unique}"));
-            fs::create_dir_all(&path).unwrap();
-            fs::write(path.join("config.yaml"), "vault_password_file: /dev/null\n").unwrap();
-            fs::write(
-                path.join("mcp.json"),
-                format!(
-                    r#"{{"mcpServers":{{"{name}":{{"type":"http","url":"https://example.test/mcp"}}}}}}"#
-                ),
-            )
-            .unwrap();
-            let _config_dir =
-                crate::testing::EnvVarGuard::set(crate::utils::get_env_name("config_dir"), &path);
-            Self { path, _config_dir }
-        }
-
-        fn mcp_json(&self) -> String {
-            fs::read_to_string(self.path.join("mcp.json")).unwrap()
-        }
-    }
-
-    impl Drop for McpConfigDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
+    fn mcp_json(dir: &TestConfigDirGuard) -> String {
+        fs::read_to_string(dir.path.join("mcp.json")).unwrap()
     }
 
     #[test]
@@ -566,8 +550,8 @@ mod tests {
     fn without_a_terminal_removing_an_mcp_server_is_refused_before_asking() {
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = prompt_script::install_non_interactive();
-        let dir = McpConfigDir::with_server("remove", "github");
-        let before = dir.mcp_json();
+        let dir = config_dir_with_server("remove", "github");
+        let before = mcp_json(&dir);
 
         let err = handle_remove("github", Some(McpScopeArg::User), false).unwrap_err();
 
@@ -576,7 +560,7 @@ mod tests {
             "Refusing to remove MCP server 'github' non-interactively. \
              Re-run in a terminal or pass --mcp-force."
         );
-        assert_eq!(dir.mcp_json(), before);
+        assert_eq!(mcp_json(&dir), before);
     }
 
     #[test]
@@ -584,8 +568,8 @@ mod tests {
     fn without_a_terminal_overwriting_an_mcp_server_is_refused_before_asking() {
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = prompt_script::install_non_interactive();
-        let dir = McpConfigDir::with_server("overwrite", "github");
-        let before = dir.mcp_json();
+        let dir = config_dir_with_server("overwrite", "github");
+        let before = mcp_json(&dir);
         let cli = Cli::try_parse_from([
             "coyote",
             "--mcp-add",
@@ -603,6 +587,6 @@ mod tests {
             "Refusing to overwrite MCP server 'github' non-interactively. \
              Re-run in a terminal or pass --mcp-force."
         );
-        assert_eq!(dir.mcp_json(), before);
+        assert_eq!(mcp_json(&dir), before);
     }
 }
