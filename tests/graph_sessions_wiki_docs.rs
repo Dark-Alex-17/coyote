@@ -32,7 +32,10 @@
 //! start-unknown stamp against `src/utils/process.rs`, the `--macro` arm
 //! against `src/main.rs` and `src/config/macros.rs`, and the child folds on
 //! Session-Compression.md against the child run loop in
-//! `src/function/agents.rs`.
+//! `src/function/agents.rs`. The wait tools on Background-Jobs.md and
+//! Agents.md are read against `handle_wait` and the `job__start` message in
+//! `src/function/jobs.rs` and the spawn instructions in
+//! `src/config/prompts.rs`.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -2982,6 +2985,269 @@ fn ctrl_c_wording_names_the_session_split() {
             sentence.contains(needle),
             "the Agents.md Ctrl-C sentence does not say {needle:?}"
         );
+    }
+}
+
+#[test]
+fn wiki_documents_the_wait_tools() {
+    let Some(wiki) = wiki_dir() else { return };
+    let jobs_rs = src(&["function", "jobs.rs"]);
+    let handle_wait = fn_body(&jobs_rs, "async fn handle_wait(");
+    let jobs = read(wiki.join("Background-Jobs.md"));
+    let tools = section("Background-Jobs.md", &jobs, "## The Six Tools");
+    let row = table_row("Background-Jobs.md", &tools, "`job__wait`");
+    for needle in [
+        "Block until ANY of the given jobs (default: every job you started)",
+        "Returns immediately if one is already finished.",
+        "Consumes nothing",
+        "An agent id lands under `unknown`",
+    ] {
+        assert!(
+            row[1].contains(needle),
+            "the Background-Jobs.md job__wait row does not say {needle:?}: {row:?}"
+        );
+    }
+
+    let lead = "`job__wait` answers with a `status`";
+    let statuses = flat(&paragraph("Background-Jobs.md", &tools, lead));
+    for needle in [
+        "`ready`, `timeout`, `interrupted`, `pending` or `none`",
+        "an `outcome` of `success` or `failed`",
+    ] {
+        assert!(
+            statuses.contains(needle),
+            "the Background-Jobs.md job__wait result sentence does not list {needle}"
+        );
+    }
+    for status in ["ready", "timeout", "interrupted", "pending", "none"] {
+        assert!(
+            handle_wait.contains(&format!("\"status\": \"{status}\"")),
+            "handle_wait no longer returns status {status:?}"
+        );
+    }
+    for outcome in ["success", "failed"] {
+        assert!(
+            handle_wait.contains(&format!("=> \"{outcome}\"")),
+            "handle_wait no longer reports outcome {outcome:?}"
+        );
+    }
+    assert!(
+        !handle_wait.contains("\"finished\""),
+        "handle_wait reports an outcome the Background-Jobs.md sentence does not list"
+    );
+
+    let after = &tools[tools
+        .find(lead)
+        .expect("the result sentence is in the section")..];
+    let open = after
+        .find("```json\n")
+        .expect("a ```json block follows the job__wait result sentence");
+    let json_block = &after[open + "```json\n".len()..];
+    let json_block = &json_block[..json_block
+        .find("\n```")
+        .expect("the job__wait result example is closed")];
+    let example: serde_json::Value = serde_json::from_str(json_block)
+        .unwrap_or_else(|e| panic!("the job__wait result example is not JSON: {e}"));
+    let keys: BTreeSet<&str> = example
+        .as_object()
+        .expect("the job__wait result example is an object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from(["status", "ready", "running", "unknown", "message"]),
+        "the job__wait result example keys"
+    );
+    assert_eq!(example["status"], "ready");
+    let ready = example["ready"]
+        .as_array()
+        .expect("the example's `ready` is a list");
+    assert!(!ready.is_empty(), "the job__wait ready example lists no id");
+    for entry in ready {
+        let entry_keys: BTreeSet<&str> = entry
+            .as_object()
+            .expect("a job__wait ready entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            entry_keys,
+            BTreeSet::from([
+                "id",
+                "name",
+                "outcome",
+                "next_action",
+                "output_bytes_captured"
+            ]),
+            "the job__wait ready entry keys"
+        );
+        let id = entry["id"].as_str().expect("a ready id is a string");
+        assert_eq!(
+            entry["next_action"],
+            format!("job__collect --id {id}"),
+            "the job__wait ready entry next_action"
+        );
+    }
+    let template = string_literals(&handle_wait)
+        .into_iter()
+        .find(|literal| literal.starts_with("Finished: {id_list}."))
+        .expect("handle_wait spells the ready message");
+    let ids: Vec<&str> = ready
+        .iter()
+        .map(|entry| entry["id"].as_str().expect("a ready id is a string"))
+        .collect();
+    assert_eq!(
+        example["message"],
+        template.replace("{id_list}", &ids.join(", ")),
+        "the job__wait result example message"
+    );
+
+    let start_message = string_literals(&fn_body(&jobs_rs, "async fn handle_start("))
+        .into_iter()
+        .find(|literal| literal.starts_with("Running in background."))
+        .expect("handle_start spells the running message");
+    assert!(start_message.contains("job__wait"));
+    assert!(
+        tools.contains(&format!("\"message\": \"{start_message}\"")),
+        "the Background-Jobs.md job__start example message differs from handle_start"
+    );
+
+    let table_and_examples = &tools[..tools
+        .find("\n### ")
+        .expect("the Six Tools section has a worked example")];
+    let collect_step = paragraph("Background-Jobs.md", &tools, "4. **Collect:**");
+    for (region, text) in [
+        (
+            "the Six Tools table and result examples",
+            table_and_examples,
+        ),
+        ("the worked example's collect step", collect_step.as_str()),
+        ("the job__wait result example", json_block),
+    ] {
+        for line in text.lines() {
+            assert!(
+                line.is_ascii(),
+                "Background-Jobs.md has a non-ASCII line in {region}: {line}"
+            );
+        }
+    }
+    let sidebar = read(wiki.join("_Sidebar.md"));
+    assert!(
+        sidebar.contains("(Background-Jobs#the-six-tools)"),
+        "_Sidebar.md does not link the Six Tools heading"
+    );
+    for page in markdown_pages(&wiki) {
+        assert!(
+            !read(&page).contains("the-five-tools"),
+            "{} still links the old Five Tools anchor",
+            page.display()
+        );
+    }
+
+    let agents = read(wiki.join("Agents.md"));
+    let row = table_row("Agents.md", &agents, "`agent__wait`");
+    for needle in [
+        "Block until ANY of several agents (default: every agent you started)",
+        "Returns immediately if one is already finished.",
+        "Consumes nothing",
+        "A job id lands under `unknown`",
+    ] {
+        assert!(
+            row[1].contains(needle),
+            "the Agents.md agent__wait row does not say {needle:?}: {row:?}"
+        );
+    }
+    for cell in &row {
+        assert!(cell.is_ascii(), "the Agents.md agent__wait row: {cell}");
+    }
+    let prompts = src(&["config", "prompts.rs"]);
+    let step_comment = prompts
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("# 3b."))
+        .expect("the spawn instructions carry the agent__wait example step");
+    let lines: Vec<&str> = agents.lines().map(str::trim).collect();
+    let step = lines
+        .windows(2)
+        .find(|pair| pair[1] == "agent__wait")
+        .expect("the Agents.md spawn example has no agent__wait step");
+    assert_eq!(
+        step[0], step_comment,
+        "the Agents.md agent__wait step comment differs from the spawn instructions"
+    );
+    for line in step {
+        assert!(line.is_ascii(), "the Agents.md agent__wait step: {line}");
+    }
+    let agent_wait = fn_body(&src(&["function", "agents.rs"]), "async fn handle_wait(");
+    let agent_lead = "`agent__wait` answers with a `status`";
+    let agent_statuses = flat(&paragraph("Agents.md", &agents, agent_lead));
+    for needle in [
+        "`ready`, `timeout`, `interrupted`, `pending` or `none`",
+        "an `outcome` of `success`, `failed`, or `finished`",
+        "(Background-Jobs#the-six-tools)",
+    ] {
+        assert!(
+            agent_statuses.contains(needle),
+            "the Agents.md agent__wait result sentence does not say {needle}"
+        );
+    }
+    for status in ["ready", "timeout", "interrupted", "pending", "none"] {
+        assert!(
+            agent_wait.contains(&format!("\"status\": \"{status}\"")),
+            "agents.rs handle_wait no longer returns status {status:?}"
+        );
+    }
+    for outcome in [
+        "=> \"success\"",
+        "=> \"failed\"",
+        ".unwrap_or(\"finished\")",
+    ] {
+        assert!(
+            agent_wait.contains(outcome),
+            "agents.rs handle_wait no longer reports outcome {outcome}"
+        );
+    }
+
+    let sessions = read(wiki.join("Sessions.md"));
+    let interrupt = flat(&section("Sessions.md", &sessions, INTERRUPT_HEADING));
+    for needle in [
+        "If the model was blocked in `agent__collect`, `job__collect`, `agent__wait` or `job__wait`, that call returns",
+        "(including the `interrupted` collect or wait result)",
+        "its own `agent__collect` / `job__collect` / `agent__wait` / `job__wait` calls keep waiting until their target finishes (or a wait's `timeout_secs` passes)",
+    ] {
+        assert!(
+            interrupt.contains(needle),
+            "the Sessions.md Ctrl+C section does not say {needle:?}"
+        );
+    }
+    for lead in [
+        "**First press, mid-turn.**",
+        "**Type to continue.**",
+        "A background child started with `agent__spawn`",
+    ] {
+        for line in paragraph("Sessions.md", &sessions, lead).lines() {
+            assert!(
+                line.is_ascii(),
+                "the Sessions.md paragraph opening {lead:?} has a non-ASCII line: {line}"
+            );
+        }
+    }
+
+    for page in [
+        "Background-Jobs.md",
+        "Agents.md",
+        "Sessions.md",
+        "_Sidebar.md",
+    ] {
+        for line in read(wiki.join(page)).lines() {
+            if line.contains("agent__wait") || line.contains("job__wait") {
+                assert!(
+                    line.is_ascii(),
+                    "{page} names a wait tool on a non-ASCII line: {line}"
+                );
+            }
+        }
     }
 }
 

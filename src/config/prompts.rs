@@ -102,6 +102,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     | `agent__spawn` | Spawn a subagent in the background. Returns an `id` immediately. Optional `variables` (string map) sets the target agent's declared variables, overriding inherited values. |
     | `agent__check` | Non-blocking status probe: running or finished. Never returns/consumes the result — use `agent__collect`. |
     | `agent__collect` | Blocking wait: wait for an agent to finish, return its output. |
+    | `agent__wait` | Block until ANY of several agents (default: every agent you started) finishes, or `timeout_secs` passes. Lists the finished ids without consuming them; collect those next. |
     | `agent__list_available` | List all agent types you can spawn (name + description + declared variables). Use this to discover specialists and the `variables` they accept before calling `agent__spawn`. |
     | `agent__list_running` | List all subagents YOU have spawned, with their status. |
     | `agent__list_sessions` | List this context's child sessions (resumable `session_id`s, effective status, run count), newest first, paginated with `page_size`/`cursor`. |
@@ -123,6 +124,9 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
 
     # 3. Check if done (non-blocking)
     agent__check --id agent_explore_a1b2c3d4
+
+    # 3b. Or call agent__wait alone: blocks until whichever finishes first (consumes nothing)
+    agent__wait
 
     # 4. Collect results when ready (blocking)
     agent__collect --id agent_explore_a1b2c3d4
@@ -159,6 +163,11 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     `agent__collect` is a **blocking wait**: it pauses your execution until the agent
     completes, then returns the output as a tool result. Use it freely — it is the
     correct primitive for \"I'm done with my own work and just need the agents' results\".
+
+    When several agents are running and you want whichever finishes first, call `agent__wait`
+    alone: it blocks until any of them finishes, then names the ids to collect without
+    consuming them. It does not reclaim anything, so you must still collect or cancel every
+    agent; after a timeout, wait again or do other work.
 
     ### Parallel Spawning (DEFAULT for multi-agent work)
 
@@ -226,13 +235,17 @@ pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
     working instead of blocking — completion arrives as a `system_notifications` entry on your
     next tool result. Check progress with `job__check` (sparingly), block on the result with
     `job__collect` (only when you have nothing else to do), cancel with `job__cancel`, and list
-    jobs with `job__list`. Collected results over 50,000 chars are tail-capped; collecting is
-    consume-once, so when you need the complete output pass `full_result: true` (or have the
-    command write to a file). Collect or cancel every job you started before ending your turn. In
-    graph LLM nodes, jobs are node-local: collect or cancel every job you start before the node
-    ends — an uncollected job burns node iterations via the guardrail, and anything still
-    running when the node exits is cancelled with its result discarded. Jobs run against a
-    snapshot of the current config/environment and do not survive coyote exiting.
+    jobs with `job__list`. With several jobs running and nothing else to do, call `job__wait`
+    alone: it blocks until any of them (default: every job you started) finishes or `timeout_secs`
+    passes, and names the ids to collect, consuming nothing. It does not reclaim anything, so you
+    must still collect or cancel every job; after a timeout, wait again or do other work.
+    Collected results over 50,000 chars are tail-capped; collecting is consume-once, so when you
+    need the complete output pass `full_result: true` (or have the command write to a file).
+    Collect or cancel every job you started before ending your turn. In graph LLM nodes, jobs are
+    node-local: collect or cancel every job you start before the node ends; an uncollected job
+    burns node iterations via the guardrail, and anything still running when the node exits is
+    cancelled with its result discarded. Jobs run against a snapshot of the current
+    config/environment and do not survive coyote exiting.
 "
 };
 
@@ -302,6 +315,72 @@ mod tests {
             .unwrap();
         for needle in ["`session_id`", "`page_size`", "`cursor`", "newest first"] {
             assert!(row.contains(needle), "{row}");
+        }
+    }
+
+    #[test]
+    fn wait_tools_are_taught_by_their_own_family_guidance() {
+        assert!(DEFAULT_SPAWN_INSTRUCTIONS.contains("| `agent__wait` |"));
+        let core_pattern_start = DEFAULT_SPAWN_INSTRUCTIONS.find("### Core Pattern").unwrap();
+        let core_pattern_end = DEFAULT_SPAWN_INSTRUCTIONS
+            .find("### Parallel Spawning")
+            .unwrap();
+        assert!(
+            DEFAULT_SPAWN_INSTRUCTIONS[core_pattern_start..core_pattern_end]
+                .contains("agent__wait")
+        );
+        assert!(!DEFAULT_JOB_INSTRUCTIONS.contains("agent__wait"));
+        assert!(!DEFAULT_SPAWN_INSTRUCTIONS.contains("job__wait"));
+        let paragraph_from = |text: &str, start: &str| {
+            let paragraph = text
+                .split("\n\n")
+                .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+                .find(|p| p.contains(start))
+                .unwrap_or_else(|| panic!("no paragraph contains {start:?}"));
+            paragraph[paragraph.find(start).unwrap()..].to_string()
+        };
+        let job_wait = paragraph_from(DEFAULT_JOB_INSTRUCTIONS, "call `job__wait` alone");
+        let collect = DEFAULT_JOB_INSTRUCTIONS.find("`job__collect`").unwrap();
+        let wait = DEFAULT_JOB_INSTRUCTIONS.find("`job__wait`").unwrap();
+        let collected_results = DEFAULT_JOB_INSTRUCTIONS
+            .find("Collected results over")
+            .unwrap();
+        assert!(collect < wait && wait < collected_results);
+        for clause in [
+            "call `job__wait` alone",
+            "(default: every job you started)",
+            "`timeout_secs`",
+            "consuming nothing",
+            "still collect or cancel every job",
+            "after a timeout, wait again or do other work",
+        ] {
+            assert!(
+                job_wait.contains(clause),
+                "the job instructions lost {clause:?}"
+            );
+        }
+        let agent_row = paragraph_from(DEFAULT_SPAWN_INSTRUCTIONS, "| `agent__wait` |");
+        let agent_row = agent_row
+            .split(" | `agent__list_available` |")
+            .next()
+            .unwrap();
+        for clause in ["(default: every agent you started)", "`timeout_secs`"] {
+            assert!(
+                agent_row.contains(clause),
+                "the agent__wait row lost {clause:?}"
+            );
+        }
+        let agent_wait = paragraph_from(DEFAULT_SPAWN_INSTRUCTIONS, "call `agent__wait` alone");
+        for clause in [
+            "call `agent__wait` alone",
+            "without consuming them",
+            "still collect or cancel every agent",
+            "after a timeout, wait again or do other work",
+        ] {
+            assert!(
+                agent_wait.contains(clause),
+                "the spawn instructions lost {clause:?}"
+            );
         }
     }
 

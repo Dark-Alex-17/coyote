@@ -452,6 +452,9 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
 3. **Wait for Sisyphus.** Do not poll `agent__collect` on a running agent — do non-overlapping work
    (e.g. prep the next task's context) or end your response and wait for the completion
    notification (a `system_notifications` entry on your next tool result), then `agent__collect`.
+   Exception: with several agents running and nothing else to do, you may call `agent__wait`
+   alone, then collect the ids it reports; it consumes and reclaims nothing, so every agent still
+   needs a collect or cancel.
 
 4. **Verify against the plan (divergence check).** When Sisyphus returns, do NOT trust its
    self-report — get an INDEPENDENT conformance verdict:

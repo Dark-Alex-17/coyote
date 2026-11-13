@@ -2897,21 +2897,11 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
     cmd_name
 }
 
-// Polling tools are expected to repeat with identical arguments (status probes,
-// list views, inbox checks); recording them would also let them break up
-// detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 7] = [
-    "job__check",
-    "job__list",
-    "agent__check",
-    "agent__list_running",
-    "agent__list_sessions",
-    "agent__task_list",
-    "agent__check_inbox",
-];
-
+// The agent and job families are polled and waited on with identical arguments
+// by design; recording them would also break up detection of a real loop in the
+// calls they interleave with.
 fn is_loop_tracker_exempt(name: &str) -> bool {
-    LOOP_TRACKER_EXEMPT_TOOLS.contains(&name)
+    name.starts_with(AGENT_FUNCTION_PREFIX) || name.starts_with(JOB_FUNCTION_PREFIX)
 }
 
 #[derive(Debug, Clone)]
@@ -3376,6 +3366,7 @@ mod tests {
             child_supervisor: None,
             session_id: None,
             child_session_root: None,
+            succeeded: Default::default(),
         };
         let mut sup = Supervisor::new(4, 3);
         sup.register(handle).unwrap();
@@ -3724,27 +3715,39 @@ mod tests {
         assert!(msg.contains("repeat_tool"));
     }
 
+    fn declared_agent_and_job_tool_names() -> Vec<String> {
+        agents::agent_function_declarations()
+            .into_iter()
+            .chain(agents::escalation_function_declarations())
+            .chain(jobs::job_function_declarations())
+            .map(|decl| decl.name)
+            .collect()
+    }
+
     #[test]
-    fn loop_tracker_exempt_list_is_exactly_the_polling_tools() {
-        let actual: HashSet<&str> = LOOP_TRACKER_EXEMPT_TOOLS.iter().copied().collect();
-        let expected: HashSet<&str> = [
-            "job__check",
-            "job__list",
-            "agent__check",
-            "agent__list_running",
-            "agent__list_sessions",
-            "agent__task_list",
-            "agent__check_inbox",
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 7);
-        assert_eq!(actual, expected);
+    fn loop_tracker_exempts_exactly_the_agent_and_job_families() {
+        let declared = declared_agent_and_job_tool_names();
+        assert!(declared.iter().any(|name| name == "agent__wait"));
+        assert!(declared.iter().any(|name| name == "job__wait"));
+        for name in &declared {
+            assert!(is_loop_tracker_exempt(name), "{name} must be exempt");
+        }
+        for name in [
+            "execute_command",
+            "fs_read",
+            "mcp_invoke_x",
+            "todo__add",
+            "user__select",
+            "my_agent__check",
+        ] {
+            assert!(!is_loop_tracker_exempt(name), "{name} must not be exempt");
+        }
     }
 
     #[test]
     fn tracker_exempt_tools_never_trip() {
-        for name in LOOP_TRACKER_EXEMPT_TOOLS {
+        for name in declared_agent_and_job_tool_names() {
+            let name = name.as_str();
             let mut tracker = ToolCallTracker::default();
             let exempt = call_with_args(name, json!({"id": "j1"}));
             tracker.record_call(exempt.clone());
@@ -3880,6 +3883,7 @@ mod tests {
         assert!(f.contains("agent__spawn"));
         assert!(f.contains("agent__check"));
         assert!(f.contains("agent__collect"));
+        assert!(f.contains("agent__wait"));
         assert!(f.contains("agent__list_running"));
         assert!(f.contains("agent__list_sessions"));
         assert!(f.contains("agent__list_available"));
@@ -3896,6 +3900,7 @@ mod tests {
         assert!(f.contains("job__start"));
         assert!(f.contains("job__check"));
         assert!(f.contains("job__collect"));
+        assert!(f.contains("job__wait"));
         assert!(f.contains("job__cancel"));
         assert!(f.contains("job__list"));
     }
