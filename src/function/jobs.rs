@@ -322,8 +322,7 @@ pub fn job_function_declarations() -> Vec<FunctionDeclaration> {
                           NOT return or consume results: it lists the finished ids, each with the exact collect \
                           command in `next_action`. Call it alone in a batch, then collect the reported ids. It \
                           does not reclaim anything: you must still collect or cancel every job before ending \
-                          your turn. Do not repeat an identical timed wait: that is flagged as a loop, so change \
-                          `timeout_secs` or do other work first.".to_string(),
+                          your turn. On a timeout, wait again or do other work.".to_string(),
             parameters: JsonSchema {
                 type_value: Some("object".to_string()),
                 properties: Some(IndexMap::from([
@@ -1061,7 +1060,7 @@ async fn handle_wait(ctx: &RequestContext, args: &Value) -> Result<Value> {
                 "ready": [],
                 "running": running,
                 "unknown": unknown,
-                "message": "No watched job finished before the timeout. Nothing is lost: every job is still running and registered. Do other work, or wait again with a different timeout_secs (repeating an identical call is flagged as a loop).",
+                "message": "No watched job finished before the timeout. Nothing is lost: every job is still running and registered. Do other work, or wait again.",
             });
         }
 

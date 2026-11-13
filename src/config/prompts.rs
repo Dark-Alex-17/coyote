@@ -167,7 +167,7 @@ pub(in crate::config) const DEFAULT_SPAWN_INSTRUCTIONS: &str = indoc! {"
     When several agents are running and you want whichever finishes first, call `agent__wait`
     alone: it blocks until any of them finishes, then names the ids to collect without
     consuming them. It does not reclaim anything, so you must still collect or cancel every
-    agent; after a timeout, do not repeat an identical wait.
+    agent; after a timeout, wait again or do other work.
 
     ### Parallel Spawning (DEFAULT for multi-agent work)
 
@@ -238,7 +238,7 @@ pub(in crate::config) const DEFAULT_JOB_INSTRUCTIONS: &str = indoc! {"
     jobs with `job__list`. With several jobs running and nothing else to do, call `job__wait`
     alone: it blocks until any of them (default: every job you started) finishes or `timeout_secs`
     passes, and names the ids to collect, consuming nothing. It does not reclaim anything, so you
-    must still collect or cancel every job; after a timeout, do not repeat an identical wait.
+    must still collect or cancel every job; after a timeout, wait again or do other work.
     Collected results over 50,000 chars are tail-capped; collecting is consume-once, so when you
     need the complete output pass `full_result: true` (or have the command write to a file).
     Collect or cancel every job you started before ending your turn. In graph LLM nodes, jobs are
@@ -352,7 +352,7 @@ mod tests {
             "`timeout_secs`",
             "consuming nothing",
             "still collect or cancel every job",
-            "do not repeat an identical wait",
+            "after a timeout, wait again or do other work",
         ] {
             assert!(
                 job_wait.contains(clause),
@@ -375,7 +375,7 @@ mod tests {
             "call `agent__wait` alone",
             "without consuming them",
             "still collect or cancel every agent",
-            "do not repeat an identical wait",
+            "after a timeout, wait again or do other work",
         ] {
             assert!(
                 agent_wait.contains(clause),
