@@ -241,32 +241,52 @@ fn unbacktick<'a>(cell: &'a str, what: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{what} cell is not a code span: {cell:?}"))
 }
 
-/// The `(path, usage, description)` rows of the command table on `Mesh-Commands.md`.
+/// The `(path, usage, description)` rows of the command tables on `Mesh-Commands.md`: one
+/// table per group under a `### Top level` or `` ### `<group>` `` heading, each row's
+/// command under the heading of its own group.
 fn wiki_command_rows(page: &str) -> Vec<(String, String, String)> {
     let section = page
         .split("\n## The commands\n")
         .nth(1)
         .expect("Mesh-Commands.md has a `## The commands` section");
     let section = section.split("\n## ").next().unwrap();
-    section
-        .lines()
-        .filter(|line| line.starts_with('|'))
-        .skip(2)
-        .map(|row| {
-            let cells = table_cells(row);
-            assert_eq!(
-                cells.len(),
-                4,
-                "command table row has {} cells: {row:?}",
-                cells.len()
-            );
-            (
-                unbacktick(&cells[0], "command").to_string(),
-                unbacktick(&cells[1], "usage").to_string(),
-                cells[2].clone(),
-            )
-        })
-        .collect()
+    let mut heading: Option<&str> = None;
+    let mut rows = Vec::new();
+    for row in section.lines() {
+        if let Some(title) = row.strip_prefix("### ") {
+            heading = Some(title);
+            continue;
+        }
+        if !row.starts_with('|') {
+            continue;
+        }
+        let cells = table_cells(row);
+        assert_eq!(
+            cells.len(),
+            4,
+            "command table row has {} cells: {row:?}",
+            cells.len()
+        );
+        if cells[0] == "Command" || cells[0].chars().all(|c| c == '-') {
+            continue;
+        }
+        let path = unbacktick(&cells[0], "command").to_string();
+        let expected = match path.split_once(' ') {
+            Some((group, _)) => format!("`{group}`"),
+            None => "Top level".to_string(),
+        };
+        assert_eq!(
+            heading,
+            Some(expected.as_str()),
+            "Mesh-Commands.md lists `{path}` under the wrong heading"
+        );
+        rows.push((
+            path,
+            unbacktick(&cells[1], "usage").to_string(),
+            cells[2].clone(),
+        ));
+    }
+    rows
 }
 
 /// N from `const ALL: [HookEvent; N]` in `src/hooks.rs`.
@@ -1782,9 +1802,9 @@ fn the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
 }
 
 /// The `collision_protection:` comment on `Mesh-Configuration.md` is the template's line;
-/// the setting's section there and the identity-tier Note on `Mesh-Trust-Model.md` each
+/// the setting's section there and the user-tier Note on `Mesh-Trust-Model.md` each
 /// name what sets the presence case apart (nothing marked, the refusal remembered from the
-/// refusal itself, the key first heard never refused, trust of the new destination and
+/// refusal itself, the key first heard never refused, trust of the new session and
 /// block clearing the memory); and the Note quotes the two presence lines with the wording
 /// `presence_collision_text` emits.
 #[test]
@@ -1814,20 +1834,20 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
         .expect("Mesh-Configuration.md has a `## collision_protection` section")..];
     let section = section[1..].split("\n## ").next().unwrap();
     let trust_model = read(wiki.join("Mesh-Trust-Model.md"));
-    let note_lead = "\n> **Note:** An identity-tier grant";
+    let note_lead = "\n> **Note:** A user-tier grant";
     let note = &trust_model[trust_model
         .find(note_lead)
-        .expect("Mesh-Trust-Model.md has the identity-tier Note")..];
+        .expect("Mesh-Trust-Model.md has the user-tier Note")..];
     let note = note[1..].split("\n\n").next().unwrap();
     for (label, text) in [
         ("Mesh-Configuration.md's `## collision_protection`", section),
-        ("Mesh-Trust-Model.md's identity-tier Note", note),
+        ("Mesh-Trust-Model.md's user-tier Note", note),
     ] {
         for needle in [
             "collision_protection",
             "nothing is marked",
-            "remembered for as long as the node runs from the refusal itself",
-            "names the key first heard holding the instance",
+            "remembered for as long as your session stays on the mesh from the refusal itself",
+            "names the key first heard holding the session",
             "`.mesh access trust session <new destination>` admits the new key and clears the memory",
             "`.mesh access block` of either key clears it too",
             "`.mesh access revoke user <old key>` admits the new key",
@@ -1858,7 +1878,7 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
     let quoted = |lead: &str| -> String {
         note.lines()
             .find(|line| line.starts_with(lead))
-            .unwrap_or_else(|| panic!("the identity-tier Note quotes no {lead:?} line:\n{note}"))
+            .unwrap_or_else(|| panic!("the user-tier Note quotes no {lead:?} line:\n{note}"))
             .to_string()
     };
     let shared = [
@@ -2030,26 +2050,26 @@ fn every_ttl_hours_twin_counts_from_the_last_written_exchange() {
     }
 }
 
-/// The identity-tier Note on `Mesh-Trust-Model.md` quotes the two presence lines with the
-/// instance as `<dest8>` (`presence_collision_text` shortens the old destination and has
+/// The user-tier Note on `Mesh-Trust-Model.md` quotes the two presence lines with the
+/// session as `<dest8>` (`presence_collision_text` shortens the old destination and has
 /// no label to print), while the record-collision lines quoted above it keep
 /// `<label or dest8>`, as `key_change_text` prints the record's label when it has one.
 /// The placeholders are not interchangeable: a reader copying the wiki's line must know
 /// which one names a labelled record and which one never does.
 #[test]
-fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8() {
+fn the_user_tier_note_quotes_the_presence_lines_with_the_session_as_dest8() {
     let Some(wiki) = wiki_dir() else { return };
     let trust_model = read(wiki.join("Mesh-Trust-Model.md"));
-    let note_lead = "\n> **Note:** An identity-tier grant";
+    let note_lead = "\n> **Note:** A user-tier grant";
     let note_at = trust_model
         .find(note_lead)
-        .expect("Mesh-Trust-Model.md has the identity-tier Note");
+        .expect("Mesh-Trust-Model.md has the user-tier Note");
     let note = trust_model[note_at + 1..].split("\n\n").next().unwrap();
     for lead in ["> warning: session ", "> error: session "] {
         let line = note
             .lines()
             .find(|line| line.starts_with(lead))
-            .unwrap_or_else(|| panic!("the identity-tier Note quotes no {lead:?} line:\n{note}"));
+            .unwrap_or_else(|| panic!("the user-tier Note quotes no {lead:?} line:\n{note}"));
         assert!(
             line.starts_with(&format!(
                 "{lead}<user> / <session> (<dest8>) was heard under the key of user <old>"
@@ -2737,8 +2757,8 @@ fn the_pages_state_the_heartbeat_period_as_the_constant_sets_it() {
 }
 
 /// The Mesh and Deployment pages tell a new joiner what to expect of the peer table in the
-/// same words: a peer never heard before shows up within one heartbeat, and a peer already
-/// in the table answers without waiting for one. `an hour` is the heartbeat.
+/// same words: a session never heard before shows up within one heartbeat, and a session
+/// already in the table answers without waiting for one. `an hour` is the heartbeat.
 #[test]
 fn the_mesh_and_deployment_pages_promise_peers_within_a_heartbeat_in_the_same_words() {
     let heartbeat = const_u64("src/mesh/announce.rs", "HEARTBEAT_SECS");
@@ -2750,8 +2770,8 @@ fn the_mesh_and_deployment_pages_promise_peers_within_a_heartbeat_in_the_same_wo
     for page in ["Mesh.md", "Mesh-Deployment.md"] {
         let text = flat(&read(wiki.join(page)));
         for needle in [
-            "Brand-new peers appear within an hour",
-            "known peers are reachable at once",
+            "Brand-new sessions appear within an hour",
+            "known sessions are reachable at once",
         ] {
             assert!(text.contains(needle), "{page} does not say {needle:?}");
         }
@@ -5866,7 +5886,7 @@ fn the_two_sessions_prose_says_the_trust_file_is_shared_live_on_both_pages() {
 }
 
 /// The knock entry quotes the four lines `.mesh access ask` prints for a knock that drew no
-/// reply or could not be held, and both the entry and the Trust Model's Knocks section say
+/// reply or could not be held, and both the entry and the Trust Model's requests section say
 /// a knock is not first contact. The quoted lines are read from the source so a reworded
 /// report moves the page with it.
 #[test]
@@ -5945,7 +5965,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     let knocks = flat(&section(
         "Mesh-Trust-Model.md",
         &read(wiki.join("Mesh-Trust-Model.md")),
-        "## Knocks",
+        "## Requests to be trusted",
     ));
     for needle in [
         "A request to be trusted is not first contact.",
@@ -5954,7 +5974,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     ] {
         assert!(
             knocks.contains(needle),
-            "Mesh-Trust-Model.md's Knocks section does not carry {needle:?}"
+            "Mesh-Trust-Model.md's requests section does not carry {needle:?}"
         );
     }
 }
@@ -6860,13 +6880,10 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         status.contains(&format!("`` `{objective}` ``")),
         "Mesh-Commands.md's `.mesh status` section does not quote the objective confirmation {objective:?}:\n{status}"
     );
-    let lead = flat(&section(
-        "Mesh-Commands.md",
-        &page,
-        "## The status card and the brief",
-    ));
+    let envoy = section("Mesh-Commands.md", &page, "## envoy");
+    let lead = flat(envoy.split("\n### ").next().unwrap_or_default());
     for needle in [
-        "served to trusted peers",
+        "served to trusted sessions",
         "never served as such",
         "](Mesh#the-brief)",
     ] {
@@ -9173,7 +9190,7 @@ fn the_commands_page_quotes_the_destination_completion_row_as_the_completer_rend
             at += found + row.len();
         }
     }
-    let general = "The `fetch` path argument completes from the peer's unfetched attachment references, then the grants it gave this node that have not expired, then its last listing, each path once.";
+    let general = "The `.mesh files fetch` path argument completes from the peer's unfetched attachment references, then the grants it gave you that have not expired, then its last listing, each path once.";
     assert!(
         commands.contains(general),
         "Mesh-Commands.md's general TAB bullet does not say {general:?}"
@@ -9564,7 +9581,7 @@ fn the_mesh_trust_section_quotes_the_destination_success_line_as_the_code_prints
 /// `format!` literal, the wait it names and the tail that points at the newest cached
 /// knock; the prose quotes the tail an identity with no cached knock gets. Both pages
 /// state the burst and the refill period as the constants set them and say a count at
-/// the gate's cap reads `N+`, and the Trust Model page's Knocks section says
+/// the gate's cap reads `N+`, and the Trust Model page's requests section says
 /// `.mesh access requests` counts the dropped ones. The literals' shapes are checked on every run.
 #[test]
 fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it() {
@@ -9635,7 +9652,11 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     }
 
     let label = "Mesh-Trust-Model.md";
-    let knocks = flat(&section(label, &read(wiki.join(label)), "## Knocks"));
+    let knocks = flat(&section(
+        label,
+        &read(wiki.join(label)),
+        "## Requests to be trusted",
+    ));
     for needle in [
         format!("{burst} requests land back to back and then one per {refill_minutes} minutes"),
         "`.mesh access requests` counts the ones that were dropped".to_string(),
@@ -9643,7 +9664,7 @@ fn the_mesh_knocks_section_quotes_the_rate_limit_drop_line_as_the_code_prints_it
     ] {
         assert!(
             knocks.contains(&needle),
-            "{label}'s Knocks section does not say {needle:?}"
+            "{label}'s requests section does not say {needle:?}"
         );
     }
 }
@@ -9670,7 +9691,7 @@ fn the_trust_model_glossary_names_the_four_standings_in_order() {
 
 /// Every page that quotes what a peer's `NoAccess` prints carries each static piece of
 /// the `RemoteRefusal` Display in `src/mesh/request/error.rs`: the `.mesh status`,
-/// `.mesh messaging send` and `.mesh access ask` sections of the Commands page, the Knocks section of
+/// `.mesh messaging send` and `.mesh access ask` sections of the Commands page, the requests section of
 /// the Trust Model page and the Platform page's rejoin step. The `.mesh status` quote ends
 /// with the live-only tail `StatusError` appends, every quote shows the peer's name in
 /// quotes and closes on the trust fact, the Mesh page quotes the `next_action` that goes
@@ -9741,7 +9762,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     let knocks = flat(&section(
         "Mesh-Trust-Model.md",
         &read(wiki.join("Mesh-Trust-Model.md")),
-        "## Knocks",
+        "## Requests to be trusted",
     ));
     let platform = flat(&read(wiki.join("Mesh-Platform-Support.md")));
     for (label, text) in [
@@ -9751,7 +9772,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
             &message,
         ),
         ("Mesh-Commands.md's `.mesh access ask` section", &knock),
-        ("Mesh-Trust-Model.md's Knocks section", &knocks),
+        ("Mesh-Trust-Model.md's requests section", &knocks),
         ("Mesh-Platform-Support.md", &platform),
     ] {
         for fragment in &fragments {
