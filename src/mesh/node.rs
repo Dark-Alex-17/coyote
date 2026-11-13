@@ -6957,8 +6957,8 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::peers::{PEER_TABLE_VERSION, PeerTableFile};
     use crate::mesh::pending::{
-        DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
-        PENDING_RECORD_VERSION, PendingState,
+        CorrelationKind, DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind,
+        InboundRecord, PENDING_RECORD_VERSION, PendingState,
     };
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::request::{
@@ -7548,6 +7548,7 @@ mod tests {
             timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
             state: PendingState::Open,
             reply: None,
+            kind: CorrelationKind::Ask,
         }
     }
 
@@ -11428,6 +11429,35 @@ mod tests {
         assert_eq!(delivered.kind, PeerKind::Reply);
         assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
         assert_eq!(slot.take_model_notes()[0].event, "peer_reply");
+    }
+
+    #[test]
+    fn a_reply_answering_our_root_message_is_a_reply_in_the_message_thread_and_closes_it() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                kind: CorrelationKind::Message,
+                ..pending("m-1")
+            })
+            .unwrap();
+        let mut reply = peer_message(PeerKind::Reply, "r-1", Some("m-1"));
+        reply.thread = Some("m-1".to_string());
+
+        slot.deliver_peer(reply);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Reply);
+        assert_eq!(delivered.thread.as_deref(), Some("m-1"));
+        assert!(
+            slot.correlations().get("m-1").is_none(),
+            "a message's reply leaves nothing to collect"
+        );
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].event, "peer_reply");
+        assert_eq!(notes[0].next_action, CHECK_INBOX_NEXT_ACTION);
     }
 
     #[test]

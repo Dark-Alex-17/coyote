@@ -13173,7 +13173,7 @@ mod tests {
     use crate::mesh::knocks::KNOCK_RECORD_VERSION;
     use crate::mesh::message::{RawPeerMessage, RecipientReport};
     use crate::mesh::pending::{
-        INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION, PendingRecord,
+        CorrelationKind, INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION, PendingRecord,
     };
     use crate::mesh::request::RemoteRefusal;
     use crate::mesh::test_support::{Compatibility, PropagationNode};
@@ -13525,6 +13525,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             };
             let left = Some(now - Duration::from_secs(3600));
             let row = QuestionRow::outbound(&record, "bob".to_string()).waiting_on(&record, left);
@@ -17332,6 +17333,7 @@ mod tests {
                 timeout_at: "2026-09-21T14:23:20Z".to_string(),
                 state,
                 reply: None,
+                kind: CorrelationKind::Ask,
             },
             reply: None,
         }
@@ -18860,6 +18862,7 @@ mod tests {
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
         #[cfg(unix)]
         use crate::mesh::message::{answered_not_as_coyote, unanswered_path_request};
+        use crate::mesh::pending::CorrelationKind;
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;
         use crate::utils::create_abort_signal;
@@ -22567,6 +22570,7 @@ mod tests {
                                 timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
                                 state: PendingState::Open,
                                 reply: None,
+                                kind: CorrelationKind::Ask,
                             })
                             .unwrap();
                         let named_temp = |ctx: &RequestContext| {
@@ -22700,6 +22704,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         };
                         temp_slot
                             .correlations()
@@ -26992,6 +26997,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                     let store = ctx
@@ -27109,6 +27115,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                     ctx.app
@@ -27295,6 +27302,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                     ctx.app
@@ -31335,6 +31343,7 @@ mod tests {
                                 timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                                 state: PendingState::Open,
                                 reply: None,
+                                kind: CorrelationKind::Ask,
                             })
                             .unwrap();
                         memory.remember_pending_access(
@@ -36216,6 +36225,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                     assert!(runtime.peers().mark_left(&peer, now));
@@ -36714,6 +36724,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                     assert!(runtime.peers().mark_left(&peer, now));
@@ -49010,6 +49021,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                 }
@@ -49282,6 +49294,7 @@ mod tests {
                             timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                             state: PendingState::Open,
                             reply: None,
+                            kind: CorrelationKind::Ask,
                         })
                         .unwrap();
                 }
@@ -51291,6 +51304,7 @@ mod tests {
                                     timeout_at: rfc3339_utc(now + Duration::from_secs(3_600)),
                                     state: PendingState::Open,
                                     reply: None,
+                                    kind: CorrelationKind::Ask,
                                 })
                                 .unwrap();
                         };
@@ -52018,6 +52032,62 @@ mod tests {
                     )
                 }
 
+                /// A root message opens a correlation under its own id, as a question
+                /// does, so the envoy's reply lands in the message's thread; the thread
+                /// is one this session may continue, and `.mesh messaging sent` lists
+                /// the message as sent, apart from the questions still open.
+                #[test]
+                #[serial]
+                fn messaging_send_opens_a_message_correlation_and_remembers_its_thread() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-send-correlation");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-send-correlation").await;
+                        let to = fx.stub.destination_hex();
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging send {to} --yes \"can you review it?\""),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert_eq!(out.lines().last(), Some(sent_line(&fx).as_str()), "{out}");
+                        let id = fx.stub.seen()[0].id.clone();
+                        let opened = fx
+                            .ctx
+                            .app
+                            .mesh
+                            .correlations()
+                            .get(&id)
+                            .expect("a root message opens a correlation");
+                        assert_eq!(opened.record.kind, CorrelationKind::Message);
+                        assert_eq!(opened.record.thread, id);
+                        assert_eq!(opened.record.peer_identity, fx.stub.identity_hex());
+                        assert_eq!(opened.record.question, "can you review it?");
+                        assert!(
+                            fx.ctx.app.mesh.sent_threads().unwrap().contains(&id),
+                            "the message's thread is one this session may continue"
+                        );
+
+                        let listed = out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap();
+                        let lines: Vec<&str> = listed.lines().collect();
+                        let head = format!("  1. -> {} ({}) ", fx.who(), fx.dest());
+                        assert!(lines[1].starts_with(&head), "{listed}");
+                        assert!(
+                            lines[1].ends_with(&format!(" . sent . id {}", short(&id))),
+                            "{listed}"
+                        );
+                        assert_eq!(lines[2], "     \"can you review it?\"", "{listed}");
+                        assert!(
+                            listed.contains(".mesh messaging follow-up <id> \"<text>\""),
+                            "{listed}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn message_with_a_small_attachment_says_so_before_asking_and_sends_it_inline() {
@@ -52167,6 +52237,7 @@ mod tests {
                                 timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                                 state: PendingState::Open,
                                 reply: None,
+                                kind: CorrelationKind::Ask,
                             })
                             .unwrap();
                         let envoy = RecordingEnvoy::new(true, true);
@@ -52261,6 +52332,7 @@ mod tests {
                                 timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                                 state: PendingState::Open,
                                 reply: None,
+                                kind: CorrelationKind::Ask,
                             })
                             .unwrap();
                         let envoy = RecordingEnvoy::new(true, true);

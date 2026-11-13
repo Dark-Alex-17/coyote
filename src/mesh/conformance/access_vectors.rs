@@ -31,8 +31,8 @@ use crate::mesh::message::{
 };
 use crate::mesh::node::MeshSlot;
 use crate::mesh::pending::{
-    INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore, PENDING_RECORD_VERSION,
-    PendingRecord, PendingState,
+    CorrelationKind, INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore,
+    PENDING_RECORD_VERSION, PendingRecord, PendingState,
 };
 use crate::mesh::request::{ACCESS_PATH, DispatchError};
 use crate::mesh::snapshot::MeshSnapshot;
@@ -1393,6 +1393,7 @@ fn the_requester_collects_the_decision_under_the_access_id() -> Result<(), Strin
             timeout_at: rfc3339_utc(now + Duration::from_secs(60)),
             state: PendingState::Open,
             reply: None,
+            kind: CorrelationKind::Ask,
         })
         .map_err(|err| err.to_string())?;
 

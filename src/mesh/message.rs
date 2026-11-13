@@ -6896,7 +6896,7 @@ mod tests {
     fn only_a_reply_another_session_owns_is_left_on_the_node() {
         use crate::mesh::access::{access_message, validate_access};
         use crate::mesh::pending::{
-            PENDING_RECORD_VERSION, PendingRecord, PendingState, PendingStore,
+            CorrelationKind, PENDING_RECORD_VERSION, PendingRecord, PendingState, PendingStore,
         };
         use crate::mesh::rfc3339_utc;
 
@@ -6917,6 +6917,7 @@ mod tests {
                         timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                         state: PendingState::Open,
                         reply: None,
+                        kind: CorrelationKind::Ask,
                     },
                     now,
                 )

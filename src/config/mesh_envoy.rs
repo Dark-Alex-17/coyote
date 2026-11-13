@@ -9089,7 +9089,8 @@ mod tests {
     async fn a_kind_note_send_leaves_the_receivers_question_open_and_a_reply_closes_it() {
         use crate::function::mesh::INTERIM_NOTE_KEEPS_THE_QUESTION_OPEN;
         use crate::mesh::pending::{
-            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+            CorrelationKind, DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord,
+            PendingState,
         };
         use crate::mesh::test_support::RecordingEnvoy;
 
@@ -9125,6 +9126,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
 
@@ -9203,7 +9205,8 @@ mod tests {
     #[serial]
     async fn the_next_step_after_a_kind_note_works_as_written_with_no_kind_at_all() {
         use crate::mesh::pending::{
-            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+            CorrelationKind, DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord,
+            PendingState,
         };
         use crate::mesh::test_support::RecordingEnvoy;
 
@@ -9238,6 +9241,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
 

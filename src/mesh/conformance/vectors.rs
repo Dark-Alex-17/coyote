@@ -50,8 +50,8 @@ use crate::mesh::peers::{
     PeerSighting, PeerTable, PeerTableFile,
 };
 use crate::mesh::pending::{
-    INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION, PendingRecord,
-    PendingState,
+    CorrelationKind, INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION,
+    PendingRecord, PendingState,
 };
 use crate::mesh::propagation::{
     MAX_ACCEPTED_STAMP_COST, OutboundMessage, PropagationError, PropagationNode,
@@ -4158,6 +4158,7 @@ fn code_vectors() -> Vec<Vector> {
                         timeout_at: "2027-01-15T05:23:20Z".to_string(),
                         state: PendingState::Open,
                         reply: None,
+                        kind: CorrelationKind::Ask,
                     },
                 )?;
                 refuses_an_unknown_key(
@@ -9967,6 +9968,7 @@ fn question(id: &str, thread: &str) -> PendingRecord {
         timeout_at: "2027-01-15T05:23:20Z".to_string(),
         state: PendingState::Open,
         reply: None,
+        kind: CorrelationKind::Ask,
     }
 }
 

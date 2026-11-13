@@ -465,7 +465,9 @@ pub(crate) mod network {
     };
     use crate::mesh::notify::Source;
     use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
-    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome};
+    use crate::mesh::pending::{
+        CorrelationKind, PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome,
+    };
     use crate::mesh::propagation::test_support::{FakeNode, stored_message};
     use crate::mesh::propagation::{PropagationNode, PropagationOptions, pn_announce_app_data};
     use crate::mesh::propagation_fetch::InboundMessage;
@@ -9705,6 +9707,7 @@ pub(crate) mod network {
             timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
             state: PendingState::Open,
             reply: None,
+            kind: CorrelationKind::Ask,
         }
     }
 
@@ -12579,6 +12582,7 @@ pub(crate) mod network {
                 timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
         requester.deliver_peer(crate::mesh::message::PeerMessage::new(

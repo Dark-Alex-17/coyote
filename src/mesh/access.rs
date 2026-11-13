@@ -30,8 +30,8 @@ use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::parse_rfc3339;
 use crate::mesh::pending::{
-    DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore,
-    PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+    CorrelationKind, DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+    InboundStore, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord, PendingState,
     question_not_an_access_request,
 };
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
@@ -557,6 +557,7 @@ impl MeshSlot {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .map_err(|err| AccessError::NotFiled(format!("{err:#}")))?;
         runtime.memory().remember_pending_access(
@@ -3268,6 +3269,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + Duration::from_secs(60)),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
         let reply = decision_reply(
@@ -3317,6 +3319,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + Duration::from_secs(60)),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
         let paths: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();

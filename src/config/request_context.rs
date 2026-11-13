@@ -22441,7 +22441,8 @@ mod tests {
         use crate::mesh::hex_lower;
         use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
         use crate::mesh::pending::{
-            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+            CorrelationKind, DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord,
+            PendingState,
         };
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::PeerSighting;
@@ -22515,6 +22516,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
         ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
@@ -40016,8 +40018,8 @@ mod tests {
     async fn repl_complete_mesh_offers_heard_peers_and_open_questions_from_the_cache() {
         use crate::mesh::hex_lower;
         use crate::mesh::pending::{
-            INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION,
-            PendingRecord, PendingState,
+            CorrelationKind, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+            PENDING_RECORD_VERSION, PendingRecord, PendingState,
         };
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::{PeerSighting, derived_sighting};
@@ -40108,6 +40110,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
         ctx.app

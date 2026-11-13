@@ -67,12 +67,29 @@ impl PendingState {
     }
 }
 
+/// What a correlation was opened for. A question's answer waits to be collected; a
+/// message's reply closes it, since nobody collects one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CorrelationKind {
+    #[default]
+    Ask,
+    Message,
+}
+
+impl CorrelationKind {
+    pub(crate) fn is_ask(&self) -> bool {
+        *self == Self::Ask
+    }
+}
+
 /// One line of `pending-<instance_id>.jsonl`. Unknown fields are rejected, so any layout
 /// change bumps `PENDING_RECORD_VERSION` and a reader refuses the whole file on a version
 /// it does not write. The one exception is a field added with `#[serde(default)]`, which
 /// keeps the version because a line written without it still loads: `reply` is such a
 /// field, skipped when `None`, and a line without one loads as a question not yet
-/// answered.
+/// answered; `kind` is another, skipped for a question, so a line without one loads as
+/// a question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingRecord {
@@ -96,6 +113,8 @@ pub(crate) struct PendingRecord {
     /// before the process ended is still there for the next one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<PeerMessage>,
+    #[serde(default, skip_serializing_if = "CorrelationKind::is_ask")]
+    pub kind: CorrelationKind,
 }
 
 /// How a store's errors name itself and one of its lines.
@@ -1265,6 +1284,7 @@ mod tests {
             timeout_at: rfc3339_utc(sent_at + DEFAULT_COLLECT_TIMEOUT),
             state,
             reply: None,
+            kind: CorrelationKind::Ask,
         }
     }
 
@@ -3244,6 +3264,66 @@ mod tests {
             listed.last().map(|record| record.id.as_str()),
             Some("escalated"),
             "the oldest, still awaiting a reply, stays"
+        );
+    }
+
+    #[test]
+    fn eviction_drops_open_messages_before_open_questions() {
+        let tmp = TempDir::new("pending-evict-message");
+        let store = PendingStore::new(&tmp.path, "inst");
+        let base = 1_000_000;
+        let mut records: Vec<PendingRecord> = (1..=PENDING_MAX_ENTRIES)
+            .rev()
+            .map(|n| record(&format!("q{n}"), t(base + n as u64), PendingState::Open))
+            .collect();
+        records[PENDING_MAX_ENTRIES / 2] = PendingRecord {
+            kind: CorrelationKind::Message,
+            ..record(
+                "message",
+                t(base + (PENDING_MAX_ENTRIES / 2) as u64),
+                PendingState::Open,
+            )
+        };
+        records.push(record("oldest-question", t(base), PendingState::Open));
+        assert_eq!(records.len(), PENDING_MAX_ENTRIES + 1);
+        store.write_all(&records).unwrap();
+
+        assert_eq!(store.prune(t(base + 10_000)).unwrap(), 1);
+
+        let listed = store.list(t(base + 10_000)).unwrap();
+        assert_eq!(listed.len(), PENDING_MAX_ENTRIES);
+        assert!(
+            !ids(&listed).contains(&"message"),
+            "the open message goes, newer as it is"
+        );
+        assert_eq!(
+            listed.last().map(|record| record.id.as_str()),
+            Some("oldest-question"),
+            "the oldest open question stays"
+        );
+    }
+
+    /// A question's line carries no `kind`, so it reads byte for byte as before the
+    /// field existed; a message's names itself, and both load back unchanged.
+    #[test]
+    fn only_a_message_writes_its_kind_on_the_line() {
+        let question = record("q1", t(1_000), PendingState::Open);
+        let line = serde_json::to_string(&question).unwrap();
+        assert!(!line.contains("\"kind\""), "{line}");
+        assert_eq!(
+            serde_json::from_str::<PendingRecord>(&line).unwrap(),
+            question
+        );
+
+        let message = PendingRecord {
+            kind: CorrelationKind::Message,
+            ..record("m1", t(1_000), PendingState::Open)
+        };
+        let line = serde_json::to_string(&message).unwrap();
+        assert!(line.ends_with(r#","kind":"message"}"#), "{line}");
+        assert_eq!(
+            serde_json::from_str::<PendingRecord>(&line).unwrap(),
+            message
         );
     }
 

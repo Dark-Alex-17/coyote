@@ -538,7 +538,7 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
     use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
     use super::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message};
     use super::message::{PEER_MESSAGE_TYPE, PeerLxmf, decode_peer_lxmf};
-    use super::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
+    use super::pending::{CorrelationKind, PENDING_RECORD_VERSION, PendingRecord, PendingState};
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use oracles::{
         TAG_ANNOUNCE, TAG_KNOCK_FIELDS, TAG_PEER_FIELDS, TAG_PENDING, inbound_with, unpack_whole,
@@ -569,6 +569,7 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
             timeout_at: "2027-01-15T05:23:20Z".to_string(),
             state: PendingState::Open,
             reply: None,
+            kind: CorrelationKind::Ask,
         };
         let mut object = serde_json::to_value(&record).unwrap();
         object["later_field"] = serde_json::Value::from("refused");

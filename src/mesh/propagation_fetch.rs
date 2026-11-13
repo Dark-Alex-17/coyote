@@ -5891,7 +5891,9 @@ mod tests {
         /// again. A's sync then takes them, the first answering A's open question.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_held_reply_is_left_for_the_session_that_asked_and_answers_it_there() {
-            use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
+            use crate::mesh::pending::{
+                CorrelationKind, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+            };
 
             let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
             let tmp = TempDir::new("fetch-net-two-sessions");
@@ -5984,6 +5986,7 @@ mod tests {
                     timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
                     state: PendingState::Open,
                     reply: None,
+                    kind: CorrelationKind::Ask,
                 })
                 .unwrap();
             a.sent_threads().record_sent("t-a").unwrap();

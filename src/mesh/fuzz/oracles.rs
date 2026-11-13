@@ -25,7 +25,7 @@ use crate::mesh::message::{
     inline_size, is_wire_id, packed_len, to_request_body,
 };
 use crate::mesh::pending::{
-    PENDING_RECORD_VERSION, PENDING_TTL, PendingRecord, PendingState, PendingStore,
+    CorrelationKind, PENDING_RECORD_VERSION, PENDING_TTL, PendingRecord, PendingState, PendingStore,
 };
 use crate::mesh::propagation::lxmf_delivery_hash;
 use crate::mesh::propagation_fetch::{
@@ -4439,6 +4439,7 @@ impl RecordGen {
                 PendingState::Open
             },
             reply,
+            kind: CorrelationKind::Ask,
         }
     }
 }

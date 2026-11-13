@@ -19,8 +19,8 @@ use crate::mesh::message::{
     collect_next_action, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
-    DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PENDING_TTL,
-    PendingRecord, PendingState, WaitOutcome,
+    CorrelationKind, DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION,
+    PENDING_TTL, PendingRecord, PendingState, WaitOutcome,
 };
 use crate::mesh::people::{Namer, Who, YOU};
 use crate::mesh::request::short;
@@ -1278,6 +1278,7 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
         timeout_at: rfc3339_utc(now + timeout),
         state: PendingState::Open,
         reply: None,
+        kind: CorrelationKind::Ask,
     })?;
     let outcome = match runtime.send_peer(&destination, &out).await {
         Ok(outcome) => outcome,
@@ -2802,6 +2803,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
     }
@@ -3456,6 +3458,7 @@ mod tests {
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
                 state: PendingState::Open,
                 reply: None,
+                kind: CorrelationKind::Ask,
             })
             .unwrap();
 
@@ -8447,6 +8450,80 @@ mod tests {
             assert_eq!(seen[0].kind, PeerKind::Ask);
             assert_eq!(seen[0].id, id);
             assert_eq!(seen[0].thread.as_deref(), Some("t-1"));
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            stub.stop().await;
+        }
+
+        /// A root message is a correlation id like a question's: the envoy's reply names
+        /// it, arrives as a reply in the message's thread, and closes it, since a message
+        /// leaves nothing to collect.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn mesh_send_of_a_root_message_opens_a_correlation_the_envoys_reply_answers() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-send-correlation");
+            let stub = PeerStub::listen(
+                "mesh-tool-send-correlation-stub",
+                TcpServer::DEFAULT_CLIENT_MTU,
+            )
+            .await;
+            let started = started_runtime_on("mesh-tool-send-correlation", stub.port()).await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            let peers = runtime.peers();
+            stub.wait_to_be_filed(&peers, &to).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let sent = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}send"),
+                &json!({"to": to, "message": "can you review the branch?"}),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(sent["status"], "sent", "{sent}");
+            let id = sent["id"].as_str().unwrap().to_string();
+            let opened = ctx
+                .app
+                .mesh
+                .correlations()
+                .get(&id)
+                .expect("a root message opens a correlation");
+            assert_eq!(opened.record.kind, CorrelationKind::Message);
+            assert_eq!(opened.record.thread, id);
+            assert_eq!(opened.record.peer_identity, stub.identity_hex());
+            assert_eq!(opened.record.question, "can you review the branch?");
+
+            ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+                source_identity: stub.identity_hex(),
+                source_destination: to.clone(),
+                destination: runtime.current_destination_hash(),
+                thread: Some(id.clone()),
+                ..raw_message(PeerKind::Reply, "r-1", Some(&id))
+            }));
+
+            let inbox = handle_check_inbox(&ctx.app.mesh);
+            let payload = &inbox["messages"][0]["payload"];
+            assert_eq!(payload["message_id"], "r-1", "{inbox}");
+            assert_eq!(payload["kind"], "reply", "{inbox}");
+            assert_eq!(payload["thread"], id.as_str(), "{inbox}");
+            assert!(
+                ctx.app.mesh.correlations().get(&id).is_none(),
+                "the reply closes the message's correlation"
+            );
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             stub.stop().await;
