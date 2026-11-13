@@ -188,11 +188,11 @@ pub async fn run_mcp_oauth_flow(
                 Ok(id) => id,
                 Err(e) => {
                     warn!("Dynamic client registration failed: {e}. Falling back to manual entry.");
-                    ask_client_id(prompter)?
+                    ask_client_id(prompter, server_name)?
                 }
             }
         } else {
-            ask_client_id(prompter)?
+            ask_client_id(prompter, server_name)?
         };
         // Persist regardless of how the client_id was obtained (DCR, config,
         // or manual entry) so refresh_mcp_token can run the refresh_token
@@ -221,13 +221,20 @@ pub async fn run_mcp_oauth_flow(
     run_oauth_flow(&provider, &mcp_token_key(server_name), prompter).await
 }
 
-fn ask_client_id(prompter: &dyn Prompter) -> Result<String> {
+fn ask_client_id(prompter: &dyn Prompter, server_name: &str) -> Result<String> {
     // Refused before any widget exists, with the flow's own message rather
     // than the prompter's typed refusal, so a headless run reads the same
     // error whichever step it stops at; `ask_client_id_bails_without_a_human_before_asking`
-    // pins that no request reaches the prompter.
+    // pins that no request reaches the prompter. A run with a human but no
+    // terminal to answer on gets the shared non-interactive refusal.
     if !human_present() {
         bail!("{NO_HUMAN_FOR_OAUTH}");
+    }
+    if !menu_can_use_terminal() {
+        return Err(refuse_non_interactive(
+            format_args!("sign in to '{server_name}' with OAuth"),
+            ".",
+        ));
     }
     let req = PromptRequest::new(
         PromptAction::Input,
@@ -709,6 +716,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::with_temp_cache;
     use super::*;
+    use crate::config::conflict::prompt_script;
     use crate::prompt::ScriptedPrompter;
     use crate::testing::AtomicFlagGuard;
     use crate::utils::HEADLESS;
@@ -725,9 +733,10 @@ mod tests {
     #[test]
     #[serial]
     fn ask_client_id_round_trips_an_input_prompt() {
+        let _tty = prompt_script::install(&[]);
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("cid-7q".to_string())]);
 
-        let client_id = ask_client_id(&prompter).unwrap();
+        let client_id = ask_client_id(&prompter, "srv-7q").unwrap();
 
         assert_eq!(client_id, "cid-7q");
         let requests = prompter.requests();
@@ -742,9 +751,10 @@ mod tests {
     #[test]
     #[serial]
     fn ask_client_id_wraps_a_cancel_in_its_context() {
+        let _tty = prompt_script::install(&[]);
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
 
-        let err = ask_client_id(&prompter).unwrap_err();
+        let err = ask_client_id(&prompter, "srv-7q").unwrap_err();
 
         assert_eq!(err.to_string(), "Failed to read client ID");
         assert_eq!(
@@ -759,9 +769,26 @@ mod tests {
         let _headless = AtomicFlagGuard::set(&HEADLESS, true);
         let prompter = ScriptedPrompter::refusing();
 
-        let err = ask_client_id(&prompter).unwrap_err();
+        let err = ask_client_id(&prompter, "srv-7q").unwrap_err();
 
         assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn ask_client_id_refuses_without_a_terminal_before_asking() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _no_tty = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = ask_client_id(&prompter, "srv-7q").unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'srv-7q' with OAuth non-interactively. Re-run in a terminal."
+        );
         assert!(prompter.requests().is_empty());
     }
 

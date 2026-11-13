@@ -320,6 +320,12 @@ async fn run_pkce_flow(
         (provider.redirect_uri().to_string(), false)
     };
 
+    // The paste flow needs someone at a terminal; checked before the URL is
+    // printed or a browser opened for a sign-in nobody could finish.
+    if !use_callback_listener {
+        ensure_paste_can_be_asked(client_name)?;
+    }
+
     let authorize_url = build_authorize_url(provider, &redirect_uri, &code_challenge, &state);
 
     println!(
@@ -971,6 +977,17 @@ fn build_token_request(
 }
 
 fn ask_paste_input(prompter: &dyn Prompter, client_name: &str) -> Result<(String, Option<String>)> {
+    ensure_paste_can_be_asked(client_name)?;
+    let req = PromptRequest::new(
+        PromptAction::Input,
+        "Paste the authorization code or callback URL:",
+        Origin::detached(),
+    );
+    let input = ask(prompter, req).and_then(PromptAnswer::into_text)?;
+    parse_paste_input(input.trim())
+}
+
+fn ensure_paste_can_be_asked(client_name: &str) -> Result<()> {
     // Refused before any widget exists, with the flow's own message rather
     // than the prompter's typed refusal, so a headless run reads the same
     // error whichever step it stops at; `ask_paste_input_bails_without_a_human_before_asking`
@@ -985,13 +1002,7 @@ fn ask_paste_input(prompter: &dyn Prompter, client_name: &str) -> Result<(String
             ".",
         ));
     }
-    let req = PromptRequest::new(
-        PromptAction::Input,
-        "Paste the authorization code or callback URL:",
-        Origin::detached(),
-    );
-    let input = ask(prompter, req).and_then(PromptAnswer::into_text)?;
-    parse_paste_input(input.trim())
+    Ok(())
 }
 
 fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
@@ -2099,6 +2110,71 @@ echo_pkce_in_token_exchange: true
         let prompter = ScriptedPrompter::refusing();
 
         let err = ask_paste_input(&prompter, "client-x").unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'client-x' with OAuth non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_paste_can_be_asked_refuses_without_a_terminal() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _no_tty = prompt_script::install_non_interactive();
+
+        let err = ensure_paste_can_be_asked("client-x").unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'client-x' with OAuth non-interactively. Re-run in a terminal."
+        );
+    }
+
+    /// A paste-flow provider (no fixed or localhost redirect) that fails the
+    /// test if anything reads its authorize URL, which the flow needs both
+    /// to print the URL and to open the browser.
+    struct UnreachableAuthorizeProvider;
+
+    impl OAuthProvider for UnreachableAuthorizeProvider {
+        fn provider_name(&self) -> &str {
+            "stub"
+        }
+
+        fn client_id(&self) -> &str {
+            "stub-client"
+        }
+
+        fn authorize_url(&self) -> &str {
+            panic!("the authorize URL was built before the paste flow was refused")
+        }
+
+        fn token_url(&self) -> &str {
+            "https://as.example/token"
+        }
+
+        fn redirect_uri(&self) -> &str {
+            "urn:ietf:wg:oauth:2.0:oob"
+        }
+
+        fn scopes(&self) -> String {
+            String::new()
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn paste_flow_without_a_terminal_refuses_before_building_the_authorize_url() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _no_tty = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = run_pkce_flow(&UnreachableAuthorizeProvider, "client-x", &prompter)
+            .await
+            .unwrap_err();
 
         assert_eq!(
             err.to_string(),
