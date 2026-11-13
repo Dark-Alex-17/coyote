@@ -2022,19 +2022,14 @@ fn ask_qdrant_host(prompter: &dyn Prompter) -> Result<String> {
     let label = "Host (e.g. qdrant.company.com:6333):";
     let mut question = label.to_string();
     loop {
-        let answer = input(prompter, &question, None, None)?;
-        if answer.is_empty() {
-            question = reask("This field is required.", label);
-            continue;
+        let answer = required_input(prompter, &question, None, None)?;
+        if !answer.contains('[') && !answer.contains(']') {
+            return Ok(answer);
         }
-        if answer.contains('[') || answer.contains(']') {
-            question = reask(
-                "Bracketed IPv6 literals are not supported; use a hostname.",
-                label,
-            );
-            continue;
-        }
-        return Ok(answer);
+        question = reask(
+            "Bracketed IPv6 literals are not supported; use a hostname.",
+            label,
+        );
     }
 }
 
@@ -3612,10 +3607,11 @@ mod tests {
         let host = ScriptedPrompter::new(vec![
             text(""),
             text("[::1]:6333"),
+            text("   "),
             text("qdrant.local:6333"),
         ]);
         assert_eq!(ask_qdrant_host(&host).unwrap(), "qdrant.local:6333");
-        let [first, second, third] = host.requests().try_into().unwrap();
+        let [first, second, third, fourth] = host.requests().try_into().unwrap();
         assert_eq!(first.question, "Host (e.g. qdrant.company.com:6333):");
         assert_eq!(
             second.question,
@@ -3624,6 +3620,10 @@ mod tests {
         assert_eq!(
             third.question,
             "Bracketed IPv6 literals are not supported; use a hostname. Host (e.g. qdrant.company.com:6333):"
+        );
+        assert_eq!(
+            fourth.question,
+            "This field is required. Bracketed IPv6 literals are not supported; use a hostname. Host (e.g. qdrant.company.com:6333):"
         );
     }
 
