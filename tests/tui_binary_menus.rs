@@ -1082,15 +1082,17 @@ fn a_run_with_nobody_to_ask_about_rag_logs_the_skip_at_debug_and_prints_nothing(
     let files_before = walk(&dir);
     let log = dir.join("probe.log");
     let log_path = log.to_str().unwrap();
-    let mut pty = spawn_tui_under(
+    let mut pty = spawn_binary_under(
+        built_binary(),
         &dir,
         &[
             ("COYOTE_UI", "repl"),
             ("COYOTE_LOG_LEVEL", "debug"),
             ("COYOTE_LOG_PATH", log_path),
         ],
-        "'{coyote}' --agent docs-agent-t4e --headless 'say hello-sentinel-t4e' <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}",
+        WAIT_WRAPPER,
         "/dev/tty",
+        " --agent docs-agent-t4e --headless 'say hello-sentinel-t4e'",
     );
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(
@@ -1893,11 +1895,14 @@ fn headless_agent_with_documents_starts_without_rag_silently() {
     write_agent_with_documents(&dir, "docs-agent-h7q");
     let files_before = walk(&dir);
     let captured = dir.join("stdout.log");
-    let wrapper = format!(
-        "'{{coyote}}' --agent docs-agent-h7q --headless 'say hello-sentinel-h7q' <{{stdin}} >'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
-        captured.display()
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        &wait_wrapper_with_stdout_to(&captured),
+        "/dev/null",
+        " --agent docs-agent-h7q --headless 'say hello-sentinel-h7q'",
     );
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], &wrapper, "/dev/null");
 
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let file = String::from_utf8_lossy(&fs::read(&captured).unwrap_or_default()).to_string();
@@ -1967,12 +1972,7 @@ fn a_tty_less_macro_step_that_would_ask_is_refused_and_writes_nothing() {
         .unwrap();
         // Seed the built-in assets first so the file walk below sees only
         // what the refused step leaves behind.
-        ttyless_command(built_binary(), &dir)
-            .arg("--info")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
+        run_ttyless_status(built_binary(), &dir, &["--info"]);
         let files_before = walk(&dir);
 
         let (ok, everything) = run_ttyless(
@@ -3671,8 +3671,7 @@ fn install_builtins_help_sentence_and_the_clap_errors_around_install_with_yes() 
             vec!["--install-builtins", "x", "--yes"],
         ),
     ] {
-        let mut cmd = ttyless_command(built_binary(), &dir);
-        let output = cmd.args(&args).output().unwrap();
+        let output = run_ttyless_output(built_binary(), &dir, &args);
         let out = format!(
             "--- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),

@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
@@ -117,6 +117,13 @@ pub const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
 pub const WAIT_WRAPPER: &str =
     "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 
+/// [`WAIT_WRAPPER`] with the binary's stdout sent to `path` while stdin
+/// keeps the `{stdin}` slot: the shape of `coyote --install x > log`
+/// typed at a terminal. The wrapper's own report still reaches the pty.
+pub fn wait_wrapper_with_stdout_to(path: &Path) -> String {
+    WAIT_WRAPPER.replace("<{stdin}", &format!("<{{stdin}} >'{}'", path.display()))
+}
+
 /// A job-control wrapper that behaves like the user's shell: the binary
 /// runs as the foreground job in its own process group; when it stops the
 /// wrapper regains the terminal, says so, reports the tty flags it sees,
@@ -168,13 +175,16 @@ pub fn spawn_binary_under(
 
 /// `extra_env` may add to the shared environment but never move the
 /// binary out of the test's own dir: a test that overrode one of these
-/// would run against the developer's real config, cache or home.
+/// would run against the developer's real config, cache, sessions or
+/// home.
 fn assert_env_stays_under_dir(extra_env: &[(&str, &str)]) {
     assert!(
-        !extra_env
-            .iter()
-            .any(|(k, _)| matches!(*k, "COYOTE_CONFIG_DIR" | "COYOTE_CACHE_DIR" | "HOME")),
-        "extra_env must not override COYOTE_CONFIG_DIR, COYOTE_CACHE_DIR or HOME: {extra_env:?}"
+        !extra_env.iter().any(|(k, _)| matches!(
+            *k,
+            "COYOTE_CONFIG_DIR" | "COYOTE_CACHE_DIR" | "COYOTE_SESSIONS_DIR" | "HOME"
+        )),
+        "extra_env must not override COYOTE_CONFIG_DIR, COYOTE_CACHE_DIR, COYOTE_SESSIONS_DIR \
+         or HOME: {extra_env:?}"
     );
 }
 
@@ -215,6 +225,25 @@ pub fn ttyless_command(binary: &Path, dir: &Path) -> Command {
         .env("COYOTE_UI", "repl")
         .stdin(Stdio::null());
     cmd
+}
+
+/// Runs the binary with no terminal at all and its output discarded,
+/// returning how it exited: for a run whose only job is its side effect
+/// (seeding the built-in assets before a file walk).
+pub fn run_ttyless_status(binary: &Path, dir: &Path, args: &[&str]) -> ExitStatus {
+    ttyless_command(binary, dir)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+}
+
+/// Runs the binary with no terminal at all and returns its `Output`,
+/// both streams and the status, for a check that needs the exact exit
+/// code (a clap usage error is 2) rather than success or failure.
+pub fn run_ttyless_output(binary: &Path, dir: &Path, args: &[&str]) -> Output {
+    ttyless_command(binary, dir).args(args).output().unwrap()
 }
 
 /// Runs the binary with no terminal at all (detached, stdin /dev/null,
@@ -283,7 +312,8 @@ pub fn run_ttyless_with_env(
 }
 
 /// Whether our child `pid` has exited and is still waiting to be reaped.
-/// A pid that is no child of ours any more counts as exited.
+/// A pid that is no child of ours any more counts as exited; any other
+/// failure of `waitid` is a harness bug and fails the test outright.
 fn exited_unreaped(pid: libc::pid_t) -> bool {
     // SAFETY: all-zero bytes are a valid `siginfo_t`, and `waitid` only
     // writes into it; with WNOHANG a pid that has not exited leaves
@@ -296,8 +326,11 @@ fn exited_unreaped(pid: libc::pid_t) -> bool {
             // SAFETY: `si_pid` is valid for a child-state report.
             return unsafe { info.si_pid() } != 0;
         }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return true;
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => {}
+            Some(libc::ECHILD) => return true,
+            _ => panic!("waitid({pid}) failed: {err}"),
         }
     }
 }
