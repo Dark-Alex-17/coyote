@@ -81,6 +81,14 @@ impl CorrelationKind {
     pub(crate) fn is_ask(&self) -> bool {
         *self == Self::Ask
     }
+
+    /// How logs name a record of this kind.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Ask => "question",
+            Self::Message => "message",
+        }
+    }
 }
 
 /// One line of `pending-<instance_id>.jsonl`. Unknown fields are rejected, so any layout
@@ -113,6 +121,8 @@ pub(crate) struct PendingRecord {
     /// before the process ended is still there for the next one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<PeerMessage>,
+    /// A root message's correlation, closed by its reply, or a question's, whose
+    /// answer waits to be collected.
     #[serde(default, skip_serializing_if = "CorrelationKind::is_ask")]
     pub kind: CorrelationKind,
 }
@@ -282,15 +292,16 @@ impl PendingStore {
     }
 }
 
-/// A question another session on this cache dir asked, with the instance it asked from.
+/// A question or message another session on this cache dir sent, with the instance it
+/// was sent from.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OtherSessionAsk {
     pub instance_id: String,
     pub record: PendingRecord,
 }
 
-/// The questions every session on `cache_dir` other than `own_instance_id` asked and
-/// still has something to do with (awaiting a reply, or answered with the reply waiting
+/// The questions and messages every session on `cache_dir` other than `own_instance_id`
+/// sent and still has something to do with (awaiting a reply, or answered with the reply waiting
 /// to be collected), newest first. Each `pending-<instance_id>.jsonl` is read as it
 /// stands and never written: only the session that asked collects or prunes its own.
 /// A store that cannot be read contributes nothing; its own session reports it.
@@ -317,7 +328,7 @@ pub(crate) fn other_sessions_asked(
                     }),
             ),
             Err(err) => log::debug!(
-                "Questions asked from instance {} are left out of `.mesh messaging sent`: {}",
+                "Correlations opened from instance {} are left out of `.mesh messaging sent`: {}",
                 short(&instance_id),
                 redact_hashes(&format!("{err:#}"))
             ),
@@ -1005,7 +1016,7 @@ struct CorrelationState {
 #[cfg(test)]
 type WaitHook = Box<dyn FnOnce(&Correlations) + Send>;
 
-/// The questions in flight, matched to replies by `in_reply_to`. Writes go through to the
+/// The questions and messages in flight, matched to replies by `in_reply_to`. Writes go through to the
 /// attached store on the caller's thread; the request path hands its delivery to a
 /// blocking thread first, so the file write never sits on the server's request loop. The
 /// file is a few lines and the write is the only way the question survives the process. A
@@ -1067,7 +1078,7 @@ impl Correlations {
         self.changed.notify_waiters();
     }
 
-    /// Files a question. The record is written to the store first so a failure there
+    /// Files a correlation. The record is written to the store first so a failure there
     /// leaves nothing waiting in memory for a reply the next process would not know.
     pub(crate) fn open(&self, record: PendingRecord) -> Result<()> {
         let mut state = self.state.lock();
@@ -1124,9 +1135,10 @@ impl Correlations {
         let entry = entries.get_mut(in_reply_to)?;
         if !entry.record.state.accepts(reply.disposition()) {
             debug!(
-                "Mesh reply {} from {} names question {in_reply_to}, which is already {}; treating it as a message",
+                "Mesh reply {} from {} names {} {in_reply_to}, which is already {}; treating it as a message",
                 reply.message_id,
                 short(&reply.source_identity),
+                entry.record.kind.noun(),
                 if entry.record.state == PendingState::Escalated {
                     "escalated"
                 } else {
@@ -1141,9 +1153,10 @@ impl Correlations {
             .eq_ignore_ascii_case(&reply.source_identity)
         {
             debug!(
-                "Mesh reply {} from {} names question {in_reply_to}, which was asked of {}; treating it as a message",
+                "Mesh reply {} from {} names {} {in_reply_to}, which was sent to {}; treating it as a message",
                 reply.message_id,
                 short(&reply.source_identity),
+                entry.record.kind.noun(),
                 short(&entry.record.peer_identity)
             );
             return None;
@@ -1173,7 +1186,8 @@ impl Correlations {
             && let Err(err) = store.upsert(entry.record.clone(), SystemTime::now())
         {
             warn!(
-                "Mesh question {in_reply_to} was answered but the answer could not be recorded on disk: {}",
+                "Mesh {} {in_reply_to} was answered but the answer could not be recorded on disk: {}",
+                entry.record.kind.noun(),
                 redact_hashes(&format!("{err:#}"))
             );
         }
@@ -1237,24 +1251,26 @@ impl Correlations {
         Some(reply)
     }
 
-    /// Forgets a question still awaiting a reply, as after a send that failed, so nothing
+    /// Forgets a correlation still awaiting a reply, as after a send that failed, so nothing
     /// waits on a reply that was never asked for. `true` when such a record with `id` was
     /// there to remove; an answered one stays for `take_answer`.
     pub(crate) fn abandon(&self, id: &str) -> bool {
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
-        if !entries
+        let Some(kind) = entries
             .get(id)
-            .is_some_and(|entry| entry.record.state.awaits_reply())
-        {
+            .filter(|entry| entry.record.state.awaits_reply())
+            .map(|entry| entry.record.kind)
+        else {
             return false;
-        }
+        };
         entries.remove(id);
         if let Some(store) = store
             && let Err(err) = store.remove(id)
         {
             warn!(
-                "Mesh question {id} was abandoned but could not be removed from disk: {}",
+                "Mesh {} {id} was abandoned but could not be removed from disk: {}",
+                kind.noun(),
                 redact_hashes(&format!("{err:#}"))
             );
         }
@@ -1267,7 +1283,7 @@ impl Correlations {
         self.state.lock().entries.get(id).cloned()
     }
 
-    /// The thread of question `id`, for the reply that answers it to inherit.
+    /// The thread of correlation `id`, for the reply that answers it to inherit.
     pub(crate) fn thread_of(&self, id: &str) -> Option<String> {
         self.state
             .lock()
@@ -1276,7 +1292,7 @@ impl Correlations {
             .map(|entry| entry.record.thread.clone())
     }
 
-    /// Whether any question in flight was asked in `thread`, which makes it a thread
+    /// Whether any correlation in flight was opened in `thread`, which makes it a thread
     /// this node may continue.
     pub(crate) fn knows_thread(&self, thread: &str) -> bool {
         self.state
@@ -1286,7 +1302,7 @@ impl Correlations {
             .any(|entry| entry.record.thread == thread)
     }
 
-    /// Every question in flight, newest first by `sent_at`.
+    /// Every correlation in flight, newest first by `sent_at`.
     pub(crate) fn list(&self) -> Vec<Correlation> {
         let mut entries: Vec<Correlation> = self.state.lock().entries.values().cloned().collect();
         entries.sort_by(|a, b| b.record.sent_at.cmp(&a.record.sent_at));

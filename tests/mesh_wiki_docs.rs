@@ -7754,9 +7754,9 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
     for needle in [
         "`Sent <id8> to <user> / <session> (<dest8>, via direct|store-and-forward).`".to_string(),
         format!(
-            "`Sent <id8> to <name> (<dest8>): <name> left 2h ago{held}<name>{end}. {see_back}`"
+            "`Sent <id8> to <user> / <session> (<dest8>): <user> / <session> left 2h ago{held}<user>{end}. {see_back}`"
         ),
-        format!("`<name>{}`", no_route.replace("{}", "<age>")),
+        format!("`<user> / <session>{}`", no_route.replace("{}", "<age>")),
         format!(
             "`request <id8> to <dest8>: pending; <dest8> left 2h ago{held}<dest8>{end} (the decision arrives as an idle line; .mesh messaging inbox lists it)`"
         ),
