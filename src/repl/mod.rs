@@ -1098,6 +1098,7 @@ pub async fn run_repl_command_with_prefix(
                             prefix: ctx.command_prefix(),
                             prompter: ctx.prompter.as_ref(),
                             remedy: config::REPL_CONFLICT_REMEDY,
+                            force_flag: "--force",
                         },
                     )?;
                 }

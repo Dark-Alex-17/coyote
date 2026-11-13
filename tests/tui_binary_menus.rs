@@ -4250,18 +4250,6 @@ mod cold_start {
 // first-run provider wizard.
 // ---------------------------------------------------------------------
 
-/// The remedy a `.install` refusal in the plain REPL ends with.
-const REPL_INSTALL_REMEDY: &str = ", with --force (installs).";
-
-/// A local `mcp.json` holding the bundle server `write_bundle_repo`
-/// ships under a different definition, so the merge hits a conflict.
-fn write_conflicting_local_mcp_server(dir: &Path) -> String {
-    let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
-                 \"args\": [\"local-definition-m10\"], \"env\": {}}}}\n";
-    fs::write(dir.join("mcp.json"), local).unwrap();
-    local.to_string()
-}
-
 /// `coyote --install <bundle>` with no terminal at all, once at a local
 /// role conflict and once at an MCP server conflict: each is refused in
 /// the shared shape and the remedy is, word for word, `, with
@@ -4374,7 +4362,7 @@ fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_ends_wit
         "{since}"
     );
     assert_eq!(
-        remedy, REPL_INSTALL_REMEDY,
+        remedy, REPL_CONFLICT_REMEDY,
         "the REPL MCP conflict remedy is not word for word the documented one:\n{since}"
     );
     assert!(

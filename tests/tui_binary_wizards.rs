@@ -1376,16 +1376,6 @@ fn dot_rebuild_rag_with_a_failing_document_and_y_goes_on_to_report_the_empty_cor
     assert_ui_alive_then_quit(&mut pty, "the rebuild over an empty corpus");
 }
 
-/// A local `mcp.json` holding the bundle's server under a different
-/// definition, so the merge hits a conflict it would otherwise resolve
-/// through a menu.
-fn write_conflicting_local_mcp(dir: &Path) -> String {
-    let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
-                 \"args\": [\"local-definition-w8\"], \"env\": {}}}}\n";
-    fs::write(dir.join("mcp.json"), local).unwrap();
-    local.to_string()
-}
-
 const MCP_CONFLICT_REFUSAL: &str =
     "Refusing to merge the already-installed MCP server 'bundle-k7s-server' non-interactively";
 const TERMINAL_HINT: &str = "Re-run in a terminal";
@@ -1403,7 +1393,7 @@ fn dot_install_with_a_conflicting_mcp_server_asks_in_the_select_modal_and_keep_l
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![]);
     write_fake_llm_config(&dir, &fake);
-    let local_before = write_conflicting_local_mcp(&dir);
+    let local_before = write_conflicting_local_mcp_server(&dir);
     let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
     let mut pty = spawn_tui(&dir, &[]);
 
@@ -1518,7 +1508,7 @@ fn an_install_with_stdout_redirected_and_a_conflicting_mcp_server_is_refused_nam
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![]);
     write_fake_llm_config(&dir, &fake);
-    let local_before = write_conflicting_local_mcp(&dir);
+    let local_before = write_conflicting_local_mcp_server(&dir);
     let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
     let captured = dir.join("stdout.log");
     let mut pty = spawn_binary_under(
@@ -3138,34 +3128,72 @@ fn a_tools_list_question_in_the_plain_repl_is_an_open_select_keeping_the_arrow_h
 
 /// The same tool's `list` question under the UI is the Select modal with
 /// the tool's entries and the `Other (custom)` row, the terminal is never
-/// released, and text typed on the custom row flows back to the tool
+/// released, Down then Enter hands the tool the second entry's index, and
+/// on a second call text typed on the custom row flows back to the tool
 /// verbatim.
 #[test]
 #[serial]
 fn a_tools_list_question_under_the_ui_takes_typed_text_from_the_custom_row() {
     let dir = fresh_config_dir("tool-list-modal");
     let _guard = TempDirGuard(dir.clone());
-    let (fake, out) = list_tool_turn(&dir);
+    let picked = dir.join("list-answer-picked");
+    let out = dir.join("list-answer");
+    let call = |out: &Path| Reply::ToolCall {
+        name: "fixture_list_rec".to_string(),
+        arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+    };
+    let fake = FakeLlm::start(vec![
+        call(&picked),
+        Reply::Text("fixture picked first q7l".to_string()),
+        call(&out),
+        Reply::Text("fixture done q7l".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_list_rec.sh", RECORDING_LIST_TOOL);
     let mut pty = spawn_tui(&dir, &[]);
+    let ask = |pty: &mut Pty, line: &[u8]| {
+        let asked_at = pty.raw().len();
+        pty.send(line).unwrap();
+        wait_for_the_modal(
+            pty,
+            asked_at,
+            "the list tool",
+            &[
+                "q7l-q",
+                "alpha-q7l",
+                "beta-q7l",
+                "gamma-q7l",
+                "Other (custom)",
+                "Up/Down=move",
+            ],
+        );
+        pty.read_for(HOTKEY_GAP);
+    };
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    let asked_at = pty.raw().len();
-    pty.send(b"call the list tool\r").unwrap();
-    wait_for_the_modal(
+    ask(&mut pty, b"call the list tool\r");
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &picked, "the tool's recorded index");
+    let transcript = wait_for_squeezed(
         &mut pty,
-        asked_at,
-        "the list tool",
-        &[
-            "q7l-q",
-            "alpha-q7l",
-            "beta-q7l",
-            "gamma-q7l",
-            "Other (custom)",
-            "Up/Down=move",
-        ],
+        "fixture picked first q7l",
+        "the reply after the first call",
+    );
+    assert_eq!(
+        fs::read_to_string(&picked).unwrap(),
+        "1",
+        "Down then Enter in the modal did not reach the tool as the second entry:\n{transcript}"
+    );
+    assert_eq!(
+        list_exit_status(&picked),
+        "0",
+        "the chosen entry did not reach the tool with the index status:\n{transcript}"
     );
 
-    pty.read_for(HOTKEY_GAP);
+    pty.read_for(Duration::from_millis(300));
+    ask(&mut pty, b"call the list tool again\r");
     for _ in 0..3 {
         pty.send(b"\x1b[B").unwrap();
         pty.read_for(Duration::from_millis(400));
@@ -3187,9 +3215,9 @@ fn a_tools_list_question_under_the_ui_takes_typed_text_from_the_custom_row() {
         "2",
         "typed text did not reach the tool with the custom-answer status:\n{transcript}"
     );
-    assert_eq!(fake.served(), 2, "{transcript}");
+    assert_eq!(fake.served(), 4, "{transcript}");
     assert!(
-        fake.bodies()[1].contains("fixture picked: typed-by-hand-x7q q7l-r"),
+        fake.bodies()[3].contains("fixture picked: typed-by-hand-x7q q7l-r"),
         "the tool's output handed to the model does not carry the typed text:\n{:?}",
         fake.bodies()
     );
@@ -3652,6 +3680,10 @@ fn keep_all_on_the_uninstall_file_modal_carries_into_the_mcp_server_loop_without
 const KEPT_MCP_SERVER_CANCELLED_NOTE: &str =
     "Kept the local MCP server 'bundle-k7s-server': the question was cancelled.";
 
+/// Typed into the vault password modal and left unsubmitted before Esc;
+/// no file may end up holding it.
+const CANCELLED_VAULT_PASSWORD: &str = "cancelled-pw-v4q";
+
 /// Waits for the modal `markers` describe after `from`, with a resize
 /// first so the whole frame is on the pty (a modal differing from the
 /// last by a few cells paints only those cells).
@@ -3748,11 +3780,11 @@ fn esc_inside_the_vault_wizard_defers_the_rest(
         .into_iter()
         .filter(|path| !files_before.contains(path))
         .filter(|path| {
-            let text = path.to_string_lossy();
-            !text.contains("/cache/") && !text.contains("/bundle-src/")
-        })
-        .filter(|path| {
-            fs::read_to_string(path).is_ok_and(|text| text.contains("twelve-chars-long"))
+            fs::read(path).is_ok_and(|bytes| {
+                bytes
+                    .windows(CANCELLED_VAULT_PASSWORD.len())
+                    .any(|window| window == CANCELLED_VAULT_PASSWORD.as_bytes())
+            })
         })
         .collect();
     assert!(
@@ -3785,10 +3817,11 @@ fn walk_files(dir: &Path) -> Vec<PathBuf> {
 /// runs later): `y` on `Add {{ A }} to the vault now?` opens the
 /// password-file wizard as modals. Esc on each of its three widgets
 /// in turn (the `create one now?` confirm on the install, the path
-/// Input on the first update, the password modal on the second) defers
-/// A and every later secret, the install or update still succeeds and
-/// lists both secrets as deferred, and no password file is written
-/// anywhere.
+/// Input on the first update, the password modal with a password typed
+/// but not submitted on the second) defers A and every later secret, the
+/// install or update still succeeds and lists both secrets as deferred,
+/// no password file is written, and no new file anywhere under the
+/// config dir holds the typed password.
 #[test]
 #[serial]
 fn esc_inside_the_vault_wizard_of_a_bundle_secret_defers_the_rest_and_writes_no_password_file() {
@@ -3902,6 +3935,9 @@ fn esc_inside_the_vault_wizard_of_a_bundle_secret_defers_the_rest_and_writes_no_
                 &["Enterapasswordtoencryptallvaultsecrets:", "Enter=answer"],
                 rows,
             );
+            pty.read_for(HOTKEY_GAP);
+            pty.send(CANCELLED_VAULT_PASSWORD.as_bytes()).unwrap();
+            pty.read_for(Duration::from_millis(400));
         },
         &mut rows,
         "Esc on the password modal",
@@ -3924,7 +3960,7 @@ fn esc_on_the_mcp_conflict_select_modal_keeps_the_local_server_and_says_the_ques
     let dir = fresh_config_dir("install-mcp-conflict-esc");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
-    let local_before = write_conflicting_local_mcp(&dir);
+    let local_before = write_conflicting_local_mcp_server(&dir);
     let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
     let mut pty = spawn_tui(&dir, &[]);
 

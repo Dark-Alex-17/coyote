@@ -87,7 +87,11 @@ fn ask_password_file_path(prompter: &dyn Prompter, default: &Path) -> Result<Pat
             );
             continue;
         }
-        if path.parent().is_some_and(|parent| !parent.exists()) {
+        // A bare file name has an empty parent: the current directory.
+        if path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty() && !parent.exists())
+        {
             question = reask("Parent directory does not exist.", label);
             continue;
         }
@@ -1050,6 +1054,23 @@ mod tests {
                 "A response is required. Enter a password to encrypt all vault secrets:",
                 "The length of the response should be at least 10. Enter a password to encrypt all vault secrets:",
             ]
+        );
+    }
+
+    /// A bare file name lands in the current directory, which exists, so
+    /// it is taken at once instead of re-asked for a missing parent.
+    #[test]
+    fn a_bare_password_file_name_is_taken_in_the_current_directory() {
+        let bare = "vault-pass-bare-q4z";
+        assert!(!Path::new(bare).exists(), "{bare} is already in the cwd");
+        let prompter = ScriptedPrompter::new(vec![text(bare)]);
+
+        let path = ask_password_file_path(&prompter, Path::new("/unused/default")).unwrap();
+
+        assert_eq!(path, PathBuf::from(bare));
+        assert_eq!(
+            questions(&prompter),
+            ["Enter the path to the password file to create:"]
         );
     }
 

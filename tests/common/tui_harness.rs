@@ -948,6 +948,9 @@ pub fn refusal_shape(out: &str) -> Option<(String, String)> {
 /// The remedy a `coyote --install` refusal ends with.
 pub const CLI_INSTALL_REMEDY: &str = ", with --install-force (installs), or with --yes (updates).";
 
+/// The remedy a `.install` refusal in the plain REPL ends with.
+pub const REPL_CONFLICT_REMEDY: &str = ", with --force (installs).";
+
 /// Whether an SGR sequence sets a foreground, background or underline
 /// colour (the 16 named colours, their bright twins, or a 38/48/58
 /// extended-colour introducer).
@@ -1066,6 +1069,16 @@ pub fn write_bundle_repo_at(repo: &Path, name: &str, secrets: &[&str]) {
     git(repo, &["init", "-q"]);
     git(repo, &["add", "."]);
     git(repo, &["commit", "-q", "-m", "bundle"]);
+}
+
+/// A local `mcp.json` holding the server `write_bundle_repo` ships under a
+/// different definition, so the merge hits a conflict it would otherwise
+/// resolve through a menu. Returns what was written.
+pub fn write_conflicting_local_mcp_server(dir: &Path) -> String {
+    let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
+                 \"args\": [\"local-definition-k7s\"], \"env\": {}}}}\n";
+    fs::write(dir.join("mcp.json"), local).unwrap();
+    local.to_string()
 }
 
 /// The UI after `.info` still takes keys, then Ctrl+D leaves it clean.

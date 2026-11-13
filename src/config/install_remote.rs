@@ -43,17 +43,9 @@ pub(crate) struct InstallIo<'a> {
     pub(crate) prompter: &'a dyn Prompter,
     /// [`CLI_CONFLICT_REMEDY`] or [`REPL_CONFLICT_REMEDY`].
     pub(crate) remedy: &'static str,
-}
-
-impl InstallIo<'_> {
-    /// The flag that forces a remote install where this caller reads it.
-    fn force_flag(&self) -> &'static str {
-        if self.remedy == REPL_CONFLICT_REMEDY {
-            "--force"
-        } else {
-            "--install-force"
-        }
-    }
+    /// The flag that forces a remote install where this caller reads it:
+    /// `--install-force` on the CLI, `--force` in the REPL.
+    pub(crate) force_flag: &'static str,
 }
 
 #[cfg(test)]
@@ -67,6 +59,7 @@ fn install_remote(
         prefix: CommandPrefix::default(),
         prompter,
         remedy: CLI_CONFLICT_REMEDY,
+        force_flag: "--install-force",
     };
     install_remote_with_io(git_url, filter, force, io)
 }
@@ -327,7 +320,7 @@ pub fn install_or_update(
             if filter.is_some() || force {
                 bail!(
                     "--filter/{} only apply to remote installs, not bundle updates",
-                    io.force_flag()
+                    io.force_flag
                 );
             }
             update_bundle_with_io(value, false, io)
@@ -387,6 +380,7 @@ pub fn update_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -> R
             prefix: CommandPrefix::default(),
             prompter,
             remedy: CLI_CONFLICT_REMEDY,
+            force_flag: "--install-force",
         },
     )
 }
@@ -2670,6 +2664,7 @@ mod tests {
             prefix: CommandPrefix::Dot,
             prompter,
             remedy: CLI_CONFLICT_REMEDY,
+            force_flag: "--install-force",
         }
     }
 
@@ -5957,6 +5952,7 @@ mod tests {
             true,
             InstallIo {
                 remedy: REPL_CONFLICT_REMEDY,
+                force_flag: "--force",
                 ..dot_io(&ScriptedPrompter::refusing())
             },
         )
@@ -6105,6 +6101,7 @@ mod tests {
                 prefix: CommandPrefix::Slash,
                 prompter: &ScriptedPrompter::refusing(),
                 remedy: REPL_CONFLICT_REMEDY,
+                force_flag: "--force",
             },
         )
         .unwrap_err()

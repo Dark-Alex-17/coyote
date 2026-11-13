@@ -309,6 +309,7 @@ async fn run_cli_flag(
                 prefix: config::CommandPrefix::default(),
                 prompter: &InquirePrompter::default(),
                 remedy: config::CLI_CONFLICT_REMEDY,
+                force_flag: "--install-force",
             },
         )?;
         return Ok(true);

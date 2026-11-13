@@ -622,7 +622,8 @@ fn confirm_asset_overwrite(
              scripts in {}, the roles hooks directory, and each bundled \
              agent's hooks directory. Where a local copy differs from the \
              bundled version you are asked per file whether to keep or \
-             replace it; non-interactive runs keep local files.",
+             replace it. Without a terminal the refresh is refused unless \
+             --yes is given, and with --yes every edited hook is kept.",
             target.display()
         ),
         _ => format!(

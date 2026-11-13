@@ -528,8 +528,10 @@ impl Default for InquirePrompter {
 
 impl Prompter for InquirePrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
-        // A tool approval keeps its type-ahead: `y<Enter>` sent before it
-        // appears must still answer it. Every other prompt drains first.
+        // A confirm a tool asks keeps its type-ahead: keys sent before its
+        // Yes / No / Yes for this session menu appears still reach the menu,
+        // so an Enter typed ahead picks Yes. Every other prompt drops stale
+        // input first.
         if !(req.action == PromptAction::Confirm && req.tool.is_some()) {
             crate::utils::drain_stale_tty_input();
         }
@@ -841,11 +843,19 @@ mod tests {
         )));
 
         let source = include_str!("mod.rs");
-        let start = source.find("fn select(req: &PromptRequest)").unwrap();
+        let start = source
+            .find("fn select(req: &PromptRequest)")
+            .expect("no `fn select(req: &PromptRequest)` in prompt/mod.rs");
         let body = &source[start..];
-        let body = &body[..body.find("\n    }\n").unwrap()];
-        let (_, after_guard) = body.split_once("if Self::is_command_menu(req) {").unwrap();
-        let (bare, styled) = after_guard.split_once("\n        }\n").unwrap();
+        let body = &body[..body
+            .find("\n    }\n")
+            .expect("`fn select` has no closing brace at four spaces of indent")];
+        let (_, after_guard) = body
+            .split_once("if Self::is_command_menu(req) {")
+            .expect("`fn select` has no `if Self::is_command_menu(req) {` guard");
+        let (bare, styled) = after_guard
+            .split_once("\n        }\n")
+            .expect("the command-menu guard in `fn select` has no closing brace at eight spaces");
         assert!(bare.contains("select.prompt()"), "{bare}");
         assert!(styled.contains(".prompt()"), "{styled}");
         for needle in [
