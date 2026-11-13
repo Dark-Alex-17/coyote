@@ -9052,7 +9052,9 @@ mod tests {
     /// The functions in `source` (the text of `file`) whose body makes one
     /// of the [`NEEDLES`] calls, each once, with whether the body checks
     /// the TUI flag. Comments do not count on either side: a needle in
-    /// one is not a reader, and a gate named only in one is no gate.
+    /// one is not a reader, and a gate named only in one is no gate. A
+    /// `debug_assert!` is no gate either: release builds drop it, so the
+    /// reader still runs under the UI there.
     fn classify_readers(file: &str, source: &str) -> Vec<KeyboardReader> {
         fn at_word_start(line: &str, at: usize) -> bool {
             line[..at]
@@ -9060,11 +9062,52 @@ mod tests {
                 .next_back()
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
         }
+        /// The line up to its `//` comment, if any. A `//` inside a string
+        /// literal on the same line is part of the string.
         fn without_comment(line: &str) -> &str {
-            match line.find("//") {
-                Some(at) => &line[..at],
-                None => line,
+            let bytes = line.as_bytes();
+            let mut in_string = false;
+            let mut at = 0;
+            while at < bytes.len() {
+                match bytes[at] {
+                    b'\\' if in_string => at += 1,
+                    b'\'' if !in_string => {
+                        for quote_char in ["'\"'", "'\\\"'"] {
+                            if line[at..].starts_with(quote_char) {
+                                at += quote_char.len() - 1;
+                                break;
+                            }
+                        }
+                    }
+                    b'"' => in_string = !in_string,
+                    b'/' if !in_string && bytes.get(at + 1) == Some(&b'/') => {
+                        return &line[..at];
+                    }
+                    _ => {}
+                }
+                at += 1;
             }
+            line
+        }
+        /// The body's lines with every `debug_assert` invocation removed,
+        /// through the line its parentheses close on.
+        fn without_debug_asserts<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+            let mut kept = Vec::new();
+            let mut depth: i32 = 0;
+            for line in lines {
+                let rest = if depth > 0 {
+                    *line
+                } else if let Some(at) = line.find("debug_assert") {
+                    kept.push(&line[..at]);
+                    &line[at..]
+                } else {
+                    kept.push(*line);
+                    continue;
+                };
+                depth += rest.matches('(').count() as i32 - rest.matches(')').count() as i32;
+                depth = depth.max(0);
+            }
+            kept
         }
         let lines: Vec<&str> = source.lines().collect();
         let mut readers: Vec<KeyboardReader> = Vec::new();
@@ -9072,9 +9115,10 @@ mod tests {
             if line.trim_start().starts_with("//") {
                 continue;
             }
+            let code = without_comment(line);
             let hit = NEEDLES.iter().any(|needle| {
-                line.match_indices(needle)
-                    .any(|(at, _)| at_word_start(line, at))
+                code.match_indices(needle)
+                    .any(|(at, _)| at_word_start(code, at))
             });
             if !hit {
                 continue;
@@ -9089,11 +9133,11 @@ mod tests {
             let body_end = (fn_index..lines.len())
                 .find(|i| lines[*i] == close || (*i == fn_index && fn_line.ends_with('}')))
                 .unwrap();
-            let body = lines[fn_index..=body_end]
+            let code_lines: Vec<&str> = lines[fn_index..=body_end]
                 .iter()
                 .map(|line| without_comment(line))
-                .collect::<Vec<_>>()
-                .join("\n");
+                .collect();
+            let body = without_debug_asserts(&code_lines).join("\n");
             let function = declared_fn(fn_line).unwrap().to_string();
             if readers.iter().any(|r| r.function == function) {
                 continue;
@@ -9147,6 +9191,41 @@ mod tests {
         assert!(!reader.gated);
     }
 
+    #[test]
+    fn a_debug_assert_on_the_tui_flag_is_no_gate() {
+        let readers = classify_readers(
+            "src/fixture.rs",
+            "fn fresh() {\n    debug_assert!(\n        !crate::tui::active(),\n        \"never under the UI\"\n    );\n    Select::new(\"q\", vec![]).prompt();\n}\n",
+        );
+        let [reader] = readers.as_slice() else {
+            panic!("{} readers", readers.len());
+        };
+        assert_eq!(reader.function, "fresh");
+        assert!(!reader.gated);
+    }
+
+    #[test]
+    fn a_needle_only_in_a_trailing_comment_is_no_reader() {
+        let readers = classify_readers(
+            "src/fixture.rs",
+            "fn fresh() {\n    let x = 1; // Select::new(\"q\", vec![]) used to live here\n}\n",
+        );
+        assert!(readers.is_empty(), "{} readers", readers.len());
+    }
+
+    #[test]
+    fn a_double_slash_inside_a_string_is_not_a_comment() {
+        let readers = classify_readers(
+            "src/fixture.rs",
+            "fn fresh() {\n    if url == \"http://x\" && crate::tui::active() {\n        return;\n    }\n    Select::new(\"q\", vec![]).prompt();\n}\n",
+        );
+        let [reader] = readers.as_slice() else {
+            panic!("{} readers", readers.len());
+        };
+        assert_eq!(reader.function, "fresh");
+        assert!(reader.gated);
+    }
+
     /// Every direct keyboard reader outside this module either checks the
     /// TUI flag or is listed here with the reason it stays REPL-only, so
     /// a new reader cannot appear without a decision about the TUI.
@@ -9178,6 +9257,7 @@ mod tests {
             ("src/client/common.rs", "select_model", BEFORE_UI),
             ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
             ("src/client/macros.rs", "create_client_config", BEFORE_UI),
+            ("src/config/mod.rs", "create_config_file", BEFORE_UI),
             ("src/config/mod.rs", "create_config_file_sandbox", BEFORE_UI),
             (
                 "src/config/request_context.rs",
