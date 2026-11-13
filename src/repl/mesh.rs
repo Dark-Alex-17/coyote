@@ -12620,13 +12620,21 @@ fn render_inbox(
                 width,
             ));
         }
+        // A reply this node sent into an awaited thread is not the answer it waits for.
+        let answered = match &row.sender {
+            InboxSender::Peer(_) => [message.in_reply_to.as_deref(), Some(message.thread())]
+                .into_iter()
+                .flatten()
+                .find(|id| awaiting_collect.iter().any(|waiting| waiting == id)),
+            InboxSender::ThisNode { .. } => None,
+        };
         if let Some(disposition) = message.disposition {
             lines.extend(indented_rows(
                 "disposition: ",
                 &format!(
                     "{} ({})",
                     disposition.wire_name(),
-                    disposition_clause(disposition, &row.sender)
+                    disposition_clause(disposition, &row.sender, answered.is_some())
                 ),
                 width,
             ));
@@ -12638,14 +12646,6 @@ fn render_inbox(
                 width,
             ));
         }
-        // A reply this node sent into an awaited thread is not the answer it waits for.
-        let answered = match &row.sender {
-            InboxSender::Peer(_) => [message.in_reply_to.as_deref(), Some(message.thread())]
-                .into_iter()
-                .flatten()
-                .find(|id| awaiting_collect.iter().any(|waiting| waiting == id)),
-            InboxSender::ThisNode { .. } => None,
-        };
         if let Some(id) = answered {
             lines.push(format!("  {AWAITING_THE_MODEL}"));
             unmatched.retain(|waiting| *waiting != id);
@@ -12725,20 +12725,26 @@ fn inbox_header(row: &InboxRow) -> String {
 }
 
 /// What a reply's disposition means for the reader, after its wire name: from the
-/// peer's side for a peer's reply, from this node's for its own copy of what the person
-/// sent with `.mesh envoy answer` or `.mesh envoy dismiss`, the only dispositions an own copy
-/// carries.
-fn disposition_clause(disposition: Disposition, sender: &InboxSender) -> &'static str {
-    match (sender, disposition) {
-        (InboxSender::ThisNode { .. }, Disposition::Answered) => {
+/// sending session's side for its reply, from this node's for its own copy of what the
+/// user sent with `.mesh envoy answer` or `.mesh envoy dismiss`, the only dispositions an
+/// own copy carries. Only a reply to a question this node still waits to collect
+/// (`awaited`) closes a question; one answering a message leaves nothing open.
+fn disposition_clause(
+    disposition: Disposition,
+    sender: &InboxSender,
+    awaited: bool,
+) -> &'static str {
+    match (sender, disposition, awaited) {
+        (InboxSender::ThisNode { .. }, Disposition::Answered, _) => {
             "you answered; the question is closed"
         }
-        (InboxSender::ThisNode { .. }, Disposition::Refused) => "you declined to answer",
-        (_, Disposition::Answered) => "the peer answered; the question is closed",
-        (_, Disposition::Escalated) => "the peer asked its human; the answer comes later",
-        (_, Disposition::Refused) => "the peer declined to answer",
-        (_, Disposition::BudgetExhausted) => {
-            "the peer's envoy is out of budget for you; wait before asking again"
+        (InboxSender::ThisNode { .. }, Disposition::Refused, _) => "you declined to answer",
+        (_, Disposition::Answered, true) => "the session answered; the question is closed",
+        (_, Disposition::Answered, false) => "the session answered; nothing is left open",
+        (_, Disposition::Escalated, _) => "the session asked its user; the answer comes later",
+        (_, Disposition::Refused, _) => "the session declined to answer",
+        (_, Disposition::BudgetExhausted, _) => {
+            "the session's envoy is out of budget for you; wait before asking again"
         }
     }
 }
@@ -16980,6 +16986,9 @@ mod tests {
         escalated.disposition = Some(Disposition::Escalated);
         let mut answered = message(PeerKind::Reply, "yes", Some(&"77".repeat(16)));
         answered.disposition = Some(Disposition::Answered);
+        let awaited_id = "88".repeat(16);
+        let mut awaited = message(PeerKind::Reply, "merged", Some(&awaited_id));
+        awaited.disposition = Some(Disposition::Answered);
         let plain = message(PeerKind::Message, "hi", None);
 
         let text = render_inbox(
@@ -16987,20 +16996,21 @@ mod tests {
                 inbox_row(refused),
                 inbox_row(escalated),
                 inbox_row(answered),
+                inbox_row(awaited),
                 inbox_row(plain),
             ],
-            &[],
+            &[awaited_id],
             200,
             false,
         );
 
         let blocks: Vec<&str> = text.split("\n\n").collect();
-        assert_eq!(blocks.len(), 4, "{text}");
+        assert_eq!(blocks.len(), 5, "{text}");
         assert_eq!(
             indented_lines(blocks[0]),
             [
                 "not now",
-                "disposition: budget_exhausted (the peer's envoy is out of budget for you; wait before asking again)",
+                "disposition: budget_exhausted (the session's envoy is out of budget for you; wait before asking again)",
                 "retry after: 90 s",
             ],
             "{text}"
@@ -17009,7 +17019,7 @@ mod tests {
             indented_lines(blocks[1]),
             [
                 "asking",
-                "disposition: escalated (the peer asked its human; the answer comes later)",
+                "disposition: escalated (the session asked its user; the answer comes later)",
             ],
             "{text}"
         );
@@ -17017,12 +17027,21 @@ mod tests {
             indented_lines(blocks[2]),
             [
                 "yes",
-                "disposition: answered (the peer answered; the question is closed)",
+                "disposition: answered (the session answered; nothing is left open)",
             ],
-            "the peer's human answers with `.mesh envoy answer` too, so no clause names its envoy: {text}"
+            "the other user answers with `.mesh envoy answer` too, so no clause names its envoy, and a reply nothing waits to collect closes no question: {text}"
         );
-        assert_eq!(indented_lines(blocks[3]), ["hi"], "{text}");
-        assert!(!blocks[3].contains("disposition"), "{text}");
+        assert_eq!(
+            indented_lines(blocks[3]),
+            [
+                "merged",
+                "disposition: answered (the session answered; the question is closed)",
+                AWAITING_THE_MODEL,
+            ],
+            "{text}"
+        );
+        assert_eq!(indented_lines(blocks[4]), ["hi"], "{text}");
+        assert!(!blocks[4].contains("disposition"), "{text}");
     }
 
     /// A text part runs to the content cap, a file name with spaces legal to a few
@@ -51598,8 +51617,8 @@ mod tests {
                         assert_eq!(
                             peer_rows,
                             [
-                                "  disposition: answered (the peer answered; the question is closed)",
-                                "  disposition: refused (the peer declined to answer)",
+                                "  disposition: answered (the session answered; the question is closed)",
+                                "  disposition: refused (the session declined to answer)",
                             ],
                             "a peer's replies keep the peer-side clauses: {out}"
                         );

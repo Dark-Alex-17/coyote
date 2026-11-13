@@ -8231,7 +8231,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     );
     let clauses = fn_body("src/repl/mesh.rs", "disposition_clause");
     let own_clause = |disposition: &str| -> String {
-        let arm = format!("(InboxSender::ThisNode {{ .. }}, Disposition::{disposition})");
+        let arm = format!("(InboxSender::ThisNode {{ .. }}, Disposition::{disposition}, _)");
         let at = clauses
             .find(&arm)
             .unwrap_or_else(|| panic!("disposition_clause has no arm {arm}:\n{clauses}"));
