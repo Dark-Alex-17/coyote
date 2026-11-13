@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
@@ -239,11 +239,16 @@ pub fn run_ttyless_status(binary: &Path, dir: &Path, args: &[&str]) -> ExitStatu
         .unwrap()
 }
 
-/// Runs the binary with no terminal at all and returns its `Output`,
-/// both streams and the status, for a check that needs the exact exit
-/// code (a clap usage error is 2) rather than success or failure.
-pub fn run_ttyless_output(binary: &Path, dir: &Path, args: &[&str]) -> Output {
-    ttyless_command(binary, dir).args(args).output().unwrap()
+/// [`run_ttyless_binary`] returning the exit status itself, for a check
+/// that needs the exact exit code (a clap usage error is 2) rather than
+/// success or failure.
+pub fn run_ttyless_output(
+    binary: &Path,
+    dir: &Path,
+    args: &[&str],
+    what: &str,
+) -> (ExitStatus, String) {
+    run_ttyless_until_exit(binary, dir, args, &[], what)
 }
 
 /// Runs the binary with no terminal at all (detached, stdin /dev/null,
@@ -262,13 +267,6 @@ pub fn run_ttyless_binary(binary: &Path, dir: &Path, args: &[&str], what: &str) 
 /// [`run_ttyless_binary`] with `extra_env` added to the shared
 /// environment (a log path, a level) for a test that reads back what a
 /// silent run recorded.
-/// Both pipes are drained on their own threads while the child runs, so
-/// a chatty child cannot block on a full pipe and be mistaken for a hang;
-/// a child that is still running at the deadline is killed, reaped and
-/// reported with whatever it had written by then. Either way anything
-/// the child spawned is killed with it, so a detached grandchild cannot
-/// hold the pipes open and stall the readers; the group is killed before
-/// the child is reaped, while its pid still names that group.
 pub fn run_ttyless_with_env(
     binary: &Path,
     dir: &Path,
@@ -276,6 +274,24 @@ pub fn run_ttyless_with_env(
     extra_env: &[(&str, &str)],
     what: &str,
 ) -> (bool, String) {
+    let (status, out) = run_ttyless_until_exit(binary, dir, args, extra_env, what);
+    (status.success(), out)
+}
+
+/// Both pipes are drained on their own threads while the child runs, so
+/// a chatty child cannot block on a full pipe and be mistaken for a hang;
+/// a child that is still running at the deadline is killed, reaped and
+/// reported with whatever it had written by then. Either way anything
+/// the child spawned is killed with it, so a detached grandchild cannot
+/// hold the pipes open and stall the readers; the group is killed before
+/// the child is reaped, while its pid still names that group.
+fn run_ttyless_until_exit(
+    binary: &Path,
+    dir: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    what: &str,
+) -> (ExitStatus, String) {
     assert_env_stays_under_dir(extra_env);
     let mut cmd = ttyless_command(binary, dir);
     cmd.args(args)
@@ -305,10 +321,7 @@ pub fn run_ttyless_with_env(
     }
     kill_process_group(child.id());
     let status = child.wait().unwrap();
-    (
-        status.success(),
-        both_streams_within(stdout, stderr, PTY_DEADLINE),
-    )
+    (status, both_streams_within(stdout, stderr, PTY_DEADLINE))
 }
 
 /// Whether our child `pid` has exited and is still waiting to be reaped.
@@ -931,6 +944,9 @@ pub fn refusal_shape(out: &str) -> Option<(String, String)> {
         ))
     })
 }
+
+/// The remedy a `coyote --install` refusal ends with.
+pub const CLI_INSTALL_REMEDY: &str = ", with --install-force (installs), or with --yes (updates).";
 
 /// Whether an SGR sequence sets a foreground, background or underline
 /// colour (the 16 named colours, their bright twins, or a 38/48/58

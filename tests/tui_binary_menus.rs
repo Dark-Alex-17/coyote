@@ -2718,10 +2718,10 @@ fn piped_answer(text: &str) -> String {
 /// bundle whose roles conflict with local files, once from `/dev/null`
 /// and once fed `replace-all` on a pipe, all with a terminal on stdout:
 /// each refuses in the shared shape (the secret with nothing but a
-/// terminal as the remedy, the install naming `--install-force`), exits
-/// non-zero, paints neither the secret prompt nor a conflict row, leaves
-/// the piped answer unconsumed (the local roles keep their text) and
-/// writes no vault file.
+/// terminal as the remedy, the install with the CLI remedy word for word),
+/// exits non-zero, paints neither the secret prompt nor a conflict row,
+/// leaves the piped answer unconsumed (the local roles keep their text)
+/// and writes no vault file.
 #[test]
 #[serial]
 fn cli_menus_with_a_tty_on_stdout_but_a_piped_stdin_refuse_without_reading_the_pipe() {
@@ -2776,9 +2776,9 @@ fn cli_menus_with_a_tty_on_stdout_but_a_piped_stdin_refuse_without_reading_the_p
             action.starts_with("overwrite local file "),
             "{what}: the refusal names the action {action:?}:\n{plain}"
         );
-        assert!(
-            remedy.contains("--install-force"),
-            "{what}: the remedy does not name `--install-force`:\n{plain}"
+        assert_eq!(
+            remedy, CLI_INSTALL_REMEDY,
+            "{what}: the remedy is not word for word the documented one:\n{plain}"
         );
         for row in ["keep-all", "replace-all", "abort"] {
             assert!(
@@ -3734,14 +3734,9 @@ fn install_builtins_help_sentence_and_the_clap_errors_around_install_with_yes() 
             vec!["--install-builtins", "x", "--yes"],
         ),
     ] {
-        let output = run_ttyless_output(built_binary(), &dir, &args);
-        let out = format!(
-            "--- stdout ---\n{}\n--- stderr ---\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let (status, out) = run_ttyless_output(built_binary(), &dir, &args, what);
         assert_eq!(
-            output.status.code(),
+            status.code(),
             Some(2),
             "{what} is not a clap usage error (exit 2):\n{out}"
         );
@@ -4255,8 +4250,6 @@ mod cold_start {
 // first-run provider wizard.
 // ---------------------------------------------------------------------
 
-/// The remedy a `coyote --install` refusal ends with.
-const CLI_INSTALL_REMEDY: &str = ", with --install-force (installs), or with --yes (updates).";
 /// The remedy a `.install` refusal in the plain REPL ends with.
 const REPL_INSTALL_REMEDY: &str = ", with --force (installs).";
 

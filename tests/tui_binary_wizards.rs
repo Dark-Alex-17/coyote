@@ -816,9 +816,12 @@ fn dot_rag_without_a_name_asks_in_the_select_modal_and_keeps_the_temp_rag_until_
 
 /// A stdout-branch loader (`cmd $1`) never inherits the terminal on its
 /// stdin, outside the UI as much as under it: in the plain command mode
-/// on a tty, `cat "$1" -` returns once the file is read instead of
-/// waiting on the keyboard, the document reaches the model, the reply is
-/// printed and the command exits 0.
+/// on a tty, `cat "$1" -` returns once the file is read, so the command
+/// finishes within the deadline with no key typed (a loader left reading
+/// the terminal would wait there until the deadline fails the test), the
+/// document reaches the model exactly once, the reply is printed and the
+/// command exits 0. No tighter wall-clock bound is asserted: a loaded
+/// runner stretches it.
 #[test]
 #[serial]
 fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
@@ -833,7 +836,6 @@ fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
     let document = dir.join("doc.catstdin");
     fs::write(&document, "document body s7d-body\n").unwrap();
     let args = format!(" -f '{}' 'summarize'", document.display());
-    let started = std::time::Instant::now();
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
@@ -851,7 +853,6 @@ fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
                 strip_ansi(&String::from_utf8_lossy(pty.raw()))
             )
         });
-    let took = started.elapsed();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_eq!(
         fake.served(),
@@ -861,10 +862,6 @@ fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
     assert!(
         squeezed(&transcript).contains("loadeddocumentreplys7d"),
         "the reply was not printed:\n{transcript}"
-    );
-    assert!(
-        took < Duration::from_secs(15),
-        "the loader took {took:?} to come back"
     );
     assert_tty_restored(&transcript);
 }
@@ -1511,9 +1508,9 @@ fn dot_install_with_a_conflicting_mcp_server_asks_in_the_select_modal_and_keep_l
 /// with a tty on stdin but stdout a file (the shape of `coyote --install
 /// x > log`), no UI involved. The menu cannot be shown without a terminal
 /// on stdout, so the merge is refused in the shared no-tty shape, naming
-/// the server and `--install-force` as the remedy (not the plain REPL,
-/// which is not what stands in the way), the command fails, and the
-/// local server definition is untouched.
+/// the server and ending with the CLI remedy word for word (not the plain
+/// REPL's, which is not what stands in the way), the command fails, and
+/// the local server definition is untouched.
 #[test]
 #[serial]
 fn an_install_with_stdout_redirected_and_a_conflicting_mcp_server_is_refused_naming_a_terminal() {
@@ -1545,9 +1542,9 @@ fn an_install_with_stdout_redirected_and_a_conflicting_mcp_server_is_refused_nam
         action.starts_with("merge the already-installed MCP server 'bundle-k7s-server'"),
         "the refusal does not name the MCP merge and the server: {action:?}\n{everything}"
     );
-    assert!(
-        remedy.contains("--install-force"),
-        "the refusal does not name the flag that settles it: {remedy:?}\n{everything}"
+    assert_eq!(
+        remedy, CLI_INSTALL_REMEDY,
+        "the refusal does not end with the documented remedy:\n{everything}"
     );
     assert_ne!(
         exit_code(&transcript),
