@@ -2667,7 +2667,7 @@ impl FirstContactMiss {
 
 pub(crate) fn unanswered_path_request(destination: &str) -> String {
     format!(
-        "{} did not answer a path request within {} s: it is not on any interface you joined, or it is not announcing (a relay that restarted has no path to it until it announces again). Check the hash, or wait for its announce (`.mesh people list`).",
+        "Session {} did not answer within {} s: it may not be running, it may be on a network you have not joined, or it may not have announced itself yet (after a relay restart nothing can reach it until it does). Check the hash, or wait until it shows in `.mesh people list`.",
         short(destination),
         PATH_REQUEST_TIMEOUT.as_secs()
     )
@@ -2675,7 +2675,7 @@ pub(crate) fn unanswered_path_request(destination: &str) -> String {
 
 pub(crate) fn answered_not_as_coyote(destination: &str) -> String {
     format!(
-        "{} answered, but not as a Coyote node; check the hash.",
+        "Session {} answered, but it is not a Coyote session; check the hash.",
         short(destination)
     )
 }

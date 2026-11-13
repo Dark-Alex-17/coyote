@@ -4391,14 +4391,14 @@ mod first_contact_wiki_pins {
         let unanswered = literal_with(
             "src/mesh/message.rs unanswered_path_request",
             &fn_body("src/mesh/message.rs", "unanswered_path_request"),
-            "did not answer a path request",
+            " did not answer within ",
         )
         .replacen("{}", "<dest8>", 1)
         .replacen("{}", &secs, 1);
         let not_coyote = literal_with(
             "src/mesh/message.rs answered_not_as_coyote",
             &fn_body("src/mesh/message.rs", "answered_not_as_coyote"),
-            "not as a Coyote node",
+            "it is not a Coyote session",
         )
         .replacen("{}", "<dest8>", 1);
         [waiting, unanswered, not_coyote]
