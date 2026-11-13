@@ -5,7 +5,7 @@ use crate::mesh::request::dispatch::{
 };
 use crate::mesh::request::error::{RefusalCode, RequestError};
 use crate::mesh::request::frame::Envelope;
-use crate::mesh::request::short;
+use crate::mesh::request::{redact_hashes, short};
 
 use rmpv::Value;
 use rns_transport::delivery::await_link_activation;
@@ -420,8 +420,9 @@ async fn close_if_never_activated(
         ),
         Ok(None) => {}
         Err(err) => debug!(
-            "Mesh could not close the unactivated link to destination {}: {err}",
-            short(destination_hex)
+            "Mesh could not close the unactivated link to destination {}: {}",
+            short(destination_hex),
+            redact_hashes(&err.to_string())
         ),
     }
 }
