@@ -4308,3 +4308,67 @@ fn auth_mcp_on_a_terminal_with_stdin_from_dev_null_is_refused_with_the_oauth_sen
         assert_tty_restored(&plain);
     }
 }
+
+// ---------------------------------------------------------------------
+// `--authenticate` for a client whose sign-in ends in pasting a code,
+// typed at a terminal with stdin piped.
+// ---------------------------------------------------------------------
+
+/// A Claude client signing in with OAuth: its redirect is the provider's
+/// own page, so the sign-in ends with the user pasting the code back.
+const PASTE_FLOW_CLIENT: &str = "\x20 - type: claude\n\
+    \x20   name: claude-paste-k4\n\
+    \x20   auth: oauth\n\
+    save_session: false\n";
+
+/// The exact refusal for that client when nobody can paste the code.
+const PASTE_FLOW_REFUSAL: &str =
+    "Refusing to sign in to 'claude-paste-k4' with OAuth non-interactively. Re-run in a terminal.";
+
+/// `printf code | coyote --authenticate claude-paste-k4` typed at a
+/// terminal (stdout a tty, stdin a pipe), in both interfaces: refused
+/// with the OAuth sentence before the authorize URL is printed (and so
+/// before a browser could be opened for it), exit non-zero, no alternate
+/// screen, tty cooked.
+#[test]
+#[serial]
+fn authenticate_a_paste_flow_client_with_stdin_piped_is_refused_before_printing_the_url() {
+    let piped = WAIT_WRAPPER.replace(
+        "'{coyote}'{args} <{stdin}",
+        "printf 'abc#def\\n' | '{coyote}'{args}",
+    );
+    for ui in ["repl", "tui"] {
+        let dir = fresh_config_dir(&format!("authenticate-paste-piped-{ui}"));
+        let _guard = TempDirGuard(dir.clone());
+        write_config(&dir, PASTE_FLOW_CLIENT);
+        let mut pty = spawn_binary_under(
+            built_binary(),
+            &dir,
+            &[("COYOTE_UI", ui)],
+            &piped,
+            "/dev/null",
+            " --authenticate claude-paste-k4",
+        );
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        let plain = strip_ansi(&transcript);
+        assert!(
+            plain
+                .lines()
+                .any(|line| line.trim().trim_start_matches("Error: ") == PASTE_FLOW_REFUSAL),
+            "[{ui}] the piped paste-flow `--authenticate` is not refused with the exact \
+             sentence:\n{plain}"
+        );
+        assert_ne!(exit_code(&plain), 0, "[{ui}] {plain}");
+        assert!(
+            !plain.contains("Open this URL")
+                && !plain.contains("oauth/authorize")
+                && !plain.contains("Paste the authorization code"),
+            "[{ui}] the refused `--authenticate` printed the sign-in URL or asked anyway:\n{plain}"
+        );
+        assert!(
+            find(pty.raw(), ENTER_ALT, 0).is_none(),
+            "[{ui}] the refused `--authenticate` entered the alternate screen:\n{plain}"
+        );
+        assert_tty_restored(&plain);
+    }
+}

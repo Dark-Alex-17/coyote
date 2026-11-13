@@ -1837,3 +1837,194 @@ fn dot_rag_for_a_new_rag_in_the_plain_repl_asks_with_inquire_and_esc_writes_noth
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
+
+// ---------------------------------------------------------------------
+// What the bash `list` helper hands back for the three kinds of typed
+// answer: text that looks like an index, the exact text of an offered
+// entry, and a blank answer; and the Python `select` for a blank one.
+// ---------------------------------------------------------------------
+
+/// Opens the custom row of the recording list tool under the UI, types
+/// `typed` there, submits it and returns the recorded answer and status.
+fn list_custom_answer_under_the_ui(scenario: &str, typed: &[u8]) -> (String, String, String) {
+    let dir = fresh_config_dir(scenario);
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = list_tool_turn(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let asked_at = pty.raw().len();
+    pty.send(b"call the list tool\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        asked_at,
+        "the list tool",
+        &["q7l-q", "alpha-q7l", "gamma-q7l", "Other (custom)"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    for _ in 0..3 {
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+    pty.send(b"\r").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(typed).unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+    assert_eq!(fake.served(), 2, "{transcript}");
+    let answer = fs::read_to_string(&out).unwrap();
+    let status = list_exit_status(&out);
+
+    pty.send(b"\x04").unwrap();
+    let end = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&end), 0, "{end}");
+    assert_tty_restored(&end);
+    (answer, status, transcript)
+}
+
+/// A typed `1` on the custom row is the user's own text, not index 1: the
+/// helper prints `1` and exits 2, so the tool can tell it from a pick.
+#[test]
+#[serial]
+fn a_typed_one_on_the_lists_custom_row_reaches_the_tool_as_text_with_status_two() {
+    let (answer, status, transcript) = list_custom_answer_under_the_ui("tool-list-typed-one", b"1");
+    assert_eq!(answer, "1", "{transcript}");
+    assert_eq!(
+        status, "2",
+        "a typed `1` was taken for index 1 (status 0) instead of custom text:\n{transcript}"
+    );
+}
+
+/// Typing an offered entry's exact text counts as choosing it: the helper
+/// prints that entry's index and exits 0.
+#[test]
+#[serial]
+fn typing_an_offered_entrys_exact_text_on_the_custom_row_chooses_that_entry() {
+    let (answer, status, transcript) =
+        list_custom_answer_under_the_ui("tool-list-typed-entry", b"beta-q7l");
+    assert_eq!(
+        answer, "1",
+        "the exact text of the second entry did not come back as its index:\n{transcript}"
+    );
+    assert_eq!(status, "0", "{transcript}");
+}
+
+/// A whitespace-only answer on the custom row is a cancel: the helper
+/// prints nothing and exits 1.
+#[test]
+#[serial]
+fn a_blank_answer_on_the_lists_custom_row_cancels_with_status_one() {
+    let (answer, status, transcript) =
+        list_custom_answer_under_the_ui("tool-list-typed-blank", b"   ");
+    assert_eq!(
+        answer, "cancelled",
+        "a blank custom answer printed something:\n{transcript}"
+    );
+    assert_eq!(
+        status, "1",
+        "a blank custom answer did not cancel with status 1:\n{transcript}"
+    );
+}
+
+/// The same blank answer in the plain REPL's `Custom response:` prompt
+/// cancels the same way.
+#[test]
+#[serial]
+fn a_blank_custom_response_in_the_plain_repl_cancels_the_list_with_status_one() {
+    let dir = fresh_config_dir("tool-list-repl-blank");
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = list_tool_turn(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let asked_at = pty.raw().len();
+    pty.send(b"call the list tool\r").unwrap();
+    pty.wait_for_after("Other (custom)", asked_at, PTY_DEADLINE)
+        .expect("the tool's list question never offered the custom row");
+    pty.read_for(Duration::from_millis(500));
+    for _ in 0..3 {
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+    }
+    let custom_at = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    pty.wait_for_after("Custom response:", custom_at, PTY_DEADLINE)
+        .expect("Enter on `Other (custom)` did not open the `Custom response:` prompt");
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"  ").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "cancelled",
+        "{transcript}"
+    );
+    assert_eq!(
+        list_exit_status(&out),
+        "1",
+        "a blank `Custom response:` did not cancel with status 1:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The Python helper's `select` returns `None` for a blank custom answer.
+#[test]
+#[serial]
+fn a_python_tools_select_returns_none_for_a_blank_custom_answer() {
+    let dir = fresh_config_dir("tool-py-select-blank");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("py-select-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_py_select".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture done p5y".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_py_select.py", RECORDING_PY_SELECT_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let asked_at = pty.raw().len();
+    pty.send(b"call the python select tool\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        asked_at,
+        "the python select tool",
+        &["p5y-q", "alpha-p5y", "beta-p5y", "Other (custom)"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    for _ in 0..2 {
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+    pty.send(b"\r").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"   ").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the python tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done p5y", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "NoneType:None",
+        "the Python `select` did not return None for a blank custom answer:\n{transcript}"
+    );
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
