@@ -10723,6 +10723,7 @@ pub(crate) mod network {
             request_timeout: Duration::from_secs(MAX_TIMEOUT_SECS),
             link_timeout: Duration::from_secs(MAX_TIMEOUT_SECS),
             path_requested: false,
+            foreground: false,
         };
         assert_eq!(
             pair.node_a.requests_made(),
@@ -12710,6 +12711,7 @@ pub(crate) mod network {
                 request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
                 link_timeout: PEER_LINK_TIMEOUT,
                 path_requested: false,
+                foreground: false,
             },
         )
         .await
@@ -12756,6 +12758,7 @@ pub(crate) mod network {
                     request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
                     link_timeout: PEER_LINK_TIMEOUT,
                     path_requested: false,
+                    foreground: false,
                 },
             )
         };

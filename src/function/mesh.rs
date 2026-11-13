@@ -1135,6 +1135,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
             request_timeout: STATUS_REQUEST_TIMEOUT,
             link_timeout: STATUS_REQUEST_TIMEOUT,
             path_requested: false,
+            foreground: false,
         };
         let permits = runtime.card_cadence().status_permits();
         let cards: Vec<_> = stream::iter(status_lookups)
@@ -7623,6 +7624,7 @@ mod tests {
                 request_timeout: Duration::from_secs(5),
                 link_timeout: Duration::from_secs(5),
                 path_requested: false,
+                foreground: false,
             };
             assert_eq!(
                 runtime.requests_made(),

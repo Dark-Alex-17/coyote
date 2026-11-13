@@ -133,6 +133,11 @@ const POST_STOP_GRACE: Duration = Duration::from_secs(2);
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
+/// How long a request the user typed waits on the path request sent to a peer that had
+/// gone and left no path, capped by the request's link timeout. A peer that is back
+/// answers within a second or so, and a typed command should not fail for want of a
+/// path that arrives just after.
+const GONE_PATH_GRACE: Duration = Duration::from_secs(2);
 /// Depth of the channel a `local` rnsd's shared-instance client reports its connection
 /// state on; the client drops an event when it is full. A client failing its dial sends
 /// one event every `LOCAL_RECONNECT_WAIT`, so 64 slots outlast the start's later joins and
@@ -229,6 +234,7 @@ impl Default for KnockOptions {
                 request_timeout: KNOCK_REQUEST_TIMEOUT,
                 link_timeout: KNOCK_LINK_TIMEOUT,
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
         }
@@ -265,6 +271,7 @@ impl RequestTimeouts {
                 configured.max(defaults.link_timeout)
             }),
             path_requested: defaults.path_requested,
+            foreground: defaults.foreground,
         }
     }
 }
@@ -1543,11 +1550,11 @@ impl MeshRuntime {
         }
     }
 
-    /// `send_peer` for a message the human attached a file to: a file carried by
-    /// reference is first lent to the peer as a one-off grant under the message's id, so
-    /// the peer may fetch it once within the default TTL. A send that then fails takes
-    /// the grant back: the peer never heard of the file. A message with no reference
-    /// part is sent as it is.
+    /// `send_peer_foreground` for a message the human typed, which may carry a file they
+    /// attached: a file carried by reference is first lent to the peer as a one-off grant
+    /// under the message's id, so the peer may fetch it once within the default TTL. A
+    /// send that then fails takes the grant back: the peer never heard of the file. A
+    /// message with no reference part is sent as it is.
     pub(crate) async fn send_peer_lending_reference(
         &self,
         destination_hex: &str,
@@ -1574,7 +1581,7 @@ impl MeshRuntime {
                 SystemTime::now(),
             )?;
         }
-        match self.send_peer(destination_hex, message).await {
+        match self.send_peer_foreground(destination_hex, message).await {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
                 if !references.is_empty()
@@ -1830,8 +1837,11 @@ impl MeshRuntime {
     /// peer that refuses this node's version over the wire is marked so the next request is
     /// refused here. A link that could not be opened marks the peer's row `no route` until
     /// a link comes up or it announces again; while marked, the request still runs when the
-    /// transport holds a path but never waits on a path request for it. One is still sent
-    /// when no path is held, so a peer that is back can be reached on the next attempt.
+    /// transport holds a path. When none is held a path request is sent. A background
+    /// request does not wait on it and fails at once, so a peer that is back is reached on
+    /// the next attempt. A foreground request, one the user typed, waits on it for up to
+    /// `GONE_PATH_GRACE` (never past its link timeout), fails only if no path arrives in
+    /// that time, and otherwise links once over the path that came back.
     async fn request_envelope(
         &self,
         destination: &DestinationDesc,
@@ -1861,13 +1871,27 @@ impl MeshRuntime {
                 .get(&dest_hex)
                 .is_some_and(|row| row.left_at.is_some());
         if gone && !transport.has_path(&destination.address_hash).await {
-            debug!(
-                "Mesh asked the network for a path to {} without waiting: its last link failed or it said it left, and it has not linked or announced since",
-                short(&dest_hex)
-            );
             transport
                 .request_path(&destination.address_hash, None, None)
                 .await;
+            if options.foreground {
+                let wait = GONE_PATH_GRACE.min(options.link_timeout);
+                let found = tokio::select! {
+                    () = self.cancel.cancelled() => return Err(RequestError::Shutdown),
+                    found = transport.await_path(&destination.address_hash, wait, None) => found,
+                };
+                debug!(
+                    "Mesh asked the network for a path to {}, whose last link failed or which said it left, and {} within {:.1} s",
+                    short(&dest_hex),
+                    if found { "heard one" } else { "heard none" },
+                    wait.as_secs_f64()
+                );
+            } else {
+                debug!(
+                    "Mesh asked the network for a path to {} without waiting: its last link failed or it said it left, and it has not linked or announced since",
+                    short(&dest_hex)
+                );
+            }
         }
         let options = RequestOptions {
             path_requested: options.path_requested || gone,
@@ -6930,6 +6954,7 @@ mod no_answer_tests {
                 request_timeout: Duration::from_secs(2),
                 link_timeout: Duration::from_secs(2),
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
         };
@@ -7028,6 +7053,7 @@ mod tests {
             request_timeout: PEER_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
             path_requested: false,
+            foreground: false,
         };
         let access = AccessOptions::default().request;
         let status = RequestOptions::default();
@@ -7093,6 +7119,7 @@ mod tests {
                     request_timeout: Duration::from_secs(90),
                     link_timeout: Duration::from_secs(45),
                     path_requested: false,
+                    foreground: false,
                 }
             );
         }
@@ -13857,6 +13884,67 @@ mod tests {
         assert!(slot.stop().await.unwrap());
     }
 
+    /// The same held peer, marked gone by a failed link while it answers path requests:
+    /// a foreground request waits on the path request it sends, so the session that is
+    /// back is reached on the request the user typed. A background request in the same
+    /// setup sends the path request without waiting and fails at once, as before.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gone_session_that_answers_the_path_request_is_reached_on_the_same_foreground_request()
+     {
+        let message = OutboundPeer::new(PeerKind::Message, "back again", None, None, None).unwrap();
+
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-gone-foreground").await;
+        let runtime = started.runtime.clone();
+        runtime.peers().mark_link_failed(&stub.destination_hex());
+        let foreground = RequestOptions {
+            foreground: true,
+            ..RequestOptions::default()
+        };
+        let reply = runtime
+            .request(
+                &desc,
+                MESSAGE_PATH,
+                to_request_body(&message, unix_now()),
+                foreground,
+            )
+            .await;
+        assert!(
+            matches!(&reply, Ok(reply) if is_received_reply(reply, &message.id)),
+            "{reply:?}"
+        );
+        assert_eq!(stub.seen().len(), 1);
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-gone-background").await;
+        let runtime = started.runtime.clone();
+        runtime.peers().mark_link_failed(&stub.destination_hex());
+        let asked = Instant::now();
+        let result = runtime
+            .request(
+                &desc,
+                MESSAGE_PATH,
+                to_request_body(&message, unix_now()),
+                RequestOptions::default(),
+            )
+            .await;
+        let waited = asked.elapsed();
+        assert!(
+            matches!(&result, Err(RequestError::LinkNotOpened(reason)) if reason.contains("no known path")),
+            "{result:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(1),
+            "a background request does not wait on the path request: {waited:?}"
+        );
+        assert!(stub.seen().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
     /// After a restart the runtime has heard no announce, so its transport holds neither
     /// the peer's description nor a path, and the key the peer table kept is what resolves
     /// it. The one path request the resolve sends is answered by the peer, and the
@@ -16060,6 +16148,7 @@ mod tests {
                     request_timeout: Duration::from_millis(500),
                     link_timeout: Duration::from_millis(500),
                     path_requested: false,
+                    foreground: false,
                 },
                 propagation: crate::mesh::propagation::PropagationOptions::default(),
                 store_and_forward: false,
@@ -22926,6 +23015,7 @@ mod tests {
         request_timeout: Duration::from_secs(90),
         link_timeout: Duration::from_secs(45),
         path_requested: false,
+        foreground: false,
     };
 
     /// With both timers unset every path hands the client its own constants: 15 s / 10 s
@@ -22950,6 +23040,7 @@ mod tests {
             request_timeout: Duration::from_secs(15),
             link_timeout: Duration::from_secs(10),
             path_requested: false,
+            foreground: false,
         };
         assert_eq!(
             runtime.requests_made(),
@@ -22964,6 +23055,7 @@ mod tests {
                         request_timeout: Duration::from_secs(30),
                         link_timeout: Duration::from_secs(10),
                         path_requested: false,
+                        foreground: false,
                     }
                 ),
                 (
@@ -22972,6 +23064,7 @@ mod tests {
                         request_timeout: Duration::from_secs(120),
                         link_timeout: Duration::from_secs(10),
                         path_requested: false,
+                        foreground: false,
                     }
                 ),
             ]
@@ -22990,6 +23083,7 @@ mod tests {
         let asked = Route {
             desc,
             path_requested: true,
+            foreground: false,
         };
         let paths = [KNOCK_PATH, LIST_PATH, ACCESS_PATH, STATUS_PATH, FETCH_PATH];
         for path in paths {
@@ -23074,6 +23168,7 @@ mod tests {
                 request_timeout: Duration::from_secs(20),
                 link_timeout: Duration::from_secs(10),
                 path_requested: false,
+                foreground: false,
             }
         );
         assert_eq!(
@@ -23082,6 +23177,7 @@ mod tests {
                 request_timeout: Duration::from_secs(30),
                 link_timeout: Duration::from_secs(10),
                 path_requested: false,
+                foreground: false,
             }
         );
         assert_eq!(
@@ -23090,6 +23186,7 @@ mod tests {
                 request_timeout: Duration::from_secs(20),
                 link_timeout: Duration::from_secs(10),
                 path_requested: false,
+                foreground: false,
             }
         );
     }
@@ -23105,6 +23202,7 @@ mod tests {
                 request_timeout: Duration::from_secs(120),
                 link_timeout: Duration::from_secs(10),
                 path_requested: false,
+                foreground: false,
             }
         );
     }
@@ -23124,6 +23222,7 @@ mod tests {
             request_timeout: Duration::from_secs(5),
             link_timeout: Duration::from_secs(5),
             path_requested: false,
+            foreground: false,
         };
 
         runtime.request_status_with(&desc, sweep).await.unwrap_err();

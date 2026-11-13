@@ -2763,7 +2763,8 @@ enum Unrouted {
 /// taken at once; otherwise the user is told the network is being asked, since the wait
 /// runs up to `PATH_REQUEST_TIMEOUT` and Ctrl-C ends it like the request that follows. A
 /// held description whose path expired is returned at once too, but the request's link
-/// asks for the path, so the same line is printed before that wait.
+/// asks for the path, so the same line is printed before that wait. Every route is a
+/// foreground one, since each verb that links over it is a command the user typed.
 async fn route_to(
     runtime: &MeshRuntime,
     destination: &str,
@@ -2777,7 +2778,7 @@ async fn route_to(
             out_text(&route_request_line(destination));
             result_follows();
         }
-        return Ok(Route::unasked(desc));
+        return Ok(Route::unasked(desc).foreground());
     }
     let key_held = runtime
         .peers()
@@ -2789,7 +2790,9 @@ async fn route_to(
         result_follows();
     }
     tokio::select! {
-        resolved = runtime.resolve_route(destination) => resolved.ok_or(Unrouted::NoAnswer),
+        resolved = runtime.resolve_route(destination) => {
+            resolved.map(Route::foreground).ok_or(Unrouted::NoAnswer)
+        }
         _ = wait_user_interrupt(Some(abort_signal)) => Err(Unrouted::Interrupted),
     }
 }
@@ -36828,8 +36831,10 @@ mod tests {
             }
 
             /// A trusted peer whose last link failed and whose path expired, with a
-            /// propagation node known: `.mesh messaging send` and mesh__send go to the node with
-            /// no path wait, and say the peer has no route and that the node holds it.
+            /// propagation node known: `.mesh messaging send` and mesh__send go to the node
+            /// and say the peer has no route and that the node holds it. Neither waits a
+            /// full path request: the typed send waits only its short grace on the path,
+            /// and mesh__send does not wait at all.
             #[test]
             #[serial]
             fn a_send_to_a_peer_with_no_route_and_no_path_is_held_without_a_wait() {
@@ -36869,6 +36874,12 @@ mod tests {
                     );
                     assert!(!out.contains(&route_request_line(&peer)), "{out}");
                     pn.next_received().await;
+                    assert!(
+                        started_at.elapsed() < PATH_REQUEST_TIMEOUT,
+                        "the typed send waited a full path request: {:?}",
+                        started_at.elapsed()
+                    );
+                    let started_at = std::time::Instant::now();
 
                     let result = handle_mesh_tool(
                         &mut ctx,

@@ -34,11 +34,14 @@ const UNACTIVATED_LINK_CLOSE_WAIT: Duration = Duration::from_secs(1);
 
 /// `path_requested` says the caller already sent a path request for the destination
 /// during this request, so a link that finds no path fails without asking again.
+/// `foreground` marks a request the user typed, which waits briefly on the path to a
+/// peer that had gone rather than failing at once as a background request does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestOptions {
     pub request_timeout: Duration,
     pub link_timeout: Duration,
     pub path_requested: bool,
+    pub foreground: bool,
 }
 
 impl Default for RequestOptions {
@@ -47,6 +50,7 @@ impl Default for RequestOptions {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             link_timeout: DEFAULT_LINK_TIMEOUT,
             path_requested: false,
+            foreground: false,
         }
     }
 }

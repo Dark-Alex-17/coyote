@@ -1657,6 +1657,7 @@ impl MeshRuntime {
             request_timeout: PEER_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
             path_requested: false,
+            foreground: false,
         }));
         let reply = self
             .request(destination, LIST_PATH, body, options)
@@ -1715,6 +1716,7 @@ impl MeshRuntime {
             request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
             path_requested: false,
+            foreground: false,
         });
         let reply = self
             .request(destination, FETCH_PATH, body, options)

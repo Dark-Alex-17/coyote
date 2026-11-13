@@ -1097,6 +1097,7 @@ mod loopback {
                 link_timeout: SHORT_LINK_TIMEOUT,
                 request_timeout: SHORT_REQUEST_TIMEOUT,
                 path_requested: false,
+                foreground: false,
             },
         )
         .await
@@ -1135,6 +1136,7 @@ mod loopback {
                 link_timeout: SHORT_LINK_TIMEOUT,
                 request_timeout: SHORT_REQUEST_TIMEOUT,
                 path_requested: false,
+                foreground: false,
             },
         )
         .await

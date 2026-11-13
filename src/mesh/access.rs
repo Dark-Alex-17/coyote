@@ -310,6 +310,7 @@ impl Default for AccessOptions {
                 request_timeout: PEER_REQUEST_TIMEOUT,
                 link_timeout: DEFAULT_LINK_TIMEOUT,
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
         }
@@ -1810,6 +1811,7 @@ mod no_answer_tests {
                 request_timeout: Duration::from_secs(2),
                 link_timeout: Duration::from_secs(2),
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
         }

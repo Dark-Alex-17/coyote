@@ -809,6 +809,7 @@ mod no_answer_tests {
             request_timeout: Duration::from_secs(2),
             link_timeout: Duration::from_secs(2),
             path_requested: false,
+            foreground: false,
         };
 
         let err = runtime

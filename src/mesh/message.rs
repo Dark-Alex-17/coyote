@@ -1725,6 +1725,7 @@ impl Default for PeerSendOptions {
                 request_timeout: PEER_REQUEST_TIMEOUT,
                 link_timeout: PEER_LINK_TIMEOUT,
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
             store_and_forward: true,
@@ -1931,11 +1932,13 @@ pub(crate) fn unix_now() -> f64 {
 
 /// The description a request links to, with whether the resolve that found it already
 /// sent a path request for it during this request. A link opened on a route that asked
-/// fails at once for want of a path instead of asking a second time.
+/// fails at once for want of a path instead of asking a second time. `foreground` marks
+/// a route the user typed a command over, whose requests are foreground ones.
 #[derive(Clone, Copy)]
 pub(crate) struct Route {
     pub(crate) desc: DestinationDesc,
     pub(crate) path_requested: bool,
+    pub(crate) foreground: bool,
 }
 
 impl Route {
@@ -1945,6 +1948,15 @@ impl Route {
         Self {
             desc,
             path_requested: false,
+            foreground: false,
+        }
+    }
+
+    /// This route, for a command the user typed.
+    pub(crate) fn foreground(self) -> Self {
+        Self {
+            foreground: true,
+            ..self
         }
     }
 
@@ -1952,6 +1964,7 @@ impl Route {
     pub(crate) fn options(self, options: RequestOptions) -> RequestOptions {
         RequestOptions {
             path_requested: options.path_requested || self.path_requested,
+            foreground: options.foreground || self.foreground,
             ..options
         }
     }
@@ -1963,6 +1976,7 @@ impl fmt::Debug for Route {
         f.debug_struct("Route")
             .field("destination", &self.desc.address_hash.to_hex_string())
             .field("path_requested", &self.path_requested)
+            .field("foreground", &self.foreground)
             .finish()
     }
 }
@@ -1978,6 +1992,17 @@ impl MeshRuntime {
     ) -> Result<SendOutcome, SendError> {
         self.send_peer_with(destination_hex, message, self.peer_send_options())
             .await
+    }
+
+    /// `send_peer` for a send the user typed, whose request is a foreground one.
+    pub(crate) async fn send_peer_foreground(
+        &self,
+        destination_hex: &str,
+        message: &OutboundPeer,
+    ) -> Result<SendOutcome, SendError> {
+        let mut options = self.peer_send_options();
+        options.request.foreground = true;
+        self.send_peer_with(destination_hex, message, options).await
     }
 
     fn peer_send_options(&self) -> PeerSendOptions {
@@ -2300,6 +2325,7 @@ impl MeshRuntime {
                 request_timeout: FAREWELL_BUDGET,
                 link_timeout: FAREWELL_BUDGET,
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
             store_and_forward: false,
@@ -2415,6 +2441,7 @@ impl MeshRuntime {
                 Some(Route {
                     desc,
                     path_requested: !known,
+                    foreground: false,
                 })
             }
             None => {
@@ -3350,6 +3377,7 @@ mod no_answer_tests {
                 request_timeout: Duration::from_secs(2),
                 link_timeout: Duration::from_secs(2),
                 path_requested: false,
+                foreground: false,
             },
             propagation: PropagationOptions::default(),
             store_and_forward: true,
