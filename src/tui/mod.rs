@@ -714,8 +714,9 @@ impl PendingPrompt {
 
     /// The question wrapped to `width`, every line of it, with the help
     /// line dimmed under it: what the user approves is read from here,
-    /// so none of it may be clipped away. Blank lines are dropped so a
-    /// run of newlines cannot push the rest of the question past the pane.
+    /// so none of it may be clipped away. Blank lines are dropped from
+    /// both so a run of newlines cannot push the rest of the question
+    /// past the pane or paint an empty help row.
     fn question_lines(&self, width: u16) -> Vec<Line<'static>> {
         // A tool controls the question's text; escape sequences in it
         // are stripped so none can move the cursor or hide a word.
@@ -726,8 +727,16 @@ impl PendingPrompt {
             .join("\n");
         let mut lines =
             render::plain_lines(&question, width, Style::new().add_modifier(Modifier::BOLD));
-        if let Some(help) = &self.req.help {
-            let help = render::plain_text(help).replace('\n', " ");
+        // The help is one paragraph however its lines were broken.
+        let help = self.req.help.as_deref().map(|help| {
+            render::plain_text(help)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+        if let Some(help) = help.filter(|help| !help.is_empty()) {
             lines.extend(render::plain_lines(&help, width, DIM));
         }
         lines
@@ -4887,6 +4896,37 @@ mod tests {
         harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Esc), None);
         assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
+    /// A help text broken over lines, with a blank line in it and a
+    /// trailing newline, is one dimmed paragraph under the question: no
+    /// row of the modal is left empty, and whitespace-only help adds none.
+    #[test]
+    fn a_modal_paints_no_empty_help_row() {
+        let (reply, _answers) = mpsc::channel();
+        let with_help = |help: &str| {
+            PendingPrompt::new(
+                PromptRequest {
+                    help: Some(help.to_string()),
+                    ..PromptRequest::new(PromptAction::Confirm, "Continue?", Origin::detached())
+                },
+                reply.clone(),
+            )
+        };
+        let lines = with_help("Overwrites the macros.\n\nKeeps the roles.\n").question_lines(80);
+        let texts: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            texts,
+            ["Continue?", "Overwrites the macros. Keeps the roles."]
+        );
+        assert!(
+            texts.iter().all(|text| !text.trim().is_empty()),
+            "{texts:?}"
+        );
+
+        let lines = with_help("\n  \n").question_lines(80);
+        let texts: Vec<String> = lines.iter().map(Line::to_string).collect();
+        assert_eq!(texts, ["Continue?"]);
     }
 
     /// An input's default sits dimmed in the empty field as a placeholder,
