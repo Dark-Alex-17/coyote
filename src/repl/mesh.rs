@@ -1,6 +1,6 @@
 use crate::config::mesh_config::{MeshBrief, MeshInterface, mesh_settings_rows};
 use crate::config::{CommandPrefix, MeshConfig, RequestContext, live_prefix, paths};
-use crate::function::mesh::trust_label;
+use crate::function::mesh::{open_message_correlation, trust_label};
 use crate::mesh::access::{
     ACCESS_MAX_PATHS, AccessError, AccessOutcome, AccessRefusal, AccessRequestOutcome, GrantKind,
     ValidAccess, validate_access,
@@ -2296,10 +2296,21 @@ async fn message(
         parts_of(attachment),
         &runtime.part_limits(),
     )?;
-    let outcome = runtime
-        .send_peer_lending_reference(&destination, &out)
-        .await
-        .map_err(|err| quoted_send_failure(err, &name))?;
+    open_message_correlation(
+        &ctx.app.mesh,
+        &destination,
+        &peer.identity_hash,
+        &out,
+        SystemTime::now(),
+    );
+    let outcome = match runtime.send_peer_lending_reference(&destination, &out).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            ctx.app.mesh.correlations().abandon(&out.id);
+            return Err(quoted_send_failure(err, &name));
+        }
+    };
+    ctx.app.mesh.remember_sent_thread(&out.id);
     out_path_text(
         &sent_line(&outcome, &destination, &name, &who.user, SystemTime::now())
             .render(live_prefix()),

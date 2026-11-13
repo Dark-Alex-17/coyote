@@ -36,7 +36,7 @@ use crate::utils::wait_user_interrupt;
 use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream};
 use indexmap::IndexMap;
-use log::debug;
+use log::{debug, warn};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::path::Path;
@@ -1193,11 +1193,20 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
     };
     let destination = canonical_hash(to).unwrap_or_else(|| to.to_string());
     let naming = Naming::of_runtime(runtime);
+    let known = runtime.identity_at(&destination);
+    if let Some(identity) = &known {
+        open_message_correlation(slot, &destination, identity, &out, SystemTime::now());
+    }
     let sent = runtime.send_peer(to, &out).await;
     // Read after the send: a first contact files the session's row on the way.
     let identity = runtime.identity_at(&destination);
     match sent {
         Ok(outcome) => {
+            if known.is_none()
+                && let Some(identity) = &identity
+            {
+                open_message_correlation(slot, &destination, identity, &out, SystemTime::now());
+            }
             let thread = sent_thread(&out);
             if let Some(thread) = thread {
                 slot.remember_sent_thread(thread);
@@ -1228,7 +1237,10 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
             }
             Ok(result)
         }
-        Err(err) => Ok(named_send_error(&err, &naming, identity.as_deref())),
+        Err(err) => {
+            slot.correlations().abandon(&out.id);
+            Ok(named_send_error(&err, &naming, identity.as_deref()))
+        }
     }
 }
 
@@ -1240,6 +1252,46 @@ fn sent_thread(out: &OutboundPeer) -> Option<&str> {
         (Some(thread), _) => Some(thread),
         (None, None) => Some(&out.id),
         (None, Some(_)) => None,
+    }
+}
+
+/// Opens the correlation the reply to a root message answers, under the message's id
+/// and in its thread, so the reply lands as a reply in that thread rather than as a
+/// stray message. Anything else sent opens none: a reply or an interim note answers a
+/// correlation of the peer's, and a bulletin goes to everyone. A store that cannot be
+/// written is only logged, since the message is still worth sending; its reply then
+/// arrives as a message. Opened before the send where the identity is known, so a
+/// reply that beats the acknowledgement still matches; the caller abandons it when the
+/// send fails.
+pub(crate) fn open_message_correlation(
+    slot: &MeshSlot,
+    destination: &str,
+    identity: &str,
+    out: &OutboundPeer,
+    now: SystemTime,
+) {
+    if out.kind != PeerKind::Message || out.in_reply_to.is_some() {
+        return;
+    }
+    let opened = slot.correlations().open(PendingRecord {
+        version: PENDING_RECORD_VERSION,
+        id: out.id.clone(),
+        peer_destination: destination.to_string(),
+        peer_identity: identity.to_string(),
+        thread: out.thread.clone().unwrap_or_else(|| out.id.clone()),
+        question: display_text(&out.content, PENDING_QUESTION_MAX_CHARS).unwrap_or_default(),
+        sent_at: rfc3339_utc(now),
+        timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+        state: PendingState::Open,
+        reply: None,
+        kind: CorrelationKind::Message,
+    });
+    if let Err(err) = opened {
+        warn!(
+            "Mesh message {} was not filed as awaiting a reply, so its reply will arrive as a message: {}",
+            out.id,
+            redact_hashes(&format!("{err:#}"))
+        );
     }
 }
 
