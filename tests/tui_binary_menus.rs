@@ -4248,3 +4248,381 @@ mod cold_start {
         assert_tty_restored(&transcript);
     }
 }
+
+// ---------------------------------------------------------------------
+// The install conflict remedies word for word, the MCP conflict with no
+// human to ask, a piped-stdin forced MCP add, and a blank answer in the
+// first-run provider wizard.
+// ---------------------------------------------------------------------
+
+/// The remedy a `coyote --install` refusal ends with.
+const CLI_INSTALL_REMEDY: &str = ", with --install-force (installs), or with --yes (updates).";
+/// The remedy a `.install` refusal in the plain REPL ends with.
+const REPL_INSTALL_REMEDY: &str = ", with --force (installs).";
+
+/// A local `mcp.json` holding the bundle server `write_bundle_repo`
+/// ships under a different definition, so the merge hits a conflict.
+fn write_conflicting_local_mcp_server(dir: &Path) -> String {
+    let local = "{\"mcpServers\": {\"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \
+                 \"args\": [\"local-definition-r10\"], \"env\": {}}}}\n";
+    fs::write(dir.join("mcp.json"), local).unwrap();
+    local.to_string()
+}
+
+/// `coyote --install <bundle>` with no terminal at all, once at a local
+/// role conflict and once at an MCP server conflict: each is refused in
+/// the shared shape and the remedy is, word for word, `, with
+/// --install-force (installs), or with --yes (updates).`; the run exits
+/// non-zero and neither the local roles nor the local mcp.json change.
+#[test]
+#[serial]
+fn a_tty_less_cli_install_at_a_role_or_mcp_conflict_ends_with_the_install_force_and_yes_remedy() {
+    let dir = fresh_config_dir("ttyless-install-remedy-cli");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let name = "bundle-k7s";
+    let repo = write_bundle_repo(&dir, name, &[]);
+
+    // A role conflict.
+    let locals = write_conflicting_local_roles(&dir, name);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", repo.to_str().unwrap()],
+        "tty-less --install at a role conflict",
+    );
+    assert!(
+        !ok,
+        "the tty-less `--install` at a role conflict exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out)
+        .unwrap_or_else(|| panic!("the role conflict is not refused in the shared shape:\n{out}"));
+    assert!(
+        action.starts_with("overwrite local file "),
+        "the role conflict refusal names {action:?}:\n{out}"
+    );
+    assert_eq!(
+        remedy, CLI_INSTALL_REMEDY,
+        "the CLI role conflict remedy is not word for word the documented one:\n{out}"
+    );
+    for path in &locals {
+        assert_eq!(
+            fs::read_to_string(path).ok().as_deref(),
+            Some(LOCAL_ROLE_TEXT),
+            "the refused install changed {}:\n{out}",
+            path.display()
+        );
+    }
+
+    // An MCP server conflict, with the roles out of the way.
+    for path in &locals {
+        fs::remove_file(path).unwrap();
+    }
+    let local_before = write_conflicting_local_mcp_server(&dir);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--install", repo.to_str().unwrap()],
+        "tty-less --install at an MCP conflict",
+    );
+    assert!(
+        !ok,
+        "the tty-less `--install` at an MCP conflict exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out)
+        .unwrap_or_else(|| panic!("the MCP conflict is not refused in the shared shape:\n{out}"));
+    assert_eq!(
+        action, "merge the already-installed MCP server 'bundle-k7s-server'",
+        "{out}"
+    );
+    assert_eq!(
+        remedy, CLI_INSTALL_REMEDY,
+        "the CLI MCP conflict remedy is not word for word the documented one:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        local_before,
+        "the refused merge changed the local mcp.json:\n{out}"
+    );
+    assert!(
+        !out.contains("Kept the local MCP server"),
+        "a refused merge also printed the kept-server note:\n{out}"
+    );
+}
+
+/// `.install <bundle>` in the plain REPL on a terminal with stdin from
+/// /dev/null, at an MCP server conflict: refused in the shared shape with
+/// the REPL's remedy word for word, `, with --force (installs).` (no
+/// `--install-force`, no `--yes`), the local mcp.json untouched, and the
+/// REPL goes on to `.exit` cleanly.
+#[test]
+#[serial]
+fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_ends_with_the_force_remedy()
+{
+    let dir = fresh_config_dir("repl-install-mcp-remedy");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
+    let local_before = write_conflicting_local_mcp_server(&dir);
+
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
+    pty.wait_for(")> ", PTY_DEADLINE).unwrap();
+    let from = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let since = pty
+        .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
+        .unwrap_or_else(|err| panic!("`.install` at an MCP conflict did not refuse: {err}"));
+    let (action, remedy) = refusal_shape(&since)
+        .unwrap_or_else(|| panic!("`.install` is not refused in the shared shape:\n{since}"));
+    assert_eq!(
+        action, "merge the already-installed MCP server 'bundle-k7s-server'",
+        "{since}"
+    );
+    assert_eq!(
+        remedy, REPL_INSTALL_REMEDY,
+        "the REPL MCP conflict remedy is not word for word the documented one:\n{since}"
+    );
+    assert!(
+        !since.contains("Conflict on MCP server") && !since.contains("keep local"),
+        "`.install` painted the conflict menu with nothing to read an answer from:\n{since}"
+    );
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert_eq!(
+        fs::read_to_string(dir.join("mcp.json")).unwrap(),
+        local_before,
+        "the refused `.install` changed the local mcp.json:\n{transcript}"
+    );
+}
+
+/// `--headless --macro <name> <prompt>` on a real terminal (both ttys
+/// present, nobody declared to answer) whose macro runs `.install
+/// <bundle>` at an MCP server conflict: the conflict is not refused (a
+/// terminal is there) and not asked (nobody is); the local server is
+/// kept, exactly one note says `Kept the local MCP server
+/// 'bundle-k7s-server': nobody could be asked.`, the install completes
+/// (role installed, merge report says kept local), the macro goes on to
+/// its `.info` step and the run exits 0.
+#[test]
+#[serial]
+fn a_headless_macro_dot_install_at_an_mcp_conflict_keeps_the_local_server_saying_nobody_could_be_asked()
+ {
+    let dir = fresh_config_dir("headless-install-mcp-conflict");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
+    let local_before = write_conflicting_local_mcp_server(&dir);
+    fs::create_dir_all(dir.join("macros")).unwrap();
+    fs::write(
+        dir.join("macros").join("install-k7s.yaml"),
+        format!(
+            "isolated: false\nsteps:\n  - \".install {}\"\n  - \".info\"\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        WAIT_WRAPPER,
+        "/dev/tty",
+        " --headless --macro install-k7s probe-r10",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    let note = "Kept the local MCP server 'bundle-k7s-server': nobody could be asked.";
+    assert_eq!(
+        plain.matches(note).count(),
+        1,
+        "the headless install did not print the kept-server note exactly once:\n{plain}"
+    );
+    assert!(
+        refusal_shape(&plain).is_none(),
+        "the headless install on a terminal was refused instead of keeping local:\n{plain}"
+    );
+    assert!(
+        !plain.contains("the question was cancelled"),
+        "the headless install printed the cancel wording:\n{plain}"
+    );
+    assert!(
+        squeezed(&plain).contains("keptlocal:bundle-k7s-server"),
+        "the merge report does not say the server was kept local:\n{plain}"
+    );
+    assert_eq!(
+        exit_code(&plain),
+        0,
+        "the headless macro install exited non-zero:\n{plain}"
+    );
+    assert!(
+        plain.contains("log_path"),
+        "the macro did not go on to `.info` after the install:\n{plain}"
+    );
+    assert!(
+        dir.join("roles").join("bundle-k7s-role.md").exists(),
+        "the headless install did not install the bundle's role:\n{plain}"
+    );
+    let local_before: serde_json::Value = serde_json::from_str(&local_before).unwrap();
+    let merged: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        merged, local_before,
+        "the headless install changed the local server definition:\n{plain}"
+    );
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "a headless run entered the alternate screen:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+}
+
+/// `coyote --mcp-add x --url 'https://h/{{TOK}}' --mcp-force` typed at a
+/// terminal with stdin a pipe (`printf '' | coyote ...`), the vault
+/// configured and `x` already present: `--mcp-force` skips the overwrite
+/// question, the missing secret still needs a human, so the run is
+/// refused in the shared shape (`provision the MCP secrets for 'x'`,
+/// remedy naming `coyote --add-secret TOK`) before anything is asked or
+/// written: exit non-zero, mcp.json byte-for-byte as before, nothing
+/// painted to answer, the tty left cooked.
+#[test]
+#[serial]
+fn a_piped_stdin_forced_mcp_add_with_a_secret_on_a_terminal_is_refused_before_touching_mcp_json() {
+    let dir = fresh_config_dir("piped-mcp-add-secret-force");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--mcp-add", "x", "--", "echo", "hi"],
+        "tty-less --mcp-add",
+    );
+    assert!(ok, "the secret-free `--mcp-add` failed:\n{out}");
+    let mcp_json = dir.join("mcp.json");
+    let before =
+        fs::read(&mcp_json).unwrap_or_else(|_| panic!("no mcp.json after the add:\n{out}"));
+
+    let piped_wrapper = "printf '' | '{coyote}'{args}; rc=$?; {report}";
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[("COYOTE_UI", "repl")],
+        piped_wrapper,
+        "/dev/null",
+        " --mcp-add x --url 'https://h/{{TOK}}' --mcp-force",
+    );
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "the piped-stdin forced `--mcp-add` exited 0:\n{plain}"
+    );
+    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
+        panic!("the piped-stdin forced `--mcp-add` is not refused in the shared shape:\n{plain}")
+    });
+    assert_eq!(action, "provision the MCP secrets for 'x'", "{plain}");
+    assert!(
+        remedy.contains("coyote --add-secret TOK"),
+        "the remedy does not name `coyote --add-secret TOK`: {remedy:?}\n{plain}"
+    );
+    for widget in [
+        "Overwrite",
+        "to the vault now?",
+        "Enter the secret value",
+        "? ",
+    ] {
+        assert!(
+            !plain.contains(widget),
+            "the piped-stdin run painted `{widget}` with nothing to read an answer from:\n{plain}"
+        );
+    }
+    assert_eq!(
+        fs::read(&mcp_json).unwrap(),
+        before,
+        "the refused forced add changed mcp.json:\n{plain}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&fs::read(&mcp_json).unwrap()).contains("TOK"),
+        "the refused forced add wrote the new definition:\n{plain}"
+    );
+    assert_tty_restored(&plain);
+}
+
+/// The first run ever (no config file) on a terminal, into the vault
+/// step with the GCP provider, whose project ID has no default: Enter on
+/// the blank field is not taken; the field is asked again with `This
+/// field is required.` in front of its label (asked twice in all, not
+/// refused), and Ctrl+C on the re-asked field leaves with no config file
+/// written and the tty restored. (A value typed there would go on to a
+/// write probe against the real Secret Manager, so the case stops at the
+/// re-ask.)
+#[test]
+#[serial]
+fn a_blank_answer_in_the_first_run_vault_provider_wizard_is_reasked_with_this_field_is_required() {
+    let dir = fresh_config_dir("first-run-provider-blank");
+    let _guard = TempDirGuard(dir.clone());
+    assert!(!dir.join("config.yaml").exists());
+
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    pty.wait_for("create a new one?", PTY_DEADLINE)
+        .expect("the first run did not ask to create a config file");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.wait_for("secrets provider", PTY_DEADLINE)
+        .expect("the wizard did not ask which secrets provider to use");
+    pty.read_for(Duration::from_millis(300));
+    // The third row is the GCP provider; the select takes arrows only.
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(200));
+    pty.send(b"\x1b[B").unwrap();
+    pty.read_for(Duration::from_millis(200));
+    pty.send(b"\r").unwrap();
+    let asked_at = pty.raw().len();
+    pty.wait_for("GCP project ID:", PTY_DEADLINE)
+        .expect("the wizard did not ask for the GCP project ID");
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let reasked = loop {
+        pty.read_for(Duration::from_millis(200));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+        if since.contains("This field is required. GCP project ID:") {
+            break since;
+        }
+        assert!(
+            !since.contains("API Provider"),
+            "the blank project ID was taken and the wizard moved on:\n{since}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a blank GCP project ID was not re-asked with `This field is required.`:\n{since}"
+        );
+    };
+    assert!(
+        !reasked.contains("Refusing to"),
+        "the blank answer was refused instead of re-asked:\n{reasked}"
+    );
+    assert_eq!(
+        reasked.matches("? GCP project ID:").count()
+            + reasked
+                .matches("? This field is required. GCP project ID:")
+                .count(),
+        2,
+        "the project ID was not asked exactly twice (once plain, once re-asked):\n{reasked}"
+    );
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x03").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_ne!(
+        exit_code(&transcript),
+        0,
+        "Ctrl+C on the re-asked field exited 0:\n{transcript}"
+    );
+    assert!(
+        !dir.join("config.yaml").exists(),
+        "the interrupted wizard wrote config.yaml:\n{transcript}"
+    );
+    assert_tty_restored(&transcript);
+}

@@ -3618,3 +3618,362 @@ fn keep_all_on_the_uninstall_file_modal_carries_into_the_mcp_server_loop_without
     );
     assert_ui_alive_then_quit(&mut pty, "keep-all on the uninstall");
 }
+
+// ---------------------------------------------------------------------
+// Cancelling INSIDE the vault wizard a bundle secret opens, and Esc on the
+// MCP conflict select of an install.
+// ---------------------------------------------------------------------
+
+/// The note the merge prints when the MCP conflict select was closed
+/// without an answer.
+const KEPT_MCP_SERVER_CANCELLED_NOTE: &str =
+    "Kept the local MCP server 'bundle-k7s-server': the question was cancelled.";
+
+/// Waits for the modal `markers` describe after `from`, with a resize
+/// first so the whole frame is on the pty (a modal differing from the
+/// last by a few cells paints only those cells).
+fn next_modal_after_a_repaint(
+    pty: &mut Pty,
+    from: usize,
+    command: &str,
+    markers: &[&str],
+    rows: &mut u16,
+) -> String {
+    *rows = if *rows == 60 { 59 } else { 60 };
+    pty.resize(*rows, 140).unwrap();
+    wait_for_the_modal(pty, from, command, markers)
+}
+
+/// The bundle install a vault-wizard cancel is checked against.
+struct VaultScene<'a> {
+    dir: &'a Path,
+    name: &'a str,
+    password_file: &'a Path,
+    files_before: &'a [PathBuf],
+}
+
+/// One install pass of `command` on a bundle with secrets A and B: `y`
+/// on `Add {{ A }} to the vault now?` opens the vault wizard, `walk`
+/// drives it up to the widget to cancel, Esc there. Then: the deferred
+/// notice lists A and B in order, B was never asked about, no password
+/// file exists at `password_file` (or anywhere new under `dir`), the
+/// bundle's files are installed, the UI is still up and the terminal was
+/// never released. Returns the text since the command.
+fn esc_inside_the_vault_wizard_defers_the_rest(
+    pty: &mut Pty,
+    scene: &VaultScene<'_>,
+    command: &str,
+    walk: &dyn Fn(&mut Pty, usize, &mut u16),
+    rows: &mut u16,
+    what: &str,
+) -> String {
+    let VaultScene {
+        dir,
+        name,
+        password_file,
+        files_before,
+    } = *scene;
+    let at = pty.raw().len();
+    pty.send(format!("{command}\r").as_bytes()).unwrap();
+    wait_for_the_modal(
+        pty,
+        at,
+        &format!("{command} ({what}: first secret)"),
+        &["Add{{BUNDLE_SECRET_A}}tothevaultnow?", "y=yes"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"y").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let answered_at = pty.raw().len();
+    walk(pty, answered_at, rows);
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        pty,
+        DEFERRED_SECRETS_NOTICE,
+        &format!("{what}: the deferred-secrets notice after Esc inside the vault wizard"),
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[at..]));
+    let flat = squeezed(&since);
+    assert!(
+        !flat.contains("Add{{BUNDLE_SECRET_B}}tothevaultnow?"),
+        "{what}: Esc inside the vault wizard still asked about the later secret:\n{since}"
+    );
+    assert!(
+        flat.contains("{{BUNDLE_SECRET_A}}{{BUNDLE_SECRET_B}}"),
+        "{what}: the notice does not list both secrets as deferred in order:\n{since}"
+    );
+    assert!(
+        !flat.contains("created.") && !flat.contains("updated."),
+        "{what}: the cancelled wizard reported a password file written:\n{since}"
+    );
+    assert!(
+        !flat.contains("Refusingto") && !flat.contains("Error:"),
+        "{what}: the install failed instead of deferring the secrets:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "{what}: the install quit the UI:\n{since}"
+    );
+    assert!(
+        !password_file.exists(),
+        "{what}: a password file was written at {} though the wizard was cancelled:\n{since}",
+        password_file.display()
+    );
+    let written: Vec<PathBuf> = walk_files(dir)
+        .into_iter()
+        .filter(|path| !files_before.contains(path))
+        .filter(|path| {
+            let text = path.to_string_lossy();
+            !text.contains("/cache/") && !text.contains("/bundle-src/")
+        })
+        .filter(|path| {
+            fs::read_to_string(path).is_ok_and(|text| text.contains("twelve-chars-long"))
+        })
+        .collect();
+    assert!(
+        written.is_empty(),
+        "{what}: a file holds the password typed before the cancel: {written:?}\n{since}"
+    );
+    for role in ["role", "obsolete"] {
+        let installed = dir.join("roles").join(format!("{name}-{role}.md"));
+        assert!(
+            installed.exists(),
+            "{what}: the bundle's {role} file was not installed at {}:\n{since}",
+            installed.display()
+        );
+    }
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "{what}: a vault wizard question released the terminal:\n{since}"
+    );
+    since
+}
+
+/// [`walk`] under its harness name, for the closure above that shadows it.
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    walk(dir)
+}
+
+/// `.install <local bundle>` with two secrets after the vault's password
+/// file went missing while the UI was up (the boot needs it, the install
+/// runs later): `y` on `Add {{ A }} to the vault now?` opens the
+/// password-file wizard as modals. Esc on each of its three widgets
+/// in turn (the `create one now?` confirm on the install, the path
+/// Input on the first update, the password modal on the second) defers
+/// A and every later secret, the install or update still succeeds and
+/// lists both secrets as deferred, and no password file is written
+/// anywhere.
+#[test]
+#[serial]
+fn esc_inside_the_vault_wizard_of_a_bundle_secret_defers_the_rest_and_writes_no_password_file() {
+    let dir = fresh_config_dir("install-esc-inside-vault-wizard");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let password_file = dir.join("vault-pass");
+    let name = "bundle-w2v";
+    let repo = write_bundle_repo(&dir, name, &["BUNDLE_SECRET_A", "BUNDLE_SECRET_B"]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    // The boot checked the password file; once it is gone the first `yes`
+    // on a secret reaches the wizard rather than the vault.
+    fs::remove_file(&password_file).unwrap();
+    let files_before = walk(&dir);
+    let install = format!(".install {}", repo.display());
+    // The size the repaints alternate from, carried across the passes so
+    // no resize is a no-op.
+    let mut rows = 60u16;
+    let scene = VaultScene {
+        dir: &dir,
+        name,
+        password_file: &password_file,
+        files_before: &files_before,
+    };
+
+    // First pass: Esc on the `create one now?` confirm.
+    esc_inside_the_vault_wizard_defers_the_rest(
+        &mut pty,
+        &scene,
+        &install,
+        &|pty, from, rows| {
+            next_modal_after_a_repaint(
+                pty,
+                from,
+                ".install (password-file confirm)",
+                &["Nopasswordfileconfigured", "createonenow?", "y=yes"],
+                rows,
+            );
+        },
+        &mut rows,
+        "Esc on the create confirm",
+    );
+
+    // Second pass (an update from the same source): Enter on the confirm,
+    // Esc on the path Input.
+    let update = format!(".install {name}");
+    esc_inside_the_vault_wizard_defers_the_rest(
+        &mut pty,
+        &scene,
+        &update,
+        &|pty, from, rows| {
+            next_modal_after_a_repaint(
+                pty,
+                from,
+                ".install <bundle> (password-file confirm)",
+                &["createonenow?", "y=yes"],
+                rows,
+            );
+            pty.read_for(HOTKEY_GAP);
+            pty.send(b"\r").unwrap();
+            pty.read_for(Duration::from_millis(500));
+            let at = pty.raw().len();
+            next_modal_after_a_repaint(
+                pty,
+                at,
+                ".install <bundle> (password-file path)",
+                &["Enterthepathtothepasswordfiletocreate:", "Enter=answer"],
+                rows,
+            );
+        },
+        &mut rows,
+        "Esc on the path Input",
+    );
+
+    // Third pass: Enter on the confirm, Enter on the path (the default),
+    // Esc on the password modal.
+    esc_inside_the_vault_wizard_defers_the_rest(
+        &mut pty,
+        &scene,
+        &update,
+        &|pty, from, rows| {
+            next_modal_after_a_repaint(
+                pty,
+                from,
+                ".install <bundle> (password-file confirm, third pass)",
+                &["createonenow?", "y=yes"],
+                rows,
+            );
+            pty.read_for(HOTKEY_GAP);
+            pty.send(b"\r").unwrap();
+            pty.read_for(Duration::from_millis(500));
+            let at = pty.raw().len();
+            next_modal_after_a_repaint(
+                pty,
+                at,
+                ".install <bundle> (password-file path, third pass)",
+                &["Enterthepathtothepasswordfiletocreate:", "Enter=answer"],
+                rows,
+            );
+            answer_field_modal(pty, "");
+            pty.read_for(Duration::from_millis(500));
+            let at = pty.raw().len();
+            next_modal_after_a_repaint(
+                pty,
+                at,
+                ".install <bundle> (vault password)",
+                &["Enterapasswordtoencryptallvaultsecrets:", "Enter=answer"],
+                rows,
+            );
+        },
+        &mut rows,
+        "Esc on the password modal",
+    );
+
+    assert_ui_alive_then_quit(&mut pty, "the cancelled vault wizards");
+}
+
+/// `.install <local bundle>` whose mcp.json defines a server the local
+/// mcp.json already holds differently: Esc on the `Conflict on MCP
+/// server` Select modal keeps the local definition, the install still
+/// completes (role installed, merge report says `kept local`), exactly
+/// one note says `Kept the local MCP server '<name>': the question was
+/// cancelled.`, nothing is refused, the terminal is never released and
+/// the UI stays live.
+#[test]
+#[serial]
+fn esc_on_the_mcp_conflict_select_modal_keeps_the_local_server_and_says_the_question_was_cancelled()
+{
+    let dir = fresh_config_dir("install-mcp-conflict-esc");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let local_before = write_conflicting_local_mcp(&dir);
+    let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        install_at,
+        ".install (MCP conflict)",
+        &[
+            "ConflictonMCPserver'bundle-k7s-server'",
+            "keeplocal",
+            "takeremote",
+            "abortmerge",
+        ],
+    );
+    assert!(
+        !squeezed(&modal).contains("Other(custom)"),
+        "the MCP conflict select is closed but the modal offers a custom row:\n{modal}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        KEPT_MCP_SERVER_CANCELLED_NOTE,
+        "the note after Esc on the MCP conflict modal",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    let flat = squeezed(&since);
+    assert_eq!(
+        flat.matches(&squeezed(KEPT_MCP_SERVER_CANCELLED_NOTE))
+            .count(),
+        1,
+        "the kept-server note was printed more or less than once:\n{since}"
+    );
+    assert!(
+        flat.contains("keptlocal:bundle-k7s-server"),
+        "the merge report does not say the server was kept local:\n{since}"
+    );
+    assert!(
+        !flat.contains(&squeezed(MCP_CONFLICT_REFUSAL)) && !flat.contains("Abortedmerge"),
+        "Esc on the conflict modal refused or aborted the merge instead of keeping local:\n{since}"
+    );
+    assert!(
+        !since.contains("exit="),
+        "the install quit the UI:\n{since}"
+    );
+    let frame = repainted_frame(&mut pty, 58, 140);
+    assert!(
+        !squeezed(&frame).contains("Esc=cancel"),
+        "the MCP conflict modal is still up after Esc:\n{frame}"
+    );
+    assert!(
+        dir.join("roles").join("bundle-k7s-role.md").exists(),
+        "the bundle's role was not installed after Esc on the conflict modal:\n{since}"
+    );
+    let local_before: serde_json::Value = serde_json::from_str(&local_before).unwrap();
+    let merged: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        merged, local_before,
+        "Esc on the conflict modal changed the local mcp.json:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the conflict modal released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "Esc on the MCP conflict modal");
+}
