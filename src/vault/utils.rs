@@ -95,7 +95,8 @@ fn ask_password_file_path(prompter: &dyn Prompter, default: &Path) -> Result<Pat
             question = reask("Parent directory does not exist.", label);
             continue;
         }
-        return Ok(path);
+        return std::path::absolute(&path)
+            .with_context(|| format!("Failed to resolve password file path '{}'", path.display()));
     }
 }
 
@@ -1058,7 +1059,8 @@ mod tests {
     }
 
     /// A bare file name lands in the current directory, which exists, so
-    /// it is taken at once instead of re-asked for a missing parent.
+    /// it is taken at once instead of re-asked for a missing parent, and
+    /// returned absolute so the config and the report name where it is.
     #[test]
     fn a_bare_password_file_name_is_taken_in_the_current_directory() {
         let bare = "vault-pass-bare-q4z";
@@ -1067,7 +1069,8 @@ mod tests {
 
         let path = ask_password_file_path(&prompter, Path::new("/unused/default")).unwrap();
 
-        assert_eq!(path, PathBuf::from(bare));
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.ends_with(bare), "{}", path.display());
         assert_eq!(
             questions(&prompter),
             ["Enter the path to the password file to create:"]
