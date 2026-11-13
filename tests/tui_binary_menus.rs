@@ -4360,14 +4360,17 @@ fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_ends_wit
     let dir = fresh_config_dir("repl-install-mcp-remedy");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
-    let repo = write_bundle_repo(&dir, "bundle-k7s", &[]);
+    write_bundle_repo(&dir, "bundle-k7s", &[]);
     let local_before = write_conflicting_local_mcp_server(&dir);
 
     let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
     pty.wait_for(")> ", PTY_DEADLINE).unwrap();
     let from = pty.raw().len();
-    pty.send(format!(".install {}\r", repo.display()).as_bytes())
-        .unwrap();
+    // The line editor repaints the prompt once per typed key, about 100 ms
+    // each in a debug build, so the absolute temp path alone would eat most
+    // of the deadline; the binary runs in `dir`, where the relative path
+    // names the same repository.
+    pty.send(b".install ./bundle-src\r").unwrap();
     let since = pty
         .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
         .unwrap_or_else(|err| panic!("`.install` at an MCP conflict did not refuse: {err}"));
@@ -4385,6 +4388,9 @@ fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_ends_wit
         !since.contains("Conflict on MCP server") && !since.contains("keep local"),
         "`.install` painted the conflict menu with nothing to read an answer from:\n{since}"
     );
+    // Let the line editor re-arm its prompt before the next command, so
+    // the keys are read by it rather than echoed by the cooked tty.
+    pty.read_for(Duration::from_millis(500));
     pty.send(b".exit\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
