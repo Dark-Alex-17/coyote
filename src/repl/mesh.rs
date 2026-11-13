@@ -31,7 +31,7 @@ use crate::mesh::message::{
 };
 use crate::mesh::notify::NoticeText;
 use crate::mesh::pending::{
-    Correlation, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
+    Correlation, CorrelationKind, INBOUND_ENVOY_QUESTION_MAX_CHARS, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingRecord, PendingState, access_not_a_question,
     question_not_an_access_request,
 };
@@ -9933,7 +9933,7 @@ fn group_concepts(group: &str) -> Vec<(String, String)> {
             ),
             (
                 "sent",
-                "The questions your sessions asked and whether an answer came back.",
+                "The questions your sessions asked and whether an answer came back; a message they sent is listed in the state `sent` until its reply comes.",
             ),
             ("open", "Asked; no answer yet."),
             (
@@ -10209,7 +10209,7 @@ mod help_output_tests {
                 "What the words mean:",
                 "word | meaning",
                 "inbox | The messages other sessions sent this one; reading it takes nothing away.",
-                "sent | The questions your sessions asked and whether an answer came back.",
+                "sent | The questions your sessions asked and whether an answer came back; a message they sent is listed in the state `sent` until its reply comes.",
                 "open | Asked; no answer yet.",
                 "escalated | The other session's envoy passed your question to its user.",
                 "answered, awaiting the model | The answer arrived; the model picks it up with mesh__collect.",
@@ -12699,6 +12699,7 @@ impl QuestionRow {
 
     fn outbound(record: &PendingRecord, name: String) -> Self {
         let state = match record.state {
+            PendingState::Open if record.kind == CorrelationKind::Message => "sent",
             PendingState::Open => "open",
             PendingState::Escalated => "escalated: the peer's human has been asked",
             PendingState::Answered => AWAITING_THE_MODEL,
