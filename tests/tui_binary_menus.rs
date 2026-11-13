@@ -4657,3 +4657,158 @@ fn a_tty_less_auth_mcp_is_refused_in_the_shared_shape() {
         "the tty-less `--auth-mcp` started the sign-in anyway:\n{out}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Esc on the agent's `init RAG?` question cancels the agent in both
+// interfaces, and `--auth-mcp` typed at a terminal with stdin piped.
+// ---------------------------------------------------------------------
+
+/// The error a cancelled question surfaces as.
+const CANCELED_BY_USER: &str = "Operation was canceled by the user";
+
+/// Under the UI, Esc on the `init RAG?` Confirm modal cancels the agent:
+/// the cancel error is shown, no rag is written, the agent is not left
+/// active (`.info agent` has no agent to show), the terminal is never
+/// released and the UI stays live.
+#[test]
+#[serial]
+fn esc_on_the_init_rag_modal_cancels_the_agent_with_the_canceled_by_user_error() {
+    let dir = fresh_config_dir("agent-init-rag-esc");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, before) = open_the_init_rag_modal(&dir, "docs-agent-e1r");
+    let files_before = walk(&dir);
+
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        CANCELED_BY_USER,
+        "the cancel error after Esc on `init RAG?`",
+    );
+    pty.read_for(Duration::from_millis(800));
+    let info_at = pty.raw().len();
+    pty.send(b".info agent\r").unwrap();
+    pty.read_for(Duration::from_millis(2500));
+    let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+    assert!(
+        !squeezed(&info).contains("name:docs-agent-e1r"),
+        "the agent is still active after Esc on `init RAG?`:\n{info}"
+    );
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "Esc on `init RAG?` still wrote a rag: {written:?}:\n{since}"
+    );
+    assert!(
+        !since.contains(RETIRED_RAG_NOTICE),
+        "the retired notice was printed after Esc:\n{since}"
+    );
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the `init RAG?` question released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "Esc on `init RAG?`");
+}
+
+/// In the plain REPL, Esc on the inquire `init RAG?` confirm cancels the
+/// agent the same way: the cancel error is printed, the prompt comes
+/// back without the agent in it, and no rag is written.
+#[test]
+#[serial]
+fn esc_on_init_rag_in_the_plain_repl_cancels_the_agent_with_the_canceled_by_user_error() {
+    let dir = fresh_config_dir("agent-init-rag-esc-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    write_agent_with_documents(&dir, "docs-agent-e2r");
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let files_before = walk(&dir);
+    let before = pty.raw().len();
+    pty.send(b".agent docs-agent-e2r\r").unwrap();
+    pty.wait_for_after(INIT_RAG_QUESTION, before, PTY_DEADLINE)
+        .expect("`.agent <name>` in the plain REPL did not ask `init RAG?`");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\x1b").unwrap();
+    pty.wait_for_after(CANCELED_BY_USER, before, PTY_DEADLINE)
+        .expect("Esc on `init RAG?` in the plain REPL did not print the cancel error");
+    pty.read_for(Duration::from_millis(800));
+    let info_at = pty.raw().len();
+    pty.send(b".info agent\r").unwrap();
+    pty.read_for(Duration::from_millis(2000));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[before..]));
+    let info = strip_ansi(&String::from_utf8_lossy(&pty.raw()[info_at..]));
+    assert!(
+        !squeezed(&info).contains("name:docs-agent-e2r"),
+        "the agent is still active after Esc on `init RAG?`:\n{since}"
+    );
+    let written = new_files_named(&dir, &files_before, "/rags/");
+    assert!(
+        written.is_empty(),
+        "Esc on `init RAG?` in the plain REPL still wrote a rag: {written:?}:\n{since}"
+    );
+
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The exact refusal `--auth-mcp` gives when nobody can answer it.
+const AUTH_MCP_OAUTH_REFUSAL: &str =
+    "Refusing to sign in to 'oauth-srv-p1d' with OAuth non-interactively. Re-run in a terminal.";
+
+/// `coyote --auth-mcp <server> </dev/null` typed at a terminal (stdout a
+/// tty, stdin not), in both the plain REPL and the UI mode: refused with
+/// exactly the documented sentence before any widget or discovery (the
+/// server URL points nowhere, so reaching discovery would surface as a
+/// connection error), exit non-zero, no alternate screen, tty cooked.
+#[test]
+#[serial]
+fn auth_mcp_on_a_terminal_with_stdin_from_dev_null_is_refused_with_the_oauth_sentence() {
+    for ui in ["repl", "tui"] {
+        let dir = fresh_config_dir(&format!("auth-mcp-piped-stdin-{ui}"));
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        fs::write(
+            dir.join("mcp.json"),
+            r#"{"mcpServers": {"oauth-srv-p1d": {"type": "http", "url": "http://127.0.0.1:9/mcp", "oauth": {"clientId": "cid-p1d"}}}}"#,
+        )
+        .unwrap();
+        let mut pty = spawn_binary_under(
+            built_binary(),
+            &dir,
+            &[("COYOTE_UI", ui)],
+            WAIT_WRAPPER,
+            "/dev/null",
+            " --auth-mcp oauth-srv-p1d",
+        );
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+        let plain = strip_ansi(&transcript);
+        assert!(
+            plain
+                .lines()
+                .any(|line| line.trim().trim_start_matches("Error: ") == AUTH_MCP_OAUTH_REFUSAL),
+            "[{ui}] `--auth-mcp` with stdin piped is not refused with the exact sentence:\n{plain}"
+        );
+        assert_ne!(
+            exit_code(&plain),
+            0,
+            "[{ui}] the refused `--auth-mcp` exited 0:\n{plain}"
+        );
+        assert!(
+            !plain.contains("Open this URL")
+                && !plain.contains("Enter the OAuth client ID")
+                && !plain.to_lowercase().contains("connection refused"),
+            "[{ui}] `--auth-mcp` with stdin piped started the sign-in anyway:\n{plain}"
+        );
+        assert!(
+            find(pty.raw(), ENTER_ALT, 0).is_none(),
+            "[{ui}] the refused `--auth-mcp` entered the alternate screen:\n{plain}"
+        );
+        assert_tty_restored(&plain);
+    }
+}

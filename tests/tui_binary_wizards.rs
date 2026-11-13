@@ -3983,3 +3983,524 @@ fn esc_on_the_mcp_conflict_select_modal_keeps_the_local_server_and_says_the_ques
     );
     assert_ui_alive_then_quit(&mut pty, "Esc on the MCP conflict modal");
 }
+
+// ---------------------------------------------------------------------
+// A tool's open select answered with typed text in the plain REPL and
+// from a Python tool under the UI, two MCP conflicts where the first is
+// cancelled, and a tool Input question whose default is the empty
+// string.
+// ---------------------------------------------------------------------
+
+/// Text a user might type on the custom row: inner spaces, both quote
+/// kinds, a dollar sign and a backslash, none of which may be expanded,
+/// escaped or dropped on the way to the tool.
+const TYPED_CUSTOM_ANSWER: &str = "my \"own\" pick $HOME 'x11' back\\slash";
+
+/// `list` in the plain REPL: the `Other (custom)` row opens the
+/// `Custom response:` text prompt, and the text typed there reaches the
+/// bash tool verbatim (the helper prints it as is) and the model sees
+/// it in the tool's output.
+#[test]
+#[serial]
+fn a_tools_list_question_in_the_plain_repl_opens_custom_response_and_passes_the_typed_text_verbatim()
+ {
+    let dir = fresh_config_dir("tool-list-repl-custom");
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = list_tool_turn(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let asked_at = pty.raw().len();
+    pty.send(b"call the list tool\r").unwrap();
+    pty.wait_for_after("Other (custom)", asked_at, PTY_DEADLINE)
+        .expect("the tool's list question never offered the custom row");
+    pty.read_for(Duration::from_millis(500));
+    for _ in 0..3 {
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(300));
+    }
+    let custom_at = pty.raw().len();
+    pty.send(b"\r").unwrap();
+    pty.wait_for_after("Custom response:", custom_at, PTY_DEADLINE)
+        .expect("Enter on `Other (custom)` did not open the `Custom response:` prompt");
+    pty.read_for(Duration::from_millis(400));
+    pty.send(TYPED_CUSTOM_ANSWER.as_bytes()).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done q7l", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        TYPED_CUSTOM_ANSWER,
+        "the text typed at `Custom response:` did not reach the tool verbatim:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+    // The tool's output reaches the model as the `output` field of the
+    // JSON object in the tool message's content.
+    let tool_output = format!("fixture picked: {TYPED_CUSTOM_ANSWER} q7l-r");
+    let body: serde_json::Value = serde_json::from_str(&fake.bodies()[1]).unwrap();
+    let handed: Vec<String> = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["content"].as_str())
+        .filter_map(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+        .filter_map(|content| content["output"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        handed.iter().any(|output| output.trim_end() == tool_output),
+        "the tool's output handed to the model does not carry the typed text verbatim: \
+         {handed:?}"
+    );
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A Python tool that loads the prompt helpers by the path the shim
+/// exports, asks one `select`, and records the Python type and value of
+/// the answer.
+const RECORDING_PY_SELECT_TOOL: &str = r#"import importlib.util
+import os
+
+
+def run(out: str) -> str:
+    """Ask the user to pick one entry and record the answer type.
+
+    Args:
+        out (str): Where to write the answer.
+
+    Returns:
+        str: The answer the user gave.
+    """
+    spec = importlib.util.spec_from_file_location("prompt_utils", os.environ["LLM_PROMPT_UTILS_PY"])
+    pu = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pu)
+    v = pu.select("Pick one entry p5y-q", ["alpha-p5y", "beta-p5y"])
+    with open(out, "w") as f:
+        f.write(type(v).__name__ + ":" + str(v))
+    return "fixture picked: " + str(v) + " p5y-r"
+"#;
+
+/// The Python helper's `select` under the UI: the Select modal offers the
+/// custom row, and text typed there comes back from `select` as a `str`
+/// holding exactly that text (an index is an `int`).
+#[test]
+#[serial]
+fn a_python_tools_select_under_the_ui_returns_the_typed_custom_text_as_a_str() {
+    let dir = fresh_config_dir("tool-py-select-custom");
+    let _guard = TempDirGuard(dir.clone());
+    let out = dir.join("py-select-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_py_select".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture done p5y".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_py_select.py", RECORDING_PY_SELECT_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let asked_at = pty.raw().len();
+    pty.send(b"call the python select tool\r").unwrap();
+    wait_for_the_modal(
+        &mut pty,
+        asked_at,
+        "the python select tool",
+        &["p5y-q", "alpha-p5y", "beta-p5y", "Other (custom)"],
+    );
+    pty.read_for(HOTKEY_GAP);
+    for _ in 0..2 {
+        pty.send(b"\x1b[B").unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+    pty.send(b"\r").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"  typed by hand p5y ").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the python tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done p5y", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "str:  typed by hand p5y ",
+        "the Python `select` did not return the typed text as a str:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A bundle repo whose mcp.json ships two servers, and a local mcp.json
+/// that holds both under different definitions: two conflicts in a row.
+fn two_mcp_conflicts(dir: &Path) -> (PathBuf, String) {
+    let repo = write_bundle_repo(dir, "bundle-k7s", &[]);
+    fs::write(
+        repo.join("mcp.json"),
+        "{\"mcpServers\": {\
+         \"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"echo\", \"args\": [\"k7s\"], \"env\": {}}, \
+         \"bundle-k7s-second\": {\"type\": \"stdio\", \"command\": \"echo\", \"args\": [\"k7s-2\"], \"env\": {}}}}\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "two servers"]);
+    let local = "{\"mcpServers\": {\
+                 \"bundle-k7s-server\": {\"type\": \"stdio\", \"command\": \"printf\", \"args\": [\"local-1-k7s\"], \"env\": {}}, \
+                 \"bundle-k7s-second\": {\"type\": \"stdio\", \"command\": \"printf\", \"args\": [\"local-2-k7s\"], \"env\": {}}}}\n";
+    fs::write(dir.join("mcp.json"), local).unwrap();
+    (repo, local.to_string())
+}
+
+/// Checks what follows Esc on the first of two MCP conflicts: the second
+/// conflict is never asked, exactly one `question was cancelled` note,
+/// both servers kept local, the role installed, nothing refused, and
+/// the local mcp.json unchanged.
+fn assert_both_kept_local_after_one_esc(dir: &Path, local_before: &str, since: &str) {
+    let flat = squeezed(since);
+    assert!(
+        !flat.contains("ConflictonMCPserver'bundle-k7s-second'"),
+        "the second conflict was asked after the first was cancelled:\n{since}"
+    );
+    assert_eq!(
+        flat.matches("thequestionwascancelled").count(),
+        1,
+        "expected exactly one `the question was cancelled` note:\n{since}"
+    );
+    assert!(
+        !flat.contains("Refusingto") && !flat.contains("Abortedmerge") && !flat.contains("Error:"),
+        "Esc on the first conflict refused, aborted or failed the install:\n{since}"
+    );
+    assert!(
+        dir.join("roles").join("bundle-k7s-role.md").exists(),
+        "the bundle's role was not installed:\n{since}"
+    );
+    let before: serde_json::Value = serde_json::from_str(local_before).unwrap();
+    let merged: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("mcp.json")).unwrap()).unwrap();
+    assert_eq!(
+        merged, before,
+        "Esc on the first conflict changed a local server definition:\n{since}"
+    );
+}
+
+/// Under the UI: Esc on the first of two MCP conflict modals keeps both
+/// servers local with one note and never raises the second modal.
+#[test]
+#[serial]
+fn esc_on_the_first_of_two_mcp_conflict_modals_keeps_both_local_with_one_note() {
+    let dir = fresh_config_dir("install-two-mcp-conflicts-esc");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let (repo, local_before) = two_mcp_conflicts(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        install_at,
+        ".install (first MCP conflict)",
+        &["ConflictonMCPserver", "keeplocal"],
+    );
+    let first_is_server = squeezed(&modal).contains("ConflictonMCPserver'bundle-k7s-server'");
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "the question was cancelled.",
+        "the note after Esc on the first MCP conflict modal",
+    );
+    pty.read_for(Duration::from_millis(2500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    let since = if first_is_server {
+        since
+    } else {
+        since
+            .replace("bundle-k7s-server", "SWAP")
+            .replace("bundle-k7s-second", "bundle-k7s-server")
+            .replace("SWAP", "bundle-k7s-second")
+    };
+    assert_both_kept_local_after_one_esc(&dir, &local_before, &since);
+    assert_eq!(
+        count(pty.raw(), LEAVE_ALT),
+        0,
+        "the conflict modal released the terminal:\n{since}"
+    );
+    assert_ui_alive_then_quit(&mut pty, "Esc on the first of two MCP conflicts");
+}
+
+/// In the plain REPL: Esc on the first of two inquire conflict selects
+/// keeps both servers local with one note and never asks the second.
+#[test]
+#[serial]
+fn esc_on_the_first_of_two_mcp_conflicts_in_the_plain_repl_keeps_both_local_with_one_note() {
+    let dir = fresh_config_dir("install-two-mcp-conflicts-esc-repl");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let (repo, local_before) = two_mcp_conflicts(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let install_at = pty.raw().len();
+    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+        .unwrap();
+    pty.wait_for_after("Conflict on MCP server", install_at, PTY_DEADLINE)
+        .expect("`.install` did not ask about the first MCP conflict");
+    pty.read_for(Duration::from_millis(600));
+    let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    let first_is_server = asked.contains("Conflict on MCP server 'bundle-k7s-server'");
+    pty.send(b"\x1b").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "the question was cancelled.",
+        "the note after Esc on the first MCP conflict",
+    );
+    pty.read_for(Duration::from_millis(2500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[install_at..]));
+    let since = if first_is_server {
+        since
+    } else {
+        since
+            .replace("bundle-k7s-server", "SWAP")
+            .replace("bundle-k7s-second", "bundle-k7s-server")
+            .replace("SWAP", "bundle-k7s-second")
+    };
+    assert_both_kept_local_after_one_esc(&dir, &local_before, &since);
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A tool that asks one Input question over the prompt channel with
+/// `"default": ""` on the wire and records the answer it gets back.
+const EMPTY_DEFAULT_INPUT_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user for a label and record the answer.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out id line reply v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   id=\"e0d-$$\"\n\
+    \x20   line=\"$(jq -cn --arg id \"$id\" '{coyote_prompt:{id:$id,action:\"input\",question:\"Label e0d-q\",options:[],default:\"\"}}')\"\n\
+    \x20   printf '%s\\n' \"$line\" >&\"$_COYOTE_PROMPT_OUT\"\n\
+    \x20   while IFS= read -r reply <\"$_COYOTE_PROMPT_REPLY_PATH\"; do\n\
+    \x20       if printf '%s' \"$reply\" | jq -e --arg id \"$id\" '.id == $id' >/dev/null 2>&1; then break; fi\n\
+    \x20   done\n\
+    \x20   v=\"$(printf '%s' \"$reply\" | jq -r 'if (.answer | type) == \"string\" then \"[\" + .answer + \"]\" else \"cancelled\" end')\"\n\
+    \x20   printf '%s' \"$v\" > \"$out\"\n\
+    \x20   echo \"fixture label: $v e0d-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+fn empty_default_turn(dir: &Path) -> (FakeLlm, PathBuf) {
+    let out = dir.join("label-answer");
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_label_rec".to_string(),
+            arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+        },
+        Reply::Text("fixture done e0d".to_string()),
+    ]);
+    write_fake_llm_config(dir, &fake);
+    write_tool(dir, "fixture_label_rec.sh", EMPTY_DEFAULT_INPUT_TOOL);
+    (fake, out)
+}
+
+/// `"default": ""` in the plain REPL is no default: the inquire prompt
+/// shows no `(...)` default hint after the question, and typed text is
+/// the answer.
+#[test]
+#[serial]
+fn a_tools_input_question_with_an_empty_default_shows_no_default_hint_in_the_plain_repl() {
+    let dir = fresh_config_dir("tool-input-empty-default-repl");
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = empty_default_turn(&dir);
+    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+
+    pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let asked_at = pty.raw().len();
+    pty.send(b"call the label tool\r").unwrap();
+    pty.wait_for_after("Label e0d-q", asked_at, PTY_DEADLINE)
+        .expect("the tool's Input question never reached the terminal");
+    pty.read_for(Duration::from_millis(600));
+    let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+    let line = asked
+        .lines()
+        .rev()
+        .find(|line| line.contains("Label e0d-q"))
+        .unwrap()
+        .to_string();
+    let after = line.split("Label e0d-q").nth(1).unwrap_or("");
+    assert!(
+        !after.contains('(') && !after.contains(')'),
+        "`\"default\": \"\"` painted a default hint after the question: {line:?}\n{asked}"
+    );
+    pty.send(b"typed-e0d").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done e0d", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "[typed-e0d]",
+        "{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b".exit\r").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// `"default": ""` under the UI is no default: no dim placeholder text is
+/// painted in the Input modal, and Enter on the untouched field answers
+/// the empty string (nothing substituted for it).
+#[test]
+#[serial]
+fn a_tools_input_question_with_an_empty_default_paints_no_placeholder_under_the_ui() {
+    let dir = fresh_config_dir("tool-input-empty-default-tui");
+    let _guard = TempDirGuard(dir.clone());
+    let (fake, out) = empty_default_turn(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let asked_at = pty.raw().len();
+    pty.send(b"call the label tool\r").unwrap();
+    let modal = wait_for_the_modal(
+        &mut pty,
+        asked_at,
+        "the label tool",
+        &["Labele0d-q", "Enter=answer"],
+    );
+    assert!(
+        !squeezed(&modal).contains("\"\"") && !squeezed(&modal).contains("default:"),
+        "the empty default is rendered as visible text in the modal:\n{modal}"
+    );
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    wait_for_file(&mut pty, &out, "the tool's recorded answer");
+    let transcript = wait_for_squeezed(&mut pty, "fixture done e0d", "the reply after the tool");
+    assert_eq!(
+        fs::read_to_string(&out).unwrap(),
+        "[]",
+        "Enter on the untouched modal with `\"default\": \"\"` did not answer the empty string:\n{transcript}"
+    );
+    assert_eq!(fake.served(), 2, "{transcript}");
+
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A tool that asks one `checkbox` question and records the indices it
+/// got back.
+const RECORDING_CHECKBOX_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Ask the user to tick entries and record the indices.\n\
+    # @option --out! Where to write the answer.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    # shellcheck disable=SC1090\n\
+    source \"$LLM_PROMPT_UTILS_FILE\"\n\
+    \n\
+    main() {\n\
+    \x20   local out v\n\
+    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   v=\"$(checkbox \"Tick entries c3b-q\" alpha-c3b beta-c3b)\"\n\
+    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
+    \x20   echo \"fixture ticked: ${v:-cancelled} c3b-r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// The custom row is for selects only: a tool's `checkbox` question,
+/// in the plain REPL and under the UI, lists the entries with no
+/// `Other (custom)` row.
+#[test]
+#[serial]
+fn a_tools_checkbox_question_stays_closed_with_no_custom_row_in_either_interface() {
+    for ui in ["repl", "tui"] {
+        let dir = fresh_config_dir(&format!("tool-checkbox-closed-{ui}"));
+        let _guard = TempDirGuard(dir.clone());
+        let out = dir.join("checkbox-answer");
+        let fake = FakeLlm::start(vec![
+            Reply::ToolCall {
+                name: "fixture_checkbox_rec".to_string(),
+                arguments: format!("{{\"out\": \"{}\"}}", out.display()),
+            },
+            Reply::Text("fixture done c3b".to_string()),
+        ]);
+        write_fake_llm_config(&dir, &fake);
+        write_tool(&dir, "fixture_checkbox_rec.sh", RECORDING_CHECKBOX_TOOL);
+        let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", ui)], WAIT_WRAPPER, "/dev/tty");
+        if ui == "repl" {
+            pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
+        } else {
+            pty.wait_for("no session", PTY_DEADLINE).unwrap();
+        }
+        pty.read_for(Duration::from_millis(300));
+        let asked_at = pty.raw().len();
+        pty.send(b"call the checkbox tool\r").unwrap();
+        if ui == "repl" {
+            pty.wait_for_after("beta-c3b", asked_at, PTY_DEADLINE)
+                .expect("the checkbox question never reached the terminal");
+        } else {
+            wait_for_the_modal(
+                &mut pty,
+                asked_at,
+                "the checkbox tool",
+                &["c3b-q", "alpha-c3b", "beta-c3b"],
+            );
+        }
+        pty.read_for(Duration::from_millis(800));
+        let asked = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+        assert!(
+            !squeezed(&asked).contains("Other(custom)"),
+            "[{ui}] a tool's checkbox question offers the custom row:\n{asked}"
+        );
+        pty.read_for(HOTKEY_GAP);
+        pty.send(b"\x1b").unwrap();
+        wait_for_file(&mut pty, &out, "the tool's recorded answer");
+        wait_for_squeezed(&mut pty, "fixture done c3b", "the reply after the tool");
+        assert_eq!(
+            fs::read_to_string(&out).unwrap(),
+            "cancelled",
+            "[{ui}] Esc on the checkbox question did not reach the tool as a cancel"
+        );
+        pty.read_for(Duration::from_millis(300));
+        pty.send(if ui == "repl" {
+            b".exit\r" as &[u8]
+        } else {
+            b"\x04"
+        })
+        .unwrap();
+        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE * 2).unwrap();
+        assert_eq!(exit_code(&transcript), 0, "[{ui}] {transcript}");
+        assert_tty_restored(&transcript);
+        assert_eq!(fake.served(), 2, "[{ui}] {transcript}");
+    }
+}
