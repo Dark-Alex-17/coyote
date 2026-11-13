@@ -2369,14 +2369,18 @@ fn send_confirmation(name: &str, destination: &str, trust: &str) -> NoticeText {
     )
 }
 
-/// A peer-side refusal ends with the command the peer's owner runs on that node, which
-/// stays as that owner types it under any prefix; what this node adds after it is its
-/// own and follows the prefix.
-fn quoted_peer_side(err: &dyn std::fmt::Display, remedy: &dyn std::fmt::Display) -> anyhow::Error {
+/// A peer-side refusal shown as `shown`, the refusal with the peer's name as its only peer
+/// run, followed by whatever `err` adds after `remedy`. Every command in it follows the
+/// prefix, the one the peer's user runs on that node included.
+fn quoted_peer_side(
+    err: &dyn std::fmt::Display,
+    remedy: &dyn std::fmt::Display,
+    shown: NoticeText,
+) -> anyhow::Error {
     let whole = err.to_string();
     let remedy = remedy.to_string();
     let text = match whole.strip_prefix(remedy.as_str()) {
-        Some(tail) => NoticeText::default().peer(remedy.as_str()).frame(tail),
+        Some(tail) => shown.frame(tail),
         None => NoticeText::default().peer(whole.as_str()),
     };
     QuotingError::wrap(text)
@@ -2384,22 +2388,24 @@ fn quoted_peer_side(err: &dyn std::fmt::Display, remedy: &dyn std::fmt::Display)
 
 fn quoted_status_failure(err: StatusError) -> anyhow::Error {
     match &err {
-        StatusError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
-        StatusError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        StatusError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal, refusal.notice()),
+        StatusError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer, no_answer.notice()),
         _ => err.into(),
     }
 }
 
 /// A send failure as the REPL shows it: a peer-side refusal quoted as `quoted_peer_side`
-/// quotes it, and a line that opens on the session's hash (busy, unreachable, not
-/// trusted) opened on `who`, its `<user> / <session>` name, quoted as it stands, with the
-/// short hash after it.
+/// quotes it, with the peer named `who`, and a line that opens on the session's hash
+/// (busy, unreachable, not trusted) opened on `who`, its `<user> / <session>` name, quoted
+/// as it stands, with the short hash after it.
 fn quoted_send_failure(err: anyhow::Error, who: &str) -> anyhow::Error {
     let (word, lead, destination) = match err.downcast_ref::<SendError>() {
         Some(send @ SendError::NotTrustedByPeer(refusal)) => {
-            return quoted_peer_side(send, refusal);
+            return quoted_peer_side(send, refusal, refusal.clone().named(Some(who)).notice());
         }
-        Some(send @ SendError::NoAnswer(no_answer)) => return quoted_peer_side(send, no_answer),
+        Some(send @ SendError::NoAnswer(no_answer)) => {
+            return quoted_peer_side(send, no_answer, no_answer.clone().named(Some(who)).notice());
+        }
         Some(SendError::Throttled { destination }) => {
             ("", short(destination).to_string(), destination.clone())
         }
@@ -2441,12 +2447,17 @@ fn session_led(
 }
 
 /// An access request failure as the REPL shows it: a peer-side refusal quoted as
-/// `quoted_peer_side` quotes it, and a busy or unreachable session named by `who`, its
-/// `<user> / <session>` name, as `quoted_send_failure` names it.
+/// `quoted_peer_side` quotes it, and the peer of that refusal or a busy or unreachable
+/// session named by `who`, its `<user> / <session>` name, as `quoted_send_failure` names
+/// it.
 fn quoted_access_failure(err: AccessError, destination: &str, who: &str) -> anyhow::Error {
     let (word, lead) = match &err {
-        AccessError::NotTrustedByPeer(refusal) => return quoted_peer_side(&err, refusal),
-        AccessError::NoAnswer(no_answer) => return quoted_peer_side(&err, no_answer),
+        AccessError::NotTrustedByPeer(refusal) => {
+            return quoted_peer_side(&err, refusal, refusal.clone().named(Some(who)).notice());
+        }
+        AccessError::NoAnswer(no_answer) => {
+            return quoted_peer_side(&err, no_answer, no_answer.clone().named(Some(who)).notice());
+        }
         AccessError::Throttled { destination } => ("", short(destination).to_string()),
         AccessError::UnknownDestination { .. } => ("Session ", "The session".to_string()),
         _ => return anyhow!(err.to_string()),
@@ -2457,8 +2468,12 @@ fn quoted_access_failure(err: AccessError, destination: &str, who: &str) -> anyh
 
 fn quoted_fetch_failure(err: FileFetchError) -> anyhow::Error {
     match &err {
-        FileFetchError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal),
-        FileFetchError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer),
+        FileFetchError::NotTrustedByPeer(refusal) => {
+            quoted_peer_side(&err, refusal, refusal.notice())
+        }
+        FileFetchError::NoAnswer(no_answer) => {
+            quoted_peer_side(&err, no_answer, no_answer.notice())
+        }
         _ => anyhow!(err.to_string()),
     }
 }
@@ -2564,7 +2579,7 @@ mod peer_side_refusal_tests {
     }
 
     #[test]
-    fn a_peer_refusal_keeps_the_owner_remedy_and_name_as_written_in_every_verb() {
+    fn a_peer_refusal_spells_its_remedy_in_the_prefix_and_keeps_the_name_in_every_verb() {
         let refused = refusal().to_string();
         let cases: [(fn() -> anyhow::Error, String); 4] = [
             (
@@ -2576,13 +2591,13 @@ mod peer_side_refusal_tests {
                     quoted_access_failure(
                         AccessError::NotTrustedByPeer(refusal()),
                         &"ab".repeat(16),
-                        "unused",
+                        ".session",
                     )
                 },
                 refused.clone(),
             ),
             (
-                || quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into(), "unused"),
+                || quoted_send_failure(SendError::NotTrustedByPeer(refusal()).into(), ".session"),
                 refused.clone(),
             ),
             (
@@ -2600,20 +2615,27 @@ mod peer_side_refusal_tests {
                 slash.starts_with("Error: `/mesh files fetch` failed"),
                 "{slash}"
             );
-            assert!(slash.ends_with(&format!("    {today}")), "{slash}");
+            assert!(
+                slash.ends_with(&format!("    {}", today.replace(".mesh ", "/mesh "))),
+                "{slash}"
+            );
             assert!(slash.contains(&format!("\"{}\"", ".session")), "{slash}");
             assert!(
                 slash.contains(&format!(
-                    "can run .mesh access trust session {}",
+                    "Its user can run /mesh access trust session {}",
                     "cd".repeat(16)
                 )),
+                "{slash}"
+            );
+            assert!(
+                !slash.contains(" .mesh ") && !slash.contains("`.mesh"),
                 "{slash}"
             );
         }
     }
 
     #[test]
-    fn silence_keeps_the_owner_remedy_while_this_node_hint_slashes() {
+    fn silence_spells_the_remedy_and_this_node_hint_in_the_prefix() {
         let no_answer = NoAnswer::new(&"ab".repeat(16), "cd".repeat(16));
         let err = AccessError::NoAnswer(no_answer.clone());
         let today = err.to_string();
@@ -2622,25 +2644,48 @@ mod peer_side_refusal_tests {
                 quoted_access_failure(
                     AccessError::NoAnswer(no_answer.clone()),
                     &"ab".repeat(16),
-                    "unused"
+                    "abababab"
                 ),
                 CommandPrefix::Dot
             ),
-            shown_as(anyhow!(today.clone()), CommandPrefix::Dot)
+            shown_as(
+                anyhow!(today.replace("from abababab:", "from \"abababab\" (abababab):")),
+                CommandPrefix::Dot
+            )
         );
         let slash = shown_as(
-            quoted_access_failure(err, &"ab".repeat(16), "unused"),
+            quoted_access_failure(err, &"ab".repeat(16), "abababab"),
             CommandPrefix::Slash,
         );
-        let tail = today.strip_prefix(&no_answer.to_string()).unwrap();
+        assert!(today.contains("`.mesh people list`"), "{today}");
+        assert!(slash.contains("`/mesh people list`"), "{slash}");
         assert!(
-            slash.ends_with(&format!(
-                "    {no_answer}{}",
-                tail.replace("`.mesh people list`", "`/mesh people list`")
-            )),
+            slash.contains("(or /mesh access unblock session "),
             "{slash}"
         );
-        assert!(tail.contains("`.mesh people list`"), "{tail}");
+        assert!(
+            !slash.contains(" .mesh ") && !slash.contains("`.mesh"),
+            "{slash}"
+        );
+    }
+
+    /// A send's refusal names the session the way the preview line before it did, by
+    /// the name this session knows it under rather than the hash-built one, and the
+    /// commands in it follow the prefix.
+    #[test]
+    fn a_send_refusal_names_the_session_as_the_preview_did_under_the_slash_prefix() {
+        let destination = "5d".repeat(16);
+        let no_answer =
+            NoAnswer::new(&destination, "ab".repeat(16)).named(Some("01a53635 / 5d5d5d5d"));
+        let slash = shown_as(
+            quoted_send_failure(SendError::NoAnswer(no_answer).into(), "Alice / notes"),
+            CommandPrefix::Slash,
+        );
+
+        assert!(slash.contains("/mesh access trust session"), "{slash}");
+        assert!(!slash.contains(" .mesh "), "{slash}");
+        assert!(slash.contains("\"Alice / notes\" (5d5d5d5d)"), "{slash}");
+        assert!(!slash.contains("01a53635"), "{slash}");
     }
 }
 
@@ -28085,7 +28130,7 @@ mod tests {
                     assert_eq!(
                         err,
                         format!(
-                            "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({a_instance}). Its owner can run .mesh access trust session {a_instance} (or .mesh access unblock session {a_instance} if they blocked this session). (You do trust them.) A status request is answered live or not at all; nothing queues it for later.",
+                            "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({a_instance}). Its user can run .mesh access trust session {a_instance} (or .mesh access unblock session {a_instance} if they blocked this session). (You do trust them.) A status request is answered live or not at all; nothing queues it for later.",
                             d8 = short(&b_hex),
                             i8 = short(&pair.responder.desc.identity.address_hash.to_hex_string())
                         )
@@ -36989,7 +37034,7 @@ mod tests {
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                        "\"Tia / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(
@@ -37065,7 +37110,7 @@ mod tests {
                             .who(started.runtime.identity_at(&peer).as_deref(), &peer)
                             .to_string();
                         let no_answer = format!(
-                            "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
+                            "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
                             short(&peer)
                         );
 
@@ -37248,7 +37293,7 @@ mod tests {
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
@@ -52239,7 +52284,11 @@ mod tests {
                             .into_iter()
                             .map(|correlation| correlation.record.id)
                             .collect();
-                        assert_eq!(open, [id.clone()], "a follow-up opens nothing of its own");
+                        assert_eq!(
+                            open,
+                            std::slice::from_ref(&id),
+                            "a follow-up opens nothing of its own"
+                        );
                         fx.stop().await;
                     });
                 }

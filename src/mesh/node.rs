@@ -20245,7 +20245,7 @@ mod tests {
         assert_eq!(sentence.matches(&new_hash).count(), 3, "{sentence}");
         assert!(
             sentence.contains(&format!(
-                "Its owner can run .mesh access trust session {new_hash} (or .mesh access unblock session {new_hash} if they blocked this session)."
+                "Its user can run .mesh access trust session {new_hash} (or .mesh access unblock session {new_hash} if they blocked this session)."
             )),
             "{sentence}"
         );

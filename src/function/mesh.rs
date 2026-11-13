@@ -9837,7 +9837,7 @@ mod tests {
 
             let i8 = short(&live.stub.identity_hex()).to_string();
             let refusal = format!(
-                "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
             );
             let next_action = format!(
                 "Nothing on your side unblocks it: ask the person at \"{i8} / {d8}\" ({d8}) to run .mesh access trust session {own}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
@@ -10007,7 +10007,7 @@ mod tests {
             let cee_d8 = short(&cee.destination_hex()).to_string();
             let cee_i8 = short(&cee.identity_hex()).to_string();
             let refusal = format!(
-                "\"{cee_i8} / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                "\"{cee_i8} / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
             );
             let next_action = format!(
                 "Nothing on your side unblocks it: ask the person at \"{cee_i8} / {cee_d8}\" ({cee_d8}) to run .mesh access trust session {own}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."

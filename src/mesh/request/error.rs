@@ -1,5 +1,6 @@
 use crate::mesh::display_text;
 use crate::mesh::message::left_mesh_hint_when;
+use crate::mesh::notify::NoticeText;
 use crate::mesh::people::WHO_MAX_CHARS;
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::short;
@@ -326,6 +327,18 @@ impl RemoteRefusal {
         }
     }
 
+    /// The same refusal with the peer named `<user> / <session>`, as `NoAnswer::named`
+    /// names it.
+    pub(crate) fn named(mut self, display_name: Option<&str>) -> Self {
+        self.display_name = display_name.and_then(|name| display_text(name, WHO_MAX_CHARS));
+        self
+    }
+
+    /// The sentence as the terminal shows it, the peer's name its only peer run.
+    pub(crate) fn notice(&self) -> NoticeText {
+        name_quoted(&self.to_string(), self.display_name.as_deref())
+    }
+
     /// What the model can still do about it, for a tool result's `next_action`. A
     /// default-closed refusal already filed the request as a request to be trusted on the
     /// peer, so nothing here is left to send; a peer that blocked this session, or one
@@ -333,14 +346,14 @@ impl RemoteRefusal {
     pub(crate) fn next_action(&self) -> String {
         format!(
             "Nothing on your side unblocks it: ask the person at {} to run .mesh access trust session {}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
-            self.named(),
+            self.named_peer(),
             self.own_destination
         )
     }
 
     /// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, or the short
     /// hash alone when no name was given.
-    fn named(&self) -> String {
+    fn named_peer(&self) -> String {
         let dest8 = short(&self.destination);
         match &self.display_name {
             Some(name) => format!("\"{}\" ({dest8})", name.replace('"', "'")),
@@ -373,9 +386,24 @@ impl fmt::Display for RemoteRefusal {
         }
         write!(
             f,
-            " refused the request: it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)",
+            " refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)",
             own = self.own_destination
         )
+    }
+}
+
+/// `sentence` with the first quoted `display_name` in it, as the sentences quote it, kept
+/// as a peer run and the rest as this node's own text, so every command in it follows
+/// the prefix while the name stays as written.
+fn name_quoted(sentence: &str, display_name: Option<&str>) -> NoticeText {
+    let Some(name) = display_name.map(|name| name.replace('"', "'")) else {
+        return NoticeText::from(sentence);
+    };
+    match sentence.split_once(&format!("\"{name}\"")) {
+        Some((before, after)) => NoticeText::from(format!("{before}\""))
+            .peer(name)
+            .frame(format!("\"{after}")),
+        None => NoticeText::from(sentence),
     }
 }
 
@@ -405,6 +433,11 @@ impl NoAnswer {
     pub(crate) fn named(mut self, display_name: Option<&str>) -> Self {
         self.display_name = display_name.and_then(|name| display_text(name, WHO_MAX_CHARS));
         self
+    }
+
+    /// The sentence as the terminal shows it, as `RemoteRefusal::notice` builds it.
+    pub(crate) fn notice(&self) -> NoticeText {
+        name_quoted(&self.to_string(), self.display_name.as_deref())
     }
 
     /// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, or the short
@@ -444,7 +477,7 @@ impl fmt::Display for NoAnswer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "no answer from {}: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
+            "no answer from {}: most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
             self.named_peer(),
             own = self.own_destination
         )
@@ -464,7 +497,7 @@ mod no_answer_tests {
         assert_eq!(
             no_answer.to_string(),
             format!(
-                "no answer from bbbbbbbb: most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session)."
+                "no answer from bbbbbbbb: most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session)."
             )
         );
         let next = no_answer.next_action();
