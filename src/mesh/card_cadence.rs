@@ -163,7 +163,7 @@ impl CardCadence {
     }
 
     /// Forgets that `destination` was heard, as a new run starts out.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn forget_heard(&self, destination: &str) {
         self.state.lock().heard.remove(destination);
     }

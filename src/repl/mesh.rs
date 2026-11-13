@@ -19065,6 +19065,7 @@ mod tests {
         use crate::config::{AppConfig, AppState, Session, WorkingMode};
         #[cfg(unix)]
         use crate::mesh::message::{answered_not_as_coyote, unanswered_path_request};
+        #[cfg(unix)]
         use crate::mesh::pending::CorrelationKind;
         use crate::repl::run_repl_command;
         use crate::testing::TestConfigDirGuard;
@@ -20877,6 +20878,7 @@ mod tests {
         }
 
         /// The three open-id listings one after another, typed under `sigil`.
+        #[cfg(unix)]
         async fn pending_out(ctx: &mut RequestContext, sigil: &str) -> Result<String> {
             let mut lists = Vec::new();
             for path in ["envoy questions", "files requests", "messaging sent"] {

@@ -1474,7 +1474,7 @@ impl MeshRuntime {
 
     /// A sighting of another session of this node's own identity at instance `instance`,
     /// whose destination re-derives from the identity as a real announce's does.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn own_session_sighting(&self, instance: &str, display_name: &str) -> PeerSighting {
         let name = session_destination_name(instance);
         let announced = SingleInputDestination::new(self.transport_identity.clone(), name);
@@ -1607,7 +1607,7 @@ impl MeshRuntime {
     /// joins the list when the interface watcher sees it come up; `mesh.started` fired once
     /// at install with the kinds connected then and nothing refires on a later connect,
     /// so a hook consumer learns of it only through `.mesh config show`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn interfaces(&self) -> Vec<String> {
         self.connected_interfaces()
             .map(|status| status.label)
