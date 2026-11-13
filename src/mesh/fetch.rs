@@ -1495,18 +1495,18 @@ pub(crate) fn not_shared_sentence(
 /// arm names the one thing to do next and the `mesh__request_access` call the result's
 /// `next_action` spells out. `PeerWithoutFetch` reads as `Unknown`, since a `not_shared`
 /// answer never carries it; the tool reports a peer without file service from the
-/// refusal that says so.
+/// refusal that says so. `peer` names the session in local words only.
 pub(crate) fn not_shared_tool_message(peer: &str, shown: &str, reason: &NotSharedReason) -> String {
     match reason {
         NotSharedReason::AlreadyFetched { .. } => format!(
-            "`{shown}` was a one-time attachment from {peer} and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+            "`{shown}` was a one-time attachment from {peer} and you already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
         ),
         NotSharedReason::GrantExpired { expires } => format!(
             "The grant for `{shown}` from {peer} expired at {expires}; ask again with the mesh__request_access call in next_action; its human decides.",
             expires = rfc3339_utc(*expires)
         ),
         NotSharedReason::PeerWithoutFetch | NotSharedReason::Unknown => format!(
-            "{peer} did not serve `{shown}`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
+            "{peer} did not serve `{shown}`: either it is not shared with you or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text."
         ),
     }
 }
@@ -1521,7 +1521,7 @@ pub(crate) fn spent_attachment_tool_message(
 ) -> String {
     let gone = if staged_present { "" } else { GONE_COPY_TAIL };
     format!(
-        "`{shown}` was a one-time attachment from {peer} and this node already fetched it; read it at `already_staged_at`.{gone} This was answered from this node's own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
+        "`{shown}` was a one-time attachment from {peer} and you already fetched it; read it at `already_staged_at`.{gone} This was answered from your own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
     )
 }
 
@@ -3713,7 +3713,7 @@ mod tests {
     fn the_tool_message_gives_the_model_one_next_step_per_reason() {
         let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let message = |reason| not_shared_tool_message("abcd1234", "docs/a.md", &reason);
-        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with this node or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
+        let unknown = "abcd1234 did not serve `docs/a.md`: either it is not shared with you or it does not exist there - a peer never says which. Ask for it with the mesh__request_access call in next_action; its human decides. Do not ask the peer's envoy for the file in free text.";
         assert_eq!(message(NotSharedReason::Unknown), unknown);
         assert_eq!(
             message(NotSharedReason::PeerWithoutFetch),
@@ -3725,7 +3725,7 @@ mod tests {
                 message_id: "m-1".to_string(),
                 staged: PathBuf::from("/inbox/peer/docs/a.md"),
             }),
-            "`docs/a.md` was a one-time attachment from abcd1234 and this node already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
+            "`docs/a.md` was a one-time attachment from abcd1234 and you already fetched it; read it at `already_staged_at`. A fresh copy needs the peer to attach it again; the mesh__request_access call in next_action asks its human."
         );
         assert_eq!(
             message(NotSharedReason::GrantExpired { expires }),

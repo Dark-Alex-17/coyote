@@ -638,11 +638,11 @@ impl fmt::Display for StatusError {
             ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
-                "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
+                "The session accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <session> does; ask that session's user to upgrade, then try again"
             ),
             Self::NotServed(DispatchError::UnknownPath { path_hash }) => write!(
                 f,
-                "An older mesh node answered unknown_path for hash {path_hash}; this Coyote no longer sends that answer, so the peer is running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
+                "The session answered unknown_path for path hash {path_hash}, an answer only an older Coyote sends, so it runs a different Coyote from yours; ask that session's user which Coyote they run, and upgrade the older side"
             ),
             Self::Malformed(reason) => write!(
                 f,
@@ -2314,7 +2314,7 @@ mod tests {
         assert_eq!(
             not_served,
             format!(
-                "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
+                "The session accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <session> does; ask that session's user to upgrade, then try again"
             )
         );
         let unknown_path = StatusError::NotServed(DispatchError::UnknownPath {
@@ -2323,7 +2323,7 @@ mod tests {
         .to_string();
         assert_eq!(
             unknown_path,
-            "An older mesh node answered unknown_path for hash 0a0b; this Coyote no longer sends that answer, so the peer is running a different Coyote; ask the person at that node which Coyote it runs, and upgrade the older side"
+            "The session answered unknown_path for path hash 0a0b, an answer only an older Coyote sends, so it runs a different Coyote from yours; ask that session's user which Coyote they run, and upgrade the older side"
         );
         let transport = StatusError::Transport(RequestError::NotRunning).to_string();
         assert!(

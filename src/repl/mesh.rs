@@ -36963,7 +36963,7 @@ mod tests {
                     assert_eq!(
                         err,
                         format!(
-                            "The mesh peer accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <destination> does; ask the person at that node to upgrade, then try again"
+                            "The session accepted the request but serves nothing at {STATUS_PATH}; it may be running an older Coyote without a status provider. mesh__peers --with_status shows its last card; at the prompt .mesh people info <session> does; ask that session's user to upgrade, then try again"
                         )
                     );
                     assert!(!err.contains("0x"), "{err}");

@@ -22571,7 +22571,7 @@ mod tests {
             broadcast["message"]
                 .as_str()
                 .unwrap()
-                .starts_with("No peer this node trusts has a known path right now;"),
+                .starts_with("No session you trust has a known path right now;"),
             "{broadcast}"
         );
 

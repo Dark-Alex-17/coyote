@@ -6028,6 +6028,13 @@ impl MeshSlot {
             .unwrap_or_default()
     }
 
+    /// `MeshRuntime::owner_namer`; with the mesh off nothing is named.
+    pub(crate) fn owner_namer(&self) -> Namer {
+        self.get()
+            .map(|runtime| runtime.owner_namer())
+            .unwrap_or_default()
+    }
+
     /// `<user> / <session>` for the session at `destination` of `identity`; empty for a
     /// message that names no session.
     pub(crate) fn who(&self, identity: &str, destination: &str) -> String {
