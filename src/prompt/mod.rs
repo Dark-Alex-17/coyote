@@ -409,10 +409,12 @@ pub(crate) fn required_input(
 }
 
 /// The default an input offers, as the text the widget shows: a
-/// string as it is, any other value (a number, a bool) rendered.
+/// string as it is, any other value (a number, a bool) rendered. An
+/// empty string offers nothing, like no default at all.
 pub(crate) fn input_default_text(req: &PromptRequest) -> Option<String> {
     match req.default.as_ref()? {
         Value::Null => None,
+        Value::String(text) if text.is_empty() => None,
         Value::String(text) => Some(text.clone()),
         other => Some(other.to_string()),
     }
@@ -803,6 +805,15 @@ mod tests {
         );
         assert_eq!(input_default_text(&input(Some(Value::Null))), None);
         assert_eq!(input_default_text(&input(None)), None);
+    }
+
+    #[test]
+    fn an_empty_string_input_default_is_no_default() {
+        let req = PromptRequest {
+            default: Some(json!("")),
+            ..request(PromptAction::Input, Some("tool-x"))
+        };
+        assert_eq!(input_default_text(&req), None);
     }
 
     /// Which widget a select gets depends on who asks: a closed command
