@@ -52222,6 +52222,56 @@ mod tests {
                             listed.contains(".mesh messaging follow-up <id> \"<text>\""),
                             "{listed}"
                         );
+
+                        out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging follow-up {id} \"and the tests too\""),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(fx.stub.seen().len(), 2, "the follow-up went out");
+                        let open: Vec<String> = fx
+                            .ctx
+                            .app
+                            .mesh
+                            .correlations()
+                            .list()
+                            .into_iter()
+                            .map(|correlation| correlation.record.id)
+                            .collect();
+                        assert_eq!(open, [id.clone()], "a follow-up opens nothing of its own");
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn a_messaging_send_the_peer_refuses_abandons_its_correlation() {
+                    use crate::mesh::test_support::{Handler, MESSAGE_PATH};
+                    use lend_gate::Gate;
+                    use std::sync::atomic::Ordering;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-send-abandon");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-send-abandon").await;
+                        let gate = Arc::new(Gate::default());
+                        gate.armed.store(true, Ordering::SeqCst);
+                        fx.stub
+                            .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
+                        let to = fx.stub.destination_hex();
+
+                        refusal(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging send {to} --yes \"x\""),
+                        )
+                        .await;
+
+                        assert!(
+                            fx.ctx.app.mesh.correlations().list().is_empty(),
+                            "the refused message abandons its correlation"
+                        );
                         fx.stop().await;
                     });
                 }
@@ -53591,6 +53641,10 @@ mod tests {
                         }
                         assert_eq!(fx.pending_ids(), ["q-1"], "the question is still open");
                         assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
+                        assert!(
+                            fx.ctx.app.mesh.correlations().list().is_empty(),
+                            "the refused message abandons its correlation"
+                        );
 
                         gate.armed.store(false, Ordering::SeqCst);
                         let out =

@@ -11478,6 +11478,33 @@ mod tests {
     }
 
     #[test]
+    fn an_escalated_reply_to_our_message_keeps_it_open_and_points_at_the_inbox() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                kind: CorrelationKind::Message,
+                ..pending("m-1")
+            })
+            .unwrap();
+        let mut escalated = peer_message(PeerKind::Reply, "r-1", Some("m-1"));
+        escalated.thread = Some("m-1".to_string());
+        escalated.disposition = Some(Disposition::Escalated);
+
+        slot.deliver_peer(escalated);
+
+        let open = slot
+            .correlations()
+            .get("m-1")
+            .expect("the message waits for the human's reply");
+        assert_eq!(open.record.state, PendingState::Escalated);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].event, "peer_escalated");
+        assert_eq!(notes[0].id, "m-1");
+        assert_eq!(notes[0].next_action, CHECK_INBOX_NEXT_ACTION);
+    }
+
+    #[test]
     fn an_accepted_reply_without_a_thread_inherits_the_question_thread() {
         let slot = MeshSlot::default();
         slot.correlations()

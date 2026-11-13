@@ -8665,6 +8665,66 @@ mod tests {
                 "the reply closes the message's correlation"
             );
 
+            let note = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}send"),
+                &json!({"to": to, "message": "still reading it", "in_reply_to": "r-1"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(note["status"], "sent", "{note}");
+            assert!(
+                ctx.app.mesh.correlations().list().is_empty(),
+                "a send answering the peer opens nothing"
+            );
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            stub.stop().await;
+        }
+
+        /// The correlation is opened before the send, since the identity is known, and the
+        /// refusal abandons it, so no message nobody received waits for a reply.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn a_failed_mesh_send_abandons_the_message_correlation() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-send-abandon");
+            let stub =
+                PeerStub::listen("mesh-tool-send-abandon-stub", TcpServer::DEFAULT_CLIENT_MTU)
+                    .await;
+            let started = started_runtime_on("mesh-tool-send-abandon", stub.port()).await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            stub.wait_to_be_filed(&runtime.peers(), &to).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let sent = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}send"),
+                &json!({"to": to, "message": "can you review the branch?"}),
+            )
+            .await
+            .unwrap();
+
+            assert_ne!(
+                sent["status"], "sent",
+                "the stub has not trusted us: {sent}"
+            );
+            assert!(
+                ctx.app.mesh.correlations().list().is_empty(),
+                "the failed send abandons its correlation: {sent}"
+            );
+
             assert!(ctx.app.mesh.stop().await.unwrap());
             stub.stop().await;
         }
@@ -11872,6 +11932,15 @@ mod tests {
                     .get(&to_a)
                     .expect("B filed A's row from the answer");
                 assert_eq!(row.identity_hash, identity_of_a);
+                let opened = ctx
+                    .app
+                    .mesh
+                    .correlations()
+                    .get(sent["id"].as_str().unwrap())
+                    .expect("a first contact opens the message's correlation once A is filed");
+                assert_eq!(opened.record.kind, CorrelationKind::Message);
+                assert_eq!(opened.record.peer_identity, identity_of_a);
+                assert_eq!(opened.record.peer_destination, to_a);
 
                 wait_until("A's inbox to hold B's message", || {
                     slot_a.peer_inbox().len() > 0
