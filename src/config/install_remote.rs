@@ -24,12 +24,25 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::{fs, iter};
 
+/// What follows "Re-run in a terminal" when an install or update
+/// conflict has nowhere to ask its question, under the CLI, whose
+/// `--install` takes `--install-force` and whose `--update-bundle`
+/// takes `--yes`.
+pub(crate) const CLI_CONFLICT_REMEDY: &str =
+    ", with --install-force (installs), or with --yes (updates).";
+/// The same under the REPL, whose `.install` takes `--force` for a
+/// remote install and offers no flag for a bundle update.
+pub(crate) const REPL_CONFLICT_REMEDY: &str = ", with --force (installs).";
+
 /// How an install or update talks to its user: the prefix its hints are
-/// rendered with and the prompter its menus ask through.
+/// rendered with, the prompter its menus ask through, and what a
+/// conflict refusal names as the way around the missing terminal.
 #[derive(Clone, Copy)]
 pub(crate) struct InstallIo<'a> {
     pub(crate) prefix: CommandPrefix,
     pub(crate) prompter: &'a dyn Prompter,
+    /// [`CLI_CONFLICT_REMEDY`] or [`REPL_CONFLICT_REMEDY`].
+    pub(crate) remedy: &'static str,
 }
 
 #[cfg(test)]
@@ -42,6 +55,7 @@ fn install_remote(
     let io = InstallIo {
         prefix: CommandPrefix::default(),
         prompter,
+        remedy: CLI_CONFLICT_REMEDY,
     };
     install_remote_with_io(git_url, filter, force, io)
 }
@@ -89,7 +103,7 @@ fn install_remote_with_io(
         } else {
             StickyMode::None
         };
-        apply_plan(&plan, sticky, &mut store, &bundle, io.prompter)?;
+        apply_plan(&plan, sticky, &mut store, &bundle, io)?;
     }
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
@@ -101,7 +115,7 @@ fn install_remote_with_io(
             force,
             &HashSet::new(),
             false,
-            io.prompter,
+            io,
         )?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
@@ -358,6 +372,7 @@ pub fn update_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -> R
         InstallIo {
             prefix: CommandPrefix::default(),
             prompter,
+            remedy: CLI_CONFLICT_REMEDY,
         },
     )
 }
@@ -421,7 +436,7 @@ fn update_bundle_with_io(spec: &str, assume_yes: bool, io: InstallIo<'_>) -> Res
         } else {
             StickyMode::None
         };
-        apply_plan(&plan, sticky, &mut store, &bundle, io.prompter)?;
+        apply_plan(&plan, sticky, &mut store, &bundle, io)?;
     }
 
     handle_obsolete_files(&mut store, &bundle, &plan, assume_yes, io.prompter)?;
@@ -430,13 +445,7 @@ fn update_bundle_with_io(spec: &str, assume_yes: bool, io: InstallIo<'_>) -> Res
         let local = local_mcp.exists().then_some(local_mcp.as_path());
         let auto_take = owned_unmodified_mcp_keys(&store, &bundle, local)?;
         let report = merge_mcp_json(
-            local,
-            remote_mcp,
-            local_mcp,
-            false,
-            &auto_take,
-            assume_yes,
-            io.prompter,
+            local, remote_mcp, local_mcp, false, &auto_take, assume_yes, io,
         )?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
@@ -634,7 +643,7 @@ fn print_note(note: &str) {
     println!("{note}");
 }
 
-/// Why a keep-or-delete menu produced no answer.
+/// Why a conflict menu produced no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoAnswer {
     Cancelled,
@@ -2073,7 +2082,7 @@ fn apply_plan(
     initial_mode: StickyMode,
     store: &mut BundleStore,
     bundle: &str,
-    prompter: &dyn Prompter,
+    io: InstallIo<'_>,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport {
         new_count: 0,
@@ -2103,8 +2112,8 @@ fn apply_plan(
                 &planned.dst,
                 planned.top_category.label(),
                 &mut sticky,
-                NonInteractive::Bail,
-                prompter,
+                NonInteractive::Bail { remedy: io.remedy },
+                io.prompter,
             )? {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
@@ -2229,7 +2238,7 @@ struct McpMergeReport {
     missing_secrets: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum McpConflictAction {
     KeepLocal,
     TakeRemote,
@@ -2243,7 +2252,7 @@ fn merge_mcp_json(
     force: bool,
     auto_take: &HashSet<String>,
     assume_yes: bool,
-    prompter: &dyn Prompter,
+    io: InstallIo<'_>,
 ) -> Result<McpMergeReport> {
     let remote_content = fs::read_to_string(remote)
         .with_context(|| format!("failed to read remote mcp.json at {}", remote.display()))?;
@@ -2283,7 +2292,7 @@ fn merge_mcp_json(
             let action = if auto_take.contains(&name) {
                 McpConflictAction::TakeRemote
             } else {
-                resolve_mcp_conflict(&name, force, assume_yes, prompter)?
+                resolve_mcp_conflict(&name, force, assume_yes, io, &mut print_note)?
             };
             match action {
                 McpConflictAction::KeepLocal => report.kept_local.push(name),
@@ -2351,11 +2360,16 @@ fn merge_mcp_json(
     Ok(report)
 }
 
+/// The answer to an MCP server the remote and the local mcp.json both
+/// define differently. No answer (the question closed, or nobody to ask
+/// it) keeps the local server, and `note` gets one line saying so; a
+/// run with no terminal at all is refused before the question.
 fn resolve_mcp_conflict(
     name: &str,
     force: bool,
     assume_yes: bool,
-    prompter: &dyn Prompter,
+    io: InstallIo<'_>,
+    note: &mut dyn FnMut(&str),
 ) -> Result<McpConflictAction> {
     if force {
         return Ok(McpConflictAction::TakeRemote);
@@ -2366,13 +2380,13 @@ fn resolve_mcp_conflict(
     if !conflict::menu_can_use_terminal() {
         return Err(conflict::refuse_non_interactive(
             format_args!("merge the already-installed MCP server '{name}'"),
-            ", with --install-force (installs), or with --yes (updates).",
+            io.remedy,
         ));
     }
     let rename_label = format!("rename remote as \"{name}-remote\"");
     let prompt = format!("Conflict on MCP server '{name}'");
-    let choice = select_closed(
-        prompter,
+    let choice = match select_closed_or_cancel(
+        io.prompter,
         &prompt,
         vec![
             "keep local".to_string(),
@@ -2380,8 +2394,14 @@ fn resolve_mcp_conflict(
             rename_label.clone(),
             "abort merge".to_string(),
         ],
-    )
-    .with_context(|| "failed to read MCP conflict choice")?;
+    ) {
+        Ok(Some(choice)) => choice,
+        Ok(None) => return Ok(keep_local_unanswered(name, NoAnswer::Cancelled, note)),
+        Err(err) if NeedsHuman::caused(&err) => {
+            return Ok(keep_local_unanswered(name, NoAnswer::NobodyToAsk, note));
+        }
+        Err(err) => return Err(err).with_context(|| "failed to read MCP conflict choice"),
+    };
 
     if choice == "keep local" {
         Ok(McpConflictAction::KeepLocal)
@@ -2392,8 +2412,20 @@ fn resolve_mcp_conflict(
     } else if choice == "abort merge" {
         bail!("Aborted MCP merge by user.")
     } else {
-        unreachable!("select_closed only hands back an offered option")
+        unreachable!("select_closed_or_cancel only hands back an offered option")
     }
+}
+
+fn keep_local_unanswered(
+    name: &str,
+    why: NoAnswer,
+    note: &mut dyn FnMut(&str),
+) -> McpConflictAction {
+    note(&format!(
+        "Kept the local MCP server '{name}': {}.",
+        why.reason()
+    ));
+    McpConflictAction::KeepLocal
 }
 
 fn unique_renamed_key(name: &str, existing: &IndexMap<String, McpServer>) -> String {
@@ -2608,6 +2640,7 @@ mod tests {
         InstallIo {
             prefix: CommandPrefix::Dot,
             prompter,
+            remedy: CLI_CONFLICT_REMEDY,
         }
     }
 
@@ -3214,7 +3247,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -3246,7 +3279,7 @@ mod tests {
             true,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -3281,7 +3314,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
 
@@ -3319,7 +3352,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &prompter,
+            dot_io(&prompter),
         )
         .unwrap();
 
@@ -3350,14 +3383,68 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Closing the MCP conflict menu keeps the local server, says so
+    /// once, and asks nothing more.
     #[test]
     #[serial]
-    fn resolve_mcp_conflict_with_no_human_is_refused() {
+    fn cancelling_the_mcp_conflict_question_keeps_the_local_server() {
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut notes = Vec::new();
 
-        let err = resolve_mcp_conflict("alpha", false, false, &HeadlessPrompter).unwrap_err();
+        let action = resolve_mcp_conflict("alpha", false, false, dot_io(&prompter), &mut |note| {
+            notes.push(note.to_string())
+        })
+        .unwrap();
 
-        assert!(NeedsHuman::caused(&err), "{err:#}");
+        assert_eq!(action, McpConflictAction::KeepLocal);
+        assert_eq!(
+            notes,
+            ["Kept the local MCP server 'alpha': the question was cancelled."]
+        );
+        assert_eq!(prompter.requests().len(), 1);
+    }
+
+    /// With a terminal but no human to answer, the MCP conflict menu's
+    /// refusal is the keep-local answer with its own note; a run with no
+    /// terminal at all is still refused before the question.
+    #[test]
+    #[serial]
+    fn a_headless_mcp_conflict_question_keeps_the_local_server() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let script = conflict::prompt_script::install(&[]);
+        let mut notes = Vec::new();
+
+        let action = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&HeadlessPrompter),
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, McpConflictAction::KeepLocal);
+        assert_eq!(
+            notes,
+            ["Kept the local MCP server 'alpha': nobody could be asked."]
+        );
+
+        drop(script);
+        let _script = conflict::prompt_script::install_non_interactive();
+        let err = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&HeadlessPrompter),
+            &mut |_| unreachable!("a refusal before the question leaves no note"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to merge the already-installed MCP server 'alpha' non-interactively. \
+             Re-run in a terminal, with --install-force (installs), or with --yes (updates)."
+        );
     }
 
     #[test]
@@ -3383,7 +3470,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &prompter,
+            dot_io(&prompter),
         )
         .unwrap();
 
@@ -3411,7 +3498,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
 
@@ -3447,7 +3534,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -3471,7 +3558,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
         let after_first = fs::read(&target).unwrap();
@@ -3483,7 +3570,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
         assert!(report.added.is_empty(), "got: {:?}", report.added);
@@ -4476,7 +4563,7 @@ mod tests {
             StickyMode::None,
             &mut store,
             "aborty",
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
 
@@ -4535,7 +4622,7 @@ mod tests {
             StickyMode::KeepAll,
             &mut store,
             "beta",
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -4885,7 +4972,7 @@ mod tests {
             StickyMode::KeepAll,
             &mut store,
             "omc",
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -4939,7 +5026,7 @@ mod tests {
             StickyMode::ReplaceAll,
             &mut store,
             "omc",
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -5029,7 +5116,7 @@ mod tests {
             StickyMode::ReplaceAll,
             &mut store,
             "beta",
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -5921,6 +6008,7 @@ mod tests {
             InstallIo {
                 prefix: CommandPrefix::Slash,
                 prompter: &ScriptedPrompter::refusing(),
+                remedy: REPL_CONFLICT_REMEDY,
             },
         )
         .unwrap_err()
@@ -7028,7 +7116,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
-            &ScriptedPrompter::refusing(),
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
         record_mcp_merge(&mut store, "omc", &report).unwrap();

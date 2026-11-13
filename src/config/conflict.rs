@@ -36,9 +36,15 @@ pub(crate) enum ConflictAction {
     Replace,
 }
 
+/// What a conflict comes to when no question can be shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NonInteractive {
-    Bail,
+    /// Refused in the shared shape; `remedy` follows "Re-run in a
+    /// terminal" and names the flags of the surface that started the
+    /// run (see [`refuse_non_interactive`]).
+    Bail {
+        remedy: &'static str,
+    },
     Keep,
 }
 
@@ -81,10 +87,10 @@ pub(crate) fn resolve_conflict(
     if !menu_can_use_terminal() {
         match non_interactive {
             NonInteractive::Keep => return Ok(ConflictAction::Keep),
-            NonInteractive::Bail => {
+            NonInteractive::Bail { remedy } => {
                 return Err(refuse_non_interactive(
                     format_args!("overwrite local file {}", dst.display()),
-                    ", with --install-force (installs), or with --yes (updates).",
+                    remedy,
                 ));
             }
         }
@@ -260,6 +266,12 @@ mod tests {
         PathBuf::from("/tmp/coyote-conflict-tests/example.yaml")
     }
 
+    /// The bail answer with a remedy no caller uses, so a test seeing it
+    /// in the message proves the caller's text is what gets there.
+    const BAIL: NonInteractive = NonInteractive::Bail {
+        remedy: " or pass --some-flag.",
+    };
+
     fn resolve(
         category: &str,
         sticky: &mut StickyMode,
@@ -272,13 +284,13 @@ mod tests {
     fn sticky_modes_short_circuit_without_prompting() {
         let mut sticky = StickyMode::KeepAll;
         assert!(matches!(
-            resolve("macros", &mut sticky, NonInteractive::Bail).unwrap(),
+            resolve("macros", &mut sticky, BAIL).unwrap(),
             ConflictAction::Keep
         ));
 
         let mut sticky = StickyMode::ReplaceAll;
         assert!(matches!(
-            resolve("macros", &mut sticky, NonInteractive::Bail).unwrap(),
+            resolve("macros", &mut sticky, BAIL).unwrap(),
             ConflictAction::Replace
         ));
     }
@@ -407,18 +419,16 @@ mod tests {
         let _script = prompt_script::install_non_interactive();
         let mut sticky = StickyMode::None;
 
-        let err = resolve("macros", &mut sticky, NonInteractive::Bail).unwrap_err();
+        let err = resolve("macros", &mut sticky, BAIL).unwrap_err();
 
-        assert!(
-            err.to_string().contains("Refusing to overwrite local file"),
-            "got: {err}"
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Refusing to overwrite local file {} non-interactively. \
+                 Re-run in a terminal or pass --some-flag.",
+                dst().display()
+            )
         );
-        assert!(
-            err.to_string()
-                .contains("non-interactively. Re-run in a terminal"),
-            "got: {err}"
-        );
-        assert!(err.to_string().contains("example.yaml"), "got: {err}");
         assert_eq!(prompt_script::prompts_asked(), 0);
     }
 
@@ -458,14 +468,7 @@ mod tests {
         assert_eq!(prompter.requests().len(), 1);
 
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("keep".into())]);
-        let action = resolve_conflict(
-            &dst(),
-            "macros",
-            &mut sticky,
-            NonInteractive::Bail,
-            &prompter,
-        )
-        .unwrap();
+        let action = resolve_conflict(&dst(), "macros", &mut sticky, BAIL, &prompter).unwrap();
         assert!(matches!(action, ConflictAction::Keep));
         assert_eq!(prompter.requests().len(), 1);
         assert_eq!(sticky, StickyMode::None);

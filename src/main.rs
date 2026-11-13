@@ -308,6 +308,7 @@ async fn run_cli_flag(
             config::InstallIo {
                 prefix: config::CommandPrefix::default(),
                 prompter: &InquirePrompter::default(),
+                remedy: config::CLI_CONFLICT_REMEDY,
             },
         )?;
         return Ok(true);

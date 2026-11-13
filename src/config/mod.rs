@@ -48,7 +48,7 @@ pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
 use self::conflict::{InstallMode, StickyMode};
 pub use self::input::Input;
-pub(crate) use self::install_remote::InstallIo;
+pub(crate) use self::install_remote::{CLI_CONFLICT_REMEDY, InstallIo, REPL_CONFLICT_REMEDY};
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
     update_bundle,

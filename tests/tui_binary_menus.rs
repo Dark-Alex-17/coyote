@@ -2846,7 +2846,7 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
         (
             format!(".install {}", conflicting_repo.display()),
             "overwrite local file ",
-            "--install-force",
+            ", with --force (installs).",
         ),
         (
             format!(".uninstall {installed}"),
