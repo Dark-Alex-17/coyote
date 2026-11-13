@@ -2,6 +2,7 @@ use crate::client::oauth::{
     OAuthProvider, OAuthTokens, TokenRequestFormat, load_oauth_tokens, refresh_oauth_token,
     run_oauth_flow, token_response_keys,
 };
+use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::config::paths;
 use crate::events::Origin;
 use crate::prompt::{
@@ -128,8 +129,16 @@ pub async fn run_mcp_oauth_flow(
     // refusal: the bail is the contract the flow's callers pin, and no
     // request is ever made (see
     // `run_mcp_oauth_flow_bails_without_a_human_before_discovery_or_the_prompter`).
+    // A run with a human but no terminal for the client-id question gets
+    // the shared non-interactive refusal, also before any network.
     if !human_present() {
         bail!("{NO_HUMAN_FOR_OAUTH}");
+    }
+    if !menu_can_use_terminal() {
+        return Err(refuse_non_interactive(
+            format_args!("sign in to '{server_name}' with OAuth"),
+            ".",
+        ));
     }
     let discovered = discover_oauth_metadata(server_url).await?;
     let metadata = discovered.metadata;
@@ -776,6 +785,34 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// A human with no terminal is refused before discovery as well: the
+    /// bogus server URL would surface as a connection error otherwise.
+    #[tokio::test]
+    #[serial]
+    async fn run_mcp_oauth_flow_refuses_without_a_terminal_before_discovery_or_the_prompter() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _no_tty = crate::config::conflict::prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = run_mcp_oauth_flow(
+            "srv-tty-6m",
+            "http://127.0.0.1:9",
+            None,
+            None,
+            None,
+            &prompter,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'srv-tty-6m' with OAuth non-interactively. Re-run in a terminal."
+        );
         assert!(prompter.requests().is_empty());
     }
 

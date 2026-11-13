@@ -4626,3 +4626,35 @@ fn a_blank_answer_in_the_first_run_vault_provider_wizard_is_reasked_with_this_fi
     );
     assert_tty_restored(&transcript);
 }
+
+/// `coyote --auth-mcp <server>` for a remote MCP server with no terminal
+/// is refused in the shared shape before any widget or network: the
+/// server's URL points nowhere, so reaching discovery would surface as a
+/// connection error instead.
+#[test]
+#[serial]
+fn a_tty_less_auth_mcp_is_refused_in_the_shared_shape() {
+    let dir = fresh_config_dir("ttyless-auth-mcp");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    fs::write(
+        dir.join("mcp.json"),
+        r#"{"mcpServers": {"oauth-srv-a4n": {"type": "http", "url": "http://127.0.0.1:9/mcp", "oauth": {"clientId": "cid-a4n"}}}}"#,
+    )
+    .unwrap();
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--auth-mcp", "oauth-srv-a4n"],
+        "tty-less --auth-mcp",
+    );
+    assert!(!ok, "the tty-less `--auth-mcp` exited 0:\n{out}");
+    let (action, remedy) = refusal_shape(&out)
+        .unwrap_or_else(|| panic!("`--auth-mcp` is not refused in the shared shape:\n{out}"));
+    assert_eq!(action, "sign in to 'oauth-srv-a4n' with OAuth", "{out}");
+    assert_eq!(remedy, ".", "{out}");
+    assert!(
+        !out.contains("Open this URL") && !out.contains("Enter the OAuth client ID"),
+        "the tty-less `--auth-mcp` started the sign-in anyway:\n{out}"
+    );
+}

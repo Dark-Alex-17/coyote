@@ -4,6 +4,7 @@ use super::gemini_oauth::GeminiOAuthProvider;
 use super::openai_compatible_oauth::OpenAICompatibleOAuthProvider;
 use super::openai_oauth::OpenAIOAuthProvider;
 use super::{ClientConfig, ProviderModels};
+use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::config::paths;
 use crate::events::Origin;
 use crate::prompt::{
@@ -334,7 +335,7 @@ async fn run_pkce_flow(
         let (code, state) = listen_for_oauth_callback(&redirect_uri)?;
         (code, Some(state))
     } else {
-        ask_paste_input(prompter)?
+        ask_paste_input(prompter, client_name)?
     };
 
     if let Some(returned) = returned_state.as_deref() {
@@ -969,13 +970,20 @@ fn build_token_request(
     request
 }
 
-fn ask_paste_input(prompter: &dyn Prompter) -> Result<(String, Option<String>)> {
+fn ask_paste_input(prompter: &dyn Prompter, client_name: &str) -> Result<(String, Option<String>)> {
     // Refused before any widget exists, with the flow's own message rather
     // than the prompter's typed refusal, so a headless run reads the same
     // error whichever step it stops at; `ask_paste_input_bails_without_a_human_before_asking`
-    // pins that no request reaches the prompter.
+    // pins that no request reaches the prompter. A run with a human but no
+    // terminal to paste into gets the shared non-interactive refusal.
     if !human_present() {
         bail!("{NO_HUMAN_FOR_OAUTH}");
+    }
+    if !menu_can_use_terminal() {
+        return Err(refuse_non_interactive(
+            format_args!("sign in to '{client_name}' with OAuth"),
+            ".",
+        ));
     }
     let req = PromptRequest::new(
         PromptAction::Input,
@@ -1268,6 +1276,7 @@ mod tests {
     use crate::client::openai::OpenAIConfig;
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
+    use crate::config::conflict::prompt_script;
     use crate::prompt::ScriptedPrompter;
     use crate::testing::AtomicFlagGuard;
     use crate::utils::{HEADLESS, get_env_name};
@@ -2027,6 +2036,7 @@ echo_pkce_in_token_exchange: true
     #[serial]
     fn ask_paste_input_round_trips_a_url_and_a_code_state_paste() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tty = prompt_script::install(&[]);
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Text(
                 " https://provider.example/oauth/callback?code=abc123&state=xyz ".to_string(),
@@ -2034,10 +2044,10 @@ echo_pkce_in_token_exchange: true
             PromptAnswer::Text("def456#uvw".to_string()),
         ]);
 
-        let (code, state) = ask_paste_input(&prompter).unwrap();
+        let (code, state) = ask_paste_input(&prompter, "client-x").unwrap();
         assert_eq!(code, "abc123");
         assert_eq!(state.as_deref(), Some("xyz"));
-        let (code, state) = ask_paste_input(&prompter).unwrap();
+        let (code, state) = ask_paste_input(&prompter, "client-x").unwrap();
         assert_eq!(code, "def456");
         assert_eq!(state.as_deref(), Some("uvw"));
 
@@ -2056,9 +2066,10 @@ echo_pkce_in_token_exchange: true
     #[serial]
     fn ask_paste_input_reports_a_cancel() {
         let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tty = prompt_script::install(&[]);
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
 
-        let err = ask_paste_input(&prompter).unwrap_err();
+        let err = ask_paste_input(&prompter, "client-x").unwrap_err();
 
         assert!(
             err.to_string()
@@ -2073,9 +2084,26 @@ echo_pkce_in_token_exchange: true
         let _headless = AtomicFlagGuard::set(&HEADLESS, true);
         let prompter = ScriptedPrompter::refusing();
 
-        let err = ask_paste_input(&prompter).unwrap_err();
+        let err = ask_paste_input(&prompter, "client-x").unwrap_err();
 
         assert_eq!(err.to_string(), NO_HUMAN_FOR_OAUTH);
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn ask_paste_input_refuses_without_a_terminal_before_asking() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _no_tty = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = ask_paste_input(&prompter, "client-x").unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to sign in to 'client-x' with OAuth non-interactively. Re-run in a terminal."
+        );
         assert!(prompter.requests().is_empty());
     }
 
