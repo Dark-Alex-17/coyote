@@ -6915,7 +6915,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         "Nothing waits on a message",
         "lands in your inbox",
         "as a `reply` in the message's thread",
-        "the state `sent`",
+        "under `Sent by your sessions` in the state `no reply yet`",
         "`mesh__ask`",
     ] {
         assert!(
@@ -7301,16 +7301,17 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         );
     }
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
-    assert_eq!(
-        outbound,
-        [
-            "sent",
-            "open",
-            "escalated: the peer's human has been asked",
-            "sent",
-        ],
-        "QuestionRow::outbound's state words (an open message's first) and label moved"
+    let (no_reply_yet, open, escalated) = (
+        "no reply yet",
+        "open",
+        "escalated: the peer's human has been asked",
     );
+    for word in [no_reply_yet, open, escalated, "sent"] {
+        assert!(
+            outbound.iter().any(|literal| literal == word),
+            "QuestionRow::outbound no longer carries the state word or label {word:?}: {outbound:?}"
+        );
+    }
     assert!(
         method_body("src/repl/mesh.rs", "outbound")
             .contains("PendingState::Answered => AWAITING_THE_MODEL,"),
@@ -7318,9 +7319,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     let awaiting = const_str("src/repl/mesh.rs", "AWAITING_THE_MODEL");
     assert_eq!(awaiting, "answered, awaiting the model");
-    let outbound: Vec<String> = [outbound[1].clone(), outbound[2].clone(), awaiting]
-        .into_iter()
-        .collect();
+    let outbound: Vec<String> = vec![open.to_string(), escalated.to_string(), awaiting];
     let inbound = string_literals(&method_body("src/repl/mesh.rs", "inbound"));
     assert_eq!(
         inbound,
@@ -7388,8 +7387,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             "grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
             "Asked by your sessions",
             "collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
+            "Sent by your sessions",
+            "follow up: .mesh messaging follow-up <id> \"<text>\"",
             "{title} ({})",
-            "every list has a section",
             "{title}: none",
             "{:<column$}{commands}",
             "{title} ({})",
@@ -7403,7 +7403,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         ],
         "render_pending's titles, commands and header shapes moved"
     );
-    let sections: Vec<(&str, &str)> = pending_literals[..6]
+    let sections: Vec<(&str, &str)> = pending_literals[..8]
         .chunks(2)
         .map(|pair| (pair[0].as_str(), pair[1].as_str()))
         .collect();
@@ -7575,10 +7575,10 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
             head.contains(" . id ") && id8.len() == 8 && id8.chars().all(|c| c.is_ascii_hexdigit()),
             "the entry ends with an 8-hex id: {head:?}"
         );
-        if section_index == 2 {
+        if section_index >= 2 {
             assert!(
                 head.starts_with("-> ") && !head.contains(" . expires in "),
-                "this node's own question reads `-> <name> (<dest8>) <age> . <state> . id <id8>`: {head:?}"
+                "this node's own question or message reads `-> <name> (<dest8>) <age> . <state> . id <id8>`: {head:?}"
             );
             continue;
         }
@@ -7640,7 +7640,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "the paths and the reason are never printed here".to_string(),
     ];
     needles.extend(outbound[..3].iter().map(|word| format!("`{word}`")));
-    needles.push("in the state `sent` until its reply arrives".to_string());
+    needles.push("in the state `no reply yet` until its reply arrives".to_string());
     needles.extend(sections.iter().map(|(title, _)| format!("`{title}`")));
     for needle in &needles {
         assert!(
@@ -8458,17 +8458,18 @@ fn the_pending_prose_names_the_short_destination_fallback_for_an_unheard_peer() 
     );
 }
 
-/// `.mesh messaging sent` lists the questions the other sessions on the config dir asked, each
-/// with a line naming the session that asked it and saying to collect it there. The
-/// renderer's words for the three cases and the Commands page's must agree; the
-/// composed lines are pinned by the REPL test of the same rows.
+/// `.mesh messaging sent` lists the questions and messages the other sessions on the
+/// config dir sent, each with a line naming that session and saying to collect a
+/// question there or follow a message up there. The renderer's words for the three
+/// cases and the Commands page's must agree; the composed lines are pinned by the REPL
+/// test of the same rows.
 #[test]
 fn the_pending_section_names_the_session_another_sessions_question_came_from() {
     let asked_by = string_literals(&fn_body("src/repl/mesh.rs", "asked_by"));
     for needle in [
-        "asked by {}",
-        "asked by {}{ENDED_SESSION_MARK}",
-        "asked by another session",
+        "{verb} by {}",
+        "{verb} by {}{ENDED_SESSION_MARK}",
+        "{verb} by another session",
     ] {
         assert!(
             asked_by.iter().any(|literal| literal == needle),
@@ -8480,12 +8481,17 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
         "asked_by no longer names a running session as `.mesh people list` does"
     );
     let other = string_literals(&method_body("src/repl/mesh.rs", "other_session"));
-    assert!(
-        other
-            .iter()
-            .any(|literal| literal == "{} . collect it from that session"),
-        "QuestionRow::other_session no longer says to collect it from that session: {other:?}"
-    );
+    for needle in [
+        "{} . collect it from that session",
+        "asked",
+        "{} . follow up from that session",
+        "sent",
+    ] {
+        assert!(
+            other.iter().any(|literal| literal == needle),
+            "QuestionRow::other_session no longer carries {needle:?}: {other:?}"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Commands.md"));
@@ -8501,6 +8507,8 @@ fn the_pending_section_names_the_session_another_sessions_question_came_from() {
         "`asked by you / <session> (ended)`",
         "`asked by another session`",
         "`collect it from that session`",
+        "`sent by you / <session>`",
+        "`follow up from that session`",
         "`.session <session>` and `.mesh on`",
     ] {
         assert!(

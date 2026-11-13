@@ -8641,6 +8641,7 @@ mod name_addressing_tests {
             expires_in: None,
             peer_left: None,
             route: AnswerRoute::Inbound,
+            kind: CorrelationKind::Ask,
         };
         let now = SystemTime::now();
         let pending = render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false);
@@ -8699,11 +8700,23 @@ fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<Stri
 /// name are quoted as they stand.
 fn asked_elsewhere(ctx: &RequestContext, id: &str, now: SystemTime) -> Option<anyhow::Error> {
     let runtime = ctx.app.mesh.get()?;
-    let (_, asker) = runtime
+    let (ask, asker) = runtime
         .other_sessions_asked(now)
         .into_iter()
         .find(|(ask, _)| ask.record.id == id)?;
-    let head = NoticeText::default().frame("Question ").peer(id);
+    let (noun, verb, only) = match ask.record.kind {
+        CorrelationKind::Ask => (
+            "Question ",
+            "asked",
+            ", and only the session that asked it can collect the reply or follow up",
+        ),
+        CorrelationKind::Message => (
+            "Message ",
+            "sent",
+            "; only the session that sent it can follow up",
+        ),
+    };
+    let head = NoticeText::default().frame(noun).peer(id);
     let answer_there = |session: &str| {
         NoticeText::default()
             .frame("run `.mesh messaging follow-up ")
@@ -8713,21 +8726,21 @@ fn asked_elsewhere(ctx: &RequestContext, id: &str, now: SystemTime) -> Option<an
     };
     let text = match &asker {
         Some(InstanceSession::Running(session)) => head
-            .frame(" was asked by ")
+            .frame(format!(" was {verb} by "))
             .peer(own_session_name(session))
-            .frame(", not this session, and only the session that asked it can collect the reply or follow up: ")
+            .frame(format!(", not this session{only}: "))
             .then(answer_there(session))
             .frame("."),
         Some(InstanceSession::Gone(session)) => head
-            .frame(" was asked by ")
+            .frame(format!(" was {verb} by "))
             .peer(format!("{}{ENDED_SESSION_MARK}", own_session_name(session)))
-            .frame(", which is no longer running, and only the session that asked it can collect the reply or follow up: resume it with `.session ")
+            .frame(format!(", which is no longer running{only}: resume it with `.session "))
             .peer(session.as_str())
             .frame("` and `.mesh on`, then ")
             .then(answer_there(session))
             .frame("."),
         None => head.frame(format!(
-            " was asked by another session this computer no longer lists, and only the session that asked it can collect the reply or follow up, so none here can; it expires {} days after it was sent.",
+            " was {verb} by another session this computer no longer lists{only}, so none here can; it expires {} days after it was sent.",
             PENDING_TTL.as_secs() / 86_400
         )),
     };
@@ -9936,9 +9949,13 @@ fn group_concepts(group: &str) -> Vec<(String, String)> {
             ),
             (
                 "sent",
-                "The questions your sessions asked and whether an answer came back; a message they sent is listed in the state `sent` until its reply comes.",
+                "The questions your sessions asked and whether an answer came back, then the messages they sent that have no reply yet.",
             ),
             ("open", "Asked; no answer yet."),
+            (
+                "no reply yet",
+                "A message your session sent; its reply lands in the inbox and closes it.",
+            ),
             (
                 "escalated",
                 "The other session's envoy passed your question to its user.",
@@ -10212,8 +10229,9 @@ mod help_output_tests {
                 "What the words mean:",
                 "word | meaning",
                 "inbox | The messages other sessions sent this one; reading it takes nothing away.",
-                "sent | The questions your sessions asked and whether an answer came back; a message they sent is listed in the state `sent` until its reply comes.",
+                "sent | The questions your sessions asked and whether an answer came back, then the messages they sent that have no reply yet.",
                 "open | Asked; no answer yet.",
+                "no reply yet | A message your session sent; its reply lands in the inbox and closes it.",
                 "escalated | The other session's envoy passed your question to its user.",
                 "answered, awaiting the model | The answer arrived; the model picks it up with mesh__collect.",
                 "bulletin | One text sent to every trusted session at once with `.mesh messaging broadcast`.",
@@ -11318,15 +11336,19 @@ fn own_session_name(session: &str) -> String {
 
 /// Who asked a question another session on this cache dir is waiting on: the running
 /// session by name, an ended one marked ended, or no name once its registry row is gone.
-fn asked_by(asker: Option<&InstanceSession>) -> String {
+/// `verb` is how the record went out: `asked` for a question, `sent` for a message.
+fn asked_by(verb: &str, asker: Option<&InstanceSession>) -> String {
     match asker {
         Some(InstanceSession::Running(session)) => {
-            format!("asked by {}", own_session_name(session))
+            format!("{verb} by {}", own_session_name(session))
         }
         Some(InstanceSession::Gone(session)) => {
-            format!("asked by {}{ENDED_SESSION_MARK}", own_session_name(session))
+            format!(
+                "{verb} by {}{ENDED_SESSION_MARK}",
+                own_session_name(session)
+            )
         }
-        None => "asked by another session".to_string(),
+        None => format!("{verb} by another session"),
     }
 }
 
@@ -12674,22 +12696,33 @@ struct QuestionRow {
     /// Which verb its footer names: `messaging follow-up` for a question this node asked,
     /// `envoy answer` for the rest.
     route: AnswerRoute,
+    /// Whether an outbound row is a question or a message, which `.mesh messaging sent`
+    /// lists in sections of their own; a peer's question or access request is `Ask`.
+    kind: CorrelationKind,
 }
 
 impl QuestionRow {
-    /// A question another session on this cache dir asked: its row reads as one this
-    /// node asked, with a line naming that session, since only it can collect the reply
-    /// or follow up.
+    /// A question or message another session on this cache dir sent: its row reads as
+    /// one this node sent, with a line naming that session, since only it can collect a
+    /// question's reply or follow up on either.
     fn other_session(
         record: &PendingRecord,
         name: String,
         asker: Option<&InstanceSession>,
     ) -> Self {
         let mut row = Self::outbound(record, name);
-        row.extra.push((
-            "",
-            format!("{} . collect it from that session", asked_by(asker)),
-        ));
+        let line = match record.kind {
+            CorrelationKind::Ask => {
+                format!(
+                    "{} . collect it from that session",
+                    asked_by("asked", asker)
+                )
+            }
+            CorrelationKind::Message => {
+                format!("{} . follow up from that session", asked_by("sent", asker))
+            }
+        };
+        row.extra.push(("", line));
         row
     }
 
@@ -12702,7 +12735,7 @@ impl QuestionRow {
 
     fn outbound(record: &PendingRecord, name: String) -> Self {
         let state = match record.state {
-            PendingState::Open if record.kind == CorrelationKind::Message => "sent",
+            PendingState::Open if record.kind == CorrelationKind::Message => "no reply yet",
             PendingState::Open => "open",
             PendingState::Escalated => "escalated: the peer's human has been asked",
             PendingState::Answered => AWAITING_THE_MODEL,
@@ -12720,6 +12753,7 @@ impl QuestionRow {
             expires_in: None,
             peer_left: None,
             route: AnswerRoute::Outbound,
+            kind: record.kind,
         }
     }
 
@@ -12737,6 +12771,7 @@ impl QuestionRow {
             expires_in: time_left(&record.received_at, now),
             peer_left: None,
             route: AnswerRoute::Inbound,
+            kind: CorrelationKind::Ask,
         }
     }
 
@@ -12754,6 +12789,7 @@ impl QuestionRow {
             expires_in: time_left(&record.received_at, now),
             peer_left: None,
             route: AnswerRoute::Inbound,
+            kind: CorrelationKind::Ask,
         }
     }
 }
@@ -12905,6 +12941,8 @@ enum PendingList {
 /// another only in case. Those stay ambiguous on purpose, so a peer cannot mint an id
 /// that takes the place of another, and the refusal names how the entries clear. Peer
 /// names, ids and words are quoted as they stand; the header's hints follow the prefix.
+/// The asked list puts the messages its sessions sent in a section of their own after
+/// the questions, shown only when there is one, since a message has no reply to collect.
 fn render_pending(
     list: PendingList,
     asked: &[QuestionRow],
@@ -12914,26 +12952,36 @@ fn render_pending(
     width: usize,
     colour: bool,
 ) -> NoticeText {
+    let (questions, messages): (Vec<&QuestionRow>, Vec<&QuestionRow>) = asked
+        .iter()
+        .partition(|row| row.kind == CorrelationKind::Ask);
     let sections = [
         (
             PendingList::Escalated,
             "Waiting for YOU",
             "answer: .mesh envoy answer <id> \"<text>\" . dismiss: .mesh envoy dismiss <id>",
-            escalated,
+            escalated.iter().collect::<Vec<_>>(),
             false,
         ),
         (
             PendingList::Access,
             "Access requests",
             "grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>",
-            access,
+            access.iter().collect(),
             false,
         ),
         (
             PendingList::Asked,
             "Asked by your sessions",
             "collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
-            asked,
+            questions,
+            true,
+        ),
+        (
+            PendingList::Asked,
+            "Sent by your sessions",
+            "follow up: .mesh messaging follow-up <id> \"<text>\"",
+            messages,
             true,
         ),
     ];
@@ -12947,25 +12995,33 @@ fn render_pending(
         .iter()
         .flat_map(|(_, _, _, rows, _)| rows.iter().map(|row| row.id.to_ascii_lowercase()))
         .collect();
-    let (_, title, commands, rows, outbound) = sections
+    let mut lines = Vec::new();
+    let mut listed = false;
+    for (index, (_, title, commands, rows, outbound)) in sections
         .into_iter()
-        .find(|(shown, ..)| *shown == list)
-        .expect("every list has a section");
-    let header = if rows.is_empty() {
-        format!("{title}: none")
-    } else {
-        format!("{:<column$}{commands}", format!("{title} ({})", rows.len()))
-    };
-    let mut lines = vec![NoticeText::from(if colour {
-        tool_name_text_forced(&header)
-    } else {
-        header
-    })];
-    for (index, row) in rows.iter().enumerate() {
-        let id_len = shown_id_len(&row.id, &ids);
-        lines.extend(pending_entry(index + 1, row, outbound, id_len, now, width));
+        .filter(|(shown, ..)| *shown == list)
+        .enumerate()
+    {
+        if index > 0 && rows.is_empty() {
+            continue;
+        }
+        let header = if rows.is_empty() {
+            format!("{title}: none")
+        } else {
+            format!("{:<column$}{commands}", format!("{title} ({})", rows.len()))
+        };
+        lines.push(NoticeText::from(if colour {
+            tool_name_text_forced(&header)
+        } else {
+            header
+        }));
+        for (index, row) in rows.iter().enumerate() {
+            let id_len = shown_id_len(&row.id, &ids);
+            lines.extend(pending_entry(index + 1, row, outbound, id_len, now, width));
+        }
+        listed |= !rows.is_empty();
     }
-    if !rows.is_empty() {
+    if listed {
         lines.push(NoticeText::from(match list {
             PendingList::Escalated => help_pointer("envoy", "escalated questions and their states"),
             PendingList::Access => help_pointer("files", "access requests and grants"),
@@ -17450,6 +17506,42 @@ mod tests {
             !text.contains("2026-09-21") && !text.contains("timeout"),
             "ages are relative and the timeout stamp is gone: {text}"
         );
+    }
+
+    #[test]
+    fn the_sent_listing_puts_open_messages_in_a_section_of_their_own() {
+        let mut message = correlation("m1", PendingState::Open).record;
+        message.kind = CorrelationKind::Message;
+        let asked = [
+            asked_row("q1", PendingState::Open),
+            QuestionRow::outbound(&message, "bob".to_string()),
+        ];
+        let text = render_pending(
+            PendingList::Asked,
+            &asked,
+            &[],
+            &[],
+            pending_now(),
+            80,
+            false,
+        )
+        .plain();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "Asked by your sessions (1)  collect: mesh__collect --id <id> (the model) . follow up: .mesh messaging follow-up <id> \"<text>\"",
+                "  1. -> bob (abababab) 3m ago . open . id q1",
+                "     \"what now?\"",
+                "Sent by your sessions (1)   follow up: .mesh messaging follow-up <id> \"<text>\"",
+                "  1. -> bob (abababab) 3m ago . no reply yet . id m1",
+                "     \"what now?\"",
+                "`.mesh messaging help` says what the states of a question mean.",
+            ],
+            "{text}"
+        );
+        let sent = text.split("Sent by your sessions").nth(1).unwrap();
+        assert!(!sent.contains("collect"), "{text}");
     }
 
     /// The builders give every row its state word, label and stamp; the escalated state
@@ -22727,6 +22819,13 @@ mod tests {
                             .correlations()
                             .open(record("q-temp-0001"))
                             .unwrap();
+                        temp_slot
+                            .correlations()
+                            .open(PendingRecord {
+                                kind: CorrelationKind::Message,
+                                ..record("m-temp-0001")
+                            })
+                            .unwrap();
                         let gone_id = hex_lower(&[0x0d; 16]);
                         let lost_id = hex_lower(&[0x0e; 16]);
                         for (instance_id, id) in
@@ -22749,6 +22848,11 @@ mod tests {
                         let out = pending_out(&mut ctx, ".").await.unwrap();
 
                         assert!(out.contains("Asked by your sessions (3)"), "{out}");
+                        assert!(out.contains("Sent by your sessions (1)"), "{out}");
+                        assert!(
+                            out.contains("sent by you / temp . follow up from that session"),
+                            "{out}"
+                        );
                         for line in [
                             "asked by you / temp . collect it from that session",
                             "asked by you / old (ended) . collect it from that session",
@@ -22768,6 +22872,15 @@ mod tests {
                             let refused = out_of(&mut ctx, verb).await.unwrap_err().to_string();
                             assert_eq!(refused, running, "{verb}");
                         }
+                        let message =
+                            out_of(&mut ctx, ".mesh messaging follow-up m-temp-0001 \"more\"")
+                                .await
+                                .unwrap_err()
+                                .to_string();
+                        assert_eq!(
+                            message,
+                            "Message m-temp-0001 was sent by you / temp, not this session; only the session that sent it can follow up: run `.mesh messaging follow-up m-temp-0001 \"<text>\"` in session temp."
+                        );
                         let gone = out_of(&mut ctx, ".mesh envoy answer q-gone-0001 \"main\"")
                             .await
                             .unwrap_err()
@@ -52091,12 +52204,20 @@ mod tests {
                         let listed = out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap();
                         let lines: Vec<&str> = listed.lines().collect();
                         let head = format!("  1. -> {} ({}) ", fx.who(), fx.dest());
-                        assert!(lines[1].starts_with(&head), "{listed}");
+                        let entry = lines
+                            .iter()
+                            .position(|line| {
+                                line.ends_with(&format!(" . no reply yet . id {}", short(&id)))
+                            })
+                            .unwrap_or_else(|| panic!("no open message entry in {listed}"));
+                        assert!(lines[entry].starts_with(&head), "{listed}");
+                        assert_eq!(lines[entry + 1], "     \"can you review it?\"", "{listed}");
                         assert!(
-                            lines[1].ends_with(&format!(" . sent . id {}", short(&id))),
+                            lines[..entry]
+                                .iter()
+                                .any(|line| line.starts_with("Sent by your sessions (1) ")),
                             "{listed}"
                         );
-                        assert_eq!(lines[2], "     \"can you review it?\"", "{listed}");
                         assert!(
                             listed.contains(".mesh messaging follow-up <id> \"<text>\""),
                             "{listed}"
