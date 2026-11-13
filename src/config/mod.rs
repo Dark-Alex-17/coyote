@@ -1064,6 +1064,10 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
             ".",
         ));
     }
+    debug_assert!(
+        !crate::tui::active(),
+        "the first-run wizard draws inquire widgets straight on the terminal and never runs under the UI"
+    );
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
         .prompt()?;

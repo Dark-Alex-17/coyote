@@ -9178,7 +9178,6 @@ mod tests {
             ("src/client/common.rs", "select_model", BEFORE_UI),
             ("src/client/common.rs", "prompt_input_string", BEFORE_UI),
             ("src/client/macros.rs", "create_client_config", BEFORE_UI),
-            ("src/config/mod.rs", "create_config_file", BEFORE_UI),
             ("src/config/mod.rs", "create_config_file_sandbox", BEFORE_UI),
             (
                 "src/config/request_context.rs",

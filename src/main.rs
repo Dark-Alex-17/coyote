@@ -1018,6 +1018,12 @@ fn init_console_logger(
         .unwrap()
 }
 
+/// The OAuth client to sign in to: the one named by `explicit`, the only
+/// OAuth-capable one, or a pick between several. The pick, and the
+/// no-terminal refusal naming `--authenticate <CLIENT_NAME>` as its
+/// remedy, is reached from the CLI alone: the REPL's `.authenticate`
+/// always names the current model's client, so under it `explicit` is
+/// never `None`.
 fn resolve_oauth_client(
     explicit: Option<&str>,
     clients: &[ClientConfig],
