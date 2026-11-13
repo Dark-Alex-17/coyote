@@ -26,7 +26,7 @@ use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
 use crate::prompt::{
-    NeedsHuman, Prompter, confirm, confirm_or_cancel, human_present, input, reask,
+    NeedsHuman, Prompter, confirm, confirm_or_cancel, human_present, required_input,
 };
 use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
@@ -1617,19 +1617,8 @@ fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
     bail!("{message}")
 }
 
-/// Asks for an agent variable until the answer is not blank; a blank one
-/// is asked again with the requirement in front of the label.
 fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str) -> Result<String> {
-    let label = format!("{name} ({description}):");
-    let mut question = label.clone();
-    loop {
-        let value = input(prompter, &question, None, None)?;
-        if value.trim().is_empty() {
-            question = reask("This field is required.", &label);
-            continue;
-        }
-        return Ok(value);
-    }
+    required_input(prompter, &format!("{name} ({description}):"), None, None)
 }
 
 /// Whether a required agent variable may be asked for rather than

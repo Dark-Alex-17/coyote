@@ -16,7 +16,9 @@ use self::provider::RagProvider;
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
 use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::hooks::RagSyncHooks;
-use crate::prompt::{Prompter, confirm, confirm_with_help, input, reask, select_closed};
+use crate::prompt::{
+    Prompter, confirm, confirm_with_help, input, reask, required_input, select_closed,
+};
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
 
@@ -1992,25 +1994,6 @@ fn select_option(
         .map(|option| option.value)
         .expect("select_closed only hands back an offered option");
     Ok(value)
-}
-
-/// Asks `label` until the answer is non-empty; an empty one is asked
-/// again with the field's requirement in front of the label.
-fn required_input(
-    prompter: &dyn Prompter,
-    label: &str,
-    default: Option<&str>,
-    help: Option<&str>,
-) -> Result<String> {
-    let mut question = label.to_string();
-    loop {
-        let answer = input(prompter, &question, default, help)?;
-        if answer.is_empty() {
-            question = reask("This field is required.", label);
-            continue;
-        }
-        return Ok(answer);
-    }
 }
 
 /// Asks `label` until the answer parses as a count; a rejected one is

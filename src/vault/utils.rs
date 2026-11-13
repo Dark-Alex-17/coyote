@@ -1,7 +1,8 @@
 use crate::config::ensure_parent_exists;
 use crate::events::Origin;
 use crate::prompt::{
-    PromptAction, PromptAnswer, PromptRequest, Prompter, ask, confirm, input, reask, select_closed,
+    PromptAction, PromptAnswer, PromptRequest, Prompter, ask, confirm, input, reask,
+    required_input, select_closed,
 };
 use crate::sandbox::{SANDBOX_ENV_FLAG, sandbox_secret_env_var};
 use crate::vault::{SECRET_RE, Vault};
@@ -42,25 +43,6 @@ pub fn ensure_password_file_initialized(local_provider: &mut LocalProvider) -> R
         Err(anyhow!(
             "A password file is required to utilize the Coyote vault. Please configure a password file in your config file and try again."
         ))
-    }
-}
-
-/// Asks `label` until the answer is non-empty; an empty one is asked
-/// again with inquire's own wording in front of the label.
-fn required_input(
-    prompter: &dyn Prompter,
-    label: &str,
-    default: Option<&str>,
-    help: Option<&str>,
-) -> Result<String> {
-    let mut question = label.to_string();
-    loop {
-        let answer = input(prompter, &question, default, help)?;
-        if answer.is_empty() {
-            question = reask("A response is required.", label);
-            continue;
-        }
-        return Ok(answer);
     }
 }
 
@@ -891,8 +873,8 @@ mod tests {
         );
     }
 
-    /// A required field left empty is asked again with inquire's own
-    /// wording in front of its label; the first non-empty answer lands.
+    /// A required field left empty is asked again with the requirement
+    /// in front of its label; the first non-empty answer lands.
     #[test]
     #[serial]
     fn an_empty_required_field_is_asked_again() {
@@ -905,7 +887,7 @@ mod tests {
         assert_eq!(provider_def.gcp_project_id.as_deref(), Some("proj"));
         assert_eq!(
             questions(&prompter),
-            vec!["GCP project ID:", "A response is required. GCP project ID:"]
+            vec!["GCP project ID:", "This field is required. GCP project ID:"]
         );
     }
 

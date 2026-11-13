@@ -388,6 +388,26 @@ pub(crate) fn input(
     ask(prompter, req).and_then(PromptAnswer::into_text)
 }
 
+/// [`input`] asked until the answer is not blank; a blank one is asked
+/// again with the requirement in front of the label. The answer is
+/// handed back as typed, surrounding whitespace included.
+pub(crate) fn required_input(
+    prompter: &dyn Prompter,
+    label: &str,
+    default: Option<&str>,
+    help: Option<&str>,
+) -> Result<String> {
+    let mut question = label.to_string();
+    loop {
+        let answer = input(prompter, &question, default, help)?;
+        if answer.trim().is_empty() {
+            question = reask("This field is required.", label);
+            continue;
+        }
+        return Ok(answer);
+    }
+}
+
 /// The default an input offers, as the text the widget shows: a
 /// string as it is, any other value (a number, a bool) rendered.
 pub(crate) fn input_default_text(req: &PromptRequest) -> Option<String> {
