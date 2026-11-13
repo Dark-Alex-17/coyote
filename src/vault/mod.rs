@@ -368,63 +368,8 @@ impl Vault {
 mod tests {
     use super::*;
     use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
-    use crate::testing::{AtomicFlagGuard, EnvVarGuard};
+    use crate::testing::{AtomicFlagGuard, TempLocalVault};
     use serial_test::serial;
-
-    /// A local vault whose password file and secrets file both live in a
-    /// fresh temp dir: the provider derives the secrets file from
-    /// `XDG_CONFIG_HOME`, so the developer's real vault is never touched.
-    /// Tests using it must serialize; the env var is process-global.
-    struct TempVault {
-        _xdg: EnvVarGuard,
-        dir: PathBuf,
-        vault: Vault,
-    }
-
-    impl TempVault {
-        fn new(label: &str) -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = env::temp_dir().join(format!("coyote-vault-{label}-{unique}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let password_file = dir.join("password");
-            std::fs::write(&password_file, "correct horse battery staple").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600))
-                    .unwrap();
-            }
-            let vault = Vault::from_provider(SupportedProvider::Local {
-                provider_def: LocalProvider {
-                    password_file: Some(password_file),
-                    git_branch: None,
-                    ..LocalProvider::default()
-                },
-            });
-            Self {
-                _xdg: EnvVarGuard::set("XDG_CONFIG_HOME", &dir),
-                dir,
-                vault,
-            }
-        }
-
-        /// Whether the provider has written its secrets file.
-        fn has_secrets_file(&self) -> bool {
-            std::fs::read_dir(&self.dir)
-                .unwrap()
-                .flatten()
-                .any(|entry| entry.path().is_dir())
-        }
-    }
-
-    impl Drop for TempVault {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
-        }
-    }
 
     /// Secret entry asks for the value through the prompter, so under the
     /// full-screen UI it is a masked modal rather than a refusal, and the
@@ -433,7 +378,7 @@ mod tests {
     #[serial]
     async fn secret_entry_under_the_tui_asks_through_the_prompter() {
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let store = TempVault::new("tui-entry");
+        let store = TempLocalVault::new("tui-entry");
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Text("s3cret".to_string()),
             PromptAnswer::Text("s3cret-two".to_string()),
@@ -467,7 +412,7 @@ mod tests {
     async fn without_a_terminal_secret_entry_is_refused_before_asking_and_writes_nothing() {
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
         let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
-        let store = TempVault::new("no-terminal");
+        let store = TempLocalVault::new("no-terminal");
         let prompter = ScriptedPrompter::refusing();
 
         let err = store.vault.add_secret("x", &prompter).unwrap_err();
@@ -492,7 +437,7 @@ mod tests {
     #[serial]
     async fn an_empty_secret_value_is_asked_again() {
         let _script = crate::config::conflict::prompt_script::install(&[]);
-        let store = TempVault::new("re-ask");
+        let store = TempLocalVault::new("re-ask");
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Text(String::new()),
             PromptAnswer::Text("s3cret".to_string()),
@@ -522,7 +467,7 @@ mod tests {
     #[serial]
     async fn secret_entry_without_an_answer_writes_nothing() {
         let _script = crate::config::conflict::prompt_script::install(&[]);
-        let store = TempVault::new("no-answer");
+        let store = TempLocalVault::new("no-answer");
 
         let cancelled = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
         let err = store.vault.add_secret("never", &cancelled).unwrap_err();
@@ -551,7 +496,7 @@ mod tests {
     #[serial]
     async fn headless_add_secret_is_a_typed_password_refusal_with_nothing_on_stdout() {
         let _script = crate::config::conflict::prompt_script::install(&[]);
-        let store = TempVault::new("headless");
+        let store = TempLocalVault::new("headless");
         let (saved, mut reader) = crate::testing::capture_stdout();
 
         let err = store

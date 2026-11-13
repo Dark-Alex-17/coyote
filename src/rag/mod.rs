@@ -2502,7 +2502,7 @@ mod tests {
         HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
     };
     use crate::sandbox::kit;
-    use crate::testing::AtomicFlagGuard;
+    use crate::testing::{AtomicFlagGuard, TempLocalVault};
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3249,45 +3249,13 @@ mod tests {
         assert!(none.requests().is_empty());
     }
 
-    /// A local vault in a throwaway config dir, holding no secrets.
-    struct EmptyVault {
-        _xdg: crate::testing::EnvVarGuard,
-        _dir: TempDir,
-        vault: Vault,
-    }
-
-    impl EmptyVault {
-        fn new(tag: &str) -> Self {
-            let dir = TempDir::new(tag);
-            let password_file = dir.path.join("password");
-            fs::write(&password_file, "correct horse battery staple").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&password_file, fs::Permissions::from_mode(0o600)).unwrap();
-            }
-            let vault = Vault::from_provider(gman::providers::SupportedProvider::Local {
-                provider_def: gman::providers::local::LocalProvider {
-                    password_file: Some(password_file),
-                    git_branch: None,
-                    ..Default::default()
-                },
-            });
-            Self {
-                _xdg: crate::testing::EnvVarGuard::set("XDG_CONFIG_HOME", &dir.path),
-                _dir: dir,
-                vault,
-            }
-        }
-    }
-
     /// A missing API key secret is offered for creation through the
     /// prompter; declining names the secret in the refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn a_missing_api_key_secret_under_the_tui_is_offered_through_the_prompter() {
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let store = EmptyVault::new("attach-secret");
+        let store = TempLocalVault::new("attach-secret");
 
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
         let err = resolve_or_create_api_key_secret(&store.vault, "QDRANT_API_KEY", &prompter)
@@ -3428,7 +3396,7 @@ mod tests {
     #[serial]
     async fn attach_under_the_tui_asks_driver_host_and_api_key_through_the_prompter() {
         let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
-        let store = EmptyVault::new("attach-wizard");
+        let store = TempLocalVault::new("attach-wizard");
         let dir = TempDir::new("attach-wizard-rag");
         let prompter = ScriptedPrompter::new(vec![
             PromptAnswer::Selected("qdrant".to_string()),
@@ -3539,7 +3507,7 @@ mod tests {
     async fn attach_without_a_terminal_is_refused_before_any_prompt() {
         let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _script = crate::config::conflict::prompt_script::install_non_interactive();
-        let store = EmptyVault::new("attach-no-tty");
+        let store = TempLocalVault::new("attach-no-tty");
         let dir = TempDir::new("attach-no-tty-rag");
         let prompter = ScriptedPrompter::refusing();
 

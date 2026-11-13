@@ -2,6 +2,9 @@
 
 use crate::config::WORKSPACE_COYOTE_DIR_NAME;
 use crate::utils;
+use crate::vault::Vault;
+use gman::providers::SupportedProvider;
+use gman::providers::local::LocalProvider;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
@@ -326,6 +329,62 @@ impl ScratchDirGuard {
 impl Drop for ScratchDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A local vault whose password file and secrets file both live in a
+/// fresh temp dir: the provider derives the secrets file from
+/// `XDG_CONFIG_HOME`, so the developer's real vault is never touched.
+/// The dir is removed on drop. Tests using it must serialize
+/// (`#[serial]`); the env var is process-global.
+pub(crate) struct TempLocalVault {
+    _xdg: EnvVarGuard,
+    dir: PathBuf,
+    pub(crate) vault: Vault,
+}
+
+impl TempLocalVault {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-vault-{label}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let password_file = dir.join("password");
+        std::fs::write(&password_file, "correct horse battery staple").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let vault = Vault::from_provider(SupportedProvider::Local {
+            provider_def: LocalProvider {
+                password_file: Some(password_file),
+                git_branch: None,
+                ..LocalProvider::default()
+            },
+        });
+        Self {
+            _xdg: EnvVarGuard::set("XDG_CONFIG_HOME", &dir),
+            dir,
+            vault,
+        }
+    }
+
+    /// Whether the provider has written its secrets file.
+    pub(crate) fn has_secrets_file(&self) -> bool {
+        std::fs::read_dir(&self.dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().is_dir())
+    }
+}
+
+impl Drop for TempLocalVault {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
