@@ -1076,7 +1076,11 @@ fn dot_file_through_a_file_loader_reading_stdin_returns_at_once_in_the_plain_rep
     pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
     let started = std::time::Instant::now();
-    pty.send(format!(".file '{}' -- summarize\r", document.display()).as_bytes())
+    // The line editor repaints the prompt once per typed key, about 100 ms
+    // each in a debug build, so the absolute temp path alone would eat most
+    // of the wait; the binary runs in `dir`, where the bare file name names
+    // the same document.
+    pty.send(b".file 'doc.catstdinfile' -- summarize\r")
         .unwrap();
     let transcript = wait_for_squeezed(
         &mut pty,
