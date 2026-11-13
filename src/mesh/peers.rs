@@ -82,7 +82,7 @@ pub(crate) struct PeerRecord {
     /// cache dir, so each node keeps its own mark: `claim_served` reads a node's mark
     /// back as "served the previous run" when it starts and clears it. The background
     /// card fetch asks only an instance that served this node in this run or the
-    /// previous one.
+    /// previous one, unless the owner has just trusted it with `.mesh access trust`.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub served_instances: BTreeSet<String>,
 }

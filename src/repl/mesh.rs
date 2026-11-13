@@ -4405,6 +4405,7 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             let outcome =
                 store.trust_destination(mesh, &destination, TrustOptions::default(), now)?;
             reset_knock_surfacing(ctx, &outcome.identity_hash);
+            fetch_cards_after_grant(ctx, &outcome.identity_hash, Some(&outcome.destination_hash));
             let namer = trust_namer(ctx, &store);
             let mut lines = vec![trusted_destination_line(&store, &namer, &outcome)];
             if outcome.deny_lifted {
@@ -4454,6 +4455,7 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             }
             let change = store.trust_identity(mesh, &identity, TrustOptions::default(), now)?;
             reset_knock_surfacing(ctx, &identity);
+            fetch_cards_after_grant(ctx, &identity, None);
             let mut lines = vec![format!(
                 "Trusted {user}, every session of {theirs}, now and later - {}.",
                 change_text(change)
@@ -4472,6 +4474,14 @@ async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
 fn reset_knock_surfacing(ctx: &RequestContext, identity: &str) {
     if let Some(runtime) = ctx.app.mesh.get() {
         runtime.knock_gate().reset_surfaced(identity);
+    }
+}
+
+/// The owner just trusted `identity` (or its one session `destination`), so each session
+/// the grant covers is asked for its card once, for the names it advertises.
+fn fetch_cards_after_grant(ctx: &RequestContext, identity: &str, destination: Option<&str>) {
+    if let Some(runtime) = ctx.app.mesh.get() {
+        runtime.fetch_cards_after_owner_grant(identity, destination);
     }
 }
 
@@ -35357,6 +35367,96 @@ mod tests {
 
             /// `access trust --identity` is a mutating verb like the rest: without a terminal it refuses
             /// naming the flag, and declined at the prompt it writes nothing.
+            /// B hears A, which trusts B but has never served B a card or a message; B's
+            /// owner trusts A with `access trust session` or `access trust user`, and
+            /// within seconds B has asked A for its card once and keeps the session name A
+            /// advertises.
+            fn owner_grant_fetches_the_card(tag: &str, by_user: bool) {
+                use crate::mesh::MeshSlot;
+                use crate::mesh::request::STATUS_PATH;
+                use crate::mesh::test_support::{
+                    TransportRelay, started_runtime_on, wait_for_peer,
+                };
+
+                let _guard = TestConfigDirGuard::new(tag);
+                let _capture = capture::install();
+                run_async(async {
+                    let relay = TransportRelay::start().await;
+                    let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+                    let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
+                    let slot_a = Arc::new(MeshSlot::default());
+                    slot_a.install(a.runtime.clone()).unwrap();
+                    slot_a.rename_session("review");
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                    let (a_rt, b_rt) = (&a.runtime, &b.runtime);
+                    let a_dest = a_rt.current_destination_hash();
+                    let a_identity = a_rt.fingerprint().to_string();
+                    let b_dest = b_rt.current_destination_hash();
+                    wait_for_peer(b_rt, &a_dest).await;
+                    wait_for_peer(a_rt, &b_dest).await;
+                    a_rt.trust()
+                        .trust_destination(
+                            slot_a.as_ref(),
+                            &b_dest,
+                            TrustOptions::default(),
+                            SystemTime::now(),
+                        )
+                        .unwrap();
+                    assert!(!b_rt.peers().served_recently(&a_dest), "A served B nothing");
+                    let status_requests = || {
+                        b_rt.requests_made()
+                            .iter()
+                            .filter(|(path, _)| path == STATUS_PATH)
+                            .count()
+                    };
+                    assert_eq!(status_requests(), 0);
+
+                    let line = if by_user {
+                        format!(".mesh access trust user {a_identity} --yes")
+                    } else {
+                        format!(".mesh access trust session {a_dest} --yes")
+                    };
+                    let out = out_of(&mut ctx, &line).await.unwrap();
+                    assert!(out.contains("Trusted "), "{out}");
+
+                    let session_name = || {
+                        b_rt.trust()
+                            .people(&[])
+                            .session(&a_identity, &a_dest)
+                            .map(|alias| alias.text.clone())
+                    };
+                    for _ in 0..100 {
+                        if session_name().is_some() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    assert_eq!(
+                        status_requests(),
+                        1,
+                        "{line}: the grant asked A for its card once"
+                    );
+                    assert_eq!(session_name().as_deref(), Some("review"), "{line}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    assert!(slot_a.stop().await.unwrap());
+                    relay.stop().await;
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn trusting_a_session_fetches_its_card_though_it_never_served_this_node() {
+                owner_grant_fetches_the_card("repl-mesh-grant-card-session", false);
+            }
+
+            #[test]
+            #[serial]
+            fn trusting_a_user_fetches_their_sessions_card_though_they_never_served_this_node() {
+                owner_grant_fetches_the_card("repl-mesh-grant-card-user", true);
+            }
+
             #[test]
             #[serial]
             fn trust_identity_without_a_terminal_or_declined_writes_nothing() {
@@ -36218,7 +36318,7 @@ mod tests {
                 })
                 .await;
                 let runtime = started.runtime.clone();
-                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let ctx = ctx_with(MeshConfig::default(), true);
                 ctx.app.mesh.install(runtime.clone()).unwrap();
                 stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
                 stub.announce(Some("Tia")).await;
@@ -36228,12 +36328,17 @@ mod tests {
                     .unwrap();
                 let peer = stub.destination_hex();
                 stub.wait_to_be_filed(&runtime.peers(), &peer).await;
-                out_of(
-                    &mut ctx,
-                    &format!(".mesh access trust session {peer} --yes"),
-                )
-                .await
-                .unwrap();
+                // Trusted through the store rather than `.mesh access trust`, whose card
+                // fetch would leave a live link to the peer that these tests then mark gone.
+                runtime
+                    .trust()
+                    .trust_destination(
+                        ctx.app.mesh.as_ref(),
+                        &peer,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
                 pn.announce(&propagation_announce_app_data(true, 0, 256))
                     .await;
                 wait_until("the runtime to file the propagation node", || {

@@ -25,6 +25,10 @@ pub(crate) const CARD_FETCH_MIN_INTERVAL: Duration = Duration::from_secs(10 * 60
 pub(crate) enum CardTrigger {
     /// This node granted trust that covers the session.
     Granted,
+    /// The owner granted it trust with `.mesh access trust`: asked once whether or not
+    /// it ever served this node, since the owner has just chosen to trust it and the card
+    /// is what names it.
+    OwnerGranted,
     /// The session announced or answered a path request; only the first time a session
     /// is heard in a run counts, and a card or message it served counts as heard.
     Heard,
@@ -94,10 +98,10 @@ impl CardCadence {
     /// Whether a background fetch of `destination`, prompted by `trigger`, may go out
     /// now, and if so notes it as asked. `served` is whether the session served this
     /// node a card or a message in this run or the previous one; a session that did not
-    /// is never asked, and neither is one that refused since the trust last changed. A
-    /// grant is a trust change on this side, so it lifts a refusal first. Only the first
-    /// time a session is heard in a run counts, and no destination is asked twice within
-    /// `CARD_FETCH_MIN_INTERVAL`.
+    /// is asked only after the owner granted it trust, and one that refused since the
+    /// trust last changed is never asked. A grant is a trust change on this side, so it
+    /// lifts a refusal first. Only the first time a session is heard in a run counts, and
+    /// no destination is asked twice within `CARD_FETCH_MIN_INTERVAL`.
     pub(crate) fn admit(&self, destination: &str, trigger: CardTrigger, served: bool) -> bool {
         let now = self.now();
         let mut state = self.state.lock();
@@ -107,11 +111,12 @@ impl CardCadence {
                     return false;
                 }
             }
-            CardTrigger::Granted => {
+            CardTrigger::Granted | CardTrigger::OwnerGranted => {
                 state.refused.remove(destination);
             }
         }
-        if !served || state.refused.contains(destination) {
+        if (!served && trigger != CardTrigger::OwnerGranted) || state.refused.contains(destination)
+        {
             return false;
         }
         if state
@@ -212,6 +217,29 @@ pub(crate) async fn drive_card_cadence(
 }
 
 impl MeshRuntime {
+    /// The owner granted trust with `.mesh access trust`: one background card fetch to
+    /// `destination`, or to every session of `identity` the peer table holds when no
+    /// destination is named, whether or not they ever served this node.
+    pub(crate) fn fetch_cards_after_owner_grant(
+        self: &Arc<Self>,
+        identity: &str,
+        destination: Option<&str>,
+    ) {
+        let destinations: Vec<String> = match destination {
+            Some(destination) => vec![destination.to_string()],
+            None => self
+                .peers()
+                .snapshot()
+                .into_iter()
+                .filter(|row| row.identity_hash == identity)
+                .map(|row| row.destination_hash)
+                .collect(),
+        };
+        for destination in destinations {
+            self.consider_card_fetch(&destination, CardTrigger::OwnerGranted);
+        }
+    }
+
     /// Asks the session at `destination` for its card in the background when the cadence
     /// allows: the peer table holds it, it has not said it left, this node trusts it, and
     /// `CardCadence::admit` agrees. The fetch waits for one of `STATUS_MAX_CONCURRENCY`
@@ -290,7 +318,7 @@ mod tests {
     const D: &str = "dddddddddddddddddddddddddddddddd";
 
     #[test]
-    fn only_a_session_that_served_this_node_is_asked() {
+    fn only_a_session_that_served_this_node_is_asked_unless_the_owner_granted_it_trust() {
         let cadence = CardCadence::default();
         assert_eq!(
             cadence.permits.available_permits(),
@@ -300,6 +328,21 @@ mod tests {
         assert!(!cadence.admit(D, CardTrigger::Granted, false));
         assert!(!cadence.admit(D, CardTrigger::Heard, false));
         assert!(cadence.admit(D, CardTrigger::Granted, true));
+        let other = "e".repeat(32);
+        assert!(
+            cadence.admit(&other, CardTrigger::OwnerGranted, false),
+            "the owner's grant asks a session that never served this node"
+        );
+        assert!(
+            !cadence.admit(&other, CardTrigger::OwnerGranted, false),
+            "and only once per interval"
+        );
+        cadence.refused(&other);
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(
+            !cadence.admit(&other, CardTrigger::Heard, true),
+            "a refusal still stops the announces"
+        );
     }
 
     #[test]
