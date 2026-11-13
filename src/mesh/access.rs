@@ -390,7 +390,7 @@ impl fmt::Display for AccessError {
             ),
             Self::Untrusted => write!(
                 f,
-                "The session is not trusted for an access request. Trust it first with `.mesh access trust session <who>`; `.mesh people list` lists what this Coyote has heard from."
+                "The session is not trusted for an access request. Trust it first with `.mesh access trust session <who>`; `.mesh people list` lists the sessions you have heard."
             ),
             Self::UnknownDestination { recently_seen } => write!(
                 f,
@@ -448,11 +448,11 @@ impl fmt::Display for AccessError {
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh people list` to see which nodes this Coyote has heard from."
+                "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh people list` to see the sessions you have heard."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
-                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from."
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the sessions you have heard."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -1843,7 +1843,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the nodes this Coyote has heard from.",
+                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the sessions you have heard.",
                 short(&to)
             )
         );

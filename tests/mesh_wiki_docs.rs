@@ -977,7 +977,7 @@ fn the_mesh_page_names_the_compatibility_values_the_peers_tool_returns() {
 /// does the Mesh page, beside the refusal's opening.
 #[test]
 fn the_mesh_page_says_how_tool_results_name_users_and_sessions() {
-    let naming = fn_body("src/function/mesh.rs", "fill");
+    let naming = method_body("src/function/mesh.rs", "fill");
     for needle in [
         "fields.insert(\"user\".into(), json!(local.user))",
         "fields.insert(\"session\".into(), json!(local.session))",
@@ -985,6 +985,17 @@ fn the_mesh_page_says_how_tool_results_name_users_and_sessions() {
         "wrap_short(short(destination)",
     ] {
         assert!(naming.contains(needle), "Naming::fill lacks {needle:?}");
+    }
+    let guidance = const_str("src/function/mesh.rs", "NAMES_GUIDANCE");
+    for needle in [
+        "`user` and `session` are your own words for it",
+        "only inside that peer's fenced `advertised_names` block",
+        "Arguments always take the full session hash, never a name.",
+    ] {
+        assert!(
+            guidance.contains(needle),
+            "the tool declarations' NAMES_GUIDANCE lacks {needle:?}"
+        );
     }
     let led = fn_body("src/function/mesh.rs", "session_led");
     assert!(
@@ -1173,7 +1184,7 @@ fn marker_line(name: &str, placeholder: &str) -> String {
 /// short per-peer pair with `<d8>` and the long pair with `<destination>`, says a tool
 /// result fences each peer card, message and reply once, and says file content keeps the
 /// long form, with the labels the code spells for a card's fields and a message's pieces,
-/// and quotes the `this node` pair an entry this node filed itself wears;
+/// and quotes the `your session` pair an entry your own session filed wears;
 /// the File Sharing page still quotes the long pair and never the short one. The code
 /// side is checked on every run, `fetch_result` included, so the File Sharing page's
 /// long-form claim is anchored to the fetch path.
@@ -7730,8 +7741,13 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
     );
     let send = fn_body("src/function/mesh.rs", "handle_send");
     assert!(
-        send.contains("if out.kind == PeerKind::Reply {") && send.contains("held_reply_sentence"),
+        send.contains("if out.kind == PeerKind::Reply {") && send.contains("Held::Reply"),
         "mesh__send no longer words a held reply for the session that asked:\n{send}"
+    );
+    let departed = fn_body("src/function/mesh.rs", "departed_result");
+    assert!(
+        departed.contains("Held::Reply => format!(\"{who}{status}{HELD_REPLY_FOR_DEPARTED}\")"),
+        "the tools' held reply no longer reads as the REPL's:\n{departed}"
     );
 
     let Some(wiki) = wiki_dir() else { return };

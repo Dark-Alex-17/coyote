@@ -36891,7 +36891,7 @@ mod tests {
                         assert_eq!(
                             err,
                             format!(
-                                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from."
+                                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the sessions you have heard."
                             )
                         );
 
@@ -36920,7 +36920,8 @@ mod tests {
             /// serves nothing at `/status` (a stub behind the real dispatcher with only the
             /// message handler registered) ends on the error line the status refusal
             /// renders: what happened, the likely why, and the two next steps (`.mesh people
-            /// info <destination>` for the last card, upgrade then try again). Nothing else is
+            /// info <session>` for the last card, that session's user upgrades then you try
+            /// again). Nothing else is
             /// printed after the progress line, and the line carries no wire code.
             #[test]
             #[serial]

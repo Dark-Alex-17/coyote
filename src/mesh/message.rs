@@ -1501,11 +1501,11 @@ impl fmt::Display for SendError {
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh people list` to see which nodes this Coyote has heard from."
+                "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh people list` to see the sessions you have heard."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
-                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from."
+                "{no_answer} Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the sessions you have heard."
             ),
             Self::Propagation(err) => write!(
                 f,
@@ -1514,7 +1514,7 @@ impl fmt::Display for SendError {
             ),
             Self::NotAcknowledged => write!(
                 f,
-                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask the person at that node to upgrade, then send it again"
+                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
             ),
         }
     }
@@ -3368,7 +3368,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the nodes this Coyote has heard from.",
+                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its owner can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the sessions you have heard.",
                 short(&to)
             )
         );
@@ -3948,7 +3948,7 @@ mod tests {
         assert_eq!(
             SendError::NotAcknowledged.to_string(),
             format!(
-                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask the person at that node to upgrade, then send it again"
+                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
             )
         );
         // The link-side tail is the request error's, and the refusal tail the code's.

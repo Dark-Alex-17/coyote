@@ -14,15 +14,15 @@ use crate::mesh::fetch::{
     spent_attachment_tool_message,
 };
 use crate::mesh::message::{
-    Departure, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind,
-    RecipientOutcome, Route, SendError, collect_next_action, held_reply_sentence, held_sentence,
-    left_mesh_hint, unreachable_head,
+    Departure, HELD_FOR_DEPARTED, HELD_FOR_DEPARTED_END, HELD_REPLY_FOR_DEPARTED, OutboundPeer,
+    PEER_CONTENT_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind, RecipientOutcome, Route, SendError,
+    collect_next_action, left_mesh_hint, unreachable_head,
 };
 use crate::mesh::pending::{
     DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PENDING_TTL,
     PendingRecord, PendingState, WaitOutcome,
 };
-use crate::mesh::people::{Namer, Who};
+use crate::mesh::people::{Namer, Who, YOU};
 use crate::mesh::request::short;
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, Verdict, same_hash};
 use crate::mesh::{
@@ -594,7 +594,7 @@ mod peer_text_prefix_tests {
             "{message}"
         );
         assert!(
-            message.ends_with("`/mesh people list` lists the nodes this Coyote has heard from."),
+            message.ends_with("`/mesh people list` lists the sessions you have heard."),
             "{message}"
         );
     }
@@ -644,7 +644,8 @@ fn collect_timeout(args: &Value) -> Result<Duration> {
 /// will. That ask takes up to `PATH_REQUEST_TIMEOUT` and one that files no row is an
 /// `unknown_destination` envelope, so the delay and the kind tell a caller the trust
 /// list could allow the destination. Every miss it rules out unasked is the same
-/// immediate `not_trusted` envelope, so a caller learns nothing about which.
+/// immediate `not_trusted` envelope, so a caller learns nothing about which; only its
+/// naming fields differ, in your own words, as `mesh__peers` already shows them.
 async fn trusted_peer(runtime: &MeshRuntime, peer: &str) -> Result<(String, PeerRecord), Value> {
     let refusal = |err: SendError| {
         let identity =
@@ -1217,12 +1218,13 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
                 result["note"] = json!(REPLY_THREAD_IS_THE_RECEIVERS);
             }
             if let Some(departed) = outcome.departed {
+                let who = naming.local(identity.as_deref(), &destination);
                 let held = if out.kind == PeerKind::Reply {
-                    held_reply_sentence
+                    Held::Reply
                 } else {
-                    held_sentence
+                    Held::Message
                 };
-                result["departed"] = departed_result(to, departed, held, SystemTime::now());
+                result["departed"] = departed_result(&who, departed, held, SystemTime::now());
             }
             Ok(result)
         }
@@ -1294,8 +1296,8 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
         if let Some(departed) = outcome.departed
             && result.is_object()
         {
-            result["departed"] =
-                departed_result(&destination, departed, held_sentence, SystemTime::now());
+            let who = naming.local(identity.as_deref(), &destination);
+            result["departed"] = departed_result(&who, departed, Held::Message, SystemTime::now());
         }
         return Ok(result);
     }
@@ -1313,8 +1315,8 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
     });
     naming.name(&mut result, identity.as_deref(), &destination);
     if let Some(departed) = outcome.departed {
-        result["departed"] =
-            departed_result(&destination, departed, held_sentence, SystemTime::now());
+        let who = naming.local(identity.as_deref(), &destination);
+        result["departed"] = departed_result(&who, departed, Held::Message, SystemTime::now());
     }
     Ok(result)
 }
@@ -1330,6 +1332,34 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
 /// question the peer's human has been asked comes back at once as escalated: the
 /// question stays open, and the reply's arrival is notified like any other.
 async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Value {
+    let mut result = wait_for_reply(ctx, id, timeout).await;
+    name_open_question(&ctx.app.mesh, id, &mut result);
+    result
+}
+
+/// Names the session a still-open question `id` was asked of on a result that names
+/// none yet (pending, escalated, interrupted). Its user is read from what proves it, as
+/// everywhere, never from the identity the question was filed under.
+fn name_open_question(slot: &MeshSlot, id: &str, result: &mut Value) {
+    if result.get("user").is_some() {
+        return;
+    }
+    let Some(destination) = slot
+        .correlations()
+        .list()
+        .into_iter()
+        .find(|correlation| correlation.record.id == id)
+        .map(|correlation| correlation.record.peer_destination)
+    else {
+        return;
+    };
+    let identity = slot
+        .get()
+        .and_then(|runtime| runtime.identity_at(&destination));
+    Naming::of(slot).name(result, identity.as_deref(), &destination);
+}
+
+async fn wait_for_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Value {
     let correlations = ctx.app.mesh.correlations();
     let deadline = tokio::time::Instant::now() + timeout;
     let outcome = loop {
@@ -1561,9 +1591,18 @@ async fn handle_broadcast(runtime: &MeshRuntime, args: &Value) -> Result<Value> 
         let destination = &report.destination;
         let identity = runtime.identity_at(destination);
         let mut row = serde_json::to_value(report)?;
-        if let RecipientOutcome::Throttled { reason } = &report.outcome {
+        let lead = match &report.outcome {
+            RecipientOutcome::Throttled { reason } => {
+                Some((reason, short(destination).to_string()))
+            }
+            RecipientOutcome::Unreachable { reason } | RecipientOutcome::Refused { reason } => {
+                Some((reason, format!("Session {destination}")))
+            }
+            _ => None,
+        };
+        if let Some((reason, lead)) = lead {
             let who = naming.local(identity.as_deref(), destination);
-            row["reason"] = json!(session_led(reason, short(destination), &who, destination));
+            row["reason"] = json!(session_led(reason, &lead, &who, destination));
         }
         naming.name(&mut row, identity.as_deref(), destination);
         recipients.push(row);
@@ -1596,8 +1635,8 @@ async fn handle_broadcast(runtime: &MeshRuntime, args: &Value) -> Result<Value> 
 /// or text or data part gets `text: null`, like a card with no free text. The headings
 /// inside the fence (`title:`, `part <n> (text):`, `part <n> (data):`, `fields:`) are
 /// rendered from the peer's message and are the peer's words too; the bare `parts` array
-/// next to the block is the trusted census of what the message carried. An entry this
-/// node filed itself (`from_self`) is fenced as `this node`, not as a peer.
+/// next to the block is the trusted census of what the message carried. An entry your
+/// own session filed (`from_self`) is fenced as `your session`, not as a peer.
 fn fence_message(payload: &mut Value, destination: &str, from_self: bool) {
     let Some(message) = payload.as_object_mut() else {
         return;
@@ -1733,23 +1772,26 @@ async fn handle_request_access(slot: &MeshSlot, args: &Value) -> Result<Value> {
     let departed = outcome.as_ref().ok().and_then(|outcome| outcome.departed);
     let lead = outcome.as_ref().err().and_then(access_error_lead);
     let mut result = access_result(outcome);
-    if let Some(destination) = canonical_hash(peer) {
-        let identity = slot
-            .get()
-            .and_then(|runtime| runtime.identity_at(&destination));
-        let naming = Naming::of(slot);
+    let naming = Naming::of(slot);
+    let destination = canonical_hash(peer);
+    let identity = destination.as_deref().and_then(|destination| {
+        slot.get()
+            .and_then(|runtime| runtime.identity_at(destination))
+    });
+    if let Some(destination) = &destination {
         if let Some(lead) = lead {
-            let who = naming.local(identity.as_deref(), &destination);
+            let who = naming.local(identity.as_deref(), destination);
             let text = result["message"].as_str().unwrap_or_default();
-            let text = session_led(text, &lead, &who, &destination)
+            let text = session_led(text, &lead, &who, destination)
                 .replace("session <who>", &format!("session {destination}"));
             result["message"] = json!(text);
         }
         result["peer"] = json!(destination);
-        naming.name(&mut result, identity.as_deref(), &destination);
+        naming.name(&mut result, identity.as_deref(), destination);
     }
     if let Some(departed) = departed {
-        result["departed"] = departed_result(peer, departed, held_sentence, SystemTime::now());
+        let who = naming.local(identity.as_deref(), destination.as_deref().unwrap_or(peer));
+        result["departed"] = departed_result(&who, departed, Held::Message, SystemTime::now());
     }
     Ok(result)
 }
@@ -1766,19 +1808,33 @@ fn access_error_lead(err: &AccessError) -> Option<String> {
     }
 }
 
+/// What a propagation node holds for a session that had gone: a reply, which only the
+/// session that asked takes, or anything else, which any of the user's sessions takes.
+#[derive(Clone, Copy)]
+enum Held {
+    Message,
+    Reply,
+}
+
 /// The `departed` object of a result whose message or request a propagation node holds
-/// because the peer had gone: its state, how long ago it left when it said so, and the
-/// sentence `held` words for the user, naming the peer by its destination hash.
-fn departed_result(
-    peer: &str,
-    departed: Departure,
-    held: fn(&str, Departure, SystemTime) -> String,
-    now: SystemTime,
-) -> Value {
-    let destination = canonical_hash(peer).unwrap_or_else(|| peer.to_string());
+/// because the session had gone: its state, how long ago it left when it said so, and
+/// the sentence for the person at the keyboard, the REPL's held line naming the session
+/// by `who`, its local `<user> / <session>`, and its sessions by the user.
+fn departed_result(who: &Who, departed: Departure, held: Held, now: SystemTime) -> Value {
+    let status = departed.status(now);
+    let message = match held {
+        Held::Reply => format!("{who}{status}{HELD_REPLY_FOR_DEPARTED}"),
+        Held::Message if who.user == YOU => {
+            format!("{who}{status}{HELD_FOR_DEPARTED}your sessions when one syncs")
+        }
+        Held::Message => format!(
+            "{who}{status}{HELD_FOR_DEPARTED}{}{HELD_FOR_DEPARTED_END}",
+            who.user
+        ),
+    };
     let mut result = json!({
         "state": departed.state(),
-        "message": held(&destination, departed, now),
+        "message": message,
     });
     let secs_ago = |at: SystemTime| json!(now.duration_since(at).unwrap_or_default().as_secs());
     match departed {
@@ -5315,16 +5371,20 @@ mod tests {
         assert!(list_result(&peer, None, Ok(page(""))).get("next").is_none());
     }
 
-    /// A result held for a peer that had gone names its state, how long ago it left when
-    /// it said so, and the sentence for the user, the peer named by its full hash.
+    /// A result held for a session that had gone names its state, how long ago it left
+    /// when it said so, and the sentence for the person at the keyboard: the session by
+    /// its `<user> / <session>`, the sessions that may take it by their user.
     #[test]
-    fn a_departed_peer_reads_its_state_and_the_held_sentence_by_hash() {
+    fn a_departed_session_reads_its_state_and_the_held_sentence_by_user_and_session() {
         let now = SystemTime::now();
-        let dest = "ab".repeat(16);
+        let who = Who {
+            user: "Coworker A".to_string(),
+            session: "abababab".to_string(),
+        };
         let left = departed_result(
-            &dest.to_uppercase(),
+            &who,
             Departure::Left(now - Duration::from_secs(7200)),
-            held_sentence,
+            Held::Message,
             now,
         );
         assert_eq!(
@@ -5332,15 +5392,23 @@ mod tests {
             json!({
                 "state": "left",
                 "left_secs_ago": 7200,
-                "message": format!("{dest} left 2h ago; held at the propagation node, delivered to any of {dest}'s sessions when one syncs"),
+                "message": "Coworker A / abababab left 2h ago; held at the propagation node, delivered to any of Coworker A's sessions when one syncs",
             })
         );
+        assert_eq!(
+            left["message"],
+            format!(
+                "Coworker A / abababab{}{HELD_FOR_DEPARTED}Coworker A{HELD_FOR_DEPARTED_END}",
+                Departure::Left(now - Duration::from_secs(7200)).status(now)
+            ),
+            "the REPL's held line, built from the same pieces"
+        );
         let no_route = departed_result(
-            &dest,
+            &who,
             Departure::NoRoute {
                 last_seen: now - Duration::from_secs(60),
             },
-            held_sentence,
+            Held::Message,
             now,
         );
         assert_eq!(no_route["state"], "no_route");
@@ -5348,22 +5416,31 @@ mod tests {
         assert_eq!(no_route["last_seen_secs_ago"], 60, "{no_route}");
         assert_eq!(
             no_route["message"],
-            format!(
-                "{dest} has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard 1m ago); held at the propagation node, delivered to any of {dest}'s sessions when one syncs"
-            )
+            "Coworker A / abababab has no route (its last link failed and it has not announced since, and a relay that restarted has no path to it until it announces again; last heard 1m ago); held at the propagation node, delivered to any of Coworker A's sessions when one syncs"
         );
         let reply = departed_result(
-            &dest,
+            &who,
             Departure::Left(now - Duration::from_secs(7200)),
-            held_reply_sentence,
+            Held::Reply,
             now,
         );
         assert_eq!(
             reply["message"],
-            format!(
-                "{dest} left 2h ago; held at the propagation node, delivered to the session that asked when it syncs"
-            ),
+            "Coworker A / abababab left 2h ago; held at the propagation node, delivered to the session that asked when it syncs",
             "a held reply is taken only by the session that asked"
+        );
+        let yours = Who {
+            user: YOU.to_string(),
+            session: "review".to_string(),
+        };
+        assert_eq!(
+            departed_result(
+                &yours,
+                Departure::Left(now - Duration::from_secs(7200)),
+                Held::Message,
+                now
+            )["message"],
+            "you / review left 2h ago; held at the propagation node, delivered to any of your sessions when one syncs"
         );
     }
 
@@ -7270,9 +7347,11 @@ mod tests {
             assert_eq!(refused["status"], "error", "{refused}");
             assert_eq!(refused["user"], "unnamed", "{refused}");
             assert_eq!(refused["session"], "5a5a5a5a", "{refused}");
-            assert!(
-                refused["message"].as_str().is_some_and(|message| message
-                    .starts_with(&format!("unnamed / 5a5a5a5a (session hash {unheard}) "))),
+            assert_eq!(
+                refused["message"],
+                format!(
+                    "unnamed / 5a5a5a5a (session hash {unheard}) is not trusted for an access request. Trust it first with `.mesh access trust session {unheard}`; `.mesh people list` lists the sessions you have heard."
+                ),
                 "{refused}"
             );
         }
@@ -7823,8 +7902,8 @@ mod tests {
             }
 
             /// With sessions `a` and `temp` running on one cache dir, `a`'s `mesh__peers`
-            /// row for temp's destination carries `"session": "temp"`, and a foreign peer's
-            /// row has no `session` key.
+            /// row for temp's destination carries `"user": "you"` and `"session": "temp"`,
+            /// and a foreign peer's row reads as its short hashes.
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
             #[serial]
             async fn an_own_running_session_row_names_its_session() {
@@ -7884,11 +7963,12 @@ mod tests {
 
                 /// A peer table row pairing one of this node's registered destinations with
                 /// another identity is a sighting this node cannot vouch for, so it names
-                /// no session. `temp` does not announce, so the only sighting of its
-                /// destination is the forged one.
+                /// no session of yours and reads as its short hashes. `temp` does not
+                /// announce, so the only sighting of its destination is the forged one.
                 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
                 #[serial]
-                async fn an_own_destination_announced_by_another_identity_names_no_session() {
+                async fn an_own_destination_announced_by_another_identity_reads_as_its_short_hashes()
+                 {
                     let _guard = TestConfigDirGuard::new("mesh-tool-peers-session-foreign");
                     let (addr, relay_handle, _) = loopback_relay().await;
                     let tmp = TempDir::new("mesh-tool-peers-session-foreign");
@@ -8084,7 +8164,7 @@ mod tests {
         /// An inbox entry is this node's own when this node filed it: the reply its
         /// envoy minted carries `from_self`, the peer's original it answers does not,
         /// and nor does a delivered message that merely names the node's destination as
-        /// its source. The own entry's text is fenced as `this node`, a peer's as
+        /// its source. The own entry's text is fenced as `your session`, a peer's as
         /// `peer <d8>`. The envelope otherwise keeps its keys, and the tool's
         /// description tells the model what the key means.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
