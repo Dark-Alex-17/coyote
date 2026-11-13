@@ -1521,7 +1521,7 @@ pub(crate) fn spent_attachment_tool_message(
 ) -> String {
     let gone = if staged_present { "" } else { GONE_COPY_TAIL };
     format!(
-        "`{shown}` was a one-time attachment from {peer} and you already fetched it; read it at `already_staged_at`.{gone} This was answered from your own records without asking the peer. If the peer now shares it some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the peer; a fresh one-time copy needs the peer to attach it again, which mesh__request_access asks its human for."
+        "`{shown}` was a one-time attachment from {peer} and you already fetched it; read it at `already_staged_at`.{gone} This was answered from your own records without asking that session. If it now shares the file some other way, a mesh__list call that lists the path (start with the one in next_action and follow its cursor if needed) lets a fetch after that ask the session; a fresh one-time copy needs that session to attach it again, which mesh__request_access asks its human for."
     )
 }
 
@@ -3767,9 +3767,17 @@ mod tests {
     }
 
     /// The REPL's `not_shared` sentence and the tool's message open each reason with the
-    /// same words and speak of sessions and their users, never of a peer.
+    /// same words and speak of sessions and their users, never of a peer; so do the
+    /// REPL's sentence for a session that serves no files and the tool's message for an
+    /// attachment already fetched.
     #[test]
     fn the_not_shared_sentence_and_tool_message_read_as_twins() {
+        let speaks_of_a_peer = |text: &str| {
+            let text = format!(" {}", text.to_ascii_lowercase());
+            [" peer ", " peer.", " peer,", " peer;", "peer's", "the peer"]
+                .iter()
+                .any(|word| text.contains(word))
+        };
         let expires = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
         let fetched = NotSharedReason::AlreadyFetched {
             message_id: "m-1".to_string(),
@@ -3797,9 +3805,21 @@ mod tests {
             let message = not_shared_tool_message("abcd1234", "docs/a.md", &reason);
             for text in [&sentence, &message] {
                 assert!(text.starts_with(&head), "{reason:?}: {text}");
-                assert!(!text.to_ascii_lowercase().contains("peer"), "{text}");
+                assert!(!speaks_of_a_peer(text), "{text}");
             }
         }
+        let without_fetch = not_shared_sentence(
+            "abcd1234",
+            "docs/a.md",
+            "docs/a.md",
+            &NotSharedReason::PeerWithoutFetch,
+        )
+        .plain();
+        for staged_present in [true, false] {
+            let spent = spent_attachment_tool_message("abcd1234", "docs/a.md", staged_present);
+            assert!(!speaks_of_a_peer(&spent), "{spent}");
+        }
+        assert!(!speaks_of_a_peer(&without_fetch), "{without_fetch}");
         let message = not_shared_tool_message("abcd1234", "docs/a.md", &NotSharedReason::Unknown);
         assert!(
             message.ends_with("Do not ask that session's envoy for the file in free text."),
