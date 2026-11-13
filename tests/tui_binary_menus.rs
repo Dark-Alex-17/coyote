@@ -3558,6 +3558,67 @@ fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mc
     assert_tty_restored(&plain);
 }
 
+/// `--mcp-add <name> --url <url with a vault placeholder> --mcp-force` for
+/// a server that is already configured, with no terminal at all:
+/// `--mcp-force` skips the overwrite question, but the missing secret
+/// still has to be asked for, so the run is refused in the shared shape
+/// (`provision the MCP secrets for '<name>'`, remedy naming
+/// `coyote --add-secret <SECRET>`), exits non-zero and leaves mcp.json
+/// byte-for-byte as it was.
+#[test]
+#[serial]
+fn a_tty_less_mcp_add_with_a_secret_and_mcp_force_is_refused_before_touching_mcp_json() {
+    let dir = fresh_config_dir("ttyless-mcp-add-secret-force");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    secure_vault_password_file(&dir);
+    let (ok, out) = run_ttyless(
+        &dir,
+        &["--mcp-add", "probe-srv-f2k", "--", "echo", "hi"],
+        "tty-less --mcp-add",
+    );
+    assert!(ok, "the secret-free `--mcp-add` failed:\n{out}");
+    let mcp_json = dir.join("mcp.json");
+    let before =
+        fs::read(&mcp_json).unwrap_or_else(|_| panic!("no mcp.json after the add:\n{out}"));
+
+    let (ok, out) = run_ttyless(
+        &dir,
+        &[
+            "--mcp-add",
+            "probe-srv-f2k",
+            "--url",
+            "https://h/{{PROBE_MCP_TOKEN_F2K}}",
+            "--mcp-force",
+        ],
+        "tty-less --mcp-add --mcp-force with a vault placeholder",
+    );
+    assert!(
+        !ok,
+        "the forced tty-less `--mcp-add` needing a secret exited 0:\n{out}"
+    );
+    let (action, remedy) = refusal_shape(&out).unwrap_or_else(|| {
+        panic!("the forced `--mcp-add` is not refused in the shared shape:\n{out}")
+    });
+    assert_eq!(
+        action, "provision the MCP secrets for 'probe-srv-f2k'",
+        "{out}"
+    );
+    assert!(
+        remedy.contains("coyote --add-secret PROBE_MCP_TOKEN_F2K"),
+        "the remedy does not name `coyote --add-secret PROBE_MCP_TOKEN_F2K`: {remedy:?}\n{out}"
+    );
+    assert!(
+        !out.contains("Overwrite?") && !out.contains("to the vault now?"),
+        "the forced run asked anyway:\n{out}"
+    );
+    assert_eq!(
+        fs::read(&mcp_json).unwrap(),
+        before,
+        "the refused forced add changed mcp.json:\n{out}"
+    );
+}
+
 /// Two more clients that authenticate with OAuth against unreachable
 /// hosts, so `--authenticate` has a pick to make and never gets a token.
 const TWO_OAUTH_CLIENTS: &str = "\x20 - type: openai-compatible\n\
