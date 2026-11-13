@@ -3576,7 +3576,7 @@ fn a_tty_less_mcp_add_with_a_secret_and_mcp_force_is_refused_before_touching_mcp
     secure_vault_password_file(&dir);
     let (ok, out) = run_ttyless(
         &dir,
-        &["--mcp-add", "probe-srv-f2k", "--", "echo", "hi"],
+        &["--mcp-add", "forced-srv-f2k", "--", "echo", "hi"],
         "tty-less --mcp-add",
     );
     assert!(ok, "the secret-free `--mcp-add` failed:\n{out}");
@@ -3588,9 +3588,9 @@ fn a_tty_less_mcp_add_with_a_secret_and_mcp_force_is_refused_before_touching_mcp
         &dir,
         &[
             "--mcp-add",
-            "probe-srv-f2k",
+            "forced-srv-f2k",
             "--url",
-            "https://h/{{PROBE_MCP_TOKEN_F2K}}",
+            "https://h/{{FORCED_MCP_TOKEN_F2K}}",
             "--mcp-force",
         ],
         "tty-less --mcp-add --mcp-force with a vault placeholder",
@@ -3603,12 +3603,12 @@ fn a_tty_less_mcp_add_with_a_secret_and_mcp_force_is_refused_before_touching_mcp
         panic!("the forced `--mcp-add` is not refused in the shared shape:\n{out}")
     });
     assert_eq!(
-        action, "provision the MCP secrets for 'probe-srv-f2k'",
+        action, "provision the MCP secrets for 'forced-srv-f2k'",
         "{out}"
     );
     assert!(
-        remedy.contains("coyote --add-secret PROBE_MCP_TOKEN_F2K"),
-        "the remedy does not name `coyote --add-secret PROBE_MCP_TOKEN_F2K`: {remedy:?}\n{out}"
+        remedy.contains("coyote --add-secret FORCED_MCP_TOKEN_F2K"),
+        "the remedy does not name `coyote --add-secret FORCED_MCP_TOKEN_F2K`: {remedy:?}\n{out}"
     );
     assert!(
         !out.contains("Overwrite?") && !out.contains("to the vault now?"),
