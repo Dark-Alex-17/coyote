@@ -1122,15 +1122,11 @@ pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed
             );
             Value::Null
         }
-        Ok(PromptAnswer::Selected(choice))
-            if action == PromptAction::Select && !options.is_empty() =>
-        {
-            match raw(choice) {
-                Some(raw) => json!(raw),
-                None if choice.trim().is_empty() => Value::Null,
-                None => json!(choice),
-            }
-        }
+        Ok(PromptAnswer::Selected(choice)) if action == PromptAction::Select => match raw(choice) {
+            Some(raw) => json!(raw),
+            None if choice.trim().is_empty() => Value::Null,
+            None => json!(choice),
+        },
         Ok(PromptAnswer::Checked(choices))
             if action == PromptAction::Checkbox && !options.is_empty() =>
         {
@@ -1859,6 +1855,23 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             );
 
             assert_eq!(reply, json!({"id": id, "answer": null}), "{blank:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn a_blank_answer_to_a_select_with_no_options_is_replied_as_null() {
+        for (answer, expected) in [("", Value::Null), ("  ", Value::Null), ("x", json!("x"))] {
+            let req =
+                PromptRequest::new(PromptAction::Select, "Pick? none-q8v", Origin::detached());
+            let id = req.id.clone();
+
+            let reply = reply_for(
+                ScriptedPrompter::new(vec![PromptAnswer::Selected(answer.to_string())]),
+                req,
+            );
+
+            assert_eq!(reply, json!({"id": id, "answer": expected}), "{answer:?}");
         }
     }
 
