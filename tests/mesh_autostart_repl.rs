@@ -7184,3 +7184,147 @@ fn the_owners_trust_grant_fetches_the_card_of_a_session_that_never_served_it() {
         );
     }
 }
+
+/// Two nodes on one real rnsd, both announcing, the owner trusting the other session. A
+/// message the other side refuses (it has not trusted the owner yet) prints a refusal
+/// whose remedy is spelled in the live `.mesh` prefix and leaves `.mesh messaging sent`
+/// with no `Sent by your sessions` section: a failed send opens nothing. Once the other
+/// side trusts the owner, a sent message prints `Sent <id8> to <user> / <session>
+/// (<dest8>, via direct).`; the other side's envoy answers on the dry-run model, the
+/// answer lands in the inbox as a `reply` in the message's thread, and the answered
+/// message is no longer listed under `Sent by your sessions`.
+#[test]
+fn a_sent_messages_reply_lands_in_its_thread_and_closes_it_and_a_refused_send_opens_nothing() {
+    let Some(relay) = RnsdRelay::start("message-thread") else {
+        eprintln!("skipped: no rnsd on the PATH");
+        return;
+    };
+    let me = Probe::new("message-thread-me", true, &[relay.port]).with_announce();
+    let mut command = me.command();
+    command.args(["--session", "probe"]);
+    let mut mine = spawn_repl(command);
+    wait_for(&mut mine, SESSION_PROMPT);
+    me.wait_for_marker("MESH_STARTED");
+    let other = Probe::new("message-thread-other", true, &[relay.port]).with_announce();
+    let mut command = other.command();
+    command.args(["--session", "probe"]);
+    let mut theirs = spawn_repl(command);
+    wait_for(&mut theirs, SESSION_PROMPT);
+    other.wait_for_marker("MESH_STARTED");
+    let carol8 = other.own_identity()[..8].to_string();
+    let me8 = me.own_identity()[..8].to_string();
+
+    let heard = |session: &mut Target, user8: &str| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let list = people_command(session, ".mesh people list");
+            if let Some(dest8) = sessions_of(&list, user8).into_iter().next() {
+                return dest8;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the announce never arrived: {list:?}"
+            );
+            thread::sleep(Duration::from_secs(1));
+        }
+    };
+    let dest8 = heard(&mut mine, &carol8);
+    let my_dest8 = heard(&mut theirs, &me8);
+    let who = format!("carol / {dest8}");
+
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+    let out = people_command(&mut mine, &format!(".mesh people name {carol8} \"carol\""));
+    check(out.contains("is now carol"), "name the user", &out);
+    let out = people_command(&mut mine, ".mesh access trust session carol --yes");
+    check(out.contains("Trusted "), "trust the other session", &out);
+
+    let out = people_command(
+        &mut mine,
+        ".mesh messaging send carol --yes \"refused, I hope\"",
+    );
+    check(
+        out.contains("Error: "),
+        "a send the other side has not trusted is refused",
+        &out,
+    );
+    check(
+        !out.contains("/mesh ") && out.contains(".mesh access trust session "),
+        "the refusal spells its remedy in the live `.mesh` prefix",
+        &out,
+    );
+    let out = people_command(&mut mine, ".mesh messaging sent");
+    check(
+        out.contains("Asked by your sessions: none") && !out.contains("Sent by your sessions"),
+        "a refused send opens no message entry",
+        &out,
+    );
+
+    let out = people_command(
+        &mut theirs,
+        &format!(".mesh access trust session {my_dest8} --yes"),
+    );
+    check(out.contains("Trusted "), "the other side trusts back", &out);
+
+    let out = people_command(
+        &mut mine,
+        ".mesh messaging send carol --yes \"are you there?\"",
+    );
+    let sent_line = out
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Sent "))
+        .unwrap_or_default()
+        .to_string();
+    let id8 = sent_line
+        .strip_prefix("Sent ")
+        .and_then(|rest| rest.get(..8))
+        .unwrap_or_default()
+        .to_string();
+    check(
+        id8.len() == 8 && sent_line == format!("Sent {id8} to {who} ({dest8}, via direct)."),
+        "the sent line names the session <user> / <session> before its hash",
+        &out,
+    );
+    let reply_in_thread = |text: &str| {
+        text.lines().map(str::trim).any(|line| {
+            line.starts_with(&format!("reply . from {who} ({dest8}) . "))
+                && line.contains(&format!(" . thread {id8}"))
+        })
+    };
+    // The envoy's answer is announced at the idle prompt, which is painted again after.
+    let idle = strip_escapes(&wait_for(
+        &mut mine,
+        &literally(&format!("{who} replies: ")),
+    ));
+    check(
+        idle.contains("[mesh:reply]"),
+        "the answer is announced as a reply",
+        &idle,
+    );
+    wait_for(&mut mine, &literally("(full text: .mesh messaging inbox)"));
+    wait_for(&mut mine, SESSION_PROMPT);
+    let inbox = people_command(&mut mine, ".mesh messaging inbox");
+    check(
+        reply_in_thread(&inbox),
+        "the reply lands in the inbox as a reply in the message's thread",
+        &inbox,
+    );
+    let out = people_command(&mut mine, ".mesh messaging sent");
+    check(
+        out.contains("Asked by your sessions: none")
+            && !out.contains(&format!(" . id {id8}"))
+            && !out.contains("Sent by your sessions"),
+        "the answered message is no longer listed as sent",
+        &out,
+    );
+
+    let _ = exit_clean(&mut theirs);
+    let status = exit_clean(&mut mine);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
