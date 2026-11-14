@@ -37,8 +37,6 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
-from crit_contract import validate  # noqa: E402
-
 MAX_FAULT_DETAIL_CHARS = 300
 MAX_MARKER_CHARS = 200
 MAX_SECTION_TEXT_CHARS = 100
@@ -74,7 +72,9 @@ def apply_format_rulings(verdicts, rulings):
 
     A ruling whose id names a verdict in any other status is ignored. A
     ruling that fails the criterion contract leaves the verdict UNVERIFIED
-    with the rejection reason as its complaint.
+    with the rejection reason as its complaint. The contract module is
+    imported only when a ruling must be checked; when it cannot be imported
+    no ruling is applied, so the verdicts stay UNVERIFIED (fail-closed).
     """
     by_id = {}
     for r in rulings if isinstance(rulings, list) else []:
@@ -85,6 +85,13 @@ def apply_format_rulings(verdicts, rulings):
         ruling = by_id.get(v.get("id")) if v.get("status") == "UNVERIFIED" and not died(v) else None
         if ruling is None:
             out.append(v)
+            continue
+        try:
+            from crit_contract import validate
+        except ImportError as e:
+            original = str_field(v, "complaint")
+            rejected = f"holistic format ruling not applied: criterion contract unavailable ({e})"
+            out.append(dict(v, complaint=f"{original}; {rejected}" if original else rejected))
             continue
         try:
             status, evidence, complaint, no_test_reason = validate(ruling)

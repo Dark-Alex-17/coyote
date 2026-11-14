@@ -26799,33 +26799,20 @@ mod tests {
         }
     }
 
-    /// The librarian binds no forge-specific MCP server: the OSS node finds
-    /// repos on any forge through web search and falls back to cloning with
-    /// `git_command` (bound as a global tool, auto-confirmed so a spawned
-    /// child never blocks on the shell guard). Neither the graph nor the
-    /// README mention the old personal server name. The README's routing
+    /// The dead personal GitHub MCP server is gone from the librarian:
+    /// the graph binds `github` (server list, the OSS node's `tools:`
+    /// entry, and the discovery tool names in its prose) and neither the
+    /// graph nor the README mention the old name. The README's routing
     /// prose and mermaid describe the fail-closed paths.
     #[test]
-    fn usage_probe_librarian_assets_search_oss_via_web_and_git_and_document_fail_closed_routing() {
+    fn usage_probe_librarian_assets_bind_the_github_mcp_server_and_document_fail_closed_routing() {
         use crate::graph::NodeType;
 
         const GRAPH_YAML: &str = include_str!("../../assets/agents/librarian/graph.yaml");
         const README: &str = include_str!("../../assets/agents/librarian/README.md");
 
         let graph = load_bundled_graph("librarian");
-        assert_eq!(graph.mcp_servers, ["ddg-search"]);
-        assert!(
-            graph.global_tools.iter().any(|t| t == "git_command.sh"),
-            "{:?}",
-            graph.global_tools
-        );
-        assert!(
-            graph
-                .variables
-                .iter()
-                .any(|v| v.name == "auto_confirm" && v.default.as_deref() == Some("1")),
-            "git_command must not block a spawned librarian on its confirm guard"
-        );
+        assert_eq!(graph.mcp_servers, ["ddg-search", "github"]);
         let NodeType::Llm(search_oss) = &graph.nodes["search_oss"].node_type else {
             panic!("search_oss must be an llm node");
         };
@@ -26833,22 +26820,19 @@ mod tests {
         // server name: the acceptance check is a repo-wide grep for it.
         let old_name = format!("personal-{}", "github");
         let tools = search_oss.tools.clone().unwrap_or_default();
-        for tool in ["mcp:ddg-search", "web_search_coyote", "git_command"] {
-            assert!(tools.iter().any(|t| t == tool), "{tool} in {tools:?}");
-        }
-        assert!(!tools.iter().any(|t| t == "mcp:github"), "{tools:?}");
+        assert!(tools.iter().any(|t| t == "mcp:github"), "{tools:?}");
         assert!(!tools.iter().any(|t| t.contains(&old_name)), "{tools:?}");
         let instructions = search_oss.instructions.as_deref().unwrap_or_default();
-        for needle in ["git_command", "git clone --depth 1", "GitLab", "Codeberg"] {
+        for tool in [
+            "mcp_search_github",
+            "mcp_describe_github",
+            "mcp_invoke_github",
+        ] {
             assert!(
-                instructions.contains(needle),
-                "search_oss instructions must carry {needle:?}"
+                instructions.contains(tool),
+                "search_oss instructions must name the {tool} discovery tool"
             );
         }
-        assert!(
-            !instructions.contains("mcp_invoke_github"),
-            "search_oss must not steer toward the github MCP"
-        );
 
         for (label, text) in [("graph.yaml", GRAPH_YAML), ("README.md", README)] {
             assert!(
@@ -26859,7 +26843,7 @@ mod tests {
         for needle in [
             "synthesize -.->|\"fallback\"| end_failure",
             "final_format -->|\"empty\"| end_failure",
-            "git_command",
+            "github MCP",
         ] {
             assert!(
                 README.contains(needle),
