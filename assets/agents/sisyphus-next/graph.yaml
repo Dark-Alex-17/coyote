@@ -69,11 +69,14 @@ variables:
     default: 'ci'
 
 settings:
-  # Engine backstop only: every cycle carries its own named bound in a script. Worst legitimate visit count of the most-visited node
-  # (run_gauntlet: 1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
-  # per review, x7 reviews (SUBTASK_MAX subtasks + the final whole-task review) = 42); user-driven review retries
-  # ride the headroom.
-  max_loop_iterations: 100
+  # Engine backstop only: the engine caps visits per node, and every cycle carries its own named bound in a script.
+  # The most-visited node is ci_poll: it revisits itself up to CI_MAX_ROUNDS (CI_WALL_SECS / CI_POLL_SLEEP = 240)
+  # times per watch, and the run-wide POLL_VISIT_BUDGET (1 initial watch + STRIKE_LIMIT CI fix re-watches + 1 watch
+  # of headroom = 5 x 240 = 1200) stops it by name first. One more watch granted at that budget still fits
+  # (1200 + 240 = 1440). run_gauntlet peaks at 42 (1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
+  # per review, x7 reviews: SUBTASK_MAX subtasks + the final whole-task review), and pr_review_poll at
+  # REVIEW_MAX_POLLS (80); user-driven retries ride the headroom. _lib.ENGINE_VISIT_CAP mirrors this value.
+  max_loop_iterations: 1500
   log_state_snapshots: true
   validate_before_run: true
   # Orchestration runs are long by design (the facade's choice); the islands that

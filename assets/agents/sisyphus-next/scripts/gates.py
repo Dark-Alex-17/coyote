@@ -21,13 +21,14 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
-    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP,
-    CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
+    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
+    CI_PASS, CI_PENDING, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
+    ENGINE_VISIT_CAP, POLL_VISIT_BUDGET,
     OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
-    REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
+    REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
@@ -2197,8 +2198,7 @@ def apply_answer(state):
         if a is None and not stop:
             _reask_unmatched(state, u, esc, answer)
         elif a == "rerun" and not stop:
-            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                      "ci_failing": []})
+            _reset_ci_watch(u)
             u["_next"] = "ci_poll"
         elif a == "fix" and not stop:
             u["fix_source"] = "ci"
@@ -2212,13 +2212,68 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"PR left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             u["_next"] = "final_report"
-    elif kind == "ci_poll_cap":
-        if _watch_started(state):
-            stopped = f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING ({REVIEW_CI_POLL_CEILING})"
+    elif kind in ("ci_inconclusive", "ci_no_checks"):
+        data = as_dict(esc.get("data"))
+        status = "no_checks" if kind == "ci_no_checks" else "inconclusive"
+        non_pass = ", ".join(f"{n} ({b})" for n, b in as_list(data.get("non_pass"))) or "no CI checks reported"
+        a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"],
+                              "green": ["treat as green", "finish without ci"],
+                              "leave": ["leave", "draft", "report", "stop"]})
+        if a is None and not stop:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "rerun" and not stop:
+            root = state.get("git_root") or state.get("project_dir") or "."
+            runs = {}
+            for name, link in as_list(data.get("cancelled")):
+                if m := re.search(r"/actions/runs/(\d+)", link or ""):
+                    runs.setdefault(m.group(1), []).append(name)
+                else:
+                    ledger(state, u, f"ci: cancelled check {name} names no run; not re-run")
+            for i, (run_id, names) in enumerate(runs.items()):
+                if i >= CI_LOG_RUNS_MAX:
+                    ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) not re-run (CI_LOG_RUNS_MAX reached)")
+                elif _rerun_failed(root, run_id):
+                    ledger(state, u, f"ci: re-ran cancelled run {run_id} ({', '.join(names)})")
+                else:
+                    ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) re-run call failed")
+            _reset_ci_watch(u)
+            u["_next"] = "ci_poll"
+        elif a == "green" and not stop:
+            reason = _stated_reason(answer, options)
+            if status == "no_checks":
+                ledger(state, u, f"ci: finished without CI at the user's say-so ({reason}); no CI checks reported")
+                note = "CI never ran: the PR reports no CI checks; finished without CI"
+                text = "The PR reports no CI checks and the user chose to finish without CI: flip the PR to ready."
+            else:
+                ledger(state, u, f"ci: inconclusive treated as green at the user's say-so ({reason}); non-pass checks: {non_pass}")
+                note = f"CI treated as green with non-pass checks: {non_pass}"
+                text = (f"Not every CI check passed ({non_pass}) and the user chose to treat CI as green: "
+                        "flip the PR to ready.")
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"{note} (reason: {reason})"]
+            u["ci_green_by"] = status
+            _ci_finish_green(state, u, f"{status} accepted", text)
+        elif _watch_started(state):
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Review watch stopped with CI {status} on the ready PR: {non_pass}"]
+            u["_next"] = "final_report"
         else:
-            stopped = f"CI watch stopped: the run's CI polls reached the ceiling ({REVIEW_CI_POLL_CEILING})"
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
-        u["_next"] = "final_report"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR left in draft with CI {status}: {non_pass}"]
+            u["_next"] = "final_report"
+    elif kind == "ci_poll_cap":
+        a = "stop" if stop else _answered(state, {"keep": ["keep waiting"], "stop": ["leave", "stop", "report"]}, "stop")
+        budget = _ci_poll_budget(state)
+        if a == "keep" and _ci_watch_fits(state):
+            _reset_ci_watch(u)
+            u["ci_poll_budget"] = as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS
+            ledger(state, u, f"ci: one more watch inside the engine cap (run-wide budget now {u['ci_poll_budget']} polls)")
+            u["_next"] = "ci_poll"
+        else:
+            if _watch_started(state):
+                stopped = f"Review watch stopped: the run's CI polls reached the run-wide budget ({budget})"
+            else:
+                stopped = f"CI watch stopped: the run's CI polls reached the run-wide budget ({budget}); the PR stays in draft"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
+            u["_next"] = "final_report"
     elif kind == "pr_review_push_unconfirmed":
         a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
         if a is None:
@@ -3783,20 +3838,53 @@ def _pr_ref(state):
     return ""
 
 
+CI_KEEP_WAITING = "Keep waiting (re-run the watch)"
+CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
+CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
+CI_NO_CI = "Finish without CI (no checks configured; recorded)"
+CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
+
+
+def _reset_ci_watch(u):
+    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": []})
+
+
+def _ci_poll_budget(state):
+    """The run-wide ci_poll visit budget: POLL_VISIT_BUDGET, or the extended one a keep-waiting answer granted."""
+    return as_int(state.get("ci_poll_budget")) or POLL_VISIT_BUDGET
+
+
+def _ci_watch_fits(state):
+    return as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS < ENGINE_VISIT_CAP
+
+
+def _ci_leave_option(state):
+    return "Stop watching and report" if _watch_started(state) else "Leave the PR in draft and report"
+
+
+def _ci_finish_green(state, u, note, text):
+    if _review_mode(state) and truthy(state.get("flip_ready")):
+        ledger(state, u, f"ci: {note} -> back to the review watch")
+        return _start_review_watch(state, u)
+    u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True, "text": text}
+    u["flip_ready"] = True
+    ledger(state, u, f"ci: {note} -> flip to ready")
+    u["_next"] = "git_ops"
+    return u
+
+
 def ci_poll(state):
-    u = {}
-    if _review_mode(state):
-        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
-        if _watch_started(state) and u["ci_polls_run"] >= REVIEW_CI_POLL_CEILING:
-            u["ci_status"] = "poll_cap"
-            u["_next"] = "ci_route"
-            return u
+    u = {"ci_polls_run": as_int(state.get("ci_polls_run")) + 1}
+    if u["ci_polls_run"] >= _ci_poll_budget(state):
+        u["ci_status"] = "poll_cap"
+        u["_next"] = "ci_route"
+        return u
     polls = as_int(state.get("ci_polls"))
     started = as_int(state.get("ci_started_at")) or int(time.time())
     if polls > 0:
         time.sleep(int(os.environ.get("SISYPHUS_CI_SLEEP", CI_POLL_SLEEP)))
     u["ci_polls"] = polls + 1
-    if time.time() - started > CI_WALL_SECS:
+    if time.time() - started > CI_WALL_SECS or polls + 1 > CI_MAX_ROUNDS:
         u["ci_status"] = "timeout"
         u["_next"] = "ci_route"
         return u
@@ -3824,20 +3912,58 @@ def ci_poll(state):
         return u
     u["ci_poll_fails"] = 0
     buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "").lower(), c.get("link", "")) for c in data]
-    failing = [(n, l) for n, b, l in buckets if b in ("fail", "failure", "cancelled")]
-    pending = [n for n, b, _ in buckets if b in ("pending", "queued", "in_progress", "")]
+    failing = [(n, l) for n, b, l in buckets if b in CI_FAIL]
+    pending = [n for n, b, _ in buckets if b in CI_PENDING]
     u["ci_checks"] = buckets
     if failing:
         u["ci_status"] = "red"
         u["ci_failing"] = failing
         u["_next"] = "ci_route"
-    elif pending:
+    elif pending or (not buckets and polls == 0):
+        # checks can take a moment to register on a fresh push, so an empty first read is polled again
         u["ci_status"] = "pending"
         u["_next"] = "ci_poll"
-    else:
+    elif not buckets:
+        u["ci_status"] = "no_checks"
+        u["_next"] = "ci_route"
+    elif all(b in CI_PASS for _, b, _ in buckets):
         u["ci_status"] = "green"
         u["_next"] = "ci_route"
+    else:
+        u["ci_status"] = "inconclusive"
+        u["_next"] = "ci_route"
     return u
+
+
+def _ci_unclear(state, u, status):
+    """Escalate a finished CI read that is not a pass on every check, listing every check with its bucket."""
+    checks = [(c[0], c[1], c[2]) for c in as_list(state.get("ci_checks"))]
+    non_pass = [[n, b] for n, b, _ in checks if b not in CI_PASS]
+    cancelled = [[n, link] for n, b, link in checks if b in CI_CANCELLED]
+    evidence = "\n".join(f"{n}: {b}" for n, b, _ in checks) or "(the PR reports no CI checks)"
+    leave = _ci_leave_option(state)
+    prefix = ""
+    if _watch_started(state):
+        prefix = "Review watch stopped: "
+        u["pr_review_status"] = f"ci_{status}"
+        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
+    if status == "no_checks":
+        question = f"{prefix}The PR reports no CI checks after a second read. How to proceed?"
+        options = [option(CI_NO_CI, recommended=True, evidence="no CI check is registered; a PR without CI must not stay in draft"),
+                   option(CI_KEEP_WAITING), option(leave)]
+    else:
+        quiet = (not cancelled and any(b in CI_PASS for _, b, _ in checks)
+                 and all(b in CI_QUIET for _, b in non_pass))
+        names = ", ".join(f"{n} ({b})" for n, b in non_pass)
+        question = f"{prefix}CI finished without a pass on every check (non-pass: {names}). How to proceed?"
+        options = [option(CI_RERUN_CANCELLED if cancelled else CI_KEEP_WAITING, recommended=bool(cancelled),
+                          evidence=", ".join(n for n, _ in cancelled)),
+                   option(CI_TREAT_GREEN, recommended=quiet,
+                          evidence="every non-pass check is skipped or neutral and at least one passed" if quiet else ""),
+                   option(leave, recommended=not cancelled and not quiet)]
+    return raise_escalation(state, u, escalation(
+        f"ci_{status}", question, options, evidence=evidence, hard_trigger=_watch_started(state),
+        data={"non_pass": non_pass, "cancelled": cancelled}))
 
 
 def ci_route(state):
@@ -3856,14 +3982,12 @@ def ci_route(state):
             return u
         status = "poll_error"
     if status == "green":
-        if _review_mode(state) and truthy(state.get("flip_ready")):
-            ledger(state, u, "ci: green -> back to the review watch")
-            return _start_review_watch(state, u)
-        u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True,
-                         "text": "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready)."}
-        u["flip_ready"] = True
-        ledger(state, u, "ci: green -> flip to ready")
-        u["_next"] = "git_ops"
+        if state.get("ci_green_by"):
+            u["ci_green_by"] = ""
+        return _ci_finish_green(state, u, "green",
+                                "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready).")
+    elif status in ("inconclusive", "no_checks"):
+        return _ci_unclear(state, u, status)
     elif status == "red":
         root = state.get("git_root") or state.get("project_dir") or "."
         pack, fetched = [], []
@@ -3881,16 +4005,22 @@ def ci_route(state):
                 pack.append(_failed_run_log(root, run_id))
         u["ci_evidence"] = tail("\n".join(pack), 12000)
         u["_next"] = "ci_diagnose"
-    elif status == "poll_cap" and _watch_started(state):
+    elif status == "poll_cap":
         polls_run = as_int(state.get("ci_polls_run"))
-        u["pr_review_status"] = "ci_poll_cap"
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_poll_cap")
+        budget = _ci_poll_budget(state)
+        fits = _ci_watch_fits(state)
+        evidence = (f"{polls_run} CI poll(s) used this run; run-wide budget {budget}; engine visit cap {ENGINE_VISIT_CAP}; "
+                    f"one more watch takes up to {CI_MAX_ROUNDS} polls")
+        prefix = "CI watch stopped"
+        if _watch_started(state):
+            prefix = "Review watch stopped"
+            u["pr_review_status"] = "ci_poll_cap"
+            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_poll_cap")
+        keep = [option(CI_CAP_KEEP_WAITING, recommended=True, evidence="another full watch still fits under the engine cap")]
+        options = (keep if fits else []) + [option(_ci_leave_option(state), recommended=not fits, evidence=evidence)]
         return raise_escalation(state, u, escalation(
-            "ci_poll_cap", f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING "
-                           f"({REVIEW_CI_POLL_CEILING}) after {polls_run} poll(s). How to proceed?",
-            [option("Stop watching and report", recommended=True,
-                    evidence=f"{polls_run} CI poll(s) this run; the ceiling sits below the per-node visit cap")],
-            hard_trigger=True))
+            "ci_poll_cap", f"{prefix}: the run's CI polls reached the run-wide budget ({budget}) after {polls_run} poll(s). "
+                           "How to proceed?", options, evidence=evidence, hard_trigger=_watch_started(state)))
     elif _watch_started(state):
         u["pr_review_status"] = f"ci_{status}"
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
@@ -3968,8 +4098,7 @@ def ci_apply(state):
                 elif not _rerun_failed(root, run_id):
                     ledger(state, u, f"flake-rerun: run {run_id} re-run call failed")
             u["ci_reruns"] = reruns
-            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                      "ci_failing": []})
+            _reset_ci_watch(u)
             u["_next"] = "ci_poll"
             return u
     if verdict == "real":

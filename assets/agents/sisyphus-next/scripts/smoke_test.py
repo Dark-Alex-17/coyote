@@ -1472,6 +1472,120 @@ check("ci_apply: infra -> wait-or-leave escalation", gates.ci_apply(base_state(c
 check("ci_apply: unsure defaults UP (escalation, never re-run)", gates.ci_apply(base_state(ci_verdict="unsure"))["escalation"]["kind"] == "ci_unsure")
 check("ci_apply: dead diagnose -> unsure path", gates.ci_apply(base_state(last_script_error="died"))["escalation"]["kind"] == "ci_unsure")
 
+
+def set_checks(*checks):
+    rows = [{"name": n, "bucket": b, "link": link} for n, b, link in checks]
+    os.environ["SISYPHUS_GH_CHECKS_CMD"] = "echo '" + json.dumps(rows) + "'"
+
+
+def opts(esc):
+    # raise_escalation puts the recommended option first; the rest keep their order
+    return [(o["text"], o["recommended"]) for o in esc.get("options", [])]
+
+
+_t_ci = int(time.time())
+_LEAVE = "Leave the PR in draft and report"
+_cancel_link = "https://github.com/o/r/actions/runs/41/job/2"
+set_checks(("build", "pass", ""), ("lint", "cancel", _cancel_link), ("test", "fail", ""))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci))
+check("ci_poll: a fail bucket beside a cancel bucket is red, and only the fail is failing",
+      u.get("ci_status") == "red" and [n for n, _ in u.get("ci_failing", [])] == ["test"])
+set_checks(("build", "pass", ""), ("lint", "cancel", _cancel_link))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci))
+check("ci_poll: a cancel bucket is inconclusive, never red or green",
+      u.get("ci_status") == "inconclusive" and u.get("_next") == "ci_route" and "ci_failing" not in u)
+_esc_cancel = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=u.get("ci_checks", []))).get("escalation", {})
+check("ci_route: inconclusive with a cancelled check -> ci_inconclusive listing every check and bucket, re-run recommended",
+      _esc_cancel.get("kind") == "ci_inconclusive" and _esc_cancel.get("evidence") == "build: pass\nlint: cancel"
+      and opts(_esc_cancel) == [(gates.CI_RERUN_CANCELLED, True), (gates.CI_TREAT_GREEN, False), (_LEAVE, False)]
+      and _esc_cancel.get("data", {}).get("non_pass") == [["lint", "cancel"]]
+      and _esc_cancel.get("data", {}).get("cancelled") == [["lint", _cancel_link]], _esc_cancel)
+set_checks(("build", "pass", ""), ("docs", "skipping", ""), ("deploy", "neutral", ""))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci))
+_esc_quiet = gates.ci_route(base_state(ci_status=u.get("ci_status"), ci_checks=u.get("ci_checks", []))).get("escalation", {})
+check("ci_poll: skipped and neutral checks beside a pass -> inconclusive; ci_route recommends treat as green",
+      u.get("ci_status") == "inconclusive" and _esc_quiet.get("evidence") == "build: pass\ndocs: skipping\ndeploy: neutral"
+      and opts(_esc_quiet) == [(gates.CI_TREAT_GREEN, True), (gates.CI_KEEP_WAITING, False), (_LEAVE, False)], _esc_quiet)
+set_checks(("build", "pass", ""), ("audit", "stale", ""))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci))
+_esc = gates.ci_route(base_state(ci_status=u.get("ci_status"), ci_checks=u.get("ci_checks", []))).get("escalation", {})
+check("ci_poll: an unknown bucket -> inconclusive; ci_route recommends leaving the PR in draft",
+      u.get("ci_status") == "inconclusive" and _esc.get("evidence") == "build: pass\naudit: stale"
+      and opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
+set_checks()
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_t_ci))
+check("ci_poll: an empty check list on the first read -> pending, polled again",
+      u.get("ci_status") == "pending" and u.get("_next") == "ci_poll")
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci))
+check("ci_poll: an empty check list after the first read -> no_checks",
+      u.get("ci_status") == "no_checks" and u.get("_next") == "ci_route")
+_esc_none = gates.ci_route(base_state(ci_status="no_checks", ci_checks=[])).get("escalation", {})
+check("ci_route: no_checks -> ci_no_checks, finishing without CI recommended",
+      _esc_none.get("kind") == "ci_no_checks" and _esc_none.get("evidence") == "(the PR reports no CI checks)"
+      and opts(_esc_none) == [(gates.CI_NO_CI, True), (gates.CI_KEEP_WAITING, False), (_LEAVE, False)], _esc_none)
+u = gates.apply_answer(base_state(escalation=_esc_none, last_answer=gates.CI_NO_CI, ci_status="no_checks"))
+_task = u.get("git_task") or {}
+check("apply: ci_no_checks headless pick -> the flip-to-ready path with a CI-never-ran follow-up, never ci_status green",
+      u.get("_next") == "git_ops" and _task.get("kind") == "flip_ready" and u.get("flip_ready")
+      and "CI is green" not in _task.get("text", "") and u.get("ci_green_by") == "no_checks" and "ci_status" not in u
+      and len(u.get("follow_ups", [])) == 1 and u["follow_ups"][0].startswith("CI never ran"), u)
+u = gates.apply_answer(base_state(escalation=_esc_quiet, last_answer=f"{gates.CI_TREAT_GREEN}: docs are skipped on purpose",
+                                  ci_status="inconclusive"))
+_task = u.get("git_task") or {}
+check("apply: ci_inconclusive treat as green -> reason and non-pass checks recorded, flip path, never ci_status green",
+      u.get("_next") == "git_ops" and _task.get("kind") == "flip_ready" and "CI is green" not in _task.get("text", "")
+      and u.get("ci_green_by") == "inconclusive" and "ci_status" not in u
+      and u.get("follow_ups") == ["CI treated as green with non-pass checks: docs (skipping), deploy (neutral) "
+                                  "(reason: docs are skipped on purpose)"]
+      and any("docs are skipped on purpose" in d and "docs (skipping)" in d for d in u.get("decisions", [])), u)
+_rerun_log = os.path.join(TMP, "ci-cancel-reruns.log")
+os.environ["SISYPHUS_GH_RERUN_CMD"] = f"echo \"$SISYPHUS_RUN_ID\" >> '{_rerun_log}'"
+u = gates.apply_answer(base_state(escalation=_esc_cancel, last_answer=gates.CI_RERUN_CANCELLED, ci_polls=7, ci_poll_fails=2))
+os.environ.pop("SISYPHUS_GH_RERUN_CMD")
+check("apply: ci_inconclusive re-run cancelled -> the cancelled run re-run and ledgered, a fresh watch",
+      u.get("_next") == "ci_poll" and u.get("ci_polls") == 0 and u.get("ci_poll_fails") == 0 and u.get("ci_status") == ""
+      and os.path.exists(_rerun_log) and open(_rerun_log).read().split() == ["41"]
+      and "ci: re-ran cancelled run 41 (lint)" in u.get("decisions", []), u)
+u = gates.apply_answer(base_state(escalation=_esc_cancel, last_answer=_LEAVE, ci_status="inconclusive"))
+check("apply: ci_inconclusive leave -> final_report with the non-pass checks in the follow-up",
+      u.get("_next") == "final_report" and u.get("follow_ups") == ["PR left in draft with CI inconclusive: lint (cancel)"], u)
+set_checks(("build", "pass", ""))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=_lib.CI_MAX_ROUNDS, ci_started_at=_t_ci))
+check("ci_poll: a visit past CI_MAX_ROUNDS in one watch -> timeout inside the wall clock",
+      u.get("ci_status") == "timeout" and u.get("_next") == "ci_route" and "ci_checks" not in u)
+check("ci_poll: the CI_MAX_ROUNDS-th visit of a watch still reads CI",
+      gates.ci_poll(base_state(git_report="pull/5", ci_polls=_lib.CI_MAX_ROUNDS - 1, ci_started_at=_t_ci)).get("ci_status") == "green")
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_t_ci, ci_polls_run=_lib.POLL_VISIT_BUDGET - 1))
+check("ci_poll: ci mode at POLL_VISIT_BUDGET -> poll_cap without reading CI",
+      u.get("ci_status") == "poll_cap" and u.get("_next") == "ci_route" and "ci_checks" not in u)
+_esc = gates.ci_route(base_state(ci_status="poll_cap", ci_polls_run=_lib.POLL_VISIT_BUDGET)).get("escalation", {})
+check("ci_route: ci mode poll_cap with a watch left under the engine cap -> keep waiting recommended, evidence names the caps",
+      _esc.get("kind") == "ci_poll_cap" and _esc.get("question", "").startswith("CI watch stopped:")
+      and opts(_esc) == [(gates.CI_CAP_KEEP_WAITING, True), (_LEAVE, False)]
+      and f"{_lib.POLL_VISIT_BUDGET} CI poll(s) used" in _esc.get("evidence", "")
+      and f"budget {_lib.POLL_VISIT_BUDGET}" in _esc.get("evidence", "")
+      and f"cap {_lib.ENGINE_VISIT_CAP}" in _esc.get("evidence", ""), _esc)
+_esc_full = gates.ci_route(base_state(ci_status="poll_cap", ci_polls_run=_lib.ENGINE_VISIT_CAP - _lib.CI_MAX_ROUNDS)).get("escalation", {})
+check("ci_route: ci mode poll_cap with no watch left under the engine cap -> only leave, recommended",
+      opts(_esc_full) == [(_LEAVE, True)], _esc_full)
+u = gates.apply_answer(base_state(escalation=_esc, last_answer=gates.CI_CAP_KEEP_WAITING, ci_polls_run=_lib.POLL_VISIT_BUDGET,
+                                  ci_polls=17, ci_poll_fails=1))
+check("apply: ci_poll_cap keep waiting -> a fresh watch, the budget raised by one watch, ci_polls_run kept",
+      u.get("_next") == "ci_poll" and u.get("ci_polls") == 0 and u.get("ci_poll_fails") == 0 and "ci_polls_run" not in u
+      and u.get("ci_poll_budget") == _lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS, u)
+check("ci_poll: after a keep-waiting answer the next poll reads CI",
+      gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_t_ci, ci_polls_run=_lib.POLL_VISIT_BUDGET,
+                               ci_poll_budget=_lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS)).get("ci_status") == "green")
+u = gates.apply_answer(base_state(escalation=_esc_full, last_answer=gates.CI_CAP_KEEP_WAITING,
+                                  ci_polls_run=_lib.ENGINE_VISIT_CAP - _lib.CI_MAX_ROUNDS))
+check("apply: ci_poll_cap keep waiting with no watch left under the engine cap -> final_report",
+      u.get("_next") == "final_report" and "ci_poll_budget" not in u)
+_graph_cap = int(re.search(r"(?m)^  max_loop_iterations: (\d+)$", open(os.path.join(HERE, "..", "graph.yaml")).read()).group(1))
+check("ci budget: ENGINE_VISIT_CAP equals graph.yaml settings.max_loop_iterations",
+      _lib.ENGINE_VISIT_CAP == _graph_cap, (_lib.ENGINE_VISIT_CAP, _graph_cap))
+check("ci budget: POLL_VISIT_BUDGET, plus the one watch a keep-waiting answer grants, stays below max_loop_iterations",
+      _lib.POLL_VISIT_BUDGET < _lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS < _graph_cap, (_lib.POLL_VISIT_BUDGET, _graph_cap))
+
 # ---------------------------------------------------------------- final report
 u = gates.final_report(base_state(coder_result=done, coder_sentinel="CODER_COMPLETE", gauntlet_verdict="PASS", round_heads=[{"round": 1, "head": "h", "verdict": "PASS"}],
                                   debt_left_behind=["a:1 -- todo!() -- none"], debris_exemptions=["b:2 -- arrow glyph is the point"],
@@ -1579,13 +1693,13 @@ check("pr_tracking ci: ci_route green -> flip with the ci-mode text unchanged",
 check("pr_tracking ci: ci_gate flip_ready on an owned PR -> final_report",
       gates.ci_gate(base_state(git_task={"kind": "flip_ready"}, ci_owner=True))["_next"] == "final_report")
 os.environ["SISYPHUS_GH_CHECKS_CMD"] = "echo '[{\"name\":\"build\",\"bucket\":\"pass\"}]'"
-check("pr_tracking ci: ci_poll counts no ci_polls_run",
-      "ci_polls_run" not in gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now)))
+check("pr_tracking ci: ci_poll counts the first visit in ci_polls_run",
+      gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now)).get("ci_polls_run") == 1)
 check("pr_tracking review: ci_poll counts every visit in ci_polls_run",
       gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=4))["ci_polls_run"] == 5)
-check("pr_tracking ci: ci_poll never counts ci_polls_run, even with the flip state set",
-      "ci_polls_run" not in gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now, ci_polls_run=4,
-                                                     flip_ready=True, pr_review_started_at=_now)))
+check("pr_tracking ci: ci_poll counts every visit in ci_polls_run, with or without the flip state set",
+      gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now, ci_polls_run=4,
+                               flip_ready=True, pr_review_started_at=_now)).get("ci_polls_run") == 5)
 _pending = [{"id": "t1", "kind": "thread", "url": "https://github.com/o/r/pull/7#c1", "text": "rename foo", "action": "fix"}]
 u = gates.pr_gate(base_state(git_actions={"commit": True, "push": True, "open_pr": True}, ci_owner=True, pr_review_pending=_pending))
 check("pr_tracking ci: pr_gate with pending review items -> the normal publish task", u["git_task"]["kind"] == "publish")
@@ -1832,36 +1946,38 @@ check("pr_tracking review: apply_answer ci leave with the watch started -> revie
 u = aa("ci_exhausted", "Leave the PR in draft and report", ci_status="timeout", ci_diagnosis="runner gone")
 check("pr_tracking ci: apply_answer ci leave keeps the draft follow-up",
       u["follow_ups"] == ["PR left in draft with CI timeout: runner gone"])
-u = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.REVIEW_CI_POLL_CEILING - 1))
-check("pr_tracking review: ci_poll at REVIEW_CI_POLL_CEILING -> poll_cap without reading CI",
-      u["ci_status"] == "poll_cap" and u["_next"] == "ci_route" and u["ci_polls_run"] == _lib.REVIEW_CI_POLL_CEILING
+u = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.POLL_VISIT_BUDGET - 1))
+check("pr_tracking review: ci_poll at POLL_VISIT_BUDGET -> poll_cap without reading CI",
+      u["ci_status"] == "poll_cap" and u["_next"] == "ci_route" and u["ci_polls_run"] == _lib.POLL_VISIT_BUDGET
       and "ci_checks" not in u)
-check("pr_tracking review: ci_poll one below REVIEW_CI_POLL_CEILING still reads CI",
-      gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.REVIEW_CI_POLL_CEILING - 2))["ci_status"] == "green")
-check("pr_tracking ci: ci_poll never poll_caps",
+check("pr_tracking review: ci_poll one below POLL_VISIT_BUDGET still reads CI",
+      gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.POLL_VISIT_BUDGET - 2))["ci_status"] == "green")
+check("pr_tracking ci: ci_poll below the run-wide budget reads CI",
       gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now, ci_polls_run=500))["ci_status"] == "green")
 u = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=500, **_pre_flip))
-check("pr_tracking review: ci_poll before the flip counts in ci_polls_run but never poll_caps",
+check("pr_tracking review: ci_poll before the flip counts in ci_polls_run and reads CI below the budget",
       u["ci_polls_run"] == 501 and u["ci_status"] == "green")
-_pre = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.REVIEW_CI_POLL_CEILING - 1, **_pre_flip))
-u = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_pre["ci_polls_run"]))
-check("pr_tracking review: the first ci_poll after the flip with pre-flip polls at the ceiling caps immediately",
-      _pre["ci_status"] == "green" and u["ci_status"] == "poll_cap" and u["_next"] == "ci_route"
-      and u["ci_polls_run"] == _lib.REVIEW_CI_POLL_CEILING + 1 and "ci_checks" not in u)
+_pre = gates.ci_poll(rs(ci_polls=0, ci_started_at=_now, ci_polls_run=_lib.POLL_VISIT_BUDGET - 1, **_pre_flip))
+check("pr_tracking review: ci_poll before the flip at the run-wide budget -> poll_cap too",
+      _pre["ci_status"] == "poll_cap" and _pre["_next"] == "ci_route" and "ci_checks" not in _pre)
 u = gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=500, **_pre_flip))
 check("pr_tracking review: ci_route poll_cap before the flip raises no Review watch text",
       "Review watch" not in json.dumps(u) and not any("review-watch" in d for d in u.get("decisions", [])))
 u = aa("ci_poll_cap", "Stop watching and report", pr_tracking="review")
 check("pr_tracking review: apply_answer ci_poll_cap before the flip -> the CI watch follow-up",
       u["_next"] == "final_report" and "Review watch" not in json.dumps(u)
-      and u["follow_ups"] == [f"CI watch stopped: the run's CI polls reached the ceiling ({_lib.REVIEW_CI_POLL_CEILING})"])
+      and u["follow_ups"] == [f"CI watch stopped: the run's CI polls reached the run-wide budget ({_lib.POLL_VISIT_BUDGET}); "
+                              "the PR stays in draft"])
 u = aa("ci_poll_cap", "Stop watching and report")
 check("pr_tracking ci: apply_answer ci_poll_cap -> the CI watch follow-up",
-      u["follow_ups"] == [f"CI watch stopped: the run's CI polls reached the ceiling ({_lib.REVIEW_CI_POLL_CEILING})"])
-u = gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.REVIEW_CI_POLL_CEILING))
-check("pr_tracking review: ci_route poll_cap -> ci_poll_cap escalation naming the ceiling and the count + ledger",
-      u["escalation"]["kind"] == "ci_poll_cap" and f"({_lib.REVIEW_CI_POLL_CEILING}) after {_lib.REVIEW_CI_POLL_CEILING} poll(s)" in u["escalation"]["question"]
-      and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]] == [("Stop watching and report", True)]
+      u["follow_ups"] == [f"CI watch stopped: the run's CI polls reached the run-wide budget ({_lib.POLL_VISIT_BUDGET}); "
+                          "the PR stays in draft"])
+u = gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.POLL_VISIT_BUDGET))
+check("pr_tracking review: ci_route poll_cap -> ci_poll_cap escalation naming the budget and the count + ledger",
+      u["escalation"]["kind"] == "ci_poll_cap" and f"({_lib.POLL_VISIT_BUDGET}) after {_lib.POLL_VISIT_BUDGET} poll(s)" in u["escalation"]["question"]
+      and u["escalation"]["question"].startswith("Review watch stopped:")
+      and [(o["text"], o["recommended"]) for o in u["escalation"]["options"]]
+      == [(gates.CI_CAP_KEEP_WAITING, True), ("Stop watching and report", False)]
       and "review-watch: PR #7 stop: ci_poll_cap" in u["decisions"])
 check("pr_tracking review: ci_route poll_cap after the flip sets pr_review_status ci_poll_cap",
       u["pr_review_status"] == "ci_poll_cap")
@@ -1877,9 +1993,9 @@ u = gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=0, pr_review_status="pen
 check("pr_tracking review: a CI fix round after the flip leaves pr_review_status unchanged",
       u["_next"] == "compose_fix" and "pr_review_status" not in u)
 u = gates.apply_answer(rs(escalation=escalation("ci_poll_cap", "q", []), last_answer="Stop watching and report"))
-check("pr_tracking review: apply_answer ci_poll_cap after the flip -> final_report with the ceiling follow-up",
+check("pr_tracking review: apply_answer ci_poll_cap after the flip -> final_report with the budget follow-up",
       u["_next"] == "final_report"
-      and u["follow_ups"] == [f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING ({_lib.REVIEW_CI_POLL_CEILING})"])
+      and u["follow_ups"] == [f"Review watch stopped: the run's CI polls reached the run-wide budget ({_lib.POLL_VISIT_BUDGET})"])
 u = gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, pr_review_pending=[]))
 _t = u["git_task"]
 check("pr_tracking review: pr_gate after the flip with no review items -> push_fix, never a publish",
@@ -2245,7 +2361,7 @@ _watch_stops = [
      gates.pr_review_route(rs(pr_review_status="comments", pr_review_items=_items, pr_review_rounds=REVIEW_MAX_ROUNDS))),
     ("pr_review_truncated", "pr_review_truncated",
      gates.pr_review_route(rs(pr_review_status="truncated", pr_review_truncated=["reviewThreads"]))),
-    ("ci_poll_cap", "ci_poll_cap", gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.REVIEW_CI_POLL_CEILING))),
+    ("ci_poll_cap", "ci_poll_cap", gates.ci_route(rs(ci_status="poll_cap", ci_polls_run=_lib.POLL_VISIT_BUDGET))),
     ("pr_review_push_unconfirmed", "pr_review_push_unconfirmed", gates.pr_review_resolve(rs(pr_review_pending=[]))),
     ("ci_exhausted from ci_route", "ci_exhausted", gates.ci_route(rs(ci_status="timeout"))),
     ("ci_exhausted from ci_apply", "ci_exhausted", gates.ci_apply(rs(ci_verdict="real", ci_fix_strikes=STRIKE_LIMIT))),
@@ -2581,8 +2697,9 @@ check("pr_tracking review: apply_answer truncated -> final_report with a follow-
       u["_next"] == "final_report"
       and u["follow_ups"] == ["PR review watch stopped: the review read of PR #7 was truncated "
                               "(reviews, reviewThreads[0].comments); read the review items on GitHub"])
-check("pr_tracking review: bounds stay under max_loop_iterations 100",
-      REVIEW_MAX_POLLS + REVIEW_MAX_ROUNDS + 1 < 100 and REVIEW_CI_POLL_BUDGET < _lib.REVIEW_CI_POLL_CEILING < 100)
+check("pr_tracking review: bounds stay under ENGINE_VISIT_CAP",
+      REVIEW_MAX_POLLS + REVIEW_MAX_ROUNDS + 1 < _lib.ENGINE_VISIT_CAP
+      and REVIEW_CI_POLL_BUDGET < _lib.REVIEW_CI_POLL_CEILING < _lib.ENGINE_VISIT_CAP)
 
 
 def node_timeout(node):

@@ -1462,8 +1462,8 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
 
 /// Each guard in gates.py, removed from a scratch copy, turns its smoke row
 /// red: the trust filter (every association the fixtures use counts as
-/// trusted), the remote-head check before resolving, the post-flip gate on
-/// the CI poll ceiling, the reply before each resolve, the trusted author of
+/// trusted), the remote-head check before resolving, the run-wide CI poll
+/// budget in ci mode, the reply before each resolve, the trusted author of
 /// an own comment, the crashed-poll count toward `pr_review_polls`, the
 /// crashed-`ci_poll` read failure in `ci_route`, the `CI_LOG_RUNS_MAX` cap on
 /// flake re-runs, the stale CI status reset after resolving, the seen-id
@@ -1491,11 +1491,10 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
              nothing replied or resolved",
         ),
         (
-            "ceiling",
-            "if _watch_started(state) and u[\"ci_polls_run\"] >= REVIEW_CI_POLL_CEILING:",
-            "if u[\"ci_polls_run\"] >= REVIEW_CI_POLL_CEILING:",
-            "pr_tracking review: ci_poll before the flip counts in ci_polls_run but never \
-             poll_caps",
+            "poll-budget",
+            "if u[\"ci_polls_run\"] >= _ci_poll_budget(state):",
+            "if False:",
+            "ci_poll: ci mode at POLL_VISIT_BUDGET -> poll_cap without reading CI",
         ),
         (
             "reply-first",
@@ -3029,7 +3028,7 @@ fn build_lock_inputs_census_is_exactly_the_three_recorded_nodes() {
 const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
     ("max_agent_depth", 5),
     ("max_concurrent_agents", 40),
-    ("settings.max_loop_iterations", 100),
+    ("settings.max_loop_iterations", 1500),
     ("settings.timeout", 0),
 ];
 
@@ -3145,29 +3144,36 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 
 /// The bound constants in `scripts/_lib.py` the gates route on (the
 /// re-run-once family covers `debris_reruns`), as written in the baseline,
-/// plus the review-watch bounds and the per-subtask extra fix-round ceiling.
+/// plus the review-watch bounds, the per-subtask extra fix-round ceiling and
+/// the `ci_poll` visit bounds that sit under the engine's per-node cap.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CHOICE_OPTIONS_MAX", "4"),
     ("CHOICE_OPTIONS_MIN", "2"),
     ("CI_FLAKE_RERUNS", "2"),
     ("CI_LOG_RUNS_MAX", "3"),
+    ("CI_MAX_ROUNDS", "CI_WALL_SECS // CI_POLL_SLEEP"),
     ("CI_POLL_FAILS", "3"),
     ("CI_POLL_SLEEP", "60"),
     ("CI_WALL_SECS", "14400"),
     ("CLARIFY_MAX", "STRIKE_LIMIT"),
     ("DISCUSSION_PARKS_MAX", "3"),
     ("DRAFT_ROUNDS_MAX", "STRIKE_LIMIT"),
+    ("ENGINE_VISIT_CAP", "1500"),
     ("FIX_ROUND_CEILING", "STRIKE_LIMIT"),
     ("GH_CALL_SECS", "90"),
     ("GO_AHEAD_WORDS_MAX", "12"),
     ("OWNER_POLL_MAX", "2"),
     ("OWNER_POLL_MINUTES", "25"),
     ("OWNER_WAIT_MINUTES", "30"),
+    (
+        "POLL_VISIT_BUDGET",
+        "(1 + STRIKE_LIMIT + 1) * CI_MAX_ROUNDS",
+    ),
     ("REASK_MAX", "STRIKE_LIMIT"),
     ("RERUN_ONCE", "1"),
     ("RESOLVE_DEADLINE_SECS", "480"),
-    ("REVIEW_CI_POLL_BUDGET", "60"),
-    ("REVIEW_CI_POLL_CEILING", "90"),
+    ("REVIEW_CI_POLL_BUDGET", "POLL_VISIT_BUDGET - CI_MAX_ROUNDS"),
+    ("REVIEW_CI_POLL_CEILING", "POLL_VISIT_BUDGET"),
     ("REVIEW_MAX_POLLS", "80"),
     ("REVIEW_MAX_ROUNDS", "STRIKE_LIMIT"),
     ("REVIEW_PERM_SECS", "120"),
@@ -3300,8 +3306,9 @@ fn graph_and_gate_budgets_equal_the_frozen_baseline() {
     );
 }
 
-/// The integer value of a `_lib.py` constant whose right-hand side is an
-/// integer literal or the name of another such constant.
+/// The integer value of a `_lib.py` constant whose right-hand side is
+/// integer arithmetic (`+`, `-`, `*`, `//` and parentheses) over literals and
+/// other such constants.
 fn lib_constant(lib: &str, name: &str) -> i64 {
     let prefix = format!("{name} = ");
     let value = lib
@@ -3312,18 +3319,59 @@ fn lib_constant(lib: &str, name: &str) -> i64 {
         .next()
         .unwrap()
         .trim();
-    value.parse().unwrap_or_else(|_| lib_constant(lib, value))
+    let spaced = value.replace('(', " ( ").replace(')', " ) ");
+    let tokens: Vec<&str> = spaced.split_whitespace().collect();
+    let mut pos = 0;
+    let n = lib_sum(lib, &tokens, &mut pos);
+    assert_eq!(pos, tokens.len(), "{name} = {value} does not parse");
+    n
+}
+
+fn lib_sum(lib: &str, tokens: &[&str], pos: &mut usize) -> i64 {
+    let mut n = lib_product(lib, tokens, pos);
+    while let Some(&op @ ("+" | "-")) = tokens.get(*pos) {
+        *pos += 1;
+        let rhs = lib_product(lib, tokens, pos);
+        n = if op == "+" { n + rhs } else { n - rhs };
+    }
+    n
+}
+
+fn lib_product(lib: &str, tokens: &[&str], pos: &mut usize) -> i64 {
+    let mut n = lib_atom(lib, tokens, pos);
+    while let Some(&op @ ("*" | "//")) = tokens.get(*pos) {
+        *pos += 1;
+        let rhs = lib_atom(lib, tokens, pos);
+        n = if op == "*" {
+            n * rhs
+        } else {
+            n.div_euclid(rhs)
+        };
+    }
+    n
+}
+
+fn lib_atom(lib: &str, tokens: &[&str], pos: &mut usize) -> i64 {
+    let token = tokens[*pos];
+    *pos += 1;
+    if token != "(" {
+        return token.parse().unwrap_or_else(|_| lib_constant(lib, token));
+    }
+    let n = lib_sum(lib, tokens, pos);
+    assert_eq!(tokens.get(*pos), Some(&")"), "unbalanced parentheses");
+    *pos += 1;
+    n
 }
 
 /// The engine caps the visits to each node at `settings.max_loop_iterations`,
-/// so review mode has to reach its own caps first: the review poll budget
-/// with the round cap and one visit to spare on `pr_review_poll`, and on
-/// `ci_poll` the run-wide CI poll ceiling, with the budget past which no fix
-/// round starts below that ceiling. The ceiling bounds the `ci_poll` visits
-/// because review mode counts every visit into `ci_polls_run` from the first
-/// poll of the run, and a first post-flip poll that finds the count at the
-/// ceiling caps at once. Only these review-mode bounds are checked; ci mode
-/// puts no run-wide cap on `ci_poll`.
+/// so the scripts have to reach their own caps first. `ci_poll` counts every
+/// visit into `ci_polls_run` in both modes and stops at the run-wide
+/// `POLL_VISIT_BUDGET`, which stays below the engine cap that
+/// `ENGINE_VISIT_CAP` mirrors and leaves room for one watch of
+/// `CI_MAX_ROUNDS` polls after the initial watch and each CI fix strike.
+/// Review mode starts a fix round only below `REVIEW_CI_POLL_BUDGET`, under
+/// its ceiling, and `pr_review_poll` keeps the review poll budget with the
+/// round cap and one visit to spare under the engine cap.
 #[test]
 fn review_watch_caps_stay_below_the_per_node_visit_cap() {
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
@@ -3331,23 +3379,33 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
     let rounds = lib_constant(&lib, "REVIEW_MAX_ROUNDS");
     let ci_budget = lib_constant(&lib, "REVIEW_CI_POLL_BUDGET");
     let ci_ceiling = lib_constant(&lib, "REVIEW_CI_POLL_CEILING");
+    let watch = lib_constant(&lib, "CI_MAX_ROUNDS");
+    let strikes = lib_constant(&lib, "STRIKE_LIMIT");
+    let run_budget = lib_constant(&lib, "POLL_VISIT_BUDGET");
+    let engine_cap = lib_constant(&lib, "ENGINE_VISIT_CAP");
     let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
     let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
     let cap = shipped["settings"]["max_loop_iterations"]
         .as_i64()
         .expect("settings.max_loop_iterations is an integer");
+    assert_eq!(
+        engine_cap, cap,
+        "ENGINE_VISIT_CAP no longer mirrors settings.max_loop_iterations"
+    );
+    assert!(
+        run_budget < cap,
+        "POLL_VISIT_BUDGET {run_budget} reaches the cap {cap}, so ci_poll could hit the engine \
+         cap before its own budget"
+    );
+    assert!(
+        watch * (1 + strikes) <= run_budget,
+        "POLL_VISIT_BUDGET {run_budget} cannot hold the initial watch and a re-watch per CI \
+         fix strike ({} watches of CI_MAX_ROUNDS {watch})",
+        1 + strikes
+    );
     assert!(
         polls + rounds + 1 < cap,
         "REVIEW_MAX_POLLS {polls} + REVIEW_MAX_ROUNDS {rounds} + 1 reaches the cap {cap}"
-    );
-    assert!(
-        ci_budget < cap,
-        "REVIEW_CI_POLL_BUDGET {ci_budget} reaches the cap {cap}"
-    );
-    assert!(
-        ci_ceiling < cap,
-        "REVIEW_CI_POLL_CEILING {ci_ceiling} reaches the cap {cap}, so ci_poll visits counted \
-         from the first poll could hit the engine cap first"
     );
     assert!(
         ci_budget < ci_ceiling,
@@ -4310,9 +4368,10 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
         .find(|l| l.starts_with("| CI budget nesting |"))
         .unwrap_or_else(|| panic!("missing CI budget nesting row:\n{section}"));
     for sentence in [
-        "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run).",
-        "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`) and `ci_fix_strikes` (`STRIKE_LIMIT`).",
-        "With `pr_tracking` set to `review`, the review watch adds the per-watch budgets `pr_review_watch_polls` and `pr_review_poll_fails`, reset at each watch start, and the per-run budgets `pr_review_polls` (`REVIEW_MAX_POLLS`), `pr_review_started_at` (`REVIEW_WALL_SECS`), `pr_review_rounds` (`REVIEW_MAX_ROUNDS`) and `ci_polls_run` (`REVIEW_CI_POLL_BUDGET`).",
+        "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run, a keep-waiting answer at the run-wide CI poll budget).",
+        "A watch ends as `timeout` once `ci_polls` passes `CI_MAX_ROUNDS` or the `CI_WALL_SECS` wall clock has passed.",
+        "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`), `ci_fix_strikes` (`STRIKE_LIMIT`) and `ci_polls_run` (`POLL_VISIT_BUDGET`, in every mode).",
+        "With `pr_tracking` set to `review`, the review watch adds the per-watch budgets `pr_review_watch_polls` and `pr_review_poll_fails`, reset at each watch start, and the per-run budgets `pr_review_polls` (`REVIEW_MAX_POLLS`), `pr_review_started_at` (`REVIEW_WALL_SECS`) and `pr_review_rounds` (`REVIEW_MAX_ROUNDS`), and starts a review fix round only while `ci_polls_run` is below `REVIEW_CI_POLL_BUDGET`.",
         "`ci_fix_strikes` stays per run across review rounds",
     ] {
         assert!(row.contains(sentence), "missing {sentence:?} in {row}");
@@ -4397,12 +4456,11 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     assert!(row.contains(stranger), "missing {stranger:?} in: {row}");
     let stale = "in place of the reply and resolve calls";
     assert!(!row.contains(stale), "stale {stale:?} in: {row}");
-    let ceiling = "In review mode `ci_polls_run` counts every CI poll of the run, the polls \
-                   before the flip and the crashed polls that `ci_route` counts included; the \
-                   `REVIEW_CI_POLL_CEILING` cap applies only once the watch has started \
-                   (`_watch_started`), and at once on the first poll after the flip if the \
-                   count is already at the ceiling";
-    assert!(row.contains(ceiling), "missing {ceiling:?} in: {row}");
+    let run_budget = "In every mode `ci_polls_run` counts every CI poll of the run, the polls \
+                      before the flip included, and in review mode the crashed polls that \
+                      `ci_route` counts too; the run-wide budget applies before and after the \
+                      flip alike, so a poll that finds the count at the budget stops at once";
+    assert!(row.contains(run_budget), "missing {run_budget:?} in: {row}");
     let owner = "Upstream `OWNER_REMOTE_INPUT` is False, so `ask_owner_poll` never runs: a \
                  stop reaches the parent orchestrator through `ask_user` when the run is a \
                  child, and the owner through the terminal `ask_user` at the top level.";
