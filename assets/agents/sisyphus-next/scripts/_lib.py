@@ -33,7 +33,7 @@ CI_FLAKE_RERUNS = 2       # section 10.12: max 2 re-runs per check per PR
 CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
-CI_MAX_ROUNDS = CI_WALL_SECS // CI_POLL_SLEEP  # ci_poll visits per watch (240), a bound beside the wall clock
+CI_MAX_ROUNDS = CI_WALL_SECS // CI_POLL_SLEEP  # ci_poll visits per watch (240), a bound beside the elapsed-time limit
 # One initial watch, a re-watch after each of the STRIKE_LIMIT CI fix rounds and one watch of headroom (1200);
 # counted over every ci_poll visit of the run and kept below ENGINE_VISIT_CAP so the watch stops by name.
 POLL_VISIT_BUDGET = (1 + STRIKE_LIMIT + 1) * CI_MAX_ROUNDS

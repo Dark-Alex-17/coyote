@@ -1557,7 +1557,7 @@ check("apply: ci_inconclusive leave -> final_report with the non-pass checks in 
       u.get("_next") == "final_report" and u.get("follow_ups") == ["PR left in draft with CI inconclusive: lint (cancel)"], u)
 set_checks(("build", "pass", ""))
 u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=_lib.CI_MAX_ROUNDS, ci_started_at=_t_ci))
-check("ci_poll: a visit past CI_MAX_ROUNDS in one watch -> timeout inside the wall clock",
+check("ci_poll: a visit past CI_MAX_ROUNDS in one watch -> timeout inside the elapsed-time limit",
       u.get("ci_status") == "timeout" and u.get("_next") == "ci_route" and "ci_checks" not in u)
 check("ci_poll: the CI_MAX_ROUNDS-th visit of a watch still reads CI",
       gates.ci_poll(base_state(git_report="pull/5", ci_polls=_lib.CI_MAX_ROUNDS - 1, ci_started_at=_t_ci)).get("ci_status") == "green")
@@ -4298,7 +4298,7 @@ u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_STOP))
 check("rejected cap: stop -> end_blocked with the rounds in the reason",
       u["_next"] == "end_blocked" and f"rejected {STRIKE_LIMIT + 1} times" in u.get("failure_reason", ""), u)
 _ps = gates.parse_answer(base_state(escalation=_rc, last_answer_text="stop"))
-_pt = gates.parse_answer(base_state(escalation=_rc, last_answer_text="drop the session store entirely"))
+_pt = gates.parse_answer(base_state(escalation=_rc, last_answer_text="drop the session cache entirely"))
 _ok = _ps["_next"] == "apply_answer" and _pt["_next"] == "interpret_reply" and "- answer:" in _pt["reply_accepts"]
 check("rejected cap: parse_answer takes a bare stop to apply_answer and interprets typed changes", _ok, (_ps, _pt))
 
