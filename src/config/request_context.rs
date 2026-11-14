@@ -2022,7 +2022,6 @@ impl RequestContext {
         match session.flush() {
             Ok(()) if is_child => events::bus().publish(Event::ChildTranscriptFlushed {
                 session_id: session.name().to_string(),
-                root: self.child_session_root.clone(),
             }),
             Ok(()) => {}
             Err(err) => {
@@ -2040,6 +2039,7 @@ impl RequestContext {
     /// all. A sessionless root keys it on this process's stamp. A fork
     /// or child inherits its parent's handle and never resolves one itself.
     /// Resolving touches no directory: the first child file write creates it.
+    /// A root context announces the root it resolves on the event bus.
     pub(crate) fn ensure_child_session_root(&mut self) -> Option<Arc<ChildSessionRoot>> {
         if let Some(root) = &self.child_session_root {
             return Some(Arc::clone(root));
@@ -2062,6 +2062,9 @@ impl RequestContext {
         };
         let root = Arc::new(root);
         self.child_session_root = Some(Arc::clone(&root));
+        events::bus().publish(Event::ChildSessionRootResolved {
+            root: Arc::clone(&root),
+        });
         Some(root)
     }
 
@@ -15011,25 +15014,20 @@ mod tests {
         assert!(!ctx.session.as_ref().unwrap().dirty());
     }
 
-    fn flushed_sessions(
-        recording: &crate::events::RecordingSink,
-    ) -> Vec<(String, Option<Arc<ChildSessionRoot>>)> {
+    fn flushed_sessions(recording: &crate::events::RecordingSink) -> Vec<String> {
         recording
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::ChildTranscriptFlushed { session_id, root }
-                    if session_id == "flush-probe-x7x" =>
-                {
-                    Some((session_id, root))
+                Event::ChildTranscriptFlushed { session_id } if session_id == "flush-probe-x7x" => {
+                    Some(session_id)
                 }
                 _ => None,
             })
             .collect()
     }
 
-    /// The flush names the child's session and the root its file lives
-    /// under, so the UI can find the file without asking the child.
+    /// The flush names the child's session, so the UI can read it again.
     #[test]
     #[serial]
     fn checkpoint_publishes_child_transcript_flushed_for_a_child_context() {
@@ -15037,16 +15035,11 @@ mod tests {
         let (mut ctx, _path) = loaded_session_ctx("flush-probe-x7x");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         ctx.self_agent_id = Some("agent-flush-x7x".into());
-        let root = Arc::new(ChildSessionRoot::Proc { pid: 7, start: 77 });
-        ctx.child_session_root = Some(Arc::clone(&root));
         let recording = crate::events::RecordingSink::install();
 
         complete_turn(&mut ctx, "hello", "reply");
 
-        assert_eq!(
-            flushed_sessions(&recording),
-            vec![("flush-probe-x7x".to_string(), Some(root))]
-        );
+        assert_eq!(flushed_sessions(&recording), vec!["flush-probe-x7x"]);
     }
 
     #[test]
@@ -15408,6 +15401,54 @@ mod tests {
         let mut sessionless_fork = create_test_ctx().fork_for_branch();
         let root = sessionless_fork.ensure_child_session_root().unwrap();
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
+    }
+
+    fn resolutions_of(
+        recording: &crate::events::RecordingSink,
+        root: &Arc<ChildSessionRoot>,
+    ) -> usize {
+        recording
+            .drain()
+            .into_iter()
+            .filter(|event| {
+                matches!(event, Event::ChildSessionRootResolved { root: sent } if Arc::ptr_eq(sent, root))
+            })
+            .count()
+    }
+
+    #[test]
+    #[serial]
+    fn a_root_context_announces_its_child_session_root_once() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-announce");
+        let recording = crate::events::RecordingSink::install();
+
+        let root = ctx.ensure_child_session_root().unwrap();
+        ctx.ensure_child_session_root();
+        ctx.ensure_child_session_root();
+
+        assert_eq!(resolutions_of(&recording, &root), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_context_never_announces_a_child_session_root() {
+        let _config = TestConfigDirGuard::new();
+        let mut parent = clean_loaded_session_ctx("child-root-quiet");
+        let root = parent.ensure_child_session_root().unwrap();
+        let mut child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_quiet".to_string(),
+        );
+        let recording = crate::events::RecordingSink::install();
+
+        let shared = child.ensure_child_session_root().unwrap();
+
+        assert!(Arc::ptr_eq(&root, &shared));
+        assert_eq!(resolutions_of(&recording, &root), 0);
     }
 
     #[test]

@@ -24,7 +24,17 @@ pub enum Reply {
     /// at the screen between two deltas. A non-streaming request gets the
     /// text chunks joined into one message.
     Streamed(Vec<Chunk>),
+    /// `reply`, answered only once `gate` exists (thirty seconds at most),
+    /// in whichever form the request asks for: the hold for a client whose
+    /// requests do not stream, such as a spawned child agent.
+    After {
+        gate: PathBuf,
+        reply: Box<Reply>,
+    },
 }
+
+/// How long an [`Reply::After`] waits for its gate.
+pub const AFTER_LIMIT: Duration = Duration::from_secs(30);
 
 pub enum Chunk {
     /// A `delta.content` frame.
@@ -117,7 +127,17 @@ fn serve(
             Ok(body) => {
                 bodies.lock().unwrap().push(body.to_string());
                 let n = served.fetch_add(1, Ordering::SeqCst);
-                let reply = replies.get(n).unwrap_or(&fallback);
+                let mut reply = replies.get(n).unwrap_or(&fallback);
+                if let Reply::After { gate, reply: inner } = reply {
+                    let deadline = std::time::Instant::now() + AFTER_LIMIT;
+                    while !gate.exists()
+                        && std::time::Instant::now() < deadline
+                        && !stop.load(Ordering::SeqCst)
+                    {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    reply = inner;
+                }
                 match (reply, body["stream"] == Value::Bool(true)) {
                     (Reply::Streamed(chunks), true) => {
                         paced_sse_response(&mut stream, chunks, stop);
@@ -197,6 +217,7 @@ fn joined_text(chunks: &[Chunk]) -> String {
 
 fn json_response(reply: &Reply) -> Vec<u8> {
     let (message, finish_reason) = match reply {
+        Reply::After { reply, .. } => return json_response(reply),
         Reply::Text(text) => (json!({"role": "assistant", "content": text}), "stop"),
         Reply::Streamed(chunks) => (
             json!({"role": "assistant", "content": joined_text(chunks)}),
@@ -226,6 +247,7 @@ fn json_response(reply: &Reply) -> Vec<u8> {
 
 fn sse_response(reply: &Reply) -> Vec<u8> {
     let delta = match reply {
+        Reply::After { reply, .. } => return sse_response(reply),
         Reply::Text(text) => json!({"content": text}),
         Reply::Streamed(chunks) => json!({"content": joined_text(chunks)}),
         Reply::ToolCall { name, arguments } => json!({

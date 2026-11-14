@@ -51,7 +51,7 @@ use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKi
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use history::ComposerHistory;
-use keys::{Action, KeyContext, ModalKind, PopupKind, ViMode};
+use keys::{Action, KeyContext, ModalKind, PagerMode, PopupKind, ViMode};
 use pager::{Pager, PagerView, ThreadRow};
 use queued::{
     QueuedLine, QueuedPreview, carry_over, reconcile_queue, remove_sent, take_user_messages,
@@ -975,7 +975,7 @@ enum ControlRequest {
         id: String,
         kind: TaskKind,
         /// The child session root the UI holds, which a turn that spawned
-        /// its first child reported after the control context was taken.
+        /// its first child resolved after the control context was taken.
         child_root: Option<Arc<ChildSessionRoot>>,
     },
     LoadChild {
@@ -2486,16 +2486,11 @@ impl App {
             }
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
             UiMsg::LendTerminal(job) => self.lend_requests.push(job),
-            UiMsg::ChildTranscriptFlushed { session_id, root } => {
+            UiMsg::ChildTranscriptFlushed { session_id } => {
                 if !is_plain_session_id(&session_id) {
                     warn!("Ignored a flush of a child session with the id {session_id:?}");
                     self.schedule_frame();
                     return;
-                }
-                // Only a child of the running turn can name the root, and
-                // only the first one to do so does.
-                if self.turn.is_some() && self.child_root.is_none() {
-                    self.child_root = root;
                 }
                 let reload = self
                     .pager
@@ -2503,6 +2498,16 @@ impl App {
                     .and_then(|pager| pager.child_flushed(&session_id));
                 if let Some(file) = reload {
                     self.read_open_child(session_id, file);
+                }
+            }
+            UiMsg::ChildSessionRootResolved(root) => {
+                self.child_root = Some(root);
+                if self
+                    .pager
+                    .as_ref()
+                    .is_some_and(|pager| pager.mode() == PagerMode::Picker)
+                {
+                    self.open_thread_picker();
                 }
             }
             UiMsg::ChildLoaded {
@@ -10628,7 +10633,8 @@ mod tests {
     }
 
     /// A cancel from the roster runs with the child session root the
-    /// turn reported after the control context was taken.
+    /// turn resolved after the control context was taken; a child's
+    /// flush never changes it.
     #[test]
     #[serial]
     fn a_roster_cancel_runs_with_the_child_root_the_turn_reported() {
@@ -10642,7 +10648,12 @@ mod tests {
             harness.app.sync_from_ctx(&mut ctx);
             harness.app.begin_turn("work on", false);
             let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 11 });
-            harness.app.child_root = Some(Arc::clone(&root));
+            harness
+                .app
+                .handle_msg(UiMsg::ChildSessionRootResolved(Arc::clone(&root)));
+            harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+                session_id: "stale-x7x".to_string(),
+            });
 
             harness.press(KeyCode::F(3));
             harness.draw();
@@ -10844,12 +10855,10 @@ mod tests {
             write_child(&root, "reviewer-x7x", &child_yaml("second draft v2"));
             harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
                 session_id: "planner-other".to_string(),
-                root: None,
             });
             assert!(harness.app.take_control_requests().is_empty());
             harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
                 session_id: "reviewer-x7x".to_string(),
-                root: None,
             });
             run_control_requests(&mut harness).await;
             let frame = harness.draw();
@@ -10859,7 +10868,6 @@ mod tests {
             write_child(&root, "reviewer-x7x", "model: [unclosed\nmessages: {");
             harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
                 session_id: "reviewer-x7x".to_string(),
-                root: None,
             });
             run_control_requests(&mut harness).await;
             let frame = harness.draw();
@@ -10893,21 +10901,9 @@ mod tests {
         });
     }
 
-    /// The first flush of a child the root has not handed back yet names
-    /// where the children live, and the picker lists them from there.
-    #[test]
-    #[serial]
-    fn a_childs_flush_names_the_root_the_picker_lists() {
-        let _guard = TestConfigDirGuard::new("tui-pager-picker");
-        let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 9 });
-        let mut harness = Harness::standalone(80, 24);
-        press_ctrl(&mut harness, 't');
-        harness.press(KeyCode::Tab);
-        assert!(harness.draw().contains("No child sessions yet"));
-        harness.press(KeyCode::Esc);
-
+    fn save_running_child(root: &ChildSessionRoot, session_id: &str) {
         let meta = crate::config::child_sessions::ChildMeta::new_running(
-            "reviewer-x7x",
+            session_id,
             "reviewer",
             "agent-x7x",
             crate::utils::process::ProcessStamp::current(),
@@ -10918,25 +10914,57 @@ mod tests {
         );
         std::fs::create_dir_all(root.children_dir()).unwrap();
         root.save_child_meta(&meta).unwrap();
-        harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
-            session_id: "reviewer-x7x".to_string(),
-            root: Some(Arc::clone(&root)),
-        });
-        harness.press(KeyCode::Tab);
-        assert!(
-            harness.draw().contains("No child sessions yet"),
-            "a flush outside a turn named the root"
-        );
-        harness.press(KeyCode::Esc);
+    }
 
+    /// A child's flush names no root; the root the turn resolves is the
+    /// one the picker lists from, and an open picker lists again at once.
+    #[test]
+    #[serial]
+    fn the_picker_lists_from_the_root_the_turn_resolves() {
+        let _guard = TestConfigDirGuard::new("tui-pager-picker");
+        let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 9 });
+        save_running_child(&root, "reviewer-x7x");
+        let mut harness = Harness::standalone(80, 24);
         harness.app.begin_turn("review it", false);
+        press_ctrl(&mut harness, 't');
         harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
             session_id: "reviewer-x7x".to_string(),
-            root: Some(Arc::clone(&root)),
         });
         harness.press(KeyCode::Tab);
+        assert!(harness.draw().contains("No child sessions yet"));
+
+        harness
+            .app
+            .handle_msg(UiMsg::ChildSessionRootResolved(Arc::clone(&root)));
         let frame = harness.draw();
         assert!(frame.contains("reviewer  reviewer-x7x  running"), "{frame}");
+        assert!(!frame.contains("No child sessions yet"), "{frame}");
+    }
+
+    /// Ctrl+T, Tab, Down, Enter opens a child's thread from the picker,
+    /// read-only, with what the child wrote.
+    #[test]
+    #[serial]
+    fn the_picker_opens_a_childs_thread_through_the_keys() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-pager-picker-keys");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 12 };
+            save_running_child(&root, "reviewer-k4k");
+            write_child(&root, "reviewer-k4k", &child_yaml("kid wrote k4k"));
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+
+            press_ctrl(&mut harness, 't');
+            harness.press(KeyCode::Tab);
+            harness.press(KeyCode::Down);
+            harness.press(KeyCode::Enter);
+            run_control_requests(&mut harness).await;
+            let frame = harness.draw();
+            assert!(frame.contains("kid wrote k4k"), "{frame}");
+            assert!(frame.contains("(read-only)"), "{frame}");
+        });
     }
 
     /// Two flushes during the first read leave that read alone in flight
@@ -10960,7 +10988,6 @@ mod tests {
             for _ in 0..2 {
                 harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
                     session_id: "reviewer-x7x".to_string(),
-                    root: None,
                 });
             }
             assert!(harness.app.take_control_requests().is_empty());
@@ -11012,23 +11039,27 @@ mod tests {
         assert!(harness.app.take_control_requests().is_empty());
     }
 
-    /// The sink forwards a child's flush to the loop with its root.
+    /// The sink forwards a child's flush and the turn's resolved root to
+    /// the loop.
     #[test]
     fn the_sink_forwards_a_childs_flush() {
         let (tx, mut rx) = unbounded_channel();
         let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 2 });
-        TuiSink::new(tx).on_event(&Event::ChildTranscriptFlushed {
+        let sink = TuiSink::new(tx);
+        sink.on_event(&Event::ChildTranscriptFlushed {
             session_id: "reviewer-x7x".to_string(),
-            root: Some(Arc::clone(&root)),
+        });
+        sink.on_event(&Event::ChildSessionRootResolved {
+            root: Arc::clone(&root),
         });
         match rx.try_recv() {
-            Ok(UiMsg::ChildTranscriptFlushed {
-                session_id,
-                root: Some(sent),
-            }) => {
+            Ok(UiMsg::ChildTranscriptFlushed { session_id }) => {
                 assert_eq!(session_id, "reviewer-x7x");
-                assert!(Arc::ptr_eq(&sent, &root));
             }
+            other => panic!("{other:?}"),
+        }
+        match rx.try_recv() {
+            Ok(UiMsg::ChildSessionRootResolved(sent)) => assert!(Arc::ptr_eq(&sent, &root)),
             other => panic!("{other:?}"),
         }
     }

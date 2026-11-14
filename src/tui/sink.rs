@@ -91,11 +91,12 @@ pub(crate) enum UiMsg {
     /// passthrough, an editor on a file): the loop releases the screen,
     /// runs it, and takes the screen back.
     LendTerminal(LendJob),
-    /// A child agent wrote its session file; `root` is where it lives.
+    /// A child agent wrote its session file.
     ChildTranscriptFlushed {
         session_id: String,
-        root: Option<Arc<ChildSessionRoot>>,
     },
+    /// The running turn settled where its child sessions live.
+    ChildSessionRootResolved(Arc<ChildSessionRoot>),
     /// What reading a child's session file for the pager gave.
     ChildLoaded {
         session_id: String,
@@ -341,11 +342,13 @@ impl EventSink for TuiSink {
             }),
             Event::TodoUpdated { items } => self.send(UiMsg::TodoUpdated(items.clone())),
             Event::QueuedInputSent { text } => self.send(UiMsg::QueuedInputSent(text.clone())),
-            Event::ChildTranscriptFlushed { session_id, root } => {
+            Event::ChildTranscriptFlushed { session_id } => {
                 self.send(UiMsg::ChildTranscriptFlushed {
                     session_id: session_id.clone(),
-                    root: root.clone(),
                 })
+            }
+            Event::ChildSessionRootResolved { root } => {
+                self.send(UiMsg::ChildSessionRootResolved(Arc::clone(root)))
             }
             _ => {}
         }

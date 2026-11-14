@@ -100,12 +100,14 @@ pub enum Event {
     UsageUpdated {
         right_prompt: String,
     },
-    /// A child agent wrote its session file. `root` is the directory
-    /// identity the child lives under, so an observer that has not seen
-    /// the spawner's own handle yet can still find the file.
     ChildTranscriptFlushed {
         session_id: String,
-        root: Option<Arc<ChildSessionRoot>>,
+    },
+    /// The root context settled the directory identity its child
+    /// sessions live under, so an observer can find a child's files
+    /// while the turn that spawned it is still running.
+    ChildSessionRootResolved {
+        root: Arc<ChildSessionRoot>,
     },
     JobCancelled {
         job_id: String,
