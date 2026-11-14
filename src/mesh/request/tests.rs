@@ -620,6 +620,35 @@ pub(crate) mod network {
                 .expect("a request was seen")
         }
 
+        /// The requests seen on `path`, with their bodies out of the envelope, oldest
+        /// first.
+        pub(crate) fn seen_on(&self, path: &str) -> Vec<(Seen, Value)> {
+            let path = PathHash::of(path);
+            let seen = self.seen.lock().clone();
+            let bodies = self.bodies.lock().clone();
+            seen.into_iter()
+                .zip(bodies)
+                .filter(|(seen, _)| seen.path_hash == path)
+                .collect()
+        }
+
+        /// Every request seen off `path` is the status-card fetch that a message from a
+        /// session the other node trusts prompts, at most once.
+        pub(crate) fn assert_only_a_card_fetch_besides(&self, path: &str) {
+            let path = PathHash::of(path);
+            let others: Vec<PathHash> = self
+                .seen
+                .lock()
+                .iter()
+                .map(|seen| seen.path_hash)
+                .filter(|hash| *hash != path)
+                .collect();
+            assert!(
+                others.iter().all(|hash| *hash == PathHash::of(STATUS_PATH)) && others.len() <= 1,
+                "requests besides the expected ones: {others:?}"
+            );
+        }
+
         async fn record(&self, seen: Seen, body: Value) -> Reply {
             self.seen.lock().push(seen);
             self.bodies.lock().push(body.clone());
@@ -10161,11 +10190,13 @@ pub(crate) mod network {
 
         assert!(is_received_reply(&outcome, &message.id));
         wait_until("node A to send node B the refusal", || {
-            pair.recorder_b.seen_count() == 1
+            pair.recorder_b.seen_on(MESSAGE_PATH).len() == 1
         })
         .await;
-        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
-        let reply = from_request_body(&pair.recorder_b.last_body()).unwrap();
+        pair.recorder_b
+            .assert_only_a_card_fetch_besides(MESSAGE_PATH);
+        let (_, body) = pair.recorder_b.seen_on(MESSAGE_PATH).remove(0);
+        let reply = from_request_body(&body).unwrap();
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.in_reply_to.as_deref(), Some(message.id.as_str()));
         assert_eq!(reply.thread.as_deref(), Some("t-1"));
@@ -10242,10 +10273,12 @@ pub(crate) mod network {
         })
         .await;
         assert_eq!(
-            pair.recorder_b.seen_count(),
+            pair.recorder_b.seen_on(MESSAGE_PATH).len(),
             0,
             "no reply followed the refusal while the run was in flight"
         );
+        pair.recorder_b
+            .assert_only_a_card_fetch_besides(MESSAGE_PATH);
         pair.stop_node_a().await;
     }
 
@@ -10614,7 +10647,13 @@ pub(crate) mod network {
             "the envoy is not offered it"
         );
         assert_eq!(messages(), 1, "a refused message is not counted");
-        assert_eq!(pair.recorder_b.seen_count(), 0, "no reply follows the code");
+        assert_eq!(
+            pair.recorder_b.seen_on(MESSAGE_PATH).len(),
+            0,
+            "no reply follows the code"
+        );
+        pair.recorder_b
+            .assert_only_a_card_fetch_besides(MESSAGE_PATH);
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.plain()).collect();
         let refusals: Vec<&String> = lines.iter().filter(|line| line.contains("refus")).collect();
         assert_eq!(refusals.len(), 1, "{lines:?}");
