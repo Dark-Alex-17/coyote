@@ -38174,10 +38174,10 @@ print(json.dumps({
         assert_eq!(got["cell"], "a/b c", "{got}");
     }
 
-    /// The README states the one-line header guarantee and how signals.py
-    /// mirrors the shared classifier, and signals.py carries no inert noqa.
+    /// The README states the one-line header guarantee and that signals.py
+    /// keeps no copy of the shared classifier, and signals.py carries no inert noqa.
     #[test]
-    fn gauntlet_docs_state_the_one_line_header_and_the_regex_copy() {
+    fn gauntlet_docs_state_the_one_line_header_and_no_regex_copy() {
         let gauntlet = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/review-gauntlet");
         let readme = read_to_string(gauntlet.join("README.md"))
             .unwrap()
@@ -38186,7 +38186,7 @@ print(json.dumps({
             "**The report header is one line per item**",
             "`scripts/report_text.py`",
             "also maps `|` to `/`",
-            "carries a byte-equal copy",
+            "`signals.py` keeps no copy",
         ] {
             assert!(readme.contains(claim), "review-gauntlet README: {claim}");
         }
