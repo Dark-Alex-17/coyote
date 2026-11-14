@@ -54,21 +54,25 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
 - A red run's record carries a `baseline`: the command is run again in a temporary detached
   worktree at the diff base (`diff_base`, resolved by `diff_facts`), and the two outputs are
   compared with the coder agent's `gate_lib.sh` helpers, by the same rule as its verify_tests gate.
+  The worktree is added with the user's git hooks disabled and is removed on normal exit.
   `pre-existing` failures are listed under `Pre-existing failures (not blocking):`; `regression`
-  and `not-run` (no diff base, deadline spent, worktree or helper failure, base run timed out)
-  block, and the complaint names the outcome.
+  and `not-run` (no diff base, deadline spent, worktree or helper failure, the command timed out
+  here or on the base) block, and the complaint names the outcome.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
-  criterion checks judge the criteria it covers as at best PARTIAL.
+  criterion checks judge the criteria it covers as at best PARTIAL. The report's `Criteria:` line
+  counts the skipped commands, so a CONFORMS that rests on them is visible.
 - Holistic complaints carry a required `blocking` flag. `blocking: false` complaints (for example
   spec-endorsed waste, whose criterion stays MET) are listed under
   `Non-blocking holistic complaints:` in either verdict.
 - INSPECTED criteria are listed under `Inspected, not test-proven:` with their evidence and
   `no_test_reason`.
 - A criterion whose check output stays unreadable after two re-asks is recorded UNVERIFIED with the
-  raw output. The holistic pass rules on UNVERIFIED criteria only (`format_rulings`), and the
-  report marks a ruled criterion `(ruled by holistic: output format failed)`. An UNVERIFIED
-  criterion with no ruling is a `PIPELINE-FAULT` complaint, so the run reads as degraded, not as
-  a fix for the coder.
+  raw output; so is one whose gate crashed. The holistic pass rules on UNVERIFIED criteria only
+  (`format_rulings`), each ruling must pass the same contract as a criterion check
+  (`scripts/crit_contract.py`), and the report marks a ruled criterion
+  `(ruled by holistic: output format failed)`. An UNVERIFIED criterion with no ruling, or with a
+  ruling that fails the contract, is a `PIPELINE-FAULT` complaint naming the reason, so the run
+  reads as degraded, not as a fix for the coder.
 
 ```
 ADVERSARIAL_REVIEW: DIVERGES

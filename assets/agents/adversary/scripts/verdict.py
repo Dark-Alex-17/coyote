@@ -13,10 +13,11 @@ the criteria it covers. An ENVIRONMENT runner-error marker blocks when
 commands were declared, since the declared commands never ran.
 Holistic complaints block unless they carry `blocking: false`; those are
 reported as non-blocking. A criterion whose check output stayed unreadable
-(UNVERIFIED) takes the holistic pass's format ruling for it when one exists,
-and is otherwise a PIPELINE-FAULT. Rulings for any other criterion are
-ignored, so the holistic pass never changes a criterion it did not have to
-settle.
+(UNVERIFIED) takes the holistic pass's format ruling for it when one exists
+and passes the same contract crit_gate.py enforces (crit_contract.py), and
+is otherwise a PIPELINE-FAULT naming the rejection. Rulings for any other
+criterion are ignored, so the holistic pass never changes a criterion it did
+not have to settle.
 Everything else -- including a missing plan or a degraded (faulted)
 pipeline -- is DIVERGES (fail-closed).
 Any "PIPELINE-FAULT:" marker recorded in `pipeline_faults` (or a holistic
@@ -33,7 +34,10 @@ import os
 import sys
 
 sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
+
+from crit_contract import validate  # noqa: E402
 
 MAX_FAULT_DETAIL_CHARS = 300
 MAX_MARKER_CHARS = 200
@@ -41,7 +45,6 @@ MAX_SECTION_TEXT_CHARS = 100
 DIED_MARKER = "criterion check DIED (pipeline fault)"
 DIED_EVIDENCE_PREFIX = "PIPELINE-FAULT: criterion "
 RULED_MARKER = "(ruled by holistic: output format failed)"
-RULING_STATUSES = {"MET", "INSPECTED", "PARTIAL", "UNMET", "DIVERGED"}
 
 
 def died(v):
@@ -69,12 +72,13 @@ def short_text(v):
 def apply_format_rulings(verdicts, rulings):
     """Settle each UNVERIFIED verdict with the holistic ruling for its id.
 
-    A ruling whose id names a verdict in any other status, or whose status is
-    outside RULING_STATUSES, is ignored.
+    A ruling whose id names a verdict in any other status is ignored. A
+    ruling that fails the criterion contract leaves the verdict UNVERIFIED
+    with the rejection reason as its complaint.
     """
     by_id = {}
     for r in rulings if isinstance(rulings, list) else []:
-        if isinstance(r, dict) and isinstance(r.get("id"), str) and r.get("status") in RULING_STATUSES:
+        if isinstance(r, dict) and isinstance(r.get("id"), str):
             by_id.setdefault(r["id"].strip(), r)
     out = []
     for v in verdicts:
@@ -82,15 +86,22 @@ def apply_format_rulings(verdicts, rulings):
         if ruling is None:
             out.append(v)
             continue
-        evidence = str_field(ruling, "evidence")
-        complaint = str_field(ruling, "complaint")
+        try:
+            status, evidence, complaint, no_test_reason = validate(ruling)
+        except ValueError as e:
+            original = str_field(v, "complaint")
+            rejected = f"holistic format ruling rejected: {e}"
+            out.append(dict(v, complaint=f"{original}; {rejected}" if original else rejected))
+            continue
+        evidence = evidence.strip()
+        complaint = complaint.strip()
         out.append(
             dict(
                 v,
-                status=ruling["status"],
+                status=status,
                 evidence=f"{RULED_MARKER} {evidence}".strip(),
                 complaint=f"{RULED_MARKER} {complaint}".strip() if complaint else "",
-                no_test_reason=str_field(ruling, "no_test_reason"),
+                no_test_reason=no_test_reason,
             )
         )
     return out
@@ -99,7 +110,7 @@ def apply_format_rulings(verdicts, rulings):
 def unverified_faults(verdicts):
     return [
         f'PIPELINE-FAULT: criterion verdict unreadable after re-asks, and the holistic '
-        f'pass gave no format ruling for it -- "{short_text(v)}" '
+        f'pass gave no usable format ruling for it -- "{short_text(v)}" '
         f"({(v.get('complaint') or '').strip()})"
         for v in verdicts
         if v.get("status") == "UNVERIFIED" and not died(v)
@@ -242,6 +253,16 @@ def baseline_text(record):
     return text
 
 
+def skipped_note(exec_results):
+    """Header note counting deadline-skipped commands; they never block."""
+    if not isinstance(exec_results, list):
+        return ""
+    skipped = sum(1 for r in exec_results if isinstance(r, dict) and r.get("skipped"))
+    if not skipped:
+        return ""
+    return f"{skipped} declared command(s) not run (deadline), judged by the criterion checks"
+
+
 def render_tail(record):
     tail = (record.get("tail") or "").strip()
     return ["    " + t for t in tail.splitlines()[-15:]]
@@ -337,6 +358,7 @@ def main():
         state.get("exec_results"), state.get("verification_commands")
     )
     n_debris, debris_hits = debris_complaints(state)
+    not_run = skipped_note(state.get("exec_results"))
     n = len(verdicts)
 
     met = [v for v in verdicts if v.get("status") in ("MET", "INSPECTED") and not died(v)]
@@ -398,7 +420,9 @@ def main():
         lines.append("ADVERSARIAL_REVIEW: CONFORMS")
         lines.append(
             f"Criteria: {n}/{n} met ({len(proven)} test-proven, "
-            f"{len(inspected)} by inspection)."
+            f"{len(inspected)} by inspection)"
+            + (f"; {not_run}" if not_run else "")
+            + "."
         )
         lines.append(debris_summary_line(state))
         if observations:
@@ -409,6 +433,8 @@ def main():
         lines.append("ADVERSARIAL_REVIEW: DIVERGES")
         header = f"Criteria: {len(met)}/{n} met, {len(partial)} partial, {len(bad)} unmet/diverged"
         notes = []
+        if not_run:
+            notes.append(not_run)
         if died_count := sum(1 for v in verdicts if died(v)):
             notes.append(f"degraded run: {died_count} criterion check(s) died (fail-closed)")
         if reds:

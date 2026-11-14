@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Contract gate for the adversary's per-criterion verify chain.
 
-Validates each criterion verdict against the contract:
+Validates each criterion verdict against the contract in crit_contract.py:
   - a single JSON object with status in {MET, INSPECTED, PARTIAL, UNMET, DIVERGED}
   - MET requires non-empty evidence (the change AND the proving test)
   - INSPECTED requires evidence with at least one file:line citation and a
@@ -23,11 +23,15 @@ to rule on, so a malformed item can never sink the map or masquerade as met.
 import json
 import os
 import re
+import sys
 
-STATUSES = {"MET", "INSPECTED", "PARTIAL", "UNMET", "DIVERGED"}
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from crit_contract import text_field, validate  # noqa: E402
+
 NOT_MET = {"PARTIAL", "UNMET", "DIVERGED"}
 MAX_RETRIES = 2
-CITATION = re.compile(r"[\w./-]+:\d+")
 STATUS_TOKEN = re.compile(r'"?status"?\s*[:=]\s*"?\s*([A-Za-z]+)', re.I)
 
 
@@ -58,49 +62,6 @@ def extract_json(text):
     if start == -1 or end <= start:
         raise ValueError("no JSON object found in criterion-check output")
     return json.loads(text[start : end + 1])
-
-
-def text_field(obj, key):
-    value = obj.get(key)
-    return value if isinstance(value, str) else ""
-
-
-def validate(obj):
-    if not isinstance(obj, dict):
-        raise ValueError("criterion-check output is not a JSON object")
-    status = obj.get("status")
-    if status not in STATUSES:
-        raise ValueError(f"status must be one of {sorted(STATUSES)}, got {status!r}")
-    evidence = text_field(obj, "evidence")
-    complaint = text_field(obj, "complaint")
-    no_test_reason = text_field(obj, "no_test_reason")
-    if status == "MET" and not evidence.strip():
-        raise ValueError(
-            "MET requires non-empty evidence citing the satisfying change AND the "
-            "test proving the behavior (file:line)"
-        )
-    if status == "INSPECTED":
-        if not evidence.strip():
-            raise ValueError(
-                "INSPECTED requires non-empty evidence citing the inspected change (file:line)"
-            )
-        if not CITATION.search(evidence):
-            raise ValueError(
-                "INSPECTED evidence must contain at least one file:line citation"
-            )
-        if not no_test_reason.strip():
-            raise ValueError(
-                "INSPECTED requires a non-empty no_test_reason saying in one line why "
-                "no test could prove this criterion"
-            )
-    if status not in ("MET", "INSPECTED") and not complaint.strip():
-        raise ValueError(
-            f"{status} requires a non-empty complaint (what the diff does/omits at "
-            "file:line, and what would make it conform)"
-        )
-    if status != "INSPECTED":
-        no_test_reason = ""
-    return status, evidence, complaint, no_test_reason.strip()
 
 
 def salvage(raw, reason):
@@ -154,15 +115,20 @@ def emit(cid, ctext, status, evidence, complaint, no_test_reason):
     )
 
 
+def raw_output(state):
+    raw = state.get("crit_verdict")
+    if isinstance(raw, str):
+        return raw
+    return "" if raw is None else json.dumps(raw)
+
+
 def main():
     state = load_state()
     cid, ctext = criterion_fields(state)
     attempts = state.get("gate_attempts")
     if not isinstance(attempts, int):
         attempts = 0
-    raw = state.get("crit_verdict")
-    if not isinstance(raw, str):
-        raw = "" if raw is None else json.dumps(raw)
+    raw = raw_output(state)
 
     try:
         emit(cid, ctext, *validate(extract_json(raw)))
@@ -205,17 +171,17 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — the gate must never crash the chain
-    print(
-        json.dumps(
-            {
-                "crit_verdict": {
-                    "id": "unknown",
-                    "text": "",
-                    "status": "PARTIAL",
-                    "evidence": "",
-                    "complaint": f"criterion gate error: {e} — treat as unproven",
-                    "no_test_reason": "",
-                }
-            }
-        )
+    try:
+        crashed_state = load_state()
+        cid, ctext = criterion_fields(crashed_state)
+        raw = raw_output(crashed_state)
+    except Exception:  # noqa: BLE001 -- unreadable state may be what crashed the gate
+        cid, ctext, raw = "unknown", "", ""
+    emit(
+        cid,
+        ctext,
+        "UNVERIFIED",
+        raw,
+        f"criterion gate error: {e} -- treat as unproven",
+        "",
     )
