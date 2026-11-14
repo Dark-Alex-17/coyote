@@ -1965,12 +1965,12 @@ _LINE_BREAKS = re.compile(r"[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+")
 
 
 def _adversary_complaints(text):
-    """The numbered items under the adversary's column-0 `Complaints:` line, in order, each whole with its
+    """The numbered items under the adversary's `Complaints:` line, in order, each whole with its
     continuation lines joined. Split on `\\n` only, since a complaint is model text and may carry any other line
     boundary or a blank line. An item runs until a line opening the NEXT number, or a blank line followed by one of
     SECTIONS_AFTER_COMPLAINTS. This follows review-gauntlet's verdict_gate.adversary_complaints; keep the two in step."""
     lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
-    start = next((i + 1 for i, l in enumerate(lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(lines))
+    start = next((i + 1 for i, l in enumerate(lines) if l.strip() == "Complaints:"), len(lines))
     body = lines[start:]
     items, number = [], None
     for k, line in enumerate(body):
@@ -1992,7 +1992,7 @@ def _adversary_complaints(text):
 # The direct micro-mode adversary's report has no gauntlet header, so on that
 # lane its `ADVERSARIAL_REVIEW:` line is the only verdict (a `GAUNTLET:` line
 # quoted in its verification output is not one) and its complaints are the
-# numbered items under its column-0 `Complaints:` line, read from the whole
+# numbered items under its `Complaints:` line, read from the whole
 # report. A lane row it quotes is not a lane verdict, so it reports no lanes
 # and the next round settles none; a quoted probe row or USAGE_PROBE line is
 # no probe verdict either, so it yields no probe files.
@@ -3326,6 +3326,28 @@ def _park_key(state, esc):
     return f"{kind}:{hashlib.sha1(asked.encode('utf-8', 'replace')).hexdigest()[:10]}"
 
 
+def _migrate_park_keys(state, esc):
+    """choice_parks with each key written before _park_key moved to its current key, counts merged by max, and
+    whether any key moved. A multiple-choice question used to count under its bare index, any other under its bare
+    kind; a relay park key is the same in both formats."""
+    parks = dict(as_dict(state.get("choice_parks")))
+    if not esc:
+        return parks, False
+    data = as_dict(esc.get("data"))
+    kind = esc.get("kind", "")
+    migrated, changed = {}, False
+    for key, count in parks.items():
+        new = key
+        if key != data.get("park_key"):
+            if re.fullmatch(r"[0-9]+", key):
+                new = f"{state.get('choice_kind') or kind}#{key}"
+            elif kind and key == kind and not data.get("multiple_choice"):
+                new = _park_key(state, esc)
+        changed = changed or new != key
+        migrated[new] = max(as_int(migrated.get(new)), as_int(count))
+    return (migrated, True) if changed else (parks, False)
+
+
 def choice_park(state):
     """End the run parked on the current question so the user can discuss it in the chat lane.
 
@@ -3339,7 +3361,7 @@ def choice_park(state):
     queue, idx = (as_list(state.get("choice_queue")), as_int(state.get("choice_index"))) if mc else ([], 0)
     key = _park_key(state, esc)
     where = f"question {idx + 1}/{len(queue)}" if mc else "the question"
-    parks = dict(as_dict(state.get("choice_parks")))
+    parks, _ = _migrate_park_keys(state, esc)
     count = as_int(parks.get(key))
     if count >= DISCUSSION_PARKS_MAX:
         if mc:
@@ -3380,6 +3402,10 @@ def choice_resume(state):
     """
     u = {"discussion": {}, "settled_answer": "", "parked": "", "reply_interpreted": False}
     esc = as_dict(state.get("escalation"))
+    parks, changed = _migrate_park_keys(state, esc)
+    if changed:
+        u["choice_parks"] = parks
+        ledger(state, u, f"discussion: park counts carried over from the old key format -> {parks}")
     settled = str(state.get("settled_answer") or "").strip()
     if not as_dict(esc.get("data")).get("multiple_choice") and esc.get("kind") not in CHOICE_KIND_GATES:
         if settled:

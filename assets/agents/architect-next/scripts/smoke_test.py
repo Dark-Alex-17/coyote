@@ -1609,6 +1609,10 @@ adv_sections = {s: _complaints(f"1. criterion one fails\n   at api/h.go:10\n\n{s
                 for s in ("Non-blocking observations:", "Met criteria (evidence):", "Verification runs:")}
 check("_parse_gauntlet: a blank line then each section after the complaints ends them",
       all(v == ["criterion one fails at api/h.go:10"] for v in adv_sections.values()), adv_sections)
+ADV_INDENT = "ADVERSARIAL_REVIEW: DIVERGES\n  Complaints:  \n1. criterion one fails\n2. criterion two fails\n"
+check("_parse_gauntlet: an indented Complaints: line still opens the adversary's complaints",
+      gates._parse_gauntlet(ADV_INDENT, adversary_lane=True)[3] == ["criterion one fails", "criterion two fails"],
+      gates._parse_gauntlet(ADV_INDENT, adversary_lane=True)[3])
 GINC = gauntlet_reply("BLOCKED", [("probe", "BLOCKED", "INCONCLUSIVE (environment)")],
                       blockers=["probe: INCONCLUSIVE - the ENVIRONMENT could not be established; this is not a code verdict"],
                       reports=[("probe", "USAGE_PROBE: INCONCLUSIVE")])
@@ -2345,6 +2349,38 @@ for prompt in ("continue please", "continue, but why X?"):
     check(f"intake: {prompt!r} is prose, not a continue -> a fresh run, no answer recorded, the key cleared, the left discussion ledgered",
           not s.get("resume_mode") and s["run_id"] != PARK_ID and not s.get("settled_answer") and s["discussion_run_id"] == ""
           and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
+
+# park counts written under the key format that predates _park_key
+OLD_PARK = dict(escalation=E_DQ, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[],
+                parked="choice_discussion", discussion={"run_id": "x"}, last_answer_text="why sqlite?")
+
+
+def rekeyed(u):
+    return [d for d in u.get("decisions", []) if "old key format" in d]
+
+
+s = base_state(**OLD_PARK, choice_parks={"0": _lib.DISCUSSION_PARKS_MAX})
+s.update(gates.choice_resume(s))
+u = gates.choice_park(s)
+check("choice_resume: an old bare-index park key at the cap is rekeyed and ledgered; choice_park then re-asks instead of parking",
+      s["choice_parks"] == {"design_round#0": _lib.DISCUSSION_PARKS_MAX} and len(rekeyed(s)) == 1
+      and u["_next"] == "choice_reask" and u.get("choice_forced") is True, (s.get("choice_parks"), u))
+u = gates.choice_park(base_state(**OLD_PARK, choice_parks={"0": _lib.DISCUSSION_PARKS_MAX}))
+check("choice_park: an old bare-index park key at the cap with no resume in between -> still re-asks",
+      u["_next"] == "choice_reask" and u.get("choice_forced") is True, u)
+u = gates.choice_resume(base_state(escalation=E_GIT, parked="choice_discussion", choice_parks={"git_setup_failed": 2}))
+check("choice_resume: an old bare-kind park key of a free-text question -> its kind and question key, the count kept, one ledger line",
+      u.get("choice_parks") == {gates._park_key({}, E_GIT): 2} and len(rekeyed(u)) == 1, u)
+E_RELAYED = {**E_GIT, "data": {**E_GIT["data"], "park_key": "7"}}
+u = gates.choice_resume(base_state(escalation=E_RELAYED, parked="choice_discussion", choice_parks={"7": 2}))
+check("choice_resume: the parked question's relay park key is left as it is, even one shaped like an old index",
+      "choice_parks" not in u and not rekeyed(u), u)
+u = gates.choice_resume(base_state(**OLD_PARK, choice_parks={"design_round#0": 1, gates._park_key({}, E_GIT): 2}))
+check("choice_resume: park keys already in the current format -> unchanged, nothing ledgered",
+      "choice_parks" not in u and not rekeyed(u), u)
+u = gates.choice_resume(base_state(**OLD_PARK, choice_parks={"0": 3, "design_round#0": 1, "1": 1, "design_round#1": 2}))
+check("choice_resume: an old key whose current key is also present -> one key holding the larger count",
+      u.get("choice_parks") == {"design_round#0": 3, "design_round#1": 2} and len(rekeyed(u)) == 1, u)
 
 
 def resume_chain(run_id, prompt, gate):
