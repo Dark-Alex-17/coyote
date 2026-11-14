@@ -284,12 +284,16 @@ def intake(state):
         u["resume_mode"] = True
         for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtask_tree", "subtask_head", "subtask_started_at",
                   "run_must_not_do", "final_rejections_from", "subtasks", "subtask_index", "current_task", "fix_round",
-                  "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
+                  "task_number", "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
                   "skipped_reviews", "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
+        idx = u.get("subtask_index")
+        if not as_int(u.get("task_number")) and type(idx) is int and idx > 0 and not truthy(u.get("final_review")):
+            u["task_number"] = idx
+            ledger(state, u, f"re-entry: run {run_id}'s state has no task_number; derived {idx} from subtask_index")
         u["resume_note"] = (
             f"Re-entry into run {run_id} (phase at exit: {prior.get('phase')}, base {prior.get('base_sha')}, "
             f"head {prior.get('head_sha')}, fix rounds {prior.get('fix_round')}, review rounds "
@@ -4205,7 +4209,7 @@ def _ci_unclear(state, u, status):
         u["pr_review_status"] = f"ci_{status}"
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
     if status == "no_checks":
-        question = f"{prefix}The PR reports no CI checks after a second read. How to proceed?"
+        question = f"{prefix}The PR still reports no CI checks {CI_NO_CHECKS_SECS} s after the watch started. How to proceed?"
         options = [option(CI_NO_CI, recommended=True, evidence="no CI check is registered; a PR without CI must not stay in draft"),
                    option(CI_KEEP_WAITING), option(leave)]
     else:
@@ -4285,13 +4289,13 @@ def ci_route(state):
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"Review watch stopped: CI watch ended without a verdict ({status}). Keep waiting, or stop watching?",
-            [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True)],
+            [option(CI_KEEP_WAITING), option("Stop watching and report", recommended=True)],
             hard_trigger=True))
     else:
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"CI watch ended without a verdict ({status}). Keep waiting, or leave the PR in draft and report?",
-            [option("Keep waiting (re-run the watch)"), option("Leave the PR in draft and report", recommended=True,
-                                                               evidence="a draft with a named blocker beats a ready PR on red/pending")]))
+            [option(CI_KEEP_WAITING), option("Leave the PR in draft and report", recommended=True,
+                                             evidence="a draft with a named blocker beats a ready PR on red/pending")]))
     return u
 
 

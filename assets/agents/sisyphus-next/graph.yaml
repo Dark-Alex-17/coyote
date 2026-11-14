@@ -795,14 +795,15 @@ nodes:
       Validate the A11 bound (B2, at most 6) and write tasklog.md; a plan over the
       bound (or none) raises the sizing_verdict escalation in a top-level run (hand it
       to the architect or narrow the scope), never trimmed, and ends in end_redirect
-      in a delegated run.
+      in a delegated run. A subtasks value that is missing or not a list ends in
+      end_blocked with a failure_reason naming its type.
     script: scripts/record_subtasks.py
     fallback: end_failure
 
   next_subtask:
     id: next_subtask
     type: script
-    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish.
+    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish. A broken or stale list or index heals from the sealed subtasks.json (ledgered) or ends in end_blocked with a failure_reason.
     script: scripts/next_subtask.py
     timeout: 60
     fallback: end_failure

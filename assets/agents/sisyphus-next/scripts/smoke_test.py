@@ -1532,7 +1532,7 @@ set_checks()
 u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_t_ci))
 check("ci_poll: an empty check list on the first read -> pending, polled again",
       u.get("ci_status") == "pending" and u.get("_next") == "ci_poll")
-u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=3, ci_started_at=_t_ci - gates.CI_NO_CHECKS_SECS + 30))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=3, ci_started_at=int(time.time()) - gates.CI_NO_CHECKS_SECS // 2))
 check("ci_poll: an empty check list on a later read inside CI_NO_CHECKS_SECS -> still pending, never no_checks",
       u.get("ci_status") == "pending" and u.get("_next") == "ci_poll", u)
 u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci - gates.CI_NO_CHECKS_SECS))
@@ -3097,6 +3097,27 @@ re_ = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {RID}", "proj
 check("subtasks: a re-entry carries the subtask snapshot keys, so a resumed read-only subtask still skips its review",
       all(re_.get(k) == prior[k] for k in ("subtask_tree", "subtask_head", "subtask_started_at", "run_base_sha", "run_must_not_do")),
       {k: re_.get(k) for k in prior})
+
+
+def _resume_mid_subtask(rid, **extra):
+    os.makedirs(os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], rid), exist_ok=True)
+    open(os.path.join(os.environ["SISYPHUS_RUNS_ROOT"], rid, "state.json"), "w").write(
+        json.dumps({"base_sha": BASE, "subtasks": SUBS7, "subtask_index": 2, **extra}))
+    st = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {rid}", "project_dir": REPO})
+    return st, gates.next_subtask({"project_dir": REPO, "git_root": REPO, "decisions": [], "anomalies": [],
+                                   "anomalies_log": [], **st})
+
+
+_st, u = _resume_mid_subtask("20990101T000000-cafef00e", task_number=2)
+check("subtasks: a re-entry mid-subtask carries task_number, so next_subtask starts subtask 3 without a fault",
+      _st.get("task_number") == 2 and u.get("task_number") == 3 and u["_next"] != "end_blocked"
+      and "failure_reason" not in u and u["current_task"].startswith(f"Subtask 3/{len(SUBS7)}")
+      and not any("derived" in d for d in _st["decisions"]), (_st.get("task_number"), u))
+_st, u = _resume_mid_subtask("20990101T000000-cafef00f")
+check("subtasks: a re-entry whose state has no task_number derives it from subtask_index, ledgered, and starts subtask 3",
+      _st.get("task_number") == 2 and u.get("task_number") == 3 and u["_next"] != "end_blocked"
+      and "failure_reason" not in u and any("derived 2 from subtask_index" in d for d in _st["decisions"]),
+      (_st.get("task_number"), u))
 
 # a plan amendment made during a subtask amends that subtask's criterion
 am = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, subtasks=SUBS7, subtask_index=2, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={},

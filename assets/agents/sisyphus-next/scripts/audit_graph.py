@@ -33,7 +33,9 @@ BOUNDED = {
     "record_subtasks": "B2 subtasks<=6 / sizing_rounds<=3 sizing verdicts, then the sizing_cap escalation",
     "next_subtask": "B3 list-bounded subtask index",
     "oracle_gate": "B4 once per task",
-    "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3",
+    "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3, then the coder_rejected_cap escalation, whose "
+                          "continue answer resets the budget FIX_ROUND_CEILING times per subtask before Stop is "
+                          "recommended",
     "apply_answer": "B6 strikeout_rounds: FIX_ROUND_CEILING recommended extra rounds per subtask, then proceeding is "
                     "recommended / B9 design_ask_rounds<=1, one question per ASK line / DRAFT_ROUNDS_MAX redrafts / "
                     "apply_reasks<=APPLY_REASK_MAX re-asks per escalation / user-driven choices",
