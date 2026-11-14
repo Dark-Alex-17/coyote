@@ -42,7 +42,10 @@ location (isolation seam, see acquire_stack_lock).
 Baseline: every red record (nonzero exit, including the -1 timeout) is run
 again, inside the same deadline, in one temporary detached git worktree of
 the project's repository at `diff_base` (from diff_facts.py), in the same
-subdirectory project_dir names. The worktree is always removed afterwards.
+subdirectory project_dir names, added with core.hooksPath pointed at an
+empty directory so the user's git hooks do not run. The worktree is removed
+on normal exit. A record that timed out here gets a not-run baseline without
+a base run, so it does not spend the shared deadline.
 The two full outputs are compared with the coder agent's own gate_lib.sh
 helpers through bash, by the rule its verify_tests gate applies: the failure
 is pre-existing only when the base run is red (and did not time out) with
@@ -106,6 +109,7 @@ GATE_LIB = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "coder", "scripts", "gate_lib.sh"
 )
 GIT_CLEANUP_TIMEOUT_SECS = 20
+GATE_CALL_MIN_TIMEOUT_SECS = 10
 
 
 def acquire_stack_lock():
@@ -277,7 +281,7 @@ def gate_call(fn, path, budget):
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=max(budget, 1),
+            timeout=max(budget, GATE_CALL_MIN_TIMEOUT_SECS),
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         raise GateUnavailable(f"{fn}: {e}") from e
@@ -367,17 +371,29 @@ def git_text(args, cwd, timeout):
     return r.stdout.strip()
 
 
+def cleanup_git(top, args):
+    try:
+        git_text(args, top, GIT_CLEANUP_TIMEOUT_SECS)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"WARN: baseline worktree cleanup `git {' '.join(args)}` failed: {e}\n")
+
+
 def remove_worktree(top, path):
-    for args in (["worktree", "remove", "--force", path], ["worktree", "prune"]):
-        try:
-            git_text(args, top, GIT_CLEANUP_TIMEOUT_SECS)
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            sys.stderr.write(f"WARN: baseline worktree cleanup `git {' '.join(args)}` failed: {e}\n")
+    """The prune after the rmtree drops a registration that a failed
+    `worktree remove` left behind."""
+    cleanup_git(top, ["worktree", "remove", "--force", path])
+    cleanup_git(top, ["worktree", "prune"])
+    shutil.rmtree(path, ignore_errors=True)
+    cleanup_git(top, ["worktree", "prune"])
 
 
 def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
     """Give every red record a `baseline` from one run at the diff base."""
     reds = [i for i, r in enumerate(results) if not r.get("skipped") and r.get("exit") != 0]
+    for i in reds:
+        if results[i]["exit"] == -1:
+            results[i]["baseline"] = not_run("the command timed out here, so no comparison applies")
+    reds = [i for i in reds if results[i]["exit"] != -1]
     if not reds:
         return
     diff_base = state.get("diff_base")
@@ -398,9 +414,15 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
             results[i]["baseline"] = not_run(f"the project's git repository could not be read: {e}")
         return
     tree = os.path.join(work, "base")
+    hooks = os.path.join(work, "no-hooks")
     try:
         try:
-            git_text(["worktree", "add", "--detach", tree, diff_base], top, left(deadline))
+            os.mkdir(hooks)
+            git_text(
+                ["-c", f"core.hooksPath={hooks}", "worktree", "add", "--detach", tree, diff_base],
+                top,
+                left(deadline),
+            )
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
             for i in reds:
                 results[i]["baseline"] = not_run(f"the diff-base worktree could not be created: {e}")

@@ -181,7 +181,7 @@ nodes:
   run_checks:
     id: run_checks
     type: script
-    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); the worktree is always removed. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3300s total deadline, started after the review-stack lock (bounded 1200s wait), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); a command that timed out here gets a not-run baseline without a base run. The worktree is added with the user's git hooks disabled and removed on normal exit. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3300s total deadline, started after the review-stack lock (bounded 1200s wait), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
     timeout: 4600
     fallback: pipeline_fault
@@ -350,7 +350,7 @@ nodes:
   holistic:
     id: holistic
     type: llm
-    description: Cross-criterion adversarial pass that hunts what per-criterion checks cannot see. Additive; it never changes a criterion verdict's status, and its blocking complaints can block CONFORMS. It also gives a format ruling for each UNVERIFIED criterion (one whose check produced no valid verdict).
+    description: Cross-criterion adversarial pass that hunts what per-criterion checks cannot see. Additive; it never changes a criterion verdict's status other than settling UNVERIFIED ones through format_rulings, and its blocking complaints can block CONFORMS. It gives a format ruling for each UNVERIFIED criterion (one whose check produced no valid verdict); a ruling that fails the criterion contract is not applied.
     instructions: |
       You run the holistic adversarial pass over a whole change AFTER each
       acceptance criterion was independently verified. You hunt what
@@ -401,8 +401,11 @@ nodes:
       (MET, INSPECTED, PARTIAL, UNMET or DIVERGED, under the same bar as the
       criterion checks: MET needs a proving test, INSPECTED only where no test
       could prove it), evidence, complaint, and no_test_reason. Rulings for
-      any other criterion are ignored. Emit an empty array when no criterion
-      is UNVERIFIED.
+      any other criterion are ignored. A ruling is held to the criterion
+      contract: MET needs evidence, INSPECTED needs a file:line citation in
+      its evidence and a no_test_reason, and any other status a complaint.
+      A ruling that misses it is rejected and the criterion stays a
+      PIPELINE-FAULT. Emit an empty array when no criterion is UNVERIFIED.
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}

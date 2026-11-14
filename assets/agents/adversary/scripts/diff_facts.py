@@ -111,6 +111,13 @@ try:
             f"diff spec {spec!r} is option-shaped; pass a revision, a range, or one "
             "of worktree/staged/auto"
         )
+    sides = spec.split("...", 1) if "..." in spec else spec.split("..", 1) if ".." in spec else []
+    for side in sides:
+        if side.startswith("-"):
+            raise ValueError(
+                f"diff spec {spec!r} has an option-shaped side {side!r}; pass a revision "
+                "on each side of the range"
+            )
     if spec in ("auto", ""):
         base_rev = "HEAD"
         text = git_diff("--cached")
