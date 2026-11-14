@@ -2465,7 +2465,7 @@ neg_ = {"amend_cap don't stop": AA("amend_cap", "don't stop, allow one more", es
         "amend_cap Stop.": AA("amend_cap", "Stop.", esc=E_AC)["_next"], "amend_cap 2": AA("amend_cap", "2", esc=E_AC)["_next"],
         "mode_invalid Abort": AA("mode_invalid", "Abort")["_next"]}
 check("apply_answer: stop and abort follow the reply's intent: negated or qualified words go on, a stop pick or bare word stops",
-      neg_ == {"amend_cap don't stop": "gate1_build", "plan_defect stop retrying": "amend_plan", "mode_invalid do not abort": "intake",
+      neg_ == {"amend_cap don't stop": "escalate_gate", "plan_defect stop retrying": "amend_plan", "mode_invalid do not abort": "intake",
                "amend_cap Stop.": "end_blocked", "amend_cap 2": "end_blocked", "mode_invalid Abort": "end_aborted"}, neg_)
 
 
@@ -2597,6 +2597,123 @@ park_steps = [park_use(s6, n) for n in ("plan_defect-second",) * 3 + ("design_ro
 park_fourth = park_use(s6, "plan_defect-second")
 check("choice_park: each question keeps its own park count; a second question of the same kind parks at its own first use",
       park_steps == ["end_discussion"] * 6 and park_fourth == "choice_reask", (park_steps, park_fourth, s6.get("choice_parks")))
+
+s7 = base_state(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT + 1, escalation=E_G2,
+                last_answer="Another fix round (state reason)", amend_counts={"gate2": _lib.AMEND_GATE2_MAX},
+                amend_cycles=AMEND_CYCLES_MAX, amend_source="", pending_amendments=[], cap_continues={})
+s7.update(gates.apply_answer(s7))
+g2_next = s7["_next"]
+s7.update(gates.reseal_gate(s7))
+check("apply_answer -> reseal_gate: gate2_stuck another fix round spends no amend_cap: the gate-2 budget and the ceiling get one more cycle",
+      g2_next == "amend_plan" and s7["_next"] == "gate1_build" and (s7.get("escalation") or {}).get("kind") != "amend_cap",
+      (g2_next, s7["_next"], s7.get("amend_counts"), s7.get("amend_cycles")))
+
+
+def _cap_offer(esc):
+    opts = (esc or {}).get("options") or [{}]
+    return opts[0].get("text"), [o["text"] for o in opts if o.get("recommended")]
+
+
+ac_first = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate1", amend_counts={"gate1": _lib.AMEND_GATE1_MAX},
+                                        cap_continues={}))
+ac_spent = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate1", amend_counts={"gate1": _lib.AMEND_GATE1_MAX},
+                                        cap_continues={"amend_cap": STRIKE_LIMIT}))
+ac_one = AA("amend_cap", "Allow one more amendment cycle", esc=E_AC, amend_counts={"gate1": 9}, cap_continues={})
+check("amend_cap: continue recommended the first time and until STRIKE_LIMIT continues past the cap, then nothing recommended",
+      _cap_offer(ac_first.get("escalation")) == ("Allow one more amendment cycle", ["Allow one more amendment cycle"])
+      and _cap_offer(ac_spent.get("escalation")) == ("Allow one more amendment cycle", [])
+      and _lib.as_dict(ac_one.get("cap_continues")).get("amend_cap") == 1,
+      (_cap_offer(ac_first.get("escalation")), _cap_offer(ac_spent.get("escalation")), ac_one.get("cap_continues")))
+g2_spent = gates.gate2_route(base_state(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT,
+                                        cap_continues={"gate2_stuck": STRIKE_LIMIT}))
+g2_one = AA("gate2_stuck", "Another fix round (state reason)", esc=E_G2, gate2_result="PLAN_REVIEW: REJECT\n1. x",
+            oracle_rejects=STRIKE_LIMIT + 1, cap_continues={})
+check("gate2_stuck: continue recommended until STRIKE_LIMIT continues past the cap, then nothing recommended",
+      _cap_offer(E_G2) == ("Another fix round (state reason)", ["Another fix round (state reason)"])
+      and _cap_offer(g2_spent.get("escalation")) == ("Another fix round (state reason)", [])
+      and _lib.as_dict(g2_one.get("cap_continues")).get("gate2_stuck") == 1,
+      (_cap_offer(g2_spent.get("escalation")), g2_one.get("cap_continues")))
+
+
+def _headless_past_ceiling():
+    s = base_state(gate2_result="PLAN_REVIEW: REJECT\n1. x", oracle_rejects=STRIKE_LIMIT, cap_continues={"gate2_stuck": STRIKE_LIMIT})
+    s.update(gates.gate2_route(s))
+    nodes = {"interpret_reply": gates.interpret_route, "apply_answer": gates.apply_answer}
+    path = []
+    for _ in range(80):
+        if s["_next"].startswith("end_"):
+            break
+        if s["_next"] not in nodes:
+            s["last_answer_text"] = HG
+        u = nodes.get(s["_next"], gates.parse_answer)(s)
+        s.update(u)
+        path.append(s["_next"])
+    return (s["_next"] == "end_blocked" and s.get("gate2_verdict") != "OKAY" and "gate2_stuck" in s.get("failure_reason", "")
+            and "no reply picked an option" in s.get("failure_reason", "")), (path[-6:], s.get("failure_reason"))
+
+
+guarded("parse_answer -> apply_answer: a headless reply past the ceiling that names no option ends blocked, never loops or promotes",
+        _headless_past_ceiling)
+
+ECHO_ONLY = "Return PLAN_REVIEW: OKAY or REJECT with line-referenced complaints.\n1. line 3 is wrong\n"
+u_echo_only = gates.gate2_route(base_state(gate2_result=ECHO_ONLY, oracle_rejects=0))
+u_lower = gates.gate2_route(base_state(gate2_result="1. line 3 is wrong\nplan_review: reject\n", oracle_rejects=0))
+check("gate2_route: a reply whose only PLAN_REVIEW text is the echoed prompt is a fault retry; a lower-case verdict still counts",
+      (u_echo_only.get("escalation") or {}).get("kind") == "gate_fault" and "oracle_rejects" not in u_echo_only
+      and u_lower.get("gate2_verdict") == "REJECT" and u_lower["_next"] == "amend_plan",
+      (u_echo_only["_next"], (u_echo_only.get("escalation") or {}).get("kind"), u_lower["_next"]))
+
+STOP_KINDS = {
+    "tasks_stuck": [option("Retry the failed blocker"), option("Skip the blocked tasks and finish (follow-ups)"),
+                    option("Stop and report", recommended=True)],
+    "batch_strikeout": [option("Stop and report", recommended=True), option("One more batch round anyway"),
+                        option("Accept the batch unresolved (recorded)")],
+    "integration_conflict": [option("Stop and report", recommended=True), option("One more rebase cycle"),
+                             option("Abort this task (branch kept)")],
+    "integration_red": [option("Stop and report", recommended=True), option("One more fix round anyway")],
+    "task_failed": [option("Retry with the oracle's direction (one round)", recommended=True),
+                    option("Re-scope: amend the plan/task (type the amendment)"), option("Abort this task and stop")],
+    "review_round_cap": [option("Resume with one more fix round"), option("Stop watching and report", recommended=True)],
+    "amend_cap": AMEND_CAP_NEW,
+}
+stop_ctx = dict(current_task=T1, tasks=tasks_with(), current_batch="B1", pr_number=7, amend_counts={"gate1": 9})
+stop_ = {}
+for k, opts in STOP_KINDS.items():
+    e = escalation(k, "q", opts, data={"source": "gate1", "over": ["source"]} if k == "amend_cap" else None)
+    for reply in ("don't stop, one more round", "hmm"):
+        v = AA(k, reply, esc=e, **copy.deepcopy(stop_ctx))
+        stop_[(k, reply)] = (v["_next"], (v.get("escalation") or {}).get("kind"))
+check("apply_answer: 'don't stop' is no stop and a reply that picks no option asks again, for every cap that offers a stop",
+      all(v == ("escalate_gate", k) for (k, _), v in stop_.items()), {k: v for k, v in stop_.items() if v != ("escalate_gate", k[0])})
+picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]), **copy.deepcopy(stop_ctx))["_next"],
+          "batch_strikeout": AA("batch_strikeout", "One more batch round anyway",
+                                esc=escalation("batch_strikeout", "q", STOP_KINDS["batch_strikeout"]), **copy.deepcopy(stop_ctx))["_next"],
+          "integration_red": AA("integration_red", "2", esc=escalation("integration_red", "q", STOP_KINDS["integration_red"]),
+                                **copy.deepcopy(stop_ctx))["_next"],
+          "integration_conflict abort": AA("integration_conflict", "Abort this task (branch kept)",
+                                           esc=escalation("integration_conflict", "q", STOP_KINDS["integration_conflict"]),
+                                           **copy.deepcopy(stop_ctx))["_next"],
+          "task_failed rescope": AA("task_failed", "Re-scope: split the parser out",
+                                    esc=escalation("task_failed", "q", STOP_KINDS["task_failed"]), **copy.deepcopy(stop_ctx))["_next"],
+          "task_failed abort": AA("task_failed", "3", esc=escalation("task_failed", "q", STOP_KINDS["task_failed"]),
+                                  **copy.deepcopy(stop_ctx))["_next"],
+          "tasks_stuck stop": AA("tasks_stuck", "Stop and report", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]),
+                                 **copy.deepcopy(stop_ctx))["_next"]}
+check("apply_answer: the caps that offer a stop still act on an explicit pick of each option",
+      picks_ == {"tasks_stuck": "select_tasks", "batch_strikeout": "batch_fix_route", "integration_red": "integration_check",
+                 "integration_conflict abort": "wave_cleanup", "task_failed rescope": "amend_plan", "task_failed abort": "end_aborted",
+                 "tasks_stuck stop": "end_blocked"}, picks_)
+
+REBUTTAL = "the empty-list test exists at tests/list_test.go:14"
+s_rb = base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, delegate_result=FIX_REPORT, delegation_kind="fix",
+                  fix_source="review", fix_return_to="verify", run_dir=RD_FIX, rejected_findings=[], fix_rebuttals=[])
+s_rb.update(gates.route_delegate(s_rb))
+s_rb["round_log"] = {T1: [{"round": 1, "head": "h"}]}
+gp_rb = gates.verify_gate(s_rb)["gauntlet_prompt"]
+check("route_delegate -> verify_gate: a fix round's rebuttals are claims to verify, shown apart and kept out of the settled decisions",
+      REBUTTAL not in _lib.as_list(s_rb.get("rejected_findings")) and _lib.as_list(s_rb.get("fix_rebuttals")) == [REBUTTAL]
+      and "Rebuttals from the fix round (claims to verify against the diff, not settled decisions):\n- " + REBUTTAL in gp_rb,
+      (s_rb.get("rejected_findings"), s_rb.get("fix_rebuttals"), gp_rb[-400:]))
 
 # ---------------------------------------------------------------- Phase F
 ts_f = tasks_with(**{T1: "complete", T2: "complete", T3: "complete"})
