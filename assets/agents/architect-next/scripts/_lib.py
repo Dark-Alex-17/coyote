@@ -375,6 +375,16 @@ def snapshot(state, updates, phase):
     write_artifact(run_dir, "state.json", json.dumps(snap, indent=1, default=str))
 
 
+def read_snapshot(run_dir):
+    """The run's last snapshot (<run_dir>/state.json); {} when there is none or it is not UTF-8 JSON."""
+    if not (isinstance(run_dir, str) and run_dir):
+        return {}
+    try:
+        return as_dict(read_artifact(run_dir, "state.json"))
+    except ValueError:
+        return {}
+
+
 def ledger(state, updates, line):
     """One durable decision/ledger line: decisions.md on disk + the `decisions` list."""
     run_dir = (updates.get("run_dir") or state.get("run_dir") or "")
@@ -855,6 +865,98 @@ def new_task(state, slug, title, body, blocked_by=(), task_type="chore", batch="
         with open(idx, "a", encoding="utf-8") as f:
             f.write(("\n" if not read_file(idx).endswith("\n") else "") + body.rstrip("\n") + "\n")
     return tid, tdir
+
+
+# ---------------------------------------------------------------- state heal
+HEAL_PATH_KEYS = ("run_dir", "code_repo_path", "plans_root", "tasks_root", "plan_path", "design_doc_path", "reference_root_path",
+                  "seed_path", "draft_path")
+# The path keys a gate cannot run without. Any other path key is optional configuration whose absence means
+# something (no planning root declared, no design doc), so it is healed only when present with a wrong value.
+HEAL_ABSENT_PATH_KEYS = ("run_dir", "code_repo_path", "tasks_root", "plan_path")
+HEAL_PATH_VARS = {"code_repo_path": CODE_VAR, "plans_root": PLANNING_VAR, "design_doc_path": "design_doc"}
+# The keys whose empty value would send a gate somewhere wrong (git in the current directory, a run with no tasks
+# left), so a present but wrong value with nothing to heal it from stays as it is and is reported with this source.
+UNRECOVERABLE_KEYS = ("run_dir", "code_repo_path", "tasks")
+UNRECOVERABLE = "unrecoverable"
+
+
+def _task_list(v):
+    """v as a list of task dicts, or None when it is not one."""
+    if not isinstance(v, (list, str)):
+        return None
+    tasks = as_list(v)
+    return tasks if all(isinstance(t, dict) for t in tasks) else None
+
+
+def _path_sources(state, snap, key):
+    if key == "run_dir":
+        run_id = state.get("run_id")
+        if isinstance(run_id, str) and run_id and os.path.isdir(run_dir_for(run_id)):
+            yield "run_id", run_dir_for(run_id)
+    if key == "tasks_root" and isinstance(state.get("plans_root"), str) and state["plans_root"]:
+        yield "plans_root", os.path.join(state["plans_root"], "tasks")
+    yield "state.json", snap.get(key)
+    name = HEAL_PATH_VARS.get(key, key)
+    v = var(state, name)
+    if isinstance(v, str) and os.path.isabs(os.path.expanduser(v)):
+        yield f"variable {name}", os.path.expanduser(v)
+
+
+def _heal_path(healed, notes, snap, key):
+    if (key in healed and isinstance(healed[key], str)) or (key not in healed and key not in HEAL_ABSENT_PATH_KEYS):
+        return
+    found = next(((src, v) for src, v in _path_sources(healed, snap, key) if isinstance(v, str) and v), None)
+    if not found and key in healed and key in UNRECOVERABLE_KEYS:
+        notes.append((key, UNRECOVERABLE))
+    elif not found and key in healed:
+        found = ("empty", "")
+    if found:
+        healed[key] = found[1]
+        notes.append((key, found[0]))
+
+
+def heal_state(state):
+    """Repair the state keys a gate cannot run without: (healed state, [(key, source)]).
+
+    A key is repaired only when it is wrong: a path key that is not a string, or missing when it is one of
+    HEAL_ABSENT_PATH_KEYS; `tasks` that is missing or not a list of task dicts; `current_task` that is missing or not a
+    string. A valid value is never replaced. A present but wrong value with no source left becomes the initial-state
+    value, except for UNRECOVERABLE_KEYS: that value is kept and reported with source UNRECOVERABLE. A missing one
+    stays missing. A `current_task` with no saved value is reported with source None and left for the gate to handle.
+    A state with no run yet (no run id and no run dir) is returned unchanged.
+    """
+    if not any(isinstance(state.get(k), str) and state.get(k) for k in ("run_id", "run_dir")):
+        return state, []
+    healed, notes = dict(state), []
+    _heal_path(healed, notes, {}, "run_dir")
+    snap = read_snapshot(healed.get("run_dir"))
+    for key in HEAL_PATH_KEYS[1:]:
+        _heal_path(healed, notes, snap, key)
+    if _task_list(healed.get("tasks")) is None:
+        run_dir = healed.get("run_dir")
+        try:
+            raw = read_artifact(run_dir, "tasks.json") if isinstance(run_dir, str) and run_dir else ""
+            saved = _task_list(json.loads(raw)) if raw else None
+        except ValueError:
+            saved = None
+        if saved is not None:
+            healed["tasks"], src = saved, "tasks.json"
+        elif stored := load_tasks(healed):
+            healed["tasks"], src = stored, "the task files"
+        elif "tasks" in healed:
+            src = UNRECOVERABLE
+        else:
+            src = None
+        if src:
+            notes.append(("tasks", src))
+    if not isinstance(healed.get("current_task"), str):
+        saved = snap.get("current_task")
+        if isinstance(saved, str) and saved:
+            healed["current_task"] = saved
+            notes.append(("current_task", "state.json"))
+        else:
+            notes.append(("current_task", None))
+    return healed, notes
 
 
 def commit_planning(state, message):

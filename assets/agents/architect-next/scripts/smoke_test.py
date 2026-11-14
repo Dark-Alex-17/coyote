@@ -114,10 +114,10 @@ CODE = os.path.join(TMP, "code")
 CODE_BASE = make_repo(CODE, {"README.md": "# demo\n", "CLAUDE.md": "Run `go test ./...` before committing.\n",
                              "src/a.go": "package a\n", "src/b.go": "package b\n", "api/h.go": "package api\n"})
 
-from _fixture import CLOSE_COMMIT_MARKER, HAS_OWNER_FILE, OWNER, Store  # noqa: E402
+from _fixture import CLOSE_COMMIT_MARKER, HAS_OWNER_FILE, OWNER, PlanningFixture  # noqa: E402
 
-STORE = Store(TMP, CODE)
-PLANS = STORE.root
+FIXTURE = PlanningFixture(TMP, CODE)
+PLANS = FIXTURE.root
 
 # The REAL prose-architect tools.sh through a scratch LLM_ROOT_DIR (copies only; never symlinks).
 ROOT = os.path.join(TMP, "coyote")
@@ -139,7 +139,7 @@ os.environ["PATH"] = GHBIN + os.pathsep + os.environ["PATH"]
 DESIGN = os.path.join(TMP, "design.md")
 write(DESIGN, "# Widget service\n\nAdd a widget endpoint and a worker.\n")
 
-PLAN = STORE.plan_path
+PLAN = FIXTURE.plan_path
 PLAN_TEXT = """---
 title: Widgets
 slug: widgets
@@ -176,9 +176,9 @@ write(PLAN, PLAN_TEXT)
 
 
 def base_state(**over):
-    s = STORE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
+    s = FIXTURE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
                         task_granularity="standard", auto_confirm="1")
-    s.update(STORE.normalized())
+    s.update(FIXTURE.normalized())
     s.update({"code_repo_path": CODE, "git_root": CODE, "reference_root_path": TMP, "design_doc_path": DESIGN,
               "run_id": "x", "run_dir": os.path.join(os.environ["ARCHITECT_RUNS_ROOT"], "x"), "decisions": [], "anomalies": [],
               "anomalies_log": [], "plan_path": PLAN, "plan_slug": "widgets", "mode_line": "m", "tasks": [], "task_rounds": {},
@@ -235,24 +235,24 @@ check("RESUME_RE: matches a suffixed run id whole and still the plain form",
 
 
 # ---------------------------------------------------------------- intake / re-entry (A2)
-st = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **STORE.variables(DESIGN, TMP, owner="someone", pr_strategy="single")})
+st = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **FIXTURE.variables(DESIGN, TMP, owner="someone", pr_strategy="single")})
 check("intake: run dir + brief + mode line + normalized paths", st["_next"] == "orient_read" and os.path.isdir(st["run_dir"])
-      and st["code_repo_path"] == CODE and st["tasks_root"] == STORE.tasks_root and "pr_strategy=single" in st["mode_line"])
+      and st["code_repo_path"] == CODE and st["tasks_root"] == FIXTURE.tasks_root and "pr_strategy=single" in st["mode_line"])
 check("intake: design doc resolved from the prompt", st["design_doc_path"] == DESIGN)
 check("intake: owner identity file wins over the owner variable (ledgered)", (not HAS_OWNER_FILE) or (st["owner_name"] == OWNER and any("whoami" in d for d in st["decisions"])))
 check("intake: brief.md + state.json written", os.path.exists(os.path.join(st["run_dir"], "brief.md")) and os.path.exists(os.path.join(st["run_dir"], "state.json")))
 rid = st["run_id"]
-st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="triple")})
+st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="triple")})
 check("intake: unknown mode value -> escalation mode_invalid (fail-safe, never a default)", st_bad["_next"] == "escalate_gate" and st_bad["escalation"]["kind"] == "mode_invalid")
-st_nd = gates.intake({"initial_prompt": "implement the thing", **STORE.variables("", TMP)})
+st_nd = gates.intake({"initial_prompt": "implement the thing", **FIXTURE.variables("", TMP)})
 check("intake draft: no design doc, no seed, a message -> draft_brief with the draft counters reset, no escalation",
       st_nd["_next"] == "draft_brief" and st_nd["draft_rounds"] == 0 and st_nd["draft_feedback"] == "" and st_nd["draft_text"] == ""
       and "escalation" not in st_nd and any(d.startswith("draft: no design doc and no ready seed") for d in st_nd["decisions"]), st_nd.get("_next"))
 check("intake draft: a first draft starts with the drafting node's output keys cleared",
       all(st_nd.get(k) == v for k, v in gates._DRAFT_OUTPUT_RESET.items()), st_nd)
-u = gates.intake({"initial_prompt": "", "previous_turns": "user: add a --dry-run flag to the sync command", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "", "previous_turns": "user: add a --dry-run flag to the sync command", **FIXTURE.variables("", TMP)})
 check("intake draft: a blank message with earlier turns still drafts", u["_next"] == "draft_brief", u.get("_next"))
-u = gates.intake({"initial_prompt": "  ", "previous_turns": " \n", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "  ", "previous_turns": " \n", **FIXTURE.variables("", TMP)})
 check("intake draft: a blank message and blank earlier turns -> escalation need_design_doc, nothing drafted",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "draft_rounds" not in u, u.get("_next"))
 SEED_DIR = os.path.join(PLANS, "engineer-handoffs")
@@ -273,15 +273,15 @@ def seed_status(path):
 seed("other.md", "2030-01-01T00:00:00Z", project=os.path.join(TMP, "elsewhere"))
 seed("used.md", "2030-01-02T00:00:00Z", status="consumed")
 seed("bare.md", "", fm=False)
-u = gates.intake({"initial_prompt": "implement the thing", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "implement the thing", **FIXTURE.variables("", TMP)})
 check("intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path"), u.get("seed_path"))
 SEED_OLD = seed("old.md", "2026-01-01T00:00:00Z")
 SEED = seed("new.md", "2026-02-01T00:00:00Z")
-u = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **STORE.variables(DESIGN, TMP)})
+u = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **FIXTURE.variables(DESIGN, TMP)})
 check("intake seed: an explicit design doc wins over a ready seed, seed untouched",
       u["_next"] == "orient_read" and u["design_doc_path"] == DESIGN and not u.get("seed_path") and seed_status(SEED) == "ready")
-st_seed = gates.intake({"initial_prompt": "okay, go ahead and get started", **STORE.variables("", TMP)})
+st_seed = gates.intake({"initial_prompt": "okay, go ahead and get started", **FIXTURE.variables("", TMP)})
 check("intake seed: no doc path + two ready seeds -> hard-trigger seed_confirm escalation on the newest, not yet consumed",
       st_seed["_next"] == "escalate_gate" and st_seed["escalation"]["kind"] == "seed_confirm" and st_seed["escalation"]["hard_trigger"] is True
       and st_seed["seed_path"] == SEED
@@ -292,7 +292,7 @@ os.remove(SEED_OLD)
 _groups = gates.MULTI_IS_GROUPS
 gates.MULTI_IS_GROUPS = False
 try:
-    u = gates.intake({"initial_prompt": "do it", **STORE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
+    u = gates.intake({"initial_prompt": "do it", **FIXTURE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
 finally:
     gates.MULTI_IS_GROUPS = _groups
 check("intake seed: the review-watch follow-up is recorded once before the seed_confirm escalation",
@@ -348,27 +348,27 @@ gates.research_dispatch(base_state(design_doc_path=SEED, run_id="other-run", exp
 check("research_dispatch: a non-seed design doc is untouched and an already consumed seed keeps its consumer",
       read_file(NOT_SEED) == _not_seed_before and gates.frontmatter(read_file(SEED))[0] == fm_seed, gates.frontmatter(read_file(SEED))[0])
 os.remove(NOT_SEED)
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: a consumed seed is not picked again -> drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path"), u.get("seed_path"))
 SEED_EXPLICIT = seed("explicit.md", "2026-02-15T00:00:00Z")
-u = gates.intake({"initial_prompt": f"Implement the design at {SEED_EXPLICIT}", **STORE.variables(SEED_EXPLICIT, TMP)})
+u = gates.intake({"initial_prompt": f"Implement the design at {SEED_EXPLICIT}", **FIXTURE.variables(SEED_EXPLICIT, TMP)})
 _explicit = [u["_next"], u.get("design_doc_path")]
 gates.research_dispatch(base_state(design_doc_path=u.get("design_doc_path") or "", run_id=u["run_id"], explore_slices=["a"]))
 _explicit.append(seed_status(SEED_EXPLICIT))
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: an explicit path to a ready seed -> consumed at research_dispatch -> a later go-ahead drafts instead",
       _explicit == ["orient_read", SEED_EXPLICIT, "consumed"] and u["_next"] == "draft_brief" and not u.get("seed_path"), (_explicit, u.get("_next")))
 SEED_SISYPHUS = seed("sisyphus.md", "2026-02-20T00:00:00Z", vehicle="sisyphus")
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: vehicle sisyphus -> not a seed, drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path") and seed_status(SEED_SISYPHUS) == "ready", u.get("seed_path"))
 SEED_NO_VEHICLE = seed("no-vehicle.md", "2026-02-10T00:00:00Z")
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: no vehicle key -> treated as architect, offered",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "seed_confirm" and u.get("seed_path") == SEED_NO_VEHICLE, u.get("seed_path"))
 seed("late.md", "2026-03-01T00:00:00Z")
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables(os.path.join(TMP, "missing-design.md"), TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables(os.path.join(TMP, "missing-design.md"), TMP)})
 check("intake draft: an explicit unreadable doc path with a ready seed present -> need_design_doc, unchanged question, no seed, no draft",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc"
       and u["escalation"]["question"] == gates._need_design_doc_escalation()["question"] and not u.get("seed_path") and "draft_rounds" not in u,
@@ -439,7 +439,7 @@ os.remove(DRAFT_PATH)
 u = gates.apply_answer(base_state(escalation=E_DRAFT, last_answer="Use this draft", draft_rounds=0))
 check("apply_answer: draft_confirm use with the draft file gone -> need_design_doc",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "design_doc_path" not in u, u)
-s = {"initial_prompt": "add a --dry-run flag to the sync command", **STORE.variables("", TMP)}
+s = {"initial_prompt": "add a --dry-run flag to the sync command", **FIXTURE.variables("", TMP)}
 s.update(gates.intake(s))
 chain = [s["_next"]]
 s.update({"draft_possible": True, "draft_title": "Dry run for sync", "draft_markdown": DRAFT_MD, "draft_reason": "", "anomalies": []})
@@ -453,10 +453,10 @@ check("chain: intake (no doc) -> draft_route -> apply_answer use -> orient_read 
       and os.path.isfile(s["design_doc_path"]), (chain, s.get("design_doc_path")))
 write(os.path.join(st["run_dir"], "tasks.json"), json.dumps([{"id": "TASK-101", "status": "complete"}]))
 gates.snapshot(st, {"sealed": True, "gate2_verdict": "OKAY", "plan_path": PLAN}, "task TASK-101 done")
-st2 = gates.intake({"initial_prompt": f"Fix these CI failures: X\nArchitect run id: {rid}", **STORE.variables(DESIGN, TMP)})
+st2 = gates.intake({"initial_prompt": f"Fix these CI failures: X\nArchitect run id: {rid}", **FIXTURE.variables(DESIGN, TMP)})
 check("intake: re-entry loads the prior run state + tasks.json (A2)", st2["_next"] == "resume_route" and st2["run_id"] == rid and st2["resume_mode"] is True
       and st2["tasks"] and st2["tasks"][0]["id"] == "TASK-101" and st2["sealed"] is True)
-st3 = gates.intake({"initial_prompt": f"go {DESIGN}\nArchitect run id: 20200101T000000-deadbeef", **STORE.variables(DESIGN, TMP)})
+st3 = gates.intake({"initial_prompt": f"go {DESIGN}\nArchitect run id: 20200101T000000-deadbeef", **FIXTURE.variables(DESIGN, TMP)})
 check("intake: unknown run id -> fresh run, declared", not st3.get("resume_mode") and "no durable state" in st3["resume_note"])
 for phase, parked, exp in [("task TASK-101 done", "", "select_tasks"), ("phase_f", "", "phase_f_gate"), ("sealed", "", "reseal_gate"), ("x", "design_round", "escalate_gate"),
                            ("choice_discussion", "choice_discussion", "choice_resume")]:
@@ -658,12 +658,57 @@ u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findin
 check("checklist_round: no items -> reseal_gate (declared)", u["_next"] == "reseal_gate")
 
 # ---------------------------------------------------------------- reseal (B2 / A1) / gates (B3, B5, B23)
-u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_cycles=0, plan_revision="old"))
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_cycles=0, plan_revision="old", quality_recorded=True))
 check("reseal_gate: amendment counts a cycle; plan unsealed + unreviewed; -> gate1_build", u["_next"] == "gate1_build" and u["amend_cycles"] == 1 and u["sealed"] is False and u["gate2_verdict"] == "")
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_cycles=AMEND_CYCLES_MAX))
 check("reseal_gate: B2 A1 cap -> escalation amend_cap (hard trigger)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap" and u["escalation"]["hard_trigger"])
-u = gates.reseal_gate(base_state(pending_amendments=[], amend_cycles=AMEND_CYCLES_MAX))
+u = gates.reseal_gate(base_state(pending_amendments=[], amend_cycles=AMEND_CYCLES_MAX, quality_recorded=True))
 check("reseal_gate: no amendment pending -> no cycle counted", "amend_cycles" not in u and u["_next"] == "gate1_build")
+u = gates.reseal_gate(base_state(pending_amendments=["design answers"], amend_source="design", amend_counts={}, amend_cycles=0,
+                                 quality_recorded=False))
+check("reseal_gate: a design-round amendment with no quality bar recorded -> quality_bar_gate, not Gate 1",
+      u["_next"] == "quality_bar_gate" and u["amend_cycles"] == 1 and u["sealed"] is False, u.get("_next"))
+u = gates.reseal_gate(base_state(pending_amendments=["design answers"], amend_source="design", amend_counts={}, amend_cycles=0,
+                                 quality_recorded=True))
+check("reseal_gate: a design-round amendment with the quality bar recorded -> gate1_build", u["_next"] == "gate1_build", u.get("_next"))
+u = gates.reseal_gate(base_state(pending_amendments=["leak answers"], amend_source="gate1", amend_counts={}, amend_cycles=0,
+                                 quality_recorded=True))
+check("reseal_gate: a mid-run amendment of a plan whose quality bar is recorded -> gate1_build", u["_next"] == "gate1_build", u.get("_next"))
+u = gates.reseal_gate(base_state(pending_amendments=["design answers"], amend_source="design",
+                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX}, amend_cycles=0, quality_recorded=False))
+check("reseal_gate: a design amendment past its cap with no quality bar -> amend_cap as before",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap", u.get("_next"))
+
+
+def _design_answers_to_gate1():
+    s = base_state(choice_kind="design_round", choice_queue=[{"question": "Which layout?", "options": []}], choice_index=1,
+                   choice_answers=[{"question": "Which layout?", "answer": "flat", "via": "option"}], design_rounds=1,
+                   open_questions=[], quality_recorded=False, quality_rigor="", quality_surfaces=None, rigor_proposal="production",
+                   surfaces_proposal="http", amend_counts={}, amend_cycles=0, pending_amendments=[], checklist_done=[])
+    s.update(gates.open_questions_gate(s))
+    nodes = {"open_questions_gate": gates.open_questions_gate, "reseal_gate": gates.reseal_gate,
+             "quality_bar_gate": gates.quality_bar_gate, "record_quality_bar": gates.record_quality_bar,
+             "checklist_gate": gates.checklist_gate, "apply_answer": gates.apply_answer}
+    path = [s["_next"]]
+    for _ in range(20):
+        if s["_next"] == "gate1_build" or s["_next"].startswith("end_"):
+            break
+        if s["_next"] == "amend_plan":
+            s["_next"] = "reseal_gate"
+            continue
+        if s["_next"] == "escalate_gate":
+            s["last_answer"] = next(o["text"] for o in s["escalation"]["options"] if o["recommended"])
+            s["_next"] = "apply_answer"
+        s.update(nodes[s["_next"]](s))
+        path.append(s["_next"])
+    after = gates.reseal_gate({**s, "pending_amendments": ["leak answers"], "amend_source": "gate1"})["_next"]
+    return (path[-1] == "gate1_build" and path.count("gate1_build") == 1 and "record_quality_bar" in path
+            and path.index("checklist_gate") < path.index("gate1_build") and s.get("quality_recorded") is True
+            and after == "gate1_build"), (path, after)
+
+
+guarded("design-round answers -> amend_plan -> reseal_gate -> quality bar -> checklist -> reseal_gate -> gate1_build once",
+        _design_answers_to_gate1)
 u = gates.gate1_build(base_state(task_granularity="micro", gate1_result="PLAN_GATE: LEAKY\n- q1?"))
 check("gate1_build: micro addendum + prior verdict", "Micro-grain addendum" in u["gate1_prompt"] and "Prior verdict" in u["gate1_prompt"])
 u = gates.gate1_build(base_state())
@@ -682,6 +727,20 @@ u = gates.gate1_route(base_state(gate1_result="PLAN_GATE: LEAKY\n- A different q
 check("gate1_route: LEAKY on different questions -> answer_leaks again", u["_next"] == "answer_leaks")
 u = gates.gate1_route(base_state(gate1_result="Agent node failed: timeout"))
 check("gate1_route: agent fault -> escalation gate_fault (never a verdict)", u["escalation"]["kind"] == "gate_fault")
+u = gates.gate1_route(base_state(gate1_result="I will end with PLAN_GATE: SEALED if every question is answered.\n"
+                                              "- Where does the infra code go?\nPLAN_GATE: LEAKY\n"
+                                              "(verdict format: PLAN_GATE: SEALED | LEAKY | FRICTION)"))
+check("gate1_route: a sentinel quoted early and a prompt echo naming every verdict after the real one -> the real verdict, LEAKY",
+      u.get("_next") == "answer_leaks" and u.get("gate1_verdict") == "LEAKY", (u.get("_next"), u.get("gate1_verdict")))
+u = gates.gate1_route(base_state(gate1_result="All questions are answered inline.\n\n**PLAN_GATE:** `SEALED`"))
+check("gate1_route: a bold sentinel with a backticked verdict -> SEALED", u.get("_next") == "gate2_build" and u.get("sealed") is True,
+      u.get("_next"))
+u = gates.gate1_route(base_state(gate1_result="The PLAN_GATE verdict could not be reached.\n- Where does the infra code go?"))
+check("gate1_route: no PLAN_GATE verdict line -> gate_fault, never a LEAKY default",
+      u.get("_next") == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "gate_fault", u.get("_next"))
+u = gates.gate1_route(base_state(gate1_result="PLAN_GATE: SEALED\nNo FRICTION findings worth noting."))
+check("gate1_route: FRICTION named outside the verdict line of a SEALED verdict -> sealed with no friction note",
+      u.get("_next") == "gate2_build" and not any("FRICTION-only" in d for d in u.get("decisions", [])), u.get("decisions"))
 u = gates.leak_route(base_state(leak_answers=[{"question": "infra?", "answer": "infra/ per CLAUDE.md:12"}], leak_unanswerable=[]))
 check("leak_route: answers -> amend_plan with pending amendments", u["_next"] == "amend_plan" and u["pending_amendments"] and "infra/" in u["pending_amendments"][0])
 LEAK_Q = {"question": "priority of X vs Y?", "options": [{"text": "X first"}, {"text": "Y first", "recommended": True, "evidence": "the verdict"}]}
@@ -791,7 +850,7 @@ check("reseal_gate: a source past its own budget -> amend_cap naming that source
       and u["escalation"]["data"] == {"source": "design", "over": ["source"]}
       and "design-round" in u["escalation"]["question"], u.get("escalation"))
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_cycles=_lib.AMEND_DESIGN_MAX + _lib.AMEND_GATE1_MAX,
-                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}))
+                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}, quality_recorded=True))
 check("reseal_gate: spent design and Gate 1 budgets leave the Gate 2 budget whole -> gate1_build, gate2 cycle 1",
       u["_next"] == "gate1_build" and u["amend_counts"]["gate2"] == 1 and u["amend_source"] == "", u)
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="", amend_counts={}))
@@ -802,7 +861,7 @@ check("reseal_gate: past the overall ceiling alone -> amend_cap naming the ceili
       and "rework" not in u["escalation"]["question"].split("ceiling")[0], u.get("escalation"))
 AMEND_CAP_OPTS = [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)]
 u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "gate1", "over": ["source"]}),
-                                  last_answer="Allow one more amendment cycle", amend_cycles=9,
+                                  last_answer="Allow one more amendment cycle", amend_cycles=9, quality_recorded=True,
                                   amend_counts={"gate1": _lib.AMEND_GATE1_MAX + 1, "design": 2}))
 check("apply_answer: amend_cap allow on a source budget -> one more cycle of that source, others and the total untouched",
       u["_next"] == "gate1_build" and u["amend_counts"] == {"gate1": _lib.AMEND_GATE1_MAX - 1, "design": 2}
@@ -944,17 +1003,17 @@ check("promote_verify: no promoted PLAN / no tasks -> one retry (B6 side 1)", u[
 u = gates.promote_verify(base_state(promote_retries=RERUN_ONCE))
 check("promote_verify: B6 exhausted -> escalation promote_failed", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed")
 # Simulate promote_tasks: PLAN + three tasks through bin/new-task.
-PROMOTED = STORE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
+PROMOTED = FIXTURE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
 ids = []
 for slug, files, blocked in [("widget-model", "src/a.go", ""), ("widget-endpoint", "api/h.go", "{0}"), ("widget-worker", "src/b.go", "")]:
-    tid, d = STORE.new_task(gates, slug, files=files, blocked=blocked.format(*ids) if blocked else "", surfaces="http" if "endpoint" in slug else "")
+    tid, d = FIXTURE.new_task(gates, slug, files=files, blocked=blocked.format(*ids) if blocked else "", surfaces="http" if "endpoint" in slug else "")
     ids.append(tid)
 T1, T2, T3 = ids
-u = gates.promote_verify(base_state(promote_retries=0, promote_report=STORE.promote_report() + "\nANOMALY: plan mentions a file that does not exist"))
+u = gates.promote_verify(base_state(promote_retries=0, promote_report=FIXTURE.promote_report() + "\nANOMALY: plan mentions a file that does not exist"))
 check("promote_verify: tasks found; plan_path -> promoted PLAN; tasks.json written; planning commit ran; A10 line harvested",
       u["_next"] == "branch_setup" and u.get("plan_path", PLAN) == PROMOTED and len(u["tasks"]) == 3 and u["tasks"][1]["blocked_by"] == [T1]
       and os.path.exists(os.path.join(base_state()["run_dir"], "tasks.json")) and any("plan mentions" in a for a in u["anomalies_log"])
-      and "promote" in STORE.last_commit())
+      and "promote" in FIXTURE.last_commit())
 TASKS = u["tasks"]
 for t in TASKS:
     t["unit"] = "run"
@@ -1113,7 +1172,7 @@ ts = tasks_with()
 u = gates.claim_task(base_state(plan_path=PROMOTED, tasks=ts, current_task=T1, run_branch="feat/PLAN-widgets"))
 t1 = gates.task_by_id(u["tasks"], T1)
 check("claim_task: claimed in the task store, BASE SHA + PR base recorded, started entry logged",
-      u["_next"] == "compose_delegation" and STORE.claimed(T1) and t1["base_sha"] and t1["pr_base"] == "feat/PLAN-widgets"
+      u["_next"] == "compose_delegation" and FIXTURE.claimed(T1) and t1["base_sha"] and t1["pr_base"] == "feat/PLAN-widgets"
       and "started:" in read_file(os.path.join(t1["dir"], "log.md")) and t1["status"] == "in-progress")
 TS1 = u["tasks"]
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", delegation_kind="implement"))
@@ -1265,7 +1324,7 @@ check("relay: choice_park parks this run on the child's question -> end_discussi
 
 
 def relay_reenter(prompt):
-    r = {"initial_prompt": prompt, "discussion_run_id": RELAY_ID, **STORE.variables(DESIGN, TMP)}
+    r = {"initial_prompt": prompt, "discussion_run_id": RELAY_ID, **FIXTURE.variables(DESIGN, TMP)}
     for gate in (gates.intake, gates.resume_route, gates.choice_resume):
         r.update(gate(r))
     return r
@@ -1333,7 +1392,7 @@ check("verify_gate: standard -> gauntlet, forced adversary only (no consumer sur
       and f"Diff: {t1['base_sha']}..HEAD" in u["gauntlet_prompt"] and u["verification_commands_json"] == '["true"]' and u["round_log"][T1][0]["round"] == 1)
 ts_c = copy.deepcopy(TS1)
 # the debris lint of every conformance reviewer leaves out the planning files inside the git work tree
-# the fixture's planning store is CODE/plans (_fixture.Store), which is also the conventional plans/ directory
+# the fixture's planning root is CODE/plans (_fixture.PlanningFixture), which is also the conventional plans/ directory
 BARE_CODE = os.path.join(TMP, "code-no-plans")
 make_repo(BARE_CODE, {"README.md": "x\n"})
 
@@ -1516,6 +1575,50 @@ check("route_verdict: a USAGE_PROBE: INCONCLUSIVE quoted in a DIVERGES adversary
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
                                    adversary_result="ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met (all with tests).\n\nVerification runs:\nGAUNTLET: BLOCKED\n", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: on the adversary lane a CONFORMS report quoting GAUNTLET: BLOCKED -> post_round", u["last_verdict"] == "PASS" and u["_next"] == "post_round")
+GADVECHO = ("I end with ADVERSARIAL_REVIEW: CONFORMS only when every criterion holds.\nCriteria: 1/2 met.\nComplaints:\n"
+            "1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n\n**ADVERSARIAL_REVIEW: DIVERGES**\n")
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result=GADVECHO, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: ADVERSARIAL_REVIEW quoted early as CONFORMS and the real DIVERGES last -> BLOCKED, a fix round",
+      u.get("last_verdict") == "BLOCKED" and u.get("_next") == "compose_delegation", (u.get("last_verdict"), u.get("_next")))
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result="The ADVERSARIAL_REVIEW: verdict is pending.\n", round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: an adversary report naming the sentinel with no verdict word -> the missing-verdict path",
+      u["round_log"][T1][-1].get("incomplete") == ["pipeline"], u["round_log"][T1][-1])
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result=("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\nComplaints:\n1. the stub prints\n"
+                                                     "ADVERSARIAL_REVIEW: CONFORMS\n   when it should print nothing\n"),
+                                   round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: the adversary's first verdict line DIVERGES and a quoted CONFORMS line last -> BLOCKED, never PASS",
+      u.get("last_verdict") == "BLOCKED" and u.get("_next") == "compose_delegation", (u.get("last_verdict"), u.get("_next")))
+
+
+def _complaints(body):
+    return gates._parse_gauntlet("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/3 met.\nComplaints:\n" + body, adversary_lane=True)[3]
+
+
+check("_parse_gauntlet: an adversary complaint's continuation line is joined to it",
+      _complaints("1. criterion one fails\n   at api/h.go:10\n2. criterion two fails\n")
+      == ["criterion one fails at api/h.go:10", "criterion two fails"], _complaints("1. criterion one fails\n   at api/h.go:10\n2. criterion two fails\n"))
+check("_parse_gauntlet: a blank line inside an adversary complaint followed by more complaint text keeps that text",
+      _complaints("1. criterion one fails\n\nthe log shows exit 1\n2. criterion two fails\n\nNon-blocking observations:\n- naming\n")
+      == ["criterion one fails the log shows exit 1", "criterion two fails"],
+      _complaints("1. criterion one fails\n\nthe log shows exit 1\n2. criterion two fails\n\nNon-blocking observations:\n- naming\n"))
+check("_parse_gauntlet: a number inside complaint 1 that is not the next one stays in it; the real 2. splits",
+      _complaints("1. steps 1. and 2. both fail\n3. see the log\n2. criterion two fails\n")
+      == ["steps 1. and 2. both fail 3. see the log", "criterion two fails"], _complaints("1. steps 1. and 2. both fail\n3. see the log\n2. criterion two fails\n"))
+ADV_CRLF = "ADVERSARIAL_REVIEW: DIVERGES\r\nComplaints:\r\n1. criterion one\x0bfails\r\n   at api/h.go:10\r\n2. criterion two fails\r\n"
+check("_parse_gauntlet: a \\r\\n adversary report splits on \\n only; other line breaks inside a complaint fold to a space",
+      gates._parse_gauntlet(ADV_CRLF, adversary_lane=True)[3] == ["criterion one fails at api/h.go:10", "criterion two fails"],
+      gates._parse_gauntlet(ADV_CRLF, adversary_lane=True)[3])
+adv_sections = {s: _complaints(f"1. criterion one fails\n   at api/h.go:10\n\n{s}\n2. not a complaint\n")
+                for s in ("Non-blocking observations:", "Met criteria (evidence):", "Verification runs:")}
+check("_parse_gauntlet: a blank line then each section after the complaints ends them",
+      all(v == ["criterion one fails at api/h.go:10"] for v in adv_sections.values()), adv_sections)
+ADV_INDENT = "ADVERSARIAL_REVIEW: DIVERGES\n  Complaints:  \n1. criterion one fails\n2. criterion two fails\n"
+check("_parse_gauntlet: an indented Complaints: line still opens the adversary's complaints",
+      gates._parse_gauntlet(ADV_INDENT, adversary_lane=True)[3] == ["criterion one fails", "criterion two fails"],
+      gates._parse_gauntlet(ADV_INDENT, adversary_lane=True)[3])
 GINC = gauntlet_reply("BLOCKED", [("probe", "BLOCKED", "INCONCLUSIVE (environment)")],
                       blockers=["probe: INCONCLUSIVE - the ENVIRONMENT could not be established; this is not a code verdict"],
                       reports=[("probe", "USAGE_PROBE: INCONCLUSIVE")])
@@ -1640,9 +1743,9 @@ check("debt_assign: owner named -> criterion appended to the owner + debt-assign
 u = gates.task_done_verify(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, report_parsed=pr_, ledger_lines=["design-decision: introduced a WidgetStore interface in src/a.go"], task_done_report="edited\nANOMALY: week plan row missing"))
 t1d = gates.task_by_id(u["tasks"], T1)
 check("task_done_verify: completed entry appended by the script when missing; ledger line re-appended; task closed in the store; status complete; A10 harvested",
-      u["_next"] == "stack_gate" and t1d["status"] == "complete" and STORE.closed(T1) and os.path.isdir(t1d["dir"])
+      u["_next"] == "stack_gate" and t1d["status"] == "complete" and FIXTURE.closed(T1) and os.path.isdir(t1d["dir"])
       and "completed" in read_file(os.path.join(t1d["dir"], "log.md")) and "WidgetStore" in read_file(os.path.join(t1d["dir"], "log.md"))
-      and any("week plan" in a for a in u["anomalies_log"]) and CLOSE_COMMIT_MARKER in STORE.last_commit())
+      and any("week plan" in a for a in u["anomalies_log"]) and CLOSE_COMMIT_MARKER in FIXTURE.last_commit())
 TS_DONE1 = u["tasks"]
 u = gates.stack_gate(base_state(plan_path=PROMOTED, tasks=TS_DONE1))
 check("stack_gate: single -> task_done_route", u["_next"] == "task_done_route")
@@ -1745,6 +1848,7 @@ u = gates.wave_integrate(base_state(plan_path=PROMOTED, tasks=TS_W, wave_results
 check("wave_integrate: per-task-stack multi conforms -> PR already open -> harvest_report", MULTI_IS_GROUPS or (u["_next"] == "harvest_report" and gates.task_by_id(u["tasks"], T1)["pr_number"] == "42"))
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets", verification_commands='["true"]'))
 check("integration_test: merge --no-ff + suite green -> push + harvest_report", u["_next"] == "harvest_report" and "Widget()" in read_file(os.path.join(CODE, "src", "a.go")) and git(CODE, "rev-parse", "origin/feat/PLAN-widgets") == git(CODE, "rev-parse", "HEAD"))
+INTEGRATED = u["task_rounds"]
 write(os.path.join(CODE, "src", "b.go"), "package b // main side\n"); git(CODE, "add", "."); git(CODE, "commit", "-q", "-m", "run branch edit")
 wt1 = WAVE[1]["worktree"]
 write(os.path.join(wt1, "src", "b.go"), "package b // task side\n"); git(wt1, "add", "."); git(wt1, "commit", "-q", "-m", f"feat({T3}): worker")
@@ -1752,15 +1856,23 @@ u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integratio
 check("integration_test: merge conflict -> abort + rebase fix round (B15 side 1); tree clean", u["_next"] == "fix_round" and u["fix_request"]["source"] == "integration" and u["task_rounds"][T3]["conflict_cycles"] == 1 and git(CODE, "status", "--porcelain") == "")
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T3, run_branch="feat/PLAN-widgets", task_rounds={T3: {"conflict_cycles": CONFLICT_CYCLES_MAX}}))
 check("integration_test: B15 exhausted -> escalation integration_conflict", u["escalation"]["kind"] == "integration_conflict")
+E_IC = u["escalation"]
+E_IC_SPENT = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T3, run_branch="feat/PLAN-widgets",
+                                               task_rounds={T3: {"conflict_cycles": CONFLICT_CYCLES_MAX}},
+                                               cap_continues={f"integration_conflict:{T3}": STRIKE_LIMIT})).get("escalation")
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets", verification_commands='["false"]', task_rounds={T1: {"merged": True}}))
 check("integration_test: suite RED after merge -> fix round (B14 side 1)", u["_next"] == "fix_round" and u["task_rounds"][T1]["integration_strikes"] == 1)
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets", verification_commands='["false"]', task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}}))
 check("integration_test: B14 exhausted -> escalation integration_red", u["escalation"]["kind"] == "integration_red")
+E_IR = u["escalation"]
+E_IR_SPENT = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets",
+                                               verification_commands='["false"]', task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}},
+                                               cap_continues={f"integration_red:{T1}": STRIKE_LIMIT})).get("escalation")
 ts_cl = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl, T1).update({"status": "complete", "worktree": wt0, "branch": WAVE[0]["branch"]})
 git(CODE, "push", "-q", "origin", WAVE[0]["branch"])
-u = gates.wave_cleanup(base_state(plan_path=PROMOTED, tasks=ts_cl, current_task=T1, run_branch="feat/PLAN-widgets", wave_results=[]))
+u = gates.wave_cleanup(base_state(plan_path=PROMOTED, tasks=ts_cl, current_task=T1, run_branch="feat/PLAN-widgets", wave_results=[], task_rounds=INTEGRATED))
 check("wave_cleanup: single + merged -> worktree removed + task branch deleted (local + remote)", not os.path.isdir(wt0) and git(CODE, "branch", "--list", WAVE[0]["branch"]) == "" and u["_next"] == "select_tasks")
 ts_cl2 = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl2, T3).update({"status": "complete", "worktree": wt1, "branch": WAVE[1]["branch"]})
@@ -1780,6 +1892,9 @@ check("batch_fix_route: owned finding -> fix round queued (re-entry); cross-task
       and u["tasks"][-1]["batch"] == "B1" and u["tasks"][-1]["type"] == "chore" and u["batch_state"]["B1"]["strikes"] == 1)
 u = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[], batch_state={"B1": {"strikes": STRIKE_LIMIT}}))
 check("batch_fix_route: B16 3 strikes per batch -> escalation batch_strikeout", u["escalation"]["kind"] == "batch_strikeout")
+E_BS = u["escalation"]
+E_BS_SPENT = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[],
+                                              batch_state={"B1": {"strikes": STRIKE_LIMIT}}, cap_continues={"batch_strikeout:B1": STRIKE_LIMIT})).get("escalation")
 u = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[], batch_state={}, last_node_output="llm node failed"))
 check("batch_fix_route: dead triage -> everything routed to the batch's last task (fail-open)", u["pending_fixes"][0]["task"] == T2)
 u = gates.batch_close(base_state(plan_path=PROMOTED, tasks=ts_b, current_batch="B1", current_task=T2, verify_unit="B1", round_log={"B1": [{"round": 1, "head": "h"}]}, last_verdict="PASS", batch_state={}))
@@ -1978,7 +2093,7 @@ check("choice_park: a non-choice escalation parks the run resumably, keyed by it
       and d.get("kind") == "git_setup_failed" and d.get("question") == E_GIT["question"]
       and s["discussion_message"].startswith("ARCHITECT_AWAITING_DISCUSSION\nA git_setup_failed question is open for discussion:\n")
       and "answer it with that text" in d.get("resume", "") and s["discussion_message"].isascii(), s)
-r = {"initial_prompt": "continue: use base release", "discussion_run_id": NPARK_ID, **STORE.variables(DESIGN, TMP)}
+r = {"initial_prompt": "continue: use base release", "discussion_run_id": NPARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 r.update(gates.intake(r))
 r.update(gates.resume_route(r))
 r.update(gates.choice_resume(r))
@@ -1987,7 +2102,7 @@ check("intake -> choice_resume: 'continue: <answer>' on a parked escalation -> t
       and r["escalation"]["kind"] == "git_setup_failed" and r["parked"] == "", r)
 r.update(gates.parse_answer(r))
 check("choice_resume -> parse_answer: a settled answer that names no option is interpreted", r["_next"] == "interpret_reply", r)
-r = {"initial_prompt": "continue", "discussion_run_id": NPARK_ID, **STORE.variables(DESIGN, TMP)}
+r = {"initial_prompt": "continue", "discussion_run_id": NPARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 r.update(gates.intake(r))
 r.update(gates.resume_route(r))
 r.update(gates.choice_resume(r))
@@ -2069,11 +2184,11 @@ for gone in (False, True):
     ov_dir = os.path.join(TMP, "gone-dir") if gone else WT_HELD
     _lib.snapshot(base_state(run_id=OV_ID, run_dir=_lib.run_dir_for(OV_ID), base_branch_override="release",
                              code_dir_override=ov_dir, run_branch_override="feat/typed"), {}, "task_loop")
-    r = {"initial_prompt": f"Architect run id: {OV_ID}", **STORE.variables(DESIGN, TMP)}
+    r = {"initial_prompt": f"Architect run id: {OV_ID}", **FIXTURE.variables(DESIGN, TMP)}
     r.update(gates.intake(r))
     check(f"intake: re-entry restores the owner's base override and {'drops a code dir that is gone' if gone else 'restores the code dir'}",
           r["_next"] == "resume_route" and r["base_branch_name"] == "release" and r["run_branch_override"] == "feat/typed"
-          and r["code_repo_path"] == (STORE.variables(DESIGN, TMP).get("project_dir", CODE) if gone else WT_HELD), r)
+          and r["code_repo_path"] == (FIXTURE.variables(DESIGN, TMP).get("project_dir", CODE) if gone else WT_HELD), r)
 E_NDD = gates._need_design_doc_escalation()
 u = gates.parse_answer(base_state(escalation=E_NDD, last_answer_text=f"{DESIGN} please"))
 u2 = gates.parse_answer(base_state(escalation=E_NDD, last_answer_text="the doc is the one we wrote yesterday"))
@@ -2168,7 +2283,7 @@ check("choice_park: the ASCII final message names the question, the marked recom
       and "Options:\n  Option 1 (recommended): 8080\n  Option 2: 9090\n" in msg and "Your reply: what does 9090 collide with?" in msg
       and "Answered so far:\n  1. Which store? -> pg\n" in msg and '"continue"' in msg and '"continue: <your answer>"' in msg
       and msg.isascii() and _lib.RESUME_RE.search(msg).group(1) == PARK_ID, msg)
-s = {"initial_prompt": "continue: 9091", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue: 9091", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: 'continue: <answer>' with the carried discussion_run_id -> re-entry into that run, answer stashed, carried key cleared",
       s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["resume_mode"] is True and s["settled_answer"] == "9091"
@@ -2191,7 +2306,7 @@ check("choice_resume: 'continue: Option 2' on the first question -> its option t
       u["choice_answers"] == [{"question": "Which store?", "answer": "sqlite", "via": "settled"}]
       and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 1 and "Which port?" in u2["escalation"]["question"], (u, u2))
 for prompt, carried in (("Continue", PARK_ID), ("resume.", PARK_ID), (f"Architect run id: {PARK_ID}\ncontinue", "")):
-    s = {"initial_prompt": prompt, "discussion_run_id": carried, **STORE.variables(DESIGN, TMP)}
+    s = {"initial_prompt": prompt, "discussion_run_id": carried, **FIXTURE.variables(DESIGN, TMP)}
     s.update(gates.intake(s))
     s.update(gates.resume_route(s))
     s.update(gates.choice_resume(s))
@@ -2200,33 +2315,33 @@ for prompt, carried in (("Continue", PARK_ID), ("resume.", PARK_ID), (f"Architec
           s["run_id"] == PARK_ID and s["escalation"]["kind"] == "design_round" and s["escalation"]["data"]["index"] == 1
           and s["_next"] == "escalate_gate" and s["choice_answers"] == PARK_ANSWERS and s["choice_parks"] == {"design_round#1": 1}
           and s["discussion"] == {} and s["settled_answer"] == "", s)
-s = {"initial_prompt": f"Architect run id: {PARK_ID}\ncontinue: Option 2", **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": f"Architect run id: {PARK_ID}\ncontinue: Option 2", **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: an explicit run id with 'continue: <answer>' -> re-entry with the answer stashed, no carried key needed",
       s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["settled_answer"] == "Option 2", s)
-s = {"initial_prompt": f"Implement the design at {DESIGN}", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": f"Implement the design at {DESIGN}", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: a message that is not a continue with the carried key -> a fresh run, the key cleared, the left discussion ledgered",
       not s.get("resume_mode") and s["run_id"] != PARK_ID and s["discussion_run_id"] == "" and s["_next"] == "orient_read"
       and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
-s = {"initial_prompt": "continue", **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue", **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: 'continue' with no carried key -> a fresh run as before", not s.get("resume_mode") and s["run_id"] != PARK_ID, s)
-s = {"initial_prompt": "continue: use pg", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue: use pg", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 s.update(gates.resume_route(s))
 s.update(gates.choice_resume(s))
 check("intake -> choice_resume: 'continue: use pg' -> 'use pg' recorded for the parked question",
       s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "use pg", "via": "settled"}],
       s.get("choice_answers"))
-s = {"initial_prompt": "resume: option 2", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "resume: option 2", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 s.update(gates.resume_route(s))
 s.update(gates.choice_resume(s))
 check("intake -> choice_resume: 'resume: option 2' -> option 2 recorded for the parked question",
       s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "9090", "via": "settled"}],
       s.get("choice_answers"))
-s = {"initial_prompt": "continue.", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue.", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 s.update(gates.resume_route(s))
 s.update(gates.choice_resume(s))
@@ -2235,16 +2350,48 @@ check("intake -> choice_resume: bare 'continue.' -> the parked question asked ag
       s["run_id"] == PARK_ID and s["_next"] == "escalate_gate" and s["escalation"]["data"]["index"] == 1
       and s["choice_answers"] == PARK_ANSWERS and s["settled_answer"] == "", s)
 for prompt in ("continue please", "continue, but why X?"):
-    s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+    s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
     s.update(gates.intake(s))
     check(f"intake: {prompt!r} is prose, not a continue -> a fresh run, no answer recorded, the key cleared, the left discussion ledgered",
           not s.get("resume_mode") and s["run_id"] != PARK_ID and not s.get("settled_answer") and s["discussion_run_id"] == ""
           and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
 
+# park counts written under the key format that predates _park_key
+OLD_PARK = dict(escalation=E_DQ, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[],
+                parked="choice_discussion", discussion={"run_id": "x"}, last_answer_text="why the second option?")
+
+
+def rekeyed(u):
+    return [d for d in u.get("decisions", []) if "old key format" in d]
+
+
+s = base_state(**OLD_PARK, choice_parks={"0": _lib.DISCUSSION_PARKS_MAX})
+s.update(gates.choice_resume(s))
+u = gates.choice_park(s)
+check("choice_resume: an old bare-index park key at the cap is rekeyed and ledgered; choice_park then re-asks instead of parking",
+      s["choice_parks"] == {"design_round#0": _lib.DISCUSSION_PARKS_MAX} and len(rekeyed(s)) == 1
+      and u["_next"] == "choice_reask" and u.get("choice_forced") is True, (s.get("choice_parks"), u))
+u = gates.choice_park(base_state(**OLD_PARK, choice_parks={"0": _lib.DISCUSSION_PARKS_MAX}))
+check("choice_park: an old bare-index park key at the cap with no resume in between -> still re-asks",
+      u["_next"] == "choice_reask" and u.get("choice_forced") is True, u)
+u = gates.choice_resume(base_state(escalation=E_GIT, parked="choice_discussion", choice_parks={"git_setup_failed": 2}))
+check("choice_resume: an old bare-kind park key of a free-text question -> its kind and question key, the count kept, one ledger line",
+      u.get("choice_parks") == {gates._park_key({}, E_GIT): 2} and len(rekeyed(u)) == 1, u)
+E_RELAYED = {**E_GIT, "data": {**E_GIT["data"], "park_key": "7"}}
+u = gates.choice_resume(base_state(escalation=E_RELAYED, parked="choice_discussion", choice_parks={"7": 2}))
+check("choice_resume: the parked question's relay park key is left as it is, even one shaped like an old index",
+      "choice_parks" not in u and not rekeyed(u), u)
+u = gates.choice_resume(base_state(**OLD_PARK, choice_parks={"design_round#0": 1, gates._park_key({}, E_GIT): 2}))
+check("choice_resume: park keys already in the current format -> unchanged, nothing ledgered",
+      "choice_parks" not in u and not rekeyed(u), u)
+u = gates.choice_resume(base_state(**OLD_PARK, choice_parks={"0": 3, "design_round#0": 1, "1": 1, "design_round#1": 2}))
+check("choice_resume: an old key whose current key is also present -> one key holding the larger count",
+      u.get("choice_parks") == {"design_round#0": 3, "design_round#1": 2} and len(rekeyed(u)) == 1, u)
+
 
 def resume_chain(run_id, prompt, gate):
     """Re-enter a parked run from its state.json the way the graph does; returns the state and the `_next` of each step."""
-    s = {"initial_prompt": prompt, "discussion_run_id": run_id, **STORE.variables(DESIGN, TMP)}
+    s = {"initial_prompt": prompt, "discussion_run_id": run_id, **FIXTURE.variables(DESIGN, TMP)}
     steps = []
     for step in (gates.intake, gates.resume_route, gates.choice_resume, gate):
         s.update(step(s))
@@ -2361,7 +2508,7 @@ check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_ga
 u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))
 check("apply_answer: checklist_accept -> recorded through the queue -> checklist_round", u["_next"] == "checklist_round" and u["choice_index"] == 1)
 check("apply_answer: amend_cap stop -> end_blocked", AA("amend_cap", "Stop and report")["_next"] == "end_blocked")
-u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"design": 9})
+u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"design": 9}, quality_recorded=True)
 check("apply_answer: amend_cap allow on an escalation with no source -> one more cycle of every source and the ceiling, then gate1",
       u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1
       and u["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX - 1}, u)
@@ -2421,9 +2568,12 @@ u = AA("wave_escalation", "Retry the task sequentially (one fix round with the e
 check("apply_answer: wave_escalation retry -> sequential fix round in the worktree", u["_next"] == "compose_delegation" and u["fix_items"] == ["e1"])
 check("apply_answer: wave_escalation accept -> integration_test (single)", AA("wave_escalation", "Accept as-is and close the task (recorded)", current_task=T3, tasks=TS_W)["_next"] == "integration_test")
 check("apply_answer: wave_escalation abort -> wave_cleanup (task failed, branch kept)", AA("wave_escalation", "Abort this task (worktree removed, branch kept)", current_task=T3, tasks=TS_W)["_next"] == "wave_cleanup")
-u = AA("integration_conflict", "One more rebase cycle", current_task=T3, tasks=TS_W, integration_task=T3, task_rounds={T3: {"conflict_cycles": 3}})
-check("apply_answer: integration_conflict one more -> integration_test (cycle decremented)", u["_next"] == "integration_test" and u["task_rounds"][T3]["conflict_cycles"] == 2)
-check("apply_answer: integration_red one more at Phase F -> integration_check", AA("integration_red", "One more fix round anyway", current_task=T1, tasks=TS_W, task_rounds={T1: {"integration_strikes": 4}})["_next"] == "integration_check")
+u = AA("integration_conflict", "One more rebase cycle (state reason)", current_task=T3, tasks=TS_W, integration_task=T3, task_rounds={T3: {"conflict_cycles": 3}})
+check("apply_answer: integration_conflict one more -> a rebase fix round (cycle at the cap)",
+      u["_next"] == "fix_round" and u["fix_request"]["return_to"] == "integration" and u["task_rounds"][T3]["conflict_cycles"] == CONFLICT_CYCLES_MAX)
+u = AA("integration_red", "One more fix round (state reason)", current_task=T1, tasks=TS_W, final_integration_strikes=4)
+check("apply_answer: integration_red one more at Phase F -> a fix round back to integration_check",
+      u["_next"] == "fix_round" and u["fix_request"]["return_to"] == "integration_check" and u["final_integration_strikes"] == STRIKE_LIMIT)
 check("apply_answer: integration_* stop -> end_blocked", AA("integration_red", "Stop and report", current_task=T1, tasks=TS_W)["_next"] == "end_blocked")
 check("apply_answer: approve_next continue -> select_tasks", AA("approve_next", "Continue")["_next"] == "select_tasks")
 u = AA("approve_next", "Stop here (park the run)")
@@ -2472,7 +2622,7 @@ check("apply_answer: stop and abort follow the reply's intent: negated or qualif
 def _surrogate_replies():
     outs = [AA("clarify", "~x\ud800/notes.md"), AA("need_design_doc", "~u\ud800"),
             AA("amend_cap", "Allow one more amendment cycle", esc=E_AC, last_answer_text="1 - keep the \ud800 note")]
-    return (outs[0]["_next"] == "orient_read" and outs[1]["_next"] == "end_blocked" and outs[2]["_next"] == "gate1_build"
+    return (outs[0]["_next"] == "orient_read" and outs[1]["_next"] == "end_blocked" and outs[2]["_next"] == "quality_bar_gate"
             and any("keep the \ud800 note" in d for d in outs[2].get("decisions", []))
             and "keep the" in read_file(os.path.join(base_state()["run_dir"], "decisions.md"))), [o["_next"] for o in outs]
 
@@ -2492,9 +2642,13 @@ ac_opts = [(o["text"], o["recommended"]) for o in u.get("escalation", {}).get("o
 check("reseal_gate: amend_cap offers 'Allow one more amendment cycle' first and recommended; Stop stays, not recommended",
       ac_opts == [("Allow one more amendment cycle", True), ("Stop and report", False)], ac_opts)
 u = AA("amend_cap", "Allow one more amendment cycle", esc=E_AC, amend_counts={"gate1": 9},
-       last_answer_text="1 - the leak questions are new each round")
+       last_answer_text="1 - the leak questions are new each round", quality_recorded=True)
 check("apply_answer: amend_cap allow with a reason -> one more cycle, the owner's reason in the ledger",
       u["_next"] == "gate1_build" and any("the leak questions are new each round" in d for d in u.get("decisions", [])), u.get("decisions"))
+u = AA("amend_cap", "Allow one more amendment cycle", esc=escalation("amend_cap", "q", AMEND_CAP_NEW, data={"source": "design", "over": ["source"]}),
+       amend_counts={"design": 9})
+check("apply_answer: amend_cap allow on a plan with no quality bar recorded -> quality_bar_gate, not Gate 1",
+      u["_next"] == "quality_bar_gate", u.get("_next"))
 u = gates.gate2_route(base_state(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT))
 g2_opts = [(o["text"], o["recommended"]) for o in u["escalation"]["options"]]
 check("gate2_route: gate2_stuck offers 'Another fix round (state reason)' first and recommended; override and stop are explicit picks only",
@@ -2600,7 +2754,7 @@ check("choice_park: each question keeps its own park count; a second question of
 
 s7 = base_state(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT + 1, escalation=E_G2,
                 last_answer="Another fix round (state reason)", amend_counts={"gate2": _lib.AMEND_GATE2_MAX},
-                amend_cycles=AMEND_CYCLES_MAX, amend_source="", pending_amendments=[], cap_continues={})
+                amend_cycles=AMEND_CYCLES_MAX, amend_source="", pending_amendments=[], cap_continues={}, quality_recorded=True)
 s7.update(gates.apply_answer(s7))
 g2_next = s7["_next"]
 s7.update(gates.reseal_gate(s7))
@@ -2666,11 +2820,11 @@ check("gate2_route: a reply whose only PLAN_REVIEW text is the echoed prompt is 
 STOP_KINDS = {
     "tasks_stuck": [option("Retry the failed blocker"), option("Skip the blocked tasks and finish (follow-ups)"),
                     option("Stop and report", recommended=True)],
-    "batch_strikeout": [option("Stop and report", recommended=True), option("One more batch round anyway"),
-                        option("Accept the batch unresolved (recorded)")],
-    "integration_conflict": [option("Stop and report", recommended=True), option("One more rebase cycle"),
-                             option("Abort this task (branch kept)")],
-    "integration_red": [option("Stop and report", recommended=True), option("One more fix round anyway")],
+    "batch_strikeout": [option("One more batch round (state reason)", recommended=True), option("Accept the batch unresolved (recorded)"),
+                        option("Stop and report")],
+    "integration_conflict": [option("One more rebase cycle (state reason)", recommended=True), option("Abort this task (branch kept)"),
+                             option("Stop and report")],
+    "integration_red": [option("One more fix round (state reason)", recommended=True), option("Stop and report")],
     "task_failed": [option("Retry with the oracle's direction (one round)", recommended=True),
                     option("Re-scope: amend the plan/task (type the amendment)"), option("Abort this task and stop")],
     "review_round_cap": [option("Resume with one more fix round"), option("Stop watching and report", recommended=True)],
@@ -2686,9 +2840,9 @@ for k, opts in STOP_KINDS.items():
 check("apply_answer: 'don't stop' is no stop and a reply that picks no option asks again, for every cap that offers a stop",
       all(v == ("escalate_gate", k) for (k, _), v in stop_.items()), {k: v for k, v in stop_.items() if v != ("escalate_gate", k[0])})
 picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]), **copy.deepcopy(stop_ctx))["_next"],
-          "batch_strikeout": AA("batch_strikeout", "One more batch round anyway",
+          "batch_strikeout": AA("batch_strikeout", "One more batch round (state reason)",
                                 esc=escalation("batch_strikeout", "q", STOP_KINDS["batch_strikeout"]), **copy.deepcopy(stop_ctx))["_next"],
-          "integration_red": AA("integration_red", "2", esc=escalation("integration_red", "q", STOP_KINDS["integration_red"]),
+          "integration_red": AA("integration_red", "1", esc=escalation("integration_red", "q", STOP_KINDS["integration_red"]),
                                 **copy.deepcopy(stop_ctx))["_next"],
           "integration_conflict abort": AA("integration_conflict", "Abort this task (branch kept)",
                                            esc=escalation("integration_conflict", "q", STOP_KINDS["integration_conflict"]),
@@ -2700,7 +2854,7 @@ picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q
           "tasks_stuck stop": AA("tasks_stuck", "Stop and report", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]),
                                  **copy.deepcopy(stop_ctx))["_next"]}
 check("apply_answer: the caps that offer a stop still act on an explicit pick of each option",
-      picks_ == {"tasks_stuck": "select_tasks", "batch_strikeout": "batch_fix_route", "integration_red": "integration_check",
+      picks_ == {"tasks_stuck": "select_tasks", "batch_strikeout": "batch_fix_route", "integration_red": "fix_round",
                  "integration_conflict abort": "wave_cleanup", "task_failed rescope": "amend_plan", "task_failed abort": "end_aborted",
                  "tasks_stuck stop": "end_blocked"}, picks_)
 
@@ -2732,6 +2886,9 @@ u = gates.integration_check(base_state(plan_path=PROMOTED, tasks=ts_f, verificat
 check("integration_check: RED -> fix round (B14 side 1, return_to integration_check)", u["_next"] == "fix_round" and u["fix_request"]["return_to"] == "integration_check")
 u = gates.integration_check(base_state(plan_path=PROMOTED, tasks=ts_f, verification_commands='["false"]', final_integration_strikes=STRIKE_LIMIT))
 check("integration_check: B14 exhausted -> integration_red", u["escalation"]["kind"] == "integration_red")
+E_FR = u["escalation"]
+E_FR_SPENT = gates.integration_check(base_state(plan_path=PROMOTED, tasks=ts_f, verification_commands='["false"]', final_integration_strikes=STRIKE_LIMIT,
+                                                cap_continues={"integration_red:run": STRIKE_LIMIT})).get("escalation")
 u = gates.integrate_route(base_state(integration_amendments=["TASK-3 criterion stale"], integration_follow_ups=["rotate key"], integration_amended=False, anomalies=["x"]))
 check("integrate_route: amendments -> amend_plan (once per Phase F), follow-ups ledgered, A10 consumed", u["_next"] == "amend_plan" and u["integration_amended"] and u["follow_ups"] == ["(integration) rotate key"] and u["after_reseal"] == "phase_f" and u["anomalies_log"])
 check("integrate_route: already amended -> hygiene_create", gates.integrate_route(base_state(integration_amendments=["x"], integration_amended=True))["_next"] == "hygiene_create")
@@ -2801,18 +2958,82 @@ u = gates.ci_apply(base_state(pr_number="99", ci_verdict="flake", failing_checks
 check("ci_apply: budgets are per check-name per PR (lint on #99 fresh although test is exhausted and #98 lint is)", u["_next"] == "ci_poll" and u["ci_reruns"]["99"]["lint"] == 1)
 u = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f))
 check("ci_apply: B18 fix strikes exhausted per check per PR -> ci_exhausted", u["escalation"]["kind"] == "ci_exhausted")
+E_CE = u["escalation"]
+E_CE_SPENT = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")],
+                                       ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f,
+                                       cap_continues={"ci_exhausted:99:test": STRIKE_LIMIT})).get("escalation")
+CAP_CASES = {
+    "integration_conflict": (E_IC, E_IC_SPENT, "One more rebase cycle (state reason)", f"integration_conflict:{T3}",
+                             dict(current_task=T3, tasks=TS_W, integration_task=T3, run_branch="feat/PLAN-widgets",
+                                  task_rounds={T3: {"conflict_cycles": CONFLICT_CYCLES_MAX + 1}})),
+    "integration_red": (E_IR, E_IR_SPENT, "One more fix round (state reason)", f"integration_red:{T1}",
+                        dict(current_task=T1, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets",
+                             task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT + 1}})),
+    "integration_red at Phase F": (E_FR, E_FR_SPENT, "One more fix round (state reason)", "integration_red:run",
+                                   dict(tasks=ts_f, final_integration_strikes=STRIKE_LIMIT + 1)),
+    "batch_strikeout": (E_BS, E_BS_SPENT, "One more batch round (state reason)", "batch_strikeout:B1",
+                        dict(current_batch="B1", tasks=copy.deepcopy(ts_b), batch_state={"B1": {"strikes": STRIKE_LIMIT + 1}})),
+    "ci_exhausted": (E_CE, E_CE_SPENT, "Resume with one more coder fix round (state reason)", "ci_exhausted:99:test",
+                     dict(pr_number="99", tasks=ts_f, ci_owning_task=T1, ci_fix_strikes={"99": {"test": STRIKE_LIMIT + 1}})),
+}
+for name, (first, spent, more, key, ctx) in CAP_CASES.items():
+    check(f"{name}: the continue option is first and recommended at the cap; after {STRIKE_LIMIT} continues none is, with the cap-spent note",
+          _cap_offer(first) == (more, [more]) and _cap_offer(spent) == (more, [])
+          and gates.CAP_SPENT_NOTE in (spent or {}).get("question", "") and gates.CAP_SPENT_NOTE not in (first or {}).get("question", ""),
+          (_cap_offer(first), _cap_offer(spent)))
+    v = AA(first["kind"], more, esc=first, last_answer_text="1 - the last round found a new cause", cap_continues={}, **copy.deepcopy(ctx))
+    check(f"apply_answer: {name} continue with a reason -> a real round dispatched, the reason ledgered, one continue counted",
+          v["_next"] in ("fix_round", "batch_fix_route") and any("the last round found a new cause" in d for d in v.get("decisions", []))
+          and _lib.as_dict(v.get("cap_continues")).get(key) == 1, (v["_next"], v.get("cap_continues"), v.get("decisions")))
+    s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
+    s.update(gates.parse_answer(s))
+    picked = s.get("last_answer")
+    s.update(gates.apply_answer(s))
+    check(f"headless: {name} guidance picks the continue option and dispatches the round",
+          picked == more and s["_next"] in ("fix_round", "batch_fix_route"), (picked, s["_next"]))
+cc_ = {n: AA(c[0]["kind"], c[2], esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
+fr_ = {n: _lib.as_dict(v.get("fix_request")) for n, v in cc_.items()}
+check("apply_answer: integration_conflict continue -> a rebase fix round for the task, back to integration, one cycle before it asks again",
+      cc_["integration_conflict"]["_next"] == "fix_round" and fr_["integration_conflict"].get("task") == T3
+      and fr_["integration_conflict"].get("return_to") == "integration" and "rebase" in " ".join(fr_["integration_conflict"].get("items", [])).lower()
+      and cc_["integration_conflict"]["task_rounds"][T3]["conflict_cycles"] == CONFLICT_CYCLES_MAX, (cc_["integration_conflict"]["_next"], fr_["integration_conflict"]))
+check("apply_answer: integration_red continue -> a fix round for the task (not a test-only re-run), back to integration",
+      cc_["integration_red"]["_next"] == "fix_round" and fr_["integration_red"].get("task") == T1
+      and fr_["integration_red"].get("return_to") == "integration" and cc_["integration_red"]["task_rounds"][T1]["integration_strikes"] == STRIKE_LIMIT,
+      (cc_["integration_red"]["_next"], fr_["integration_red"]))
+check("apply_answer: integration_red continue at Phase F -> a fix round back to integration_check",
+      cc_["integration_red at Phase F"]["_next"] == "fix_round" and fr_["integration_red at Phase F"].get("return_to") == "integration_check"
+      and cc_["integration_red at Phase F"].get("final_integration_strikes") == STRIKE_LIMIT, (cc_["integration_red at Phase F"]["_next"], fr_["integration_red at Phase F"]))
+check("apply_answer: batch_strikeout continue -> batch_fix_route with the strikes one below the cap",
+      cc_["batch_strikeout"]["_next"] == "batch_fix_route" and cc_["batch_strikeout"]["batch_state"]["B1"]["strikes"] == STRIKE_LIMIT - 1)
+v = AA("batch_strikeout", "One more batch round (state reason)", esc=E_BS, last_answer_text="1 - the flaky fixture is fixed now", cap_continues={},
+       **copy.deepcopy(CAP_CASES["batch_strikeout"][4]))
+u = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[],
+                                     batch_state=v["batch_state"]))
+check("apply_answer: batch_strikeout continue with a reason -> the dispatched batch round's fix items carry the owner's reason",
+      u.get("pending_fixes") and all(any("the flaky fixture is fixed now" in i for i in f["items"]) for f in u["pending_fixes"]),
+      u.get("pending_fixes"))
+check("apply_answer: ci_exhausted continue -> a coder fix round for the owning task back to CI, the check one strike before it asks again",
+      cc_["ci_exhausted"]["_next"] == "fix_round" and fr_["ci_exhausted"].get("task") == T1 and fr_["ci_exhausted"].get("return_to") == "ci"
+      and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
+      (cc_["ci_exhausted"]["_next"], fr_["ci_exhausted"], cc_["ci_exhausted"].get("ci_fix_strikes")))
+ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
+check("apply_answer: a reply that picks none of a cap's options is asked again, never stopped",
+      all(v["_next"] == "escalate_gate" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
+      {n: v["_next"] for n, v in ask_.items()})
 check("ci_apply: infra -> escalation ci_infra (wait-or-escalate)", gates.ci_apply(base_state(pr_number="99", ci_verdict="infra", failing_checks=["test"]))["escalation"]["kind"] == "ci_infra")
 check("ci_apply: unsure defaults UP (never a re-run)", gates.ci_apply(base_state(pr_number="99", ci_verdict="unsure", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
 check("ci_apply: dead diagnose = unsure", gates.ci_apply(base_state(pr_number="99", ci_verdict="", last_node_output="llm node failed", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
 os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo false"
 u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
-check("flip_ready: single green -> gh pr ready -> finish_plan", u["flipped_ready"] and u["_next"] == "finish_plan")
+check("flip_ready: single green -> gh pr ready, isDraft re-read false -> finish_plan", u["flipped_ready"] and u["_next"] == "finish_plan")
 if MULTI_IS_GROUPS:
     u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f, pr_strategy="multi", closeout_scope="group", closeout_unit="g1"))
     check("flip_ready: group close-out -> next group", u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1")
 u = gates.finish_plan(base_state(plan_path=PROMOTED, tasks=ts_f, pr_url="https://github.com/o/r/pull/99", follow_ups=["Provision WIDGET_SECRET"]))
 check("finish_plan: validate run; PLAN status Implemented + PR + follow-ups; final planning commit", u["_next"] == "final_report" and "implemented" in read_file(PROMOTED).lower() and "pull/99" in read_file(PROMOTED)
-      and "**Follow-ups:**" in read_file(PROMOTED) and "implemented" in STORE.last_commit())
+      and "**Follow-ups:**" in read_file(PROMOTED) and "implemented" in FIXTURE.last_commit())
 u = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, pr_url="https://github.com/o/r/pull/99", flipped_ready=True, ci_status="green", escalation_policy="autonomous",
                                   autonomous_digest=["x: y (basis: recommended)"], skipped_reviews=["T1: security"], anomalies_log=["a: b"], follow_ups=["f"], quality_rigor="prototype",
                                   mode_line="m", task_granularity="micro", batch_state={"B1": {"passed": True, "closed_at": "h", "strikes": 1}}))
@@ -2861,12 +3082,12 @@ for tracking in ("", "ci"):
         check(f"review watch: pr_tracking {label} - flip_ready group close-out -> select_tasks, no review_* keys",
               u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1" and u["pr_number"] == "" and not review_keys(u), review_keys(u))
 check("review watch: ci_route green with no watch running -> flip_ready", gates.ci_route(base_state(**RW, ci_status="green"))["_next"] == "flip_ready")
-st_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="ci")})
-st_rv = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="review")})
+st_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="ci")})
+st_rv = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="review")})
 check("review watch: intake mode_line - ci carries no pr_tracking, review appends ' pr_tracking=review'",
       "pr_tracking" not in st_ci["mode_line"] and st_rv["mode_line"] == st_ci["mode_line"] + " pr_tracking=review" and st_ci["_next"] == st_rv["_next"] == "orient_read",
       (st_ci["mode_line"], st_rv["mode_line"]))
-st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="sometimes")})
+st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="sometimes")})
 check("review watch: intake unknown pr_tracking -> mode_invalid with option 'pr_tracking = ci'",
       st_bad["_next"] == "escalate_gate" and st_bad["escalation"]["kind"] == "mode_invalid" and any(o["text"] == "pr_tracking = ci" for o in st_bad["escalation"]["options"]))
 u = AA("mode_invalid", "pr_tracking = review", design_doc_path="")
@@ -3316,7 +3537,8 @@ check("watch: ci_route timeout while watching -> review-aware ci_exhausted with 
       and ledgered(u, "review-watch: PR #99 stop: ci_exhausted"), esc_shape(u))
 CI_CASES = (
     ("ci_exhausted", dict(ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}),
-     "CI still red on ['test']{d} after 3 fix rounds (per check-name per PR #99). How to proceed?", [("Resume with one more coder fix round", False), ("{l}", True)]),
+     "CI still red on ['test']{d} after 3 fix rounds (per check-name per PR #99). How to proceed?",
+     [("Resume with one more coder fix round (state reason)", True), ("{l}", False)]),
     ("ci_infra", dict(ci_verdict="infra", failing_checks=["test"]),
      "CI failed{d} for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or {w}?",
      [("Keep waiting (re-run the watch)", True), ("{l}", False)]),
@@ -3937,20 +4159,26 @@ u = gates.post_round(base_state(**WATCH, current_task=T1, verify_unit=T1, delega
 check("fix origin: post_round with delegation_kind already reset to implement and origin review -> fix_done", u.get("_next") == "fix_done", u.get("_next"))
 u = AA("task_failed", "Abort this task and stop", current_task=T1, tasks=tasks_with(), fix_origin_return="review")
 check("fix origin: task_failed abort clears fix_origin_return", u.get("_next") == "end_aborted" and u.get("fix_origin_return") == "", u.get("fix_origin_return"))
-for ret in ("integration", "batch"):
-    s, steps = fix_origin_chain(ret, GBLOCK, GPASS)
-    s.update(gates.post_round(s))
-    u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
-    check(f"fix origin scope: a BLOCKED {ret} fix round keeps fix_origin_return empty; fix_done follows fix_return_to verify -> select_tasks",
-          steps[0].get("fix_return_to") == ret and all(st.get("fix_origin_return") == "" for st in steps) and steps[1].get("fix_return_to") == "verify"
-          and u.get("_next") == "select_tasks", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+s, steps = fix_origin_chain("batch", GBLOCK, GPASS)
+s.update(gates.post_round(s))
+u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+check("fix origin scope: a BLOCKED batch fix round keeps fix_origin_return empty; fix_done follows fix_return_to verify -> select_tasks",
+      steps[0].get("fix_return_to") == "batch" and all(st.get("fix_origin_return") == "" for st in steps) and steps[1].get("fix_return_to") == "verify"
+      and u.get("_next") == "select_tasks", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+s, steps = fix_origin_chain("integration", GBLOCK, GPASS)
+s.update(gates.post_round(s))
+u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+check("fix origin scope: a BLOCKED integration fix round keeps the integration origin through the conformance round; fix_done -> integration_test",
+      steps[1].get("fix_return_to") == "verify" and all(st.get("fix_origin_return") == "integration" for st in steps)
+      and u.get("_next") == "integration_test", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
 for ret, pend, want in (("integration", [], "integration_test"), ("batch", [], "batch_gauntlet_build"),
                         ("batch", [{"task": T2, "items": ["y"], "source": "batch", "return_to": "batch"}], "select_tasks")):
     s, steps = fix_origin_chain(ret, GPASS, pending_fixes=pend)
     s.update(gates.post_round(s))
     u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
-    check(f"fix origin scope: a passing {ret} fix round{' with pending fixes' if pend else ''} keeps fix_origin_return empty; fix_done -> {want}",
-          all(st.get("fix_origin_return") == "" for st in steps) and u.get("_next") == want, ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+    origin = "integration" if ret == "integration" else ""
+    check(f"fix origin scope: a passing {ret} fix round{' with pending fixes' if pend else ''} keeps fix_origin_return {origin or 'empty'}; fix_done -> {want}",
+          all(st.get("fix_origin_return") == origin for st in steps) and u.get("_next") == want, ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
 
 # ---------------------------------------------------------------- truncation: a review read that overflows a page stops the watch
 def paged(decision="", **lists):
@@ -4072,8 +4300,8 @@ try:
 
     UNWATCHED = "review-watch: not started: per-task PRs are not watched (pr_tracking=review needs pr_strategy single or PR groups)"
     gates.MULTI_IS_GROUPS = False
-    st_stack = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
-    st_stack_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="ci")})
+    st_stack = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
+    st_stack_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="ci")})
     check("stack scope: intake per-task-stack multi + review -> ledgered and a follow-up, no escalation, same route as ci",
           ledgered(st_stack, UNWATCHED) and st_stack.get("follow_ups") == [UNWATCHED] and "escalation" not in st_stack
           and st_stack["_next"] == st_stack_ci["_next"] == "orient_read" and not ledgered(st_stack_ci, UNWATCHED), st_stack)
@@ -4082,7 +4310,7 @@ try:
     check("stack scope: flip_ready per-task-stack multi in review mode -> no watch armed, no still-draft line -> finish_plan",
           u.get("_next") == "finish_plan" and not review_keys(u) and not ledgered(u, "still draft") and "follow_ups" not in u, u)
     gates.MULTI_IS_GROUPS = True
-    st_groups = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
+    st_groups = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
     u = gates.flip_ready(base_state(**RW, **GROUP))
     check("stack scope: PR groups in review mode -> intake ledgers nothing, flip_ready still arms the watch",
           not ledgered(st_groups, UNWATCHED) and not st_groups.get("follow_ups") and u.get("_next") == "review_poll" and u.get("review_watching") is True, u)
@@ -4483,9 +4711,453 @@ env = {**os.environ, "GRAPH_STATE_FILE": sf}
 env.pop("GRAPH_STATE", None)
 p = subprocess.run([sys.executable, os.path.join(HERE, "escalate_gate.py")], capture_output=True, text=True, env=env)
 check("entry script: GRAPH_STATE_FILE path (>32 KiB) -> JSON with _next", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "ask_dispatch", p.stderr[-300:])
-env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP)})}
+env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP)})}
 p = subprocess.run([sys.executable, os.path.join(HERE, "intake.py")], capture_output=True, text=True, env=env)
 check("entry script: intake through GRAPH_STATE", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "orient_read", p.stderr[-300:])
+
+# ---------------------------------------------------------------- state heal at gate entry and the state_fault boundary
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+HEAL_RUN = "heal"
+HEAL_DIR = _lib.run_dir_for(HEAL_RUN)
+HEAL_TASKS = tasks_with()
+SF_RETRY, SF_RESUME = "Retry the gate (state reloaded from disk)", "Resume from the last saved phase"
+
+
+def heal_base(**over):
+    return base_state(**{"run_id": HEAL_RUN, "run_dir": HEAL_DIR, "tasks": HEAL_TASKS, "current_task": T1, **over})
+
+
+def heal_disk(**snap):
+    shutil.rmtree(HEAL_DIR, ignore_errors=True)
+    os.makedirs(os.path.join(HEAL_DIR, "reports"))
+    write(os.path.join(HEAL_DIR, "tasks.json"), json.dumps(HEAL_TASKS))
+    write(os.path.join(HEAL_DIR, "state.json"),
+          json.dumps({"run_id": HEAL_RUN, "run_dir": HEAL_DIR, "code_repo_path": CODE, "plan_path": PROMOTED, "phase": "task saved", **snap}))
+
+
+def entry(gate, state):
+    env = {k: v for k, v in os.environ.items() if k not in ("GRAPH_STATE", "GRAPH_STATE_FILE")}
+    p = subprocess.run([sys.executable, os.path.join(HERE, f"{gate}.py")], capture_output=True, text=True, env={**env, "GRAPH_STATE": json.dumps(state)})
+    lines = p.stdout.strip().splitlines()
+    return p.returncode, (json.loads(lines[-1]) if p.returncode == 0 and lines else {}), p.stderr[-300:]
+
+
+def run_gate(name, state, fn=None):
+    """gates.run(name) in-process, with the gate swapped for fn when given; the emitted JSON line."""
+    saved = gates.GATES[name]
+    env_saved = {k: os.environ.pop(k) for k in ("GRAPH_STATE", "GRAPH_STATE_FILE") if k in os.environ}
+    if fn:
+        gates.GATES[name] = fn
+    os.environ["GRAPH_STATE"] = json.dumps(state)
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            gates.run(name)
+    finally:
+        gates.GATES[name] = saved
+        os.environ.pop("GRAPH_STATE")
+        os.environ.update(env_saved)
+    return json.loads(out.getvalue().strip().splitlines()[-1])
+
+
+def boom(state):
+    raise KeyError("boom")
+
+
+heal_disk()
+rc, u, err = entry("apply_answer", heal_base(tasks="garbage", escalation=escalation("plan_unauthored", "q", []), last_answer="go"))
+check("entry apply_answer: tasks is a plain string -> healed from tasks.json and the gate runs (exit 0)",
+      rc == 0 and u.get("_next") == "quality_bar_gate" and u.get("tasks") == HEAL_TASKS and "state: healed tasks from tasks.json" in u.get("decisions", []),
+      f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("harvest_report", heal_base(run_dir=None))
+check("entry harvest_report: run_dir null with a run_id -> recomputed from the run id and the gate runs",
+      rc == 0 and u.get("run_dir") == HEAL_DIR and u.get("_next") == "design_ask_gate" and "state: healed run_dir from run_id" in u.get("decisions", []),
+      f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("verify_gate", heal_base(code_repo_path=None, verify_scope="task"))
+check("entry verify_gate: code_repo_path null -> healed from state.json and the gate runs",
+      rc == 0 and u.get("code_repo_path") == CODE and u.get("_next") in ("run_gauntlet", "run_adversary")
+      and "state: healed code_repo_path from state.json" in u.get("decisions", []), f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("claim_task", heal_base(current_task=None))
+check("entry claim_task: current_task null and none saved -> back to select_tasks with a ledger line, nothing claimed",
+      rc == 0 and u.get("_next") == "select_tasks" and any("claim_task has no current task" in d for d in u.get("decisions", [])),
+      f"rc={rc} {err} {u.get('_next')}")
+heal_disk(current_task=T1)
+_s = heal_base()
+_s.pop("current_task")
+rc, u, err = entry("harvest_report", _s)
+check("entry harvest_report: current_task missing -> healed from state.json",
+      rc == 0 and u.get("current_task") == T1 and "state: healed current_task from state.json" in u.get("decisions", []), f"rc={rc} {err}")
+heal_disk()
+rc, u, err = entry("select_tasks", heal_base(pending_fixes="garbage"))
+_esc = u.get("escalation") or {}
+check("entry select_tasks: an exception in the gate -> state_fault escalation naming the gate and the error, Retry recommended",
+      rc == 0 and u.get("_next") == "escalate_gate" and _esc.get("kind") == "state_fault" and "select_tasks" in _esc.get("question", "")
+      and "AttributeError" in _esc.get("question", "") and (_esc.get("options") or [{}])[0].get("text") == SF_RETRY
+      and _esc["options"][0].get("recommended") and "Traceback" in _esc.get("evidence", "") and u.get("ask_question")
+      and _esc.get("data", {}).get("gate") == "select_tasks" and _esc["data"].get("phase") == "task saved", f"rc={rc} {err} {_esc}")
+heal_disk()
+guarded("run: a gate past the retry cap -> state_fault with no option recommended",
+        lambda: (lambda u: (u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault"
+                            and not any(o.get("recommended") for o in u["escalation"]["options"]), u.get("escalation")))(
+            run_gate("claim_task", heal_base(cap_continues={"state_fault:claim_task": STRIKE_LIMIT}), boom)))
+guarded("run: a fault names the healed keys in its question",
+        lambda: (lambda u: ("run_dir" in u["escalation"]["question"] and u.get("run_dir") == HEAL_DIR, u["escalation"]["question"]))(
+            run_gate("claim_task", heal_base(run_dir=None), boom)))
+
+
+def _escalate_twice():
+    first = run_gate("escalate_gate", heal_base(escalation=E), boom)
+    second = run_gate("escalate_gate", heal_base(escalation=first.get("escalation")), boom)
+    ok = (first.get("_next") == "escalate_gate" and first["escalation"]["kind"] == "state_fault"
+          and first["escalation"]["data"].get("gate") == "escalate_gate" and first["escalation"]["data"].get("prior", {}).get("kind") == E["kind"]
+          and second.get("_next") == "end_failure" and "escalate_gate faulted repeatedly" in second.get("failure_reason", "")
+          and "escalation" not in second)
+    return ok, f"{first.get('_next')} {second.get('_next')} {second.get('failure_reason')}"
+
+
+guarded("run: escalate_gate faulting while its own state_fault is open -> end_failure with a failure_reason, never a third ask", _escalate_twice)
+SF = escalation("state_fault", "q", [option(SF_RETRY, True), option(SF_RESUME), option("Abort the run")], data={"gate": "select_tasks", "phase": "task saved"})
+u = AA("state_fault", "1", esc=SF)
+check("apply_answer: state_fault retry -> the gate's own node, the per-gate retry counted",
+      u.get("_next") == "select_tasks" and u.get("cap_continues", {}).get("state_fault:select_tasks") == 1, u)
+u = AA("state_fault", SF_RESUME, esc=SF)
+check("apply_answer: state_fault resume -> resume_route at the saved phase", u.get("_next") == "resume_route" and u.get("resume_phase") == "task saved", u)
+check("apply_answer: state_fault abort -> end_aborted", AA("state_fault", "Abort the run", esc=SF)["_next"] == "end_aborted")
+u = AA("state_fault", "don't retry yet", esc=SF)
+check("apply_answer: state_fault reply naming no option -> asked again, nothing retried",
+      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault" and u["escalation"]["data"].get("unmatched_replies") == 1
+      and "cap_continues" not in u, u)
+u = AA("state_fault", SF_RETRY, esc={**SF, "data": {"gate": "apply_answer", "prior": E}})
+check("apply_answer: state_fault retry of an escalation gate -> the interrupted question is asked again",
+      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == E["kind"], u)
+_s = base_state(run_id="heal-none", run_dir=_lib.run_dir_for("heal-none"), tasks=None, tasks_root=LEDGER_TASKS, plan_path=LEDGER_PLAN)
+guarded("heal_state: tasks null, no tasks.json -> the task files",
+        lambda: (lambda r: (r[0]["tasks"] and r[0]["tasks"] == _lib.load_tasks(_s) and ("tasks", "the task files") in r[1], r[1]))(
+            _lib.heal_state(_s)))
+_s = heal_base()
+_s.pop("tasks_root")
+guarded("heal_state: tasks_root missing -> recomputed from plans_root",
+        lambda: (lambda r: (r[0]["tasks_root"] == os.path.join(_s["plans_root"], "tasks") and ("tasks_root", "plans_root") in r[1], r[1]))(_lib.heal_state(_s)))
+heal_disk(plans_root=PLANS, design_doc_path=DESIGN)
+_s = heal_base()
+for _k in ("plans_root", "design_doc_path"):
+    _s.pop(_k)
+guarded("heal_state: an absent optional key (plans_root, design_doc_path) stays absent even when state.json carries one",
+        lambda: (lambda r: ("plans_root" not in r[0] and "design_doc_path" not in r[0]
+                            and not any(k in ("plans_root", "design_doc_path") for k, _ in r[1]), r[1]))(_lib.heal_state(_s)))
+guarded("heal_state: a null plans_root is still healed from state.json",
+        lambda: (lambda r: (r[0]["plans_root"] == PLANS and ("plans_root", "state.json") in r[1], r[1]))(_lib.heal_state(heal_base(plans_root=None))))
+
+
+def _verify_without_store(declared):
+    s = heal_base(verify_scope="task", round_log=copy.deepcopy(rl))
+    if not declared:
+        s.pop("plans_root")
+    dirt = os.path.join(PLANS, "tasks", "heal-dirt.md")
+    write(dirt, "status: in-progress\n")
+    try:
+        gp = run_gate("verify_gate", s)["gauntlet_prompt"].splitlines()
+    finally:
+        os.remove(dirt)
+    return [l for l in gp if l.startswith(("Re-review delta:", "Settled lanes:"))]
+
+
+guarded("run verify_gate: plans_root absent from state (state.json carries one), planning dirt only -> no Re-review delta and no Settled lanes line",
+        lambda: (lambda declared, absent: (declared != [] and absent == [], (declared, absent)))(
+            _verify_without_store(True), _verify_without_store(False)))
+heal_disk()
+heal_disk(plan_path="/elsewhere.md")
+guarded("heal_state: valid values are never overwritten, and a state with no run is left alone",
+        lambda: (lambda a, b: (a[1] == [] and a[0]["plan_path"] == PROMOTED and a[0]["code_repo_path"] == "" and b == ({"tasks": "x"}, []), (a[1], b)))(
+            _lib.heal_state(heal_base(plan_path=PROMOTED, code_repo_path="")), _lib.heal_state({"tasks": "x"})))
+heal_disk()
+with open(os.path.join(HEAL_DIR, "state.json"), "wb") as _f:
+    _f.write(b"\xff\xfe{not json")
+with open(os.path.join(HEAL_DIR, "tasks.json"), "wb") as _f:
+    _f.write(b"\xff\xfe[not json")
+rc, u, err = entry("harvest_report", heal_base(tasks="garbage", code_repo_path=None))
+check("entry harvest_report: state.json and tasks.json not UTF-8 -> no crash, the gate runs or raises state_fault",
+      rc == 0 and (u.get("_next") == "design_ask_gate" or (u.get("escalation") or {}).get("kind") == "state_fault"), f"rc={rc} {err}")
+heal_disk()
+os.remove(os.path.join(HEAL_DIR, "tasks.json"))
+EMPTY_TASKS = os.path.join(TMP, "no-task-files")
+os.makedirs(EMPTY_TASKS, exist_ok=True)
+guarded("run: tasks=123 with no tasks.json and no task files -> select_tasks raises state_fault naming tasks, never the Phase F close-out",
+        lambda: (lambda u: (u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault" and "tasks" in u["escalation"]["question"]
+                            and "tasks" not in u, (u.get("_next"), (u.get("escalation") or {}).get("question"))))(
+            run_gate("select_tasks", heal_base(tasks=123, tasks_root=EMPTY_TASKS))))
+guarded("run: tasks=123 with nothing to heal from -> an escalation gate still runs, so the owner can answer",
+        lambda: (lambda u: (u.get("_next") == "end_aborted", u.get("_next")))(
+            run_gate("apply_answer", heal_base(tasks=123, tasks_root=EMPTY_TASKS, last_answer="Abort the run",
+                                               escalation=escalation("state_fault", "q", [option(SF_RETRY), option(SF_RESUME), option("Abort the run")],
+                                                                     data={"gate": "select_tasks"})))))
+write(os.path.join(HEAL_DIR, "state.json"), json.dumps({"run_id": HEAL_RUN, "run_dir": HEAL_DIR, "phase": "task saved"}))
+guarded("run: code_repo_path=5 with nothing to heal from -> a git-using gate raises state_fault before it runs, never git in the current directory",
+        lambda: (lambda u: (u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault"
+                            and "code_repo_path" in u["escalation"]["question"] and "code_repo_path" not in u, u))(
+            run_gate("integration_test", heal_base(code_repo_path=5, project_dir="relative/dir"), lambda s: {"_next": "the gate ran"})))
+heal_disk()
+_s = heal_base()
+_s.pop("current_task")
+guarded("run: a gate that acts on no task, with current_task missing and none saved -> its state_fault does not name current_task",
+        lambda: (lambda q: ("current_task" not in q, q))(run_gate("harvest_report", _s, boom)["escalation"]["question"]))
+
+# ---------------------------------------------------------------- task branch cleanup only after a verified merge
+RB = "feat/PLAN-widgets"
+git(CODE, "checkout", "-q", RB)
+
+
+def task_branch(name, merge=False):
+    """A task branch with one commit in its own worktree, pushed; merged into the run branch and pushed when asked."""
+    wt = os.path.join(CODE, ".worktrees", name)
+    git(CODE, "worktree", "add", "-q", wt, "-b", name, RB)
+    write(os.path.join(wt, f"{name}.txt"), name + "\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-q", "-m", f"feat: {name}")
+    git(CODE, "push", "-q", "origin", name)
+    if merge:
+        git(CODE, "merge", "-q", "--no-ff", "--no-edit", name)
+        git(CODE, "push", "-q", "origin", RB)
+    return wt, git(CODE, "rev-parse", name)
+
+
+def on_origin(branch):
+    return git(CODE, "ls-remote", "--heads", "origin", branch) != ""
+
+
+def local(branch):
+    return git(CODE, "branch", "--list", branch) != ""
+
+
+def cleanup_task(wt, branch, status="complete", **rounds):
+    ts = copy.deepcopy(TS_W)
+    gates.task_by_id(ts, T1).update({"status": status, "worktree": wt, "branch": branch})
+    return gates.wave_cleanup(base_state(plan_path=PROMOTED, tasks=ts, current_task=T1, run_branch=RB, wave_results=[],
+                                         task_rounds={T1: rounds} if rounds else {}))
+
+
+wt_x, sha_x = task_branch("cl-unmerged")
+u = cleanup_task(wt_x, "cl-unmerged")
+check("wave_cleanup: a complete task whose branch was never merged -> branch kept locally and on origin, the reason ledgered",
+      local("cl-unmerged") and on_origin("cl-unmerged") and any("cl-unmerged kept" in d for d in u["decisions"]), u["decisions"])
+wt_x, sha_x = task_branch("cl-unverified", merge=True)
+u = cleanup_task(wt_x, "cl-unverified")
+check("wave_cleanup: merged but no passed integration test recorded -> branch kept locally and on origin",
+      local("cl-unverified") and on_origin("cl-unverified"), u["decisions"])
+wt_x, sha_x = task_branch("cl-merged", merge=True)
+u = cleanup_task(wt_x, "cl-merged", integrated_sha=sha_x)
+check("wave_cleanup: head is the integrated sha and an ancestor of the run branch -> worktree removed, branch deleted (local + origin)",
+      not os.path.isdir(wt_x) and not local("cl-merged") and not on_origin("cl-merged"), u["decisions"])
+wt_x, sha_x = task_branch("cl-moved", merge=True)
+write(os.path.join(wt_x, "late.txt"), "late\n")
+git(wt_x, "add", ".")
+git(wt_x, "commit", "-q", "-m", "late commit")
+git(CODE, "push", "-q", "origin", "cl-moved")
+u = cleanup_task(wt_x, "cl-moved", integrated_sha=sha_x)
+check("wave_cleanup: branch moved past the integrated sha -> branch kept locally and on origin",
+      local("cl-moved") and on_origin("cl-moved"), u["decisions"])
+wt_x, sha_x = task_branch("cl-dirty", merge=True)
+write(os.path.join(wt_x, "scratch.txt"), "uncommitted\n")
+u = cleanup_task(wt_x, "cl-dirty", integrated_sha=sha_x)
+check("wave_cleanup: a worktree that will not remove cleanly -> kept (never forced), follow-up recorded, branch kept",
+      os.path.isdir(wt_x) and local("cl-dirty") and any("cl-dirty" in f for f in u.get("follow_ups", [])), (u["decisions"], u.get("follow_ups")))
+wt_x, sha_x = task_branch("cl-failed")
+write(os.path.join(wt_x, "scratch.txt"), "uncommitted\n")
+u = cleanup_task(wt_x, "cl-failed", status="failed")
+check("wave_cleanup: a failed task's dirty worktree -> force-removed, branch kept locally and on origin",
+      not os.path.isdir(wt_x) and local("cl-failed") and on_origin("cl-failed"), u["decisions"])
+wt_x, sha_x = task_branch("cl-remote", merge=True)
+write(os.path.join(wt_x, "remote-only.txt"), "pushed from elsewhere\n")
+git(wt_x, "add", ".")
+git(wt_x, "commit", "-q", "-m", "remote-only commit")
+git(CODE, "push", "-q", "origin", "cl-remote")
+git(wt_x, "reset", "-q", "--hard", sha_x)
+remote_head = git(CODE, "ls-remote", "--heads", "origin", "cl-remote").split()[0]
+u = cleanup_task(wt_x, "cl-remote", integrated_sha=sha_x)
+check("wave_cleanup: origin holds a commit the local branch lacks -> local branch deleted, remote kept at its head, the refusal ledgered",
+      not local("cl-remote") and on_origin("cl-remote") and git(CODE, "ls-remote", "--heads", "origin", "cl-remote").split()[0] == remote_head
+      and any("cl-remote" in d and "remote kept" in d for d in u["decisions"]), u["decisions"])
+
+wt_x, sha_x = task_branch("int-green")
+ts_i = copy.deepcopy(TS_W)
+gates.task_by_id(ts_i, T1).update({"status": "in-progress", "worktree": wt_x, "branch": "int-green"})
+u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch=RB, task_rounds={}, verification_commands='["true"]'))
+check("integration_test: a green merge records the merged branch head as integrated_sha",
+      u["_next"] == "harvest_report" and u["task_rounds"][T1].get("integrated_sha") == sha_x, u.get("task_rounds"))
+wt_x, sha_x = task_branch("int-checkout")
+gates.task_by_id(ts_i, T1).update({"worktree": wt_x, "branch": "int-checkout"})
+head0 = git(CODE, "rev-parse", "HEAD")
+u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch="no-such-run-branch", task_rounds={}))
+check("integration_test: checkout of the run branch fails -> escalation, nothing merged",
+      u.get("_next") == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "integration_checkout"
+      and git(CODE, "rev-parse", "HEAD") == head0
+      and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", "int-checkout", "HEAD"]).returncode != 0, u.get("_next"))
+_esc = u.get("escalation") or {}
+_spent = (gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch="no-such-run-branch", task_rounds={},
+                                            cap_continues={f"integration_checkout:{T1}": STRIKE_LIMIT})).get("escalation") or {})
+check("integration_test: a failed checkout offers the retry first and recommended; after the cap's continues none is, with the cap-spent note",
+      [(o["text"], o["recommended"]) for o in _esc.get("options", [])] == [("Retry the integration", True), ("Stop and report", False)]
+      and not any(o["recommended"] for o in _spent.get("options", [])) and gates.CAP_SPENT_NOTE in _spent.get("question", ""),
+      (_esc.get("options"), _spent.get("options")))
+u = AA("integration_checkout", "1", esc=_esc, tasks=ts_i, current_task=T1, cap_continues={})
+check("apply_answer: integration_checkout retry -> integration_test, one continue counted on the task's checkout cap",
+      u.get("_next") == "integration_test" and _lib.as_dict(u.get("cap_continues")).get(f"integration_checkout:{T1}") == 1, u)
+
+
+def integrate_red_then_fixed(name, between):
+    """A merge whose suite is RED, `between` run on the repo, a fix commit on the task branch, then integration_test again
+    on green; (the run branch before the merge, the RED merge, the fixed head, the green update)."""
+    wt, _ = task_branch(name)
+    ts = copy.deepcopy(TS_W)
+    gates.task_by_id(ts, T1).update({"status": "in-progress", "worktree": wt, "branch": name})
+    git(CODE, "checkout", "-q", RB)
+    before = git(CODE, "rev-parse", RB)
+    red = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts, integration_task=T1, run_branch=RB, task_rounds={},
+                                            verification_commands='["false"]'))
+    rounds = red["task_rounds"]
+    merge = rounds[T1].get("merge_sha", "")
+    rounds[T1]["merged"] = False
+    between()
+    write(os.path.join(wt, f"{name}-fix.txt"), "fixed\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-q", "-m", f"fix: {name}")
+    green = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts, integration_task=T1, run_branch=RB, task_rounds=rounds,
+                                              verification_commands='["true"]'))
+    return before, merge, git(CODE, "rev-parse", name), green
+
+
+before_, merge_, fixed_, u = integrate_red_then_fixed("int-redo", lambda: None)
+check("integration_test: RED after the merge, a fix round, then green -> the unpushed merge undone once, the fixed branch merged once",
+      u.get("_next") == "harvest_report" and git(CODE, "rev-parse", f"{RB}^1") == before_ and git(CODE, "rev-parse", f"{RB}^2") == fixed_
+      and git(CODE, "rev-list", "--count", "--merges", f"{before_}..{RB}") == "1"
+      and sum("unpushed merge" in d and "undone" in d for d in u.get("decisions", [])) == 1, u.get("decisions"))
+
+
+def _commit_on_run_branch():
+    write(os.path.join(CODE, "moved.txt"), "moved\n")
+    git(CODE, "add", "moved.txt")
+    git(CODE, "commit", "-q", "-m", "a commit on top of the merge")
+
+
+before_, merge_, fixed_, u = integrate_red_then_fixed("int-moved", _commit_on_run_branch)
+check("integration_test: HEAD moved past the RED merge -> no reset, the earlier merge stays on the run branch",
+      bool(merge_) and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", merge_, RB]).returncode == 0
+      and not any("unpushed merge" in d for d in u.get("decisions", [])), u.get("decisions"))
+before_, merge_, fixed_, u = integrate_red_then_fixed("int-pushed", lambda: git(CODE, "push", "-q", "origin", RB))
+check("integration_test: the RED merge already on origin -> no reset, the earlier merge stays on the run branch",
+      bool(merge_) and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", merge_, RB]).returncode == 0
+      and not any("unpushed merge" in d for d in u.get("decisions", [])), u.get("decisions"))
+
+
+def finish_fix_round(s):
+    """post_round then fix_done on a finished fix round; (post_round's next, the merged state)."""
+    s.update({"round_log": {T1: [{"round": 1, "head": "h"}]}, "last_verdict": "PASS", "verify_unit": T1})
+    s.update(gates.post_round(s))
+    first = s["_next"]
+    if first == "fix_done":
+        s.update(gates.fix_done(s))
+    return first, s
+
+
+ts_f1 = copy.deepcopy(TS_W)
+gates.task_by_id(ts_f1, T1).update({"status": "in-progress", "worktree": WAVE[0]["worktree"]})
+s = base_state(plan_path=PROMOTED, tasks=ts_f1, current_task=T1, run_branch=RB, integration_task="", task_rounds={T1: {"merged": True, "integration_strikes": 1}},
+               fix_request={"task": T1, "source": "integration", "return_to": "integration", "items": ["Post-merge integration failure"]})
+s.update(gates.fix_round(s))
+s.update({"fix_source": "review", "fix_return_to": "verify"})
+first, s = finish_fix_round(s)
+check("integration fix round (with a conformance round inside) finishing -> fix_done -> integration_test, merged cleared",
+      first == "fix_done" and s["_next"] == "integration_test" and s.get("integration_task") == T1 and not s["task_rounds"][T1].get("merged"),
+      (first, s.get("_next"), s.get("integration_task"), s.get("task_rounds")))
+s = base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_f1), current_task=T1, integration_task=T3,
+               last_answer="Retry the task sequentially (one fix round with the evidence)",
+               escalation=gates.escalation("wave_escalation", "q", [gates.option("Retry the task sequentially (one fix round with the evidence)")], evidence="- e"))
+s.update(gates.apply_answer(s))
+first, s = finish_fix_round(s)
+check("wave retry fix round finishing (single) -> integration_test for that task",
+      first == "fix_done" and s["_next"] == "integration_test" and s.get("integration_task") == T1, (first, s.get("_next"), s.get("integration_task")))
+
+# ---------------------------------------------------------------- CI verdicts: only all-pass is green; draft state re-read after gh pr ready
+_ci_saved = {k: os.environ.get(k) for k in ("ARCHITECT_GH_CHECKS_CMD", "ARCHITECT_GH_READY_CMD", "ARCHITECT_GH_VIEW_CMD", "ARCHITECT_GH_RERUN_CMD")}
+CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
+CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
+CI_NO_CI = "Finish without CI (no checks configured; recorded)"
+checks(("build", "pass"), ("e2e", "cancel"))
+u_cancel = gates.ci_poll(base_state(pr_number="99", ci_polls=1))
+check("ci_poll: a cancelled check beside a pass -> inconclusive, not green", u_cancel.get("ci_status") == "inconclusive" and u_cancel["_next"] == "ci_route", u_cancel.get("ci_status"))
+checks(("lint", "skipping"))
+check("ci_poll: skipped checks only -> inconclusive", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "inconclusive")
+checks(("build", "pass"), ("docs", "neutral"))
+check("ci_poll: a neutral check beside a pass -> inconclusive", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "inconclusive")
+checks(("build", "pass"), ("odd", "mystery"))
+check("ci_poll: an unknown bucket -> inconclusive", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "inconclusive")
+checks()
+u = gates.ci_poll(base_state(pr_number="99", ci_polls=1))
+check("ci_poll: an empty check list -> no_checks -> ci_route", u.get("ci_status") == "no_checks" and u["_next"] == "ci_route", u.get("ci_status"))
+checks(("build", "pass"), ("test", "success"))
+check("ci_poll: every check pass or success -> green", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "green")
+u = gates.ci_route(base_state(pr_number="99", ci_status="inconclusive", ci_checks=u_cancel["ci_checks"]))
+ESC_INC = u.get("escalation") or {}
+check("ci_route: inconclusive -> ci_inconclusive evidence escalation naming every check and bucket, re-run recommended when one was cancelled",
+      u["_next"] == "escalate_gate" and ESC_INC.get("kind") == "ci_inconclusive" and "build: pass" in ESC_INC.get("evidence", "")
+      and "e2e: cancel" in ESC_INC.get("evidence", "") and [o["text"] for o in ESC_INC["options"] if o.get("recommended")] == [CI_RERUN_CANCELLED], ESC_INC)
+u = gates.ci_route(base_state(pr_number="99", ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["docs", "skipping", ""]]))
+ESC_SKIP = u.get("escalation") or {}
+check("ci_route: only skipped checks beside a pass -> treat as green recommended",
+      [o["text"] for o in ESC_SKIP.get("options", []) if o.get("recommended")] == [CI_TREAT_GREEN], ESC_SKIP)
+u = gates.ci_route(base_state(pr_number="99", ci_status="no_checks", ci_checks=[]))
+ESC_NONE = u.get("escalation") or {}
+check("ci_route: no_checks -> ci_no_checks escalation, finish without CI recommended",
+      ESC_NONE.get("kind") == "ci_no_checks" and [o["text"] for o in ESC_NONE.get("options", []) if o.get("recommended")] == [CI_NO_CI], ESC_NONE)
+u = AA("ci_inconclusive", CI_TREAT_GREEN, esc=ESC_SKIP, last_answer_text="2 - the docs job is skipped by design", pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive treat as green -> flip_ready with the reason ledgered and recorded, CI status not green",
+      u.get("_next") == "flip_ready" and any("treated as green" in d and "skipped by design" in d for d in u.get("decisions", []))
+      and any("treated as green" in f for f in u.get("follow_ups", [])) and u.get("ci_status") != "green", u)
+u = AA("ci_inconclusive", CI_TREAT_GREEN, esc=ESC_SKIP, **WATCH, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive treat as green while watching -> review_poll", u.get("_next") == "review_poll", u.get("_next"))
+u = AA("ci_inconclusive", "1", esc=ESC_INC, pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive re-run -> ci_poll with the watch reset", u.get("_next") == "ci_poll" and u.get("ci_polls") == 0, u.get("_next"))
+u = AA("ci_inconclusive", "whatever you think", esc=ESC_INC, pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive reply naming no option -> asked again",
+      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "ci_inconclusive" and u["escalation"]["data"].get("unmatched_replies") == 1, u.get("_next"))
+u = AA("ci_no_checks", CI_NO_CI, esc=ESC_NONE, pr_number="99", tasks=ts_f, ci_status="no_checks")
+check("apply_answer: ci_no_checks finish without CI -> flip_ready with a follow-up, never CI green",
+      u.get("_next") == "flip_ready" and any("no CI checks" in f for f in u.get("follow_ups", [])) and u.get("ci_status") != "green", u)
+check("apply_answer: a whole-reply stop or abort on ci_inconclusive or ci_no_checks -> the leave path, as on ci_exhausted",
+      [AA(k, r, esc=e, pr_number="99", tasks=ts_f, ci_status=s)["_next"]
+       for k, e, s in (("ci_inconclusive", ESC_INC, "inconclusive"), ("ci_no_checks", ESC_NONE, "no_checks")) for r in ("stop", "abort")]
+      == ["finish_plan"] * 4)
+u = gates.ci_route(base_state(pr_number="99", ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["e2e", "cancel", "https://ci.example/job/7"]]))
+ESC_NOID = u.get("escalation") or {}
+check("ci_route: a cancelled check with no /actions/runs/<id> link -> the re-run is not recommended, leaving is",
+      [o["text"] for o in ESC_NOID.get("options", []) if o.get("recommended")] == ["Leave the PR in draft and report"], ESC_NOID.get("options"))
+u = AA("ci_inconclusive", CI_RERUN_CANCELLED, esc=ESC_NOID, pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: a re-run that finds no re-runnable run id -> ledgered as such, the watch still restarts",
+      u.get("_next") == "ci_poll" and any("no re-runnable run found" in d for d in u.get("decisions", [])), u.get("decisions"))
+os.environ["ARCHITECT_GH_CHECKS_CMD"] = "echo \"no checks reported on the 'feat/x' branch\" >&2; exit 1"
+u0 = gates.ci_poll(base_state(pr_number="99", ci_polls=0))
+u1 = gates.ci_poll(base_state(pr_number="99", ci_polls=1))
+check("ci_poll: gh exits non-zero with 'no checks reported on the' -> polled again on the first read, then no_checks",
+      (u0.get("ci_status"), u0["_next"], u1.get("ci_status"), u1["_next"]) == ("pending", "ci_poll", "no_checks", "ci_route")
+      and not u1.get("ci_poll_fails"), (u0, u1))
+os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo true"
+u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
+check("flip_ready: gh pr ready exit 0 but isDraft still true -> flipped_ready False, no 'flipped to ready' line",
+      u.get("flipped_ready") is False and not any("flipped to ready" in d for d in u.get("decisions", [])), u.get("decisions"))
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo false"
+u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
+check("flip_ready: gh pr ready exit 0 and isDraft re-read false -> flipped_ready True", u.get("flipped_ready") is True, u.get("decisions"))
+for _k, _v in _ci_saved.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")

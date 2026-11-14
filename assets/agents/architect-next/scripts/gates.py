@@ -2,9 +2,11 @@
 
 Each function takes the graph state and returns the updates to merge, including
 `_next` when the node routes dynamically. Entry scripts call `run("<name>")`.
-Gates on the critical path raise on internal errors (the engine then takes the
-node's declared fallback and records last_script_error); advisory gates catch
-and declare their degradation instead.
+`run` heals wrong-typed or missing state keys before the gate and turns an
+exception on the critical path into a `state_fault` escalation; only a gate
+inside a map branch still raises, so the engine takes the branch's declared
+fallback and records last_script_error. Advisory gates catch and declare their
+degradation instead.
 """
 
 import datetime
@@ -15,6 +17,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,10 +36,10 @@ from _lib import (  # noqa: E402
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
     append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, emit,
-    ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
+    ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines, heal_state,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section, review_fault,
-    raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
+    raise_escalation, read_artifact, read_file, read_snapshot, render_question, run_dir_for, save_tasks, set_frontmatter,
     set_task_status, sh, snapshot, split_option_reply, tail, task_by_id, task_dir_for, task_section, today, trim_items,
     truthy, var, write_artifact, write_file,
 )
@@ -807,7 +810,8 @@ def reseal_gate(state):
                 data={"source": source, "over": over}))
     u.update({"plan_revision": rev, "sealed": False, "gate2_verdict": "", "gate1_verdict": ""})
     snapshot(state, u, "reseal")
-    u["_next"] = "gate1_build"
+    # design-round answers reach here before the quality bar and checklist ran; that chain ends back here once recorded
+    u["_next"] = "gate1_build" if truthy(state.get("quality_recorded")) else "quality_bar_gate"
     return u
 
 
@@ -859,17 +863,15 @@ def gate1_route(state):
     u = {}
     note_script_error(state, u, "gate1")
     text = state.get("gate1_result") or ""
-    if not text or text.startswith("Agent node failed") or "PLAN_GATE" not in text:
+    verdict = _last_verdict(text, "PLAN_GATE", ("SEALED", "LEAKY", "FRICTION"))
+    if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The gatekeeper produced no verdict (agent fault). Retry the gate, or abort?",
             [option("Retry the gatekeeper", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
             data={"gate": "gate1"}))
-    m = re.search(r"PLAN_GATE:\s*(SEALED|LEAKY|FRICTION)", text)
-    verdict = m.group(1) if m else "LEAKY"
-    friction_only = verdict == "FRICTION" or (verdict == "SEALED" and "FRICTION" in text)
     u["gate1_verdict"] = verdict
     if verdict == "SEALED" or verdict == "FRICTION":
-        if friction_only and verdict == "FRICTION":
+        if verdict == "FRICTION":
             ledger(state, u, "gate1: FRICTION-only verdict sealed at discretion (tier 1); accepted findings noted in the plan")
             path = state.get("plan_path", "")
             if path and os.path.isfile(path):
@@ -992,7 +994,7 @@ def gate2_route(state):
     u = {}
     note_script_error(state, u, "gate2")
     text = state.get("gate2_result") or ""
-    verdict = _plan_review_verdict(text)
+    verdict = _last_verdict(text, "PLAN_REVIEW", ("OKAY", "REJECT"))
     if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The oracle produced no PLAN_REVIEW verdict (agent fault). Retry, or abort?",
@@ -1022,7 +1024,6 @@ def gate2_route(state):
 
 GATE2_ANOTHER_ROUND = "Another fix round (state reason)"
 GATE2_OVERRIDE = "Override: promote the plan as reviewed (recorded)"
-PLAN_REVIEW_RE = re.compile(r"(?i)PLAN_REVIEW\s*:\s*(OKAY|REJECT)\b")
 
 
 def _gate2_stuck_options(more=True):
@@ -1048,13 +1049,16 @@ def _count_continue(state, u, cap):
     u["cap_continues"] = counts
 
 
-def _plan_review_verdict(text):
-    """The reviewer's final verdict: the last line reading PLAN_REVIEW: OKAY or REJECT, markdown bold and backticks
-    ignored; a line that names both (an echoed prompt) is no verdict. "" when no line qualifies."""
+def _last_verdict(text, sentinel, words):
+    """A reviewer's final verdict: the last line reading `SENTINEL: WORD` for one of `words`, case-insensitive,
+    markdown bold and backticks ignored, upper-cased; a line that names more than one of the words (an echoed prompt)
+    is no verdict. "" when no line qualifies."""
+    alternatives = "|".join(words)
+    verdict_re = re.compile(rf"(?i){sentinel}\s*:\s*({alternatives})\b")
     for line in reversed(text.splitlines()):
         plain = re.sub(r"[*`]", "", line)
-        m = PLAN_REVIEW_RE.search(plain)
-        if m and not (re.search(r"(?i)\bOKAY\b", plain) and re.search(r"(?i)\bREJECT\b", plain)):
+        m = verdict_re.search(plain)
+        if m and sum(bool(re.search(rf"(?i)\b{w}\b", plain)) for w in words) == 1:
             return m.group(1).upper()
     return ""
 
@@ -1948,10 +1952,52 @@ def _probe_verdict(text):
     return verdicts[-1] if verdicts else ""
 
 
+def _adversary_verdict(text):
+    """The last verdict line, unless the first one disagrees with it: the adversary writes its verdict first, so a
+    CONFORMS line further down may be quoted inside a complaint, and a report that says both reads DIVERGES."""
+    words = ("CONFORMS", "DIVERGES")
+    last = _last_verdict(text, "ADVERSARIAL_REVIEW", words)
+    first = _last_verdict("\n".join(reversed(text.splitlines())), "ADVERSARIAL_REVIEW", words)
+    return last if first == last else "DIVERGES"
+
+
+# The sections the adversary renders after its complaints, each after a blank
+# line. Exact names, so a complaint holding a blank line and a line ending in
+# `:` stays inside its complaint.
+SECTIONS_AFTER_COMPLAINTS = ("Non-blocking observations:", "Met criteria (evidence):", "Verification runs:")
+# Every character str.splitlines() treats as a line boundary.
+_LINE_BREAKS = re.compile(r"[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+")
+
+
+def _adversary_complaints(text):
+    """The numbered items under the adversary's `Complaints:` line, in order, each whole with its
+    continuation lines joined. Split on `\\n` only, since a complaint is model text and may carry any other line
+    boundary or a blank line. An item runs until a line opening the NEXT number, or a blank line followed by one of
+    SECTIONS_AFTER_COMPLAINTS. This follows review-gauntlet's verdict_gate.adversary_complaints; keep the two in step."""
+    lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+    start = next((i + 1 for i, l in enumerate(lines) if l.strip() == "Complaints:"), len(lines))
+    body = lines[start:]
+    items, number = [], None
+    for k, line in enumerate(body):
+        m = re.match(r"(\d+)\.\s+(.*)", line)
+        if m and (number is None or int(m.group(1)) == number + 1):
+            number = int(m.group(1))
+            items.append(m.group(2).strip())
+        elif not items:
+            break
+        elif not line.strip():
+            nxt = next((b for b in body[k + 1:] if b.strip()), None)
+            if nxt is None or nxt.strip() in SECTIONS_AFTER_COMPLAINTS:
+                break
+        else:
+            items[-1] += " " + line.strip()
+    return [_LINE_BREAKS.sub(" ", c).strip() for c in items if c.strip()]
+
+
 # The direct micro-mode adversary's report has no gauntlet header, so on that
 # lane its `ADVERSARIAL_REVIEW:` line is the only verdict (a `GAUNTLET:` line
 # quoted in its verification output is not one) and its complaints are the
-# numbered items under its column-0 `Complaints:` line, read from the whole
+# numbered items under its `Complaints:` line, read from the whole
 # report. A lane row it quotes is not a lane verdict, so it reports no lanes
 # and the next round settles none; a quoted probe row or USAGE_PROBE line is
 # no probe verdict either, so it yields no probe files.
@@ -1960,8 +2006,9 @@ def _parse_gauntlet(text, adversary_lane=False):
     header_lines = header.splitlines()
     verdict = "BLOCKED"
     if adversary_lane:
-        if m := re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", text):
-            verdict = "PASS" if m.group(1) == "CONFORMS" else "BLOCKED"
+        adversary = _adversary_verdict(text)
+        if adversary:
+            verdict = "PASS" if adversary == "CONFORMS" else "BLOCKED"
     elif m := _GAUNTLET_VERDICT_RE.search(header):
         verdict = m.group(1)
     incomplete = []
@@ -1975,14 +2022,8 @@ def _parse_gauntlet(text, adversary_lane=False):
         sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", text)
         if sec:
             blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
-        text_lines = text.splitlines()
-        start = next((i + 1 for i, l in enumerate(text_lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(text_lines))
-        for line in text_lines[start:]:
-            if not line.strip():
-                break
-            if m := re.match(r"\d+\.[ \t]+(.+)", line):
-                blockers.append(m.group(1).strip())
-        if verdict == "BLOCKED" and not blockers and "ADVERSARIAL_REVIEW: DIVERGES" in text:
+        blockers += _adversary_complaints(text)
+        if adversary == "DIVERGES" and not blockers:
             blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
         blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     else:
@@ -2056,7 +2097,7 @@ def route_verdict(state):
     adversary_lane = state.get("verify_lane") == "adversary"
     text = (state.get("adversary_result") if adversary_lane else state.get("gauntlet_result")) or ""
     verdict, incomplete, lanes, blockers, plan_root, probe_files = _parse_gauntlet(text, adversary_lane)
-    has_verdict = "ADVERSARIAL_REVIEW:" in text if adversary_lane else _has_verdict(_gauntlet_header(text))
+    has_verdict = bool(_adversary_verdict(text)) if adversary_lane else _has_verdict(_gauntlet_header(text))
     if not text or text.startswith("Agent node failed") or not has_verdict:
         verdict, incomplete, blockers = "BLOCKED", incomplete or ["pipeline"], []
     probe = "" if adversary_lane else _probe_verdict(text)
@@ -2148,7 +2189,7 @@ def fix_round(state):
     ret = f.get("return_to", "select_tasks")
     u.update({"current_task": f.get("task") or state.get("current_task"), "delegation_kind": "fix",
               "fix_items": as_list(f.get("items")), "fix_source": f.get("source", "review"),
-              "fix_return_to": ret, "fix_origin_return": ret if ret in ("ci", "review") else "",
+              "fix_return_to": ret, "fix_origin_return": ret if ret in ("ci", "review", "integration") else "",
               "fix_note": f.get("note", ""), "fix_request": {}})
     u["_next"] = "compose_delegation"
     return u
@@ -2193,7 +2234,9 @@ def post_round(state):
         ledger(state, u, f"pr-comment: {task['id']} PR #{task['pr_number']} round {n}: {'posted' if ok else 'FAILED ' + tail(out, 120)}")
     if state.get("fix_source") == "probe_adopt" and state.get("delegation_kind") == "fix":
         u.update({"delegation_kind": "implement", "fix_source": "", "fix_items": []})
-    if task.get("status") == "complete" and (state.get("delegation_kind") == "fix" or state.get("fix_origin_return")):
+    # A fix that integration asked for ends at integration_test, where the branch is merged and verified again.
+    if state.get("fix_origin_return") == "integration" or (
+            task.get("status") == "complete" and (state.get("delegation_kind") == "fix" or state.get("fix_origin_return"))):
         u["_next"] = "fix_done"
     else:
         u["_next"] = "harvest_report"
@@ -2216,6 +2259,9 @@ def fix_done(state):
         else:
             u["_next"] = "batch_gauntlet_build"
     elif ret == "integration":
+        rounds = dict(as_dict(state.get("task_rounds")))
+        rounds[task.get("id", "")] = {**as_dict(rounds.get(task.get("id", ""))), "merged": False}
+        u.update({"task_rounds": rounds, "integration_task": task.get("id") or state.get("integration_task") or ""})
         u["_next"] = "integration_test"
     elif ret == "integration_check":
         u["_next"] = "integration_check"
@@ -2634,6 +2680,17 @@ def _run_verification(state, cwd):
     return True, "\n".join(out_all)
 
 
+def _drop_unpushed_merge(state, u, code, run_branch, tr):
+    """Undo this task's earlier merge while it is still the unpushed tip of the run branch, so a fixed branch merges once."""
+    sha, parent = tr.pop("merge_sha", ""), tr.pop("merge_parent", "")
+    if not sha or not parent or git_out(code, "rev-parse", "HEAD") != sha:
+        return
+    if git(code, "merge-base", "--is-ancestor", sha, f"origin/{run_branch}")[0] == 0:
+        return
+    if git(code, "reset", "--quiet", "--keep", parent)[0] == 0:
+        ledger(state, u, f"integration: unpushed merge {sha[:12]} undone before merging the fixed branch")
+
+
 def integration_test(state):
     u = {}
     tasks = as_list(state.get("tasks"))
@@ -2646,7 +2703,18 @@ def integration_test(state):
     u["task_rounds"] = rounds
     u["current_task"] = tid
     if not truthy(tr.get("merged")):
-        git(code, "checkout", "--quiet", run_branch)
+        rc, out, err = git(code, "checkout", "--quiet", run_branch)
+        if rc != 0:
+            ledger(state, u, f"integration: checkout of {run_branch} failed; {tid} not merged")
+            more = _continue_recommended(_cap_continues(state, f"integration_checkout:{tid}"))
+            return raise_escalation(state, u, escalation(
+                "integration_checkout", f"The run branch {run_branch} could not be checked out in {code}, so {tid} was not merged. "
+                                        "Retry once the checkout can succeed, or stop?" + ("" if more else CAP_SPENT_NOTE),
+                [option("Retry the integration", recommended=more), option("Stop and report")], evidence=tail(out + err, 2000), hard_trigger=True,
+                data={"task": tid}))
+        _drop_unpushed_merge(state, u, code, run_branch, tr)
+        parent = git_out(code, "rev-parse", "HEAD")
+        head = git_out(code, "rev-parse", "--verify", "--quiet", task["branch"]) if task.get("branch") else ""
         rc, out, err = git(code, "merge", "--no-ff", "--no-edit", task.get("branch", ""))
         if rc != 0:
             git(code, "merge", "--abort")
@@ -2654,31 +2722,37 @@ def integration_test(state):
             tr["conflict_cycles"] = cycles
             ledger(state, u, f"integration: merge conflict for {tid} (cycle {cycles}/{CONFLICT_CYCLES_MAX})")
             if cycles > CONFLICT_CYCLES_MAX:
+                more = _continue_recommended(_cap_continues(state, f"integration_conflict:{tid}"))
                 return raise_escalation(state, u, escalation(
-                    "integration_conflict", f"{tid} conflicts with the run branch after {CONFLICT_CYCLES_MAX} rebase cycles. How to proceed?",
-                    [option("Stop and report", recommended=True), option("One more rebase cycle"), option("Abort this task (branch kept)")],
-                    evidence=tail(out + err, 2000), hard_trigger=True))
-            u["fix_request"] = {"task": tid, "source": "integration", "return_to": "integration",
-                                "items": [f"Merge conflict: rebase your task branch {task.get('branch')} onto the current {run_branch}, resolve, re-verify, re-push"],
-                                "note": tail(out + err, 3000)}
+                    "integration_conflict", f"{tid} conflicts with the run branch after {CONFLICT_CYCLES_MAX} rebase cycles. "
+                                            "One more rebase cycle (say why it should land), abort the task, or stop?"
+                                            + ("" if more else CAP_SPENT_NOTE),
+                    [option(INTEGRATION_CONFLICT_MORE, recommended=more), option("Abort this task (branch kept)"), option("Stop and report")],
+                    evidence=tail(out + err, 2000), hard_trigger=True, data={"task": tid}))
+            u["fix_request"] = _conflict_fix_request(tid, task, run_branch, tail(out + err, 3000))
             u["_next"] = "fix_round"
             return u
-        tr["merged"] = True
+        tr.update({"merged": True, "merge_head": head, "merge_sha": git_out(code, "rev-parse", "HEAD"), "merge_parent": parent})
     ok, out = _run_verification(state, code)
     if not ok:
         strikes = as_int(tr.get("integration_strikes")) + 1
         tr["integration_strikes"] = strikes
         ledger(state, u, f"integration: suite RED after merging {tid} (strike {strikes}/{STRIKE_LIMIT})")
         if strikes > STRIKE_LIMIT:
+            more = _continue_recommended(_cap_continues(state, f"integration_red:{tid}"))
             return raise_escalation(state, u, escalation(
-                "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds following {tid}'s merge. How to proceed?",
-                [option("Stop and report", recommended=True), option("One more fix round anyway")], evidence=tail(out, 2500), hard_trigger=True))
-        u["fix_request"] = {"task": tid, "source": "integration", "return_to": "integration",
-                            "items": [f"Post-merge integration failure on {run_branch} (the task was verified against its fork point, not siblings' merged work)"],
-                            "note": tail(out, 4000)}
+                "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds following {tid}'s merge. "
+                                   "One more fix round (say why it should land), or stop?" + ("" if more else CAP_SPENT_NOTE),
+                [option(INTEGRATION_RED_MORE, recommended=more), option("Stop and report")], evidence=tail(out, 2500), hard_trigger=True,
+                data={"task": tid}))
+        u["fix_request"] = _integration_red_fix_request(tid, run_branch, tail(out, 4000))
         u["_next"] = "fix_round"
         return u
     tr["merged"] = False
+    tr.pop("merge_sha", None)
+    tr.pop("merge_parent", None)
+    if integrated := tr.pop("merge_head", ""):
+        tr["integrated_sha"] = integrated
     git(code, "push", "--quiet", "origin", run_branch)
     task["head_sha"] = git_out(code, "rev-parse", "HEAD", default="")
     save_tasks(state, u, tasks)
@@ -2687,24 +2761,82 @@ def integration_test(state):
     return u
 
 
+INTEGRATION_CONFLICT_MORE = "One more rebase cycle (state reason)"
+INTEGRATION_RED_MORE = "One more fix round (state reason)"
+
+
+def _conflict_fix_request(tid, task, run_branch, note):
+    return {"task": tid, "source": "integration", "return_to": "integration",
+            "items": [f"Merge conflict: rebase your task branch {task.get('branch')} onto the current {run_branch}, resolve, re-verify, re-push"],
+            "note": note}
+
+
+def _integration_red_fix_request(tid, run_branch, note):
+    return {"task": tid, "source": "integration", "return_to": "integration",
+            "items": [f"Post-merge integration failure on {run_branch} (the task was verified against its fork point, not siblings' merged work)"],
+            "note": note}
+
+
+def _final_red_fix_request(state, note):
+    tasks = as_list(state.get("tasks"))
+    return {"task": state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else ""), "source": "integration", "return_to": "integration_check",
+            "items": ["Phase F integration: the full build + test suite is RED on the run branch (integrated result of all tasks)"],
+            "note": note}
+
+
+def _unmerged_reason(state, code, task, run_branch):
+    """Why a task branch is not provably merged; "" when its head is the head a green integration test recorded and
+    that head is an ancestor of the run branch."""
+    want = as_dict(as_dict(state.get("task_rounds")).get(task.get("id", ""))).get("integrated_sha")
+    head = git_out(code, "rev-parse", "--verify", "--quiet", task["branch"])
+    if not want:
+        return "no passed integration test recorded"
+    if head != want:
+        return f"head {head[:12] or 'unknown'} is not the integrated {want[:12]}"
+    if git(code, "merge-base", "--is-ancestor", head, run_branch)[0] != 0:
+        return f"not an ancestor of {run_branch}"
+    return ""
+
+
 def wave_cleanup(state):
-    """The four cleanup rules (markers 4-6 / 72-74): the ONLY unasked destructive ops."""
+    """The four cleanup rules (markers 4-6 / 72-74). With the reset in _drop_unpushed_merge, which undoes a task's
+    merge only while HEAD is still that merge commit and origin does not have it, these are the only destructive ops
+    taken without asking. A task branch is deleted only when provably merged, its remote copy only while origin still
+    holds the integrated head, and a worktree is forced out only for a failed task, whose branch is kept."""
     u = {}
     tasks = as_list(state.get("tasks"))
     task = task_by_id(tasks, state.get("current_task")) or {}
     code = state.get("code_repo_path", "")
+    run_branch = state.get("run_branch") or _run_branch(state)
     wt = task.get("worktree", "")
     if wt:
         rc, out, err = git(code, "worktree", "remove", wt)
-        if rc != 0:
-            git(code, "worktree", "remove", "--force", wt)
-        task["worktree"] = ""
-        ledger(state, u, f"cleanup: worktree {wt} removed")
-    if (is_single(state) or MULTI_IS_GROUPS) and task.get("status") == "complete" and task.get("branch") and task["branch"] != (state.get("run_branch") or _run_branch(state)):
-        git(code, "branch", "-D", task["branch"])
-        git(code, "push", "--quiet", "origin", "--delete", task["branch"])
-        ledger(state, u, f"cleanup: merged task branch {task['branch']} deleted (local + remote)")
-        task["branch"] = state.get("run_branch") or _run_branch(state)
+        if rc != 0 and task.get("status") in ("failed", "aborted"):
+            rc, out, err = git(code, "worktree", "remove", "--force", wt)
+        if rc == 0:
+            task["worktree"] = ""
+            ledger(state, u, f"cleanup: worktree {wt} removed")
+        else:
+            line = f"cleanup: worktree {wt} kept, it did not remove cleanly: {tail(err, 200)}"
+            ledger(state, u, line)
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) {line}"]
+    if (is_single(state) or MULTI_IS_GROUPS) and task.get("status") == "complete" and task.get("branch") and task["branch"] != run_branch:
+        why = _unmerged_reason(state, code, task, run_branch)
+        if not why:
+            rc, out, err = git(code, "branch", "-d", task["branch"])
+            why = f"branch -d refused: {tail(err, 200)}" if rc != 0 else ""
+        if why:
+            ledger(state, u, f"cleanup: task branch {task['branch']} kept (local + remote): {why}")
+        else:
+            integrated = as_dict(as_dict(state.get("task_rounds")).get(task.get("id", ""))).get("integrated_sha")
+            rc, out, err = git(code, "push", "--quiet", f"--force-with-lease={task['branch']}:{integrated}", "origin", "--delete", task["branch"])
+            if rc == 0:
+                ledger(state, u, f"cleanup: merged task branch {task['branch']} deleted (local + remote)")
+            else:
+                line = f"cleanup: merged task branch {task['branch']} deleted locally; remote kept, the delete was refused: {tail(out + err, 200)}"
+                ledger(state, u, line)
+                u["follow_ups"] = list(as_list(u.get("follow_ups", state.get("follow_ups")))) + [f"({task.get('id')}) {line}"]
+            task["branch"] = run_branch
     elif task.get("branch"):
         ledger(state, u, f"cleanup: task branch {task['branch']} kept ({'multi: never deleted' if not (is_single(state) or MULTI_IS_GROUPS) else 'not cleanly merged'})")
     git(code, "worktree", "prune")
@@ -2730,6 +2862,9 @@ def batch_gauntlet_build(state):
     return u
 
 
+BATCH_STRIKEOUT_MORE = "One more batch round (state reason)"
+
+
 def batch_fix_route(state):
     u = {}
     harvest_anomalies(state, u, "batch_triage")
@@ -2747,9 +2882,11 @@ def batch_fix_route(state):
         last = members[-1]["id"] if members else state.get("current_task")
         routed = [{"finding": bl, "task": last} for bl in blockers]
     if b["strikes"] > STRIKE_LIMIT:
+        more = _continue_recommended(_cap_continues(state, f"batch_strikeout:{batch}"))
         return raise_escalation(state, u, escalation(
-            "batch_strikeout", f"Batch {batch} is still BLOCKED after {STRIKE_LIMIT} gauntlet rounds (3 strikes per batch). How to proceed?",
-            [option("Stop and report", recommended=True), option("One more batch round anyway"), option("Accept the batch unresolved (recorded)")],
+            "batch_strikeout", f"Batch {batch} is still BLOCKED after {STRIKE_LIMIT} gauntlet rounds (3 strikes per batch). One more batch "
+                               "round (say why it should land), accept the batch unresolved, or stop?" + ("" if more else CAP_SPENT_NOTE),
+            [option(BATCH_STRIKEOUT_MORE, recommended=more), option("Accept the batch unresolved (recorded)"), option("Stop and report")],
             evidence="\n".join(f"- {r.get('finding')}" for r in routed)[:3000], hard_trigger=True))
     by_task = {}
     for r in routed:
@@ -2759,11 +2896,12 @@ def batch_fix_route(state):
         else:
             by_task.setdefault("__cross__", []).append(r["finding"])
     fixes = list(as_list(state.get("pending_fixes")))
+    reason = b.pop("owner_reason", "")
     for tid, items in by_task.items():
         if tid == "__cross__":
             continue
-        fixes.append({"task": tid, "items": items, "source": "batch", "return_to": "batch",
-                      "note": f"Batch {batch} gauntlet finding(s) routed to this task by file:line."})
+        fixes.append(_with_reason({"task": tid, "items": items, "source": "batch", "return_to": "batch",
+                                   "note": f"Batch {batch} gauntlet finding(s) routed to this task by file:line."}, reason))
     cross = by_task.get("__cross__", [])
     spec = as_dict(state.get("cross_task_fix"))
     if cross or spec.get("title"):
@@ -3204,6 +3342,28 @@ def _park_key(state, esc):
     return f"{kind}:{hashlib.sha1(asked.encode('utf-8', 'replace')).hexdigest()[:10]}"
 
 
+def _migrate_park_keys(state, esc):
+    """choice_parks with each key written before _park_key moved to its current key, counts merged by max, and
+    whether any key moved. A multiple-choice question used to count under its bare index, any other under its bare
+    kind; a relay park key is the same in both formats."""
+    parks = dict(as_dict(state.get("choice_parks")))
+    if not esc:
+        return parks, False
+    data = as_dict(esc.get("data"))
+    kind = esc.get("kind", "")
+    migrated, changed = {}, False
+    for key, count in parks.items():
+        new = key
+        if key != data.get("park_key"):
+            if re.fullmatch(r"[0-9]+", key):
+                new = f"{state.get('choice_kind') or kind}#{key}"
+            elif kind and key == kind and not data.get("multiple_choice"):
+                new = _park_key(state, esc)
+        changed = changed or new != key
+        migrated[new] = max(as_int(migrated.get(new)), as_int(count))
+    return (migrated, True) if changed else (parks, False)
+
+
 def choice_park(state):
     """End the run parked on the current question so the user can discuss it in the chat lane.
 
@@ -3217,7 +3377,7 @@ def choice_park(state):
     queue, idx = (as_list(state.get("choice_queue")), as_int(state.get("choice_index"))) if mc else ([], 0)
     key = _park_key(state, esc)
     where = f"question {idx + 1}/{len(queue)}" if mc else "the question"
-    parks = dict(as_dict(state.get("choice_parks")))
+    parks, _ = _migrate_park_keys(state, esc)
     count = as_int(parks.get(key))
     if count >= DISCUSSION_PARKS_MAX:
         if mc:
@@ -3258,6 +3418,10 @@ def choice_resume(state):
     """
     u = {"discussion": {}, "settled_answer": "", "parked": "", "reply_interpreted": False}
     esc = as_dict(state.get("escalation"))
+    parks, changed = _migrate_park_keys(state, esc)
+    if changed:
+        u["choice_parks"] = parks
+        ledger(state, u, f"discussion: park counts carried over from the old key format -> {parks}")
     settled = str(state.get("settled_answer") or "").strip()
     if not as_dict(esc.get("data")).get("multiple_choice") and esc.get("kind") not in CHOICE_KIND_GATES:
         if settled:
@@ -3326,6 +3490,11 @@ def _picked_key(answer, options, choices):
 
 STOP_REPLIES = ("stop", "stop and report", "abort", "abort the run")
 ABORT_REPLIES = ("abort", "abort the run")
+STATE_FAULT_RETRY = "Retry the gate (state reloaded from disk)"
+STATE_FAULT_RESUME = "Resume from the last saved phase"
+# The gates that ask and apply escalations; retrying one re-asks the question it was handling.
+ESCALATION_GATES = ("escalate_gate", "ladder_route", "consult_route", "ask_dispatch", "ask_owner_poll", "ask_owner_route", "parse_answer",
+                    "apply_answer", "choice_reply_route", "choice_reask", "choice_park", "choice_resume", "interpret_route")
 
 
 def _whole_reply_stop(answer, options=(), replies=STOP_REPLIES):
@@ -3383,6 +3552,96 @@ def _leave_in_draft(state, u):
     u["_next"] = "finish_plan"
 
 
+def _ci_leave(state, u, kind):
+    """The CI escalations' leave pick: a running review watch closes with the stop recorded, else the PR stays in draft."""
+    if truthy(state.get("review_watching")):
+        status = f"{kind} (CI {state.get('ci_status') or 'unresolved'})"
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
+        _review_event(state, u, f"stopped by the owner: {status}")
+        _close_review_watch(state, u, kind)
+        u["_next"] = "finish_plan"
+    else:
+        _leave_in_draft(state, u)
+
+
+def _run_ids(links):
+    return sorted({m.group(1) for link in as_list(links) if (m := re.search(r"/actions/runs/(\d+)", link or ""))})
+
+
+def _rerun_cancelled(state, u, links):
+    """Ask for one re-run of each workflow run behind a cancelled check."""
+    cmd = os.environ.get("ARCHITECT_GH_RERUN_CMD")
+    run_ids = _run_ids(links)
+    if not run_ids:
+        ledger(state, u, f"ci: PR #{state.get('pr_number')} no re-runnable run found behind the cancelled checks; watching again")
+    for run_id in run_ids:
+        if cmd:
+            rc, _ = sh(["bash", "-c", cmd, "_", run_id], timeout=GH_CALL_SECS)
+        else:
+            rc, _ = sh(["gh", "run", "rerun", run_id, "--failed"], cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
+        ledger(state, u, f"ci: PR #{state.get('pr_number')} re-run of cancelled run {run_id} {'requested' if rc == 0 else 'FAILED'}")
+
+
+def _continue_past_cap(state, u, answer, options, cap, what):
+    """Ledger a pick to go on past a cap with the owner's reason, count it toward that cap's continues, and return the reason."""
+    reason = _owner_reason(state, answer, options)
+    ledger(state, u, what + (f": {trim_items(reason, 300)}" if reason else ""))
+    _count_continue(state, u, cap)
+    return reason
+
+
+def _with_reason(request, reason):
+    if reason:
+        request["items"] = list(request["items"]) + [f"Owner's reason for one more round: {trim_items(reason, 300)}"]
+    return request
+
+
+def _integration_round(state, u, esc, answer, options, task):
+    """One more rebase or fix round past an integration cap. The round is dispatched here and its counter set to the
+    cap, so the next conflict or RED asks again."""
+    data = as_dict(esc.get("data"))
+    note = tail(esc.get("evidence", ""), 3000)
+    run_branch = state.get("run_branch") or _run_branch(state)
+    tid = data.get("task") or ""
+    if esc.get("kind") == "integration_red" and not tid:
+        reason = _continue_past_cap(state, u, answer, options, "integration_red:run", "phase_f: one more fix round past the integration RED cap")
+        u["final_integration_strikes"] = STRIKE_LIMIT
+        u["fix_request"] = _with_reason(_final_red_fix_request(state, note), reason)
+    else:
+        tid = tid or task.get("id", "")
+        rounds = dict(as_dict(state.get("task_rounds")))
+        tr = rounds[tid] = dict(as_dict(rounds.get(tid)))
+        if esc.get("kind") == "integration_conflict":
+            reason = _continue_past_cap(state, u, answer, options, f"integration_conflict:{tid}",
+                                        f"integration: one more rebase cycle for {tid} past the conflict cap")
+            tr["conflict_cycles"] = CONFLICT_CYCLES_MAX
+            request = _conflict_fix_request(tid, task_by_id(as_list(state.get("tasks")), tid) or task, run_branch, note)
+        else:
+            reason = _continue_past_cap(state, u, answer, options, f"integration_red:{tid}",
+                                        f"integration: one more fix round for {tid} past the RED cap")
+            tr["integration_strikes"] = STRIKE_LIMIT
+            request = _integration_red_fix_request(tid, run_branch, note)
+        u["task_rounds"] = rounds
+        u["fix_request"] = _with_reason(request, reason)
+    u["_next"] = "fix_round"
+
+
+def _ci_fix_past_cap(state, u, esc, answer, options):
+    """One more coder fix round past the per-check CI fix cap; those checks sit at the cap, so the next red asks again."""
+    data = as_dict(esc.get("data"))
+    pr = str(state.get("pr_number") or "")
+    over = [str(c) for c in as_list(data.get("over"))]
+    reason = _continue_past_cap(state, u, answer, options, _ci_fix_cap(pr, over),
+                                f"ci: one more coder fix round on PR #{pr} past the fix cap for {', '.join(over)}")
+    strikes = dict(as_dict(state.get("ci_fix_strikes")))
+    strikes[pr] = {**as_dict(strikes.get(pr)), **{c: STRIKE_LIMIT for c in over}}
+    u["ci_fix_strikes"] = strikes
+    tasks = as_list(state.get("tasks"))
+    owner = state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else "")
+    u["fix_request"] = _with_reason(_ci_fix_request(state, owner, pr, [str(c) for c in as_list(data.get("failing"))] or over), reason)
+    u["_next"] = "fix_round"
+
+
 def apply_answer(state):
     u = {}
     esc = as_dict(state.get("escalation"))
@@ -3427,7 +3686,7 @@ def apply_answer(state):
                 u["draft_feedback"] = answer
                 u["_next"] = "draft_brief"
     elif kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
-                  "git_setup_failed", "gate_fault") and abort:
+                  "git_setup_failed", "gate_fault", "state_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -3489,7 +3748,7 @@ def apply_answer(state):
             if "ceiling" in over:
                 u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
             _count_continue(state, u, "amend_cap")
-            u["_next"] = "gate1_build"
+            u["_next"] = "gate1_build" if truthy(state.get("quality_recorded")) else "quality_bar_gate"
         else:
             _ask_again(state, u, esc, answer)
     elif kind == "gate1_stuck":
@@ -3536,6 +3795,28 @@ def apply_answer(state):
         else:
             u["failure_reason"] = f"{gate} kept faulting"
             u["_next"] = "end_failure"
+    elif kind == "state_fault":
+        data = as_dict(esc.get("data"))
+        gate = data.get("gate") or ""
+        picked = _bare_pick(answer, options)
+        if picked == STATE_FAULT_RETRY and gate in GATES:
+            _count_continue(state, u, f"state_fault:{gate}")
+            prior = as_dict(data.get("prior"))
+            if gate not in ESCALATION_GATES:
+                ledger(state, u, f"state: retrying {gate}")
+                u["_next"] = gate
+            elif prior.get("question"):
+                ledger(state, u, f"state: retrying {gate} by asking the interrupted {prior.get('kind')} question again")
+                raise_escalation(state, u, prior)
+            else:
+                ledger(state, u, f"state: {gate} was handling no question to ask again -> resume_route")
+                u["_next"] = "resume_route"
+        elif picked in (STATE_FAULT_RETRY, STATE_FAULT_RESUME):
+            u["resume_phase"] = str(data.get("phase") or "")
+            ledger(state, u, f"state: resuming after the {gate or 'unknown'} fault from phase {u['resume_phase']!r}")
+            u["_next"] = "resume_route"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "approve_breakdown":
         a = _answered(state, {"approve": ["approve"], "revise": ["revise"], "abort": ["abort"]}, "approve")
         if a == "approve":
@@ -3709,7 +3990,9 @@ def apply_answer(state):
         batch = state.get("current_batch") or ""
         bs = dict(as_dict(state.get("batch_state")))
         if a == "round":
-            bs.setdefault(batch, {})["strikes"] = STRIKE_LIMIT - 1
+            reason = _continue_past_cap(state, u, answer, options, f"batch_strikeout:{batch}", f"batch: one more batch round on {batch} past the strike cap")
+            # batch_fix_route counts this round's strike, so the cap asks again after it
+            bs[batch] = {**as_dict(bs.get(batch)), "strikes": STRIKE_LIMIT - 1, "owner_reason": reason}
             u["batch_state"] = bs
             u["_next"] = "batch_fix_route"
         elif a == "accept":
@@ -3727,7 +4010,9 @@ def apply_answer(state):
         if a == "retry":
             task["status"] = "in-progress"
             save_tasks(state, u, tasks)
+            # a retried branch goes back through integration_test before cleanup may delete it
             u.update({"delegation_kind": "fix", "fix_source": "wave", "fix_return_to": "verify",
+                      "fix_origin_return": "integration" if (is_single(state) or MULTI_IS_GROUPS) else "",
                       "fix_items": [l[2:] for l in esc.get("evidence", "").splitlines() if l.startswith("- ")] or ["Address the evidence below"],
                       "fix_note": tail(esc.get("evidence", ""), 3000), "delegate_project_dir": task.get("worktree") or state.get("code_repo_path", "")})
             u["_next"] = "compose_delegation"
@@ -3735,6 +4020,7 @@ def apply_answer(state):
             task["status"] = "in-progress"
             save_tasks(state, u, tasks)
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) parallel task accepted as-is at the user's say-so"]
+            u["integration_task"] = task.get("id", "")
             u["_next"] = "integration_test" if (is_single(state) or MULTI_IS_GROUPS) else "harvest_report"
         else:
             task["status"] = "failed"
@@ -3752,13 +4038,8 @@ def apply_answer(state):
     elif kind in ("integration_conflict", "integration_red"):
         a = ("abort" if abort else "stop" if stop
              else _picked_key(answer, options, {"round": ["one more", "cycle", "round"], "abort": ["abort"], "stop": ["stop"]}))
-        rounds = dict(as_dict(state.get("task_rounds")))
-        tr = rounds.setdefault(task.get("id", ""), {})
         if a == "round":
-            key = "conflict_cycles" if kind == "integration_conflict" else "integration_strikes"
-            tr[key] = as_int(tr.get(key)) - 1
-            u["task_rounds"] = rounds
-            u["_next"] = "integration_test" if state.get("integration_task") else "integration_check"
+            _integration_round(state, u, esc, answer, options, task)
         elif a == "abort":
             task["status"] = "failed"
             save_tasks(state, u, tasks)
@@ -3766,6 +4047,16 @@ def apply_answer(state):
             u["_next"] = "wave_cleanup"
         elif a == "stop":
             u["failure_reason"] = f"stopped: {kind} on {task.get('id')}"
+            u["_next"] = "end_blocked"
+        else:
+            _ask_again(state, u, esc, answer)
+    elif kind == "integration_checkout":
+        a = "stop" if stop else _picked_key(answer, options, {"retry": ["retry"], "stop": ["stop"]})
+        if a == "retry":
+            _count_continue(state, u, f"integration_checkout:{as_dict(esc.get('data')).get('task') or task.get('id', '')}")
+            u["_next"] = "integration_test"
+        elif a == "stop":
+            u["failure_reason"] = f"stopped: the run branch could not be checked out to integrate {task.get('id')}"
             u["_next"] = "end_blocked"
         else:
             _ask_again(state, u, esc, answer)
@@ -3790,6 +4081,14 @@ def apply_answer(state):
     elif kind == "scope_surprise":
         u["failure_reason"] = f"stopped: the design requires writing outside the code repo: {answer}"
         u["_next"] = "end_blocked"
+    elif kind == "ci_exhausted" and as_dict(esc.get("data")).get("over"):
+        a = "leave" if stop else _picked_key(answer, options, {"fix": ["resume"], "leave": ["leave", "stop watching"]})
+        if a == "fix":
+            _ci_fix_past_cap(state, u, esc, answer, options)
+        elif a == "leave":
+            _ci_leave(state, u, kind)
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind in ("ci_unsure", "ci_exhausted", "ci_infra"):
         a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"], "fix": ["resume", "coder", "fix"], "leave": ["leave", "draft", "report"]}, "leave")
         if a == "rerun":
@@ -3799,14 +4098,33 @@ def apply_answer(state):
             u["fix_request"] = {"task": state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else ""), "source": "ci", "return_to": "ci",
                                 "items": [f"CI failure (user-directed fix round): {tail(state.get('ci_diagnosis', ''), 300)}"], "note": tail(state.get("ci_evidence", ""), 4000)}
             u["_next"] = "fix_round"
-        elif truthy(state.get("review_watching")):
-            status = f"{kind} (CI {state.get('ci_status') or 'unresolved'})"
-            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
-            _review_event(state, u, f"stopped by the owner: {status}")
-            _close_review_watch(state, u, kind)
-            u["_next"] = "finish_plan"
         else:
-            _leave_in_draft(state, u)
+            _ci_leave(state, u, kind)
+    elif kind in ("ci_inconclusive", "ci_no_checks"):
+        picked = match_option(answer, options)
+        a = "leave" if stop else _keyed(picked or "", {"rerun": ["re-run", "keep waiting"], "green": ["treat as green", "finish without ci"],
+                                                       "leave": ["leave", "stop watching"]})
+        pr, status = state.get("pr_number"), state.get("ci_status") or kind
+        if a == "rerun":
+            _rerun_cancelled(state, u, as_dict(esc.get("data")).get("cancelled_links"))
+            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_rounds": 0, "ci_started_at": int(time.time())})
+            u["_next"] = "ci_poll"
+        elif a == "green":
+            if kind == "ci_no_checks":
+                line = f"ci: PR #{pr} has no CI checks configured; finished without CI at the owner's pick"
+                note = f"PR #{pr}: no CI checks configured; finished without CI (CI never ran, not green)"
+            else:
+                reason = _owner_reason(state, picked, options) or "no reason stated"
+                non_pass = ", ".join(as_list(as_dict(esc.get("data")).get("non_pass"))) or "none named"
+                line = f"ci: PR #{pr} CI {status} treated as green: {trim_items(reason, 300)}; non-pass checks: {non_pass}"
+                note = f"PR #{pr}: CI {status} treated as green ({trim_items(reason, 300)}); non-pass checks: {non_pass}"
+            ledger(state, u, line)
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [note]
+            u["_next"] = "review_poll" if truthy(state.get("review_watching")) else "flip_ready"
+        elif a == "leave":
+            _ci_leave(state, u, kind)
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind in ("review_exhausted", "review_read_truncated", "review_round_cap", "review_owner_judgment"):
         more_words = ["one more", "resume", "address", "fix round"]
         a = "stop" if stop else _picked_key(answer, options, {"skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
@@ -3923,7 +4241,6 @@ def phase_f_gate(state):
 def integration_check(state):
     u = {}
     code = state.get("code_repo_path", "")
-    tasks = as_list(state.get("tasks"))
     ok, out = _run_verification(state, code)
     if ok:
         u["integration_checked"] = True
@@ -3934,13 +4251,12 @@ def integration_check(state):
     u["final_integration_strikes"] = strikes
     ledger(state, u, f"phase_f: full suite RED on the run branch (strike {strikes}/{STRIKE_LIMIT})")
     if strikes > STRIKE_LIMIT:
+        more = _continue_recommended(_cap_continues(state, "integration_red:run"))
         return raise_escalation(state, u, escalation(
-            "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds at Phase F. How to proceed?",
-            [option("Stop and report", recommended=True), option("One more fix round anyway")], evidence=tail(out, 2500), hard_trigger=True))
-    owner = state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else "")
-    u["fix_request"] = {"task": owner, "source": "integration", "return_to": "integration_check",
-                        "items": ["Phase F integration: the full build + test suite is RED on the run branch (integrated result of all tasks)"],
-                        "note": tail(out, 4000)}
+            "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds at Phase F. One more fix round "
+                               "(say why it should land), or stop?" + ("" if more else CAP_SPENT_NOTE),
+            [option(INTEGRATION_RED_MORE, recommended=more), option("Stop and report")], evidence=tail(out, 2500), hard_trigger=True))
+    u["fix_request"] = _final_red_fix_request(state, tail(out, 4000))
     u["_next"] = "fix_round"
     return u
 
@@ -4204,6 +4520,19 @@ def pr_round_comments(state):
     return u
 
 
+CI_PASS = ("pass", "success")
+CI_FAIL = ("fail", "failure")
+CI_PENDING = ("pending", "queued", "in_progress", "")
+CI_CANCELLED = ("cancel", "cancelled")
+CI_QUIET = ("skipping", "skipped", "neutral")
+CI_KEEP_WAITING = "Keep waiting (re-run the watch)"
+CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
+CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
+CI_NO_CI = "Finish without CI (no checks configured; recorded)"
+# `gh pr checks` exits non-zero with this message, not an empty list, when a PR has no checks.
+NO_CHECKS_OUTPUT = "no checks reported on the"
+
+
 def ci_poll(state):
     u = {}
     polls = as_int(state.get("ci_polls"))
@@ -4231,6 +4560,8 @@ def ci_poll(state):
             p = subprocess.run(["gh", "pr", "checks", str(state.get("pr_number")), "--json", "name,state,bucket,link"], cwd=code,
                                capture_output=True, text=True, timeout=GH_CALL_SECS)
         data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+        if p.returncode != 0 and NO_CHECKS_OUTPUT in (p.stdout or "") + (p.stderr or ""):
+            data = []
     except Exception:  # noqa: BLE001
         data = None
     if data is None:
@@ -4241,16 +4572,48 @@ def ci_poll(state):
         return u
     u["ci_poll_fails"] = 0
     buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "").lower(), c.get("link", "")) for c in data]
-    failing = [(n, l) for n, b, l in buckets if b in ("fail", "failure", "cancelled")]
-    pending = [n for n, b, _ in buckets if b in ("pending", "queued", "in_progress", "")]
+    failing = [(n, l) for n, b, l in buckets if b in CI_FAIL]
+    pending = [n for n, b, _ in buckets if b in CI_PENDING]
     u["ci_checks"] = buckets
     if failing:
         u.update({"ci_status": "red", "ci_failing": failing, "_next": "ci_route"})
-    elif pending:
+    elif pending or (not buckets and polls == 0):
+        # checks can take a moment to register on a fresh push, so an empty first read is polled again
         u.update({"ci_status": "pending", "_next": "ci_poll"})
-    else:
+    elif not buckets:
+        u.update({"ci_status": "no_checks", "_next": "ci_route"})
+    elif all(b in CI_PASS for _, b, _ in buckets):
         u.update({"ci_status": "green", "_next": "ci_route"})
+    else:
+        u.update({"ci_status": "inconclusive", "_next": "ci_route"})
     return u
+
+
+def _ci_unclear_escalation(state, status):
+    """The evidence escalation for a CI read that is neither green nor red: every check is listed with its bucket."""
+    pr = state.get("pr_number")
+    if truthy(state.get("review_watching")):
+        leave, leave_q = "Stop watching and report", "stop watching and report"
+    else:
+        leave, leave_q = "Leave the PR in draft and report", "leave the PR in draft"
+    rows = [(str(c[0]), str(c[1]), str(c[2]) if len(c) > 2 else "") for c in as_list(state.get("ci_checks"))
+            if isinstance(c, (list, tuple)) and len(c) >= 2]
+    evidence = "\n".join(f"- {n}: {b or '(no bucket)'}" for n, b, _ in rows) or "(the PR reports an empty check list)"
+    if status == "no_checks":
+        return escalation(
+            "ci_no_checks", f"PR #{pr} reports no CI checks, so CI cannot go green. Finish without CI (recorded as a follow-up; "
+                            f"the report never says CI green), keep waiting, or {leave_q}?",
+            [option(CI_NO_CI, recommended=True), option(CI_KEEP_WAITING), option(leave)], evidence=evidence)
+    cancelled = [l for _, b, l in rows if b in CI_CANCELLED]
+    rerunnable = bool(_run_ids(cancelled))
+    non_pass = [f"{n}: {b or '(no bucket)'}" for n, b, _ in rows if b not in CI_PASS]
+    quiet = any(b in CI_PASS for _, b, _ in rows) and all(b in CI_PASS + CI_QUIET for _, b, _ in rows)
+    return escalation(
+        "ci_inconclusive", f"CI on PR #{pr} has no failing or pending check, but not every check passed ({', '.join(non_pass)}). "
+                           f"Re-run, treat it as green (say why), or {leave_q}?",
+        [option(CI_RERUN_CANCELLED if cancelled else CI_KEEP_WAITING, recommended=rerunnable),
+         option(CI_TREAT_GREEN, recommended=quiet and not rerunnable), option(leave, recommended=not rerunnable and not quiet)],
+        evidence=evidence, data={"cancelled_links": cancelled, "non_pass": non_pass})
 
 
 def ci_route(state):
@@ -4273,6 +4636,9 @@ def ci_route(state):
         u["_next"] = "review_poll" if watching else "flip_ready"
     elif status == "red":
         u["_next"] = "ci_evidence"
+    elif status in ("inconclusive", "no_checks"):
+        ledger(state, u, f"ci: PR #{pr} {status}; asking before anything is called green")
+        return raise_escalation(state, u, _ci_unclear_escalation(state, status))
     elif status == "visit_cap":
         if watching:
             ledger(state, u, f"review-watch: PR #{pr} stop: watch_visit_cap")
@@ -4345,6 +4711,20 @@ def _owning_task(state, diagnosis):
     return tasks[-1]["id"] if tasks else ""
 
 
+CI_FIX_MORE = "Resume with one more coder fix round (state reason)"
+
+
+def _ci_fix_cap(pr, over):
+    return f"ci_exhausted:{pr}:{','.join(sorted(over))}"
+
+
+def _ci_fix_request(state, owner, pr, checks):
+    return {"task": owner, "source": "ci", "return_to": "ci",
+            "items": [f"CI failure on PR #{pr} ({', '.join(checks)}): " + tail(state.get("ci_diagnosis", ""), 400)],
+            "note": "Evidence pack:\n" + tail(state.get("ci_evidence", ""), 5000)
+                    + "\nPost a NEW top-level PR comment '## Update @ <full head SHA>' mapping the fix to its commit; never rewrite the description."}
+
+
 def ci_apply(state):
     u = {}
     started = _lib._now()
@@ -4406,14 +4786,13 @@ def ci_apply(state):
         if over:
             if watching:
                 ledger(state, u, f"review-watch: PR #{pr} stop: ci_exhausted")
+            more = _continue_recommended(_cap_continues(state, _ci_fix_cap(pr, over)))
             return raise_escalation(state, u, escalation(
-                "ci_exhausted", f"CI still red on {over}{during} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?",
-                [option("Resume with one more coder fix round"), option(leave, recommended=True)],
-                evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True))
-        u["fix_request"] = {"task": owner, "source": "ci", "return_to": "ci",
-                            "items": [f"CI failure on PR #{pr} ({', '.join(checks)}): " + tail(state.get("ci_diagnosis", ""), 400)],
-                            "note": "Evidence pack:\n" + tail(state.get("ci_evidence", ""), 5000)
-                                    + "\nPost a NEW top-level PR comment '## Update @ <full head SHA>' mapping the fix to its commit; never rewrite the description."}
+                "ci_exhausted", f"CI still red on {over}{during} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?"
+                                + ("" if more else CAP_SPENT_NOTE),
+                [option(CI_FIX_MORE, recommended=more), option(leave)],
+                evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True, data={"over": over, "failing": checks}))
+        u["fix_request"] = _ci_fix_request(state, owner, pr, checks)
         ledger(state, u, f"ci: real failure -> fix round to {owner} (strikes {pr_strikes})")
         u["_next"] = "fix_round"
         return u
@@ -4443,8 +4822,15 @@ def flip_ready(state):
         if pr:
             cmd = os.environ.get("ARCHITECT_GH_READY_CMD")
             rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "pr", "ready", str(pr)], cwd=code, timeout=GH_CALL_SECS)
-            u["flipped_ready"] = rc == 0
-            ledger(state, u, f"pr: #{pr} {'flipped to ready' if rc == 0 else 'flip FAILED: ' + tail(out, 200)}")
+            # a ready claim needs the PR itself to read as no longer a draft; a clean exit alone is not enough
+            view_rc, draft = _pr_view(state, pr, "isDraft") if rc == 0 else (1, "")
+            u["flipped_ready"] = rc == 0 and view_rc == 0 and draft.strip() == "false"
+            if u["flipped_ready"]:
+                ledger(state, u, f"pr: #{pr} flipped to ready")
+            elif rc == 0:
+                ledger(state, u, f"pr: #{pr} still reads as a draft after gh pr ready (isDraft: {tail(draft, 100).strip() or 'unread'})")
+            else:
+                ledger(state, u, f"pr: #{pr} flip FAILED: {tail(out, 200)}")
     drafts, unchecked = [], []
     for t in tasks:
         if t.get("pr_number") and not (is_single(state) or MULTI_IS_GROUPS):
@@ -5168,6 +5554,85 @@ GATES = {
 }
 
 
+# Gates the engine runs inside a map branch: a fault there takes the branch's own fallback.
+BRANCH_GATES = ("explore_fault", "archivist_fault", "librarian_fault", "checklist_fault", "wave_verify_build", "wave_route", "wave_fault")
+TASK_GATES = ("claim_task", "compose_delegation", "route_delegate", "verify_gate", "task_done_verify", "task_done_route", "fix_done")
+# The gates that read each key heal_state can find unrecoverable; such a gate faults before it runs. An escalation
+# gate never does, so the owner can still be asked.
+STATE_KEY_READERS = {
+    "run_dir": tuple(GATES),
+    "code_repo_path": ("intake", "gate1_build", "branch_setup", "claim_task", "compose_delegation", "verify_gate", "post_round",
+                       "wave_claim", "wave_verify_build", "integration_test", "wave_cleanup", "batch_close", "phase_f_gate",
+                       "integration_check", "hygiene_create", "open_pr", "pr_round_comments", "ci_poll", "ci_evidence", "ci_apply",
+                       "flip_ready", "review_poll", "review_update"),
+    "tasks": ("intake", "resume_route", "reseal_return", "branch_setup", "select_tasks", "claim_task", "compose_delegation",
+              "route_delegate", "verify_gate", "route_verdict", "post_round", "fix_done", "harvest_report", "debt_assign",
+              "task_done_verify", "stack_gate", "task_done_route", "wave_claim", "wave_verify_build", "wave_integrate",
+              "integration_test", "wave_cleanup", "batch_gauntlet_build", "batch_fix_route", "batch_close", "phase_f_gate",
+              "integration_check", "hygiene_create", "stack_gate_final", "pr_body", "open_pr", "ci_poll", "ci_apply", "flip_ready",
+              "review_poll", "review_route", "review_apply", "review_update", "finish_plan", "final_report", "group_closeout"),
+}
+
+
+def _lost_task(name, state):
+    """A gate that acts on the current task, entered with a current_task that names no task in the list."""
+    if name not in TASK_GATES or (name == "verify_gate" and (state.get("verify_scope") or "task") != "task"):
+        return False
+    return task_by_id(as_list(state.get("tasks")), state.get("current_task")) is None
+
+
+def _state_fault(state, name, notes, err):
+    """The escalation for a gate that raised; a second fault in an escalation gate on its own fault ends the run."""
+    u = {}
+    esc = as_dict(state.get("escalation"))
+    said = f"{type(err).__name__}: {err}"
+    if name in ESCALATION_GATES and esc.get("kind") == "state_fault" and as_dict(esc.get("data")).get("gate") == name:
+        ledger(state, u, f"state: {name} faulted again on its own state_fault -> end_failure: {said[:300]}")
+        u["failure_reason"] = f"{name} faulted repeatedly: {said}"
+        u["_next"] = "end_failure"
+        return u
+    keys = ", ".join(f"{k} {src}" if src == _lib.UNRECOVERABLE else f"{k} from {src}" if src else f"{k} missing"
+                     for k, src in notes) or "none"
+    retries = _cap_continues(state, f"state_fault:{name}")
+    ledger(state, u, f"state: {name} faulted: {said[:300]} -> state_fault")
+    return raise_escalation(state, u, escalation(
+        "state_fault", f"The {name} step failed on the run state ({said[:300]}). Keys healed or missing at entry: {keys}. "
+                       "Retry the step, resume from the last saved phase, or abort?",
+        [option(STATE_FAULT_RETRY, recommended=_continue_recommended(retries)), option(STATE_FAULT_RESUME), option("Abort the run")],
+        evidence=tail(traceback.format_exc()),
+        data={"gate": name, "error": said, "phase": read_snapshot(state.get("run_dir")).get("phase") or "",
+              "prior": esc if name in ESCALATION_GATES and esc.get("question") else {}}))
+
+
 def run(name):
-    state = load_state()
-    emit(GATES[name](state))
+    """Heal the state, run the gate, and turn an exception in either into a state_fault escalation.
+
+    The healed values and one ledger line per heal ride along with the gate's own updates, which win on a clash.
+    """
+    gate = GATES[name]
+    state, notes, u = load_state(), [], {}
+    try:
+        state, notes = heal_state(state)
+        if name not in TASK_GATES:
+            notes = [(k, src) for k, src in notes if src or k != "current_task"]
+        lost = {k: state[k] for k, src in notes if src == _lib.UNRECOVERABLE}
+        # a gate that may run without such a key gets its empty value in memory only; the run state keeps the bad one
+        state = {**state, **{k: [] if k == "tasks" else "" for k in lost}}
+        for key, source in notes:
+            if source and source != _lib.UNRECOVERABLE:
+                u[key] = state[key]
+                ledger(state, u, f"state: healed {key} from {source}")
+        state = {**state, **u}
+        if faulted := [k for k in lost if name in STATE_KEY_READERS[k] and name not in ESCALATION_GATES]:
+            raise ValueError("; ".join(f"{k} is {str(lost[k])[:80]!r} with nothing to heal it from" for k in faulted))
+        if _lost_task(name, state):
+            out = {}
+            ledger(state, out, f"state: {name} has no current task ({state.get('current_task')!r}) -> select_tasks")
+            out["_next"] = "select_tasks"
+        else:
+            out = gate(state)
+    except Exception as e:  # noqa: BLE001
+        if name in BRANCH_GATES:
+            raise
+        out = _state_fault(state, name, notes, e)
+    emit({**u, **out})
