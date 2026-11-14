@@ -15,6 +15,7 @@ use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build
 use crate::mesh::card_cadence::{
     CadenceTrustObserver, CardCadence, CardTrigger, drive_card_cadence,
 };
+use crate::mesh::card_refusals::card_refusals_path;
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::envoy_sessions::{
     EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn, Forgotten, RememberedOf,
@@ -854,6 +855,8 @@ impl MeshRuntime {
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
         let sent_threads = SentThreads::open(&paths.cache_dir, &instance_id)?;
+        let card_cadence =
+            CardCadence::persisted(card_refusals_path(&paths.cache_dir, &instance_id))?;
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
         if let Some(store) = &envoy_memory {
@@ -1046,7 +1049,7 @@ impl MeshRuntime {
             envoy_memory_config: config.envoy_memory.clone(),
             sent_threads: ArcSwap::from_pointee(sent_threads),
             memory: PeerMemory::default(),
-            card_cadence: CardCadence::default(),
+            card_cadence,
             interface_states: RwLock::new(states),
             watched_interfaces: watched,
             interface_events: parking_lot::Mutex::new(Some(interface_events)),
@@ -1088,10 +1091,12 @@ impl MeshRuntime {
             #[cfg(all(test, unix))]
             next_request_error: parking_lot::Mutex::new(None),
         });
-        runtime.dispatcher.set_observer(Arc::new(LeftMarkLifter {
-            peers: runtime.peers.clone(),
-            runtime: Arc::downgrade(&runtime),
-        }));
+        runtime
+            .dispatcher
+            .set_observer(Arc::new(AllowedRequestHook {
+                peers: runtime.peers.clone(),
+                runtime: Arc::downgrade(&runtime),
+            }));
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
             runtime.peers.clone(),
@@ -3424,42 +3429,51 @@ fn note_return(runtime: &Weak<MeshRuntime>, destination: &str) {
     }
 }
 
-/// Lifts the left mark of an instance whose request the trust gate let through: a request
-/// arrives over a live link, so the instance is back as surely as if it had announced, and
-/// a reply to it must not be routed as if it were gone. Its farewell is the one request
-/// that does not count, since it is what set the mark. Held mail never reaches here: a
-/// held message can be older than the farewell. Requests on concurrent links are not
-/// ordered against each other, so one the instance sent just before its farewell can
-/// still be let through after it and lift the fresh mark; the mark is advisory and the
-/// instance was alive a moment ago.
-struct LeftMarkLifter {
+/// What a request the trust gate let through tells this node about its sender.
+///
+/// It lifts the sender's left mark: a request arrives over a live link, so the instance
+/// is back as surely as if it had announced, and a reply to it must not be routed as if
+/// it were gone. Its farewell is the one request that does not count, since it is what
+/// set the mark. Held mail never reaches here: a held message can be older than the
+/// farewell. Requests on concurrent links are not ordered against each other, so one the
+/// instance sent just before its farewell can still be let through after it and lift the
+/// fresh mark; the mark is advisory and the instance was alive a moment ago.
+///
+/// A status request or a message other than a farewell also says the sender trusts this
+/// node, so its card is fetched in the background as `CardTrigger::Contacted` allows.
+/// The fetch is only spawned: the dispatcher waits on nothing here.
+struct AllowedRequestHook {
     peers: Arc<PeerTable>,
     runtime: Weak<MeshRuntime>,
 }
 
-impl AllowObserver for LeftMarkLifter {
+impl AllowObserver for AllowedRequestHook {
     fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &rmpv::Value) {
-        let destination = destination.to_hex_string();
-        // Most requests come from instances not marked left; they skip the body read.
-        if self
-            .peers
-            .get(&destination)
-            .is_none_or(|row| row.left_at.is_none())
-        {
-            return;
-        }
-        if path_hash == PathHash::of(MESSAGE_PATH)
+        let is_status = path_hash == PathHash::of(STATUS_PATH);
+        let is_message = path_hash == PathHash::of(MESSAGE_PATH);
+        if is_message
             && from_request_body(body)
                 .is_ok_and(|body| is_farewell(body.kind, body.fields.as_ref()))
         {
             return;
         }
-        if self.peers.clear_left(&destination) {
+        let destination = destination.to_hex_string();
+        if self
+            .peers
+            .get(&destination)
+            .is_some_and(|row| row.left_at.is_some())
+            && self.peers.clear_left(&destination)
+        {
             debug!(
                 "Mesh instance {} was heard over a link; no longer marked left",
                 short(&destination)
             );
             note_return(&self.runtime, &destination);
+        }
+        if (is_status || is_message)
+            && let Some(runtime) = self.runtime.upgrade()
+        {
+            runtime.consider_card_fetch(&destination, CardTrigger::Contacted);
         }
     }
 }
@@ -6104,9 +6118,16 @@ impl MeshSlot {
         }
     }
 
-    /// `MeshRuntime::note_served_by`; a no-op while the mesh is off.
-    fn note_served_by(&self, destination: &str) {
+    /// `MeshRuntime::note_served_by`, after the background card fetch a message from a
+    /// session this node trusts prompts (`CardTrigger::Contacted`), so a stored message
+    /// fetches the card as one over a link does; a no-op while the mesh is off. The fetch
+    /// is considered first, since it is what lifts a refusal stop and gives back the
+    /// interval the refused ask took.
+    pub(crate) fn note_served_by(&self, destination: &str) {
         if let Some(runtime) = self.get() {
+            if !destination.is_empty() {
+                runtime.consider_card_fetch(destination, CardTrigger::Contacted);
+            }
             runtime.note_served_by(destination);
         }
     }

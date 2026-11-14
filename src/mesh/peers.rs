@@ -1,9 +1,11 @@
 use crate::mesh::announce::{HEARTBEAT_PERIOD_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
+use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::request::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{InstancePresence, PresenceRow};
 use crate::mesh::{decode_hex, destination_address, redact_hashes, short, write_atomically};
+use crate::utils::fs::EXCLUSIVE_LOCK_WAIT;
 
 use anyhow::{Context, Result, bail};
 use log::{debug, warn};
@@ -80,9 +82,10 @@ pub(crate) struct PeerRecord {
     /// The instance ids of this cache dir's nodes the instance served a status card or a
     /// message during their latest run. The table is shared by every session on the
     /// cache dir, so each node keeps its own mark: `claim_served` reads a node's mark
-    /// back as "served the previous run" when it starts and clears it. The background
-    /// card fetch asks only an instance that served this node in this run or the
-    /// previous one, unless the owner has just trusted it with `.mesh access trust`.
+    /// back as "served the previous run" when it starts and clears it, and a write keeps
+    /// the marks other nodes wrote meanwhile. The background card fetch asks only an
+    /// instance that served this node in this run or the previous one, unless the owner
+    /// has just trusted it with `.mesh access trust` or it has just contacted this node.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub served_instances: BTreeSet<String>,
 }
@@ -475,9 +478,9 @@ impl PeerTable {
         self.inner.lock().get(destination_hash).cloned()
     }
 
-    /// Writes the table only if it changed since the last write. The flag is cleared before
-    /// the snapshot is taken so a change that lands mid-write is not lost, and restored on
-    /// failure so the next call retries.
+    /// Writes the table only if it changed since the last write, as `persist` says. The
+    /// flag is cleared before the snapshot is taken so a change that lands mid-write is
+    /// not lost, and restored on failure so the next call retries.
     pub(crate) fn persist_if_dirty(&self) -> Result<()> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -486,10 +489,59 @@ impl PeerTable {
             .inspect_err(|_| self.dirty.store(true, Ordering::Release))
     }
 
+    /// Writes this table's rows under the table's lock, merging the served marks of the
+    /// file as it is now: each row keeps the marks other nodes on the cache dir wrote for
+    /// it and this node's own mark as held in memory, never this node's mark read back
+    /// from the disk, since `claim_served` cleared it on purpose. Rows only on the disk
+    /// are not adopted. A file this build cannot read holds nothing to merge and is
+    /// replaced, but for one of another readable version, which is refused and left as
+    /// it is.
     fn persist(&self) -> Result<()> {
+        let _held = acquire_mesh_lock(
+            &self.path.with_added_extension("lock"),
+            "mesh peer table",
+            EXCLUSIVE_LOCK_WAIT,
+        )?;
+        let on_disk = match fs::read(&self.path).map(|bytes| parse_peer_file(&bytes)) {
+            Ok(Ok(records)) => records,
+            Ok(Err(PeerFileParse::Version(found))) => bail!(version_refusal(
+                "peer table",
+                &self.path,
+                None,
+                found,
+                PEER_TABLE_VERSION,
+                Remedy::Cache
+            )),
+            Ok(Err(PeerFileParse::Corrupt(_))) | Err(_) => Vec::new(),
+        };
+        let mut marks_on_disk: BTreeMap<String, BTreeSet<String>> = on_disk
+            .into_iter()
+            .map(|record| (record.destination_hash, record.served_instances))
+            .collect();
+        let own = self.own_instance.lock().clone();
+        let peers = self
+            .snapshot()
+            .into_iter()
+            .map(|mut record| {
+                let mut served = marks_on_disk
+                    .remove(&record.destination_hash)
+                    .unwrap_or_default();
+                match &own {
+                    Some(own) => {
+                        served.remove(own);
+                        if record.served_instances.contains(own) {
+                            served.insert(own.clone());
+                        }
+                    }
+                    None => served.extend(record.served_instances.iter().cloned()),
+                }
+                record.served_instances = served;
+                record
+            })
+            .collect();
         let file = PeerTableFile {
             version: PEER_TABLE_VERSION,
-            peers: self.snapshot(),
+            peers,
         };
         let json =
             serde_json::to_vec_pretty(&file).context("Failed to serialize the mesh peer table")?;
@@ -1097,7 +1149,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(
             siblings_of(&path),
-            ["peers.json"],
+            ["peers.json", "peers.json.lock"],
             "the atomic write leaves no temp file behind"
         );
 
@@ -1371,6 +1423,85 @@ mod tests {
             !third.served_recently("aa"),
             "two runs ago no longer counts"
         );
+    }
+
+    /// Two nodes on one cache dir hold the same row and each marks it served: whichever
+    /// writes last keeps the other's mark, since each node's mark on disk is that node's
+    /// latest word.
+    #[test]
+    fn two_nodes_on_one_cache_dir_keep_each_others_served_marks() {
+        for first_to_write in [0, 1] {
+            let tmp = TempDir::new("peers-served-merge");
+            let path = tmp.path.join("mesh").join("peers.json");
+            let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+            let seed = PeerTable::load(path.clone(), t0).unwrap();
+            seed.observe(sighting("aa", None), t0);
+            seed.persist_if_dirty().unwrap();
+
+            let tables = [
+                PeerTable::load(path.clone(), t0).unwrap(),
+                PeerTable::load(path.clone(), t0).unwrap(),
+            ];
+            tables[0].claim_served("node-1");
+            tables[1].claim_served("node-2");
+            for table in &tables {
+                table.mark_served("aa");
+            }
+            tables[first_to_write].persist_if_dirty().unwrap();
+            tables[1 - first_to_write].persist_if_dirty().unwrap();
+
+            let reloaded = PeerTable::load(path, t0).unwrap();
+            assert_eq!(
+                reloaded.get("aa").unwrap().served_instances,
+                BTreeSet::from(["node-1".to_string(), "node-2".to_string()]),
+                "table {first_to_write} wrote first"
+            );
+        }
+    }
+
+    /// A node's own mark on disk is cleared by its claim and stays cleared: the merge on
+    /// write takes other nodes' marks from the disk, never its own.
+    #[test]
+    fn a_claimed_mark_is_not_read_back_from_the_disk_on_write() {
+        let tmp = TempDir::new("peers-served-own");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let earlier = PeerTable::load(path.clone(), t0).unwrap();
+        earlier.claim_served("node-1");
+        earlier.observe(sighting("aa", None), t0);
+        earlier.mark_served("aa");
+        earlier.persist_if_dirty().unwrap();
+
+        let next = PeerTable::load(path.clone(), t0).unwrap();
+        next.claim_served("node-1");
+        next.persist_if_dirty().unwrap();
+        assert!(
+            PeerTable::load(path, t0)
+                .unwrap()
+                .get("aa")
+                .unwrap()
+                .served_instances
+                .is_empty(),
+            "the stale mark of node-1 is not resurrected"
+        );
+    }
+
+    /// A table of another version that appeared on disk after this node loaded its own
+    /// is refused on write and left as it is.
+    #[test]
+    fn persist_refuses_to_overwrite_a_table_of_another_version() {
+        let (table, _tmp) = table("peers-persist-version");
+        let t0 = SystemTime::now();
+        table.observe(sighting("aa", None), t0);
+        let mut newer = file_of(Vec::new());
+        newer["version"] = serde_json::json!(PEER_TABLE_VERSION + 1);
+        let bytes = serde_json::to_vec(&newer).unwrap();
+        fs::create_dir_all(table.path.parent().unwrap()).unwrap();
+        fs::write(&table.path, &bytes).unwrap();
+
+        let err = table.persist_if_dirty().unwrap_err().to_string();
+        assert!(err.contains("upgrade Coyote"), "{err}");
+        assert_eq!(fs::read(&table.path).unwrap(), bytes);
     }
 
     #[test]

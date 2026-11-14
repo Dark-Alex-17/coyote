@@ -2,14 +2,17 @@
 //! card advertises stay current without anyone running `.mesh people status`.
 
 use crate::mesh::card::{STATUS_MAX_CONCURRENCY, StatusError};
+use crate::mesh::card_refusals::{load_card_refusals, save_card_refusals};
 use crate::mesh::message::Route;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{RequestOptions, short};
 use crate::mesh::trust::{Decision, TrustGranted, TrustObserver, TrustRevoked};
 
+use anyhow::Result;
 use log::debug;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::sync::{Semaphore, mpsc};
@@ -34,11 +37,21 @@ pub(crate) enum CardTrigger {
     /// The session announced or answered a path request; only the first time a session
     /// is heard in a run counts, and a card or message it served counts as heard.
     Heard,
+    /// The session sent this node a status request or a message, so it trusts this
+    /// node: asked whether or not it served this node, as after the owner's grant. When
+    /// it lifts a refusal stop it is asked at once, since the refused ask brought no card
+    /// and the trust on its side has changed; otherwise the interval applies, so a
+    /// chatty session costs one fetch per interval at most.
+    Contacted,
 }
 
-/// The bookkeeping behind the background card fetch, in memory for one run.
+/// The bookkeeping behind the background card fetch: in memory for one run, but for the
+/// refusals, which are kept on disk when the cadence was loaded from a file.
 pub(crate) struct CardCadence {
     state: Mutex<CadenceState>,
+    /// The file the refusals are written to on every change; `None` keeps them in
+    /// memory only.
+    refusals: Option<PathBuf>,
     /// The node's one `STATUS_MAX_CONCURRENCY` cap, shared by the background fetches and
     /// a `mesh__peers` listing with its cards.
     permits: Arc<Semaphore>,
@@ -55,8 +68,8 @@ struct CadenceState {
     /// When each destination was last asked in the background.
     last_asked: HashMap<String, Instant>,
     /// Destinations whose last answer was a refusal; not asked in the background again
-    /// until the trust on either side changes or the owner asks by hand. Kept for the
-    /// run only: a restart asks again once, at most, before a refusal stops it anew.
+    /// until the trust on either side changes or the owner asks by hand. Kept across
+    /// runs in the instance's card-refusal list, so a restart does not ask again.
     refused: HashSet<String>,
 }
 
@@ -64,6 +77,7 @@ impl Default for CardCadence {
     fn default() -> Self {
         Self {
             state: Mutex::default(),
+            refusals: None,
             permits: Arc::new(Semaphore::new(STATUS_MAX_CONCURRENCY)),
             #[cfg(test)]
             skew: Mutex::default(),
@@ -72,6 +86,20 @@ impl Default for CardCadence {
 }
 
 impl CardCadence {
+    /// A cadence that starts from the refusals kept at `path` and writes them back there
+    /// on every change. Fails as `load_card_refusals` does.
+    pub(crate) fn persisted(path: PathBuf) -> Result<Self> {
+        let refused = load_card_refusals(&path)?;
+        Ok(Self {
+            state: Mutex::new(CadenceState {
+                refused,
+                ..CadenceState::default()
+            }),
+            refusals: Some(path),
+            ..Self::default()
+        })
+    }
+
     /// The permits every `/status` request this node makes on its own or for a listing
     /// takes one of, so together they never exceed `STATUS_MAX_CONCURRENCY`.
     pub(crate) fn status_permits(&self) -> Arc<Semaphore> {
@@ -100,10 +128,12 @@ impl CardCadence {
     /// Whether a background fetch of `destination`, prompted by `trigger`, may go out
     /// now, and if so notes it as asked. `served` is whether the session served this
     /// node a card or a message in this run or the previous one; a session that did not
-    /// is asked only after the owner granted it trust, and one that refused since the
-    /// trust last changed is never asked. A grant is a trust change on this side, so it
-    /// lifts a refusal first. Only the first time a session is heard in a run counts, and
-    /// no destination is asked twice within `CARD_FETCH_MIN_INTERVAL`.
+    /// is asked only after the owner granted it trust or after it contacted this node,
+    /// and one that refused since the trust last changed is never asked. A grant is a
+    /// trust change on this side and a contact one on the other side, so both lift a
+    /// refusal first. Only the first time a session is heard in a run counts, and no
+    /// destination is asked twice within `CARD_FETCH_MIN_INTERVAL`, but for a contact
+    /// that lifted a refusal.
     pub(crate) fn admit(&self, destination: &str, trigger: CardTrigger, served: bool) -> bool {
         let now = self.now();
         let mut state = self.state.lock();
@@ -114,11 +144,19 @@ impl CardCadence {
                 }
             }
             CardTrigger::Granted | CardTrigger::OwnerGranted => {
-                state.refused.remove(destination);
+                if state.refused.remove(destination) {
+                    self.save_refusals(&state);
+                }
+            }
+            CardTrigger::Contacted => {
+                if state.refused.remove(destination) {
+                    state.last_asked.remove(destination);
+                    self.save_refusals(&state);
+                }
             }
         }
-        if (!served && trigger != CardTrigger::OwnerGranted) || state.refused.contains(destination)
-        {
+        let asks_unserved = matches!(trigger, CardTrigger::OwnerGranted | CardTrigger::Contacted);
+        if (!served && !asks_unserved) || state.refused.contains(destination) {
             return false;
         }
         if state
@@ -135,14 +173,39 @@ impl CardCadence {
     /// The session refused a status request: no background fetch asks it again until
     /// `lift`.
     pub(crate) fn refused(&self, destination: &str) {
-        self.state.lock().refused.insert(destination.to_string());
+        let mut state = self.state.lock();
+        if state.refused.insert(destination.to_string()) {
+            self.save_refusals(&state);
+        }
     }
 
     /// The trust on the session's side may have changed (it sent this node a message,
     /// which it sends only to a session it trusts, though a held message may predate a
     /// later revoke) or the owner asked for its card by hand.
     pub(crate) fn lift(&self, destination: &str) {
-        self.state.lock().refused.remove(destination);
+        let mut state = self.state.lock();
+        if state.refused.remove(destination) {
+            self.save_refusals(&state);
+        }
+    }
+
+    /// The owner forgot the session's user: the session starts out as one never asked,
+    /// heard or refused, so trusting it again asks for its card at once.
+    pub(crate) fn forget(&self, destination: &str) {
+        let mut state = self.state.lock();
+        state.heard.remove(destination);
+        state.last_asked.remove(destination);
+        if state.refused.remove(destination) {
+            self.save_refusals(&state);
+        }
+    }
+
+    /// Written under the state lock, so the writes reach the disk in the order the
+    /// changes were made.
+    fn save_refusals(&self, state: &CadenceState) {
+        if let Some(path) = &self.refusals {
+            save_card_refusals(path, &state.refused);
+        }
     }
 
     /// The session served this node a card or a message: it has been heard in this run,
@@ -244,6 +307,18 @@ impl MeshRuntime {
     ) {
         for destination in self.sessions_a_grant_covers(identity, destination) {
             self.consider_card_fetch(&destination, CardTrigger::OwnerGranted);
+        }
+    }
+
+    /// The owner forgot `identity`: every session of it the peer table holds starts the
+    /// background card fetch afresh, its refusal stop cleared from the disk too. Done in
+    /// the forget itself rather than by a trust event, so a re-trust run right after it
+    /// finds the reset made.
+    pub(crate) fn forget_card_cadence(&self, identity: &str) {
+        for row in self.peers().snapshot() {
+            if row.identity_hash.eq_ignore_ascii_case(identity) {
+                self.card_cadence().forget(&row.destination_hash);
+            }
         }
     }
 
@@ -407,6 +482,62 @@ mod tests {
         );
         assert!(!cadence.is_refused(D));
     }
+
+    /// A contact asks a session that never served this node, at once when it lifts a
+    /// refusal and within the interval otherwise.
+    #[test]
+    fn a_contact_that_lifts_a_refusal_asks_at_once_and_otherwise_keeps_the_interval() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::OwnerGranted, false));
+        cadence.refused(D);
+        assert!(
+            cadence.admit(D, CardTrigger::Contacted, false),
+            "the refused ask brought no card, so the contact asks at once"
+        );
+        assert!(!cadence.is_refused(D));
+        assert!(
+            !cadence.admit(D, CardTrigger::Contacted, false),
+            "with no refusal to lift the interval holds"
+        );
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(cadence.admit(D, CardTrigger::Contacted, false));
+    }
+
+    #[test]
+    fn forget_leaves_a_destination_never_asked_heard_or_refused() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::Heard, true));
+        cadence.refused(D);
+        cadence.forget(D);
+        assert!(!cadence.is_refused(D));
+        assert!(cadence.admit(D, CardTrigger::Heard, true));
+    }
+
+    /// A cadence loaded from a file writes every change of its refusals back, and one
+    /// loaded later starts with them.
+    #[test]
+    fn a_persisted_cadence_keeps_its_refusals_on_disk() {
+        let tmp = crate::mesh::test_support::TempDir::new("card-cadence-persisted");
+        let path = crate::mesh::card_refusals::card_refusals_path(&tmp.path, "instance");
+        let cadence = CardCadence::persisted(path.clone()).unwrap();
+        assert!(!path.exists(), "nothing is written before a refusal");
+        cadence.refused(D);
+        assert!(CardCadence::persisted(path.clone()).unwrap().is_refused(D));
+        for clear in [
+            CardCadence::lift as fn(&CardCadence, &str),
+            CardCadence::forget,
+            |cadence, destination| {
+                cadence.admit(destination, CardTrigger::Granted, true);
+            },
+            |cadence, destination| {
+                cadence.admit(destination, CardTrigger::Contacted, false);
+            },
+        ] {
+            cadence.refused(D);
+            clear(&cadence, D);
+            assert!(!CardCadence::persisted(path.clone()).unwrap().is_refused(D));
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -415,8 +546,10 @@ mod network {
     use crate::mesh::node::MeshSlot;
     use crate::mesh::request::STATUS_PATH;
     use crate::mesh::test_support::{
-        TransportRelay, closed_port, started_runtime_on, started_runtime_on_with, status_round_trip,
+        TransportRelay, closed_port, mesh_paths, started_runtime_on, started_runtime_on_with,
+        status_round_trip, wait_for_peer,
     };
+    use crate::mesh::trust::TrustOptions;
     use std::time::SystemTime;
 
     fn status_requests(runtime: &MeshRuntime) -> usize {
@@ -616,6 +749,240 @@ mod network {
             assert!(a.runtime.consider_card_fetch(&b_dest, trigger).is_none());
         }
         assert_eq!(status_requests(&a.runtime), 0);
+
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// A trusts B before B trusts A, so A's fetch after the grant is refused and the
+    /// stop holds. Once B trusts A and asks A for its card, A fetches B's card at once,
+    /// with no ten minutes to wait, and shows the names B advertises. Another card
+    /// request from B within the interval asks nothing more of B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_trusted_first_is_named_within_seconds_of_trusting_back() {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("cadence-trust-first-a", relay.port).await;
+        let b = started_runtime_on_with("cadence-trust-first-b", relay.port, |config| {
+            config.person_name = Some("Beatrice".into());
+        })
+        .await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        slot_b.rename_session("named-session");
+        let (a_rt, b_rt) = (&a.runtime, &b.runtime);
+        let a_dest = a_rt.current_destination_hash();
+        let b_dest = b_rt.current_destination_hash();
+        let b_identity = b_rt.fingerprint().to_string();
+        wait_for_peer(a_rt, &b_dest).await;
+        wait_for_peer(b_rt, &a_dest).await;
+        let names_of_b = || {
+            let people = a_rt.trust().people(&[]);
+            (
+                people.person(&b_identity).map(|alias| alias.text.clone()),
+                people
+                    .session(&b_identity, &b_dest)
+                    .map(|alias| alias.text.clone()),
+            )
+        };
+
+        a_rt.trust()
+            .trust_destination(
+                slot_a.as_ref(),
+                &b_dest,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        a_rt.consider_card_fetch(&b_dest, CardTrigger::OwnerGranted)
+            .expect("the owner's grant asks B")
+            .await
+            .unwrap();
+        assert_eq!(status_requests(a_rt), 1);
+        assert!(
+            a_rt.card_cadence().is_refused(&b_dest),
+            "B does not trust A yet, so it refuses"
+        );
+        assert_eq!(names_of_b(), (None, None));
+
+        b_rt.trust()
+            .trust_destination(
+                slot_b.as_ref(),
+                &a_dest,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let to_a = b_rt.resolve_destination(&a_dest).await.unwrap();
+        b_rt.request_status(Route::unasked(to_a))
+            .await
+            .expect("A trusts B, so it answers");
+        let mut names = names_of_b();
+        for _ in 0..100 {
+            if names.0.is_some() && names.1.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            names = names_of_b();
+        }
+        assert_eq!(
+            names,
+            (
+                Some("Beatrice".to_string()),
+                Some("named-session".to_string())
+            ),
+            "B's card request lifts A's stop and A fetches B's card at once"
+        );
+        assert!(!a_rt.card_cadence().is_refused(&b_dest));
+        assert_eq!(status_requests(a_rt), 2);
+
+        b_rt.request_status(Route::unasked(to_a))
+            .await
+            .expect("A answers again");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            status_requests(a_rt),
+            2,
+            "a second card request within ten minutes asks nothing more of B"
+        );
+
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// A message from B that A takes in, as a stored one is filed, does what B's card
+    /// request does: A trusted B first and was refused, B has trusted A since, and A
+    /// fetches B's card at once and shows its names.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_message_from_a_session_trusted_first_fetches_its_card_at_once() {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("cadence-message-first-a", relay.port).await;
+        let b = started_runtime_on_with("cadence-message-first-b", relay.port, |config| {
+            config.person_name = Some("Beatrice".into());
+        })
+        .await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        let (a_rt, b_rt) = (&a.runtime, &b.runtime);
+        let a_dest = a_rt.current_destination_hash();
+        let b_dest = b_rt.current_destination_hash();
+        let b_identity = b_rt.fingerprint().to_string();
+        wait_for_peer(a_rt, &b_dest).await;
+        wait_for_peer(b_rt, &a_dest).await;
+
+        a_rt.trust()
+            .trust_destination(
+                slot_a.as_ref(),
+                &b_dest,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        a_rt.consider_card_fetch(&b_dest, CardTrigger::OwnerGranted)
+            .expect("the owner's grant asks B")
+            .await
+            .unwrap();
+        assert!(a_rt.card_cadence().is_refused(&b_dest));
+        b_rt.trust()
+            .trust_destination(
+                slot_b.as_ref(),
+                &a_dest,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        slot_a.note_served_by(&b_dest);
+        let person_of_b = || {
+            a_rt.trust()
+                .people(&[])
+                .person(&b_identity)
+                .map(|alias| alias.text.clone())
+        };
+        for _ in 0..100 {
+            if person_of_b().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(person_of_b().as_deref(), Some("Beatrice"));
+        assert_eq!(status_requests(a_rt), 2);
+        assert!(!a_rt.card_cadence().is_refused(&b_dest));
+
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// The stop a refusal sets outlasts `.mesh off` and `.mesh on`: the restarted node
+    /// asks nothing of the session that refused it, even one that served it, until the
+    /// owner asks by hand, which clears the stop from the disk too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_stop_holds_across_a_restart_until_lifted() {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let mut a = started_runtime_on("cadence-restart-a", relay.port).await;
+        let b = started_runtime_on("cadence-restart-b", relay.port).await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        let b_dest = b.runtime.current_destination_hash();
+        wait_for_peer(&a.runtime, &b_dest).await;
+        a.runtime
+            .trust()
+            .trust_destination(
+                slot_a.as_ref(),
+                &b_dest,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        a.runtime
+            .consider_card_fetch(&b_dest, CardTrigger::OwnerGranted)
+            .expect("the owner's grant asks B")
+            .await
+            .unwrap();
+        assert!(a.runtime.card_cadence().is_refused(&b_dest));
+
+        assert!(slot_a.stop().await.unwrap());
+        a.restart_on(relay.port).await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let refusals = crate::mesh::mesh_cache_dir(&mesh_paths(&a.tmp).cache_dir).join(format!(
+            "card-refusals-{}.json",
+            a.runtime.current_instance_id()
+        ));
+        assert!(
+            a.runtime.card_cadence().is_refused(&b_dest),
+            "the restarted node still holds the stop"
+        );
+        a.runtime.peers().mark_served(&b_dest);
+        assert!(
+            a.runtime
+                .consider_card_fetch(&b_dest, CardTrigger::Heard)
+                .is_none(),
+            "a session that served the node but refused it is not asked"
+        );
+        assert_eq!(status_requests(&a.runtime), 0);
+        assert!(
+            std::fs::read_to_string(&refusals)
+                .unwrap()
+                .contains(&b_dest)
+        );
+
+        a.runtime.card_cadence().lift(&b_dest);
+        assert!(!a.runtime.card_cadence().is_refused(&b_dest));
+        assert!(
+            !std::fs::read_to_string(&refusals)
+                .unwrap()
+                .contains(&b_dest),
+            "asking by hand clears the stop on disk"
+        );
 
         assert!(slot_a.stop().await.unwrap());
         assert!(slot_b.stop().await.unwrap());

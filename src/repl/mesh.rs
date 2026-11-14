@@ -5158,6 +5158,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let forgotten = store.forget_identity(mesh, &identity, false)?;
             let knocks = runtime.knock_gate().forget_identity(&identity);
             let claims = runtime.memory().forget_identity(&identity);
+            runtime.forget_card_cadence(&identity);
             let mut lines = vec![format!(
                 "Forgot {user}: trust, blocks, requests to be trusted, names, remembered attachments and envoy memory erased; they are a stranger again."
             )];
@@ -22170,6 +22171,7 @@ mod tests {
             use crate::hooks::HookEvent;
             use crate::mesh::MeshSlot;
             use crate::mesh::brief::Digest;
+            use crate::mesh::card_cadence::CardTrigger;
             use crate::mesh::envoy::{EnvoyJob, EnvoySink};
             use crate::mesh::events::RecordingHookSink;
             use crate::mesh::grants::GrantRecord;
@@ -31658,6 +31660,70 @@ mod tests {
                         "once swept, the identity is a stranger"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Forgetting a user starts the background card fetch afresh for each of its
+            /// sessions: no refusal stop, no interval and nothing heard is left, so a
+            /// re-trust within ten minutes asks for the card again.
+            #[test]
+            #[serial]
+            fn forget_identity_resets_the_background_card_fetch_for_its_sessions() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-forget-cadence");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-forget-cadence").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let (dest, id) = heard_unnamed_peer(&started.runtime, "Tia", now);
+                    let other = "e".repeat(32);
+                    let row = started.runtime.peers().get(&dest).unwrap();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: other.clone(),
+                            identity_hash: id.clone(),
+                            name_hash: row.name_hash,
+                            public_key: None,
+                            display_name: None,
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+                    let cadence = started.runtime.card_cadence();
+                    for destination in [&dest, &other] {
+                        assert!(cadence.admit(destination, CardTrigger::OwnerGranted, false));
+                        cadence.note_heard(destination);
+                        cadence.refused(destination);
+                    }
+                    started.runtime.memory().remember_reference(
+                        &dest,
+                        &id,
+                        "0123456789abcdef",
+                        "docs/a.md",
+                    );
+
+                    out_of(
+                        &mut ctx,
+                        &format!(
+                            ".mesh access forget user {id} --confirm forget-{}",
+                            short(&id)
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    for destination in [&dest, &other] {
+                        assert!(!cadence.is_refused(destination));
+                        assert!(
+                            cadence.admit(destination, CardTrigger::Heard, true),
+                            "{destination} is asked again at once"
+                        );
+                    }
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
