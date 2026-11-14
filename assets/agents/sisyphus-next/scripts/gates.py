@@ -3176,7 +3176,7 @@ def _findings_changed(before, after):
 
 
 def _code_changed(state, root, tree_before, tree_after):
-    """How the reviewed code compares between two worktree trees, planning-store edits not counted: "changed",
+    """How the reviewed code compares between two worktree trees, edits under the plans directory not counted: "changed",
     "unchanged", or "unknown" when a tree is missing or git cannot compare them."""
     if not tree_before or not tree_after:
         return "unknown"
