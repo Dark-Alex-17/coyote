@@ -4369,7 +4369,7 @@ fn readme_ci_budget_row_separates_per_watch_from_per_run_counters() {
         .unwrap_or_else(|| panic!("missing CI budget nesting row:\n{section}"));
     for sentence in [
         "Per-watch budgets are `ci_polls`, `ci_poll_fails` and `ci_started_at`: they reset every time a watch starts (`ci_gate`, the owner's re-run answer, a flake re-run, a keep-waiting answer at the run-wide CI poll budget).",
-        "A watch ends as `timeout` once `ci_polls` passes `CI_MAX_ROUNDS` or the `CI_WALL_SECS` wall clock has passed.",
+        "A watch ends as `timeout` once `ci_polls` passes `CI_MAX_ROUNDS` or the `CI_WALL_SECS` elapsed-time limit has passed.",
         "Per-run budgets are `ci_reruns` (per check, `CI_FLAKE_RERUNS`), `ci_fix_strikes` (`STRIKE_LIMIT`) and `ci_polls_run` (`POLL_VISIT_BUDGET`, in every mode).",
         "With `pr_tracking` set to `review`, the review watch adds the per-watch budgets `pr_review_watch_polls` and `pr_review_poll_fails`, reset at each watch start, and the per-run budgets `pr_review_polls` (`REVIEW_MAX_POLLS`), `pr_review_started_at` (`REVIEW_WALL_SECS`) and `pr_review_rounds` (`REVIEW_MAX_ROUNDS`), and starts a review fix round only while `ci_polls_run` is below `REVIEW_CI_POLL_BUDGET`.",
         "`ci_fix_strikes` stays per run across review rounds",
