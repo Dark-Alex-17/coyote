@@ -105,7 +105,11 @@ those rules are *structure*:
   value that is neither a string nor a list of strings (`false`, `0`) is
   rejected rather than read as none, and any invalid value is a lint crash,
   so it blocks. The adversary lane receives the same value through its
-  `inputs:`, so its own debris lint leaves out the same directories.
+  `inputs:`, so its own debris lint leaves out the same directories. The
+  signals stage also turns a valid value into `bookkeeping_note`, one
+  sentence naming those directories as the run's own planning files that
+  a task's file list never names, which every agent lane prompt carries;
+  it is empty when no directories are configured.
 - **Verdict independence is structural**: lanes run as isolated sub-agents
   with no `teammates:` flag — no cross-lane messaging, by construction.
 - **Failure fails closed, structurally** (`fallback:` routes + `PIPELINE-FAULT`

@@ -21,6 +21,7 @@ prints the rendered hits and the summary; exit 1 on hits, 0 when clean, 2 on
 error.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -124,6 +125,7 @@ GLOB_CHARS = "*?["
 # with one; on unix it is an ordinary (if odd) directory character that the
 # literal pathspec must keep.
 BACKSLASH_IS_SEPARATOR = os.sep == "\\"
+LINE_SUFFIX_RE = re.compile(r":\d+(?:[-:]\d+)*$")
 
 # The target-header regex only knows the a/ b/ prefix form; these pin it
 # regardless of diff.noprefix / diff.mnemonicPrefix / diff.external in the
@@ -433,6 +435,48 @@ def check_excludes(exclude):
             )
         normalized.append("/".join(parts))
     return normalized
+
+
+def parse_excludes(value):
+    """The `debris_exclude` state value as checked excludes, or ValueError.
+
+    None and "" mean none, a string starting with `[` is a JSON array, any
+    other string is one directory, and a list is taken as is; the entries
+    then go through check_excludes.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "":
+            return []
+        if value.startswith("["):
+            try:
+                value = json.loads(value)
+            except ValueError as e:
+                raise ValueError(f"debris_exclude {value!r} is not a JSON array: {e}") from None
+        elif not value.startswith('"'):
+            value = [value]
+    if not isinstance(value, list) or not all(isinstance(p, str) for p in value):
+        raise ValueError(
+            f"debris_exclude must be a JSON array of strings or one directory, got {value!r}"
+        )
+    return check_excludes(value)
+
+
+def under_excludes(path, excludes):
+    """Whether a repo-relative `path`, optionally `./`-prefixed or ending in a
+    `:line` reference, is one of the checked `excludes` or lies below one.
+    An empty or absolute path, or one with a `..` segment, never is."""
+    path = LINE_SUFFIX_RE.sub("", path.strip())
+    if BACKSLASH_IS_SEPARATOR:
+        path = path.replace("\\", "/")
+    while path.startswith("./"):
+        path = path[2:]
+    path = path.rstrip("/")
+    if not path or path.startswith("/") or os.path.isabs(path) or ".." in path.split("/"):
+        return False
+    return any(path == e or path.startswith(e + "/") for e in excludes)
 
 
 def git_diff(project_dir, *revs, timeout=GIT_TIMEOUT, exclude=()):
