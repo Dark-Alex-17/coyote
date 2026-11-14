@@ -253,7 +253,7 @@ mod tests {
 
     // The coder's self_review node discloses new-to-repo patterns through
     // `design_notes`, and end_success prints them as `Design: ...` after
-    // `Tests: passed`. Drive the shipped graph through the merge the engine
+    // the `Tests:` line. Drive the shipped graph through the merge the engine
     // performs and the end-node render: a disclosed note reaches the final
     // output in that position, a second note landing as a continuation line
     // under it; the key is required so a model cannot omit it, and when the
@@ -324,14 +324,14 @@ mod tests {
         );
         let rendered = state.interpolate_lenient(&end.output);
         let tests_at = rendered
-            .find("Tests: passed\n")
+            .find("\nTests: ")
             .expect("end_success reports the test gate");
         let design_at = rendered
             .find(&format!("Design: {note}"))
             .expect("end_success renders the disclosure verbatim, continuation line included");
         assert!(
             design_at > tests_at,
-            "Design: follows Tests: passed, got:\n{rendered}"
+            "Design: follows the Tests: line, got:\n{rendered}"
         );
         assert!(
             rendered.starts_with("CODER_COMPLETE\n"),

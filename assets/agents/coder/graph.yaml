@@ -106,6 +106,10 @@ initial_state:
   baseline_failure_hash: ''
   baseline_note: No baseline was recorded.
   baseline_report: ''
+  build_verdict: not run
+  tests_verdict: not run
+  review_verdict: not run
+  approval_reask: ''
 
 start: resolve_paths
 
@@ -218,13 +222,24 @@ nodes:
       Complexity: {{complexity_score}}/10
 
       Approve this plan?
+      {{approval_reask}}
     options:
       - 'yes'
       - 'no'
     routes:
       'yes': baseline_tests
       'no': end_rejected
-    on_other: end_rejected
+    on_other: parse_approval
+    state_updates:
+      approval_answer: '{{choice}}'
+
+  parse_approval:
+    id: parse_approval
+    type: script
+    description: Reads an approval answer that is not exactly yes or no. A reworded yes goes on to baseline_tests, a reworded no to end_rejected, and anything unclear asks again with approval_reask set. A crash fails the run closed (never a rejection); a static edge back to gate_approval would be a cycle the validator refuses.
+    script: scripts/parse_approval.sh
+    timeout: 5
+    fallback: end_failure
 
   baseline_tests:
     id: baseline_tests
@@ -527,6 +542,13 @@ nodes:
       Be terse. The orchestrator wants signal, not noise. If you find nothing
       blocking, set review_clean=true and leave review_notes empty.
 
+      When the tests passed only because their failures match the pre-run
+      baseline, accepting those failures is a scope judgement nobody else
+      reviews: if any accepted failure is within what the request asked for,
+      set review_clean=false and name it in review_notes. A build or test
+      result reported as NOT RUN was not verified, so never describe it as
+      verified or skip a check on the strength of it.
+
       Project directory: {{project_dir}}
     prompt: |
       ## Files to review
@@ -535,6 +557,15 @@ nodes:
 
       ## What the implementation was supposed to do
       {{plan_summary}}
+
+      ## Build result
+      {{build_verdict}}
+
+      ## Test result
+      {{tests_verdict}}{{baseline_report}}
+
+      ## Test output
+      {{tests_output}}
 
       ## Implementer's summary
       {{last_node_output}}
@@ -591,8 +622,9 @@ nodes:
       Plan: {{plan_summary}}
       Files modified: {{files_to_modify}}
       Files created: {{files_to_create}}
-      Build: passed
-      Tests: passed{{baseline_report}}
+      Build: {{build_verdict}}
+      Tests: {{tests_verdict}}{{baseline_report}}
+      Review: {{review_verdict}}
       Design: {{design_notes}}
 
   end_rejected:

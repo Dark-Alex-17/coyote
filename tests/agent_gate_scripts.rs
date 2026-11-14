@@ -5352,7 +5352,7 @@ fn usage_probe_gate_crash_branch_fires_for_every_verify_node_id() {
 /// AC7: both arms of coder/route_review_result.sh read `review_notes` from
 /// stdin — a 300 000-byte note set (above the 128 KiB per-argument cap the
 /// change removes) must reach `fix_instructions` on the findings arm and
-/// `review_notes_unresolved` on the budget-exhausted arm, tail intact, with
+/// `review_verdict` on the budget-exhausted arm, tail intact, with
 /// HEAD's routing targets (`implement` / `end_success`) unchanged.
 #[test]
 fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
@@ -5400,17 +5400,25 @@ fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
         &[],
     );
     assert_eq!(str_field(&out, "_next"), "end_success", "{}", out["_next"]);
-    let unresolved = str_field(&out, "review_notes_unresolved");
+    let unresolved = str_field(&out, "review_verdict");
     assert!(
-        unresolved.starts_with("Shipped with unresolved review notes (budget exhausted):\n"),
+        unresolved.starts_with("unresolved notes (review budget exhausted):\n"),
         "{}",
         &unresolved[..80]
     );
     assert!(unresolved.ends_with(LAST_LINE), "budget arm lost the tail");
+    let body = &unresolved["unresolved notes (review budget exhausted):\n".len()..];
+    let restored: Vec<&str> = body
+        .split('\n')
+        .map(|line| {
+            line.strip_prefix("  ")
+                .expect("every note line is indented")
+        })
+        .collect();
     assert_eq!(
-        unresolved.len(),
-        "Shipped with unresolved review notes (budget exhausted):\n".len() + TRANSCRIPT_BYTES,
-        "budget arm must carry the notes byte-for-byte"
+        restored.join("\n"),
+        notes,
+        "budget arm must carry the notes byte-for-byte under the indent"
     );
     assert!(out.get("fix_instructions").is_none(), "{out}");
 }
@@ -5846,8 +5854,8 @@ fn usage_probe_coder_self_review_fault_lifts_only_trimmed_ask_lines() {
     );
     assert_eq!(
         out.as_object().unwrap().len(),
-        3,
-        "the fault emits exactly design_notes, review_notes and _next: {out}"
+        4,
+        "the fault emits exactly design_notes, review_notes, review_verdict and _next: {out}"
     );
 
     // Running the fault twice over the same state is a no-op the second time.

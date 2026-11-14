@@ -23709,6 +23709,7 @@ mod tests {
                         "fix_loop_gate",
                         "gate_approval",
                         "implement",
+                        "parse_approval",
                         "route_complexity",
                         "route_review_result",
                         "self_review",
@@ -32365,6 +32366,7 @@ print(json.dumps({
                     ("self_review_fault", "end_failure"),
                     ("route_review_result", "end_failure"),
                     ("route_complexity", "gate_approval"),
+                    ("parse_approval", "end_failure"),
                 ][..],
             ),
         ] {
