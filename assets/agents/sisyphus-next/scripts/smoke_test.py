@@ -4354,8 +4354,7 @@ check("rejected cap: at the reset ceiling Stop is recommended and a headless pic
       in _rcs.get("evidence", "") and _ah.get("_next") == "end_blocked", (recommended(_rcs), _ph, _ah))
 u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_CONTINUE, rejected_cap_resets=1))
 _ns = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=0, rejected_cap_resets=2, run_dir=_edir))
-check("rejected cap: continue counts a reset and next_subtask clears the count",
-      u.get("rejected_cap_resets") == 2 and _ns.get("rejected_cap_resets") == 0, (u.get("rejected_cap_resets"), _ns))
+check("rejected cap: continue counts a reset and next_subtask clears the count", u.get("rejected_cap_resets") == 2 and _ns.get("rejected_cap_resets") == 0, (u.get("rejected_cap_resets"), _ns))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
