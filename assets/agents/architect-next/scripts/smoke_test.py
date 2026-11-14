@@ -4487,6 +4487,139 @@ env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}"
 p = subprocess.run([sys.executable, os.path.join(HERE, "intake.py")], capture_output=True, text=True, env=env)
 check("entry script: intake through GRAPH_STATE", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "orient_read", p.stderr[-300:])
 
+# ---------------------------------------------------------------- state heal at gate entry and the state_fault boundary
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+HEAL_RUN = "heal"
+HEAL_DIR = _lib.run_dir_for(HEAL_RUN)
+HEAL_TASKS = tasks_with()
+SF_RETRY, SF_RESUME = "Retry the gate (state reloaded from disk)", "Resume from the last saved phase"
+
+
+def heal_base(**over):
+    return base_state(**{"run_id": HEAL_RUN, "run_dir": HEAL_DIR, "tasks": HEAL_TASKS, "current_task": T1, **over})
+
+
+def heal_disk(**snap):
+    shutil.rmtree(HEAL_DIR, ignore_errors=True)
+    os.makedirs(os.path.join(HEAL_DIR, "reports"))
+    write(os.path.join(HEAL_DIR, "tasks.json"), json.dumps(HEAL_TASKS))
+    write(os.path.join(HEAL_DIR, "state.json"),
+          json.dumps({"run_id": HEAL_RUN, "run_dir": HEAL_DIR, "code_repo_path": CODE, "plan_path": PROMOTED, "phase": "task saved", **snap}))
+
+
+def entry(gate, state):
+    env = {k: v for k, v in os.environ.items() if k not in ("GRAPH_STATE", "GRAPH_STATE_FILE")}
+    p = subprocess.run([sys.executable, os.path.join(HERE, f"{gate}.py")], capture_output=True, text=True, env={**env, "GRAPH_STATE": json.dumps(state)})
+    lines = p.stdout.strip().splitlines()
+    return p.returncode, (json.loads(lines[-1]) if p.returncode == 0 and lines else {}), p.stderr[-300:]
+
+
+def run_gate(name, state, fn=None):
+    """gates.run(name) in-process, with the gate swapped for fn when given; the emitted JSON line."""
+    saved = gates.GATES[name]
+    env_saved = {k: os.environ.pop(k) for k in ("GRAPH_STATE", "GRAPH_STATE_FILE") if k in os.environ}
+    if fn:
+        gates.GATES[name] = fn
+    os.environ["GRAPH_STATE"] = json.dumps(state)
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            gates.run(name)
+    finally:
+        gates.GATES[name] = saved
+        os.environ.pop("GRAPH_STATE")
+        os.environ.update(env_saved)
+    return json.loads(out.getvalue().strip().splitlines()[-1])
+
+
+def boom(state):
+    raise KeyError("boom")
+
+
+heal_disk()
+rc, u, err = entry("apply_answer", heal_base(tasks="garbage", escalation=escalation("plan_unauthored", "q", []), last_answer="go"))
+check("entry apply_answer: tasks is a plain string -> healed from tasks.json and the gate runs (exit 0)",
+      rc == 0 and u.get("_next") == "quality_bar_gate" and u.get("tasks") == HEAL_TASKS and "state: healed tasks from tasks.json" in u.get("decisions", []),
+      f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("harvest_report", heal_base(run_dir=None))
+check("entry harvest_report: run_dir null with a run_id -> recomputed from the run id and the gate runs",
+      rc == 0 and u.get("run_dir") == HEAL_DIR and u.get("_next") == "design_ask_gate" and "state: healed run_dir from run_id" in u.get("decisions", []),
+      f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("verify_gate", heal_base(code_repo_path=None, verify_scope="task"))
+check("entry verify_gate: code_repo_path null -> healed from state.json and the gate runs",
+      rc == 0 and u.get("code_repo_path") == CODE and u.get("_next") in ("run_gauntlet", "run_adversary")
+      and "state: healed code_repo_path from state.json" in u.get("decisions", []), f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("claim_task", heal_base(current_task=None))
+check("entry claim_task: current_task null and none saved -> back to select_tasks with a ledger line, nothing claimed",
+      rc == 0 and u.get("_next") == "select_tasks" and any("claim_task has no current task" in d for d in u.get("decisions", [])),
+      f"rc={rc} {err} {u.get('_next')}")
+heal_disk(current_task=T1)
+_s = heal_base()
+_s.pop("current_task")
+rc, u, err = entry("harvest_report", _s)
+check("entry harvest_report: current_task missing -> healed from state.json",
+      rc == 0 and u.get("current_task") == T1 and "state: healed current_task from state.json" in u.get("decisions", []), f"rc={rc} {err}")
+heal_disk()
+rc, u, err = entry("select_tasks", heal_base(pending_fixes="garbage"))
+_esc = u.get("escalation") or {}
+check("entry select_tasks: an exception in the gate -> state_fault escalation naming the gate and the error, Retry recommended",
+      rc == 0 and u.get("_next") == "escalate_gate" and _esc.get("kind") == "state_fault" and "select_tasks" in _esc.get("question", "")
+      and "AttributeError" in _esc.get("question", "") and (_esc.get("options") or [{}])[0].get("text") == SF_RETRY
+      and _esc["options"][0].get("recommended") and "Traceback" in _esc.get("evidence", "") and u.get("ask_question")
+      and _esc.get("data", {}).get("gate") == "select_tasks" and _esc["data"].get("phase") == "task saved", f"rc={rc} {err} {_esc}")
+heal_disk()
+guarded("run: a gate past the retry cap -> state_fault with no option recommended",
+        lambda: (lambda u: (u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault"
+                            and not any(o.get("recommended") for o in u["escalation"]["options"]), u.get("escalation")))(
+            run_gate("claim_task", heal_base(cap_continues={"state_fault:claim_task": STRIKE_LIMIT}), boom)))
+guarded("run: a fault names the healed keys in its question",
+        lambda: (lambda u: ("run_dir" in u["escalation"]["question"] and u.get("run_dir") == HEAL_DIR, u["escalation"]["question"]))(
+            run_gate("claim_task", heal_base(run_dir=None), boom)))
+
+
+def _escalate_twice():
+    first = run_gate("escalate_gate", heal_base(escalation=E), boom)
+    second = run_gate("escalate_gate", heal_base(escalation=first.get("escalation")), boom)
+    ok = (first.get("_next") == "escalate_gate" and first["escalation"]["kind"] == "state_fault"
+          and first["escalation"]["data"].get("gate") == "escalate_gate" and first["escalation"]["data"].get("prior", {}).get("kind") == E["kind"]
+          and second.get("_next") == "end_failure" and "escalate_gate faulted repeatedly" in second.get("failure_reason", "")
+          and "escalation" not in second)
+    return ok, f"{first.get('_next')} {second.get('_next')} {second.get('failure_reason')}"
+
+
+guarded("run: escalate_gate faulting while its own state_fault is open -> end_failure with a failure_reason, never a third ask", _escalate_twice)
+SF = escalation("state_fault", "q", [option(SF_RETRY, True), option(SF_RESUME), option("Abort the run")], data={"gate": "select_tasks", "phase": "task saved"})
+u = AA("state_fault", "1", esc=SF)
+check("apply_answer: state_fault retry -> the gate's own node, the per-gate retry counted",
+      u.get("_next") == "select_tasks" and u.get("cap_continues", {}).get("state_fault:select_tasks") == 1, u)
+u = AA("state_fault", SF_RESUME, esc=SF)
+check("apply_answer: state_fault resume -> resume_route at the saved phase", u.get("_next") == "resume_route" and u.get("resume_phase") == "task saved", u)
+check("apply_answer: state_fault abort -> end_aborted", AA("state_fault", "Abort the run", esc=SF)["_next"] == "end_aborted")
+u = AA("state_fault", "don't retry yet", esc=SF)
+check("apply_answer: state_fault reply naming no option -> asked again, nothing retried",
+      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault" and u["escalation"]["data"].get("unmatched_replies") == 1
+      and "cap_continues" not in u, u)
+u = AA("state_fault", SF_RETRY, esc={**SF, "data": {"gate": "apply_answer", "prior": E}})
+check("apply_answer: state_fault retry of an escalation gate -> the interrupted question is asked again",
+      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == E["kind"], u)
+_s = base_state(run_id="heal-none", run_dir=_lib.run_dir_for("heal-none"), tasks=None, tasks_root=LEDGER_TASKS, plan_path=LEDGER_PLAN)
+guarded("heal_state: tasks null, no tasks.json -> the task store",
+        lambda: (lambda r: (r[0]["tasks"] and r[0]["tasks"] == _lib.load_tasks(_s) and ("tasks", "task store") in r[1], r[1]))(
+            _lib.heal_state(_s)))
+_s = heal_base()
+_s.pop("tasks_root")
+guarded("heal_state: tasks_root missing -> recomputed from plans_root",
+        lambda: (lambda r: (r[0]["tasks_root"] == os.path.join(_s["plans_root"], "tasks") and ("tasks_root", "plans_root") in r[1], r[1]))(_lib.heal_state(_s)))
+heal_disk(plan_path="/elsewhere.md")
+guarded("heal_state: valid values are never overwritten, and a state with no run is left alone",
+        lambda: (lambda a, b: (a[1] == [] and a[0]["plan_path"] == PROMOTED and a[0]["code_repo_path"] == "" and b == ({"tasks": "x"}, []), (a[1], b)))(
+            _lib.heal_state(heal_base(plan_path=PROMOTED, code_repo_path="")), _lib.heal_state({"tasks": "x"})))
+
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",

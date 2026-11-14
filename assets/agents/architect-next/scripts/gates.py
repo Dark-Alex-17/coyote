@@ -2,9 +2,11 @@
 
 Each function takes the graph state and returns the updates to merge, including
 `_next` when the node routes dynamically. Entry scripts call `run("<name>")`.
-Gates on the critical path raise on internal errors (the engine then takes the
-node's declared fallback and records last_script_error); advisory gates catch
-and declare their degradation instead.
+`run` heals wrong-typed or missing state keys before the gate and turns an
+exception on the critical path into a `state_fault` escalation; only a gate
+inside a map branch still raises, so the engine takes the branch's declared
+fallback and records last_script_error. Advisory gates catch and declare their
+degradation instead.
 """
 
 import datetime
@@ -15,6 +17,7 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,10 +36,10 @@ from _lib import (  # noqa: E402
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
     append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, emit,
-    ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines,
+    ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines, heal_state,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section, review_fault,
-    raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
+    raise_escalation, read_artifact, read_file, read_snapshot, render_question, run_dir_for, save_tasks, set_frontmatter,
     set_task_status, sh, snapshot, split_option_reply, tail, task_by_id, task_dir_for, task_section, today, trim_items,
     truthy, var, write_artifact, write_file,
 )
@@ -3326,6 +3329,11 @@ def _picked_key(answer, options, choices):
 
 STOP_REPLIES = ("stop", "stop and report", "abort", "abort the run")
 ABORT_REPLIES = ("abort", "abort the run")
+STATE_FAULT_RETRY = "Retry the gate (state reloaded from disk)"
+STATE_FAULT_RESUME = "Resume from the last saved phase"
+# The gates that ask and apply escalations; retrying one re-asks the question it was handling.
+ESCALATION_GATES = ("escalate_gate", "ladder_route", "consult_route", "ask_dispatch", "ask_owner_poll", "ask_owner_route", "parse_answer",
+                    "apply_answer", "choice_reply_route", "choice_reask", "choice_park", "choice_resume", "interpret_route")
 
 
 def _whole_reply_stop(answer, options=(), replies=STOP_REPLIES):
@@ -3427,7 +3435,7 @@ def apply_answer(state):
                 u["draft_feedback"] = answer
                 u["_next"] = "draft_brief"
     elif kind in ("mode_invalid", "need_design_doc", "seed_confirm", "clarify", "plan_unauthored", "promote_failed",
-                  "git_setup_failed", "gate_fault") and abort:
+                  "git_setup_failed", "gate_fault", "state_fault") and abort:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "mode_invalid":
@@ -3536,6 +3544,28 @@ def apply_answer(state):
         else:
             u["failure_reason"] = f"{gate} kept faulting"
             u["_next"] = "end_failure"
+    elif kind == "state_fault":
+        data = as_dict(esc.get("data"))
+        gate = data.get("gate") or ""
+        picked = _bare_pick(answer, options)
+        if picked == STATE_FAULT_RETRY and gate in GATES:
+            _count_continue(state, u, f"state_fault:{gate}")
+            prior = as_dict(data.get("prior"))
+            if gate not in ESCALATION_GATES:
+                ledger(state, u, f"state: retrying {gate}")
+                u["_next"] = gate
+            elif prior.get("question"):
+                ledger(state, u, f"state: retrying {gate} by asking the interrupted {prior.get('kind')} question again")
+                raise_escalation(state, u, prior)
+            else:
+                ledger(state, u, f"state: {gate} was handling no question to ask again -> resume_route")
+                u["_next"] = "resume_route"
+        elif picked in (STATE_FAULT_RETRY, STATE_FAULT_RESUME):
+            u["resume_phase"] = str(data.get("phase") or "")
+            ledger(state, u, f"state: resuming after the {gate or 'unknown'} fault from phase {u['resume_phase']!r}")
+            u["_next"] = "resume_route"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "approve_breakdown":
         a = _answered(state, {"approve": ["approve"], "revise": ["revise"], "abort": ["abort"]}, "approve")
         if a == "approve":
@@ -5168,6 +5198,62 @@ GATES = {
 }
 
 
+# Gates the engine runs inside a map branch: a fault there takes the branch's own fallback.
+BRANCH_GATES = ("explore_fault", "archivist_fault", "librarian_fault", "checklist_fault", "wave_verify_build", "wave_route", "wave_fault")
+TASK_GATES = ("claim_task", "compose_delegation", "route_delegate", "verify_gate", "task_done_verify", "task_done_route", "fix_done")
+
+
+def _lost_task(name, state):
+    """A gate that acts on the current task, entered with a current_task that names no task in the list."""
+    if name not in TASK_GATES or (name == "verify_gate" and (state.get("verify_scope") or "task") != "task"):
+        return False
+    return task_by_id(as_list(state.get("tasks")), state.get("current_task")) is None
+
+
+def _state_fault(state, name, notes, err):
+    """The escalation for a gate that raised; a second fault in an escalation gate on its own fault ends the run."""
+    u = {}
+    esc = as_dict(state.get("escalation"))
+    said = f"{type(err).__name__}: {err}"
+    if name in ESCALATION_GATES and esc.get("kind") == "state_fault" and as_dict(esc.get("data")).get("gate") == name:
+        ledger(state, u, f"state: {name} faulted again on its own state_fault -> end_failure: {said[:300]}")
+        u["failure_reason"] = f"{name} faulted repeatedly: {said}"
+        u["_next"] = "end_failure"
+        return u
+    keys = ", ".join(f"{k} from {src}" if src else f"{k} missing" for k, src in notes) or "none"
+    retries = _cap_continues(state, f"state_fault:{name}")
+    ledger(state, u, f"state: {name} faulted: {said[:300]} -> state_fault")
+    return raise_escalation(state, u, escalation(
+        "state_fault", f"The {name} step failed on the run state ({said[:300]}). Keys healed or missing at entry: {keys}. "
+                       "Retry the step, resume from the last saved phase, or abort?",
+        [option(STATE_FAULT_RETRY, recommended=_continue_recommended(retries)), option(STATE_FAULT_RESUME), option("Abort the run")],
+        evidence=tail(traceback.format_exc()),
+        data={"gate": name, "error": said, "phase": read_snapshot(state.get("run_dir")).get("phase") or "",
+              "prior": esc if name in ESCALATION_GATES and esc.get("question") else {}}))
+
+
 def run(name):
-    state = load_state()
-    emit(GATES[name](state))
+    """Heal the state, run the gate, and turn a gate exception into a state_fault escalation.
+
+    The healed values and one ledger line per heal ride along with the gate's own updates, which win on a clash.
+    """
+    gate = GATES[name]
+    state, notes = heal_state(load_state())
+    u = {}
+    for key, source in notes:
+        if source:
+            u[key] = state[key]
+            ledger(state, u, f"state: healed {key} from {source}")
+    state = {**state, **u}
+    if _lost_task(name, state):
+        out = {}
+        ledger(state, out, f"state: {name} has no current task ({state.get('current_task')!r}) -> select_tasks")
+        out["_next"] = "select_tasks"
+    else:
+        try:
+            out = gate(state)
+        except Exception as e:  # noqa: BLE001
+            if name in BRANCH_GATES:
+                raise
+            out = _state_fault(state, name, notes, e)
+    emit({**u, **out})
