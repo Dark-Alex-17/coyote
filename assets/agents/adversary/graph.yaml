@@ -4,15 +4,21 @@ description: |
   criteria are extracted into a list and the graph mechanically fans out ONE
   fresh-context verification branch per criterion — "checked 8 of 12 and waved
   the rest through" becomes structurally impossible. Each criterion verdict
-  (MET / PARTIAL / UNMET / DIVERGED) passes a deterministic contract gate
-  (MET requires evidence including a test proving the behavior — no test means
-  at best PARTIAL). A holistic pass then hunts what per-criterion checks cannot
+  (MET / INSPECTED / PARTIAL / UNMET / DIVERGED) passes a deterministic
+  contract gate (MET requires evidence including a test proving the behavior;
+  INSPECTED, met by inspection, is only for a criterion no test could prove
+  and requires a file:line citation plus the reason no test applies). A
+  holistic pass then hunts what per-criterion checks cannot
   see: absence (the dog that didn't bark), scope drift, interface substitution,
   silently-overridden recorded decisions, out-of-scope touches, and gamed
-  tests — ADDITIVE-only: it can add complaints, never flip a criterion verdict.
+  tests. It is additive: it adds complaints, each marked blocking or not, and
+  never changes a criterion verdict, except that it rules on a criterion whose
+  check output stayed unreadable after re-asks (UNVERIFIED).
   The final CONFORMS/DIVERGES sentinel is computed by a script: CONFORMS
-  requires every criterion MET, zero holistic complaints, zero pipeline faults,
-  and zero red verification runs (exit≠0/timeout/skipped, or a runner error
+  requires every criterion MET or INSPECTED, zero blocking holistic
+  complaints, zero pipeline faults, and zero blocking red verification runs (a
+  failure that already happened on the diff base is reported, not blocking; a
+  command the deadline skipped is reported as not run; a runner error blocks
   when commands were declared), plus zero implementation-debris hits from the
   mechanical debris_lint stage. Missing plan = DIVERGES (fail-closed) naming
   the missing spec. Caller-declared verification
@@ -34,6 +40,9 @@ variables:
   - name: project_dir
     description: Project directory containing the changes under review
     default: '.'
+  - name: review_grounding
+    description: "'1' grounds the fs read tools in the review checkout: relative paths resolve against project_dir, and a read inside another clone of the same origin repository is refused with the checkout path. Reads in other repositories are unaffected. '0' turns it off."
+    default: '1'
   - name: verification_commands
     description: |
       JSON array of shell commands the CALLER declares for the deterministic
@@ -52,12 +61,12 @@ variables:
 settings:
   max_loop_iterations: 10
   log_state_snapshots: false
-  # 3600 (run_checks node timeout, worst case) + 5400 (the previous
-  # whole-graph budget, kept as the envelope for every stage other than
+  # 4600 (run_checks node timeout, worst case: 1200 lock wait + 3300 deadline
+  # + cleanup margin) + 5400 (the envelope for every stage other than
   # run_checks: parse/facts before it, criteria map/holistic/verdict after)
-  # = 9000. A graph timeout kills from outside — no fallback fires and the
+  # = 10000. A graph timeout kills from outside: no fallback fires and the
   # sentinel is lost.
-  timeout: 9000
+  timeout: 10000
 
 initial_state:
   project_dir_in: ''
@@ -70,12 +79,14 @@ initial_state:
   changed_files: []
   diff_text: ''
   diff_note: ''
+  diff_base: ''
   exec_results: ''
   debris_findings: []
   debris_summary: ''
   last_script_error: ''
   crit_verdicts: []
   extra_complaints: []
+  format_rulings: []
   observations: ''
   adv_report: ''
   gate_feedback: ''
@@ -170,9 +181,9 @@ nodes:
   run_checks:
     id: run_checks
     type: script
-    description: Deterministic execution evidence — runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed); a 3300s total deadline keeps the script under the node timeout (commands past it are recorded as skipped), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); a command that timed out here gets a not-run baseline without a base run. The worktree is added with the user's git hooks disabled and removed on normal exit. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3300s total deadline, started after the review-stack lock (bounded 1200s wait), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
-    timeout: 3600
+    timeout: 4600
     fallback: pipeline_fault
     next: debris_lint
 
@@ -199,7 +210,7 @@ nodes:
   check_criterion:
     id: check_criterion
     type: llm
-    description: Fresh-context verification of ONE acceptance criterion against the diff and the working tree (ENVIRONMENT/SKIPPED runs judge PARTIAL here; the deterministic verdict blocks CONFORMS when declared commands did not run).
+    description: Fresh-context verification of ONE acceptance criterion against the diff and the working tree (ENVIRONMENT/SKIPPED runs judge PARTIAL here; the deterministic verdict blocks CONFORMS when declared commands did not run because the runner errored).
     instructions: |
       You verify ONE acceptance criterion against a code change. Fresh context,
       one criterion, full suspicion: assume the implementer drifted, cut a
@@ -208,9 +219,14 @@ nodes:
       Classification (exactly one):
       - `MET` — the diff satisfies the criterion AND a test proves the promised
         behavior. Evidence MUST cite both: the satisfying change (file:line) and
-        the test targeting the behavior (file:line). No test ⇒ NOT MET — at best
-        PARTIAL (a criterion is a promise of observable behavior; unproven
-        behavior is unverified behavior).
+        the test targeting the behavior (file:line). For a behavioral criterion,
+        no test means NOT MET: at best PARTIAL (a criterion is a promise of
+        observable behavior; unproven behavior is unverified behavior).
+      - `INSPECTED` (met by inspection): only for a criterion whose nature
+        admits no test that could prove it (documentation, an absence such as
+        "does not touch Y", a deletion, no new dependencies, a process or log
+        entry, performance). Evidence MUST cite file:line, and
+        `no_test_reason` says in one line why no test applies.
       - `PARTIAL` — partially satisfied, or satisfied but unproven (missing/weak
         test), or you could not establish it either way (say why — doubt lands
         here, never in MET).
@@ -251,7 +267,10 @@ nodes:
       - a recorded green run (exit 0) of a command covering the criterion is
         the proving evidence — MET, citing that run (the command + exit 0).
       - a recorded failing run covering the criterion ⇒ UNMET, citing the
-        recorded exit code and output tail.
+        recorded exit code and output tail. A failing record may carry a
+        `baseline` field saying whether the same failures already occurred on
+        the diff base; failures that predate the change are not attributed to
+        it unless the criterion asks for them to be fixed.
       - "none declared" or an ENVIRONMENT marker ⇒ at best PARTIAL, with an
         ENVIRONMENT note in the complaint naming the exact command the caller
         should declare via the `verification_commands` variable (structured
@@ -260,19 +279,27 @@ nodes:
       - a SKIPPED record (the runner's total deadline expired before that
         command ran) ⇒ at best PARTIAL for the criteria it covers, same
         treatment as an ENVIRONMENT marker: unproven at the criterion level.
-        The deterministic verdict additionally blocks CONFORMS when declared
-        commands did not run — that is its job, not yours.
+        A skipped command does not block the verdict by itself: your judgment
+        of the criteria it covers is what blocks. The
+        deterministic verdict additionally blocks CONFORMS when a runner error
+        (ENVIRONMENT marker) kept declared commands from running.
 
       Output format — respond with ONLY this JSON object, no prose around it:
       {"id": "<the criterion's id, echoed>",
-       "status": "MET" | "PARTIAL" | "UNMET" | "DIVERGED",
+       "status": "MET" | "INSPECTED" | "PARTIAL" | "UNMET" | "DIVERGED",
        "evidence": "<for MET: the satisfying change file:line AND the proving test
-      file:line, quoted decisively; otherwise the closest relevant citations or empty>",
-       "complaint": "<required for non-MET: what the diff does/omits (file:line) and
-      what would make it conform; empty string for MET>"}
+      file:line, quoted decisively; for INSPECTED: the inspected file:line; otherwise
+      the closest relevant citations or empty>",
+       "complaint": "<required unless MET or INSPECTED: what the diff does/omits
+      (file:line) and what would make it conform; empty string otherwise>",
+       "no_test_reason": "<required for INSPECTED: one line, why no test could prove
+      this criterion; empty string otherwise>"}
 
       Your response is machine-validated: a malformed response is rejected back
-      to you exactly once with the reason, then recorded as PARTIAL (unproven).
+      to you with the reason, at most twice (the second time quoting your
+      response verbatim); after that a status that does not claim the
+      criterion met is kept, and anything else is recorded as UNVERIFIED for
+      the holistic pass to rule on.
       The id is stamped from the criterion itself — your echo is informative only.
       You have a bounded tool budget — prefer fs_grep and line-ranged fs_read over
       whole-file reads, and conclude as soon as the evidence is decisive.
@@ -309,7 +336,7 @@ nodes:
   crit_gate:
     id: crit_gate
     type: script
-    description: Deterministic contract gate per criterion verdict — status enum, MET requires evidence, non-MET requires a complaint; reject-and-retry once, then record PARTIAL (unproven). Never sinks the map.
+    description: Deterministic contract gate per criterion verdict. Status enum; MET requires evidence; INSPECTED requires a file:line citation and a no_test_reason; every other status requires a complaint. Rejects and re-asks twice (the second time quoting the rejected output), then keeps a recoverable not-met status or records UNVERIFIED with the raw output for the holistic pass to rule on. Never sinks the map.
     script: scripts/crit_gate.py
     timeout: 30
 
@@ -323,15 +350,18 @@ nodes:
   holistic:
     id: holistic
     type: llm
-    description: Cross-criterion adversarial pass — hunts what per-criterion checks cannot see. ADDITIVE-only; cannot flip criterion verdicts.
+    description: Cross-criterion adversarial pass that hunts what per-criterion checks cannot see. Additive; it never changes a criterion verdict's status other than settling UNVERIFIED ones through format_rulings, and its blocking complaints can block CONFORMS. It gives a format ruling for each UNVERIFIED criterion (one whose check produced no valid verdict); a ruling that fails the criterion contract is not applied.
     instructions: |
       You run the holistic adversarial pass over a whole change AFTER each
       acceptance criterion was independently verified. You hunt what
       per-criterion checks cannot see. You are ADDITIVE-ONLY: you may add
       complaints; you may NOT flip, soften, or re-judge any criterion verdict.
+      The one exception is `format_rulings`, below.
 
       The checklist (each hit becomes one complaint with kind, file:line
-      location, the violation, and the fix):
+      location, the violation, the fix, and `blocking`). A complaint is
+      blocking (`blocking: true`) when the change does not conform to the
+      plan: every kind below except spec-endorsed waste.
       - **Absence** — something the PLAN requires that maps to no criterion and
         never showed up in the diff (the dog that didn't bark). A missing
         retry/redelivery spec is an absence ONLY for a handler that carries state
@@ -351,7 +381,8 @@ nodes:
         the called API accepts a set/batch form the implementation ignores.
         The criterion stays MET — raise the complaint anyway, naming the batch
         form at file:line. A plan-blessed budget is a floor, not an endorsement
-        of per-item calls.
+        of per-item calls. This complaint is `blocking: false`, since its
+        criterion stays MET.
       - **Gamed tests** — tests weakened, deleted, or shaped (hardcoded
         expectations, skipped assertions) so the criteria APPEAR met.
       - **The plan itself is the culprit** — impossible or self-contradictory
@@ -362,12 +393,25 @@ nodes:
       complaint with no location and no criterion/scope reference is noise — do
       not emit it. When everything is a nitpick, emit zero complaints and put
       1-3 non-blocking notes in `observations`.
+
+      `format_rulings`: a per-criterion verdict with status UNVERIFIED means
+      its check produced no valid verdict after re-asks; its evidence is the
+      check's raw output. Rule on each UNVERIFIED criterion, and ONLY those,
+      from that raw output and the diff: one entry with its id, a status
+      (MET, INSPECTED, PARTIAL, UNMET or DIVERGED, under the same bar as the
+      criterion checks: MET needs a proving test, INSPECTED only where no test
+      could prove it), evidence, complaint, and no_test_reason. Rulings for
+      any other criterion are ignored. A ruling is held to the criterion
+      contract: MET needs evidence, INSPECTED needs a file:line citation in
+      its evidence and a no_test_reason, and any other status a complaint.
+      A ruling that misses it is rejected and the criterion stays a
+      PIPELINE-FAULT. Emit an empty array when no criterion is UNVERIFIED.
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
 
       Acceptance criteria: {{criteria}}
-      Per-criterion verdicts (already final): {{crit_verdicts}}
+      Per-criterion verdicts (final, except UNVERIFIED ones awaiting your format ruling): {{crit_verdicts}}
 
       Plan-recorded decisions: {{plan_notes}}
       Scope boundaries: {{scope_notes}}
@@ -396,10 +440,29 @@ nodes:
                 type: string
               fix:
                 type: string
-            required: [kind, location, violation, fix]
+              blocking:
+                type: boolean
+            required: [kind, location, violation, fix, blocking]
+        format_rulings:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              status:
+                type: string
+                enum: [MET, INSPECTED, PARTIAL, UNMET, DIVERGED]
+              evidence:
+                type: string
+              complaint:
+                type: string
+              no_test_reason:
+                type: string
+            required: [id, status, evidence, complaint, no_test_reason]
         observations:
           type: string
-      required: [extra_complaints, observations]
+      required: [extra_complaints, format_rulings, observations]
     max_iterations: 45
     max_attempts: 2
     state_updates:
@@ -418,7 +481,7 @@ nodes:
   verdict:
     id: verdict
     type: script
-    description: Deterministic verdict -- CONFORMS requires every criterion MET, zero holistic complaints, zero pipeline faults, zero recorded red verification runs (exit!=0/timeout/skipped, or an ENVIRONMENT runner-error marker when commands were declared), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
+    description: Deterministic verdict -- CONFORMS requires every criterion MET or INSPECTED (after applying holistic format rulings to UNVERIFIED criteria only; an unruled UNVERIFIED criterion is a PIPELINE-FAULT), zero blocking holistic complaints, zero pipeline faults, zero recorded red verification runs other than failures that already happened on the diff base (exit!=0/timeout, or an ENVIRONMENT runner-error marker when commands were declared; a deadline-skipped command is reported as not run), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
     script: scripts/verdict.py
     timeout: 30
     next: done

@@ -13,6 +13,7 @@ use std::path::Path;
 const SPAWN_SITE: &str = concat!("CARGO_BIN_EXE_", "coyote");
 const CONFIG_ENV: &str = ".env(\"COYOTE_CONFIG_DIR\"";
 const CACHE_ENV: &str = ".env(\"COYOTE_CACHE_DIR\"";
+const XDG_ENV: &str = ".env(\"XDG_CACHE_HOME\"";
 const PATH_PIN: &str = ".env(\"PATH\", pinned_path(";
 const MEMORY_ROOT_SCRUB: &str = ".env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)";
 const MEMORY_ROOT_MIRROR: &str = "const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = ";
@@ -45,13 +46,21 @@ fn every_binary_spawn_in_the_harnesses_pins_the_config_dir_and_the_cache_dir() {
         let spawn_sites = source.matches(SPAWN_SITE).count();
         let config_sites = source.matches(CONFIG_ENV).count();
         let cache_sites = source.matches(CACHE_ENV).count();
+        let xdg_sites = source.matches(XDG_ENV).count();
         if spawn_sites == 0 && config_sites == 0 && cache_sites == 0 {
             continue;
         }
+        // Two surpluses are legitimate. The candidate harnesses also pin
+        // `COYOTE_CACHE_DIR` on the python battery `Command`s they spawn,
+        // which never run the binary. And a spawn of the binary may pin its
+        // cache through `XDG_CACHE_HOME` instead, the engine's middle cache
+        // tier, so XDG sites count as cache pins.
         assert!(
-            spawn_sites == config_sites && config_sites == cache_sites,
+            config_sites >= spawn_sites && cache_sites + xdg_sites >= spawn_sites,
             "{}: {spawn_sites} binary spawn(s), {config_sites} COYOTE_CONFIG_DIR site(s), \
-             {cache_sites} COYOTE_CACHE_DIR site(s); every spawn of the binary must pin both dirs",
+             {cache_sites} COYOTE_CACHE_DIR site(s), {xdg_sites} XDG_CACHE_HOME site(s); every \
+             spawn of the binary must pin the config dir and one of the two cache dirs, so the \
+             config count and the combined cache count must each be at least the spawn count",
             path.display()
         );
         pinned.push(path.file_name().unwrap().to_string_lossy().into_owned());

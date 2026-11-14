@@ -41,7 +41,27 @@ never kills the graph.
 
 import json
 import os
+import sys
 import time
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
+sys.dont_write_bytecode = True
+# Under PYTHONSAFEPATH sys.path[0] is not this directory.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# A missing helper module or name must still end in the crash stub below, so
+# the import error is kept here and raised inside the crash guard by main().
+try:
+    from report_text import one_line
+
+    helper_import_error = None
+except Exception as e:  # noqa: BLE001 - any helper failure must reach the stub
+    helper_import_error = e
 
 # Keep in sync with default_lanes.ALIASES — a caller-forced lane must
 # canonicalize the same way on the degraded path as it does here.
@@ -76,7 +96,7 @@ crash_context = {"signals_error": "", "lanes_summary": ""}
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -94,6 +114,8 @@ def main():
         return v.strip() if isinstance(v, str) else ""
 
     crash_context["lanes_summary"] = text("lanes_summary")
+    if helper_import_error:
+        raise helper_import_error
     retry_lanes = [lane for lane in (state.get("retry_lanes") or []) if lane in LANE_KEYS]
     if retry_lanes:
         attempts = state.get("lane_attempts") or {}
@@ -222,15 +244,19 @@ def main():
                     f"round and {why}"
                 )
 
+        # Security narrows only on a tests/docs-only delta: a source change
+        # with no auth/deps/exec signal can still alter input handling.
         narrow(
             "security",
-            not (
+            bool(state.get("delta_tests_docs_only"))
+            and not (
                 state.get("delta_touches_auth")
                 or state.get("delta_touches_deps")
                 or state.get("delta_touches_exec")
                 or state.get("security_posture") == "hardened"
             ),
-            f"the re-review delta ({delta_summary}) has no attack-surface signals",
+            f"the re-review delta ({delta_summary}) is tests/docs-only with no "
+            "attack-surface signals",
         )
         narrow(
             "probe",
@@ -295,7 +321,9 @@ def main():
                 "adversary_items": [{"lane": "adversary"}] if "adversary" in lanes else [],
                 "security_items": [{"lane": "security"}] if "security" in lanes else [],
                 "probe_items": [{"lane": "probe"}] if "probe" in lanes else [],
-                "lanes_summary": "\n".join(f"- {r}" for r in reasons),
+                # Each reason is folded before the join: the gate reads one
+                # bullet per line, and a reason may carry model-written text.
+                "lanes_summary": "\n".join(f"- {one_line(r)}" for r in reasons),
                 **stamp,
             }
         )
@@ -305,7 +333,8 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — a builder crash must never kill the graph
-    fault = f"PIPELINE-FAULT: lane builder crashed — {e}; no lanes were run"
+    error = " ".join(str(e).splitlines()) if helper_import_error else one_line(e)
+    fault = f"PIPELINE-FAULT: lane builder crashed \u2014 {error}; no lanes were run"
     if crash_context["signals_error"]:
         fault = f"{crash_context['signals_error']}; {fault}"
     print(

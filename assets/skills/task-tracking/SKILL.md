@@ -29,6 +29,8 @@ plan: PLAN-<slug>.md
 blocked_by: []         # TASK ids that must be complete first
 created: YYYY-MM-DD
 surfaces: []           # this task's surfaces; omitted = inherit the plan's list
+batch: <slug>          # micro-grain plans only: the breakdown table's Batch value
+protected: true        # micro-grain plans only: set when the Protected column is set; omitted otherwise
 ---
 
 ## What

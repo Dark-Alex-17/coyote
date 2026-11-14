@@ -22,10 +22,23 @@ re-reads, no judgment. The gate's hard rules:
     checks, or its verdict script's crash stub — blocks as a PIPELINE-FAULT,
     not as a DIVERGES finding: the nested graph completed with a dead stage
     behind it, so its verdict is not a judgment on the code;
+  - an adversary DIVERGES verdict blocks with the adversary's own numbered
+    complaints (the column-0 items under its `Complaints:` line, each read
+    whole whatever line boundaries its model-written fields carry), one
+    blocker each, so a fix round can act on them: at most
+    ADVERSARY_COMPLAINTS_MAX, each clipped to ADVERSARY_COMPLAINT_CHARS, the
+    rest folded into one line naming every remaining complaint's head; a
+    report without that block keeps one generic DIVERGES blocker;
   - a non-zero critical count in the code-review report blocks regardless
     of the lane's own verdict line — derived from render.py's deterministic
     summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
     count is used only when that summary line is missing;
+  - a code-review lane whose OWN verdict line opens its reason with
+    `review incomplete:` (finding verification failed as a whole) is an
+    incomplete review: the row blocks and the lane is named on the
+    GAUNTLET_REVIEW_INCOMPLETE: machine line. Its unverified findings keep
+    their stated severity, so an unverified 🔴 is in the critical count and
+    blocks like any other; single unverified findings add an attention line;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
   - probe INCONCLUSIVE blocks with an ENVIRONMENT note — it is never
     treated as PASS or FAIL (fix the environment per the plan's local-run
@@ -63,8 +76,26 @@ import os
 import re
 import sys
 
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
+# Under PYTHONSAFEPATH sys.path[0] is not this directory; report_text must
+# still resolve here, ahead of anything of the same name in .shared.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# A missing helper module or name must still end in the BLOCKED stub below,
+# so the import error is kept here and raised inside the crash guard by main().
+try:
+    from report_text import one_line, table_cell
+
+    helper_import_error = None
+except Exception as e:  # noqa: BLE001 - any helper failure must reach the stub
+    helper_import_error = e
 
 # Duplicated verbatim in the sibling gate script — the two copies must stay identical.
 ADVERSARY_DEGRADED_HEADER = re.compile(
@@ -78,7 +109,7 @@ ADVERSARY_DEGRADED_HEADER = re.compile(
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -95,10 +126,94 @@ def adversary_degraded(report):
     return False
 
 
+def selection_lines(summary):
+    # build_items writes one `- ` bullet per reason; a continuation line from
+    # any other writer joins the item above it instead of starting a line,
+    # and a leading non-bullet line gets the bullet so no line starts bare.
+    items = []
+    for line in summary.splitlines():
+        if line.startswith("- "):
+            items.append(line[2:])
+        elif line.strip() and items:
+            items[-1] += " " + line
+        elif line.strip():
+            items.append(line)
+    folded = (one_line(text) for text in items)
+    return ["- " + text for text in folded if text]
+
+
+# A DIVERGES verdict hands the fixer the adversary's own numbered complaints, each a blocker line of its own,
+# clipped so one runaway complaint cannot swamp the Blockers section; past the cap, the rest go on one line as heads.
+ADVERSARY_COMPLAINTS_MAX = 8
+ADVERSARY_COMPLAINT_CHARS = 600
+ADVERSARY_OVERFLOW_HEAD_CHARS = 120
+# The sections adversary/scripts/verdict.py renders after its complaints,
+# each after a blank line. Exact names, so a model-written field holding a
+# blank line and a line ending in `:` stays inside its complaint.
+SECTIONS_AFTER_COMPLAINTS = (
+    "Non-blocking observations:",
+    "Met criteria (evidence):",
+    "Verification runs:",
+)
+
+
+def adversary_complaints(report):
+    """The column-0 numbered items under the adversary's `Complaints:` line,
+    in order, each with its continuation lines joined.
+
+    The report is split on `\\n` only: an item's fields are model text and may
+    carry any other line-boundary character or a blank line. An item runs
+    until a line that opens the NEXT number (so a field line opening with
+    that exact number does start a new item), or until a blank line followed
+    by one of SECTIONS_AFTER_COMPLAINTS."""
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in report.split("\n")]
+    start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "Complaints:"), None)
+    body = lines[start:] if start is not None else []
+    items, number = [], None
+    for k, ln in enumerate(body):
+        m = re.match(r"(\d+)\.\s+(.*)", ln)
+        if m and (number is None or int(m.group(1)) == number + 1):
+            number = int(m.group(1))
+            items.append(m.group(2).strip())
+        elif not items:
+            break
+        elif not ln.strip():
+            nxt = next((b for b in body[k + 1 :] if b.strip()), None)
+            if nxt is None or nxt.strip() in SECTIONS_AFTER_COMPLAINTS:
+                break
+        else:
+            items[-1] += " " + ln.strip()
+    return [one_line(c) for c in items if c.strip()]
+
+
+def clip(text, limit):
+    return text if len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def adversary_divergence_blockers(report):
+    complaints = adversary_complaints(report)
+    if not complaints:
+        return ["adversary: DIVERGES -- the implementation does not conform to the plan"]
+    out = [
+        f"adversary: DIVERGES -- complaint {i}: {clip(c, ADVERSARY_COMPLAINT_CHARS)}"
+        for i, c in enumerate(complaints[:ADVERSARY_COMPLAINTS_MAX], 1)
+    ]
+    if len(complaints) > ADVERSARY_COMPLAINTS_MAX:
+        rest = complaints[ADVERSARY_COMPLAINTS_MAX:]
+        heads = "; ".join(clip(c, ADVERSARY_OVERFLOW_HEAD_CHARS) for c in rest)
+        out.append(f"adversary: DIVERGES -- {len(rest)} more complaint(s): {heads}")
+    return out
+
+
 def main():
+    if helper_import_error:
+        raise helper_import_error
     state = load_state()
     blockers, attention, reports = [], [], []
     rows = {}
+    # lane -> the "Review incomplete" line for a lane that completed with a
+    # verdict but reported its own review as incomplete.
+    incomplete_detail = {}
     malformed = set()
     lane_attempts = state.get("lane_attempts")
     if not isinstance(lane_attempts, dict):
@@ -191,6 +306,35 @@ def main():
             re.MULTILINE,
         )
         reds = int(sums[-1]) if sums else cr.count("🔴")
+        # CONTRACT: code-reviewer/verdict.py. Verification that failed as a
+        # whole OPENS the reason with "review incomplete:" and is an
+        # incomplete review. Unverified findings keep their stated severity,
+        # so an unverified 🔴 is already in `reds`; single unverified findings
+        # add an attention line. Same first-verdict-line scoping as the fault
+        # anchor.
+        line = verdict_line.group(0) if verdict_line else ""
+        m_incomplete = re.search(
+            r"^\*\*Verdict: NEEDS-HUMAN\*\* \u2014 review incomplete: finding verification "
+            r"failed, (\d+) finding",
+            line,
+        )
+        m_unverified = re.search(r"(\d+) finding\(s\) unverified, kept at their stated severity", line)
+        if m_incomplete:
+            n_unverified = m_incomplete.group(1)
+            incomplete_detail["code-review"] = (
+                f"code-review: finding verification failed; {n_unverified} unverified "
+                "finding(s) are kept at their stated severity in the lane report"
+            )
+            blockers.append(
+                "code-review: review incomplete \u2014 finding verification failed; "
+                f"{n_unverified} unverified finding(s) are kept at their stated severity in the "
+                "lane report"
+            )
+        elif m_unverified:
+            attention.append(
+                f"code-review: {m_unverified.group(1)} unverified finding(s) kept at their "
+                "stated severity; check each one against the code"
+            )
         if m_fault:
             blockers.append(
                 "code-review: the lane reported an internal PIPELINE-FAULT "
@@ -205,6 +349,10 @@ def main():
             record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane{suffix}); {reds} 🔴")
         elif m_fault:
             record("code-review", "BLOCKED", f"PIPELINE-FAULT (degraded lane{suffix})")
+        elif m_incomplete and reds:
+            record("code-review", "BLOCKED", f"review incomplete (verification); {reds} 🔴")
+        elif m_incomplete:
+            record("code-review", "BLOCKED", "review incomplete (verification)")
         elif reds:
             record("code-review", "BLOCKED", f"{reds} 🔴 finding(s)")
         elif m and m.group(1) == "MERGE-READY":
@@ -214,7 +362,10 @@ def main():
                 "code-review: NEEDS-HUMAN — see the lane report's "
                 "'Human attention required' section"
             )
-            record("code-review", "GREEN (attention)", "NEEDS-HUMAN, no 🔴")
+            unverified_note = (
+                f"; {m_unverified.group(1)} unverified finding(s)" if m_unverified else ""
+            )
+            record("code-review", "GREEN (attention)", f"NEEDS-HUMAN, no 🔴{unverified_note}")
         else:
             blockers.append(
                 "code-review: no Review Verdict sentinel found — the lane failed; "
@@ -247,9 +398,7 @@ def main():
         elif m and m.group(1) == "CONFORMS":
             record("adversary", "GREEN", "CONFORMS")
         elif m:
-            blockers.append(
-                "adversary: DIVERGES — the implementation does not conform to the plan"
-            )
+            blockers.extend(adversary_divergence_blockers(adv))
             record("adversary", "BLOCKED", "DIVERGES")
         else:
             blockers.append(
@@ -370,6 +519,7 @@ def main():
         malformed_bookkeeping = repr(declared)[:80]
     if debris_incomplete is not None:
         incomplete.add("debris")
+    incomplete.update(incomplete_detail)
     for lane in sorted(incomplete - {"pipeline"}):
         if rows.get(lane, ("", ""))[0] == "BLOCKED":
             continue
@@ -404,40 +554,53 @@ def main():
     for name in sorted(incomplete):
         if name == "pipeline":
             incomplete_lines.append(
-                f"- pipeline: {signals_error}"
+                f"pipeline: {signals_error}"
                 if pipeline_fault
-                else "- pipeline: review incomplete (no fault text recorded)"
+                else "pipeline: review incomplete (no fault text recorded)"
             )
         elif name == "debris" and debris_incomplete is not None:
-            incomplete_lines.append(f"- debris: {debris_incomplete}")
+            incomplete_lines.append(f"debris: {debris_incomplete}")
+        elif name in incomplete_detail:
+            incomplete_lines.append(incomplete_detail[name])
         elif n := attempt_count(name):
-            incomplete_lines.append(f"- {name}: no completed review after {n} attempt(s)")
+            incomplete_lines.append(f"{name}: no completed review after {n} attempt(s)")
         else:
-            incomplete_lines.append(f"- {name}: no completed review")
+            incomplete_lines.append(f"{name}: no completed review")
     incomplete_line = (
-        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(sorted(incomplete))
+        "\nGAUNTLET_REVIEW_INCOMPLETE: " + ", ".join(one_line(n) for n in sorted(incomplete))
         if incomplete
         else ""
     )
 
+    # Above `## Full lane reports` every interpolated value goes through
+    # report_text, so no state-sourced text can start a header line of its own.
     md = "\n".join(
         ["| lane | status | detail |", "|------|--------|--------|"]
-        + [f"| {lane} | {status} | {detail} |" for lane, (status, detail) in rows.items()]
+        + [
+            f"| {table_cell(lane)} | {status} | {table_cell(detail)} |"
+            for lane, (status, detail) in rows.items()
+        ]
     )
-    md += "\n\n## Lane selection\n" + (state.get("lanes_summary") or "(none recorded)")
+    md += "\n\n## Lane selection\n" + (
+        "\n".join(selection_lines(state.get("lanes_summary") or "")) or "(none recorded)"
+    )
     _notes = state.get("retry_notes")
     if isinstance(_notes, list):
         _shown = [n for n in _notes if isinstance(n, str)][:8]
         if _shown:
-            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {n}" for n in _shown)
+            md += "\n\n## Pipeline notes\n" + "\n".join(f"- {one_line(n)}" for n in _shown)
     if blockers:
-        md += "\n\n## Blockers\n" + "\n".join(f"- {b}" for b in blockers)
+        md += "\n\n## Blockers\n" + "\n".join(f"- {one_line(b)}" for b in blockers)
     if attention:
-        md += "\n\n## Human attention required\n" + "\n".join(f"- {a}" for a in attention)
+        md += "\n\n## Human attention required\n" + "\n".join(
+            f"- {one_line(a)}" for a in attention
+        )
     if state.get("signals_error"):
-        md += f"\n\n> {state['signals_error']}"
+        md += f"\n\n> {one_line(state['signals_error'])}"
     if incomplete_lines:
-        md += "\n\n## Review incomplete\n" + "\n".join(incomplete_lines)
+        md += "\n\n## Review incomplete\n" + "\n".join(
+            f"- {one_line(x)}" for x in incomplete_lines
+        )
     md += "\n\n## Full lane reports\n"
     for lane, rep in reports:
         md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"
@@ -456,11 +619,14 @@ def main():
 try:
     main()
 except Exception as e:  # noqa: BLE001 — the gate must never crash into a silent pass
+    # Without the helper the error is the helper's own, which may span lines;
+    # splitlines() splits on exactly the boundaries one_line folds.
+    error = " ".join(str(e).splitlines()) if helper_import_error else one_line(e)
     print(
         json.dumps(
             {
                 "gauntlet_verdict": "BLOCKED",
-                "gauntlet_report": f"verdict gate error: {e} — treat as a failed gate, not a pass.",
+                "gauntlet_report": f"verdict gate error: {error} \u2014 treat as a failed gate, not a pass.",
                 "gauntlet_incomplete_line": "\nGAUNTLET_REVIEW_INCOMPLETE: pipeline",
             }
         )
