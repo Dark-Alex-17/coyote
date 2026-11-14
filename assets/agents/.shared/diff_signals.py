@@ -33,17 +33,20 @@ AUTH_ADDED_RE = (
     r"|permission|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b"
 )
 # Manifest and lockfile basenames, as anchored regex fragments. Any `*.lock`,
-# `*-lock.*` or `*.lockfile` counts too, so a lockfile missing from the list
-# still selects the lane.
+# `*.lock.*`, `*.lockb`, `*.lockfile` or data-shaped `*-lock.*` counts too, so
+# a lockfile missing from the list still selects the lane.
 DEPS_BASENAMES = (
     r"[^/]*\.lock",
-    r"[^/]*-lock\.[^/]*",
+    r"[^/]*\.lock\.[^/]*",
+    r"[^/]*\.lockb",
+    r"[^/]*-lock\.(json|ya?ml|toml)",
     r"[^/]*\.lockfile",
     r"go\.(mod|sum|work|work\.sum)",
     r"package\.json",
     r"npm-shrinkwrap\.json",
     r"Cargo\.toml",
     r"requirements[^/]*\.(txt|in)",
+    r"requirements/[^/]*\.(txt|in)",
     r"constraints[^/]*\.txt",
     r"pyproject\.toml",
     r"Pipfile",
@@ -63,6 +66,7 @@ DEPS_BASENAMES = (
     r"Directory\.Packages\.props",
     r"[^/]*\.nuspec",
     r"Package\.swift",
+    r"Package\.resolved",
     r"Podfile",
     r"Cartfile",
     r"pubspec\.yaml",
@@ -91,7 +95,7 @@ EXEC_RE = (
 CONSUMER_RE = (
     r"routes?|handlers?|\bapi\b|endpoints?|\bcmd/|\bcli\b|\.proto$"
     r"|openapi|swagger|controllers?|graphql"
-    r"|(^|/)(servers?|views|urls|app|wsgi|asgi)(\.[^/]*)?(/|$)"
+    r"|(^|/)(servers?|views|urls|wsgi|asgi)(\.[^/]*)?(/|$)"
 )
 PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
 MIGRATIONS_RE = r"migrations?/|\.sql$"

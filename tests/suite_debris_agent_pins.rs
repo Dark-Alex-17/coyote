@@ -491,7 +491,7 @@ fn every_banned_glyph_sentence_names_every_glyph_family_the_debris_lint_reports(
 /// engine takes its `fallback:` edge) must carry it byte for byte after their
 /// own escaping is undone; no prompt may keep another copy.
 fn debt_grep_regex_has_one_home_in_debt_markers_and_its_fallbacks_match() {
-    const GREP_TAIL: &str = r#"grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|skipIf|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented|panic\("(TODO|not implemented|unimplemented)|(//|#|--|;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|@?[A-Za-z_]+[-:] ?(disable|ignore|nocheck|expect-error)|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'"#;
+    const GREP_TAIL: &str = r#"grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|[sS][kK][iI][pP][iI][fF]|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|importorskip\(|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented(Error|Exception)|panic\("(TODO|not implemented|unimplemented)|(//|#|-- |;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|NOLINT(NEXTLINE|BEGIN|END)?([^A-Za-z0-9_]|$)|@?[A-Za-z_]+-(disable|ignore|nocheck|expect-error)($|[-=,:[]| +($|[a-z@#/*-]))|@?[A-Za-z_]+: ?(disable|ignore|nocheck)($|[-=,[]| +[#A-Z])|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|pragma +(GCC|clang) +diagnostic +(ignored|push)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'"#;
 
     for (rel, import) in [
         (".shared/debt_scan.py", "from debt_markers import "),
@@ -1239,8 +1239,9 @@ fn debt_scan_cli_flags_win_over_an_inherited_graph_state() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(
-        text.starts_with(&format!("Debt scan (diff base: {base}): 1 hit(s) [scanned: "))
-            && text.contains("src/new.rs:1 -- todo!()"),
+        text.starts_with(&format!(
+            "Debt scan (diff base: {base}): 1 hit(s) [scanned: "
+        )) && text.contains("src/new.rs:1 -- todo!()"),
         "plain-text report for the flagged repo, not a JSON envelope: {text}"
     );
 }

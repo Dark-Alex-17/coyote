@@ -50,26 +50,56 @@ DIFF_FLAGS = (
 
 ROUTE_RE = re.compile(r'["\'](/[a-z0-9][a-z0-9/_{}.:-]{5,})["\']')
 SCHEMA_RE = re.compile(r"^\s*(?:message|service|rpc)\s+([A-Z][A-Za-z0-9_]{5,})", re.M)
-# Top-level definition keywords and the modifiers that may precede them,
-# across common languages. A `func` may carry a method receiver `(...)`.
+# Definition keywords and the modifiers that may precede them, across common
+# languages. A `func` may carry a method receiver `(...)`. A definition counts
+# when it starts the line or carries a `pub`/`export` modifier; anything else
+# is likely a local. `let`/`var`/`val` bind locals too often to count without
+# that modifier, and a restricted `pub(...)` is not exported.
 DEFINITION_KEYWORDS = (
     "def", "class", "fn", "func", "function", "type", "interface", "struct", "enum",
-    "trait", "module", "const", "let", "var", "val", "object", "record", "protocol",
+    "trait", "module", "const", "object", "record", "protocol",
 )
+BINDING_KEYWORDS = ("let", "var", "val")
 DEFINITION_MODIFIERS = (
-    r"pub(?:\([^)]*\))?", "export", "default", "public", "static", "async", "abstract",
+    "pub", "export", "default", "public", "static", "async", "abstract",
     "final", "open", "internal", "sealed", "data",
 )
-DEFINITION_RE = re.compile(
-    r"^\s*(?:(?:" + "|".join(DEFINITION_MODIFIERS) + r")\s+)*"
-    r"(?:func\s*\([^)]*\)\s*|(?:" + "|".join(DEFINITION_KEYWORDS) + r")\s+)"
-    r"([A-Za-z][A-Za-z0-9_]{5,})",
-    re.M,
+_MODIFIERS = r"(?:(?:" + "|".join(DEFINITION_MODIFIERS) + r")\s+)*"
+_NAME = r"([A-Za-z][A-Za-z0-9_]{5,})"
+DEFINITION_RES = (
+    re.compile(
+        "^" + _MODIFIERS
+        + r"(?:func\s*\([^)]*\)\s*|(?:" + "|".join(DEFINITION_KEYWORDS) + r")\s+)" + _NAME,
+        re.M,
+    ),
+    re.compile(
+        r"^\s*" + _MODIFIERS + r"(?:pub|export)\s+" + _MODIFIERS
+        + r"(?:func\s*\([^)]*\)\s*|(?:"
+        + "|".join(DEFINITION_KEYWORDS + BINDING_KEYWORDS) + r")\s+)" + _NAME,
+        re.M,
+    ),
 )
-# A consumer line that imports a module: the keyword table covers
-# import/from/require/use/include/using/load forms.
-IMPORT_LINE_ERE = "(^|[^A-Za-z0-9_])(import|from|require|use|include|using|load)([^A-Za-z0-9_]|$)"
+# Same path shapes as facts.py TEST_PATH_RE and DOCS_PATH_RE: tokens come only
+# from code, never from tests or prose.
+TEST_PATH_RE = (
+    r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|^spec/"
+    r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
+)
+DOCS_PATH_RE = (
+    r"\.(md|rst|adoc)$|(^|/)docs?/.*\.txt$"
+    r"|(^|/)(readme|changelog|changes|history|license|licence|copying|notice|authors|contributing)[^/]*\.txt$"
+)
+# Data, config and lock files are not imported by module path.
+DATA_FILE_RE = r"\.(lock|lockb|lockfile|sum|json|ya?ml|toml|ini|cfg|txt|xml|csv)$"
+# A consumer line that imports a module: an import keyword opening the line,
+# or a `require(` call alone or bound to a name.
+IMPORT_LINE_ERE = (
+    "^[[:space:]]*(#[[:space:]]*include|(import|from|use|using)[^A-Za-z0-9_]"
+    "|((const|let|var)[[:space:]]+[A-Za-z0-9_$]+[[:space:]]*=[[:space:]]*)?require[[:space:]]*\\()"
+)
+WORD_BOUNDARY_ERE = "([^A-Za-z0-9_]|$)"
 TOKEN_CAP = 5
+IMPORT_TOKEN_CAP = 10
 MIN_TOKEN = 6
 
 
@@ -79,18 +109,42 @@ def ere_escape(text):
 
 
 def import_tokens(paths):
-    """Module tokens a consumer would import a changed file by: the path
-    without its extension in slashed and dotted form, and the bare stem."""
-    found = set()
+    """Module tokens a consumer would import a changed file by, as
+    (display, ERE) pairs, at most two per file: the path without its
+    extension, matched in slashed or dotted form, and the bare stem."""
+    found = {}
     for p in paths:
         stem_path = os.path.splitext(p)[0]
         stem = os.path.basename(stem_path)
         if stem.startswith("_") or not stem:
             continue
-        for tok in (stem_path, stem_path.replace("/", "."), stem):
-            if len(tok) >= MIN_TOKEN:
-                found.add(tok)
-    return sorted(found, key=lambda t: (-len(t), t))[:TOKEN_CAP]
+        module = "[/.]".join(ere_escape(part) for part in stem_path.split("/"))
+        for display, pattern in ((stem_path, module), (stem, ere_escape(stem))):
+            if len(display) >= MIN_TOKEN:
+                found.setdefault(display, pattern)
+    return sorted(found.items(), key=lambda t: (-len(t[0]), t[0]))[:IMPORT_TOKEN_CAP]
+
+
+def code_path(path):
+    return not re.search(TEST_PATH_RE, path, re.I) and not re.search(DOCS_PATH_RE, path, re.I)
+
+
+def changed_lines_by_file(lines):
+    """Changed (+/-) line text of a unified diff, keyed by file path; a deleted
+    file keeps its old path."""
+    by_file = {}
+    current = None
+    for l in lines:
+        if l.startswith("--- "):
+            current = l[6:] if l.startswith("--- a/") else None
+        elif l.startswith("+++ "):
+            if l.startswith("+++ b/"):
+                current = l[6:]
+            if current:
+                by_file.setdefault(current, [])
+        elif current and l.startswith(("+", "-")):
+            by_file.setdefault(current, []).append(l[1:])
+    return by_file
 
 if not state.get("consumer_surface"):
     print(json.dumps({"downstream_notes": "(skipped — no consumer-facing contract surface in the diff)"}))
@@ -152,23 +206,24 @@ def diff_text():
 
 try:
     lines = diff_text().splitlines()
-    changed = [
-        l[1:] for l in lines
-        if (l.startswith("+") or l.startswith("-")) and not l.startswith(("+++", "---"))
-    ]
-    paths = sorted({
-        l[6:] for l in lines
-        if l.startswith(("+++ b/", "--- a/"))
-    })
-    text = "\n".join(changed)
-    families = {
+    by_file = {p: body for p, body in changed_lines_by_file(lines).items() if code_path(p)}
+    text = "\n".join(l for body in by_file.values() for l in body)
+    exact = {
         "route literals": set(ROUTE_RE.findall(text)),
         "schema names": set(SCHEMA_RE.findall(text)),
-        "definitions": set(DEFINITION_RE.findall(text)),
+    }
+    definitions = set().union(*(regex.findall(text) for regex in DEFINITION_RES))
+    families = {
+        **exact,
+        "definitions": definitions,
     }
     tokens = sorted(set().union(*families.values()), key=lambda t: (-len(t), t))[:TOKEN_CAP]
-    imports = import_tokens(paths)
-    families["import paths"] = set(imports)
+    imports = import_tokens(sorted(p for p in by_file if not re.search(DATA_FILE_RE, p, re.I)))
+    families["import paths"] = {display for display, _ in imports}
+    # Schema names and routes are fragments of generated or composed
+    # identifiers (`NewAdminServiceClient`), so only definitions need a whole
+    # word.
+    substring_tokens = set().union(*exact.values())
 
     notes = [
         "token families extracted: "
@@ -182,11 +237,14 @@ try:
         if tokens:
             notes.append(f"contract tokens probed: {tokens}")
         if imports:
-            notes.append(f"import paths probed: {imports}")
+            notes.append(f"import paths probed: {[display for display, _ in imports]}")
         if consumers_root and os.path.isdir(consumers_root):
             self_name = os.path.basename(proj)
-            probes = [(tok, ["-wF", "-e", tok]) for tok in tokens] + [
-                (tok, ["-E", "-e", f"{IMPORT_LINE_ERE}.*{ere_escape(tok)}"]) for tok in imports
+            probes = [
+                (tok, ["-F" if tok in substring_tokens else "-wF", "-e", tok]) for tok in tokens
+            ] + [
+                (display, ["-E", "-e", f"{IMPORT_LINE_ERE}(.*{WORD_BOUNDARY_ERE})?{pattern}{WORD_BOUNDARY_ERE}"])
+                for display, pattern in imports
             ]
             for tok, pattern in probes:
                 r = subprocess.run(

@@ -16,11 +16,20 @@ attribute, a comment leader, a decorator, a test-runner call), so a
 
 import re
 
-# Openers of a line or block comment across common languages.
-COMMENT_LEADERS = ("//", "#", "--", ";", r"/\*", r"\*", "<!--", "%", "'", "REM ")
+# Openers of a line or block comment across common languages. `--` needs a
+# space after it, so a command-line flag such as `--no-ignore` is not a comment.
+COMMENT_LEADERS = ("//", "#", "-- ", ";", r"/\*", r"\*", "<!--", "%", "'", "REM ")
 LEADER = "(" + "|".join(COMMENT_LEADERS) + ") *"
 NON_WORD = "[^A-Za-z0-9_.]"
 WORD_END = "([^A-Za-z0-9_]|$)"
+# What may follow a `tool-disable` style directive: the end of the comment, a
+# longer directive name, a rule list, or the close of a block comment. A CSS
+# selector such as `#btn-disable {` stops at none of these.
+HYPHEN_DIRECTIVE_END = "($|[-=,:[]| +($|[a-z@#/*-]))"
+# A `tool: ignore` directive ends the comment or carries a rule list; prose
+# such as `Note: ignore the header row` continues with a lowercase word.
+COLON_DIRECTIVE_END = "($|[-=,[]| +[#A-Z])"
+CASELESS_SKIPIF = "[sS][kK][iI][pP][iI][fF]"
 
 # (family, markers found anywhere on a line, markers that must start the line
 # or follow a non-word character, markers that must follow a comment leader).
@@ -35,16 +44,20 @@ MARKER_FAMILIES = (
         (),
         (
             "@?no(lint|qa|sec|check|inspection)",
-            "@?[A-Za-z_]+[-:] ?(disable|ignore|nocheck|expect-error)",
+            "NOLINT(NEXTLINE|BEGIN|END)?" + WORD_END,
+            "@?[A-Za-z_]+-(disable|ignore|nocheck|expect-error)" + HYPHEN_DIRECTIVE_END,
+            "@?[A-Za-z_]+: ?(disable|ignore|nocheck)" + COLON_DIRECTIVE_END,
             "[A-Za-z_]+ disable=",
             "pragma[: ]+(warning +disable|no ?cover)",
+            "pragma +(GCC|clang) +diagnostic +(ignored|push)",
         ),
     ),
     (
         "test skip/ignore",
         (
             r"#\[ignore",
-            r"@([A-Za-z_]+\.)*(skip|skipIf|skipUnless|xfail|Skip|Ignore|Disabled)" + WORD_END,
+            r"@([A-Za-z_]+\.)*(skip|" + CASELESS_SKIPIF + "|skipUnless|xfail|Skip|Ignore|Disabled)" + WORD_END,
+            r"importorskip\(",
             r"\[Ignore",
             'Skip *= *"',
         ),
@@ -59,7 +72,7 @@ MARKER_FAMILIES = (
         "unimplemented/todo stubs",
         (
             r"(todo|unimplemented)!",
-            "NotImplemented",
+            "NotImplemented(Error|Exception)",
             r'panic\("(TODO|not implemented|unimplemented)',
         ),
         (r"TODO\(",),
