@@ -2730,24 +2730,28 @@ fn architect_tools_write_no_bytecode_into_the_agent_dir() {
 fn debt_scan_repo(dir: &Path) -> (PathBuf, String) {
     let repo = dir.join("repo");
     fs::create_dir_all(&repo).unwrap();
-    let git = |args: &[&str]| {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(["-c", "commit.gpgsign=false"])
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("spawn git");
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    git(&["init", "-q"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "base"]);
-    let base = git(&["rev-parse", "HEAD"]);
+    scratch_git(&repo, &["init", "-q"]);
+    scratch_git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let base = scratch_git(&repo, &["rev-parse", "HEAD"]);
     (repo, base)
+}
+
+/// git in `repo` with the host's global and system config shut out and a
+/// fixed identity, so commits work on any machine. Returns trimmed stdout.
+#[cfg(unix)]
+fn scratch_git(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("spawn git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Runs the engine-built sisyphus `debt_scan` tool with `args`. The tool
@@ -3221,6 +3225,353 @@ fn diff_signals_classify_leaves_the_tenancy_signal_out() {
     }
 }
 
+/// The sisyphus `debt_scan` tool reports the debt markers of languages other
+/// than Rust, at their real lines, and its report names the families it
+/// scanned so a clean report is a scanned one.
+#[cfg(unix)]
+#[test]
+fn sisyphus_debt_scan_reports_non_rust_markers_and_names_the_families_scanned() {
+    if tools_missing() {
+        return;
+    }
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("sisyphus-debt-scan-non-rust");
+    let tool = engine_built_tool(&dir.0, "sisyphus");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    let files = [
+        (
+            "svc/handler_test.go",
+            "package svc\n_ = os.Remove(p) //nolint:errcheck\nt.Skip(\"flaky on CI\")\nfunc clean() {}\n",
+        ),
+        (
+            "app/views.py",
+            "import os  # noqa: F401\n@pytest.mark.skip(reason=\"slow\")\ndef later():\n    raise NotImplementedError\n",
+        ),
+        (
+            "web/app.test.js",
+            "// eslint-disable-next-line no-console\nit.skip(\"renders\", () => {});\nconst ok = 1;\n",
+        ),
+    ];
+    for (path, text) in files {
+        let full = repo.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, text).unwrap();
+    }
+    let (code, stdout, stderr) = sisyphus_debt_scan(
+        &dir.0,
+        &tool,
+        &["--base", &base, "--dir", repo.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    for hit in [
+        "svc/handler_test.go:2 -- _ = os.Remove(p) //nolint:errcheck",
+        "svc/handler_test.go:3 -- t.Skip(\"flaky on CI\")",
+        "app/views.py:1 -- import os  # noqa: F401",
+        "app/views.py:2 -- @pytest.mark.skip(reason=\"slow\")",
+        "app/views.py:4 -- raise NotImplementedError",
+        "web/app.test.js:1 -- // eslint-disable-next-line no-console",
+        "web/app.test.js:2 -- it.skip(\"renders\", () => {});",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l == hit),
+            "missing {hit:?}: {stdout}"
+        );
+    }
+    for clean in ["func clean", "def later", "const ok"] {
+        assert!(!stdout.contains(clean), "{clean:?} is not debt: {stdout}");
+    }
+    let header = stdout.lines().next().unwrap_or_default();
+    for family in [
+        "lint/type suppression",
+        "test skip/ignore",
+        "unimplemented/todo stubs",
+        "TODO/FIXME comments",
+    ] {
+        assert!(
+            header.contains(family),
+            "the header must name {family:?}: {header}"
+        );
+    }
+}
+
+/// Runs `program` under `python3 -B -c` with the shared helpers dir as
+/// `sys.argv[1]` and `args` after it; returns its stdout parsed as JSON.
+fn shared_python(program: &str, args: &[&str]) -> Value {
+    let (code, stdout, stderr) = run(Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(program)
+        .arg(asset(".shared"))
+        .args(args)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"));
+    assert_eq!(code, 0, "{stderr}");
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"))
+}
+
+/// classify() reads manifests and lockfiles by generic name shapes, takes
+/// `spec/` as a test root only at the top level, counts `.txt` as docs only
+/// under a docs dir or as a README-style name, and sees generic process
+/// spawns and server files.
+#[test]
+fn diff_signals_classify_reads_generic_manifest_test_and_docs_shapes() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let program = "import json, sys; sys.path.insert(0, sys.argv[1]); import diff_signals as d; \
+                   print(json.dumps({f: d.classify([f], '') for f in sys.argv[2:]} | \
+                   {'exec': d.classify(['src/a.rs'], 'let c = Command::new(\"ls\");')}))";
+    let out = shared_python(
+        program,
+        &[
+            "uv.lock",
+            "poetry.lock",
+            "tools/deps.lockfile",
+            "go.work",
+            "src/App.csproj",
+            "api/spec/openapi.yaml",
+            "spec/models/user_spec.rb",
+            "CMakeLists.txt",
+            "requirements.txt",
+            "docs/notes.txt",
+            "LICENSE.txt",
+            "app/server.py",
+        ],
+    );
+    let flag = |path: &str, key: &str| out[path][key].as_bool().unwrap_or_else(|| panic!("{out}"));
+    for lock in [
+        "uv.lock",
+        "poetry.lock",
+        "tools/deps.lockfile",
+        "go.work",
+        "src/App.csproj",
+    ] {
+        assert!(flag(lock, "touches_deps"), "{lock} is a manifest: {out}");
+    }
+    assert!(
+        !flag("api/spec/openapi.yaml", "tests_docs_only"),
+        "an API spec dir is not a test root: {out}"
+    );
+    assert!(
+        flag("spec/models/user_spec.rb", "tests_docs_only"),
+        "a top-level spec/ is a test root: {out}"
+    );
+    for build in ["CMakeLists.txt", "requirements.txt"] {
+        assert!(!flag(build, "docs_only"), "{build} is not docs: {out}");
+    }
+    for doc in ["docs/notes.txt", "LICENSE.txt"] {
+        assert!(flag(doc, "docs_only"), "{doc} is docs: {out}");
+    }
+    assert!(flag("requirements.txt", "touches_deps"), "{out}");
+    assert!(flag("app/server.py", "consumer_surface"), "{out}");
+    assert_eq!(out["exec"]["touches_exec"], Value::Bool(true), "{out}");
+}
+
+/// Without the shared diff_signals module, signals.py does not guess: it
+/// reports `signals_error`, which degrades lane selection wider, and exits 0.
+#[test]
+fn gauntlet_signals_without_the_shared_module_reports_signals_error() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("gauntlet-signals-no-shared");
+    let scripts = dir.0.join("agents/review-gauntlet/scripts");
+    fs::create_dir_all(&scripts).unwrap();
+    fs::copy(
+        asset("review-gauntlet/scripts/signals.py"),
+        scripts.join("signals.py"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run(Command::new("python3")
+        .arg("-B")
+        .arg(scripts.join("signals.py"))
+        .env(
+            "GRAPH_STATE",
+            serde_json::json!({"project_dir": dir.0.to_string_lossy(), "diff_spec": "worktree"})
+                .to_string(),
+        )
+        .env_remove("GRAPH_STATE_FILE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let err = out["signals_error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("shared diff_signals module unavailable") && err.contains("degrades WIDER"),
+        "{out}"
+    );
+    assert_eq!(out["signals_summary"], "signals unavailable", "{out}");
+    assert!(out.get("touches_auth").is_none(), "{out}");
+}
+
+/// facts.py excludes a file by its generated header in any comment syntax,
+/// and reviews a file that only looks generated by name, with a note.
+#[cfg(unix)]
+#[test]
+fn code_reviewer_facts_reads_generated_headers_in_any_comment_syntax() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("facts-generated-headers");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    let files = [
+        (
+            "proto/messages_pb2.py",
+            "# -*- coding: utf-8 -*-\n# Generated by the protocol buffer compiler.  DO NOT EDIT!\n# source: messages.proto\n",
+        ),
+        (
+            "web/page.html",
+            "<!-- generated by the site builder, do not edit -->\n<p>hi</p>\n",
+        ),
+        ("api/foo.pb.go", "package api\n\nfunc Hand() {}\n"),
+        ("src/main.go", "package main\n"),
+    ];
+    for (path, text) in files {
+        let full = repo.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, text).unwrap();
+    }
+    scratch_git(&repo, &["add", "-A"]);
+    scratch_git(&repo, &["commit", "-qm", "head"]);
+    let (code, stdout, stderr) = run(Command::new("python3")
+        .arg("-B")
+        .arg(asset("code-reviewer/scripts/facts.py"))
+        .env(
+            "GRAPH_STATE",
+            serde_json::json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": base})
+                .to_string(),
+        )
+        .env_remove("GRAPH_STATE_FILE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let mut generated: Vec<&str> = out["generated_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{out}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    generated.sort_unstable();
+    assert_eq!(
+        generated,
+        ["proto/messages_pb2.py", "web/page.html"],
+        "{out}"
+    );
+    let changed = out["changed_files"].to_string();
+    assert!(
+        changed.contains("\"api/foo.pb.go\"") && changed.contains("\"src/main.go\""),
+        "a name-only match is still reviewed: {out}"
+    );
+    assert!(
+        out["generated_notes"].to_string().contains(
+            "api/foo.pb.go looks generated by name but has no generated header; reviewed"
+        ),
+        "{out}"
+    );
+}
+
+/// downstream_sweep.py extracts definitions of any language (Python `def`,
+/// a Go method with a receiver, a snake_case `pub fn`) and the changed
+/// files' import paths, finds them in a sibling checkout with word
+/// boundaries, and names the token families it extracted.
+#[cfg(unix)]
+#[test]
+fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let dir = fixture_dir("downstream-sweep-generic");
+    let (repo, base) = debt_scan_repo(&dir.0);
+    let files = [
+        (
+            "app/handlers.py",
+            "def handle_request(req):\n    return req\n",
+        ),
+        (
+            "server/server.go",
+            "package server\n\nfunc (s *Server) HandleThing(w Writer) {}\n",
+        ),
+        ("src/config.rs", "pub fn parse_config() {}\n"),
+    ];
+    for (path, text) in files {
+        let full = repo.join(path);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(full, text).unwrap();
+    }
+    scratch_git(&repo, &["add", "-A"]);
+    scratch_git(&repo, &["commit", "-qm", "head"]);
+    let consumers = dir.0.join("consumers/client");
+    fs::create_dir_all(&consumers).unwrap();
+    fs::write(
+        consumers.join("client.py"),
+        "from app.handlers import handle_request\n",
+    )
+    .unwrap();
+    fs::write(consumers.join("call.go"), "srv.HandleThing(w)\n").unwrap();
+    fs::write(consumers.join("main.rs"), "svc::parse_config();\n").unwrap();
+    fs::write(consumers.join("metrics.txt"), "handle_requests_total 3\n").unwrap();
+    let (code, stdout, stderr) = run(Command::new("python3")
+        .arg("-B")
+        .arg(asset("code-reviewer/scripts/downstream_sweep.py"))
+        .env(
+            "GRAPH_STATE",
+            serde_json::json!({
+                "project_dir": repo.to_string_lossy(),
+                "resolved_diff_spec": base,
+                "consumer_surface": true,
+                "consumers_root": dir.0.join("consumers").to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .env_remove("GRAPH_STATE_FILE")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3"));
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let out: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"));
+    let notes = out["downstream_notes"].as_str().unwrap_or_default();
+    assert!(
+        notes.contains(
+            "token families extracted: route literals 0, schema names 0, definitions 3, import paths "
+        ),
+        "{notes}"
+    );
+    for (file, token) in [
+        ("client.py", "handle_request"),
+        ("call.go", "HandleThing"),
+        ("main.rs", "parse_config"),
+        ("client.py", "app.handlers"),
+    ] {
+        assert!(
+            notes
+                .lines()
+                .any(|l| l.starts_with("CONSUMER HIT (sibling checkout): ")
+                    && l.contains(&format!("/{file} references '{token}'"))),
+            "{file} must be a consumer of {token}: {notes}"
+        );
+    }
+    assert!(
+        !notes.contains("metrics.txt"),
+        "identifiers are matched on word boundaries: {notes}"
+    );
+}
+
 fn parse_findings(findings: &Value) -> Value {
     let prompt = format!(
         "Verify these code-review findings against the working tree.\n\nProject: /tmp/p\n\nFindings (JSON):\n{findings}"
@@ -3309,7 +3660,7 @@ fn step_runner_debt_hits_default_parses_to_the_manual_fallback() {
         hits.starts_with("DEBT_SCAN_FAILED: the debt_scan node did not run."),
         "{hits}"
     );
-    let grep = r"grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'";
+    let grep = r#"grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|skipIf|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented|panic\("(TODO|not implemented|unimplemented)|(//|#|--|;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|@?[A-Za-z_]+[-:] ?(disable|ignore|nocheck|expect-error)|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'"#;
     assert_eq!(hits.matches(grep).count(), 1, "{hits}");
     assert!(hits.contains("fs_grep tool"), "{hits}");
 }

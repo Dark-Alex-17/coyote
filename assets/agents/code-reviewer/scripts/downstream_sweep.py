@@ -3,8 +3,9 @@
 
 Runs only when consumer-facing contract surface changed. Extracts the most
 specific changed contract tokens from the diff deterministically (route path
-literals, proto message/service/rpc names, exported symbols), greps sibling
-checkouts under `consumers_root`, and runs a bounded org code search via gh.
+literals, proto message/service/rpc names, top-level definitions, and the
+import paths of the changed files), greps sibling checkouts under
+`consumers_root`, and runs a bounded org code search via gh.
 Hits are reported for the synthesis to raise as 🔴 findings naming the
 consuming repo + file:line. Degrades silently when unconfigured/offline;
 public-library caveats are noted, not guessed at.
@@ -46,6 +47,50 @@ DIFF_FLAGS = (
     "--src-prefix=a/",
     "--dst-prefix=b/",
 )
+
+ROUTE_RE = re.compile(r'["\'](/[a-z0-9][a-z0-9/_{}.:-]{5,})["\']')
+SCHEMA_RE = re.compile(r"^\s*(?:message|service|rpc)\s+([A-Z][A-Za-z0-9_]{5,})", re.M)
+# Top-level definition keywords and the modifiers that may precede them,
+# across common languages. A `func` may carry a method receiver `(...)`.
+DEFINITION_KEYWORDS = (
+    "def", "class", "fn", "func", "function", "type", "interface", "struct", "enum",
+    "trait", "module", "const", "let", "var", "val", "object", "record", "protocol",
+)
+DEFINITION_MODIFIERS = (
+    r"pub(?:\([^)]*\))?", "export", "default", "public", "static", "async", "abstract",
+    "final", "open", "internal", "sealed", "data",
+)
+DEFINITION_RE = re.compile(
+    r"^\s*(?:(?:" + "|".join(DEFINITION_MODIFIERS) + r")\s+)*"
+    r"(?:func\s*\([^)]*\)\s*|(?:" + "|".join(DEFINITION_KEYWORDS) + r")\s+)"
+    r"([A-Za-z][A-Za-z0-9_]{5,})",
+    re.M,
+)
+# A consumer line that imports a module: the keyword table covers
+# import/from/require/use/include/using/load forms.
+IMPORT_LINE_ERE = "(^|[^A-Za-z0-9_])(import|from|require|use|include|using|load)([^A-Za-z0-9_]|$)"
+TOKEN_CAP = 5
+MIN_TOKEN = 6
+
+
+def ere_escape(text):
+    """`text` as a literal inside a POSIX extended regex."""
+    return re.sub(r"([.\[\]()*+?{}|^$\\])", r"\\\1", text)
+
+
+def import_tokens(paths):
+    """Module tokens a consumer would import a changed file by: the path
+    without its extension in slashed and dotted form, and the bare stem."""
+    found = set()
+    for p in paths:
+        stem_path = os.path.splitext(p)[0]
+        stem = os.path.basename(stem_path)
+        if stem.startswith("_") or not stem:
+            continue
+        for tok in (stem_path, stem_path.replace("/", "."), stem):
+            if len(tok) >= MIN_TOKEN:
+                found.add(tok)
+    return sorted(found, key=lambda t: (-len(t), t))[:TOKEN_CAP]
 
 if not state.get("consumer_surface"):
     print(json.dumps({"downstream_notes": "(skipped — no consumer-facing contract surface in the diff)"}))
@@ -106,28 +151,47 @@ def diff_text():
 
 
 try:
+    lines = diff_text().splitlines()
     changed = [
-        l[1:] for l in diff_text().splitlines()
+        l[1:] for l in lines
         if (l.startswith("+") or l.startswith("-")) and not l.startswith(("+++", "---"))
     ]
+    paths = sorted({
+        l[6:] for l in lines
+        if l.startswith(("+++ b/", "--- a/"))
+    })
     text = "\n".join(changed)
-    tokens = set()
-    tokens.update(re.findall(r'["\'](/[a-z0-9][a-z0-9/_{}.:-]{5,})["\']', text))          # route paths
-    tokens.update(re.findall(r"^\s*(?:message|service|rpc)\s+([A-Z][A-Za-z0-9_]{5,})", text, re.M))  # proto names
-    tokens.update(re.findall(r"^\s*(?:pub\s+fn|pub\s+struct|func|export\s+(?:function|const|class))\s+([A-Z][A-Za-z0-9_]{5,})", text, re.M))
-    tokens = sorted(tokens, key=len, reverse=True)[:5]
+    families = {
+        "route literals": set(ROUTE_RE.findall(text)),
+        "schema names": set(SCHEMA_RE.findall(text)),
+        "definitions": set(DEFINITION_RE.findall(text)),
+    }
+    tokens = sorted(set().union(*families.values()), key=lambda t: (-len(t), t))[:TOKEN_CAP]
+    imports = import_tokens(paths)
+    families["import paths"] = set(imports)
 
-    notes = []
-    if not tokens:
+    notes = [
+        "token families extracted: "
+        + ", ".join(f"{name} {len(found)}" for name, found in families.items())
+        + " (import paths are matched only on import-shaped lines of sibling checkouts; "
+        "a family with 0 tokens was not searched)"
+    ]
+    if not tokens and not imports:
         notes.append("(no specific contract tokens extractable from the diff — sweep skipped)")
     else:
-        notes.append(f"contract tokens probed: {tokens}")
+        if tokens:
+            notes.append(f"contract tokens probed: {tokens}")
+        if imports:
+            notes.append(f"import paths probed: {imports}")
         if consumers_root and os.path.isdir(consumers_root):
             self_name = os.path.basename(proj)
-            for tok in tokens:
+            probes = [(tok, ["-wF", "-e", tok]) for tok in tokens] + [
+                (tok, ["-E", "-e", f"{IMPORT_LINE_ERE}.*{ere_escape(tok)}"]) for tok in imports
+            ]
+            for tok, pattern in probes:
                 r = subprocess.run(
                     ["grep", "-rIl", "--exclude-dir=.git", "--exclude-dir=node_modules",
-                     "--exclude-dir=target", "--exclude-dir=vendor", tok, consumers_root],
+                     "--exclude-dir=target", "--exclude-dir=vendor", *pattern, consumers_root],
                     capture_output=True, encoding="utf-8", errors="replace", timeout=60,
                 )
                 hits = [

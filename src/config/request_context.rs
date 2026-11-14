@@ -29289,41 +29289,17 @@ mod tests {
             .collect()
     }
 
-    /// The contiguous `#` comment lines directly above a script's `NAME = `
-    /// assignment, in source order.
-    fn python_comment_block(source: &str, name: &str) -> String {
-        let head = format!("\n{name} = ");
-        let end = source
-            .find(&head)
-            .unwrap_or_else(|| panic!("{name} is not assigned"));
-        let mut block: Vec<&str> = source[..end]
-            .lines()
-            .rev()
-            .take_while(|line| line.starts_with('#'))
-            .collect();
-        block.reverse();
-        block.join("\n")
-    }
-
-    /// signals.py imports `classify` from the shared module and keeps an inline
-    /// fallback for installs without it; the constants are shared byte for byte
-    /// and the fallback classifies every fixture exactly as the shared module.
-    /// Mutation check: narrowing the fallback's AUTH_PATH_RE to `auth(?!or)`
-    /// fails the AUTH_PATH_RE pin, and the harness on its own then reports the
-    /// `src/authorize.rs` row diverging (shared true, fallback false); adding
-    /// `re.I` to the fallback's exec search fails the matrix on the uppercase
-    /// exec row; pointing the path insert at a missing directory fails the
-    /// import-binds-shared flag; dropping `re.I` from the fallback's
-    /// AUTH_ADDED_RE search fails the matrix on the uppercase VERIFY_CSRF row;
-    /// rewording one word of signals.py's AUTH_PATH_RE comment fails the
-    /// comment-block pin; skipping the temp dir's git init fails its base
-    /// commit, and skipping both fails the live import's signals_error check.
+    /// signals.py imports `classify` from the shared module and keeps no copy
+    /// of its rules. Mutation check: pointing the path insert at a missing
+    /// directory fails the import-binds-shared flag; re-adding an inline
+    /// constant fails the no-copy pin; skipping the temp dir's git init fails
+    /// its base commit, and skipping both fails the live import's
+    /// signals_error check.
     #[test]
-    fn gauntlet_signals_fallback_classify_matches_the_shared_module() {
+    fn gauntlet_signals_binds_the_shared_classify_and_keeps_no_copy() {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
         let signals_path = assets.join("review-gauntlet/scripts/signals.py");
         let signals = read_to_string(&signals_path).unwrap();
-        let shared = read_to_string(assets.join(".shared/diff_signals.py")).unwrap();
         for name in [
             "DOCS_RE",
             "TESTS_RE",
@@ -29335,21 +29311,9 @@ mod tests {
             "PROTO_RE",
             "MIGRATIONS_RE",
         ] {
-            let pinned = python_regex_literal(&signals, name);
-            assert!(!pinned.is_empty(), "signals.py {name} is empty");
-            assert_eq!(
-                pinned,
-                python_regex_literal(&shared, name),
-                "{name}: signals.py must carry the shared module's regex byte for byte"
-            );
-        }
-        for name in ["AUTH_PATH_RE", "AUTH_ADDED_RE"] {
-            let pinned = python_comment_block(&signals, name);
-            assert!(!pinned.is_empty(), "signals.py {name} has no comment block");
-            assert_eq!(
-                pinned,
-                python_comment_block(&shared, name),
-                "{name}: signals.py must carry the shared module's comment byte for byte"
+            assert!(
+                !signals.contains(&format!("\n{name} = ")),
+                "signals.py must not keep a copy of the shared {name}"
             );
         }
 
@@ -29357,14 +29321,11 @@ mod tests {
             eprintln!("skipping: python3 not available");
             return;
         }
-        // signals.py is loaded twice: once with the shared module reachable,
-        // which must bind `_classify` to the shared `classify` (a broken
-        // path insert would otherwise fall through silently), and once with
-        // `diff_signals` blocked in sys.modules so the except arm defines the
-        // inline fallback. Stdout is captured because the module prints its
-        // JSON at import time; the live load's copy is returned so its diff
-        // can be checked. Mixed-case rows separate the `re.I` sites from the
-        // case-sensitive exec search.
+        // signals.py is loaded with the shared module reachable, which must
+        // bind `_classify` to the shared `classify`. Stdout is captured
+        // because the module prints its JSON at import time; the live load's
+        // copy is returned so its diff can be checked. Mixed-case rows
+        // separate the `re.I` sites from the case-sensitive exec search.
         const HARNESS: &str = r#"
 import contextlib, importlib.util, io, json, os, sys
 
@@ -29381,8 +29342,6 @@ sys.path.insert(0, os.environ["SHARED_DIR"])
 import diff_signals
 shared = diff_signals.classify
 import_binds_shared = live is shared
-sys.modules["diff_signals"] = None
-fallback = load_signals("signals")[0]._classify
 cases = [
     (["api/v1/thing.proto"], ""),
     (["db/migrations/001_init.sql"], ""),
@@ -29409,13 +29368,11 @@ cases = [
 ]
 print(json.dumps({
     "shared": [dict(shared(f, a), added=a) for f, a in cases],
-    "fallback": [dict(fallback(f, a), added=a) for f, a in cases],
-    "fallback_is_shared": fallback is shared,
     "import_binds_shared": import_binds_shared,
     "live_import_stdout": live_import_stdout,
 }))
 "#;
-        let dir = temp_file("-gauntlet-fallback-", "");
+        let dir = temp_file("-gauntlet-shared-classify-", "");
         create_dir_all(&dir).unwrap();
         // signals.py diffs the worktree against HEAD at import, so the temp
         // dir needs a commit; without a repo of its own, a temp root inside a
@@ -29443,7 +29400,7 @@ print(json.dumps({
         let _ = remove_dir_all(&dir);
         assert!(
             out.status.success(),
-            "fallback harness exited nonzero: {}",
+            "classify harness exited nonzero: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let out: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
@@ -29452,14 +29409,6 @@ print(json.dumps({
                 String::from_utf8_lossy(&out.stdout)
             )
         });
-        assert_eq!(
-            out["shared"], out["fallback"],
-            "the fallback classify must agree with the shared module on every fixture"
-        );
-        assert_eq!(
-            out["fallback_is_shared"], false,
-            "the harness must have exercised the inline fallback, not the shared function"
-        );
         assert_eq!(
             out["import_binds_shared"], true,
             "with the shared module reachable signals.py must bind the shared classify"
@@ -29480,7 +29429,7 @@ print(json.dumps({
             );
         }
         let row_flag = |files: &[&str], added: &str, key: &str| {
-            out["fallback"]
+            out["shared"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -29568,8 +29517,8 @@ print(json.dumps({
                 "review-gauntlet README must state the sentinel contract: {claim:?}"
             );
         }
-        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
-        let auth_path_re = python_regex_literal(&signals, "AUTH_PATH_RE");
+        let shared = read_to_string(assets.join(".shared/diff_signals.py")).unwrap();
+        let auth_path_re = python_regex_literal(&shared, "AUTH_PATH_RE");
         let auth_word = auth_path_re
             .split('|')
             .next()
@@ -30427,21 +30376,21 @@ print(json.dumps({
     }
 
     /// facts.py spells its test and docs path shapes by hand rather than
-    /// importing signals.py, so the copies are held equal here.
+    /// importing the shared diff_signals.py, so the copies are held equal here.
     #[test]
-    fn code_reviewer_facts_path_regexes_match_gauntlet_signals() {
+    fn code_reviewer_facts_path_regexes_match_the_shared_diff_signals() {
         let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents");
         let facts = read_to_string(assets.join("code-reviewer/scripts/facts.py")).unwrap();
-        let signals = read_to_string(assets.join("review-gauntlet/scripts/signals.py")).unwrap();
+        let shared = read_to_string(assets.join(".shared/diff_signals.py")).unwrap();
         for (facts_name, signals_name) in
             [("TEST_PATH_RE", "TESTS_RE"), ("DOCS_PATH_RE", "DOCS_RE")]
         {
-            let twin = python_regex_literal(&signals, signals_name);
-            assert!(!twin.is_empty(), "signals.py {signals_name} is empty");
+            let twin = python_regex_literal(&shared, signals_name);
+            assert!(!twin.is_empty(), "diff_signals.py {signals_name} is empty");
             assert_eq!(
                 python_regex_literal(&facts, facts_name),
                 twin,
-                "facts.py {facts_name} must spell signals.py {signals_name}"
+                "facts.py {facts_name} must spell diff_signals.py {signals_name}"
             );
         }
     }
