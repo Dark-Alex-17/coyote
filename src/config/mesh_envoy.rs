@@ -1048,7 +1048,7 @@ impl EnvoyRunner {
                 .await;
                 match sent {
                     Ok(_) => None,
-                    Err(BoundedSendError::Send(err)) => Some(err.to_string()),
+                    Err(BoundedSendError::Send(err)) => Some((err.to_string(), err.log_text())),
                     Err(cut_off) => {
                         runtime.hooks().fire(MeshEvent::MessageFailed {
                             kind: out.kind,
@@ -1057,21 +1057,21 @@ impl EnvoyRunner {
                             class: cut_off.class(),
                             error: cut_off.to_string(),
                         });
-                        Some(cut_off.to_string())
+                        Some(told_and_logged(cut_off.to_string()))
                     }
                 }
             }
-            (None, _) => Some("mesh is off".to_string()),
-            (_, Err(err)) => Some(err.to_string()),
+            (None, _) => Some(told_and_logged("mesh is off".to_string())),
+            (_, Err(err)) => Some(told_and_logged(err.to_string())),
         };
-        let Some(why) = unsent else {
+        let Some((why, logged)) = unsent else {
             return;
         };
         warn!(
             "Mesh envoy could not tell {} its question {} was escalated: {}",
             short(&message.source_identity),
             message.message_id,
-            redact_hashes(&why)
+            redact_hashes(&logged)
         );
         app.mesh.push_idle(IdleNotify {
             source: Source::Message,
@@ -1218,15 +1218,15 @@ impl EnvoyRunner {
                     .send_peer(&message.source_destination, &out)
                     .await
                     .err()
-                    .map(|err| err.to_string()),
-                (None, _) => Some("mesh is off".to_string()),
-                (_, Err(err)) => Some(err.to_string()),
+                    .map(|err| (err.to_string(), err.log_text())),
+                (None, _) => Some(told_and_logged("mesh is off".to_string())),
+                (_, Err(err)) => Some(told_and_logged(err.to_string())),
             }
         };
-        if let Some(why) = unsent {
+        if let Some((why, logged)) = unsent {
             warn!(
                 "Mesh envoy reply to {id} could not be sent: {}",
-                redact_hashes(&why)
+                redact_hashes(&logged)
             );
             let retry = if settles_question {
                 NoticeText::default()
@@ -1592,6 +1592,13 @@ async fn bounded_send<T>(
         _ = tokio::time::sleep(remaining) => Err(BoundedSendError::TimedOut),
         res = send => res.map_err(BoundedSendError::Send),
     }
+}
+
+/// A reason a reply did not go that names no peer, once for the user's notice and once
+/// for the log. A send failure is logged by `SendError::log_text` instead, since the
+/// notice names the peer and the log must not.
+fn told_and_logged(why: String) -> (String, String) {
+    (why.clone(), why)
 }
 
 /// Why a bounded send gave no result: the run ended the wait first (dropping the send

@@ -3370,4 +3370,29 @@ mod tests {
             "log lines violating the redaction rule"
         );
     }
+
+    /// A send a peer refused or met with silence is logged without the `<user> /
+    /// <session>` name the user is shown, which can be one of the user's own aliases;
+    /// the short hash still says which session it was.
+    #[test]
+    fn a_logged_named_refusal_or_no_answer_carries_no_user_or_session_name() {
+        use crate::mesh::message::SendError;
+        use crate::mesh::request::{NoAnswer, RemoteRefusal};
+
+        let peer = "ab".repeat(16);
+        let own = "cd".repeat(16);
+        let name = "Alice / laptop";
+        for err in [
+            SendError::NotTrustedByPeer(RemoteRefusal::new(&peer, Some(name), own.clone())),
+            SendError::NoAnswer(NoAnswer::new(&peer, own.clone()).named(Some(name))),
+        ] {
+            assert!(err.to_string().contains(name), "{err}");
+            let logged = redact_hashes(&err.log_text());
+            assert!(
+                !logged.contains("Alice") && !logged.contains("laptop"),
+                "{logged}"
+            );
+            assert!(logged.contains(short(&peer)), "{logged}");
+        }
+    }
 }

@@ -975,7 +975,7 @@ impl AccessSurface for MeshSlot {
             if let Err(err) = runtime.send_peer(&destination, &out).await {
                 warn!(
                     "Mesh access {id} from {id8} (instance {dest8}) was granted but the grant could not be sent: {}",
-                    redact_hashes(&err.to_string())
+                    redact_hashes(&err.log_text())
                 );
             }
         });

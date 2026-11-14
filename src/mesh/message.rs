@@ -1627,6 +1627,19 @@ impl SendError {
             Self::NotAcknowledged => "not_acknowledged",
         }
     }
+
+    /// The sentence as a log line carries it: a refusal or a silence names the peer by
+    /// its short hash alone, never by the `<user> / <session>` name the user is shown,
+    /// which can be one of the user's own aliases.
+    pub(crate) fn log_text(&self) -> String {
+        match self {
+            Self::NotTrustedByPeer(refusal) => {
+                Self::NotTrustedByPeer(refusal.clone().named(None)).to_string()
+            }
+            Self::NoAnswer(no_answer) => Self::NoAnswer(no_answer.clone().named(None)).to_string(),
+            other => other.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
