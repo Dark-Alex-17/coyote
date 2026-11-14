@@ -19,10 +19,16 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use unicode_width::UnicodeWidthStr;
 
 const HINT: &str = "j/k scroll  g/G top/end  / find  n/N next/prev  Tab threads  q close";
+/// The legend under `NARROW` columns, where `HINT` would lose its end:
+/// the way out and the way to the other threads come first.
+const SHORT_HINT: &str = "q close  Tab threads  / find  n/N  j/k  g/G";
+const NARROW: u16 = 70;
 const PICKER_HEADER: &str = "Threads  Enter = open  Esc = back";
 const CHECKPOINT_NOTE: &str =
     "Read-only. Rounds inside a tool loop show up at the child's next checkpoint.";
@@ -218,20 +224,78 @@ enum Jump {
     Match { forward: bool },
 }
 
-/// The text of a thread laid out at one width, and the line each root
-/// cell starts on.
+/// A run of the text: the lines of one root cell (shared with the
+/// layout cache) or the whole of a child's thread, and where it starts.
+struct Piece {
+    cell: Option<usize>,
+    start: usize,
+    lines: Arc<[Line<'static>]>,
+}
+
+/// The text of a thread laid out at one width. Root cells are kept as
+/// their own runs with a blank line between, so a frame after one cell
+/// changed shares every other cell's lines rather than copying them.
 pub(super) struct PagerText {
-    lines: Vec<Line<'static>>,
-    cell_starts: Vec<(usize, usize)>,
+    pieces: Vec<Piece>,
+    total: usize,
+}
+
+impl PagerText {
+    fn single(lines: Vec<Line<'static>>) -> Self {
+        Self {
+            total: lines.len(),
+            pieces: vec![Piece {
+                cell: None,
+                start: 0,
+                lines: lines.into(),
+            }],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.total
+    }
+
+    /// Line `index`; None past the end and for the blank line between
+    /// two cells.
+    fn line(&self, index: usize) -> Option<&Line<'static>> {
+        let at = self
+            .pieces
+            .partition_point(|piece| piece.start <= index)
+            .checked_sub(1)?;
+        let piece = &self.pieces[at];
+        piece.lines.get(index - piece.start)
+    }
+
+    fn cell_start(&self, cell: usize) -> Option<usize> {
+        self.pieces
+            .iter()
+            .find(|piece| piece.cell == Some(cell))
+            .map(|piece| piece.start)
+    }
+}
+
+fn holds(line: Option<&Line<'static>>, needle: &str) -> bool {
+    line.is_some_and(|line| line.to_string().to_lowercase().contains(needle))
+}
+
+/// Each root cell's pager lines at one width, by the cell's revision.
+#[derive(Default)]
+struct RootLines {
+    width: u16,
+    by_revision: HashMap<u64, Arc<[Line<'static>]>>,
 }
 
 pub(super) struct Pager {
     thread: Thread,
     top: usize,
     jump: Option<Jump>,
-    /// Set when the last frame ended on the last line: a thread that
-    /// grows keeps its newest line in view until the user scrolls up.
+    /// Set by a jump to the end, or a scroll that reached it: a thread
+    /// that grows keeps its newest line in view until the user moves.
     follow: bool,
+    /// The user scrolled since the last frame; whether that reached the
+    /// end decides `follow`.
+    scrolled: bool,
     /// The find field while it is open.
     field: Option<String>,
     query: String,
@@ -244,6 +308,10 @@ pub(super) struct Pager {
     /// The text as last laid out, with the width and the transcript
     /// generation it was laid out for; reused until either moves.
     laid_out: Option<(u16, u64, Arc<PagerText>)>,
+    root_lines: RootLines,
+    /// Root cells laid out since the pager opened.
+    #[cfg(test)]
+    cell_layouts: usize,
 }
 
 impl Pager {
@@ -253,6 +321,7 @@ impl Pager {
             top: 0,
             jump: Some(jump),
             follow: false,
+            scrolled: false,
             field: None,
             query: String::new(),
             matched: None,
@@ -260,6 +329,9 @@ impl Pager {
             picker: None,
             page: 1,
             laid_out: None,
+            root_lines: RootLines::default(),
+            #[cfg(test)]
+            cell_layouts: 0,
         }
     }
 
@@ -360,6 +432,7 @@ impl Pager {
             .top
             .saturating_add_signed(isize::try_from(delta).unwrap_or(0));
         self.follow = false;
+        self.scrolled = true;
     }
 
     pub(super) fn page(&mut self, direction: i32) {
@@ -397,7 +470,7 @@ impl Pager {
     /// and nowhere otherwise.
     pub(super) fn paste(&mut self, text: &str) {
         if let Some(field) = self.field.as_mut() {
-            field.push_str(&text.replace('\n', " "));
+            field.push_str(&text.replace(['\r', '\n'], " "));
         }
     }
 
@@ -470,12 +543,14 @@ impl Pager {
         usize::from(if height >= 3 { height - 2 } else { height })
     }
 
-    /// The thread laid out at `width`. The root thread is laid out again
-    /// only when the transcript's `generation` moved; a child's when a
-    /// read of it came back.
+    /// The thread laid out at `width`. The root thread is looked at
+    /// again only when the transcript's `generation` moved, and then only
+    /// the cells whose revision moved are laid out again; a child's
+    /// thread is laid out again when a read of it came back.
     pub(super) fn text(
         &mut self,
         cells: &mut [Cell],
+        revisions: &[u64],
         generation: u64,
         width: u16,
         renderer: &mut Renderer,
@@ -490,31 +565,38 @@ impl Pager {
         {
             return Arc::clone(text);
         }
-        let text = Arc::new(self.lay_out(cells, width, renderer));
+        let text = Arc::new(self.lay_out(cells, revisions, width, renderer));
+        self.reanchor(&text);
         self.laid_out = Some((width, generation, Arc::clone(&text)));
         text
     }
 
-    fn lay_out(&mut self, cells: &mut [Cell], width: u16, renderer: &mut Renderer) -> PagerText {
-        let mut lines = Vec::new();
-        let mut cell_starts = Vec::new();
+    /// A highlighted match the new text no longer has on its line is
+    /// looked for again from the top of the view.
+    fn reanchor(&mut self, text: &PagerText) {
+        let Some(line) = self.matched else {
+            return;
+        };
+        if holds(text.line(line), &self.query.to_lowercase()) {
+            return;
+        }
+        self.matched = None;
+        if self.jump.is_none() {
+            self.jump = Some(Jump::Match { forward: true });
+        }
+    }
+
+    fn lay_out(
+        &mut self,
+        cells: &mut [Cell],
+        revisions: &[u64],
+        width: u16,
+        renderer: &mut Renderer,
+    ) -> PagerText {
         match &mut self.thread {
-            Thread::Root => {
-                for (index, cell) in cells.iter_mut().enumerate() {
-                    if matches!(cell, Cell::Welcome { .. }) {
-                        continue;
-                    }
-                    if !lines.is_empty() {
-                        lines.push(Line::default());
-                    }
-                    cell_starts.push((index, lines.len()));
-                    lines.extend(cell.full_lines(width, renderer));
-                }
-                if lines.is_empty() {
-                    lines.push(Line::from(Span::styled("(nothing yet)", DIM)));
-                }
-            }
+            Thread::Root => self.lay_out_root(cells, revisions, width, renderer),
             Thread::Child(view) => {
+                let mut lines = Vec::new();
                 let no_color = renderer.no_color;
                 lines.extend(render::plain_lines(CHECKPOINT_NOTE, width, DIM));
                 if let Some(error) = &view.error {
@@ -541,45 +623,103 @@ impl Pager {
                     }
                     None => {}
                 }
+                PagerText::single(lines)
             }
         }
-        PagerText { lines, cell_starts }
+    }
+
+    /// The root thread: each cell's lines are taken from the last layout
+    /// when its revision has not moved, and laid out again otherwise.
+    fn lay_out_root(
+        &mut self,
+        cells: &mut [Cell],
+        revisions: &[u64],
+        width: u16,
+        renderer: &mut Renderer,
+    ) -> PagerText {
+        if self.root_lines.width != width {
+            self.root_lines = RootLines {
+                width,
+                by_revision: HashMap::new(),
+            };
+        }
+        let mut kept = HashMap::with_capacity(cells.len());
+        let mut pieces = Vec::new();
+        let mut total = 0;
+        for (index, (cell, &revision)) in cells.iter_mut().zip(revisions).enumerate() {
+            if matches!(cell, Cell::Welcome { .. }) {
+                continue;
+            }
+            let lines = match self.root_lines.by_revision.remove(&revision) {
+                Some(lines) => lines,
+                None => {
+                    #[cfg(test)]
+                    {
+                        self.cell_layouts += 1;
+                    }
+                    Arc::from(cell.full_lines(width, renderer))
+                }
+            };
+            if total > 0 {
+                total += 1;
+            }
+            pieces.push(Piece {
+                cell: Some(index),
+                start: total,
+                lines: Arc::clone(&lines),
+            });
+            total += lines.len();
+            kept.insert(revision, lines);
+        }
+        self.root_lines.by_revision = kept;
+        if total == 0 {
+            return PagerText::single(vec![Line::from(Span::styled("(nothing yet)", DIM))]);
+        }
+        PagerText { pieces, total }
     }
 
     /// Resolves the pending jump against the laid-out text and keeps the
     /// view inside it.
     pub(super) fn settle(&mut self, text: &PagerText, rows: usize) {
         self.page = rows.max(1);
-        let total = text.lines.len();
+        let total = text.len();
         let last_top = total.saturating_sub(rows);
         match self.jump.take() {
-            Some(Jump::Top) => self.top = 0,
-            Some(Jump::Bottom) => self.top = last_top,
-            Some(Jump::Cell(cell)) => {
-                self.top = text
-                    .cell_starts
-                    .iter()
-                    .find(|(index, _)| *index == cell)
-                    .map_or(last_top, |(_, line)| *line);
+            Some(Jump::Top) => {
+                self.top = 0;
+                self.follow = false;
             }
+            Some(Jump::Bottom) => {
+                self.top = last_top;
+                self.follow = true;
+            }
+            Some(Jump::Cell(cell)) => {
+                self.top = text.cell_start(cell).unwrap_or(last_top);
+                self.follow = false;
+            }
+            // A match on the last page is a place the user went to read,
+            // not a request to follow new lines past it.
             Some(Jump::Match { forward }) => {
-                self.matched = self.find(&text.lines, forward);
+                self.matched = self.find(text, forward);
                 self.missed = self.matched.is_none();
                 if let Some(line) = self.matched {
                     self.top = line;
                 }
+                self.follow = false;
             }
             None if self.follow => self.top = last_top,
             None => {}
         }
         self.top = self.top.min(last_top);
-        self.follow = self.top == last_top;
+        if std::mem::take(&mut self.scrolled) {
+            self.follow = self.top == last_top;
+        }
     }
 
     /// The line of the next match after the current one (or before it),
     /// wrapping round; the first search starts at the top of the view.
-    fn find(&self, lines: &[Line<'static>], forward: bool) -> Option<usize> {
-        let total = lines.len();
+    fn find(&self, text: &PagerText, forward: bool) -> Option<usize> {
+        let total = text.len();
         if total == 0 || self.query.is_empty() {
             return None;
         }
@@ -598,20 +738,25 @@ impl Pager {
                     (origin + total - step) % total
                 }
             })
-            .find(|&index| lines[index].to_string().to_lowercase().contains(&needle))
+            .find(|&index| holds(text.line(index), &needle))
     }
 
-    fn title(&self) -> String {
-        let title = match &self.thread {
+    /// The thread's name for a title `width` columns wide. A child's
+    /// session id too long for it loses its middle: the ids end in what
+    /// tells two runs of one agent apart.
+    fn title(&self, width: usize) -> String {
+        match &self.thread {
             Thread::Root => format!("Thread: {ROOT_THREAD}"),
             Thread::Child(view) => {
-                format!("Thread: {} (read-only) {}", view.agent, view.session_id)
+                let head = render::plain_text(&format!("Thread: {} (read-only) ", view.agent));
+                let id = render::plain_text(&view.session_id);
+                let room = width.saturating_sub(head.width());
+                format!("{head}{}", elide_middle(&id, room))
             }
-        };
-        render::plain_text(&title)
+        }
     }
 
-    fn hint(&self) -> Line<'static> {
+    fn hint(&self, width: u16) -> Line<'static> {
         if let Some(field) = &self.field {
             return Line::from(format!("/{}", render::plain_text(field)));
         }
@@ -621,8 +766,25 @@ impl Pager {
                 DIM,
             ));
         }
-        Line::from(Span::styled(HINT, DIM))
+        let legend = if width < NARROW { SHORT_HINT } else { HINT };
+        Line::from(Span::styled(legend, DIM))
     }
+}
+
+/// `text` cut to `width` characters by dropping its middle for `...`;
+/// whole when it fits or when too little room is left to say anything.
+fn elide_middle(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width || width < 7 {
+        return text.to_string();
+    }
+    let kept = width - 3;
+    let tail = kept.div_ceil(2);
+    let head = kept - tail;
+    let mut short: String = chars[..head].iter().collect();
+    short.push_str("...");
+    short.extend(&chars[chars.len() - tail..]);
+    short
 }
 
 /// The pager over the whole frame: the thread's name and the position in
@@ -639,7 +801,8 @@ impl Widget for PagerView<'_> {
             return;
         }
         let pager = self.pager;
-        let lines = &self.text.lines;
+        let text = self.text;
+        let total = text.len();
         let rows = Pager::text_rows(area.height);
         let chrome = area.height >= 3;
         let body = if chrome {
@@ -647,24 +810,31 @@ impl Widget for PagerView<'_> {
         } else {
             area
         };
-        let start = pager.top.min(lines.len());
-        let end = (start + rows).min(lines.len());
+        let start = pager.top.min(total);
+        let end = (start + rows).min(total);
         if chrome {
             let title = Rect::new(area.x, area.y, area.width, 1);
-            let position = format!("{}-{end}/{}", (start + 1).min(end), lines.len());
+            let position = format!("{}-{end}/{total}", (start + 1).min(end));
             // The name gives way to the position, which is what moves.
             let name_width = area
                 .width
                 .saturating_sub(u16::try_from(position.len() + 1).unwrap_or(u16::MAX));
             let name = Rect::new(area.x, area.y, name_width, 1);
-            Paragraph::new(Line::from(Span::styled(pager.title(), BOLD))).render(name, buf);
+            Paragraph::new(Line::from(Span::styled(
+                pager.title(usize::from(name_width)),
+                BOLD,
+            )))
+            .render(name, buf);
             Paragraph::new(Line::from(Span::styled(position, DIM)))
                 .right_aligned()
                 .render(title, buf);
             let hint = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-            Paragraph::new(pager.hint()).render(hint, buf);
+            Paragraph::new(pager.hint(area.width)).render(hint, buf);
         }
-        Paragraph::new(lines[start..end].to_vec()).render(body, buf);
+        let visible: Vec<Line<'static>> = (start..end)
+            .map(|index| text.line(index).cloned().unwrap_or_default())
+            .collect();
+        Paragraph::new(visible).render(body, buf);
         if let Some(line) = pager.matched
             && (start..end).contains(&line)
         {
@@ -697,8 +867,11 @@ impl Widget for PagerView<'_> {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::config::CommandPrefix;
     use crate::config::child_sessions::ChildStatus;
-    use crate::tui::cells::{ToolStatus, append_output};
+    use crate::tui::TOOL_OUTPUT_TAIL;
+    use crate::tui::cells::{AgentStatus, FoldedCall, JobStatus, ToolStatus, append_output};
+    use crate::tui::transcript::Transcript;
     use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -710,6 +883,11 @@ mod tests {
     fn fresh_generation() -> u64 {
         static GENERATION: AtomicU64 = AtomicU64::new(1);
         GENERATION.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// A fresh revision for each of `cells`, so every one is laid out.
+    fn fresh_revisions(cells: &[Cell]) -> Vec<u64> {
+        cells.iter().map(|_| fresh_generation()).collect()
     }
 
     fn renderer() -> Renderer {
@@ -754,7 +932,14 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                let text = pager.text(cells, fresh_generation(), area.width, &mut renderer);
+                let revisions = fresh_revisions(cells);
+                let text = pager.text(
+                    cells,
+                    &revisions,
+                    fresh_generation(),
+                    area.width,
+                    &mut renderer,
+                );
                 pager.settle(&text, Pager::text_rows(area.height));
                 frame.render_widget(PagerView { pager, text: &text }, area);
             })
@@ -829,10 +1014,12 @@ mod tests {
     }
 
     fn cells_line(pager: &mut Pager, cells: &mut [Cell], line: usize) -> String {
+        let revisions = fresh_revisions(cells);
         pager
-            .text(cells, fresh_generation(), 80, &mut renderer())
-            .lines[line]
-            .to_string()
+            .text(cells, &revisions, fresh_generation(), 80, &mut renderer())
+            .line(line)
+            .map(Line::to_string)
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1052,15 +1239,194 @@ mod tests {
     #[test]
     fn the_root_thread_is_laid_out_again_only_when_the_transcript_or_width_moved() {
         let mut cells = root_cells();
+        let revisions = vec![1, 2, 3];
         let mut pager = Pager::root();
         let mut renderer = renderer();
-        let first = pager.text(&mut cells, 5, 80, &mut renderer);
-        let again = pager.text(&mut cells, 5, 80, &mut renderer);
+        let first = pager.text(&mut cells, &revisions, 5, 80, &mut renderer);
+        let again = pager.text(&mut cells, &revisions, 5, 80, &mut renderer);
         assert!(Arc::ptr_eq(&first, &again));
-        let changed = pager.text(&mut cells, 6, 80, &mut renderer);
+        let changed = pager.text(&mut cells, &revisions, 6, 80, &mut renderer);
         assert!(!Arc::ptr_eq(&first, &changed));
-        let narrower = pager.text(&mut cells, 6, 40, &mut renderer);
+        let narrower = pager.text(&mut cells, &revisions, 6, 40, &mut renderer);
         assert!(!Arc::ptr_eq(&changed, &narrower));
+    }
+
+    /// A folded call that printed `lines` numbered lines, each starting
+    /// with `label`.
+    fn folded(call_id: &str, name: &str, label: &str, lines: usize) -> FoldedCall {
+        let mut call = FoldedCall::new(call_id.to_string(), name.to_string());
+        let output: String = (1..=lines).map(|n| format!("{label} {n:02}\n")).collect();
+        let target = (&mut call.output, &mut call.open_line, &mut call.pending);
+        call.full.push(&append_output(target, output.as_bytes()));
+        call
+    }
+
+    /// A job and an agent whose folded calls printed more than a row
+    /// keeps, the job failed: the pager shows each call under its name
+    /// from its first line, and the job's error whole where its row
+    /// shows only the first line.
+    #[test]
+    fn the_pager_opens_job_and_agent_rows_on_every_call_and_the_whole_error() {
+        let lines = TOOL_OUTPUT_TAIL + 5;
+        let mut cells = vec![
+            Cell::Job {
+                job_id: "job_0a1b2c3d".to_string(),
+                tool: "execute_command".to_string(),
+                status: JobStatus::Failed(
+                    "exit status 2\nstderr: no space left\nwhile writing out.bin".to_string(),
+                ),
+                calls: vec![folded("c1", "job__check", "job", lines)],
+                expanded: false,
+            },
+            Cell::Agent {
+                agent_id: "agent_reviewer_4e5f6a7b".to_string(),
+                name: "reviewer".to_string(),
+                status: AgentStatus::Completed,
+                calls: vec![
+                    folded("c2", "agent__check", "progress", lines),
+                    folded("c3", "agent__collect", "verdict", 2),
+                ],
+                expanded: false,
+            },
+        ];
+        let mut renderer = renderer();
+        let collapsed: Vec<String> = cells
+            .iter_mut()
+            .flat_map(|cell| cell.lines(80, &mut renderer))
+            .map(|line| line.to_string())
+            .collect();
+        assert!(
+            !collapsed.iter().any(|line| line.contains("stderr")),
+            "{collapsed:?}"
+        );
+        let mut pager = Pager::root();
+        pager.jump_to_top();
+        let frame = draw(&mut pager, &mut cells, 80, 70);
+        insta::assert_snapshot!("pager_job_and_agent_rows_80x70", &frame);
+        for needle in [
+            "job__check:",
+            "job 01",
+            "agent__check:",
+            "progress 01",
+            "agent__collect:",
+            "verdict 02",
+            "error: exit status 2",
+            "stderr: no space left",
+            "while writing out.bin",
+        ] {
+            assert!(frame.contains(needle), "{needle} is missing: {frame}");
+        }
+    }
+
+    /// Each chunk streamed into the newest cell lays out that cell alone;
+    /// every cell before it is taken from the last layout.
+    #[test]
+    fn streaming_into_the_last_cell_lays_out_only_that_cell() {
+        let mut transcript = Transcript::new("m".to_string(), CommandPrefix::Dot);
+        for cell in root_cells() {
+            transcript.push(cell);
+        }
+        transcript.open_stream(Cell::assistant(String::new(), false));
+        let mut pager = Pager::root();
+        let mut renderer = renderer();
+        let mut lay_out = |pager: &mut Pager, transcript: &mut Transcript| {
+            let generation = transcript.generation();
+            let (cells, revisions) = transcript.cells_for_layout();
+            pager.text(cells, revisions, generation, 80, &mut renderer)
+        };
+        lay_out(&mut pager, &mut transcript);
+        assert_eq!(pager.cell_layouts, 4);
+        for n in 1..=5 {
+            let Some(Cell::Assistant { source, .. }) = transcript.stream_cell_mut() else {
+                panic!("the stream cell is gone");
+            };
+            source.push_str(&format!("chunk {n} "));
+            let text = lay_out(&mut pager, &mut transcript);
+            assert_eq!(
+                pager.cell_layouts,
+                4 + n,
+                "chunk {n} laid out more than one cell"
+            );
+            let last = text.len() - 1;
+            assert!(holds(text.line(last), &format!("chunk {n}")));
+        }
+        lay_out(&mut pager, &mut transcript);
+        assert_eq!(
+            pager.cell_layouts, 9,
+            "a frame with no change laid out a cell"
+        );
+    }
+
+    /// A highlighted match whose line the new layout changed is looked
+    /// for again from the top of the view; one still on its line stays.
+    /// A match on the last page does not start following.
+    #[test]
+    fn a_layout_change_finds_the_match_again_and_a_match_never_follows() {
+        let mut cells = root_cells();
+        let mut pager = Pager::root();
+        draw(&mut pager, &mut cells, 80, 24);
+        pager.open_find();
+        for c in "done counting".chars() {
+            pager.find_char(c);
+        }
+        pager.submit_find();
+        draw(&mut pager, &mut cells, 80, 24);
+        let matched = pager.matched.unwrap();
+        assert!(!pager.follow, "a match on the last page started following");
+        cells.push(Cell::user("below"));
+        draw(&mut pager, &mut cells, 80, 24);
+        assert_eq!(pager.matched, Some(matched));
+        cells.insert(0, Cell::user("above"));
+        cells.insert(0, Cell::user("above"));
+        draw(&mut pager, &mut cells, 80, 24);
+        let moved = pager.matched.expect("the match was not found again");
+        assert_eq!(moved, matched + 4);
+        assert!(cells_line(&mut pager, &mut cells, moved).contains("Done counting"));
+        cells.pop();
+        cells[4] = Cell::assistant("Gone.".to_string(), true);
+        draw(&mut pager, &mut cells, 80, 24);
+        assert_eq!(pager.matched, None);
+        assert!(pager.missed);
+    }
+
+    /// A paste into the find field lands on one line however its lines
+    /// end.
+    #[test]
+    fn a_paste_into_the_find_field_drops_every_line_break() {
+        let mut pager = Pager::root();
+        pager.paste("ignored");
+        pager.open_find();
+        pager.paste("one\r\ntwo\rthree\n");
+        assert_eq!(pager.field.as_deref(), Some("one  two three "));
+    }
+
+    /// A narrow pager keeps the way out and the threads key first in its
+    /// legend, and a long session id loses its middle, not its end.
+    #[test]
+    fn a_narrow_pager_keeps_close_and_threads_and_the_ids_end() {
+        let pager = Pager::root();
+        assert!(
+            pager
+                .hint(69)
+                .to_string()
+                .starts_with("q close  Tab threads")
+        );
+        assert_eq!(pager.hint(70).to_string(), HINT);
+
+        let mut cells = Vec::new();
+        let mut pager = Pager::child(
+            "reviewer_20260102_0a1b2c3d4e5f".to_string(),
+            "reviewer".to_string(),
+            PathBuf::from("/nonexistent/reviewer.yaml"),
+        );
+        let frame = draw(&mut pager, &mut cells, 50, 12);
+        let title = frame.lines().next().unwrap();
+        assert!(title.contains("Thread: reviewer (read-only) "), "{title}");
+        assert!(title.contains("review...3d4e5f "), "{title}");
+        assert!(!title.contains("_2026"), "{title}");
+        assert_eq!(elide_middle("abcdefghij", 7), "ab...ij");
+        assert_eq!(elide_middle("abcdefghij", 10), "abcdefghij");
+        assert_eq!(elide_middle("abcdefghij", 6), "abcdefghij");
     }
 
     #[test]
@@ -1075,7 +1441,14 @@ mod tests {
             Rect::new(0, 0, 5, 2),
         ] {
             let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
-            let text = pager.text(&mut cells, fresh_generation(), area.width, &mut renderer);
+            let revisions = fresh_revisions(&cells);
+            let text = pager.text(
+                &mut cells,
+                &revisions,
+                fresh_generation(),
+                area.width,
+                &mut renderer,
+            );
             pager.settle(&text, Pager::text_rows(area.height));
             PagerView {
                 pager: &pager,

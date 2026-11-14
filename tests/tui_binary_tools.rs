@@ -6,10 +6,10 @@
 //! select an MCP server conflict asks during `.install`, the `init RAG?`
 //! question an agent with documents asks when it starts, and the `.rag`
 //! wizard and macro steps that reach those questions.
-//! After them: the transcript printed when Ctrl+D, Ctrl+C or `.exit`
-//! leaves the UI (and its `tui_dump_on_exit: false` opt-out), the Ctrl+T
-//! pager over a tool's whole output with its find and thread picker, and
-//! the F3 roster cancelling a background job.
+//! After them: the Ctrl+T pager over a tool's whole output with its find
+//! and thread picker, the F3 roster cancelling a background job, and both
+//! with nothing to show. The transcript printed when the UI leaves is
+//! checked in `tui_binary_wizards.rs`.
 //! Each case runs the binary on a pseudo-terminal under a bash wrapper
 //! that reports the exit code and `stty -a` afterwards, so the file is
 //! unix-only. The cases run one at a time: each spawn forks a session
@@ -2034,40 +2034,8 @@ fn a_python_tools_select_returns_none_for_a_blank_custom_answer() {
 }
 
 // ---------------------------------------------------------------------------
-// What the UI leaves on the normal screen, and the pager over a tool's
-// whole output.
+// The pager over a tool's whole output.
 // ---------------------------------------------------------------------------
-
-/// With `tui_dump_on_exit: false` the transcript is not printed when the
-/// UI leaves: the wrapper's report follows the leave directly.
-#[test]
-#[serial]
-fn tui_dump_on_exit_false_prints_nothing_between_the_leave_and_the_report() {
-    let dir = fresh_config_dir("dump-off");
-    let _guard = TempDirGuard(dir.clone());
-    let fake = FakeLlm::start(vec![Reply::Text("the reply to drop k4w".to_string())]);
-    write_fake_llm_config_with(&dir, &fake, "tui_dump_on_exit: false\n");
-    let mut pty = spawn_tui(&dir, &[]);
-
-    pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.send(b"prompt to drop j3q\r").unwrap();
-    wait_for_squeezed(&mut pty, "the reply to drop k4w", "the reply");
-    pty.read_for(Duration::from_millis(800));
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
-
-    let raw = pty.raw();
-    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
-    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
-    let report_at = after.find("exit=").expect("no exit= line after the leave");
-    assert!(
-        after[..report_at].trim().is_empty(),
-        "the transcript was printed with tui_dump_on_exit: false: {:?}",
-        after[..report_at].trim()
-    );
-}
 
 /// A tool that writes forty numbered lines to stderr, twice what a tool
 /// row keeps.
@@ -2160,8 +2128,8 @@ fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The pager's find and thread picker, the roster over a background job,
-// and the transcript printed when Ctrl+C leaves an idle UI.
+// The pager's find and thread picker, and the roster over a background
+// job.
 // ---------------------------------------------------------------------------
 
 /// In the pager `/` finds a line of the tool's output that is off the
@@ -2268,6 +2236,7 @@ fn sleeping_tool(pid_file: &Path) -> String {
 }
 
 fn alive(pid: i32) -> bool {
+    // SAFETY: kill with signal 0 only checks the pid and touches no memory.
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
@@ -2287,6 +2256,15 @@ impl Drop for Sleepers {
             }
         }
     }
+}
+
+/// The roster band of a repainted frame: from its legend down to the rule
+/// under it.
+fn roster_band(frame: &str) -> &str {
+    let legend = frame
+        .rfind("Esc = close")
+        .unwrap_or_else(|| panic!("the roster's legend is not on screen:\n{frame}"));
+    frame[legend..].split('\u{2500}').next().unwrap_or_default()
 }
 
 /// A job the model started in the background and the user left running
@@ -2336,13 +2314,10 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
 
     pty.send(b"\x1bOR").unwrap();
     let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "F3 did not list the job");
-    let row: Vec<&str> = roster
-        .lines()
-        .filter(|line| line.contains("fixture_sleep"))
-        .collect();
+    let band = roster_band(&roster);
     assert!(
-        squeezed(&roster).contains("running"),
-        "the job row does not say running:\n{roster}"
+        band.contains("fixture_sleep") && band.contains("running"),
+        "the roster does not list the job as running: {band:?}\n{roster}"
     );
     pty.send(b"x").unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -2352,7 +2327,7 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
     let gone = !alive(pid);
     assert!(
         gone,
-        "x did not stop the job's process {pid}; roster was {row:#?}"
+        "x did not stop the job's process {pid}; roster was {band:?}"
     );
     // The repaint is the screen's rows in order with the escapes gone:
     // the transcript's job row, then the roster band under its legend.
@@ -2365,10 +2340,7 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
         job_row.contains("cancelled"),
         "the job row does not say cancelled after x: {job_row:?}\n{after}"
     );
-    let band = after
-        .rfind("Esc = close")
-        .map_or("", |legend| &after[legend..]);
-    let band = band.split('─').next().unwrap_or_default();
+    let band = roster_band(&after);
     assert!(
         !band.contains("fixture_sleep"),
         "the roster still lists the cancelled job: {band:?}"
@@ -2382,59 +2354,108 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
     assert_tty_restored(&transcript);
 }
 
-/// Leaves an idle UI with `keys` after one exchange and checks the
-/// prompt and the reply were printed between the leave and the report.
-fn leaving_prints_the_transcript(name: &str, keys: &[u8], prompt: &str, reply: &str) {
-    let dir = fresh_config_dir(name);
+// ---------------------------------------------------------------------------
+// The pager and roster with nothing in them.
+// ---------------------------------------------------------------------------
+
+/// Every pager key on a first start with no turn at all: Ctrl+T, the
+/// scroll keys, a find with no match, Tab and Esc. The UI stays up, the
+/// composer takes keys afterwards and Ctrl+D leaves with exit 0.
+#[test]
+#[serial]
+fn ctrl_t_and_every_pager_key_on_an_empty_transcript_keep_the_ui_up() {
+    let dir = fresh_config_dir("pager-empty");
     let _guard = TempDirGuard(dir.clone());
-    let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
-    write_fake_llm_config(&dir, &fake);
+    write_dry_run_config(&dir);
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
-    wait_for_squeezed(&mut pty, reply, "the reply");
-    pty.read_for(Duration::from_millis(800));
-    pty.send(keys).unwrap();
+    pty.send(b"\x14").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    for keys in [
+        &b"j"[..],
+        b"k",
+        b"G",
+        b"g",
+        b"\x1b[6~",
+        b"\x1b[5~",
+        b"/nothing-here-w2z",
+        b"\r",
+        b"n",
+        b"N",
+        b"\t",
+        b"\x1b[B",
+        b"\r",
+    ] {
+        pty.send(keys).unwrap();
+        pty.read_for(Duration::from_millis(150));
+    }
+    for _ in 0..3 {
+        pty.send(b"\x1b").unwrap();
+        pty.read_for(Duration::from_millis(400));
+    }
+    let frame = repainted_frame_showing(&mut pty, "no session", "the UI did not come back");
+    assert!(
+        !squeezed(&frame).contains("Thread:rootthread"),
+        "Esc left the pager up:\n{frame}"
+    );
+    pty.send(b"alive after the pager c8v").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "alive after the pager c8v",
+        "keys did not reach the composer",
+    );
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert!(!transcript.contains("panicked"), "{transcript}");
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// F3 with no task and no question shows the empty roster; `x` and `o`
+/// on it change nothing, Esc closes it and the composer takes keys.
+#[test]
+#[serial]
+fn f3_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
+    let dir = fresh_config_dir("roster-empty");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"\x1bOR").unwrap();
+    repainted_frame_showing(
+        &mut pty,
+        "(no tasks and no questions)",
+        "F3 did not show the empty roster",
+    );
+    pty.send(b"x").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"o").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let still = repainted_frame_showing(
+        &mut pty,
+        "(no tasks and no questions)",
+        "x or o closed the empty roster or opened something",
+    );
+    assert!(
+        !squeezed(&still).contains("Thread:"),
+        "o on the empty roster opened the pager:\n{still}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"typed after the roster h5n").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "typed after the roster h5n",
+        "keys did not reach the composer after Esc",
+    );
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
-
-    let raw = pty.raw();
-    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
-    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
-    let report_at = after.find("exit=").expect("no exit= line after the leave");
-    let between = squeezed(&after[..report_at]);
-    for marker in [prompt, reply] {
-        assert!(
-            between.contains(&squeezed(marker)),
-            "{marker:?} was not printed after {keys:?} left the UI: {:?}",
-            after[..report_at].trim()
-        );
-    }
-}
-
-/// Ctrl+C on an idle empty composer leaves the UI like Ctrl+D does, and
-/// the transcript is printed on the normal screen on that path too.
-#[test]
-#[serial]
-fn ctrl_c_on_an_idle_composer_also_prints_the_transcript() {
-    leaving_prints_the_transcript(
-        "ctrl-c-dump",
-        b"\x03",
-        "prompt to keep z1c",
-        "the reply to keep h3w",
-    );
-}
-
-/// `.exit` leaves the UI too, and prints the transcript the same way.
-#[test]
-#[serial]
-fn dot_exit_also_prints_the_transcript() {
-    leaving_prints_the_transcript(
-        "dot-exit-dump",
-        b".exit\r",
-        "prompt to keep e8y",
-        "the reply to keep m4s",
-    );
 }

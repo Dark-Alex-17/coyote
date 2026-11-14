@@ -430,8 +430,10 @@ pub(super) fn render_rows(
     for (offset, (name, description)) in visible.iter().enumerate() {
         let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
         let line_area = Rect::new(area.x, y, area.width, 1);
+        // `{:<n$}` pads by characters; a wide glyph takes two columns.
+        let pad = name_width.saturating_sub(name.width());
         let line = Line::from(vec![
-            Span::raw(format!("{name:<name_width$}")),
+            Span::raw(format!("{name}{:pad$}", "")),
             Span::raw("  "),
             Span::styled(*description, DIM),
         ]);
@@ -542,6 +544,27 @@ mod tests {
             highlight: None,
             token_range: 0..2,
         }
+    }
+
+    /// A name with wide glyphs is padded by the columns it takes, so the
+    /// descriptions after it line up with the ASCII rows'.
+    #[test]
+    fn rows_line_up_by_display_width() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 2));
+        render_rows(
+            &[("\u{4e2d}\u{6587}", "wide"), ("abcdef", "ascii")],
+            None,
+            Rect::new(0, 0, 20, 2),
+            &mut buf,
+        );
+        let column = |y: u16, symbol: &str| {
+            (0..20)
+                .find(|&x| buf[(x, y)].symbol() == symbol)
+                .unwrap_or_else(|| panic!("{symbol} is not on row {y}"))
+        };
+        assert_eq!(column(0, "w"), 8);
+        assert_eq!(column(1, "a"), 0);
+        assert_eq!(column(1, "s"), 9);
     }
 
     fn ctx_with(prefix: CommandPrefix, function_calling: bool) -> RequestContext {

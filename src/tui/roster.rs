@@ -36,15 +36,17 @@ pub(super) struct RosterSources {
 }
 
 impl RosterSources {
-    /// The tasks by id, a shared prefix's numbers in number order
-    /// (`agent-2` before `agent-10`), then the questions by id.
+    /// The tasks sorted by id, then the questions sorted by id. Ids end
+    /// in random hex, so this is not the order the tasks were spawned or
+    /// the questions asked in; it is only stable, so a row stays put
+    /// between frames while others come and go.
     pub(super) fn rows(&self) -> Vec<RosterRow> {
         let mut tasks: Vec<TaskRow> = self
             .supervisor
             .as_ref()
             .map(|supervisor| supervisor.read().task_snapshot())
             .unwrap_or_default();
-        tasks.sort_by(|a, b| natural_key(&a.id).cmp(&natural_key(&b.id)));
+        tasks.sort_by(|a, b| a.id.cmp(&b.id));
         let mut rows: Vec<RosterRow> = tasks.into_iter().map(RosterRow::Task).collect();
         if let Some(queue) = &self.escalations {
             let mut asks: Vec<Escalation> = queue
@@ -57,19 +59,6 @@ impl RosterSources {
         }
         rows
     }
-}
-
-/// An id split as its text before a run of trailing digits, then the
-/// digits compared by value: the count of digits first, then the digits.
-fn natural_key(id: &str) -> (&str, usize, &str) {
-    let digits_at = id
-        .char_indices()
-        .rev()
-        .take_while(|(_, c)| c.is_ascii_digit())
-        .last()
-        .map_or(id.len(), |(at, _)| at);
-    let digits = id[digits_at..].trim_start_matches('0');
-    (&id[..digits_at], digits.len(), digits)
 }
 
 /// A question a child agent is blocked on until the user answers it.
@@ -137,8 +126,9 @@ impl RosterRow {
     }
 
     /// The row's text after its label: a task's id, padded to `id_width`
-    /// columns so the states line up, its state and how long a job has
-    /// run by `now`; a question's first line and how many follow.
+    /// columns so the states line up, its state and, while it runs, how
+    /// long it has run by `now`; a question's first line and how many
+    /// follow.
     fn detail(&self, id_width: usize, now: Instant) -> String {
         match self {
             RosterRow::Task(task) => {
@@ -151,7 +141,9 @@ impl RosterRow {
                 let id = super::render::plain_text(&task.id);
                 let pad = id_width.saturating_sub(id.width());
                 let mut detail = format!("{id}{:pad$}  {status}", "");
-                if let Some(started) = task.started_at {
+                if task.status == TaskRowStatus::Running
+                    && let Some(started) = task.started_at
+                {
                     detail.push_str("  ");
                     detail.push_str(&elapsed_text(now.saturating_duration_since(started)));
                 }
@@ -317,7 +309,7 @@ pub(super) mod tests {
     pub(in crate::tui) fn ask(id: &str, agent: &str, question: &str) -> RosterRow {
         RosterRow::Escalation(Escalation {
             id: id.to_string(),
-            agent_id: format!("{agent}-id"),
+            agent_id: format!("agent_{agent}_5a6b7c8d"),
             agent_name: agent.to_string(),
             question: question.to_string(),
             options: vec!["yes".to_string(), "no".to_string()],
@@ -327,19 +319,19 @@ pub(super) mod tests {
     fn mixed() -> RosterState {
         let mut state = RosterState::new(vec![
             task(
-                "agent-1",
+                "agent_reviewer_1a2b3c4d",
                 TaskKind::Agent,
                 "reviewer",
                 TaskRowStatus::Running,
             ),
             task(
-                "job-2",
+                "job_5e6f7a8b",
                 TaskKind::Job,
                 "execute_command",
                 TaskRowStatus::Failed,
             ),
             ask(
-                "esc_1",
+                "esc_9c0d1e2f",
                 "reviewer",
                 "Ship the fix to main?\nIt touches the release.",
             ),
@@ -404,32 +396,35 @@ pub(super) mod tests {
         let mut state = mixed();
         state.refresh(vec![
             task(
-                "agent-0",
+                "agent_planner_0f1e2d3c",
                 TaskKind::Agent,
                 "planner",
                 TaskRowStatus::Running,
             ),
             task(
-                "agent-1",
+                "agent_reviewer_1a2b3c4d",
                 TaskKind::Agent,
                 "reviewer",
                 TaskRowStatus::Running,
             ),
             task(
-                "job-2",
+                "job_5e6f7a8b",
                 TaskKind::Job,
                 "execute_command",
                 TaskRowStatus::Failed,
             ),
         ]);
-        assert_eq!(state.focused().map(RosterRow::id), Some("job-2"));
+        assert_eq!(state.focused().map(RosterRow::id), Some("job_5e6f7a8b"));
         state.refresh(vec![task(
-            "agent-0",
+            "agent_planner_0f1e2d3c",
             TaskKind::Agent,
             "planner",
             TaskRowStatus::Running,
         )]);
-        assert_eq!(state.focused().map(RosterRow::id), Some("agent-0"));
+        assert_eq!(
+            state.focused().map(RosterRow::id),
+            Some("agent_planner_0f1e2d3c")
+        );
         state.refresh(Vec::new());
         assert!(state.focused().is_none());
         assert_eq!(state.band_rows(), 2);
@@ -463,12 +458,30 @@ pub(super) mod tests {
         assert!(terminal.backend().to_string().contains("(no tasks"));
     }
 
-    /// Ids that share a prefix sort by their number, not their text.
+    /// A job that is no longer running stops its clock: two frames apart
+    /// show the same row. A running one counts on.
     #[test]
-    fn task_ids_sort_by_their_trailing_number() {
-        let mut ids = vec!["agent-10", "job_ff", "agent-2", "agent-1", "agent"];
-        ids.sort_by(|a, b| natural_key(a).cmp(&natural_key(b)));
-        assert_eq!(ids, ["agent", "agent-1", "agent-2", "agent-10", "job_ff"]);
+    fn only_a_running_task_shows_how_long_it_has_run() {
+        let failed = task(
+            "job_5e6f7a8b",
+            TaskKind::Job,
+            "execute_command",
+            TaskRowStatus::Failed,
+        );
+        let later = frame_time() + Duration::from_secs(60);
+        assert_eq!(failed.detail(12, frame_time()), failed.detail(12, later));
+        assert_eq!(failed.detail(12, later), "job_5e6f7a8b  failed");
+        let running = task(
+            "job_5e6f7a8b",
+            TaskKind::Job,
+            "execute_command",
+            TaskRowStatus::Running,
+        );
+        assert_eq!(
+            running.detail(12, frame_time()),
+            "job_5e6f7a8b  running  75.0s"
+        );
+        assert_ne!(running.detail(12, frame_time()), running.detail(12, later));
     }
 
     #[test]
@@ -476,8 +489,8 @@ pub(super) mod tests {
         let queue = Arc::new(EscalationQueue::new());
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         queue.submit(crate::supervisor::escalation::EscalationRequest {
-            id: "esc_9".to_string(),
-            from_agent_id: "agent-9".to_string(),
+            id: "esc_3a4b5c6d".to_string(),
+            from_agent_id: "agent_planner_7d8e9f0a".to_string(),
             from_agent_name: "planner".to_string(),
             question: "Which branch?".to_string(),
             options: Some(vec!["main".to_string(), "dev".to_string()]),
@@ -490,8 +503,8 @@ pub(super) mod tests {
         assert_eq!(
             sources.rows(),
             vec![RosterRow::Escalation(Escalation {
-                id: "esc_9".to_string(),
-                agent_id: "agent-9".to_string(),
+                id: "esc_3a4b5c6d".to_string(),
+                agent_id: "agent_planner_7d8e9f0a".to_string(),
                 agent_name: "planner".to_string(),
                 question: "Which branch?".to_string(),
                 options: vec!["main".to_string(), "dev".to_string()],

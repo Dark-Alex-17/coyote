@@ -52,18 +52,33 @@ impl LineCache {
 pub(super) struct FullOutput {
     text: String,
     dropped: usize,
-    cache: LineCache,
-    /// Counts the changes to the text; the cache holds the lines of
-    /// `laid_out`'s and is redone at the first read after a change.
-    revision: u64,
-    laid_out: u64,
+    wrapped: Option<WrappedOutput>,
+}
+
+/// The lines of a `FullOutput` at one width. The text up to `committed`
+/// ends on a whole line with no colour left open, so its lines cannot
+/// change as more text arrives; only what follows is laid out again.
+struct WrappedOutput {
+    width: u16,
+    /// The `dropped` count the lines were laid out with; once it moves
+    /// the note and the text's offsets have changed, so all of it is.
+    dropped: usize,
+    committed: usize,
+    committed_lines: usize,
+    /// An escape came before `committed`, so the text after it starts in
+    /// the style a reset leaves.
+    reset: bool,
+    lines: Vec<Line<'static>>,
 }
 
 impl FullOutput {
-    pub(super) fn push(&mut self, text: &str) {
+    /// Appends `text`, returning how many more bytes are kept now (fewer
+    /// when the cap cut the oldest away).
+    pub(super) fn push(&mut self, text: &str) -> isize {
         if text.is_empty() {
-            return;
+            return 0;
         }
+        let before = self.text.len();
         self.text.push_str(text);
         if self.text.len() > FULL_OUTPUT_LIMIT {
             // Cut well under the cap, so a stream that keeps going past it
@@ -76,7 +91,7 @@ impl FullOutput {
             self.text.drain(..cut);
             self.dropped += cut;
         }
-        self.revision += 1;
+        byte_delta(before, self.text.len())
     }
 
     pub(super) fn text(&self) -> &str {
@@ -87,48 +102,120 @@ impl FullOutput {
         self.dropped
     }
 
-    /// Gives up the whole kept text, counting it as not kept.
-    pub(super) fn evict(&mut self) {
-        if self.text.is_empty() {
-            return;
+    /// Gives up the whole kept text, counting it as not kept, and returns
+    /// the bytes given up.
+    fn evict(&mut self) -> usize {
+        let freed = self.text.len();
+        if freed == 0 {
+            return 0;
         }
-        self.dropped += self.text.len();
+        self.dropped += freed;
         self.text = String::new();
-        self.cache = LineCache::default();
-        self.revision += 1;
+        self.wrapped = None;
+        freed
     }
 
     /// Frees the laid-out lines; the next read lays them out again.
     pub(super) fn release_cache(&mut self) {
-        self.cache = LineCache::default();
+        self.wrapped = None;
     }
 
     /// The kept text as dim lines broken at `width`, led by a line saying
     /// how much was not kept when the cap dropped any.
     pub(super) fn lines(&mut self, width: u16) -> &[Line<'static>] {
-        if self.laid_out != self.revision {
-            self.cache = LineCache::default();
-            self.laid_out = self.revision;
+        let dropped = self.dropped;
+        if self
+            .wrapped
+            .as_ref()
+            .is_some_and(|wrapped| wrapped.width != width || wrapped.dropped != dropped)
+        {
+            self.wrapped = None;
         }
-        let Self {
-            text,
-            dropped,
-            cache,
-            ..
-        } = self;
-        cache.get(width, || {
-            let mut lines = Vec::new();
-            if *dropped > 0 {
-                lines.push(Line::from(format!(
-                    "[... {dropped} earlier bytes not kept]"
-                )));
+        let wrapped = self.wrapped.get_or_insert_with(|| {
+            let lines = if dropped > 0 {
+                dim_wrapped(
+                    vec![Line::from(format!(
+                        "[... {dropped} earlier bytes not kept]"
+                    ))],
+                    width,
+                )
+            } else {
+                Vec::new()
+            };
+            WrappedOutput {
+                width,
+                dropped,
+                committed: 0,
+                committed_lines: lines.len(),
+                reset: false,
+                lines,
             }
-            if !text.is_empty() {
-                lines.extend(render::preformatted_lines(text));
-            }
-            dim_wrapped(lines, width)
-        })
+        });
+        wrapped.lines.truncate(wrapped.committed_lines);
+        let fresh = &self.text[wrapped.committed..];
+        let (settled, styled) = settled_prefix(fresh);
+        if settled > 0 {
+            wrapped.lines.extend(dim_wrapped(
+                output_segment_lines(&fresh[..settled], wrapped.reset),
+                width,
+            ));
+            wrapped.committed += settled;
+            wrapped.committed_lines = wrapped.lines.len();
+            wrapped.reset |= styled;
+        }
+        wrapped.lines.extend(dim_wrapped(
+            output_segment_lines(&self.text[wrapped.committed..], wrapped.reset),
+            width,
+        ));
+        &wrapped.lines
     }
+}
+
+/// The length of the longest prefix of `text` that ends a line with text
+/// on it while no colour is left open, and whether an escape (a reset,
+/// then) came before that end. Laid out apart from the rest, that prefix
+/// gives the same lines as it does inside the whole: it ends on a line
+/// with text, so no blank line is trimmed off its end, and the rest
+/// starts in the style the whole would carry over to it.
+fn settled_prefix(text: &str) -> (usize, bool) {
+    let bytes = text.as_bytes();
+    let mut plain = true;
+    let mut styled = false;
+    let mut settled = (0, false);
+    for (at, &byte) in bytes.iter().enumerate() {
+        match byte {
+            0x1b => {
+                let rest = &bytes[at..];
+                plain = rest.starts_with(b"\x1b[0m") || rest.starts_with(b"\x1b[m");
+                styled = true;
+            }
+            b'\n' if plain && at > 0 && !matches!(bytes[at - 1], b'\n' | b'\r') => {
+                settled = (at + 1, styled);
+            }
+            _ => {}
+        }
+    }
+    settled
+}
+
+/// The lines of a piece of output that starts in the style a reset left
+/// when `reset`, plain style otherwise: once an escape has been read the
+/// parser carries the reset style rather than none, and a piece laid out
+/// on its own has to start from the same.
+fn output_segment_lines(segment: &str, reset: bool) -> Vec<Line<'static>> {
+    let trimmed = segment.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        Vec::new()
+    } else if reset {
+        render::preformatted_lines(&format!("\x1b[0m{trimmed}"))
+    } else {
+        render::preformatted_lines(trimmed)
+    }
+}
+
+fn byte_delta(before: usize, after: usize) -> isize {
+    let signed = |bytes: usize| isize::try_from(bytes).unwrap_or(isize::MAX);
+    signed(after) - signed(before)
 }
 
 impl Clone for FullOutput {
@@ -136,9 +223,7 @@ impl Clone for FullOutput {
         Self {
             text: self.text.clone(),
             dropped: self.dropped,
-            cache: LineCache::default(),
-            revision: 0,
-            laid_out: 0,
+            wrapped: None,
         }
     }
 }
@@ -157,24 +242,6 @@ impl fmt::Debug for FullOutput {
             .field("bytes", &self.text.len())
             .field("dropped", &self.dropped)
             .finish()
-    }
-}
-
-/// Gives up the whole output of the oldest calls until what all the
-/// calls keep fits in `budget` bytes; each one given up says so in the
-/// pager.
-pub(super) fn enforce_full_output_budget(cells: &mut [Cell], budget: usize) {
-    let mut kept: usize = cells
-        .iter_mut()
-        .flat_map(Cell::full_outputs)
-        .map(|full| full.text.len())
-        .sum();
-    for full in cells.iter_mut().flat_map(Cell::full_outputs) {
-        if kept <= budget {
-            return;
-        }
-        kept -= full.text.len();
-        full.evict();
     }
 }
 
@@ -300,12 +367,14 @@ pub(super) enum Cell {
         cache: LineCache,
     },
     /// Dim lines: tool output that belongs to no tool row, such as a
-    /// background job still writing after its turn ended.
+    /// background job still writing after its turn ended. The cell keeps
+    /// a tail like a tool row does; `full` is everything, for the pager.
     Text {
         call_id: Option<String>,
         lines: Vec<String>,
         open_line: bool,
         pending: Vec<u8>,
+        full: FullOutput,
     },
     /// A tool call: a one-line `name(args)` header, then the narration
     /// line and the tail of its output while it runs or when opened. A
@@ -548,15 +617,50 @@ impl Cell {
         }
     }
 
+    /// Whether `output_for(call_id)` finds somewhere in this cell.
+    pub(super) fn takes_output_of(&self, call_id: &str) -> bool {
+        match self {
+            Cell::Tool { call_id: id, .. } => id == call_id,
+            Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
+                calls.iter().any(|call| call.call_id == call_id)
+            }
+            _ => false,
+        }
+    }
+
     /// Every whole-output buffer the cell holds, oldest call first.
     fn full_outputs(&mut self) -> Vec<&mut FullOutput> {
         match self {
-            Cell::Tool { full, .. } => vec![full],
+            Cell::Tool { full, .. } | Cell::Text { full, .. } => vec![full],
             Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
                 calls.iter_mut().map(|call| &mut call.full).collect()
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The bytes every whole-output buffer of the cell keeps.
+    pub(super) fn full_output_bytes(&self) -> usize {
+        match self {
+            Cell::Tool { full, .. } | Cell::Text { full, .. } => full.text.len(),
+            Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
+                calls.iter().map(|call| call.full.text.len()).sum()
+            }
+            _ => 0,
+        }
+    }
+
+    /// Gives up whole outputs, oldest call first, until at least `excess`
+    /// bytes are freed or none is left; returns the bytes freed.
+    pub(super) fn evict_full_outputs(&mut self, excess: usize) -> usize {
+        let mut freed = 0;
+        for full in self.full_outputs() {
+            if freed >= excess {
+                break;
+            }
+            freed += full.evict();
+        }
+        freed
     }
 
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
@@ -683,9 +787,13 @@ impl Cell {
     }
 
     /// The cell as the pager shows it: a tool, job or agent row open,
-    /// with everything its calls printed rather than the inline tail.
-    /// Every other cell reads as it does in the transcript.
+    /// with everything its calls printed rather than the inline tail, and
+    /// all of a stray call's output. Every other cell reads as it does in
+    /// the transcript.
     pub(super) fn full_lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
+        if let Cell::Text { full, .. } = self {
+            return full.lines(width).to_vec();
+        }
         let Some(header) = self.summary_line() else {
             return self.lines(width, renderer);
         };
@@ -1128,29 +1236,68 @@ mod tests {
         assert_eq!(small.lines(80)[0].to_string(), "a");
     }
 
-    /// Over the budget the oldest calls give up their whole output first,
-    /// and the row of each one says how much went; the newest keep theirs.
+    /// A row gives up its calls' whole output oldest first, only as much
+    /// as was asked for, and each call given up says how much went.
     #[test]
-    fn the_budget_over_all_calls_drops_the_oldest_whole_output_first() {
-        let mut cells: Vec<Cell> = (1..=3)
-            .map(|n| {
-                let id = format!("c{n}");
-                let mut cell = Cell::tool(id.clone(), format!("Call t{n} {{}}"), Instant::now());
-                let (_, full) = cell.output_for(&id).unwrap();
-                full.push(&format!("call {n} out\n"));
-                cell
-            })
+    fn a_row_gives_up_its_oldest_calls_whole_output_first() {
+        let mut calls: Vec<FoldedCall> = (1..=3)
+            .map(|n| FoldedCall::new(format!("c{n}"), "job__check".to_string()))
             .collect();
+        for (n, call) in calls.iter_mut().enumerate() {
+            call.full.push(&format!("call {} out\n", n + 1));
+        }
+        let mut cell = Cell::Job {
+            job_id: "job_0a1b2c3d".to_string(),
+            tool: "execute_command".to_string(),
+            status: JobStatus::Running,
+            calls,
+            expanded: false,
+        };
         let each = "call 1 out\n".len();
-        enforce_full_output_budget(&mut cells, 3 * each);
-        let kept = |cell: &mut Cell| cell.full_outputs()[0].text().to_string();
-        assert_eq!(kept(&mut cells[0]), "call 1 out\n");
-        enforce_full_output_budget(&mut cells, 2 * each - 1);
-        assert_eq!(kept(&mut cells[0]), "");
-        assert_eq!(kept(&mut cells[1]), "");
-        assert_eq!(kept(&mut cells[2]), "call 3 out\n");
-        let note = cells[0].full_outputs()[0].lines(80)[0].to_string();
+        assert_eq!(cell.full_output_bytes(), 3 * each);
+        assert_eq!(cell.evict_full_outputs(each + 1), 2 * each);
+        assert_eq!(cell.full_output_bytes(), each);
+        let mut fulls = cell.full_outputs();
+        assert_eq!(fulls[2].text(), "call 3 out\n");
+        let note = fulls[0].lines(80)[0].to_string();
         assert_eq!(note, format!("[... {each} earlier bytes not kept]"));
+    }
+
+    /// Text pushed in pieces lays out to the same lines as the whole text
+    /// laid out at once, however the pieces cut its lines, blank lines
+    /// and colours; the lines before the last whole one are not redone.
+    #[test]
+    fn the_full_output_appends_new_lines_to_what_it_laid_out() {
+        let pieces = [
+            "one\n",
+            "\n",
+            "\n",
+            "two",
+            " still two\n",
+            "\x1b[31mred\n",
+            "still red\x1b[0m\n",
+            "crlf\r\n",
+            "after\n\n",
+            "x".repeat(200).as_str(),
+            "\n",
+            "last",
+        ]
+        .map(str::to_string);
+        let mut full = FullOutput::default();
+        for piece in &pieces {
+            full.push(piece);
+            let incremental = full.lines(40).to_vec();
+            let whole = dim_wrapped(render::preformatted_lines(full.text()), 40);
+            assert_eq!(incremental, whole, "after {piece:?}");
+        }
+        let committed = full.wrapped.as_ref().unwrap().committed;
+        assert!(
+            full.text()[..committed].ends_with('\n') && committed > "one\n".len(),
+            "nothing was kept laid out: {committed}"
+        );
+        let freed = full.evict();
+        assert_eq!(freed, pieces.concat().len());
+        assert_eq!(full.lines(40).len(), 1, "the note alone");
     }
 
     /// The whole output's lines are laid out once per width and change;

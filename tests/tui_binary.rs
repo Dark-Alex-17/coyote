@@ -1380,7 +1380,9 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
             ]
             .iter()
             .any(|prefix| line.starts_with(prefix))
-                || line.contains("panicked")
+                || ["panicked", "No such file", "cannot", "could not"]
+                    .iter()
+                    .any(|word| line.contains(word))
                 || [" WARN ", " ERROR ", " INFO ", " DEBUG "]
                     .iter()
                     .any(|level| line.contains(level))

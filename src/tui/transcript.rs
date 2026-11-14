@@ -52,9 +52,15 @@ pub(super) struct Transcript {
     reveal_focus: bool,
     last_layout: Vec<RowSpan>,
     last_area: Rect,
-    /// Goes up whenever a cell may have changed, so a layout of every
-    /// cell (the pager's) is redone only then.
+    /// Goes up at every change to the cells, so a layout of all of them
+    /// (the pager's) is looked at again only then.
     generation: u64,
+    /// The generation each cell last changed at, by index. No two changes
+    /// share one, so a cell laid out at some revision is known to read
+    /// the same while it keeps it, wherever it has moved to.
+    revisions: Vec<u64>,
+    /// The bytes every call's whole output in the cells keeps.
+    full_output_bytes: usize,
 }
 
 impl Transcript {
@@ -71,7 +77,9 @@ impl Transcript {
             reveal_focus: false,
             last_layout: Vec::new(),
             last_area: Rect::ZERO,
-            generation: 0,
+            generation: 1,
+            revisions: vec![1],
+            full_output_bytes: 0,
         }
     }
 
@@ -83,16 +91,25 @@ impl Transcript {
         self.generation
     }
 
-    /// The cells to change, counted as changed.
-    fn edit(&mut self) -> &mut Vec<Cell> {
+    fn next_revision(&mut self) -> u64 {
         self.generation += 1;
-        &mut self.cells
+        self.generation
     }
 
-    /// The cells for laying out: what they show is left as it is and
-    /// only the line caches inside them fill, so the generation stays.
-    pub(super) fn cells_for_layout(&mut self) -> &mut [Cell] {
-        &mut self.cells
+    /// Cell `index` to change, counted as changed.
+    fn touch(&mut self, index: usize) -> Option<&mut Cell> {
+        if index >= self.cells.len() {
+            return None;
+        }
+        self.revisions[index] = self.next_revision();
+        self.cells.get_mut(index)
+    }
+
+    /// The cells for laying out, with the revision of each: what they
+    /// show is left as it is and only the line caches inside them fill,
+    /// so nothing counts as changed.
+    pub(super) fn cells_for_layout(&mut self) -> (&mut [Cell], &[u64]) {
+        (&mut self.cells, &self.revisions)
     }
 
     pub(super) fn len(&self) -> usize {
@@ -100,15 +117,34 @@ impl Transcript {
     }
 
     pub(super) fn cell_mut(&mut self, index: usize) -> Option<&mut Cell> {
-        self.edit().get_mut(index)
-    }
-
-    pub(super) fn cells_mut(&mut self) -> &mut [Cell] {
-        self.edit()
+        self.touch(index)
     }
 
     pub(super) fn last_mut(&mut self) -> Option<&mut Cell> {
-        self.edit().last_mut()
+        self.touch(self.cells.len().checked_sub(1)?)
+    }
+
+    /// Counts `delta` more bytes kept by the whole output of a call in
+    /// some cell, then gives up the oldest calls' whole output until the
+    /// total fits `budget`. Only a cell that gave something up changes.
+    pub(super) fn account_full_output(&mut self, delta: isize, budget: usize) {
+        self.full_output_bytes = self.full_output_bytes.saturating_add_signed(delta);
+        if self.full_output_bytes <= budget {
+            return;
+        }
+        for index in 0..self.cells.len() {
+            let excess = self.full_output_bytes.saturating_sub(budget);
+            if excess == 0 {
+                break;
+            }
+            if self.cells[index].full_output_bytes() == 0 {
+                continue;
+            }
+            let freed = self
+                .touch(index)
+                .map_or(0, |cell| cell.evict_full_outputs(excess));
+            self.full_output_bytes -= freed;
+        }
     }
 
     /// Appends a cell. The greeting gives way to the first real entry,
@@ -118,7 +154,10 @@ impl Transcript {
         if self.offset_from_bottom > 0 {
             self.unseen += 1;
         }
-        self.edit().push(cell);
+        self.full_output_bytes += cell.full_output_bytes();
+        let revision = self.next_revision();
+        self.revisions.push(revision);
+        self.cells.push(cell);
     }
 
     /// Appends the cell a reply streams into and remembers where it is.
@@ -129,24 +168,36 @@ impl Transcript {
 
     pub(super) fn stream_cell_mut(&mut self) -> Option<&mut Cell> {
         let stream = self.stream?;
-        self.edit().get_mut(stream)
+        self.touch(stream)
     }
 
     /// Forgets the streaming cell and hands it over to be finalised.
     pub(super) fn close_stream(&mut self) -> Option<&mut Cell> {
         let stream = self.stream.take()?;
-        self.edit().get_mut(stream)
+        self.touch(stream)
     }
 
     /// Puts `cell` where another was; the row keeps its place and its
-    /// focus.
+    /// focus. Whole output the caller moves from the old cell into the
+    /// new one afterwards is counted again with `account_full_output`.
     pub(super) fn replace(&mut self, index: usize, cell: Cell) -> Cell {
-        std::mem::replace(&mut self.edit()[index], cell)
+        self.full_output_bytes += cell.full_output_bytes();
+        self.revisions[index] = self.next_revision();
+        let old = std::mem::replace(&mut self.cells[index], cell);
+        self.full_output_bytes = self
+            .full_output_bytes
+            .saturating_sub(old.full_output_bytes());
+        old
     }
 
     pub(super) fn remove(&mut self, index: usize) -> Cell {
         let unseen_from = self.cells.len().saturating_sub(self.unseen);
-        let removed = self.edit().remove(index);
+        self.next_revision();
+        self.revisions.remove(index);
+        let removed = self.cells.remove(index);
+        self.full_output_bytes = self
+            .full_output_bytes
+            .saturating_sub(removed.full_output_bytes());
         if index >= unseen_from {
             self.unseen -= 1;
         }
@@ -164,7 +215,16 @@ impl Transcript {
         self.unseen = self
             .unseen
             .saturating_sub(self.cells.len().saturating_sub(len));
-        self.edit().truncate(len);
+        let cut: usize = self
+            .cells
+            .iter()
+            .skip(len)
+            .map(Cell::full_output_bytes)
+            .sum();
+        self.full_output_bytes = self.full_output_bytes.saturating_sub(cut);
+        self.next_revision();
+        self.cells.truncate(len);
+        self.revisions.truncate(len);
         if self.focus.is_some_and(|focus| focus >= len) {
             self.focus = None;
         }
@@ -174,6 +234,8 @@ impl Transcript {
         if self.cells.is_empty() {
             self.cells
                 .push(Cell::welcome(self.model.clone(), self.prefix));
+            let revision = self.next_revision();
+            self.revisions.push(revision);
         }
     }
 
@@ -261,7 +323,7 @@ impl Transcript {
 
     pub(super) fn toggle_focused(&mut self) {
         if let Some(focus) = self.focus
-            && let Some(cell) = self.edit().get_mut(focus)
+            && let Some(cell) = self.touch(focus)
         {
             cell.toggle();
         }
@@ -286,12 +348,11 @@ impl Transcript {
         else {
             return;
         };
-        self.generation += 1;
-        if let Some(cell) = self.cells.get_mut(index)
-            && cell.collapsible()
+        if self.cells.get(index).is_some_and(Cell::collapsible)
+            && let Some(cell) = self.touch(index)
         {
-            self.focus = Some(index);
             cell.toggle();
+            self.focus = Some(index);
         }
     }
 
@@ -455,6 +516,61 @@ mod tests {
 
     fn area(height: u16) -> Rect {
         Rect::new(0, 0, 40, height)
+    }
+
+    /// A tool row whose whole output holds `text`, counted as pushed.
+    fn tool_with_output(transcript: &mut Transcript, call_id: &str, text: &str) {
+        transcript.push(tool(call_id));
+        let index = transcript.len() - 1;
+        let (_, full) = transcript
+            .cell_mut(index)
+            .unwrap()
+            .output_for(call_id)
+            .unwrap();
+        let grew = full.push(text);
+        transcript.account_full_output(grew, usize::MAX);
+    }
+
+    /// Output under the budget changes no cell; over it, the oldest calls
+    /// give up their whole output and only their cells count as changed.
+    #[test]
+    fn the_budget_gives_up_the_oldest_output_and_changes_nothing_else() {
+        let (mut transcript, mut renderer) = transcript();
+        for n in 1..=3 {
+            tool_with_output(
+                &mut transcript,
+                &format!("c{n}"),
+                &format!("call {n} out\n"),
+            );
+        }
+        let each = "call 1 out\n".len();
+        let generation = transcript.generation();
+        transcript.account_full_output(0, 3 * each);
+        assert_eq!(
+            transcript.generation(),
+            generation,
+            "a budget pass that gave nothing up counted as a change"
+        );
+        let revisions = transcript.revisions.clone();
+        transcript.account_full_output(0, 2 * each - 1);
+        assert_eq!(transcript.full_output_bytes, each);
+        let kept: Vec<usize> = transcript
+            .cells()
+            .iter()
+            .map(Cell::full_output_bytes)
+            .collect();
+        assert_eq!(kept, [0, 0, each]);
+        assert_ne!(transcript.revisions[0], revisions[0]);
+        assert_ne!(transcript.revisions[1], revisions[1]);
+        assert_eq!(transcript.revisions[2], revisions[2]);
+        let note = transcript.cells_for_layout().0[0].full_lines(80, &mut renderer);
+        assert!(
+            note.iter()
+                .any(|line| line.to_string() == format!("[... {each} earlier bytes not kept]")),
+            "{note:?}"
+        );
+        transcript.remove(2);
+        assert_eq!(transcript.full_output_bytes, 0);
     }
 
     /// Ctrl+Up from nothing takes the last row that opens; Ctrl+Down the
@@ -731,8 +847,16 @@ mod tests {
         // its first row, a blank, then the tool row.
         transcript.click(5, 2);
         assert_eq!(transcript.focus, None);
+        let generation = transcript.generation();
+        transcript.click(5, 2);
+        assert_eq!(
+            transcript.generation(),
+            generation,
+            "a click that changed nothing counted as a change"
+        );
         transcript.click(5, 2 + 2);
         assert_eq!(transcript.focus, Some(1));
+        assert_ne!(transcript.generation(), generation);
         assert!(matches!(
             transcript.cells()[1],
             Cell::Tool { expanded: true, .. }

@@ -974,12 +974,29 @@ enum ControlRequest {
     Cancel {
         id: String,
         kind: TaskKind,
+        /// The child session root the UI holds, which a turn that spawned
+        /// its first child reported after the control context was taken.
+        child_root: Option<Arc<ChildSessionRoot>>,
     },
     LoadChild {
         session_id: String,
         file: PathBuf,
         generation: u64,
     },
+}
+
+/// The fork of the control context a roster cancel runs on: it carries
+/// the child session root the UI holds, so cancelling a child the running
+/// turn spawned finishes that child's record under the right root.
+fn cancel_context(
+    control: &RequestContext,
+    child_root: Option<Arc<ChildSessionRoot>>,
+) -> RequestContext {
+    let mut ctx = control.fork_for_branch();
+    if child_root.is_some() {
+        ctx.child_session_root = child_root;
+    }
+    ctx
 }
 
 /// Runs `request` off the loop on a fork of the control context.
@@ -989,8 +1006,12 @@ fn spawn_control_request(
     tx: UnboundedSender<UiMsg>,
 ) {
     match request {
-        ControlRequest::Cancel { id, kind } => {
-            let mut ctx = control.fork_for_branch();
+        ControlRequest::Cancel {
+            id,
+            kind,
+            child_root,
+        } => {
+            let mut ctx = cancel_context(&control, child_root);
             tokio::spawn(async move {
                 let args = serde_json::json!({ "id": id });
                 let result = match kind {
@@ -1028,9 +1049,16 @@ fn spawn_control_request(
 }
 
 /// A session id that can name a file under the child session root and
-/// nowhere else.
+/// nowhere else: letters, digits, `_`, `.` and `-` only, never `..`, and
+/// one plain path component on every platform (so not `C:x` either).
 fn is_plain_session_id(session_id: &str) -> bool {
-    !session_id.is_empty() && !session_id.contains(['/', '\\', '\0']) && !session_id.contains("..")
+    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
+    let mut components = Path::new(session_id).components();
+    !session_id.is_empty()
+        && session_id.chars().all(allowed)
+        && !session_id.contains("..")
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// The kind of question an escalated `question` asks, from the `[kind] `
@@ -1447,8 +1475,16 @@ impl App {
     /// background.
     fn fail_unreported_tools(&mut self, first_cell: usize) {
         let now = self.clock.now();
-        for cell in self.transcript.cells_mut().iter_mut().skip(first_cell) {
-            if let Cell::Tool { status, .. } = cell
+        for index in first_cell..self.transcript.len() {
+            let running = matches!(
+                self.transcript.cells()[index],
+                Cell::Tool {
+                    status: ToolStatus::Running { .. },
+                    ..
+                }
+            );
+            if running
+                && let Some(Cell::Tool { status, .. }) = self.transcript.cell_mut(index)
                 && let ToolStatus::Running { since } = *status
             {
                 *status = ToolStatus::Failed {
@@ -2086,7 +2122,7 @@ impl App {
     /// Closes the pager and frees the lines it laid out.
     fn close_pager(&mut self) {
         if self.pager.take().is_some() {
-            cells::release_full_output_caches(self.transcript.cells_for_layout());
+            cells::release_full_output_caches(self.transcript.cells_for_layout().0);
         }
     }
 
@@ -2120,6 +2156,7 @@ impl App {
             self.queue_control(ControlRequest::Cancel {
                 id: task.id,
                 kind: task.kind,
+                child_root: self.child_root.clone(),
             });
         }
     }
@@ -2620,6 +2657,7 @@ impl App {
                 else {
                     unreachable!("the index was found holding a tool row");
                 };
+                let moved = full.text().len();
                 if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) =
                     self.transcript.cell_mut(index)
                 {
@@ -2631,6 +2669,10 @@ impl App {
                         pending,
                         full,
                     });
+                    self.transcript.account_full_output(
+                        isize::try_from(moved).unwrap_or(isize::MAX),
+                        FULL_OUTPUT_BUDGET,
+                    );
                 }
             }
             _ => self.transcript.push(row),
@@ -2638,32 +2680,29 @@ impl App {
     }
 
     fn set_job_status(&mut self, job_id: &str, status: JobStatus) {
-        for cell in self.transcript.cells_mut().iter_mut().rev() {
-            if let Cell::Job {
-                job_id: id,
-                status: current,
-                ..
-            } = cell
-                && id == job_id
-            {
-                *current = status;
-                return;
-            }
+        let row = self
+            .transcript
+            .cells()
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::Job { job_id: id, .. } if id == job_id));
+        if let Some(Cell::Job {
+            status: current, ..
+        }) = row.and_then(|row| self.transcript.cell_mut(row))
+        {
+            *current = status;
         }
     }
 
     fn set_agent_status(&mut self, agent_id: &str, status: AgentStatus) {
-        for cell in self.transcript.cells_mut().iter_mut().rev() {
-            if let Cell::Agent {
-                agent_id: id,
-                status: current,
-                ..
-            } = cell
-                && id == agent_id
-            {
-                *current = status;
-                return;
-            }
+        let row =
+            self.transcript.cells().iter().rposition(
+                |cell| matches!(cell, Cell::Agent { agent_id: id, .. } if id == agent_id),
+            );
+        if let Some(Cell::Agent {
+            status: current, ..
+        }) = row.and_then(|row| self.transcript.cell_mut(row))
+        {
+            *current = status;
         }
     }
 
@@ -2751,8 +2790,9 @@ impl App {
             None => None,
         };
         if let Some((target, full)) = target {
-            full.push(&append_output(target, bytes));
-            cells::enforce_full_output_budget(self.transcript.cells_mut(), FULL_OUTPUT_BUDGET);
+            let grew = full.push(&append_output(target, bytes));
+            self.transcript
+                .account_full_output(grew, FULL_OUTPUT_BUDGET);
             return;
         }
         // Inside a turn the output never merges into a cell from before
@@ -2771,18 +2811,22 @@ impl App {
                 lines: Vec::new(),
                 open_line: false,
                 pending: Vec::new(),
+                full: FullOutput::default(),
             });
         }
         let Some(Cell::Text {
             lines,
             open_line,
             pending,
+            full,
             ..
         }) = self.transcript.last_mut()
         else {
             return;
         };
-        append_output((lines, open_line, pending), bytes);
+        let grew = full.push(&append_output((lines, open_line, pending), bytes));
+        self.transcript
+            .account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
     /// The output lines of the call `call_id`: a tool row's own, within
@@ -2793,15 +2837,18 @@ impl App {
         first_cell: usize,
         call_id: &str,
     ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
-        self.transcript
-            .cells_mut()
-            .iter_mut()
+        let index = self
+            .transcript
+            .cells()
+            .iter()
             .enumerate()
             .rev()
             .filter(|(index, cell)| {
                 *index >= first_cell || matches!(cell, Cell::Job { .. } | Cell::Agent { .. })
             })
-            .find_map(|(_, cell)| cell.output_for(call_id))
+            .find(|(_, cell)| cell.takes_output_of(call_id))?
+            .0;
+        self.transcript.cell_mut(index)?.output_for(call_id)
     }
 
     /// The output lines of a call without an id, within this turn: the
@@ -2938,12 +2985,8 @@ impl App {
         self.frame_area = Some(area);
         if let Some(pager) = self.pager.as_mut() {
             let generation = self.transcript.generation();
-            let text = pager.text(
-                self.transcript.cells_for_layout(),
-                generation,
-                area.width,
-                &mut self.renderer,
-            );
+            let (cells, revisions) = self.transcript.cells_for_layout();
+            let text = pager.text(cells, revisions, generation, area.width, &mut self.renderer);
             pager.settle(&text, Pager::text_rows(area.height));
             frame.render_widget(PagerView { pager, text: &text }, area);
             return;
@@ -10374,6 +10417,28 @@ mod tests {
         assert_eq!(harness.app.composer.text(), "");
     }
 
+    /// Output of a call no row is waiting for (a background job still
+    /// writing after its turn) keeps a tail in its cell, and the pager
+    /// shows all of it.
+    #[test]
+    fn the_pager_shows_a_stray_calls_whole_output() {
+        let mut harness = Harness::standalone(80, 60);
+        let output: String = (1..=30).map(|n| format!("noise {n:02}\n")).collect();
+        harness.app.handle_msg(UiMsg::ToolOutput {
+            call_id: Some("job-call".to_string()),
+            bytes: output.into_bytes(),
+        });
+        let inline = harness.draw();
+        assert!(inline.contains("noise 30"), "{inline}");
+        assert!(!inline.contains("noise 01"), "{inline}");
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Char('g'));
+        let frame = harness.draw();
+        for n in [1, 10, 30] {
+            assert!(frame.contains(&format!("noise {n:02}")), "{frame}");
+        }
+    }
+
     /// A question arriving while the pager is open closes the pager: it
     /// must never wait out of sight.
     #[test]
@@ -10532,6 +10597,39 @@ mod tests {
             let frame = harness.draw();
             assert!(frame.contains("Cancelled job-x7x"), "{frame}");
             assert!(frame.contains("Cancelled agent 'reviewer'"), "{frame}");
+        });
+    }
+
+    /// A cancel from the roster runs with the child session root the
+    /// turn reported after the control context was taken.
+    #[test]
+    #[serial]
+    fn a_roster_cancel_runs_with_the_child_root_the_turn_reported() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-roster-cancel-root");
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            tasks.write().register(running_job("job_0a1b2c3d")).unwrap();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness.app.begin_turn("work on", false);
+            let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 11 });
+            harness.app.child_root = Some(Arc::clone(&root));
+
+            harness.press(KeyCode::F(3));
+            harness.draw();
+            harness.press(KeyCode::Char('x'));
+            let requests = harness.app.take_control_requests();
+            let [ControlRequest::Cancel { child_root, .. }] = requests.as_slice() else {
+                panic!("{requests:?}");
+            };
+            assert_eq!(child_root.as_deref(), Some(&*root));
+            let control = harness.app.control.clone().expect("a control context");
+            assert!(control.child_session_root.is_none());
+            let fork = cancel_context(&control, child_root.clone());
+            assert_eq!(fork.child_session_root.as_deref(), Some(&*root));
+            assert!(cancel_context(&control, None).child_session_root.is_none());
         });
     }
 
@@ -10858,10 +10956,24 @@ mod tests {
     /// the roster or from a flush.
     #[test]
     fn a_session_id_with_a_path_in_it_is_refused() {
-        for id in ["../etc", "a/b", "a\\b", "nul\0", ""] {
+        for id in [
+            "../etc",
+            "a/b",
+            "a\\b",
+            "nul\0",
+            "",
+            "..",
+            ".",
+            "C:x",
+            "a b",
+            "id\n",
+            "caf\u{e9}",
+        ] {
             assert!(!is_plain_session_id(id), "{id:?}");
         }
-        assert!(is_plain_session_id("reviewer-x7x"));
+        for id in ["reviewer-x7x", "ok_id-1.x", "reviewer_20260102_0a1b2c3d"] {
+            assert!(is_plain_session_id(id), "{id:?}");
+        }
         let mut ctx = chat_ctx();
         ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 11 }));
         let mut harness = Harness::for_ctx(&ctx);

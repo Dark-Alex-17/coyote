@@ -15011,21 +15011,25 @@ mod tests {
         assert!(!ctx.session.as_ref().unwrap().dirty());
     }
 
-    fn flushed_session_ids(recording: &crate::events::RecordingSink) -> Vec<String> {
+    fn flushed_sessions(
+        recording: &crate::events::RecordingSink,
+    ) -> Vec<(String, Option<Arc<ChildSessionRoot>>)> {
         recording
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::ChildTranscriptFlushed { session_id, .. }
+                Event::ChildTranscriptFlushed { session_id, root }
                     if session_id == "flush-probe-x7x" =>
                 {
-                    Some(session_id)
+                    Some((session_id, root))
                 }
                 _ => None,
             })
             .collect()
     }
 
+    /// The flush names the child's session and the root its file lives
+    /// under, so the UI can find the file without asking the child.
     #[test]
     #[serial]
     fn checkpoint_publishes_child_transcript_flushed_for_a_child_context() {
@@ -15033,13 +15037,15 @@ mod tests {
         let (mut ctx, _path) = loaded_session_ctx("flush-probe-x7x");
         ctx.session.as_mut().unwrap().set_save_session(Some(true));
         ctx.self_agent_id = Some("agent-flush-x7x".into());
+        let root = Arc::new(ChildSessionRoot::Proc { pid: 7, start: 77 });
+        ctx.child_session_root = Some(Arc::clone(&root));
         let recording = crate::events::RecordingSink::install();
 
         complete_turn(&mut ctx, "hello", "reply");
 
         assert_eq!(
-            flushed_session_ids(&recording),
-            vec!["flush-probe-x7x".to_string()]
+            flushed_sessions(&recording),
+            vec![("flush-probe-x7x".to_string(), Some(root))]
         );
     }
 
@@ -15054,7 +15060,7 @@ mod tests {
 
         complete_turn(&mut ctx, "hello", "reply");
 
-        assert!(flushed_session_ids(&recording).is_empty());
+        assert!(flushed_sessions(&recording).is_empty());
     }
 
     fn graph_run(prompt: &str, output: &str) -> LastRun {

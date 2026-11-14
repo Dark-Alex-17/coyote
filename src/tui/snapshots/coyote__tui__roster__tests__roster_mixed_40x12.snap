@@ -3,8 +3,8 @@ source: src/tui/roster.rs
 expression: terminal.backend().to_string()
 ---
 "Tasks  j/k = move  x = cancel  o = open "
-"agent reviewer         agent-1  running "
-"job   execute_command  job-2    failed  "
+"agent reviewer         agent_reviewer_1a"
+"job   execute_command  job_5e6f7a8b     "
 "ask   reviewer         Ship the fix to m"
 "                                        "
 "                                        "
