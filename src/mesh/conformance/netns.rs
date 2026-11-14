@@ -675,7 +675,7 @@ async fn two_nodes_in_separate_namespaces_reach_each_other_through_the_relay() {
     assert!(
         error.contains(&format!(
             "display_name: Some({:?})",
-            format!("{} / {}", &b.identity_hash[..8], &b.destination_hash[..8])
+            format!("{} / {}", b.identity_hash[..8], b.destination_hash[..8])
         )),
         "{refused}"
     );

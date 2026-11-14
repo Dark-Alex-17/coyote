@@ -404,8 +404,8 @@ pub(crate) mod network {
     fn unnamed_who(identity: &str, destination: &str) -> String {
         format!(
             "{} / {}",
-            &identity[..8].to_ascii_lowercase(),
-            &destination[..8].to_ascii_lowercase()
+            identity[..8].to_ascii_lowercase(),
+            destination[..8].to_ascii_lowercase()
         )
     }
 
