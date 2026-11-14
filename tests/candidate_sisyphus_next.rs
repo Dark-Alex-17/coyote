@@ -3109,11 +3109,13 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 /// The integer counters and indices `initial_state` seeds, all at zero; the
 /// round counters among them are what the `_lib.py` bounds are checked on.
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
+    "apply_reasks",
     "ci_fix_strikes",
     "ci_poll_fails",
     "ci_polls",
     "ci_polls_run",
     "ci_started_at",
+    "clarify_extensions",
     "clarify_rounds",
     "debris_reruns",
     "debt_rounds",
@@ -3133,6 +3135,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "reask_rounds",
     "rejected_rounds",
     "review_rounds",
+    "sizing_extensions",
     "sizing_rounds",
     "strikeout_rounds",
     "subtask_estimate",
@@ -3142,7 +3145,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 
 /// The bound constants in `scripts/_lib.py` the gates route on (the
 /// re-run-once family covers `debris_reruns`), as written in the baseline,
-/// plus the review-watch bounds.
+/// plus the review-watch bounds and the per-subtask extra fix-round ceiling.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CHOICE_OPTIONS_MAX", "4"),
     ("CHOICE_OPTIONS_MIN", "2"),
@@ -3154,6 +3157,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CLARIFY_MAX", "STRIKE_LIMIT"),
     ("DISCUSSION_PARKS_MAX", "3"),
     ("DRAFT_ROUNDS_MAX", "STRIKE_LIMIT"),
+    ("FIX_ROUND_CEILING", "STRIKE_LIMIT"),
     ("GH_CALL_SECS", "90"),
     ("GO_AHEAD_WORDS_MAX", "12"),
     ("OWNER_POLL_MAX", "2"),

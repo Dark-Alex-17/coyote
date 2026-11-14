@@ -174,7 +174,8 @@ check("assess_fault: fail-safe -> ambiguous with options", u["intent"] == "ambig
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "which module?", "options": [{"text": "a", "recommended": True, "evidence": "e"}]}], clarify_rounds=0))
 check("route_intent: ambiguous -> escalation clarify (round 1)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "clarify" and u["clarify_rounds"] == 1)
 u = gates.route_intent(base_state(intent="ambiguous", clarifying_questions=[{"question": "q"}], clarify_rounds=CLARIFY_MAX))
-check("route_intent: B1 clarify bound -> end_blocked", u["_next"] == "end_blocked")
+check("route_intent: B1 clarify bound -> clarify_cap escalation, never end_blocked",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "clarify_cap")
 STEP_REPO = os.path.join(TMP, "step-repo")
 os.makedirs(os.path.join(STEP_REPO, "plans", "steps"))
 u = gates.route_intent(base_state(intent="plan_execution", sizing="n/a", project_dir=STEP_REPO, brief="Execute step 2 of the plan at plans"))
@@ -365,7 +366,8 @@ def aa(kind, answer, **over):
 check("apply: clarify -> assess with Q/A", aa("clarify", "auth")["_next"] == "assess")
 check("apply: design_choice -> compose_brief", aa("design_choice", "A")["_next"] == "compose_brief")
 check("apply: oracle_fault retry (within once) -> consult", aa("oracle_fault", "Retry the consult", oracle_retries=0)["_next"] == "consult_oracle")
-check("apply: oracle_fault retry exhausted -> design_gate", aa("oracle_fault", "Retry the consult", oracle_retries=RERUN_ONCE)["_next"] == "design_gate")
+check("apply: oracle_fault explicit retry past the bound -> consult again (honoured)",
+      aa("oracle_fault", "Retry the consult", oracle_retries=RERUN_ONCE)["_next"] == "consult_oracle")
 check("apply: oracle_fault abort -> end_aborted", aa("oracle_fault", "Abort this task")["_next"] == "end_aborted")
 check("apply: coder_rejected -> compose_fix", aa("coder_rejected", "use cookies")["_next"] == "compose_fix")
 check("apply: engine_fault retry -> compose_fix", aa("engine_fault", "Retry the coder round")["_next"] == "compose_fix")
@@ -386,7 +388,8 @@ check("apply: review_incomplete accept -> skipped review recorded", u["_next"] =
 check("apply: review_incomplete abort -> end_aborted", aa("review_incomplete", "Abort this task")["_next"] == "end_aborted")
 u = aa("strikeout", "Apply the oracle's direction in ONE more coder round", strikeout_rounds=0)
 check("apply: strikeout one round -> compose_fix with strikes reset (B6)", u["_next"] == "compose_fix" and u["fix_strikes"] == 0 and u["strikeout_rounds"] == 1)
-check("apply: strikeout B6 exhausted -> end_aborted", aa("strikeout", "Apply the oracle's direction", strikeout_rounds=RERUN_ONCE)["_next"] == "end_aborted")
+check("apply: strikeout explicit round past RERUN_ONCE -> compose_fix (honoured)",
+      aa("strikeout", "Apply the oracle's direction", strikeout_rounds=RERUN_ONCE)["_next"] == "compose_fix")
 check("apply: lane_stuck accept -> proceed with follow-up", aa("lane_stuck", "Accept the findings unresolved")["_next"] == "observability_gate")
 u = aa("scope_breach", "Serialize: finish in-scope work only", coder_brief={"task": "t"}, scope_breach="src/x")
 check("apply: scope_breach serialize -> render with constraint", u["_next"] == "render_coder_prompt" and any("Do NOT edit" in l for l in u["coder_brief"]["must_not_do_extra"]))
@@ -694,9 +697,15 @@ check("answers: at the re-ask cap a non-stop recommendation is taken, otherwise 
       and all(u["_next"] != "end_aborted" for u in _cap.values()), {k: u.get("_next") for k, u in _cap.items()})
 _hp = gates.apply_answer(base_state(escalation=escalation("handoff_path", "q", [option("Abort the run")], hard_trigger=True),
                                     last_answer="/no/such/handoff.md"))
-_spent = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
-                                       apply_reasks=gates.APPLY_REASK_MAX, strikeout_rounds=RERUN_ONCE))
-check("answers: at the cap a recommendation whose branch is spent is not taken; the run blocks, never aborts",
+_real_apply = gates.apply_answer
+# the spent re-ask budget falls back to the recommendation through apply_answer; the stub makes that branch abort
+gates.apply_answer = lambda s: {"_next": "end_aborted"}
+try:
+    _spent = _real_apply(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
+                                    apply_reasks=gates.APPLY_REASK_MAX))
+finally:
+    gates.apply_answer = _real_apply
+check("answers: at the cap a recommendation that would still abort is not taken; the run blocks, never aborts",
       _spent["_next"] == "end_blocked" and any("would abort here" in d for d in _spent["decisions"]), _spent.get("_next"))
 _late = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - hmm, actually let's go with 3"))
 check("answers: a navigator note naming another option number anywhere goes to the owner, never applied",
@@ -986,9 +995,9 @@ s2, u = chain({**ss, "last_answer_text": "just do the parser for now", "reply_ve
                "reply_instruction": "narrow", "reply_value": "the parser"}, "interpret_route", "apply_answer")
 check("sizing: an Other reply that narrows the scope -> interpret_reply's narrow instruction, assess on the owner's words",
       u["_next"] == "assess" and s2["brief"].startswith("just do the parser for now"))
-check("sizing: a whole-reply abort ends the run; the verdict re-asks at most CLARIFY_MAX times, then redirects",
+check("sizing: a whole-reply abort ends the run; the verdict re-asks at most CLARIFY_MAX times, then asks sizing_cap",
       gates.apply_answer({**ss, "last_answer": "abort"})["_next"] == "end_aborted"
-      and gates.route_intent(base_state(**sz, sizing_rounds=CLARIFY_MAX))["_next"] == "end_redirect")
+      and gates.route_intent(base_state(**sz, sizing_rounds=CLARIFY_MAX)).get("escalation", {}).get("kind") == "sizing_cap")
 SDIR = os.path.join(SREPO, "plans", "engineer-handoffs")
 _before = sorted(os.listdir(SDIR))
 s2, u = chain({**ss, "last_answer": "don't hand it to the architect, do it here", "run_id": "sz3"}, "apply_answer")
@@ -1203,7 +1212,9 @@ u = gates.strikeout(base_state(last_coder_error="e"))
 check("strikeout: dirty tree stashed (recoverable, V8) + documented", "stash" in u["strikeout_stash"].lower() or "Saved" in u["strikeout_stash"])
 check("strikeout: tree clean after stash", subprocess.run(["git", "-C", REPO, "status", "--porcelain"], capture_output=True, text=True).stdout.strip() == "")
 u = gates.strikeout_route(base_state(oracle_result="I cannot resolve this without more context"))
-check("strikeout_route: unresolved -> hard-trigger escalation, abort recommended", u["escalation"]["hard_trigger"] and u["escalation"]["options"][0]["recommended"])
+check("strikeout_route: unresolved -> hard-trigger escalation, one more round on the oracle's notes recommended",
+      u["escalation"]["hard_trigger"] and u["escalation"]["options"][0]["recommended"]
+      and u["escalation"]["options"][0]["text"].startswith("Apply the oracle's notes"))
 u = gates.strikeout_route(base_state(oracle_result="The root cause is X; change Y."))
 check("strikeout_route: resolved -> one-round option recommended", "ONE more" in u["escalation"]["options"][0]["text"] and u["escalation"]["options"][0]["recommended"])
 
@@ -1369,7 +1380,9 @@ check("triage_route: critical + uncited rejections stand as fixes; cited rejecti
       u["_next"] == "compose_fix" and len(u["rejected_findings"]) == 1 and len(u["fix_items"]) == 3 and u["review_rounds"] == 1)
 u = gates.triage_route(base_state(triage=tri[3:], quality_rigor="poc", review_rounds=0))
 check("triage_route: defer honoured at poc -> deferred, no fix round", u["_next"] == "observability_gate" and u["deferred_findings"] and "(deferred by quality bar)" in u["deferred_findings"][0])
-u = gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "adversary"}], review_rounds=0, lane_block_streak={"adversary": 1}))
+_same = [{"code_tree": "t1", "lane_blockers": {"adversary": ["DIVERGES: c1"]}}] * 2
+u = gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "adversary"}], review_rounds=0,
+                                  lane_block_streak={"adversary": 1}, round_heads=_same))
 check("triage_route: adversary blocking twice after a fix -> lane_stuck escalation (re-run once rule)", u["escalation"]["kind"] == "lane_stuck")
 u = gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}], review_rounds=STRIKE_LIMIT))
 check("triage_route: B10 review rounds exhausted -> review_exhausted escalation", u["escalation"]["kind"] == "review_exhausted")
@@ -3539,10 +3552,14 @@ check("diff base: a later subtask over an unchanged tracked worktree diffs again
 os.rename(os.path.join(CLEAN_REPO, ".git", "index"), os.path.join(CLEAN_REPO, ".git", "index.away"))
 open(os.path.join(CLEAN_REPO, "a.txt"), "a").write("edited\n")
 u = gates.next_subtask(clean)
+_noindex_blob = subprocess.run(["git", "-C", CLEAN_REPO, "show", f"{u.get('base_sha')}:a.txt"], capture_output=True,
+                               text=True).stdout
+_noindex_written = os.path.exists(os.path.join(CLEAN_REPO, ".git", "index"))
 os.rename(os.path.join(CLEAN_REPO, ".git", "index.away"), os.path.join(CLEAN_REPO, ".git", "index"))
-check("diff base: a missing index file -> HEAD with the 'diff base snapshot failed' ledger line, never an empty tree",
-      u.get("base_sha") == CLEAN_HEAD and any("diff base snapshot failed" in d for d in u.get("decisions", [])),
-      (u.get("base_sha"), u.get("decisions")))
+check("diff base: a missing index file -> a snapshot built from an empty private index, never an empty tree",
+      u.get("base_sha") != CLEAN_HEAD and _noindex_blob == "a\nedited\n"
+      and not any("diff base snapshot failed" in d for d in u.get("decisions", []))
+      and not _noindex_written, (u.get("base_sha"), u.get("decisions")))
 check("diff base: a git_root that is not a repo -> the given HEAD and a reason",
       gates._snapshot_base(TMP, CLEAN_HEAD)[0] == CLEAN_HEAD and gates._snapshot_base(TMP, CLEAN_HEAD)[1])
 
@@ -3582,8 +3599,9 @@ u = a6_triage(A6_AGAIN, [tree_1, tree_2], [A6_FINDING, A6_AGAIN], 1)
 check("lane_stuck: (i) same finding at the same HEAD but a changed code tree -> another fix round, not lane_stuck",
       u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 2
       and any("code changed" in d for d in u.get("decisions", [])), (u.get("_next"), u.get("escalation", {}).get("kind")))
-u = a6_triage(A6_AGAIN, [tree_1, tree_2, tree_3], [A6_FINDING, A6_AGAIN, A6_AGAIN], 2)
-check("lane_stuck: (ii) a third round on the same finding -> lane_stuck even though the code changed again",
+u = a6_triage(A6_AGAIN, [tree_1, tree_2, tree_3], [A6_FINDING, A6_AGAIN, A6_AGAIN], gates.STUCK_CODE_CHANGED_CAP)
+check("lane_stuck: (ii) a block past STUCK_CODE_CHANGED_CAP on the same finding -> an owner decision under the "
+      "lane_stuck kind",
       u.get("escalation", {}).get("kind") == "lane_stuck", u.get("_next"))
 u = a6_triage(A6_AGAIN, [tree_2, tree_2], [A6_FINDING, A6_AGAIN], 1)
 check("lane_stuck: (iii) same finding over an unchanged code tree -> lane_stuck", u.get("escalation", {}).get("kind") == "lane_stuck",
@@ -3731,6 +3749,241 @@ plain = BILLING_ANCHOR_SUBTASKS[1:3]
 u = gates.record_subtasks(base_state(subtasks=plain, top_level=True, git_actions={}))
 plain_kept = as_list_(u.get("subtasks")) == plain and not any("merged into" in d for d in u.get("decisions", []))
 check("subtasks: a plain two-subtask plan with no tests-first subtask is unchanged", plain_kept, u.get("subtasks"))
+
+# ---------------------------------------------------------------- caps escalate, they never amputate
+FIX_CEIL = _lib.FIX_ROUND_CEILING
+STOP_WORDS_RE = re.compile(r"\b(?:abort|stop|cancel|quit|give up)\b", re.I)
+SO_REF = "refs/sisyphus-next/strikeout/x abc (recover with: git diff)"
+SO_SUBTASK = {"subtasks": subs, "subtask_index": 0, "strikeout_stash": SO_REF}
+
+
+def recommended(esc):
+    return [o["text"] for o in esc.get("options") or [] if o.get("recommended")]
+
+
+def stuck_triage(streak=1, trees=("t1", "t1"), **over):
+    heads = [{"code_tree": t, "lane_blockers": {"adversary": ["DIVERGES: c1"]}} for t in trees]
+    return gates.triage_route(base_state(triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "adversary"}],
+                                         review_rounds=0, lane_block_streak={"adversary": streak}, round_heads=heads,
+                                         **over))
+
+
+_low = {"lane_stuck": stuck_triage().get("escalation", {}),
+        "review_exhausted": gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}],
+                                                          review_rounds=STRIKE_LIMIT)).get("escalation", {}),
+        "strikeout unresolved": gates.strikeout_route(base_state(oracle_result="cannot resolve")).get("escalation", {}),
+        "strikeout resolved": gates.strikeout_route(base_state(oracle_result="change Y")).get("escalation", {})}
+check("caps: lane_stuck, review_exhausted and strikeout recommend one more round, never a stop, below the ceiling",
+      all(len(recommended(e)) == 1 and not STOP_WORDS_RE.search(recommended(e)[0])
+          and re.search(r"one more", recommended(e)[0], re.I) for e in _low.values()),
+      {k: recommended(e) for k, e in _low.items()})
+_high = {"lane_stuck": stuck_triage(strikeout_rounds=FIX_CEIL).get("escalation", {}),
+         "review_exhausted": gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}],
+                                                           review_rounds=STRIKE_LIMIT, strikeout_rounds=FIX_CEIL)
+                                                ).get("escalation", {}),
+         "strikeout": gates.strikeout_route(base_state(oracle_result="cannot resolve", strikeout_rounds=FIX_CEIL,
+                                                       **SO_SUBTASK)).get("escalation", {})}
+check("caps: at FIX_ROUND_CEILING the round stays offered and a non-stop way on is recommended instead",
+      all(len(recommended(e)) == 1 and not STOP_WORDS_RE.search(recommended(e)[0])
+          and not re.search(r"one more", recommended(e)[0], re.I)
+          and any(re.search(r"one more", o["text"], re.I) for o in e.get("options") or []) for e in _high.values())
+      and recommended(_high["lane_stuck"]) == ["Accept the findings unresolved and proceed"]
+      and recommended(_high["review_exhausted"]) == ["Accept the findings unresolved and proceed"],
+      {k: recommended(e) for k, e in _high.items()})
+_round_texts = {"lane_stuck": "One more fix round anyway", "review_exhausted": "One more fix round anyway",
+                "strikeout": "Apply the oracle's notes in one more coder round anyway"}
+_again = {k: gates.apply_answer(base_state(escalation=_high[k], last_answer=t, strikeout_rounds=FIX_CEIL + 1))
+          for k, t in _round_texts.items()}
+check("caps: an explicit one-more-round pick is honoured every time, past the ceiling too, and counted",
+      all(u["_next"] == "compose_fix" and u["strikeout_rounds"] == FIX_CEIL + 2 for u in _again.values()),
+      {k: u.get("_next") for k, u in _again.items()})
+_so_esc = _high["strikeout"]
+_so_pick = next((o["text"] for o in _so_esc.get("options") or [] if o["text"].startswith("Proceed without")), "")
+u = gates.apply_answer(base_state(escalation=_so_esc, last_answer=_so_pick, oracle_result="ORACLE-NOTE: root cause is X",
+                                  strikeout_rounds=FIX_CEIL, **SO_SUBTASK))
+check("caps: the strikeout proceed option goes on without the change, keeping the oracle's notes and the saved attempt",
+      _so_pick and u["_next"] == "next_subtask"
+      and any("ORACLE-NOTE" in f and "refs/sisyphus-next/strikeout/x" in f for f in u.get("follow_ups") or [])
+      and any("ORACLE-NOTE" in d for d in u.get("decisions") or []), (_so_pick, u.get("_next")))
+_so_unsafe = {"single-task": {"strikeout_stash": SO_REF},
+              "final review": {**SO_SUBTASK, "final_review": True},
+              "whole-worktree stash": {**SO_SUBTASK, "strikeout_stash": "Saved working directory and index state"}}
+_so_hard = {k: gates.strikeout_route(base_state(oracle_result="change Y", strikeout_rounds=FIX_CEIL, **s)
+                                     ).get("escalation", {}) for k, s in _so_unsafe.items()}
+check("caps: strikeout without a subtask's own saved attempt offers no proceed; at the ceiling a hard trigger with "
+      "no recommendation",
+      all(not any(o["text"] == gates.STRIKEOUT_PROCEED for o in e.get("options") or []) and e.get("hard_trigger")
+          and not recommended(e) for e in _so_hard.values()),
+      {k: (recommended(e), e.get("hard_trigger")) for k, e in _so_hard.items()})
+_so_np = {k: gates.apply_answer(base_state(escalation=escalation("strikeout", "q", [option("Apply it"),
+                                                                                   option(gates.STRIKEOUT_PROCEED)]),
+                                           last_answer=gates.STRIKEOUT_PROCEED, **s)) for k, s in _so_unsafe.items()}
+check("caps: a strikeout proceed pick where proceeding was not offered is asked again, never applied",
+      all(u["_next"] == "ask_dispatch" and not u.get("follow_ups") for u in _so_np.values()),
+      {k: u.get("_next") for k, u in _so_np.items()})
+_sec = {"lane_stuck": gates.triage_route(base_state(
+            triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "security"}], review_rounds=0,
+            round_heads=[{"code_tree": "t1", "lane_blockers": {"security": ["DIVERGES: c1"]}}] * 2,
+            lane_block_streak={"security": 1}, strikeout_rounds=FIX_CEIL)).get("escalation", {}),
+        "review_exhausted": gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "security"}],
+                                                          review_rounds=STRIKE_LIMIT, strikeout_rounds=FIX_CEIL)
+                                               ).get("escalation", {})}
+check("caps: at FIX_ROUND_CEILING security blockers raise a hard trigger that recommends nothing",
+      all(e.get("kind") == k and e.get("hard_trigger") and not recommended(e) for k, e in _sec.items()),
+      {k: (e.get("kind"), recommended(e), e.get("hard_trigger")) for k, e in _sec.items()})
+check("caps: next_subtask resets the extra-round counter for each subtask",
+      gates.next_subtask(base_state(subtasks=subs, subtask_index=1, strikeout_rounds=FIX_CEIL))["strikeout_rounds"] == 0)
+
+u = a6_triage(A6_AGAIN, [tree_1, tree_2], [A6_FINDING, A6_AGAIN], gates.STUCK_CODE_CHANGED_CAP - 1)
+check("caps: STUCK_CODE_CHANGED_CAP is 3", gates.STUCK_CODE_CHANGED_CAP == 3, gates.STUCK_CODE_CHANGED_CAP)
+check("caps: STUCK_CODE_CHANGED_CAP is the last changed-code streak with a fix round, so the cap fires one block later",
+      u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == gates.STUCK_CODE_CHANGED_CAP,
+      (u.get("_next"), u.get("escalation", {}).get("kind")))
+
+_unk = {"one round recorded": stuck_triage(trees=("t1",)),
+        "a tree missing": stuck_triage(trees=("", "t1")),
+        "git cannot compare": stuck_triage(trees=("1" * 40, "2" * 40))}
+check("caps: an unverifiable tree is never stuck: one more fix round, ledgered as could not be verified",
+      all(u.get("_next") == "compose_fix" and any("could not be verified" in d for d in u.get("decisions") or [])
+          for u in _unk.values()), {k: u.get("_next") for k, u in _unk.items()})
+u = stuck_triage(streak=gates.STUCK_CODE_CHANGED_CAP, trees=("", "t1"))
+_q = u.get("escalation", {}).get("question", "")
+check("caps: past the cap an unverified tree raises lane_stuck that says so and recommends continuing",
+      u.get("escalation", {}).get("kind") == "lane_stuck" and _q.startswith("The adversary lane still blocks")
+      and "could not be verified" in _q and recommended(u["escalation"]) == ["One more fix round anyway"], _q)
+u = stuck_triage()
+check("caps: same findings over a verified unchanged tree is still lane_stuck",
+      u.get("escalation", {}).get("kind") == "lane_stuck"
+      and u["escalation"]["question"].startswith("The adversary lane still blocks"), u.get("_next"))
+
+_cq = gates.route_intent(base_state(intent="ambiguous", clarify_rounds=CLARIFY_MAX,
+                                    clarifications="\nQ: FIRST-QUESTION?\nA: unsure\n",
+                                    clarifying_questions=[{"question": "OPEN-QUESTION?"}])).get("escalation", {})
+check("caps: past CLARIFY_MAX the user gets clarify_cap with the questions so far and a recommended way on",
+      _cq.get("kind") == "clarify_cap" and _lib.as_dict(_cq.get("data")).get("cap") == "CLARIFY_MAX"
+      and "FIRST-QUESTION?" in _cq.get("evidence", "") and "OPEN-QUESTION?" in _cq.get("evidence", "")
+      and len(recommended(_cq)) == 1 and not STOP_WORDS_RE.search(recommended(_cq)[0])
+      and any(STOP_WORDS_RE.search(o["text"]) for o in _cq.get("options") or []), _cq.get("kind"))
+_cs, u = chain(base_state(escalation=_cq, clarify_rounds=CLARIFY_MAX, clarifications="",
+                          last_answer="it means the export command only"), "apply_answer")
+check("caps: a clarify_cap reading is kept as the stated reason and the run goes on, the round counter untouched",
+      u.get("_next") == "assess" and "it means the export command only" in _cs.get("clarifications", "")
+      and _cs.get("clarify_rounds") == CLARIFY_MAX and _cs.get("clarify_extensions") == 1
+      and any("it means the export command only" in d for d in _cs.get("decisions") or []), u.get("_next"))
+u = gates.route_intent(base_state(**{**_cs, "intent": "implementation", "sizing": "simple",
+                                     "clarifying_questions": [{"question": "still?"}]}))
+_cq2 = gates.route_intent(base_state(**{**_cs, "intent": "ambiguous"})).get("escalation", {})
+_ci, u2 = chain(base_state(**{**_cs, "escalation": _cq2, "last_answer": recommended(_cq2)[0] if recommended(_cq2) else ""}),
+                "apply_answer", "route_intent")
+check("caps: after a stated reading assess's leftover questions no longer hold the run; a second cap leaves the loop",
+      u.get("_next") == "next_subtask" and _cq2.get("kind") == "clarify_cap"
+      and recommended(_cq2) != recommended(_cq) and u2.get("_next") == "plan_subtasks"
+      and _ci.get("clarify_rounds") == CLARIFY_MAX and _ci.get("clarify_extensions") == 2, (u.get("_next"), u2.get("_next")))
+
+_sc = gates.route_intent(base_state(**sz, sizing_rounds=CLARIFY_MAX)).get("escalation", {})
+_here = recommended(_sc)[0] if recommended(_sc) else ""
+check("caps: past CLARIFY_MAX sizing verdicts the user gets sizing_cap: do it here on a reason, the architect, or stop",
+      _sc.get("kind") == "sizing_cap" and _lib.as_dict(_sc.get("data")).get("cap") == "CLARIFY_MAX"
+      and "about 9 subtasks" in _sc.get("evidence", "") and _here.startswith("Do it here")
+      and gates.SIZING_ARCHITECT in [o["text"] for o in _sc["options"]]
+      and any(STOP_WORDS_RE.search(o["text"]) for o in _sc["options"]), _sc.get("kind"))
+_ss, u = chain(base_state(**sz, sizing_rounds=CLARIFY_MAX, escalation=_sc, last_answer=f"{_here}: the team wants one PR"),
+               "apply_answer")
+check("caps: do it here past the sizing cap keeps the reason, plans in this run, and leaves sizing_rounds alone",
+      u.get("_next") == "plan_subtasks" and "the team wants one PR" in _ss.get("sizing_note", "")
+      and "the team wants one PR" in _ss.get("clarifications", "") and _ss.get("sizing_rounds") == CLARIFY_MAX
+      and _ss.get("sizing_extensions") == 1, u.get("_next"))
+_sc2 = gates.route_intent(base_state(**{**_ss, "sizing": "plan_shaped"})).get("escalation", {})
+check("caps: a second sizing cap after a granted extension recommends the architect handoff, still no stop",
+      recommended(_sc2) == [gates.SIZING_ARCHITECT], recommended(_sc2))
+_sp = gates.record_subtasks(base_state(**{**sz, "subtasks": subs + [subs[0]], "sizing_rounds": CLARIFY_MAX}))
+_sp_esc = _sp.get("escalation", {})
+check("caps: a sizing cap after the planner overflowed recommends the architect; do it here stays offered",
+      _sp_esc.get("kind") == "sizing_cap" and _lib.as_dict(_sp_esc.get("data")).get("planned") is True
+      and recommended(_sp_esc) == [gates.SIZING_ARCHITECT]
+      and gates.SIZING_HERE_REASON in [o["text"] for o in _sp_esc.get("options") or []],
+      (_sp_esc.get("kind"), recommended(_sp_esc)))
+_cbare, _ = chain(base_state(escalation=_cq, clarify_rounds=CLARIFY_MAX, clarifications="", last_answer="1"),
+                  "apply_answer")
+_cnote, _ = chain(base_state(escalation=_cq, clarify_rounds=CLARIFY_MAX, clarifications="",
+                             last_answer=f"{recommended(_cq)[0]}: READING-NOTE"), "apply_answer")
+check("caps: a bare clarify_cap pick goes on and records no stated reason; a noted pick records the note",
+      _cbare.get("clarify_extensions") == 1 and gates.NO_STATED_REASON in _cbare.get("clarifications", "")
+      and recommended(_cq)[0] not in _cbare.get("clarifications", "")
+      and any(gates.NO_STATED_REASON in d for d in _cbare.get("decisions") or [])
+      and "A: READING-NOTE" in _cnote.get("clarifications", "")
+      and any("READING-NOTE" in d for d in _cnote.get("decisions") or []),
+      (_cbare.get("clarifications"), _cnote.get("clarifications")))
+_sbare, u = chain(base_state(**sz, sizing_rounds=CLARIFY_MAX, escalation=_sc, last_answer=_here), "apply_answer")
+_snum, u2 = chain(base_state(**sz, sizing_rounds=CLARIFY_MAX, escalation=_sc,
+                             last_answer=f"{[o['text'] for o in _sc['options']].index(_here) + 1}: NUMBERED-NOTE"),
+                  "apply_answer")
+check("caps: a bare sizing_cap pick goes on and records no stated reason; a numbered pick with a note records the note",
+      u.get("_next") == "plan_subtasks" and gates.NO_STATED_REASON in _sbare.get("sizing_note", "")
+      and gates.NO_STATED_REASON in _sbare.get("clarifications", "")
+      and any(gates.NO_STATED_REASON in d for d in _sbare.get("decisions") or [])
+      and u2.get("_next") == "plan_subtasks" and "stating: NUMBERED-NOTE." in _snum.get("sizing_note", "")
+      and any("NUMBERED-NOTE" in d for d in _snum.get("decisions") or []),
+      (_sbare.get("sizing_note"), _snum.get("sizing_note")))
+
+check("caps: next_subtask resets oracle_retries for each subtask",
+      gates.next_subtask(base_state(subtasks=subs, subtask_index=1, oracle_retries=RERUN_ONCE)).get("oracle_retries") == 0)
+_of = gates.merge_oracle(base_state(oracle_result="", oracle_retries=RERUN_ONCE)).get("escalation", {})
+check("caps: an oracle fault past its retry recommends proceeding without the oracle, never a stop",
+      len(recommended(_of)) == 1 and recommended(_of)[0].startswith("Proceed without the oracle"), recommended(_of))
+
+_d1 = gates.bookkeeping_route(base_state(debt_items=[], design_asks=["ASK -- FIRST strategy?", "ASK -- SECOND factory?"],
+                                         design_ask_rounds=0))
+_d1s = base_state(**{k: v for k, v in _d1.items() if k != "_next"}, design_ask_rounds=0)
+_d2s, _d2 = chain({**_d1s, "last_answer": "Keep the code as shipped (answer recorded, no change)"}, "apply_answer")
+_d3s, _d3 = chain({**_d2s, "last_answer": "Adopt the pattern (one more coder round introduces it)"}, "apply_answer")
+check("caps: every ASK line is asked in turn, each answer recorded, and an adopting answer drives one coder round",
+      _d1.get("escalation", {}).get("question") == "Design question: ASK -- FIRST strategy?"
+      and _d2.get("_next") == "escalate_gate"
+      and _d2s.get("escalation", {}).get("question") == "Design question: ASK -- SECOND factory?"
+      and _d3.get("_next") == "compose_fix" and "SECOND factory" in _d3s.get("fix_note", "")
+      and "FIRST strategy" not in _d3s.get("fix_note", "")
+      and [d.split(" -> ")[0] for d in _d3s.get("design_decisions") or []]
+      == ["Design question: ASK -- FIRST strategy?", "Design question: ASK -- SECOND factory?"],
+      (_d2.get("_next"), _d3.get("_next"), _d3s.get("design_decisions")))
+
+BASE_REPO = os.path.join(TMP, "untracked-base-repo")
+os.makedirs(os.path.join(BASE_REPO, "docs"))
+os.makedirs(os.path.join(BASE_REPO, "src"))
+scratch_git(BASE_REPO, "init", "-q")
+open(os.path.join(BASE_REPO, "README.md"), "w").write("r\n")
+scratch_git(BASE_REPO, "add", ".")
+scratch_git(BASE_REPO, "commit", "-q", "-m", "init")
+_bhead = scratch_git(BASE_REPO, "rev-parse", "HEAD")
+open(os.path.join(BASE_REPO, "docs", "guide.md"), "w").write("subtask 1\n")
+_bbase, _berr = gates._snapshot_base(BASE_REPO, _bhead)
+open(os.path.join(BASE_REPO, "src", "new_b.py"), "w").write("subtask 2\n")
+_bdiff = scratch_git(BASE_REPO, "diff", "--name-only", _bbase, gates._worktree_tree(BASE_REPO)).split()
+check("caps: an earlier subtask's untracked file is in the next diff base, so the diff names only the new subtask's file",
+      _bdiff == ["src/new_b.py"] and not _berr and scratch_git(BASE_REPO, "ls-files") == "README.md", (_bdiff, _berr))
+
+with open(os.path.join(HERE, "..", "graph.yaml")) as _fh:
+    _initial = _fh.read().split("\ninitial_state:\n", 1)[-1].split("\n\n", 1)[0]
+import audit_graph  # noqa: E402
+check("caps: initial_state seeds apply_reasks next to reask_rounds, and the audit names APPLY_REASK_MAX",
+      re.search(r"(?m)^  reask_rounds: 0\n  apply_reasks: 0$", _initial) is not None
+      and "APPLY_REASK_MAX" in audit_graph.BOUNDED.get("apply_answer", ""))
+check("caps: initial_state seeds clarify_extensions and sizing_extensions next to their round counters",
+      re.search(r"(?m)^  clarify_rounds: 0\n  clarify_extensions: 0$", _initial) is not None
+      and re.search(r"(?m)^  sizing_rounds: 0\n  sizing_extensions: 0$", _initial) is not None)
+check("caps: the final whole-task review resets oracle_retries",
+      gates._start_final_review(base_state(subtasks=subs, oracle_retries=RERUN_ONCE), {}, len(subs))
+      .get("oracle_retries") == 0)
+_ra, u = chain(base_state(escalation=escalation("lane_stuck", "q", SO3), last_answer="hmm", reask_rounds=REASK_MAX - 1),
+               "apply_answer")
+_rb, u2 = chain({**_ra, "last_answer_text": "still hmm", "reply_interpreted": True}, "parse_answer")
+_rc, u3 = chain({**_rb, "last_answer_text": "hmm again"}, "parse_answer")
+_reset = gates.raise_escalation({**_rc, "apply_reasks": gates.APPLY_REASK_MAX}, {}, escalation("x", "q"))
+shared_total = (u["_next"] == "ask_dispatch" and _ra.get("reask_rounds") == REASK_MAX - 1 and u2["_next"] == "ask_user"
+                and _rb.get("reask_rounds") == REASK_MAX and u3["_next"] == "apply_answer"
+                and _reset["reask_rounds"] == 0 and _reset["apply_reasks"] == 0)
+_rs = (_ra.get("reask_rounds"), u2.get("_next"), u3.get("_next"))
+check("caps: apply_answer's re-ask leaves parse_answer's count, so both share one bounded total per escalation", shared_total, _rs)
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

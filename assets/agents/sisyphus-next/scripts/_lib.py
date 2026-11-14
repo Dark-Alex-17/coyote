@@ -39,6 +39,7 @@ REVIEW_POLL_SLEEP = 600   # review comments arrive on a human timescale, so the 
 REVIEW_MAX_POLLS = 80     # per run; stays below settings.max_loop_iterations (100), which caps visits per node
 REVIEW_WALL_SECS = REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP  # the poll budget expressed as wall clock
 REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per run, the 3-strike family bound
+FIX_ROUND_CEILING = STRIKE_LIMIT  # extra fix rounds per subtask the stuck / exhausted / strikeout questions recommend
 REVIEW_CI_POLL_BUDGET = 60  # a fix round starts only while ci_polls_run is below this, leaving the next CI watch headroom under the per-node cap
 REVIEW_CI_POLL_CEILING = 90  # review mode stops the CI watch here, below the per-node visit cap of 100
 RESOLVE_DEADLINE_SECS = 480  # below the pr_review_resolve node timeout of 600 with one GH_CALL_SECS call of margin
