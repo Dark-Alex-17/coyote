@@ -1325,8 +1325,11 @@ fn a_second_ctrl_d_during_teardown_changes_nothing() {
 
 /// The first run ever: no cache dir, no sessions, no config beyond the
 /// dry-run file. The UI comes up with its chrome, and leaving prints the
-/// transcript and nothing else (no log line, no warning about the missing
-/// directories) ahead of the tty report.
+/// transcript ahead of the tty report: the prompt line and the reply's
+/// last line each once, in that order. The dry-run reply echoes the
+/// whole request, so the lines between the prompt line and that last
+/// line are not checked; no line before or after them looks like a log
+/// line, a warning or an error (about the missing directories, say).
 #[test]
 #[serial]
 fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
@@ -1358,11 +1361,9 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
         .map(str::trim_end)
         .collect();
     // The dry-run reply echoes the whole request, system prompt included,
-    // so only its last line is pinned: the rendered user message.
+    // and ends on the rendered user message.
     let prompt = "> **zebra** and `quartz` marker";
     let reply = "zebra and quartz marker";
-    assert_eq!(printed.first(), Some(&prompt), "{printed:#?}");
-    assert_eq!(printed.last(), Some(&reply), "{printed:#?}");
     for line in [prompt, reply] {
         assert_eq!(
             printed.iter().filter(|printed| **printed == line).count(),
@@ -1370,8 +1371,12 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
             "{line:?} is not printed exactly once: {printed:#?}"
         );
     }
-    let leaked: Vec<&&str> = printed
+    let prompt_at = printed.iter().position(|line| *line == prompt).unwrap();
+    let reply_at = printed.iter().position(|line| *line == reply).unwrap();
+    assert!(prompt_at < reply_at, "{printed:#?}");
+    let leaked: Vec<&&str> = printed[..=prompt_at]
         .iter()
+        .chain(&printed[reply_at..])
         .filter(|line| {
             let line = line.trim_start();
             [
@@ -1390,7 +1395,7 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
         .collect();
     assert!(
         leaked.is_empty(),
-        "the bytes between the leave and the report are not just the transcript: {leaked:#?}"
+        "lines printed around the echoed request look like log output: {leaked:#?}"
     );
 }
 

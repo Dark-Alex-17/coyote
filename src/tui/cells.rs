@@ -52,6 +52,9 @@ impl LineCache {
 pub(super) struct FullOutput {
     text: String,
     dropped: usize,
+    /// A `\r` that ended the last push, held until the next push shows
+    /// whether it began a `\r\n`.
+    pending_cr: bool,
     wrapped: Option<WrappedOutput>,
 }
 
@@ -72,9 +75,39 @@ struct WrappedOutput {
 }
 
 impl FullOutput {
-    /// Appends `text`, returning how many more bytes are kept now (fewer
-    /// when the cap cut the oldest away).
+    /// Appends `text` with each `\r\n` made `\n`, even one split across
+    /// two pushes, returning how many more bytes are kept now (fewer when
+    /// the cap cut the oldest away).
     pub(super) fn push(&mut self, text: &str) -> isize {
+        if text.is_empty() {
+            return 0;
+        }
+        let mut chunk = String::with_capacity(text.len() + 1);
+        if std::mem::take(&mut self.pending_cr) && !text.starts_with('\n') {
+            chunk.push('\r');
+        }
+        let body = match text.strip_suffix('\r') {
+            Some(head) => {
+                self.pending_cr = true;
+                head
+            }
+            None => text,
+        };
+        chunk.push_str(&body.replace("\r\n", "\n"));
+        self.append(&chunk)
+    }
+
+    /// Keeps a `\r` still held back by `push` as it is, for output that
+    /// has ended.
+    pub(super) fn settle(&mut self) -> isize {
+        if std::mem::take(&mut self.pending_cr) {
+            self.append("\r")
+        } else {
+            0
+        }
+    }
+
+    fn append(&mut self, text: &str) -> isize {
         if text.is_empty() {
             return 0;
         }
@@ -223,6 +256,7 @@ impl Clone for FullOutput {
         Self {
             text: self.text.clone(),
             dropped: self.dropped,
+            pending_cr: self.pending_cr,
             wrapped: None,
         }
     }
@@ -230,7 +264,9 @@ impl Clone for FullOutput {
 
 impl PartialEq for FullOutput {
     fn eq(&self, other: &Self) -> bool {
-        self.text == other.text && self.dropped == other.dropped
+        self.text == other.text
+            && self.dropped == other.dropped
+            && self.pending_cr == other.pending_cr
     }
 }
 
@@ -250,6 +286,14 @@ pub(super) fn release_full_output_caches(cells: &mut [Cell]) {
     for full in cells.iter_mut().flat_map(Cell::full_outputs) {
         full.release_cache();
     }
+}
+
+#[cfg(test)]
+pub(super) fn any_full_output_laid_out(cells: &mut [Cell]) -> bool {
+    cells
+        .iter_mut()
+        .flat_map(Cell::full_outputs)
+        .any(|full| full.wrapped.is_some())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1308,8 +1352,35 @@ mod tests {
             "nothing was kept laid out: {committed}"
         );
         let freed = full.evict();
-        assert_eq!(freed, pieces.concat().len());
+        assert_eq!(freed, pieces.concat().replace("\r\n", "\n").len());
         assert_eq!(full.lines(40).len(), 1, "the note alone");
+    }
+
+    /// A `\r\n` is kept as `\n` whether it sits inside one push or is cut
+    /// between two; a `\r` not followed by `\n` is kept as it is.
+    #[test]
+    fn the_full_output_keeps_crlf_as_lf_across_pushes() {
+        let mut full = FullOutput::default();
+        full.push("one\r\ntwo\r\n");
+        assert_eq!(full.text(), "one\ntwo\n");
+
+        let mut split = FullOutput::default();
+        assert_eq!(split.push("one\r"), 3);
+        assert_eq!(split.text(), "one");
+        split.push("\ntwo\n");
+        assert_eq!(split.text(), "one\ntwo\n");
+        assert_eq!(split.settle(), 0);
+
+        let mut settled = FullOutput::default();
+        settled.push("50%\r");
+        assert_eq!(settled.settle(), 1);
+        assert_eq!(settled.text(), "50%\r");
+        assert_eq!(settled.settle(), 0);
+
+        let mut overwritten = FullOutput::default();
+        overwritten.push("50%\r");
+        overwritten.push("99%\n");
+        assert_eq!(overwritten.text(), "50%\r99%\n");
     }
 
     /// The whole output's lines are laid out once per width and change;

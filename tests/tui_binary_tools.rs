@@ -9,7 +9,7 @@
 //! After them: the Ctrl+T pager over a tool's whole output with its find
 //! and thread picker, the F3 roster cancelling a background job, and both
 //! with nothing to show. The transcript printed when the UI leaves is
-//! checked in `tui_binary_wizards.rs`.
+//! checked in `tui_binary_exit.rs`.
 //! Each case runs the binary on a pseudo-terminal under a bash wrapper
 //! that reports the exit code and `stty -a` afterwards, so the file is
 //! unix-only. The cases run one at a time: each spawn forks a session
@@ -2337,7 +2337,7 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
         "the roster does not list the job as running: {band:?}\n{roster}"
     );
     pty.send(b"x").unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
     while alive(pid) && std::time::Instant::now() < deadline {
         pty.read_for(Duration::from_millis(200));
     }

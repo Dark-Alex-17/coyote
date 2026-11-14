@@ -7,11 +7,16 @@ use super::cells::{Cell, without_think_spans};
 use super::render;
 use crate::config::AppConfig;
 use crate::render::{MarkdownRender, RenderOptions};
+use std::sync::Arc;
+use syntect::parsing::SyntaxSet;
 
 /// The transcript text for `cells`, ending in a newline unless empty.
 pub(super) fn transcript_text(cells: &[Cell], config: &AppConfig) -> String {
-    let options = match config.render_options() {
-        Ok(options) => Some(options),
+    let markdown_setup = match config
+        .render_options()
+        .and_then(|options| Ok((options, MarkdownRender::syntax_set()?)))
+    {
+        Ok(setup) => Some(setup),
         Err(err) => {
             warn!("Printing the transcript without markdown: {err}");
             None
@@ -25,7 +30,7 @@ pub(super) fn transcript_text(cells: &[Cell], config: &AppConfig) -> String {
                 format!("> {}{marker}", render::plain_text(text))
             }
             Cell::Assistant { source, .. } => {
-                markdown(without_think_spans(source, true), options.as_ref())
+                markdown(without_think_spans(source, true), markdown_setup.as_ref())
             }
             Cell::Notice { text, .. } | Cell::Error { text, .. } => render::plain_text(text),
             Cell::Command { name, output, .. } => {
@@ -54,18 +59,22 @@ pub(super) fn transcript_text(cells: &[Cell], config: &AppConfig) -> String {
 }
 
 /// `AppConfig::print_markdown`'s rendering, with only the colours and
-/// attributes of what it produces let through to the terminal.
-fn markdown(text: &str, options: Option<&RenderOptions>) -> String {
-    let rendered = options.map(|options| {
-        MarkdownRender::init(options.clone()).map(|mut renderer| {
-            let body = renderer.render(text);
-            let tail = renderer.finalize();
-            if tail.is_empty() {
-                body
-            } else {
-                format!("{body}\n{tail}")
-            }
-        })
+/// attributes of what it produces let through to the terminal. Each
+/// reply gets a renderer of its own, as the REPL does, but the syntaxes
+/// are decoded once per dump.
+fn markdown(text: &str, setup: Option<&(RenderOptions, Arc<SyntaxSet>)>) -> String {
+    let rendered = setup.map(|(options, syntax_set)| {
+        MarkdownRender::with_syntax_set(options.clone(), Arc::clone(syntax_set)).map(
+            |mut renderer| {
+                let body = renderer.render(text);
+                let tail = renderer.finalize();
+                if tail.is_empty() {
+                    body
+                } else {
+                    format!("{body}\n{tail}")
+                }
+            },
+        )
     });
     match rendered {
         Some(Ok(rendered)) => render::sanitize_ansi(&rendered),

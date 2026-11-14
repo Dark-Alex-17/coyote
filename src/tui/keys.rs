@@ -317,6 +317,19 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             // Readline's split: EOF only on an empty line; with a draft the
             // chord reaches the textarea, which deletes forward.
             KeyCode::Char('d') if ctrl && ctx.composer_empty => Action::Quit,
+            // The draft, the focus and the queue are out of sight under the
+            // roster: only the band's own keys do anything.
+            _ if ctx.popup == Some(PopupKind::Roster) => match code {
+                KeyCode::Esc => Action::ClosePopup,
+                KeyCode::Up | KeyCode::BackTab if !ctrl && !alt => Action::PaletteMove(-1),
+                KeyCode::Down | KeyCode::Tab if !ctrl && !alt => Action::PaletteMove(1),
+                KeyCode::Enter => Action::PaletteAccept,
+                KeyCode::Char('j') if !ctrl => Action::PaletteMove(1),
+                KeyCode::Char('k') if !ctrl => Action::PaletteMove(-1),
+                KeyCode::Char('x') if !ctrl => Action::RosterCancel,
+                KeyCode::Char('o') if !ctrl => Action::RosterOpen,
+                _ => Action::Nothing,
+            },
             KeyCode::Up if ctrl => Action::FocusPrev,
             KeyCode::Down if ctrl => Action::FocusNext,
             KeyCode::Up if alt => Action::EditQueued,
@@ -330,20 +343,11 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter
                 if matches!(
                     ctx.popup,
-                    Some(PopupKind::HistorySearch | PopupKind::Rewind | PopupKind::Roster)
+                    Some(PopupKind::HistorySearch | PopupKind::Rewind)
                 ) =>
             {
                 Action::PaletteAccept
             }
-            KeyCode::Char(c) if !ctrl && ctx.popup == Some(PopupKind::Roster) => match c {
-                'j' => Action::PaletteMove(1),
-                'k' => Action::PaletteMove(-1),
-                'x' => Action::RosterCancel,
-                'o' => Action::RosterOpen,
-                _ => Action::Nothing,
-            },
-            // The draft is out of sight under the roster: no key edits it.
-            _ if ctx.popup == Some(PopupKind::Roster) => Action::Nothing,
             KeyCode::Char(_) if !ctrl && ctx.popup == Some(PopupKind::HistorySearch) => {
                 match key.code {
                     KeyCode::Char(typed) => Action::PopupChar(typed),
@@ -1471,8 +1475,9 @@ mod tests {
     }
 
     /// With the roster up its letters act on the highlighted row and no
-    /// other letter reaches the composer; Esc and the quit chords close
-    /// it, Enter answers the row even mid-turn.
+    /// other letter reaches the composer; the focus and queue chords do
+    /// nothing either. Esc and the quit chords close it, Enter answers
+    /// the row even mid-turn.
     #[test]
     fn roster_keys() {
         let roster = KeyContext {
@@ -1497,6 +1502,21 @@ mod tests {
             (ctrl('w'), roster, Action::Nothing),
             (plain(KeyCode::Left), roster, Action::Nothing),
             (plain(KeyCode::Home), roster, Action::Nothing),
+            (
+                press(KeyCode::Up, KeyModifiers::ALT),
+                roster,
+                Action::Nothing,
+            ),
+            (
+                press(KeyCode::Up, KeyModifiers::CONTROL),
+                roster,
+                Action::Nothing,
+            ),
+            (
+                press(KeyCode::Down, KeyModifiers::CONTROL),
+                roster,
+                Action::Nothing,
+            ),
             (plain(KeyCode::Enter), roster, Action::PaletteAccept),
             (plain(KeyCode::Enter), running, Action::PaletteAccept),
             (plain(KeyCode::Esc), roster, Action::ClosePopup),

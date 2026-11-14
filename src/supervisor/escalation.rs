@@ -18,6 +18,17 @@ pub struct EscalationQueue {
     pending: parking_lot::Mutex<HashMap<String, EscalationRequest>>,
 }
 
+/// A question waiting in the queue, without the channel its answer goes
+/// back on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingEscalation {
+    pub id: String,
+    pub from_agent_id: String,
+    pub from_agent_name: String,
+    pub question: String,
+    pub options: Option<Vec<String>>,
+}
+
 impl EscalationQueue {
     pub fn new() -> Self {
         Self {
@@ -35,10 +46,23 @@ impl EscalationQueue {
         self.pending.lock().remove(escalation_id)
     }
 
-    pub fn pending_summary(&self) -> Vec<Value> {
+    pub fn pending(&self) -> Vec<PendingEscalation> {
         self.pending
             .lock()
             .values()
+            .map(|r| PendingEscalation {
+                id: r.id.clone(),
+                from_agent_id: r.from_agent_id.clone(),
+                from_agent_name: r.from_agent_name.clone(),
+                question: r.question.clone(),
+                options: r.options.clone(),
+            })
+            .collect()
+    }
+
+    pub fn pending_summary(&self) -> Vec<Value> {
+        self.pending()
+            .into_iter()
             .map(|r| {
                 let mut entry = json!({
                     "escalation_id": r.id,
@@ -46,7 +70,7 @@ impl EscalationQueue {
                     "from_agent_name": r.from_agent_name,
                     "question": r.question,
                 });
-                if let Some(ref options) = r.options {
+                if let Some(options) = r.options {
                     entry["options"] = json!(options);
                 }
                 entry
@@ -171,6 +195,56 @@ mod tests {
     fn pending_summary_empty_when_no_requests() {
         let queue = EscalationQueue::new();
         assert!(queue.pending_summary().is_empty());
+    }
+
+    #[test]
+    fn pending_lists_each_request_and_the_summary_says_the_same() {
+        let queue = EscalationQueue::new();
+        let (req, _rx) = make_request("esc_1", "agent_x", "What to do?");
+        queue.submit(req);
+        let (tx, _options_rx) = oneshot::channel();
+        queue.submit(EscalationRequest {
+            id: "esc_2".into(),
+            from_agent_id: "a".into(),
+            from_agent_name: "agent".into(),
+            question: "[select] Pick one".into(),
+            options: Some(vec!["A".into(), "B".into()]),
+            reply_tx: tx,
+        });
+        let mut pending = queue.pending();
+        pending.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            pending[1],
+            PendingEscalation {
+                id: "esc_2".into(),
+                from_agent_id: "a".into(),
+                from_agent_name: "agent".into(),
+                question: "[select] Pick one".into(),
+                options: Some(vec!["A".into(), "B".into()]),
+            }
+        );
+        assert_eq!(pending[0].options, None);
+
+        let mut summary = queue.pending_summary();
+        summary.sort_by_key(|entry| entry["escalation_id"].as_str().map(str::to_string));
+        assert_eq!(
+            summary,
+            [
+                json!({
+                    "escalation_id": "esc_1",
+                    "from_agent_id": "agent_x",
+                    "from_agent_name": pending[0].from_agent_name,
+                    "question": "What to do?",
+                }),
+                json!({
+                    "escalation_id": "esc_2",
+                    "from_agent_id": "a",
+                    "from_agent_name": "agent",
+                    "question": "[select] Pick one",
+                    "options": ["A", "B"],
+                }),
+            ]
+        );
     }
 
     #[test]

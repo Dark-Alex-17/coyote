@@ -29,6 +29,7 @@ const HINT: &str = "j/k scroll  g/G top/end  / find  n/N next/prev  Tab threads 
 /// The legend under `NARROW` columns, where `HINT` would lose its end:
 /// the way out and the way to the other threads come first.
 const SHORT_HINT: &str = "q close  Tab threads  / find  n/N  j/k  g/G";
+const PICKER_HINT: &str = "j/k move  Enter open  Esc back";
 const NARROW: u16 = 70;
 const PICKER_HEADER: &str = "Threads  Enter = open  Esc = back";
 const CHECKPOINT_NOTE: &str =
@@ -405,6 +406,10 @@ impl Pager {
         } else {
             PagerMode::Browse
         }
+    }
+
+    pub(super) fn shows_root(&self) -> bool {
+        matches!(self.thread, Thread::Root)
     }
 
     fn open_child_view(&mut self, session_id: &str) -> Option<&mut ChildView> {
@@ -796,31 +801,32 @@ impl Pager {
     /// The thread's name for a title `width` columns wide. A child's
     /// session id too long for it loses its middle: the ids end in what
     /// tells two runs of one agent apart. With too little room even for
-    /// that, the "(read-only)" goes first, since the body says so too,
-    /// and then all but the id's end.
+    /// that, the "(read-only)" shrinks to "(ro)", since the body says so
+    /// too, and then all but the id's end goes.
     fn title(&self, width: usize) -> String {
         match &self.thread {
             Thread::Root => format!("Thread: {ROOT_THREAD}"),
             Thread::Child(view) => {
                 let agent = render::plain_text(&view.agent);
                 let id = render::plain_text(&view.session_id);
-                let head = format!("Thread: {agent} (read-only) ");
-                let room = width.saturating_sub(head.width());
-                if room >= ELIDED_MIN || id.width() <= room {
-                    return format!("{head}{}", elide_middle(&id, room));
+                for marker in ["(read-only)", "(ro)"] {
+                    let head = format!("Thread: {agent} {marker} ");
+                    let room = width.saturating_sub(head.width());
+                    if room >= ELIDED_MIN || id.width() <= room {
+                        return format!("{head}{}", elide_middle(&id, room));
+                    }
                 }
-                let head = format!("Thread: {agent} ");
+                let head = format!("Thread: {agent} (ro) ");
                 let room = width.saturating_sub(head.width());
-                if room >= ELIDED_MIN {
-                    format!("{head}{}", elide_middle(&id, room))
-                } else {
-                    format!("{head}{}", keep_tail(&id, room))
-                }
+                format!("{head}{}", keep_tail(&id, room))
             }
         }
     }
 
     fn hint(&self, width: u16) -> Line<'static> {
+        if self.picker.is_some() {
+            return Line::from(Span::styled(PICKER_HINT, DIM));
+        }
         if let Some(field) = &self.field {
             return Line::from(format!("/{}", render::plain_text(field)));
         }
@@ -1539,18 +1545,18 @@ mod tests {
         assert_eq!(elide_middle("abcdefghij", 6), "abcdefghij");
     }
 
-    /// Too narrow for the id beside "(read-only)", the title gives that
-    /// up first and then keeps only the id's end.
+    /// Too narrow for the id beside "(read-only)", the title shortens
+    /// that to "(ro)" first and then keeps only the id's end.
     #[test]
-    fn a_cramped_title_drops_read_only_then_keeps_the_ids_end() {
+    fn a_cramped_title_shortens_read_only_then_keeps_the_ids_end() {
         let pager = Pager::child(
             "reviewer_20260102_0a1b2c3d4e5f".to_string(),
             "reviewer".to_string(),
             PathBuf::from("/nonexistent/reviewer.yaml"),
         );
-        assert_eq!(pager.title(32), "Thread: reviewer review...3d4e5f");
-        assert_eq!(pager.title(23), "Thread: reviewer ...e5f");
-        assert_eq!(pager.title(19), "Thread: reviewer 5f");
+        assert_eq!(pager.title(36), "Thread: reviewer (read-only) re...5f");
+        assert_eq!(pager.title(35), "Thread: reviewer (ro) revie...d4e5f");
+        assert_eq!(pager.title(27), "Thread: reviewer (ro) ...5f");
         let pager = Pager::child(
             "rev-a1".to_string(),
             "reviewer".to_string(),

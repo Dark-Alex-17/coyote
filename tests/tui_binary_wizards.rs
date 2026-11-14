@@ -8,11 +8,10 @@
 //! `tui_binary_menus.rs`, and the transcript printed on the normal screen
 //! when the UI leaves in `tui_binary_exit.rs`). Each case runs the binary
 //! on a pseudo-terminal under a bash wrapper that reports the exit code
-//! and `stty -a`
-//! afterwards, so the file is unix-only. The cases run one at a time:
-//! each spawn forks a session leader and takes a controlling tty, and a
-//! fork landing between another test's `openpty` and its `exec` has
-//! failed the spawn with a garbled errno.
+//! and `stty -a` afterwards, so the file is unix-only. The cases run one
+//! at a time: each spawn forks a session leader and takes a controlling
+//! tty, and a fork landing between another test's `openpty` and its
+//! `exec` has failed the spawn with a garbled errno.
 #![cfg(unix)]
 
 mod common;

@@ -11,7 +11,7 @@ use super::bottom_pane::{
 use super::cells::elapsed_text;
 use super::{ChromeKind, DIM, chrome_style};
 use crate::events::NoticeKind;
-use crate::supervisor::escalation::EscalationQueue;
+use crate::supervisor::escalation::{EscalationQueue, PendingEscalation};
 use crate::supervisor::{Supervisor, TaskKind, TaskRow, TaskRowStatus};
 use parking_lot::RwLock;
 use ratatui::buffer::Buffer;
@@ -19,7 +19,6 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
-use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
@@ -49,11 +48,8 @@ impl RosterSources {
         tasks.sort_by(|a, b| a.id.cmp(&b.id));
         let mut rows: Vec<RosterRow> = tasks.into_iter().map(RosterRow::Task).collect();
         if let Some(queue) = &self.escalations {
-            let mut asks: Vec<Escalation> = queue
-                .pending_summary()
-                .iter()
-                .filter_map(Escalation::from_summary)
-                .collect();
+            let mut asks: Vec<Escalation> =
+                queue.pending().into_iter().map(Escalation::from).collect();
             asks.sort_by(|a, b| a.id.cmp(&b.id));
             rows.extend(asks.into_iter().map(RosterRow::Escalation));
         }
@@ -72,25 +68,15 @@ pub(super) struct Escalation {
     pub(super) options: Vec<String>,
 }
 
-impl Escalation {
-    fn from_summary(entry: &Value) -> Option<Self> {
-        let text = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_string);
-        Some(Self {
-            id: text("escalation_id")?,
-            agent_id: text("from_agent_id")?,
-            agent_name: text("from_agent_name").unwrap_or_default(),
-            question: text("question").unwrap_or_default(),
-            options: entry
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|options| {
-                    options
-                        .iter()
-                        .filter_map(|option| option.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        })
+impl From<PendingEscalation> for Escalation {
+    fn from(pending: PendingEscalation) -> Self {
+        Self {
+            id: pending.id,
+            agent_id: pending.from_agent_id,
+            agent_name: pending.from_agent_name,
+            question: pending.question,
+            options: pending.options.unwrap_or_default(),
+        }
     }
 }
 
@@ -127,8 +113,8 @@ impl RosterRow {
 
     /// The row's text after its label: a task's id, padded to `id_width`
     /// columns so the states line up, its state and, while it runs, how
-    /// long it has run by `now`; a question's first line and how many
-    /// follow.
+    /// long it has run by `now`; a question's first line, without the
+    /// `[kind] ` that names its modal, and how many follow.
     fn detail(&self, id_width: usize, now: Instant) -> String {
         match self {
             RosterRow::Task(task) => {
@@ -150,7 +136,8 @@ impl RosterRow {
                 detail
             }
             RosterRow::Escalation(ask) => {
-                let (first, tail) = first_line(&ask.question);
+                let (_, question) = super::escalation_kind(&ask.question);
+                let (first, tail) = first_line(question);
                 if tail.is_empty() {
                     first
                 } else {
@@ -360,7 +347,7 @@ pub(super) mod tests {
             ask(
                 "esc_9c0d1e2f",
                 "reviewer",
-                "Ship the fix to main?\nIt touches the release.",
+                "[confirm] Ship the fix to main?\nIt touches the release.",
             ),
         ]);
         state.move_highlight(1);
@@ -535,14 +522,14 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn questions_come_from_the_queue_summary_with_their_options() {
+    fn questions_come_from_the_queue_with_their_options_and_without_their_kind() {
         let queue = Arc::new(EscalationQueue::new());
         let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         queue.submit(crate::supervisor::escalation::EscalationRequest {
             id: "esc_3a4b5c6d".to_string(),
             from_agent_id: "agent_planner_7d8e9f0a".to_string(),
             from_agent_name: "planner".to_string(),
-            question: "Which branch?".to_string(),
+            question: "[select] Which branch?".to_string(),
             options: Some(vec!["main".to_string(), "dev".to_string()]),
             reply_tx,
         });
@@ -550,15 +537,17 @@ pub(super) mod tests {
             supervisor: None,
             escalations: Some(queue),
         };
+        let rows = sources.rows();
         assert_eq!(
-            sources.rows(),
+            rows,
             vec![RosterRow::Escalation(Escalation {
                 id: "esc_3a4b5c6d".to_string(),
                 agent_id: "agent_planner_7d8e9f0a".to_string(),
                 agent_name: "planner".to_string(),
-                question: "Which branch?".to_string(),
+                question: "[select] Which branch?".to_string(),
                 options: vec!["main".to_string(), "dev".to_string()],
             })]
         );
+        assert_eq!(rows[0].detail(0, frame_time()), "Which branch?");
     }
 }

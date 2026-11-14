@@ -145,6 +145,7 @@ fn the_transcript_printed_on_exit_honours_no_color() {
     pty.send(b"\x04").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
 
     let between = raw_between_leave_and_report(&pty);
     let text = squeezed(&strip_ansi(&String::from_utf8_lossy(&between)));
@@ -199,7 +200,9 @@ fn the_transcript_printed_on_exit_renders_the_reply_like_the_repl() {
     repl.read_for(Duration::from_millis(1200));
     let repl_rows = text_rows(&repl.raw()[from..]);
     repl.send(b"\x04").unwrap();
-    repl.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let transcript = repl.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
     let start = repl_rows
         .iter()
         .position(|row| row.contains("Heading r6t"))
@@ -220,7 +223,9 @@ fn the_transcript_printed_on_exit_renders_the_reply_like_the_repl() {
     wait_for_squeezed(&mut pty, "fenced_f7p", "the reply");
     pty.read_for(Duration::from_millis(800));
     pty.send(b"\x04").unwrap();
-    pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
     let dumped = text_rows(&raw_between_leave_and_report(&pty));
     let at = dumped
         .iter()

@@ -1060,7 +1060,7 @@ fn spawn_control_request(
             generation,
         } => {
             tasks.spawn_blocking(move || {
-                let result = pager::load_child(&file, &control).map_err(|err| format!("{err:#}"));
+                let result = catch_child_load(|| pager::load_child(&file, &control));
                 let _ = tx.send(UiMsg::ChildLoaded {
                     session_id,
                     generation,
@@ -1068,6 +1068,17 @@ fn spawn_control_request(
                 });
             });
         }
+    }
+}
+
+/// Runs a child load, a panic inside it reported as the error the pager
+/// shows rather than lost with the task.
+fn catch_child_load(
+    load: impl FnOnce() -> Result<Vec<pager::ChildEntry>>,
+) -> Result<Vec<pager::ChildEntry>, String> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)) {
+        Ok(result) => result.map_err(|err| format!("{err:#}")),
+        Err(_) => Err("child load panicked".to_string()),
     }
 }
 
@@ -1214,8 +1225,12 @@ pub(crate) struct App {
     child_reads: u64,
     roster_sources: RosterSources,
     /// A fork of the context as it last came back idle, for what the
-    /// roster and the pager do while a turn has the context. None before
-    /// the first sync and once the exit has begun.
+    /// roster and the pager do while a turn has the context: cancelling
+    /// a task, replying to an agent's question and reading a child's
+    /// session. The fork shares the supervisor, the escalation queue and
+    /// the child session root with the context the turn holds, so those
+    /// act on the turn's live tasks; it never runs a turn of its own.
+    /// None before the first sync and once the exit has begun.
     control: Option<Arc<RequestContext>>,
     /// Where child sessions live: the context's handle as it last came
     /// back, or the one a child's first write named during the turn
@@ -2248,6 +2263,9 @@ impl App {
             return;
         };
         let file = root.child_session_file(&session_id);
+        if self.pager.as_ref().is_some_and(Pager::shows_root) {
+            cells::release_full_output_caches(self.transcript.cells_for_layout().0);
+        }
         self.pager = Some(Pager::child(session_id.clone(), agent, file.clone()));
         self.read_open_child(session_id, file);
     }
@@ -2646,9 +2664,11 @@ impl App {
         let Some(index) = self.tool_row(call_id) else {
             return;
         };
-        if let Some(Cell::Tool { status, .. }) = self.transcript.cell_mut(index)
-            && let ToolStatus::Running { since } = *status
-        {
+        let Some(Cell::Tool { status, full, .. }) = self.transcript.cell_mut(index) else {
+            return;
+        };
+        let grew = full.settle();
+        if let ToolStatus::Running { since } = *status {
             // The hook's own measurement when it has one; the UI's clock
             // otherwise, so a failed call still shows how long it took.
             let elapsed =
@@ -2662,6 +2682,8 @@ impl App {
                 }
             };
         }
+        self.transcript
+            .account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
     /// A job or agent row takes the place of the running `starter` call
@@ -10868,7 +10890,7 @@ mod tests {
             id: "esc_x7x".to_string(),
             from_agent_id: "agent-x7x".to_string(),
             from_agent_name: "reviewer".to_string(),
-            question: "Which branch? x7x".to_string(),
+            question: "[select] Which branch? x7x".to_string(),
             options,
             reply_tx,
         });
@@ -10890,6 +10912,7 @@ mod tests {
         harness.press(KeyCode::F(3));
         let frame = harness.draw();
         assert!(frame.contains("Which branch? x7x"), "{frame}");
+        assert!(!frame.contains("[select]"), "{frame}");
         harness.press(KeyCode::Enter);
         let frame = harness.draw();
         assert_welcome_snapshot("escalation_modal_80x24", &frame);
@@ -11070,6 +11093,45 @@ mod tests {
         });
     }
 
+    /// A loader that panics reaches the pager as an error line, and the
+    /// read is no longer shown as loading.
+    #[test]
+    #[serial]
+    fn a_child_load_that_panics_degrades_to_an_error_line() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-pager-panicking-child");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 9 };
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness
+                .app
+                .open_child("panics-x7x".to_string(), "reviewer".to_string());
+            let Some(ControlRequest::LoadChild {
+                session_id,
+                generation,
+                ..
+            }) = harness.app.take_control_requests().pop()
+            else {
+                panic!("opening a child asks for a read");
+            };
+            let result =
+                tokio::task::spawn_blocking(|| catch_child_load(|| panic!("the loader broke")))
+                    .await
+                    .expect("the panic is caught inside the task");
+            assert_eq!(result, Err("child load panicked".to_string()));
+            harness.app.handle_msg(UiMsg::ChildLoaded {
+                session_id,
+                generation,
+                result,
+            });
+            let frame = harness.draw();
+            assert!(frame.contains("child load panicked"), "{frame}");
+            assert!(!frame.contains("Loading..."), "{frame}");
+        });
+    }
+
     fn save_running_child(root: &ChildSessionRoot, session_id: &str) {
         let meta = crate::config::child_sessions::ChildMeta::new_running(
             session_id,
@@ -11111,7 +11173,9 @@ mod tests {
     }
 
     /// Ctrl+T, Tab, Down, Enter opens a child's thread from the picker,
-    /// read-only, with what the child wrote.
+    /// read-only, with what the child wrote. Leaving the root thread, by
+    /// closing the pager or by opening the child, frees the lines the
+    /// root's whole outputs were laid out to.
     #[test]
     #[serial]
     fn the_picker_opens_a_childs_thread_through_the_keys() {
@@ -11124,11 +11188,28 @@ mod tests {
             ctx.child_session_root = Some(Arc::new(root));
             let mut harness = Harness::for_ctx(&ctx);
             harness.app.sync_from_ctx(&mut ctx);
+            harness.app.handle_msg(UiMsg::ToolOutput {
+                call_id: Some("job-call".to_string()),
+                bytes: b"root output\n".to_vec(),
+            });
+            let laid_out = |harness: &mut Harness| {
+                cells::any_full_output_laid_out(harness.app.transcript.cells_for_layout().0)
+            };
 
             press_ctrl(&mut harness, 't');
+            harness.draw();
+            assert!(laid_out(&mut harness));
+            harness.press(KeyCode::Esc);
+            assert!(harness.app.pager.is_none());
+            assert!(!laid_out(&mut harness));
+
+            press_ctrl(&mut harness, 't');
+            harness.draw();
+            assert!(laid_out(&mut harness));
             harness.press(KeyCode::Tab);
             harness.press(KeyCode::Down);
             harness.press(KeyCode::Enter);
+            assert!(!laid_out(&mut harness));
             run_control_requests(&mut harness).await;
             let frame = harness.draw();
             assert!(frame.contains("kid wrote k4k"), "{frame}");
