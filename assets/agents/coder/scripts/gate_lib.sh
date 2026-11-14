@@ -341,12 +341,25 @@ gate_failure_hash() {
       -e 's/[[:space:]]+$//' |
     LC_ALL=C sort -u)
   [[ -n "$lines" ]] || return 0
-  if command -v sha256sum >/dev/null 2>&1; then
-    printf '%s' "$lines" | sha256sum | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    printf '%s' "$lines" | shasum -a 256 | awk '{print $1}'
+  if gate_has_sha256; then
+    printf '%s' "$lines" | gate_sha256
   else
     printf '%s' "$lines" | cksum | awk '{print $1}'
+  fi
+}
+
+# gate_has_sha256 succeeds when gate_sha256 has a tool to hash with.
+gate_has_sha256() {
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1
+}
+
+# gate_sha256 prints the hex sha256 digest of its stdin, through sha256sum
+# or else `shasum -a 256`. Check gate_has_sha256 first.
+gate_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
   fi
 }
 
