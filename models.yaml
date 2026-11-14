@@ -9119,9 +9119,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -10895,9 +10895,9 @@
   - name: qwen/qwen3.5-9b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.158
-    output_price: 0.232
-    cache_read_price: 0.142
+    input_price: 0.17
+    output_price: 0.25
+    cache_read_price: 0.153
     max_output_tokens: 40960
     supports_vision: true
     supports_function_calling: true
