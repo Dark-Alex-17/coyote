@@ -698,10 +698,13 @@ check("answers: at the re-ask cap a non-stop recommendation is taken, otherwise 
 _hp = gates.apply_answer(base_state(escalation=escalation("handoff_path", "q", [option("Abort the run")], hard_trigger=True),
                                     last_answer="/no/such/handoff.md"))
 _real_apply = gates.apply_answer
+# the spent re-ask budget falls back to the recommendation through apply_answer; the stub makes that branch abort
 gates.apply_answer = lambda s: {"_next": "end_aborted"}
-_spent = _real_apply(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
-                                apply_reasks=gates.APPLY_REASK_MAX))
-gates.apply_answer = _real_apply
+try:
+    _spent = _real_apply(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
+                                    apply_reasks=gates.APPLY_REASK_MAX))
+finally:
+    gates.apply_answer = _real_apply
 check("answers: at the cap a recommendation that would still abort is not taken; the run blocks, never aborts",
       _spent["_next"] == "end_blocked" and any("would abort here" in d for d in _spent["decisions"]), _spent.get("_next"))
 _late = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - hmm, actually let's go with 3"))
@@ -3597,7 +3600,8 @@ check("lane_stuck: (i) same finding at the same HEAD but a changed code tree -> 
       u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == 2
       and any("code changed" in d for d in u.get("decisions", [])), (u.get("_next"), u.get("escalation", {}).get("kind")))
 u = a6_triage(A6_AGAIN, [tree_1, tree_2, tree_3], [A6_FINDING, A6_AGAIN, A6_AGAIN], gates.STUCK_CODE_CHANGED_CAP)
-check("lane_stuck: (ii) a block past STUCK_CODE_CHANGED_CAP on the same finding -> lane_stuck even though the code changed",
+check("lane_stuck: (ii) a block past STUCK_CODE_CHANGED_CAP on the same finding -> an owner decision under the "
+      "lane_stuck kind",
       u.get("escalation", {}).get("kind") == "lane_stuck", u.get("_next"))
 u = a6_triage(A6_AGAIN, [tree_2, tree_2], [A6_FINDING, A6_AGAIN], 1)
 check("lane_stuck: (iii) same finding over an unchanged code tree -> lane_stuck", u.get("escalation", {}).get("kind") == "lane_stuck",
@@ -3747,8 +3751,10 @@ plain_kept = as_list_(u.get("subtasks")) == plain and not any("merged into" in d
 check("subtasks: a plain two-subtask plan with no tests-first subtask is unchanged", plain_kept, u.get("subtasks"))
 
 # ---------------------------------------------------------------- caps escalate, they never amputate
-FIX_CEIL = getattr(_lib, "FIX_ROUND_CEILING", STRIKE_LIMIT)
+FIX_CEIL = _lib.FIX_ROUND_CEILING
 STOP_WORDS_RE = re.compile(r"\b(?:abort|stop|cancel|quit|give up)\b", re.I)
+SO_REF = "refs/sisyphus-next/strikeout/x abc (recover with: git diff)"
+SO_SUBTASK = {"subtasks": subs, "subtask_index": 0, "strikeout_stash": SO_REF}
 
 
 def recommended(esc):
@@ -3775,8 +3781,8 @@ _high = {"lane_stuck": stuck_triage(strikeout_rounds=FIX_CEIL).get("escalation",
          "review_exhausted": gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "code-review"}],
                                                            review_rounds=STRIKE_LIMIT, strikeout_rounds=FIX_CEIL)
                                                 ).get("escalation", {}),
-         "strikeout": gates.strikeout_route(base_state(oracle_result="cannot resolve", strikeout_rounds=FIX_CEIL)
-                                            ).get("escalation", {})}
+         "strikeout": gates.strikeout_route(base_state(oracle_result="cannot resolve", strikeout_rounds=FIX_CEIL,
+                                                       **SO_SUBTASK)).get("escalation", {})}
 check("caps: at FIX_ROUND_CEILING the round stays offered and a non-stop way on is recommended instead",
       all(len(recommended(e)) == 1 and not STOP_WORDS_RE.search(recommended(e)[0])
           and not re.search(r"one more", recommended(e)[0], re.I)
@@ -3784,24 +3790,52 @@ check("caps: at FIX_ROUND_CEILING the round stays offered and a non-stop way on 
       and recommended(_high["lane_stuck"]) == ["Accept the findings unresolved and proceed"]
       and recommended(_high["review_exhausted"]) == ["Accept the findings unresolved and proceed"],
       {k: recommended(e) for k, e in _high.items()})
-_again = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", SO3), last_answer="One more fix round anyway",
-                                           strikeout_rounds=FIX_CEIL + 1))
-          for k in ("lane_stuck", "review_exhausted", "strikeout")}
+_round_texts = {"lane_stuck": "One more fix round anyway", "review_exhausted": "One more fix round anyway",
+                "strikeout": "Apply the oracle's notes in one more coder round anyway"}
+_again = {k: gates.apply_answer(base_state(escalation=_high[k], last_answer=t, strikeout_rounds=FIX_CEIL + 1))
+          for k, t in _round_texts.items()}
 check("caps: an explicit one-more-round pick is honoured every time, past the ceiling too, and counted",
       all(u["_next"] == "compose_fix" and u["strikeout_rounds"] == FIX_CEIL + 2 for u in _again.values()),
       {k: u.get("_next") for k, u in _again.items()})
 _so_esc = _high["strikeout"]
 _so_pick = next((o["text"] for o in _so_esc.get("options") or [] if o["text"].startswith("Proceed without")), "")
 u = gates.apply_answer(base_state(escalation=_so_esc, last_answer=_so_pick, oracle_result="ORACLE-NOTE: root cause is X",
-                                  strikeout_stash="refs/sisyphus-next/strikeout/x", strikeout_rounds=FIX_CEIL))
+                                  strikeout_rounds=FIX_CEIL, **SO_SUBTASK))
 check("caps: the strikeout proceed option goes on without the change, keeping the oracle's notes and the saved attempt",
-      _so_pick and u["_next"] == "observability_gate"
+      _so_pick and u["_next"] == "next_subtask"
       and any("ORACLE-NOTE" in f and "refs/sisyphus-next/strikeout/x" in f for f in u.get("follow_ups") or [])
       and any("ORACLE-NOTE" in d for d in u.get("decisions") or []), (_so_pick, u.get("_next")))
+_so_unsafe = {"single-task": {"strikeout_stash": SO_REF},
+              "final review": {**SO_SUBTASK, "final_review": True},
+              "whole-worktree stash": {**SO_SUBTASK, "strikeout_stash": "Saved working directory and index state"}}
+_so_hard = {k: gates.strikeout_route(base_state(oracle_result="change Y", strikeout_rounds=FIX_CEIL, **s)
+                                     ).get("escalation", {}) for k, s in _so_unsafe.items()}
+check("caps: strikeout without a subtask's own saved attempt offers no proceed; at the ceiling a hard trigger with "
+      "no recommendation",
+      all(not any(o["text"] == gates.STRIKEOUT_PROCEED for o in e.get("options") or []) and e.get("hard_trigger")
+          and not recommended(e) for e in _so_hard.values()),
+      {k: (recommended(e), e.get("hard_trigger")) for k, e in _so_hard.items()})
+_so_np = {k: gates.apply_answer(base_state(escalation=escalation("strikeout", "q", [option("Apply it"),
+                                                                                   option(gates.STRIKEOUT_PROCEED)]),
+                                           last_answer=gates.STRIKEOUT_PROCEED, **s)) for k, s in _so_unsafe.items()}
+check("caps: a strikeout proceed pick where proceeding was not offered is asked again, never applied",
+      all(u["_next"] == "ask_dispatch" and not u.get("follow_ups") for u in _so_np.values()),
+      {k: u.get("_next") for k, u in _so_np.items()})
+_sec = {"lane_stuck": gates.triage_route(base_state(
+            triage=[{"finding": "DIVERGES: c1", "action": "fix", "lane": "security"}], review_rounds=0,
+            round_heads=[{"code_tree": "t1", "lane_blockers": {"security": ["DIVERGES: c1"]}}] * 2,
+            lane_block_streak={"security": 1}, strikeout_rounds=FIX_CEIL)).get("escalation", {}),
+        "review_exhausted": gates.triage_route(base_state(triage=[{"finding": "x", "action": "fix", "lane": "security"}],
+                                                          review_rounds=STRIKE_LIMIT, strikeout_rounds=FIX_CEIL)
+                                               ).get("escalation", {})}
+check("caps: at FIX_ROUND_CEILING security blockers raise a hard trigger that recommends nothing",
+      all(e.get("kind") == k and e.get("hard_trigger") and not recommended(e) for k, e in _sec.items()),
+      {k: (e.get("kind"), recommended(e), e.get("hard_trigger")) for k, e in _sec.items()})
 check("caps: next_subtask resets the extra-round counter for each subtask",
       gates.next_subtask(base_state(subtasks=subs, subtask_index=1, strikeout_rounds=FIX_CEIL))["strikeout_rounds"] == 0)
 
 u = a6_triage(A6_AGAIN, [tree_1, tree_2], [A6_FINDING, A6_AGAIN], gates.STUCK_CODE_CHANGED_CAP - 1)
+check("caps: STUCK_CODE_CHANGED_CAP is 3", gates.STUCK_CODE_CHANGED_CAP == 3, gates.STUCK_CODE_CHANGED_CAP)
 check("caps: STUCK_CODE_CHANGED_CAP is the last changed-code streak with a fix round, so the cap fires one block later",
       u.get("_next") == "compose_fix" and u.get("lane_block_streak", {}).get("adversary") == gates.STUCK_CODE_CHANGED_CAP,
       (u.get("_next"), u.get("escalation", {}).get("kind")))
@@ -3862,6 +3896,35 @@ check("caps: do it here past the sizing cap keeps the reason, plans in this run,
 _sc2 = gates.route_intent(base_state(**{**_ss, "sizing": "plan_shaped"})).get("escalation", {})
 check("caps: a second sizing cap after a granted extension recommends the architect handoff, still no stop",
       recommended(_sc2) == [gates.SIZING_ARCHITECT], recommended(_sc2))
+_sp = gates.record_subtasks(base_state(**{**sz, "subtasks": subs + [subs[0]], "sizing_rounds": CLARIFY_MAX}))
+_sp_esc = _sp.get("escalation", {})
+check("caps: a sizing cap after the planner overflowed recommends the architect; do it here stays offered",
+      _sp_esc.get("kind") == "sizing_cap" and _lib.as_dict(_sp_esc.get("data")).get("planned") is True
+      and recommended(_sp_esc) == [gates.SIZING_ARCHITECT]
+      and gates.SIZING_HERE_REASON in [o["text"] for o in _sp_esc.get("options") or []],
+      (_sp_esc.get("kind"), recommended(_sp_esc)))
+_cbare, _ = chain(base_state(escalation=_cq, clarify_rounds=CLARIFY_MAX, clarifications="", last_answer="1"),
+                  "apply_answer")
+_cnote, _ = chain(base_state(escalation=_cq, clarify_rounds=CLARIFY_MAX, clarifications="",
+                             last_answer=f"{recommended(_cq)[0]}: READING-NOTE"), "apply_answer")
+check("caps: a bare clarify_cap pick goes on and records no stated reason; a noted pick records the note",
+      _cbare.get("clarify_extensions") == 1 and gates.NO_STATED_REASON in _cbare.get("clarifications", "")
+      and recommended(_cq)[0] not in _cbare.get("clarifications", "")
+      and any(gates.NO_STATED_REASON in d for d in _cbare.get("decisions") or [])
+      and "A: READING-NOTE" in _cnote.get("clarifications", "")
+      and any("READING-NOTE" in d for d in _cnote.get("decisions") or []),
+      (_cbare.get("clarifications"), _cnote.get("clarifications")))
+_sbare, u = chain(base_state(**sz, sizing_rounds=CLARIFY_MAX, escalation=_sc, last_answer=_here), "apply_answer")
+_snum, u2 = chain(base_state(**sz, sizing_rounds=CLARIFY_MAX, escalation=_sc,
+                             last_answer=f"{[o['text'] for o in _sc['options']].index(_here) + 1}: NUMBERED-NOTE"),
+                  "apply_answer")
+check("caps: a bare sizing_cap pick goes on and records no stated reason; a numbered pick with a note records the note",
+      u.get("_next") == "plan_subtasks" and gates.NO_STATED_REASON in _sbare.get("sizing_note", "")
+      and gates.NO_STATED_REASON in _sbare.get("clarifications", "")
+      and any(gates.NO_STATED_REASON in d for d in _sbare.get("decisions") or [])
+      and u2.get("_next") == "plan_subtasks" and "stating: NUMBERED-NOTE." in _snum.get("sizing_note", "")
+      and any("NUMBERED-NOTE" in d for d in _snum.get("decisions") or []),
+      (_sbare.get("sizing_note"), _snum.get("sizing_note")))
 
 check("caps: next_subtask resets oracle_retries for each subtask",
       gates.next_subtask(base_state(subtasks=subs, subtask_index=1, oracle_retries=RERUN_ONCE)).get("oracle_retries") == 0)
@@ -3905,13 +3968,20 @@ import audit_graph  # noqa: E402
 check("caps: initial_state seeds apply_reasks next to reask_rounds, and the audit names APPLY_REASK_MAX",
       re.search(r"(?m)^  reask_rounds: 0\n  apply_reasks: 0$", _initial) is not None
       and "APPLY_REASK_MAX" in audit_graph.BOUNDED.get("apply_answer", ""))
+check("caps: initial_state seeds clarify_extensions and sizing_extensions next to their round counters",
+      re.search(r"(?m)^  clarify_rounds: 0\n  clarify_extensions: 0$", _initial) is not None
+      and re.search(r"(?m)^  sizing_rounds: 0\n  sizing_extensions: 0$", _initial) is not None)
+check("caps: the final whole-task review resets oracle_retries",
+      gates._start_final_review(base_state(subtasks=subs, oracle_retries=RERUN_ONCE), {}, len(subs))
+      .get("oracle_retries") == 0)
 _ra, u = chain(base_state(escalation=escalation("lane_stuck", "q", SO3), last_answer="hmm", reask_rounds=REASK_MAX - 1),
                "apply_answer")
 _rb, u2 = chain({**_ra, "last_answer_text": "still hmm", "reply_interpreted": True}, "parse_answer")
 _rc, u3 = chain({**_rb, "last_answer_text": "hmm again"}, "parse_answer")
-shared_total = (u["_next"] == "ask_dispatch" and _ra.get("reask_rounds") == REASK_MAX - 1 and u2["_next"] != "apply_answer"
+_reset = gates.raise_escalation({**_rc, "apply_reasks": gates.APPLY_REASK_MAX}, {}, escalation("x", "q"))
+shared_total = (u["_next"] == "ask_dispatch" and _ra.get("reask_rounds") == REASK_MAX - 1 and u2["_next"] == "ask_user"
                 and _rb.get("reask_rounds") == REASK_MAX and u3["_next"] == "apply_answer"
-                and gates.raise_escalation(_rc, {}, escalation("x", "q"))["reask_rounds"] == 0)
+                and _reset["reask_rounds"] == 0 and _reset["apply_reasks"] == 0)
 _rs = (_ra.get("reask_rounds"), u2.get("_next"), u3.get("_next"))
 check("caps: apply_answer's re-ask leaves parse_answer's count, so both share one bounded total per escalation", shared_total, _rs)
 

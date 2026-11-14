@@ -3115,6 +3115,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "ci_polls",
     "ci_polls_run",
     "ci_started_at",
+    "clarify_extensions",
     "clarify_rounds",
     "debris_reruns",
     "debt_rounds",
@@ -3134,6 +3135,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "reask_rounds",
     "rejected_rounds",
     "review_rounds",
+    "sizing_extensions",
     "sizing_rounds",
     "strikeout_rounds",
     "subtask_estimate",
@@ -3143,7 +3145,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
 
 /// The bound constants in `scripts/_lib.py` the gates route on (the
 /// re-run-once family covers `debris_reruns`), as written in the baseline,
-/// plus the review-watch bounds.
+/// plus the review-watch bounds and the per-subtask extra fix-round ceiling.
 const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CHOICE_OPTIONS_MAX", "4"),
     ("CHOICE_OPTIONS_MIN", "2"),

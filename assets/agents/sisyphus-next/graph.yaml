@@ -164,6 +164,7 @@ initial_state:
   clarifying_questions: []
   clarifications: ''
   clarify_rounds: 0
+  clarify_extensions: 0
   needs_oracle: false
   oracle_question: ''
   architecture_scale: false
@@ -196,6 +197,7 @@ initial_state:
   task_number: 0
   # --- sizing verdict (plan-shaped work asked, not refused) ---
   sizing_rounds: 0
+  sizing_extensions: 0
   sizing_note: ''
   architect_handoff: ''
   handoff_report: ''

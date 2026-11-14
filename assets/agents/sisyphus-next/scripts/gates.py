@@ -441,7 +441,7 @@ def _sizing_cap(state, u, rounds, reason, planned):
         evidence.append(f"The in-run planner could not fit the work into {SUBTASK_MAX} subtasks")
     if breakdown:
         evidence += ["Proposed breakdown:"] + [f"- {b}" for b in breakdown]
-    here = granted < RERUN_ONCE
+    here = granted < RERUN_ONCE and planned is None
     opts = [option(SIZING_HERE_REASON, here, f"plans at most {SUBTASK_MAX} sealed subtasks in this run; the reason is "
                                              "recorded with the clarifications"),
             option(SIZING_ARCHITECT, not here, "writes a ready architect handoff that a bare go-ahead in architect-next "
@@ -1074,7 +1074,8 @@ def _start_final_review(state, u, n):
         "final_review": True, "base_sha": base, "debt_base": base, "current_task": task,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
-        "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": brief, "expected_files": [],
+        "oracle_retries": 0, "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": brief,
+        "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
         # rejections made against a subtask's scope are no ruling on the parent criteria
         "final_rejections_from": len(as_list(state.get("rejected_findings"))),
@@ -1806,6 +1807,23 @@ def _named_option(answer, options):
                  if o.get("text", "").strip() and low.startswith(o["text"].strip().lower() + ":")), None)
 
 
+NO_STATED_REASON = "no reason stated (the recommended/bare option was taken)"
+
+
+def _stated_reason(answer, options):
+    """The reason a reply gives: the note after the option it names, the whole reply when it names none, and
+    NO_STATED_REASON for a bare option label or number."""
+    answer = (answer or "").strip()
+    picked = _named_option(answer, options)
+    if not picked:
+        return answer or NO_STATED_REASON
+    numbered, note = split_option_reply(answer, options)
+    if not numbered:
+        own = picked.strip()
+        note = answer[len(own) + 1:] if answer.lower().startswith(own.lower() + ":") else ""
+    return (note or "").strip() or NO_STATED_REASON
+
+
 def _is_stop_text(text):
     """Whether an option text stops or aborts the run."""
     return (text or "").strip().lower().startswith(("stop", "abort"))
@@ -1945,11 +1963,12 @@ def apply_answer(state):
     elif kind == "clarify_cap":
         # any reply that is no stop states the reading the run goes on from; its text is kept as the stated reason
         granted = as_int(state.get("clarify_extensions")) + 1
+        reason = _stated_reason(answer, options)
         u["clarify_extensions"] = granted
-        u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
+        u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {reason}\n"
         u["assess_faulted"] = False
         ledger(state, u, f"clarify: past the CLARIFY_MAX cap, going on (extension {granted}) on the stated reading: "
-                         f"{tail(answer, 300)}")
+                         f"{tail(reason, 300)}")
         if _named_option(answer, options) == CLARIFY_IMPLEMENT:
             u.update({"intent": "implementation", "sizing": "compound", "clarifying_questions": []})
             u["_next"] = "route_intent"
@@ -2004,15 +2023,16 @@ def apply_answer(state):
             _hand_to_architect(state, u)
         elif picked == SIZING_HERE_REASON:
             granted = as_int(state.get("sizing_extensions")) + 1
+            reason = _stated_reason(answer, options)
             u["sizing_extensions"] = granted
-            u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
+            u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {reason}\n"
             u["sizing_note"] = (f"The user chose to do this work here past {CLARIFY_MAX} plan-shaped sizing verdicts "
-                                f"({state.get('sizing_reason') or 'no reason recorded'}), stating: {answer}. Fit it into "
+                                f"({state.get('sizing_reason') or 'no reason recorded'}), stating: {reason}. Fit it into "
                                 f"at most {SUBTASK_MAX} sealed subtasks; return an empty list with plan_shaped_reason "
                                 "only when it cannot fit at all.")
             _consume_handoff(state, u)
             ledger(state, u, f"sizing: past the CLARIFY_MAX cap, doing it here (extension {granted}); stated reason: "
-                             f"{tail(answer, 300)}")
+                             f"{tail(reason, 300)}")
             u["_next"] = "plan_subtasks"
         else:
             _reask_unmatched(state, u, esc, answer, "picks none of the sizing options", exhausted={
@@ -2128,7 +2148,8 @@ def apply_answer(state):
                                                    "proceed": ["proceed without"]})
         # a strikeout's way on is proceeding without its change, the others' is accepting the findings
         onward = "proceed" if kind == "strikeout" else "accept"
-        if a is None or (a in ("accept", "proceed") and a != onward):
+        if a is None or (a in ("accept", "proceed") and a != onward) \
+                or (a == "proceed" and not _strikeout_can_proceed(state)):
             _reask_unmatched(state, u, esc, answer)
         elif a == "round":
             rounds = as_int(state.get("strikeout_rounds")) + 1
@@ -2621,6 +2642,12 @@ def _save_failed_attempt(state, u, root, start, head):
 STRIKEOUT_PROCEED = "Proceed without this change (the failed attempt stays set aside; the oracle's notes go in the report)"
 
 
+def _strikeout_can_proceed(state):
+    """Proceeding without the change is only safe when it drops this subtask's attempt alone: a later subtask
+    exists to move on to, and the attempt was saved under its own ref rather than in a whole-worktree stash."""
+    return _subtask_phase(state) and (state.get("strikeout_stash") or "").startswith("refs/sisyphus-next/strikeout/")
+
+
 def _extra_rounds(state):
     """(spent, note): whether this subtask's extra fix rounds reached FIX_ROUND_CEILING, and the count as evidence.
 
@@ -2636,20 +2663,22 @@ def strikeout_route(state):
     unresolved = (not result or result.startswith("Agent node failed")
                   or re.search(r"cannot (be )?resolve|unable to resolve|no resolution|cannot determine", result, re.I))
     spent, note = _extra_rounds(state)
+    proceed = _strikeout_can_proceed(state)
     if unresolved:
         opts = [option("Apply the oracle's notes in one more coder round anyway", not spent,
-                       f"the oracle could not resolve it; {note}"),
-                option(STRIKEOUT_PROCEED, spent, "the subtask's change is left out and recorded as a follow-up"),
-                option("Abort and report (code left in a working state; the failed attempt is stashed)")]
+                       f"the oracle could not resolve it; {note}")]
     else:
         opts = [option("Apply the oracle's direction in ONE more coder round", not spent,
-                       f"the oracle proposed a concrete resolution; {note}"),
-                option(STRIKEOUT_PROCEED, spent, "the subtask's change is left out and recorded as a follow-up"),
-                option("Abort and report")]
+                       f"the oracle proposed a concrete resolution; {note}")]
+    if proceed:
+        opts.append(option(STRIKEOUT_PROCEED, spent, "the subtask's change is left out and recorded as a follow-up"))
+    opts.append(option("Abort and report (code left in a working state; the failed attempt is stashed)"
+                       if unresolved else "Abort and report"))
+    # with no safe way on at the ceiling nothing is recommended, so the owner or the model decides
     return raise_escalation(state, u, escalation(
         "strikeout", f"Three fix attempts failed on the same problem. Oracle verdict: "
                      f"{'unresolved' if unresolved else 'resolution proposed'}. How to proceed?",
-        opts, evidence=f"{note}\n\n{tail(result, 2500)}", hard_trigger=bool(unresolved)))
+        opts, evidence=f"{note}\n\n{tail(result, 2500)}", hard_trigger=bool(unresolved) or (spent and not proceed)))
 
 
 # ====================================================================== 2.5
@@ -3173,11 +3202,14 @@ def _repeat_block(state, root, lane, fixes):
     return _code_changed(state, root, prev.get("code_tree") or "", cur.get("code_tree") or "")
 
 
-def _extra_round_options(state):
+def _extra_round_options(state, lanes):
+    """(options, hard): at the ceiling, security blockers are never accepted by default; nothing is recommended."""
     spent, note = _extra_rounds(state)
+    hard = spent and "security" in lanes
     return [option("One more fix round anyway", not spent, note),
-            option("Accept the findings unresolved and proceed", spent, "recorded as a follow-up; the run goes on"),
-            option("Abort and report")]
+            option("Accept the findings unresolved and proceed", spent and not hard,
+                   "recorded as a follow-up; the run goes on"),
+            option("Abort and report")], hard
 
 
 def _stuck_question(unchanged, capped, streak):
@@ -3275,13 +3307,15 @@ def triage_route(state):
         # set before either escalation too, so a fix round picked there works this review's findings
         u["fix_items"] = [f for _, f in fixes]
         if unchanged or capped:
+            opts, hard = _extra_round_options(state, unchanged + capped)
             return raise_escalation(state, u, escalation(
-                "lane_stuck", _stuck_question(unchanged, capped, streak), _extra_round_options(state),
-                evidence=("\n".join(notes) + "\n\nFindings:\n" + findings)[:2500]))
+                "lane_stuck", _stuck_question(unchanged, capped, streak), opts,
+                evidence=("\n".join(notes) + "\n\nFindings:\n" + findings)[:2500], hard_trigger=hard))
         if rounds >= STRIKE_LIMIT:
+            opts, hard = _extra_round_options(state, {lane for lane, _ in fixes})
             return raise_escalation(state, u, escalation(
                 "review_exhausted", f"Still blocked after {STRIKE_LIMIT} review fix rounds. How to proceed?",
-                _extra_round_options(state), evidence=findings[:2500]))
+                opts, evidence=findings[:2500], hard_trigger=hard))
         u["review_rounds"] = rounds + 1
         u["fix_source"] = "review"
         ledger(state, u, f"review: round {rounds + 1} fixes {len(fixes)} finding(s) in lanes {sorted(lanes_now)}")

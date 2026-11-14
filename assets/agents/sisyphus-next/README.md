@@ -99,9 +99,9 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:2523:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:2643:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:2644:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/gates.py:2544:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:2646:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:2647:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
@@ -166,7 +166,8 @@ first reply that names no option goes to the `interpret_reply` llm node with the
 the reply and the instructions the kind accepts (`ACCEPTED_INSTRUCTIONS`: `answer` for
 `clarify` and `design_ask`, `design` for `design_choice`, `amendment` for `plan_defect`,
 `recipe` for `probe_gap`, `rescope` for `scope_breach`, `path` for `handoff_confirm` and
-`handoff_path`). `interpret_route` acts on the verdict: an option counts only when the
+`handoff_path`, `answer` for `clarify_cap`, `here` for `sizing_cap`). `interpret_route` acts
+on the verdict: an option counts only when the
 interpreter names it exactly or by its number; an accepted free-form instruction is applied
 with the owner's own words verbatim inside the answer prefix `apply_answer` keys on (for
 example `Continue; treat the criterion as amended: <reply>`); an unaccepted or unapplicable
@@ -276,7 +277,11 @@ trimmed or dropped but raises `sizing_verdict` again with the planner's breakdow
 architect and narrow options, while a delegated one ends at `end_redirect`. `sizing_rounds`
 bounds the verdicts at `CLARIFY_MAX` (3) per run; past it `sizing_cap` asks with the verdicts
 as evidence: do it here on a stated reason (recommended until one such extension was granted,
-then the architect handoff is), hand it to the architect, or stop. `clarify_rounds` caps
+or after the planner overflowed, then the architect handoff is), hand it to the architect, or
+stop. A bare option label or number still goes on, and the ledger, the clarifications and the
+sizing note record "no reason stated (the recommended/bare option was taken)"; a note after the
+option (`<option>: <text>`), or free text for `clarify_cap`, is kept as the stated reason.
+`clarify_rounds` caps
 clarification the same way through `clarify_cap`. Neither round counter is ever reset; the
 extensions are counted in `sizing_extensions` and `clarify_extensions`. The
 wrapper's ignored `choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages` tail
@@ -298,8 +303,22 @@ moved only by commits that are on the upstream branch and were made before the s
 the worktree matching it, is a pull: no change. The run base moves past such a pull only while
 no earlier subtask has committed (HEAD still at the run base; uncommitted earlier work stays in
 the diff either way); after that the pulled commits stay in the whole-task diff.
-When nothing commits between subtasks the review's `Diff:` also carries earlier subtasks' work,
-so the prompt names the files this subtask changed.
+Each subtask's diff base is a snapshot of the worktree when the subtask starts, untracked
+non-ignored files included, so its review's `Diff:` carries only this subtask's work even when
+nothing commits between subtasks; the base falls back to HEAD only when the snapshot fails,
+and then the prompt names the files this subtask changed.
+
+Stuck lanes and the extra fix-round ceiling: a lane is stuck only when it blocks on the same
+findings over a code tree verified unchanged since its previous round. A tree that changed, or
+that could not be verified (a missing tree, a git error, fewer than two rounds), is never
+stuck: it gets another fix round, ledgered as such, up to `STUCK_CODE_CHANGED_CAP` (3) blocks
+in a row, and past that the `lane_stuck` question goes to the owner and says the code changed
+or could not be verified. `lane_stuck`, `review_exhausted` and `strikeout` recommend one more
+fix round until the subtask has used `FIX_ROUND_CEILING` (3) extra rounds; from then on the
+round stays offered and the recommendation moves to accepting the findings, or for a
+strikeout to proceeding without the change. Proceeding without a strikeout's change is offered
+only in a subtask whose failed attempt was saved under its own strikeout ref; elsewhere, and
+when security blocks at the ceiling, the question is a hard trigger with nothing recommended.
 
 A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
 attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and
