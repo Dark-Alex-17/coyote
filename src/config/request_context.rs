@@ -25606,8 +25606,8 @@ mod tests {
         let out = run_adversary_script("verdict.py", &state);
         let report = out["adv_report"].as_str().unwrap();
         assert!(
-            report.contains("- [SKIPPED] `cargo test --all`"),
-            "a skipped record must render as SKIPPED: {report}"
+            report.contains("- [NOT RUN] `cargo test --all`"),
+            "a skipped record must render as NOT RUN: {report}"
         );
         assert!(
             !report.contains("[FAIL] `cargo test --all`"),
@@ -25676,12 +25676,12 @@ mod tests {
         let out = run_adversary_script("verdict.py", &state);
         let report = out["adv_report"].as_str().unwrap();
         assert!(
-            report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
-            "a skipped (unproven) run must force DIVERGES: {report}"
+            report.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+            "a skipped run is not run, not red: the criterion checks judge what it covers: {report}"
         );
         assert!(
-            report.contains("1. Verification run `cargo clippy` — never ran"),
-            "the skipped run must be a numbered complaint naming the command: {report}"
+            report.contains("- [NOT RUN] `cargo clippy`") && !report.contains("Complaints:"),
+            "the skipped run must render as NOT RUN, never as a complaint: {report}"
         );
     }
 
@@ -26023,7 +26023,7 @@ mod tests {
         );
         assert_eq!(out["gate_attempts"], 1);
 
-        // Malformed output with the retry exhausted → recorded PARTIAL (unproven).
+        // Second failure re-asks again, quoting the rejected output.
         let out = run_adversary_script(
             "crit_gate.py",
             &json!({
@@ -26032,13 +26032,36 @@ mod tests {
                 "crit_verdict": "still not json"
             }),
         );
-        assert_eq!(out["crit_verdict"]["status"], "PARTIAL");
+        assert_eq!(
+            out["_next"], "check_criterion",
+            "second failure must retry: {out}"
+        );
+        assert_eq!(out["gate_attempts"], 2);
+        assert!(
+            out["gate_feedback"]
+                .as_str()
+                .unwrap()
+                .contains("still not json"),
+            "the second re-ask must quote the rejected output: {out}"
+        );
+
+        // Re-asks spent on unrecoverable output: UNVERIFIED with the raw output.
+        let out = run_adversary_script(
+            "crit_gate.py",
+            &json!({
+                "criterion": {"id": "c7", "text": "the spec"},
+                "gate_attempts": 2,
+                "crit_verdict": "still not json"
+            }),
+        );
+        assert_eq!(out["crit_verdict"]["status"], "UNVERIFIED");
+        assert_eq!(out["crit_verdict"]["evidence"], "still not json");
         assert!(
             out["crit_verdict"]["complaint"]
                 .as_str()
                 .unwrap()
                 .contains("failed machine validation"),
-            "exhausted retries must record the unproven complaint: {out}"
+            "exhausted re-asks must record the validation reason: {out}"
         );
     }
 
@@ -38806,7 +38829,10 @@ print(json.dumps({
         let report = out["adv_report"].as_str().unwrap().to_string();
         let lines: Vec<&str> = report.lines().collect();
         assert_eq!(lines[0], "ADVERSARIAL_REVIEW: CONFORMS", "{report}");
-        assert_eq!(lines[1], "Criteria: 1/1 met (all with tests).", "{report}");
+        assert_eq!(
+            lines[1], "Criteria: 1/1 met (1 test-proven, 0 by inspection).",
+            "{report}"
+        );
         assert_eq!(
             lines[2], "Debris: clean (3 added line(s) scanned, 1 debris-exempt line(s))",
             "{report}"

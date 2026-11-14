@@ -5,6 +5,12 @@ Resolves the diff spec (get_diff semantics: staged → unstaged → HEAD~1 for
 "auto"), lists changed files, and captures the bounded diff text every
 criterion branch verifies against. Failures degrade into diff_note — the
 review proceeds fail-closed rather than crashing.
+
+Also records `diff_base`, the commit SHA the diff is taken against, for the
+baseline runs in run_checks.py: HEAD for staged, worktree, and an `auto` that
+found staged or unstaged changes; HEAD~1 for an `auto` that fell back to it;
+A for `A..B`; the merge-base of A and B for `A...B`; and the normalized base
+for a revision. It is empty when the base cannot be resolved.
 """
 
 import json
@@ -98,6 +104,7 @@ def normalize_base(spec):
 
 
 out = {"diff_note": "", "project_dir": proj}
+base_rev = ""
 try:
     if spec.startswith("-"):
         raise ValueError(
@@ -105,17 +112,22 @@ try:
             "of worktree/staged/auto"
         )
     if spec in ("auto", ""):
+        base_rev = "HEAD"
         text = git_diff("--cached")
         if not text.strip():
             text = git_diff()
         if not text.strip():
+            base_rev = "HEAD~1"
             text = git_diff("HEAD~1")
     elif spec == "staged":
+        base_rev = "HEAD"
         text = git_diff("--cached")
     elif spec == "worktree":
+        base_rev = "HEAD"
         text = git_diff("HEAD")
     else:
         base, note = normalize_base(spec)
+        base_rev = base
         text = git_diff(base)
         out["diff_note"] += note
 
@@ -141,5 +153,20 @@ except Exception as e:  # noqa: BLE001
     out["changed_files"] = []
     out["diff_text"] = "(diff unavailable)"
     out["diff_note"] = f" (diff resolution failed for spec {spec!r}: {e})"
+
+
+def resolve_base(rev):
+    if "..." in rev:
+        left, right = rev.split("...", 1)
+        return git("merge-base", left or "HEAD", right or "HEAD").strip()
+    if ".." in rev:
+        rev = rev.split("..", 1)[0] or "HEAD"
+    return git("rev-parse", "--verify", f"{rev}^{{commit}}").strip()
+
+
+try:
+    out["diff_base"] = resolve_base(base_rev) if base_rev else ""
+except Exception:  # noqa: BLE001 -- an unresolvable base means no baseline run
+    out["diff_base"] = ""
 
 print(json.dumps(out))
