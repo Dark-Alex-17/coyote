@@ -2022,6 +2022,7 @@ impl RequestContext {
         match session.flush() {
             Ok(()) if is_child => events::bus().publish(Event::ChildTranscriptFlushed {
                 session_id: session.name().to_string(),
+                root: self.child_session_root.clone(),
             }),
             Ok(()) => {}
             Err(err) => {
@@ -15015,7 +15016,9 @@ mod tests {
             .drain()
             .into_iter()
             .filter_map(|event| match event {
-                Event::ChildTranscriptFlushed { session_id } if session_id == "flush-probe-x7x" => {
+                Event::ChildTranscriptFlushed { session_id, .. }
+                    if session_id == "flush-probe-x7x" =>
+                {
                     Some(session_id)
                 }
                 _ => None,

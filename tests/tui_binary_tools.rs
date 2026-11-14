@@ -6,6 +6,10 @@
 //! select an MCP server conflict asks during `.install`, the `init RAG?`
 //! question an agent with documents asks when it starts, and the `.rag`
 //! wizard and macro steps that reach those questions.
+//! After them: the transcript printed when Ctrl+D, Ctrl+C or `.exit`
+//! leaves the UI (and its `tui_dump_on_exit: false` opt-out), the Ctrl+T
+//! pager over a tool's whole output with its find and thread picker, and
+//! the F3 roster cancelling a background job.
 //! Each case runs the binary on a pseudo-terminal under a bash wrapper
 //! that reports the exit code and `stty -a` afterwards, so the file is
 //! unix-only. The cases run one at a time: each spawn forks a session
@@ -2027,4 +2031,410 @@ fn a_python_tools_select_returns_none_for_a_blank_custom_answer() {
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
+}
+
+// ---------------------------------------------------------------------------
+// What the UI leaves on the normal screen, and the pager over a tool's
+// whole output.
+// ---------------------------------------------------------------------------
+
+/// With `tui_dump_on_exit: false` the transcript is not printed when the
+/// UI leaves: the wrapper's report follows the leave directly.
+#[test]
+#[serial]
+fn tui_dump_on_exit_false_prints_nothing_between_the_leave_and_the_report() {
+    let dir = fresh_config_dir("dump-off");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text("the reply to drop k4w".to_string())]);
+    write_fake_llm_config_with(&dir, &fake, "tui_dump_on_exit: false\n");
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"prompt to drop j3q\r").unwrap();
+    wait_for_squeezed(&mut pty, "the reply to drop k4w", "the reply");
+    pty.read_for(Duration::from_millis(800));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let raw = pty.raw();
+    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
+    let report_at = after.find("exit=").expect("no exit= line after the leave");
+    assert!(
+        after[..report_at].trim().is_empty(),
+        "the transcript was printed with tui_dump_on_exit: false: {:?}",
+        after[..report_at].trim()
+    );
+}
+
+/// A tool that writes forty numbered lines to stderr, twice what a tool
+/// row keeps.
+const FORTY_LINES_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Print forty numbered lines.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   for i in $(seq -w 1 40); do echo \"pg-$i\" >&2; done\n\
+    \x20   echo \"fixture printed forty p9g\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Ctrl+T opens the pager over the screen with the tool's whole output,
+/// the lines its row in the transcript dropped included, and `q` closes
+/// it with the UI still taking keys.
+#[test]
+#[serial]
+fn ctrl_t_pages_a_tools_whole_output_and_q_closes_the_pager() {
+    let dir = fresh_config_dir("pager");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_forty".to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text("fixture done p9g".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_forty.sh", FORTY_LINES_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"print forty lines\r").unwrap();
+    wait_for_squeezed(&mut pty, "fixture done p9g", "the reply after the tool");
+    pty.read_for(Duration::from_millis(500));
+    let inline = repainted_frame(&mut pty, 30, 100);
+    assert!(
+        !inline.contains("pg-01"),
+        "the transcript shows a line its tool row drops:\n{inline}"
+    );
+
+    pty.send(b"\x14").unwrap();
+    repainted_frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Ctrl+T did not open the pager",
+    );
+    pty.send(b"g").unwrap();
+    repainted_frame_showing(
+        &mut pty,
+        "pg-01",
+        "the pager did not show the first line of the tool's output",
+    );
+
+    pty.send(b"q").unwrap();
+    let frame = repainted_frame_showing(&mut pty, "no session", "q did not give the screen back");
+    assert!(
+        !squeezed(&frame).contains("Thread:rootthread"),
+        "q left the pager on the screen:\n{frame}"
+    );
+    pty.send(b"still here").unwrap();
+    repainted_frame_showing(
+        &mut pty,
+        "still here",
+        "keys did not reach the composer after the pager closed",
+    );
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The first fully repainted frame that shows `needle`, panicking with
+/// `what` after a few repaints without it. The pager covers cells that may
+/// already hold the same characters, so a diff paint read straight off the
+/// pty can miss part of a string the screen does show.
+fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str) -> String {
+    let mut frame = String::new();
+    for rows in [30, 32, 30, 32, 30] {
+        frame = repainted_frame(pty, rows, 100);
+        if squeezed(&frame).contains(&squeezed(needle)) {
+            return frame;
+        }
+    }
+    panic!("{what}:\n{frame}");
+}
+
+// ---------------------------------------------------------------------------
+// The pager's find and thread picker, the roster over a background job,
+// and the transcript printed when Ctrl+C leaves an idle UI.
+// ---------------------------------------------------------------------------
+
+/// In the pager `/` finds a line of the tool's output that is off the
+/// screen, Tab lists the root thread, Esc goes back to the pager, and Esc
+/// again gives the screen back.
+#[test]
+#[serial]
+fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
+    let dir = fresh_config_dir("pager-find");
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "fixture_forty".to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text("fixture done f5d".to_string()),
+    ]);
+    write_fake_llm_config(&dir, &fake);
+    write_tool(&dir, "fixture_forty.sh", FORTY_LINES_TOOL);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"print forty lines\r").unwrap();
+    wait_for_squeezed(&mut pty, "fixture done f5d", "the reply after the tool");
+    pty.read_for(Duration::from_millis(500));
+
+    pty.send(b"\x14").unwrap();
+    repainted_frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Ctrl+T did not open the pager",
+    );
+    pty.send(b"g").unwrap();
+    let top = repainted_frame_showing(&mut pty, "pg-01", "g did not go to the top");
+    assert!(
+        !top.contains("pg-37"),
+        "pg-37 already on the top page:\n{top}"
+    );
+    pty.send(b"/pg-37").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    let found = repainted_frame_showing(&mut pty, "pg-37", "find did not bring pg-37 on screen");
+    // The repaint is the screen's rows in order with the escapes gone:
+    // the find field closed on Enter, so the last row is the key legend
+    // again and a `pg-37` ahead of it is a row of the text.
+    let legend = found
+        .rfind("j/k scroll")
+        .unwrap_or_else(|| panic!("Enter did not give the key legend back:\n{found}"));
+    assert!(
+        found[..legend].contains("pg-37") && !found.contains("/pg-37"),
+        "pg-37 is not in the pager's text:\n{found}"
+    );
+    assert!(
+        !found.contains("No match"),
+        "the find reported no match:\n{found}"
+    );
+
+    pty.send(b"\t").unwrap();
+    let picker = repainted_frame_showing(
+        &mut pty,
+        "Threads  Enter = open  Esc = back",
+        "Tab did not open the picker",
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let back = repainted_frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Esc did not go back to the pager",
+    );
+    assert!(
+        !squeezed(&back).contains(&squeezed("Threads  Enter = open  Esc = back")),
+        "Esc left the picker up:\n{back}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let frame = repainted_frame_showing(&mut pty, "no session", "Esc did not close the pager");
+    assert!(
+        !squeezed(&frame).contains("Thread:rootthread"),
+        "the pager is still up after Esc:\n{frame}\npicker was:\n{picker}"
+    );
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// A tool that records its pid at `pid_file` and then becomes a sleep far
+/// longer than a test runs, so the recorded pid is the sleeper's.
+fn sleeping_tool(pid_file: &Path) -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         \n\
+         # @describe Sleep for a long time.\n\
+         \n\
+         # @env LLM_OUTPUT=/dev/stdout The output path\n\
+         \n\
+         main() {{\n\
+         \x20   echo $$ > \"{}\"\n\
+         \x20   exec sleep 300\n\
+         }}\n",
+        pid_file.display()
+    )
+}
+
+fn alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Kills the recorded sleepers when the test ends, so a failed assertion
+/// does not leave them running for five minutes.
+struct Sleepers(Vec<PathBuf>);
+
+impl Drop for Sleepers {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            if let Some(pid) = fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                // SAFETY: kill takes a pid and a signal number and touches no memory.
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+}
+
+/// A job the model started in the background and the user left running
+/// by interrupting the turn shows on the F3 roster as running; `x` on its
+/// row cancels it, so its process goes away and the row stops saying
+/// running.
+#[test]
+#[serial]
+fn f3_lists_a_job_left_running_and_x_cancels_it() {
+    let dir = fresh_config_dir("roster-cancel");
+    let _guard = TempDirGuard(dir.clone());
+    let job_pid = dir.join("job.pid");
+    let blocker_pid = dir.join("blocker.pid");
+    let _sleepers = Sleepers(vec![job_pid.clone(), blocker_pid.clone()]);
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "job__start".to_string(),
+            arguments: r#"{"tool":"fixture_sleep","arguments":{}}"#.to_string(),
+        },
+        Reply::ToolCall {
+            name: "fixture_block".to_string(),
+            arguments: "{}".to_string(),
+        },
+    ]);
+    write_fake_llm_config_with(
+        &dir,
+        &fake,
+        "enabled_tools:\n  - fixture_sleep\n  - fixture_block\n",
+    );
+    write_tool(&dir, "fixture_sleep.sh", &sleeping_tool(&job_pid));
+    write_tool(&dir, "fixture_block.sh", &sleeping_tool(&blocker_pid));
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"start the sleeper\r").unwrap();
+    wait_for_file(&mut pty, &job_pid, "the job's pid file");
+    wait_for_file(&mut pty, &blocker_pid, "the blocking tool's pid file");
+    pty.read_for(Duration::from_millis(1200));
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    let pid: i32 = fs::read_to_string(&job_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(alive(pid), "the job died with the interrupted turn");
+
+    pty.send(b"\x1bOR").unwrap();
+    let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "F3 did not list the job");
+    let row: Vec<&str> = roster
+        .lines()
+        .filter(|line| line.contains("fixture_sleep"))
+        .collect();
+    assert!(
+        squeezed(&roster).contains("running"),
+        "the job row does not say running:\n{roster}"
+    );
+    pty.send(b"x").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while alive(pid) && std::time::Instant::now() < deadline {
+        pty.read_for(Duration::from_millis(200));
+    }
+    let gone = !alive(pid);
+    assert!(
+        gone,
+        "x did not stop the job's process {pid}; roster was {row:#?}"
+    );
+    // The repaint is the screen's rows in order with the escapes gone:
+    // the transcript's job row, then the roster band under its legend.
+    let after = repainted_frame_showing(&mut pty, "Cancelled job_", "x reported no cancel");
+    let at = after
+        .find("job fixture_sleep")
+        .unwrap_or_else(|| panic!("the transcript lost the job's row:\n{after}"));
+    let job_row: String = after[at..].chars().take(60).collect();
+    assert!(
+        job_row.contains("cancelled"),
+        "the job row does not say cancelled after x: {job_row:?}\n{after}"
+    );
+    let band = after
+        .rfind("Esc = close")
+        .map_or("", |legend| &after[legend..]);
+    let band = band.split('─').next().unwrap_or_default();
+    assert!(
+        !band.contains("fixture_sleep"),
+        "the roster still lists the cancelled job: {band:?}"
+    );
+
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// Leaves an idle UI with `keys` after one exchange and checks the
+/// prompt and the reply were printed between the leave and the report.
+fn leaving_prints_the_transcript(name: &str, keys: &[u8], prompt: &str, reply: &str) {
+    let dir = fresh_config_dir(name);
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
+    wait_for_squeezed(&mut pty, reply, "the reply");
+    pty.read_for(Duration::from_millis(800));
+    pty.send(keys).unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let raw = pty.raw();
+    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
+    let report_at = after.find("exit=").expect("no exit= line after the leave");
+    let between = squeezed(&after[..report_at]);
+    for marker in [prompt, reply] {
+        assert!(
+            between.contains(&squeezed(marker)),
+            "{marker:?} was not printed after {keys:?} left the UI: {:?}",
+            after[..report_at].trim()
+        );
+    }
+}
+
+/// Ctrl+C on an idle empty composer leaves the UI like Ctrl+D does, and
+/// the transcript is printed on the normal screen on that path too.
+#[test]
+#[serial]
+fn ctrl_c_on_an_idle_composer_also_prints_the_transcript() {
+    leaving_prints_the_transcript(
+        "ctrl-c-dump",
+        b"\x03",
+        "prompt to keep z1c",
+        "the reply to keep h3w",
+    );
+}
+
+/// `.exit` leaves the UI too, and prints the transcript the same way.
+#[test]
+#[serial]
+fn dot_exit_also_prints_the_transcript() {
+    leaving_prints_the_transcript(
+        "dot-exit-dump",
+        b".exit\r",
+        "prompt to keep e8y",
+        "the reply to keep m4s",
+    );
 }

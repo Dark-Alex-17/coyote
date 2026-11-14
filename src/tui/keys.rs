@@ -34,6 +34,19 @@ pub(crate) enum PopupKind {
     /// Typing goes into the band's filter line.
     HistorySearch,
     Rewind,
+    /// The running tasks and the questions waiting on the user; letters
+    /// act on the highlighted row and never reach the composer.
+    Roster,
+}
+
+/// What the full-screen pager is taking keys for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PagerMode {
+    Browse,
+    /// Typing goes into the find field.
+    Find,
+    /// The thread picker is open over the text.
+    Picker,
 }
 
 /// The vi layer's mode; the composer under emacs bindings has none.
@@ -94,6 +107,9 @@ pub(crate) struct KeyContext {
     pub(crate) focused: bool,
     pub(crate) popup: Option<PopupKind>,
     pub(crate) vi: Option<ViMode>,
+    /// The pager covers the whole screen and takes every key but the
+    /// terminal's own.
+    pub(crate) pager: Option<PagerMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +173,35 @@ pub(crate) enum Action {
     /// The `d` of `dd`: the second press deletes the cursor's line.
     ViDeleteLine,
     ToggleTodo,
+    ToggleRoster,
+    /// Cancel the task on the roster's highlighted row.
+    RosterCancel,
+    /// Show the highlighted roster row's transcript in the pager.
+    RosterOpen,
+    OpenPager,
+    ClosePager,
+    /// Move the pager's text by this many lines, down when positive.
+    PagerScroll(i32),
+    /// Move the pager's text by this many pages, down when positive.
+    PagerPage(i32),
+    PagerTop,
+    PagerBottom,
+    PagerFindOpen,
+    PagerFindChar(char),
+    PagerFindBackspace,
+    /// Jump to the next match of the find text, or the previous one.
+    PagerFindNext {
+        forward: bool,
+    },
+    /// Search for the find field's text and close the field, keeping the
+    /// text for `n` and `N`.
+    PagerFindSubmit,
+    PagerFindCancel,
+    OpenThreadPicker,
+    /// Move the thread picker's highlight by this many rows.
+    ThreadPickerMove(i32),
+    ThreadPickerChoose,
+    CloseThreadPicker,
     /// Move the transcript view by this many lines, down when positive.
     ScrollLines(i32),
     /// Move the transcript view by this many pages, down when positive.
@@ -184,6 +229,12 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     match code {
         KeyCode::Char('z') if ctrl => return Action::Suspend,
         KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
+        _ => {}
+    }
+    if let Some(mode) = ctx.pager {
+        return pager_key(key, code, mode);
+    }
+    match code {
         KeyCode::F(2) => return Action::ToggleTodo,
         KeyCode::PageUp => return Action::ScrollPage(-1),
         KeyCode::PageDown => return Action::ScrollPage(1),
@@ -249,6 +300,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
         }
         None => match code {
+            KeyCode::F(3) => Action::ToggleRoster,
+            KeyCode::Char('t') if ctrl => Action::OpenPager,
             // A band is the innermost thing open, so the quit chords
             // close it first, as Esc does.
             KeyCode::Char('c' | 'd') if ctrl && ctx.popup.is_some() => Action::ClosePopup,
@@ -277,11 +330,20 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter
                 if matches!(
                     ctx.popup,
-                    Some(PopupKind::HistorySearch | PopupKind::Rewind)
+                    Some(PopupKind::HistorySearch | PopupKind::Rewind | PopupKind::Roster)
                 ) =>
             {
                 Action::PaletteAccept
             }
+            KeyCode::Char(c) if !ctrl && ctx.popup == Some(PopupKind::Roster) => match c {
+                'j' => Action::PaletteMove(1),
+                'k' => Action::PaletteMove(-1),
+                'x' => Action::RosterCancel,
+                'o' => Action::RosterOpen,
+                _ => Action::Nothing,
+            },
+            // The draft is out of sight under the roster: no key edits it.
+            _ if ctx.popup == Some(PopupKind::Roster) => Action::Nothing,
             KeyCode::Char(_) if !ctrl && ctx.popup == Some(PopupKind::HistorySearch) => {
                 match key.code {
                     KeyCode::Char(typed) => Action::PopupChar(typed),
@@ -352,6 +414,57 @@ fn vi_normal(code: KeyCode) -> Action {
     }
 }
 
+/// The pager's keys: less's motions over the text, a find field and
+/// the thread picker. `code` is the case-folded key; `G` and `N` are
+/// told from `g` and `n` by the key as typed or by Shift.
+fn pager_key(key: KeyEvent, code: KeyCode, mode: PagerMode) -> Action {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let upper = key.modifiers.contains(KeyModifiers::SHIFT)
+        || matches!(key.code, KeyCode::Char(c) if c.is_ascii_uppercase());
+    match mode {
+        PagerMode::Find => match code {
+            KeyCode::Esc => Action::PagerFindCancel,
+            KeyCode::Char('c') if ctrl => Action::PagerFindCancel,
+            KeyCode::Enter => Action::PagerFindSubmit,
+            KeyCode::Backspace => Action::PagerFindBackspace,
+            KeyCode::Char(_) if !ctrl => match key.code {
+                KeyCode::Char(typed) => Action::PagerFindChar(typed),
+                _ => Action::Nothing,
+            },
+            _ => Action::Nothing,
+        },
+        PagerMode::Picker => match code {
+            KeyCode::Esc | KeyCode::Tab => Action::CloseThreadPicker,
+            KeyCode::Char('c' | 'd') if ctrl => Action::CloseThreadPicker,
+            KeyCode::Char('q') if !ctrl => Action::CloseThreadPicker,
+            KeyCode::Up => Action::ThreadPickerMove(-1),
+            KeyCode::Down => Action::ThreadPickerMove(1),
+            KeyCode::Char('k') if !ctrl => Action::ThreadPickerMove(-1),
+            KeyCode::Char('j') if !ctrl => Action::ThreadPickerMove(1),
+            KeyCode::Enter => Action::ThreadPickerChoose,
+            _ => Action::Nothing,
+        },
+        PagerMode::Browse => match code {
+            KeyCode::Esc => Action::ClosePager,
+            KeyCode::Char('c' | 'd' | 't') if ctrl => Action::ClosePager,
+            _ if ctrl => Action::Nothing,
+            KeyCode::Char('q') => Action::ClosePager,
+            KeyCode::Down | KeyCode::Char('j') => Action::PagerScroll(1),
+            KeyCode::Up | KeyCode::Char('k') => Action::PagerScroll(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => Action::PagerPage(1),
+            KeyCode::PageUp => Action::PagerPage(-1),
+            KeyCode::Home => Action::PagerTop,
+            KeyCode::End => Action::PagerBottom,
+            KeyCode::Char('g') if upper => Action::PagerBottom,
+            KeyCode::Char('g') => Action::PagerTop,
+            KeyCode::Char('/') => Action::PagerFindOpen,
+            KeyCode::Char('n') => Action::PagerFindNext { forward: !upper },
+            KeyCode::Tab => Action::OpenThreadPicker,
+            _ => Action::Nothing,
+        },
+    }
+}
+
 /// A hotkey answers the same with Shift or caps lock held.
 fn lowercase(code: KeyCode) -> KeyCode {
     match code {
@@ -388,6 +501,7 @@ mod tests {
         focused: false,
         popup: None,
         vi: None,
+        pager: None,
     };
 
     #[test]
@@ -1314,6 +1428,156 @@ mod tests {
         let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
         for needle in [["io", "::"].concat(), ["execute", "!"].concat()] {
             assert!(!production.contains(&needle), "{needle} in keys.rs");
+        }
+    }
+
+    /// Ctrl+T opens the pager over an idle or busy composer, never under a
+    /// question; F3 toggles the roster the same way.
+    #[test]
+    fn ctrl_t_and_f3_open_the_pager_and_the_roster() {
+        let running = KeyContext {
+            turn_running: true,
+            ..IDLE
+        };
+        let typing = KeyContext {
+            composer_empty: false,
+            ..IDLE
+        };
+        let roster = KeyContext {
+            popup: Some(PopupKind::Roster),
+            ..IDLE
+        };
+        let confirm = KeyContext {
+            modal: Some(ModalKind::Confirm {
+                default: true,
+                tool: false,
+            }),
+            ..IDLE
+        };
+        let cases = [
+            (ctrl('t'), IDLE, Action::OpenPager),
+            (ctrl('t'), running, Action::OpenPager),
+            (ctrl('t'), typing, Action::OpenPager),
+            (ctrl('t'), roster, Action::OpenPager),
+            (ctrl('t'), confirm, Action::Nothing),
+            (plain(KeyCode::F(3)), IDLE, Action::ToggleRoster),
+            (plain(KeyCode::F(3)), running, Action::ToggleRoster),
+            (plain(KeyCode::F(3)), roster, Action::ToggleRoster),
+            (plain(KeyCode::F(3)), confirm, Action::Nothing),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// With the roster up its letters act on the highlighted row and no
+    /// other letter reaches the composer; Esc and the quit chords close
+    /// it, Enter answers the row even mid-turn.
+    #[test]
+    fn roster_keys() {
+        let roster = KeyContext {
+            popup: Some(PopupKind::Roster),
+            ..IDLE
+        };
+        let running = KeyContext {
+            turn_running: true,
+            ..roster
+        };
+        let cases = [
+            (plain(KeyCode::Char('j')), roster, Action::PaletteMove(1)),
+            (plain(KeyCode::Char('k')), roster, Action::PaletteMove(-1)),
+            (plain(KeyCode::Down), roster, Action::PaletteMove(1)),
+            (plain(KeyCode::Up), roster, Action::PaletteMove(-1)),
+            (plain(KeyCode::Char('x')), roster, Action::RosterCancel),
+            (plain(KeyCode::Char('x')), running, Action::RosterCancel),
+            (plain(KeyCode::Char('o')), roster, Action::RosterOpen),
+            (plain(KeyCode::Char('a')), roster, Action::Nothing),
+            (plain(KeyCode::Backspace), roster, Action::Nothing),
+            (ctrl('u'), roster, Action::Nothing),
+            (ctrl('w'), roster, Action::Nothing),
+            (plain(KeyCode::Left), roster, Action::Nothing),
+            (plain(KeyCode::Home), roster, Action::Nothing),
+            (plain(KeyCode::Enter), roster, Action::PaletteAccept),
+            (plain(KeyCode::Enter), running, Action::PaletteAccept),
+            (plain(KeyCode::Esc), roster, Action::ClosePopup),
+            (plain(KeyCode::Esc), running, Action::ClosePopup),
+            (ctrl('c'), running, Action::ClosePopup),
+            (
+                plain(KeyCode::Char('x')),
+                IDLE,
+                Action::ComposerInput(plain(KeyCode::Char('x'))),
+            ),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// The pager takes every key but suspend and repaint, in each of its
+    /// three modes.
+    #[test]
+    fn pager_keys() {
+        let browse = KeyContext {
+            pager: Some(PagerMode::Browse),
+            turn_running: true,
+            ..IDLE
+        };
+        let find = KeyContext {
+            pager: Some(PagerMode::Find),
+            ..IDLE
+        };
+        let picker = KeyContext {
+            pager: Some(PagerMode::Picker),
+            ..IDLE
+        };
+        let shift = |c: char| press(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let cases = [
+            (plain(KeyCode::Char('j')), browse, Action::PagerScroll(1)),
+            (plain(KeyCode::Down), browse, Action::PagerScroll(1)),
+            (plain(KeyCode::Char('k')), browse, Action::PagerScroll(-1)),
+            (plain(KeyCode::Up), browse, Action::PagerScroll(-1)),
+            (plain(KeyCode::PageDown), browse, Action::PagerPage(1)),
+            (plain(KeyCode::PageUp), browse, Action::PagerPage(-1)),
+            (plain(KeyCode::Char('g')), browse, Action::PagerTop),
+            (plain(KeyCode::Char('G')), browse, Action::PagerBottom),
+            (shift('G'), browse, Action::PagerBottom),
+            (plain(KeyCode::Char('q')), browse, Action::ClosePager),
+            (plain(KeyCode::Esc), browse, Action::ClosePager),
+            (ctrl('t'), browse, Action::ClosePager),
+            (ctrl('c'), browse, Action::ClosePager),
+            (ctrl('z'), browse, Action::Suspend),
+            (ctrl('l'), browse, Action::ScheduleFrame),
+            (plain(KeyCode::F(2)), browse, Action::Nothing),
+            (plain(KeyCode::Char('/')), browse, Action::PagerFindOpen),
+            (
+                plain(KeyCode::Char('n')),
+                browse,
+                Action::PagerFindNext { forward: true },
+            ),
+            (
+                plain(KeyCode::Char('N')),
+                browse,
+                Action::PagerFindNext { forward: false },
+            ),
+            (plain(KeyCode::Tab), browse, Action::OpenThreadPicker),
+            (plain(KeyCode::Char('x')), browse, Action::Nothing),
+            (plain(KeyCode::Char('q')), find, Action::PagerFindChar('q')),
+            (plain(KeyCode::Char('G')), find, Action::PagerFindChar('G')),
+            (plain(KeyCode::Backspace), find, Action::PagerFindBackspace),
+            (plain(KeyCode::Enter), find, Action::PagerFindSubmit),
+            (plain(KeyCode::Esc), find, Action::PagerFindCancel),
+            (
+                plain(KeyCode::Char('j')),
+                picker,
+                Action::ThreadPickerMove(1),
+            ),
+            (plain(KeyCode::Up), picker, Action::ThreadPickerMove(-1)),
+            (plain(KeyCode::Enter), picker, Action::ThreadPickerChoose),
+            (plain(KeyCode::Esc), picker, Action::CloseThreadPicker),
+            (plain(KeyCode::Tab), picker, Action::CloseThreadPicker),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
         }
     }
 }

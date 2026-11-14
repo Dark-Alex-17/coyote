@@ -655,6 +655,17 @@ pub fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
     .unwrap();
 }
 
+/// Writes `extra` top-level YAML after the fake-LLM config, so a case can
+/// add a setting (`document_loaders`, `tui_dump_on_exit`) while keeping
+/// the fake model.
+pub fn write_fake_llm_config_with(dir: &Path, fake: &FakeLlm, extra: &str) {
+    write_fake_llm_config(dir, fake);
+    let path = dir.join("config.yaml");
+    let mut config = fs::read_to_string(&path).unwrap();
+    config.push_str(extra);
+    fs::write(&path, config).unwrap();
+}
+
 /// Drops one bash tool into the config's `functions/tools` dir; the binary
 /// builds its shim on startup. No `set -e`: the fixture `tput` on PATH
 /// exits 1 for everything but `cols`/`lines`, and the prompt helper's

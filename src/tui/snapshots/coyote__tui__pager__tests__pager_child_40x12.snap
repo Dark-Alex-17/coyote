@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: reviewer (read-only) rev 2-11/11"
+"show up at the child's next checkpoint. "
+"                                        "
+"> review src/lib.rs                     "
+"                                        "
+"Reading the file first.                 "
+"                                        "
+"fs_read({"path":"src/lib.rs"})          "
+"fn main() {}                            "
+"                                        "
+"It looks fine.                          "
+"j/k scroll  g/G top/end  / find  n/N nex"

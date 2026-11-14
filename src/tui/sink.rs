@@ -5,6 +5,7 @@
 
 use crate::client::SseEvent;
 use crate::config::AppConfig;
+use crate::config::child_sessions::ChildSessionRoot;
 use crate::config::todo::TodoItem;
 use crate::events::{Event, EventSink, NoticeKind, Origin, OutputStream};
 use crate::hooks::HookEvent;
@@ -90,6 +91,24 @@ pub(crate) enum UiMsg {
     /// passthrough, an editor on a file): the loop releases the screen,
     /// runs it, and takes the screen back.
     LendTerminal(LendJob),
+    /// A child agent wrote its session file; `root` is where it lives.
+    ChildTranscriptFlushed {
+        session_id: String,
+        root: Option<Arc<ChildSessionRoot>>,
+    },
+    /// What reading a child's session file for the pager gave.
+    ChildLoaded {
+        session_id: String,
+        /// Which read this is; only the newest one asked for is shown.
+        generation: u64,
+        result: Result<Vec<super::pager::ChildEntry>, String>,
+    },
+    /// What cancelling a task from the roster gave: the cancel tool's own
+    /// result, or the error that kept it from running.
+    TaskCancelled {
+        id: String,
+        result: Result<Value, String>,
+    },
 }
 
 /// The job behind [`UiMsg::LendTerminal`]; its result travels back to
@@ -322,6 +341,12 @@ impl EventSink for TuiSink {
             }),
             Event::TodoUpdated { items } => self.send(UiMsg::TodoUpdated(items.clone())),
             Event::QueuedInputSent { text } => self.send(UiMsg::QueuedInputSent(text.clone())),
+            Event::ChildTranscriptFlushed { session_id, root } => {
+                self.send(UiMsg::ChildTranscriptFlushed {
+                    session_id: session_id.clone(),
+                    root: root.clone(),
+                })
+            }
             _ => {}
         }
     }

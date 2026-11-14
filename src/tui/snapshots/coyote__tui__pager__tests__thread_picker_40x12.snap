@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: root thread             38-47/47"
+"Threads  Enter = open  Esc = back       "
+"root thread                             "
+"reviewer  reviewer-a1  running          "
+"planner  planner-b2    completed        "
+"tester  tester-c3      failed           "
+"fixer  fixer-d4        crashed          "
+"scout  scout-e5        cancelled        "
+"                                        "
+"                                        "
+"                                        "
+"j/k scroll  g/G top/end  / find  n/N nex"

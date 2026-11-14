@@ -1,4 +1,5 @@
 use crate::config::RequestContext;
+use crate::config::child_sessions::ChildSessionRoot;
 use crate::config::todo::TodoItem;
 use crate::hooks::HookEvent;
 use crate::prompt::PromptAction;
@@ -99,8 +100,12 @@ pub enum Event {
     UsageUpdated {
         right_prompt: String,
     },
+    /// A child agent wrote its session file. `root` is the directory
+    /// identity the child lives under, so an observer that has not seen
+    /// the spawner's own handle yet can still find the file.
     ChildTranscriptFlushed {
         session_id: String,
+        root: Option<Arc<ChildSessionRoot>>,
     },
     JobCancelled {
         job_id: String,

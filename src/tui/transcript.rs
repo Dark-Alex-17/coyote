@@ -52,6 +52,9 @@ pub(super) struct Transcript {
     reveal_focus: bool,
     last_layout: Vec<RowSpan>,
     last_area: Rect,
+    /// Goes up whenever a cell may have changed, so a layout of every
+    /// cell (the pager's) is redone only then.
+    generation: u64,
 }
 
 impl Transcript {
@@ -68,6 +71,7 @@ impl Transcript {
             reveal_focus: false,
             last_layout: Vec::new(),
             last_area: Rect::ZERO,
+            generation: 0,
         }
     }
 
@@ -75,20 +79,36 @@ impl Transcript {
         &self.cells
     }
 
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The cells to change, counted as changed.
+    fn edit(&mut self) -> &mut Vec<Cell> {
+        self.generation += 1;
+        &mut self.cells
+    }
+
+    /// The cells for laying out: what they show is left as it is and
+    /// only the line caches inside them fill, so the generation stays.
+    pub(super) fn cells_for_layout(&mut self) -> &mut [Cell] {
+        &mut self.cells
+    }
+
     pub(super) fn len(&self) -> usize {
         self.cells.len()
     }
 
     pub(super) fn cell_mut(&mut self, index: usize) -> Option<&mut Cell> {
-        self.cells.get_mut(index)
+        self.edit().get_mut(index)
     }
 
     pub(super) fn cells_mut(&mut self) -> &mut [Cell] {
-        &mut self.cells
+        self.edit()
     }
 
     pub(super) fn last_mut(&mut self) -> Option<&mut Cell> {
-        self.cells.last_mut()
+        self.edit().last_mut()
     }
 
     /// Appends a cell. The greeting gives way to the first real entry,
@@ -98,7 +118,7 @@ impl Transcript {
         if self.offset_from_bottom > 0 {
             self.unseen += 1;
         }
-        self.cells.push(cell);
+        self.edit().push(cell);
     }
 
     /// Appends the cell a reply streams into and remembers where it is.
@@ -108,23 +128,25 @@ impl Transcript {
     }
 
     pub(super) fn stream_cell_mut(&mut self) -> Option<&mut Cell> {
-        self.cells.get_mut(self.stream?)
+        let stream = self.stream?;
+        self.edit().get_mut(stream)
     }
 
     /// Forgets the streaming cell and hands it over to be finalised.
     pub(super) fn close_stream(&mut self) -> Option<&mut Cell> {
-        self.cells.get_mut(self.stream.take()?)
+        let stream = self.stream.take()?;
+        self.edit().get_mut(stream)
     }
 
     /// Puts `cell` where another was; the row keeps its place and its
     /// focus.
     pub(super) fn replace(&mut self, index: usize, cell: Cell) -> Cell {
-        std::mem::replace(&mut self.cells[index], cell)
+        std::mem::replace(&mut self.edit()[index], cell)
     }
 
     pub(super) fn remove(&mut self, index: usize) -> Cell {
         let unseen_from = self.cells.len().saturating_sub(self.unseen);
-        let removed = self.cells.remove(index);
+        let removed = self.edit().remove(index);
         if index >= unseen_from {
             self.unseen -= 1;
         }
@@ -142,7 +164,7 @@ impl Transcript {
         self.unseen = self
             .unseen
             .saturating_sub(self.cells.len().saturating_sub(len));
-        self.cells.truncate(len);
+        self.edit().truncate(len);
         if self.focus.is_some_and(|focus| focus >= len) {
             self.focus = None;
         }
@@ -238,7 +260,9 @@ impl Transcript {
     }
 
     pub(super) fn toggle_focused(&mut self) {
-        if let Some(cell) = self.focus.and_then(|focus| self.cells.get_mut(focus)) {
+        if let Some(focus) = self.focus
+            && let Some(cell) = self.edit().get_mut(focus)
+        {
             cell.toggle();
         }
     }
@@ -262,6 +286,7 @@ impl Transcript {
         else {
             return;
         };
+        self.generation += 1;
         if let Some(cell) = self.cells.get_mut(index)
             && cell.collapsible()
         {

@@ -6,26 +6,36 @@
 //! just another frame. A `!cmd` passthrough or an editor borrows the
 //! terminal: the loop leaves the screen and runs the job synchronously on
 //! its own thread, so nothing is drawn until the job returns.
+//! The roster (F3) and the pager (Ctrl+T) act through a control context,
+//! a fork of the context taken each time it comes back idle: it shares
+//! the supervisor, the escalation queue and the child session root with
+//! the context a turn has, so a task can be cancelled or a question
+//! answered mid-turn. It never runs a turn.
 
 mod bottom_pane;
 mod cells;
 mod composer;
+mod dump;
 mod events;
 mod history;
 mod keys;
+mod pager;
 mod queued;
 mod redirect;
 mod render;
+mod roster;
 mod sink;
 mod terminal;
 mod todo;
 mod transcript;
 
+use crate::config::child_sessions::ChildSessionRoot;
 use crate::config::{AppConfig, RequestContext};
-use crate::events::{EventSink, NoticeKind, SubscriptionId};
+use crate::events::{EventSink, NoticeKind, Origin, SubscriptionId};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, input_default_text};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::supervisor::notification::NotificationQueue;
+use crate::supervisor::{TaskKind, TaskRow};
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, anyhow, bail};
 use bottom_pane::{
@@ -33,8 +43,8 @@ use bottom_pane::{
     SearchView, View,
 };
 use cells::{
-    AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTarget, RewindBarrier, ToolStatus,
-    append_output,
+    AgentStatus, Cell, FoldedCall, FullOutput, JobStatus, LineCache, OutputTarget, RewindBarrier,
+    ToolStatus, append_output,
 };
 use composer::{Composer, field_background};
 use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
@@ -42,6 +52,7 @@ use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
 use history::ComposerHistory;
 use keys::{Action, KeyContext, ModalKind, PopupKind, ViMode};
+use pager::{Pager, PagerView, ThreadRow};
 use queued::{
     QueuedLine, QueuedPreview, carry_over, reconcile_queue, remove_sent, take_user_messages,
 };
@@ -55,6 +66,7 @@ use ratatui_textarea::TextArea;
 use redirect::FdRedirect;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
+use roster::{RosterRow, RosterSources, RosterState, RosterView};
 use serde_json::Value;
 use sink::{AgentOutcome, LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
 use std::collections::VecDeque;
@@ -239,6 +251,12 @@ const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
 /// task that ignores cancellation would cost the user the save.
 const EXIT_TEARDOWN_WAIT: Duration = EXIT_CANCEL_WAIT.saturating_add(EXIT_HOOK_DRAIN_TIMEOUT);
 const TOOL_OUTPUT_TAIL: usize = 20;
+/// Most bytes of one call's output kept for the pager; past it the
+/// oldest go and the pager says how many.
+const FULL_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+/// Most bytes of whole output kept over all calls; past it the oldest
+/// calls' whole output goes first.
+const FULL_OUTPUT_BUDGET: usize = 32 * 1024 * 1024;
 /// Most text one cell of late command output holds; a leftover child that
 /// keeps writing sees its oldest lines dropped rather than the transcript grow.
 const LATE_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -947,6 +965,121 @@ pub(crate) enum Command {
     Rewind(RewindTarget),
 }
 
+/// Work the roster or the pager asks of the control context. The loop
+/// runs it on a task of its own and the result comes back as a `UiMsg`:
+/// an agent's cancel waits seconds for the agent to stop, and a child's
+/// session file is parsed whole.
+#[derive(Debug, PartialEq, Eq)]
+enum ControlRequest {
+    Cancel {
+        id: String,
+        kind: TaskKind,
+    },
+    LoadChild {
+        session_id: String,
+        file: PathBuf,
+        generation: u64,
+    },
+}
+
+/// Runs `request` off the loop on a fork of the control context.
+fn spawn_control_request(
+    request: ControlRequest,
+    control: Arc<RequestContext>,
+    tx: UnboundedSender<UiMsg>,
+) {
+    match request {
+        ControlRequest::Cancel { id, kind } => {
+            let mut ctx = control.fork_for_branch();
+            tokio::spawn(async move {
+                let args = serde_json::json!({ "id": id });
+                let result = match kind {
+                    TaskKind::Job => {
+                        crate::function::jobs::handle_job_tool(&mut ctx, "job__cancel", &args).await
+                    }
+                    TaskKind::Agent => {
+                        crate::function::agents::handle_agent_tool(&mut ctx, "agent__cancel", &args)
+                            .await
+                    }
+                };
+                // A closed inbox means the UI is gone; nobody is left to
+                // tell.
+                let _ = tx.send(UiMsg::TaskCancelled {
+                    id,
+                    result: result.map_err(|err| format!("{err:#}")),
+                });
+            });
+        }
+        ControlRequest::LoadChild {
+            session_id,
+            file,
+            generation,
+        } => {
+            tokio::task::spawn_blocking(move || {
+                let result = pager::load_child(&file, &control).map_err(|err| format!("{err:#}"));
+                let _ = tx.send(UiMsg::ChildLoaded {
+                    session_id,
+                    generation,
+                    result,
+                });
+            });
+        }
+    }
+}
+
+/// A session id that can name a file under the child session root and
+/// nowhere else.
+fn is_plain_session_id(session_id: &str) -> bool {
+    !session_id.is_empty() && !session_id.contains(['/', '\\', '\0']) && !session_id.contains("..")
+}
+
+/// The kind of question an escalated `question` asks, from the `[kind] `
+/// an agent's user tool puts in front of it, and the question without it.
+fn escalation_kind(question: &str) -> (Option<PromptAction>, &str) {
+    [
+        PromptAction::Confirm,
+        PromptAction::Select,
+        PromptAction::Checkbox,
+        PromptAction::Input,
+    ]
+    .into_iter()
+    .find_map(|action| {
+        question
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_prefix(action.name()))
+            .and_then(|rest| rest.strip_prefix("] "))
+            .map(|rest| (Some(action), rest))
+    })
+    .unwrap_or((None, question))
+}
+
+/// The notice a roster cancel ends with: the tool's message when it
+/// gave one, and a warning when it refused.
+fn cancel_report(id: &str, result: &Result<Value, String>) -> (NoticeKind, String) {
+    match result {
+        Ok(value) => {
+            let message = value.get("message").and_then(Value::as_str);
+            match value.get("status").and_then(Value::as_str) {
+                Some("ok" | "cancelled") => (
+                    NoticeKind::Interrupted,
+                    message.map_or_else(|| format!("Cancelled {id}"), str::to_string),
+                ),
+                _ => (
+                    NoticeKind::ToolWarning,
+                    format!(
+                        "Cancel of {id} refused: {}",
+                        message.unwrap_or("no reason given")
+                    ),
+                ),
+            }
+        }
+        Err(err) => (
+            NoticeKind::ToolWarning,
+            format!("Cancel of {id} failed: {err}"),
+        ),
+    }
+}
+
 fn new_textarea() -> TextArea<'static> {
     let mut textarea = TextArea::default();
     textarea.set_cursor_line_style(Style::new());
@@ -981,6 +1114,9 @@ pub(crate) struct App {
     /// Index of the first cell the exit work may add; what came after it
     /// is the exit's late output.
     exit_first_cell: usize,
+    /// End of the cells printed on the way out, fixed when the exit
+    /// began: a turn cut short then is left out with the exit's cells.
+    committed_end: usize,
     footer: FooterInfo,
     usage: String,
     last_keystroke: Option<Instant>,
@@ -1021,6 +1157,25 @@ pub(crate) struct App {
     last_esc: Option<Instant>,
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
+    /// Ctrl+T's full-screen view, drawn over everything while open.
+    pager: Option<Pager>,
+    /// The generation of the newest child read asked for.
+    child_reads: u64,
+    roster_sources: RosterSources,
+    /// A fork of the context as it last came back idle, for what the
+    /// roster and the pager do while a turn has the context. None before
+    /// the first sync and once the exit has begun.
+    control: Option<Arc<RequestContext>>,
+    /// Where child sessions live: the context's handle as it last came
+    /// back, or the one a child's first write named during the turn
+    /// that spawned it.
+    child_root: Option<Arc<ChildSessionRoot>>,
+    /// Work the roster and the pager asked for; the loop runs each off
+    /// itself after the step that queued it.
+    control_requests: Vec<ControlRequest>,
+    /// Escalations put to the user through the prompt modal, by id, with
+    /// the kind of modal asked and where its answer arrives.
+    escalation_answers: Vec<(String, PromptAction, mpsc::Receiver<PromptAnswer>)>,
 }
 
 fn history_file(config: &AppConfig, session: Option<&str>) -> Option<PathBuf> {
@@ -1064,6 +1219,7 @@ impl App {
             turn: None,
             exiting: false,
             exit_first_cell: 0,
+            committed_end: 0,
             footer,
             usage: String::new(),
             last_keystroke: None,
@@ -1084,6 +1240,13 @@ impl App {
             last_esc: None,
             config,
             prompt_memory,
+            pager: None,
+            roster_sources: RosterSources::default(),
+            control: None,
+            child_root: None,
+            control_requests: Vec::new(),
+            child_reads: 0,
+            escalation_answers: Vec::new(),
         })
     }
 
@@ -1151,6 +1314,17 @@ impl App {
         }
         self.todo
             .set(ctx.todo_list.goal.clone(), ctx.todo_list.todos.clone());
+        // Read again on every return, never kept from the start: `.agent`
+        // swaps the supervisor and drops the queue. The queue is made here
+        // rather than by the first spawn, so the one a turn hands to its
+        // children is the one the roster reads.
+        ctx.ensure_root_escalation_queue();
+        self.roster_sources = RosterSources {
+            supervisor: ctx.supervisor.clone(),
+            escalations: ctx.escalation_queue.clone(),
+        };
+        self.child_root = ctx.child_session_root.clone();
+        self.control = Some(Arc::new(ctx.fork_for_branch()));
         self.schedule_frame();
     }
 
@@ -1250,6 +1424,13 @@ impl App {
             self.exiting = true;
             self.transcript.clear_welcome();
             self.exit_first_cell = self.transcript.len();
+            self.committed_end = self
+                .turn
+                .as_ref()
+                .map_or(self.exit_first_cell, |turn| turn.first_cell);
+            // The teardown owns the context now; nothing may act beside it.
+            self.control = None;
+            self.roster_sources = RosterSources::default();
         }
         self.schedule_frame();
     }
@@ -1317,8 +1498,10 @@ impl App {
                 View::Palette(_) => Some(PopupKind::Palette),
                 View::HistorySearch(_) => Some(PopupKind::HistorySearch),
                 View::Rewind(_) => Some(PopupKind::Rewind),
+                View::Roster(_) => Some(PopupKind::Roster),
             },
             vi: self.vi_mode,
+            pager: self.pager.as_ref().map(Pager::mode),
         }
     }
 
@@ -1501,6 +1684,12 @@ impl App {
                 self.close_view();
                 chosen
             }
+            View::Roster(roster) => {
+                if let Some(RosterRow::Escalation(ask)) = roster.focused().cloned() {
+                    self.ask_escalation(ask);
+                }
+                None
+            }
             View::Palette(palette) => {
                 if palette.highlighted().is_none() {
                     return if self.turn.is_some() || self.exiting {
@@ -1532,6 +1721,13 @@ impl App {
                 // they use themselves (CR, CRLF or LF); the composer and
                 // the field take one shape.
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                if let Some(pager) = self.pager.as_mut() {
+                    // Only the find field takes it; the widgets under the
+                    // pager are out of sight.
+                    pager.paste(&text);
+                    self.schedule_frame();
+                    return None;
+                }
                 match self.prompts.front_mut() {
                     // A confirm has no field, and the composer is hidden
                     // under the modal: a paste there would land where the
@@ -1554,6 +1750,15 @@ impl App {
                 None
             }
             TermInput::Mouse(mouse) => {
+                if let Some(pager) = self.pager.as_mut() {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => pager.scroll(-WHEEL_LINES),
+                        MouseEventKind::ScrollDown => pager.scroll(WHEEL_LINES),
+                        _ => return None,
+                    }
+                    self.schedule_frame();
+                    return None;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
                     MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
@@ -1720,6 +1925,7 @@ impl App {
                     View::Palette(palette) => palette.move_highlight(delta),
                     View::HistorySearch(search) => search.move_highlight(delta),
                     View::Rewind(rewind) => rewind.move_highlight(delta),
+                    View::Roster(roster) => roster.move_highlight(delta),
                 }
                 None
             }
@@ -1772,6 +1978,49 @@ impl App {
                 self.todo.toggle();
                 None
             }
+            Action::ToggleRoster => {
+                self.view = match self.view {
+                    View::Roster(_) => View::Composer,
+                    _ => View::Roster(RosterState::new(self.roster_sources.rows())),
+                };
+                None
+            }
+            Action::RosterCancel => {
+                self.cancel_focused_task();
+                None
+            }
+            Action::RosterOpen => {
+                self.open_focused_task();
+                None
+            }
+            Action::OpenPager => {
+                self.pager = Some(Pager::root());
+                None
+            }
+            Action::ClosePager => {
+                self.close_pager();
+                None
+            }
+            Action::OpenThreadPicker => {
+                self.open_thread_picker();
+                None
+            }
+            Action::ThreadPickerChoose => {
+                self.choose_thread();
+                None
+            }
+            Action::PagerScroll(delta) => self.with_pager(|pager| pager.scroll(delta)),
+            Action::PagerPage(direction) => self.with_pager(|pager| pager.page(direction)),
+            Action::PagerTop => self.with_pager(Pager::jump_to_top),
+            Action::PagerBottom => self.with_pager(Pager::jump_to_bottom),
+            Action::PagerFindOpen => self.with_pager(Pager::open_find),
+            Action::PagerFindChar(c) => self.with_pager(|pager| pager.find_char(c)),
+            Action::PagerFindBackspace => self.with_pager(Pager::find_backspace),
+            Action::PagerFindNext { forward } => self.with_pager(|pager| pager.find_next(forward)),
+            Action::PagerFindSubmit => self.with_pager(Pager::submit_find),
+            Action::PagerFindCancel => self.with_pager(Pager::cancel_find),
+            Action::ThreadPickerMove(delta) => self.with_pager(|pager| pager.move_picker(delta)),
+            Action::CloseThreadPicker => self.with_pager(Pager::close_picker),
             Action::ScrollLines(delta) => {
                 self.transcript.scroll_lines(delta);
                 None
@@ -1802,6 +2051,7 @@ impl App {
             }
             Action::Nothing => None,
         };
+        self.settle_escalation_answers();
         self.schedule_frame();
         command
     }
@@ -1824,6 +2074,244 @@ impl App {
         self.last_keystroke = Some(now);
         self.front_since = (!self.prompts.is_empty()).then_some(now);
         self.question_area = None;
+    }
+
+    fn with_pager(&mut self, f: impl FnOnce(&mut Pager)) -> Option<Command> {
+        if let Some(pager) = self.pager.as_mut() {
+            f(pager);
+        }
+        None
+    }
+
+    /// Closes the pager and frees the lines it laid out.
+    fn close_pager(&mut self) {
+        if self.pager.take().is_some() {
+            cells::release_full_output_caches(self.transcript.cells_for_layout());
+        }
+    }
+
+    fn take_control_requests(&mut self) -> Vec<ControlRequest> {
+        std::mem::take(&mut self.control_requests)
+    }
+
+    fn queue_control(&mut self, request: ControlRequest) {
+        if self.control.is_none() {
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                "Tasks cannot be reached while the session is ending".to_string(),
+            );
+            return;
+        }
+        self.control_requests.push(request);
+    }
+
+    fn focused_task(&self) -> Option<TaskRow> {
+        match &self.view {
+            View::Roster(roster) => match roster.focused() {
+                Some(RosterRow::Task(task)) => Some(task.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn cancel_focused_task(&mut self) {
+        if let Some(task) = self.focused_task() {
+            self.queue_control(ControlRequest::Cancel {
+                id: task.id,
+                kind: task.kind,
+            });
+        }
+    }
+
+    /// Shows the highlighted task in the pager: an agent's own session,
+    /// or the root thread from a job's row.
+    fn open_focused_task(&mut self) {
+        let Some(task) = self.focused_task() else {
+            return;
+        };
+        match task.kind {
+            TaskKind::Agent => match task.session_id {
+                Some(session_id) => self.open_child(session_id, task.name),
+                None => self.push_notice(
+                    NoticeKind::ToolWarning,
+                    format!("Agent {} keeps no session to show", task.id),
+                ),
+            },
+            TaskKind::Job => {
+                let row = self.transcript.cells().iter().rposition(
+                    |cell| matches!(cell, Cell::Job { job_id, .. } if *job_id == task.id),
+                );
+                match row {
+                    Some(index) => self.pager = Some(Pager::root_at(index)),
+                    None => self.push_notice(
+                        NoticeKind::ToolWarning,
+                        format!("Job {} has no row in this transcript", task.id),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Opens a child's thread in the pager and asks for its first read.
+    fn open_child(&mut self, session_id: String, agent: String) {
+        if self.control.is_none() {
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                "Transcripts cannot be read while the session is ending".to_string(),
+            );
+            return;
+        }
+        if !is_plain_session_id(&session_id) {
+            warn!("Refused to read a child session with the id {session_id:?}");
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                format!(
+                    "Cannot read the session of {agent}: its id {} is not a plain name",
+                    render::plain_text(&session_id)
+                ),
+            );
+            return;
+        }
+        let Some(root) = self.child_root.as_ref() else {
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                format!("The session of {agent} has not been written yet"),
+            );
+            return;
+        };
+        let file = root.child_session_file(&session_id);
+        self.pager = Some(Pager::child(session_id.clone(), agent, file.clone()));
+        self.read_open_child(session_id, file);
+    }
+
+    /// Asks for a read of the child on show. Nothing is read once the
+    /// exit has begun; the pager keeps what it has.
+    fn read_open_child(&mut self, session_id: String, file: PathBuf) {
+        let Some(pager) = self.pager.as_mut() else {
+            return;
+        };
+        if self.control.is_none() {
+            return;
+        }
+        self.child_reads += 1;
+        pager.child_load_started(self.child_reads);
+        self.control_requests.push(ControlRequest::LoadChild {
+            session_id,
+            file,
+            generation: self.child_reads,
+        });
+    }
+
+    fn open_thread_picker(&mut self) {
+        let mut rows = vec![ThreadRow::root()];
+        let none_yet = || Some("No child sessions yet".to_string());
+        let note = match self.child_root.as_deref() {
+            None => none_yet(),
+            Some(root) => match root.list_children() {
+                Ok(children) if children.is_empty() => none_yet(),
+                Ok(children) => {
+                    rows.extend(
+                        children
+                            .iter()
+                            .map(|meta| ThreadRow::child(meta, meta.effective_status())),
+                    );
+                    None
+                }
+                Err(err) => {
+                    warn!("Failed to list the child sessions: {err:#}");
+                    Some(format!("Cannot list the child sessions: {err:#}"))
+                }
+            },
+        };
+        if let Some(pager) = self.pager.as_mut() {
+            pager.open_picker(rows, note);
+        }
+    }
+
+    fn choose_thread(&mut self) {
+        let Some(row) = self.pager.as_mut().and_then(Pager::take_picked) else {
+            return;
+        };
+        match row.session_id {
+            Some(session_id) => self.open_child(session_id, row.agent),
+            None => self.pager = Some(Pager::root()),
+        }
+    }
+
+    /// Puts an agent's question to the user in the prompt modal of the
+    /// kind the agent asked for, named by the `[kind] ` its question
+    /// starts with; a list or checklist with no options, or a question
+    /// with no kind, is a list when it has options and a text field
+    /// otherwise. The answer is relayed once the modal gives it, as the
+    /// published text of that answer; a cancelled modal leaves the
+    /// question waiting.
+    fn ask_escalation(&mut self, ask: roster::Escalation) {
+        let (kind, question) = escalation_kind(&ask.question);
+        let action = match kind {
+            Some(PromptAction::Select | PromptAction::Checkbox) | None
+                if ask.options.is_empty() =>
+            {
+                PromptAction::Input
+            }
+            Some(action) => action,
+            None => PromptAction::Select,
+        };
+        let origin = Origin {
+            agent_id: Some(ask.agent_id),
+            // The queue does not say how deep the asking agent is; a
+            // direct child is the fallback.
+            depth: 1,
+        };
+        let mut req = PromptRequest::new(action, question.to_string(), origin);
+        req.options = ask.options;
+        let (reply, answer) = mpsc::channel();
+        self.escalation_answers.push((ask.id, action, answer));
+        self.enqueue_prompt(req, reply);
+    }
+
+    fn settle_escalation_answers(&mut self) {
+        let mut answered = Vec::new();
+        self.escalation_answers
+            .retain(|(id, action, answer)| match answer.try_recv() {
+                Ok(answer) => {
+                    answered.push((id.clone(), *action, answer));
+                    false
+                }
+                Err(mpsc::TryRecvError::Empty) => true,
+                Err(mpsc::TryRecvError::Disconnected) => false,
+            });
+        for (id, action, answer) in answered {
+            if !matches!(answer, PromptAnswer::Cancelled) {
+                self.reply_escalation(&id, &answer.summary(action));
+            }
+        }
+    }
+
+    fn reply_escalation(&mut self, id: &str, reply: &str) {
+        let Some(control) = &self.control else {
+            self.push_notice(
+                NoticeKind::ToolWarning,
+                "The reply was not delivered: the session is ending".to_string(),
+            );
+            return;
+        };
+        let mut ctx = control.fork_for_branch();
+        match crate::function::agents::reply_escalation(&mut ctx, id, reply) {
+            Ok(result) if result.get("status").and_then(Value::as_str) == Some("ok") => {}
+            Ok(result) => self.push_notice(
+                NoticeKind::ToolWarning,
+                result
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("The reply was not delivered")
+                    .to_string(),
+            ),
+            Err(err) => self.push_notice(
+                NoticeKind::ToolWarning,
+                format!("The reply was not delivered: {err:#}"),
+            ),
+        }
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
@@ -1958,6 +2446,45 @@ impl App {
             }
             UiMsg::Prompt { req, reply } => self.enqueue_prompt(*req, reply),
             UiMsg::LendTerminal(job) => self.lend_requests.push(job),
+            UiMsg::ChildTranscriptFlushed { session_id, root } => {
+                if !is_plain_session_id(&session_id) {
+                    warn!("Ignored a flush of a child session with the id {session_id:?}");
+                    self.schedule_frame();
+                    return;
+                }
+                // Only a child of the running turn can name the root, and
+                // only the first one to do so does.
+                if self.turn.is_some() && self.child_root.is_none() {
+                    self.child_root = root;
+                }
+                let reload = self
+                    .pager
+                    .as_mut()
+                    .and_then(|pager| pager.child_flushed(&session_id));
+                if let Some(file) = reload {
+                    self.read_open_child(session_id, file);
+                }
+            }
+            UiMsg::ChildLoaded {
+                session_id,
+                generation,
+                result,
+            } => {
+                if let Err(err) = &result {
+                    warn!("Failed to read the session of child {session_id}: {err}");
+                }
+                let again = self
+                    .pager
+                    .as_mut()
+                    .and_then(|pager| pager.set_child_entries(&session_id, generation, result));
+                if let Some(file) = again {
+                    self.read_open_child(session_id, file);
+                }
+            }
+            UiMsg::TaskCancelled { id, result } => {
+                let (kind, text) = cancel_report(&id, &result);
+                self.push_notice(kind, text);
+            }
         }
         self.schedule_frame();
     }
@@ -2087,6 +2614,7 @@ impl App {
                     output,
                     open_line,
                     pending,
+                    full,
                     ..
                 } = self.transcript.replace(index, row)
                 else {
@@ -2101,6 +2629,7 @@ impl App {
                         output,
                         open_line,
                         pending,
+                        full,
                     });
                 }
             }
@@ -2140,6 +2669,8 @@ impl App {
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
         self.close_view();
+        // A question is never left waiting behind the pager.
+        self.close_pager();
         let becomes_front = self.prompts.is_empty();
         self.prompts.push_back(PendingPrompt::new(req, reply));
         if becomes_front {
@@ -2219,8 +2750,9 @@ impl App {
             None if self.turn.is_some() => self.anonymous_tool_output_target(first_cell),
             None => None,
         };
-        if let Some(target) = target {
-            append_output(target, bytes);
+        if let Some((target, full)) = target {
+            full.push(&append_output(target, bytes));
+            cells::enforce_full_output_budget(self.transcript.cells_mut(), FULL_OUTPUT_BUDGET);
             return;
         }
         // Inside a turn the output never merges into a cell from before
@@ -2256,7 +2788,11 @@ impl App {
     /// The output lines of the call `call_id`: a tool row's own, within
     /// this turn, or those of a call folded into a job's or agent's row,
     /// which a later turn's check reaches back to.
-    fn tool_output_target(&mut self, first_cell: usize, call_id: &str) -> Option<OutputTarget<'_>> {
+    fn tool_output_target(
+        &mut self,
+        first_cell: usize,
+        call_id: &str,
+    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
         self.transcript
             .cells_mut()
             .iter_mut()
@@ -2272,7 +2808,10 @@ impl App {
     /// newest running tool row without one (a finished one has had all
     /// its output), or the newest such call folded into a running job's
     /// or agent's row; a finished job or agent takes nothing more.
-    fn anonymous_tool_output_target(&mut self, first_cell: usize) -> Option<OutputTarget<'_>> {
+    fn anonymous_tool_output_target(
+        &mut self,
+        first_cell: usize,
+    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
         let cells = self.transcript.cells();
         let index = (first_cell..cells.len())
             .rev()
@@ -2332,6 +2871,20 @@ impl App {
             .collect()
     }
 
+    /// The cells of the turns that ended: none of the exit's own, nor of
+    /// a turn whose task was lost under it.
+    fn committed_cells(&self) -> &[Cell] {
+        let cells = self.transcript.cells();
+        let end = if self.exiting {
+            self.committed_end
+        } else {
+            self.turn
+                .as_ref()
+                .map_or(cells.len(), |turn| turn.first_cell)
+        };
+        &cells[..end.min(cells.len())]
+    }
+
     fn status_text(&self) -> Option<String> {
         if self.exiting {
             return Some("Leaving...".to_string());
@@ -2383,6 +2936,23 @@ impl App {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.frame_area = Some(area);
+        if let Some(pager) = self.pager.as_mut() {
+            let generation = self.transcript.generation();
+            let text = pager.text(
+                self.transcript.cells_for_layout(),
+                generation,
+                area.width,
+                &mut self.renderer,
+            );
+            pager.settle(&text, Pager::text_rows(area.height));
+            frame.render_widget(PagerView { pager, text: &text }, area);
+            return;
+        }
+        // The roster is read on every frame it is up: the tasks move on
+        // whether or not the context is in hand.
+        if let View::Roster(roster) = &mut self.view {
+            roster.refresh(self.roster_sources.rows());
+        }
         let [transcript, status, bottom, footer] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(1),
@@ -2428,6 +2998,14 @@ impl App {
                     View::Palette(palette) => frame.render_widget(PaletteView(palette), band),
                     View::HistorySearch(search) => frame.render_widget(SearchView(search), band),
                     View::Rewind(rewind) => frame.render_widget(RewindView(rewind), band),
+                    View::Roster(roster) => frame.render_widget(
+                        RosterView {
+                            state: roster,
+                            no_color: self.renderer.no_color,
+                            now: self.clock.now(),
+                        },
+                        band,
+                    ),
                 }
                 let macro_names: Vec<&str> =
                     self.macros.iter().map(|(name, _)| name.as_str()).collect();
@@ -2455,10 +3033,10 @@ impl App {
 
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
-    /// that was just drawn.
+    /// that was just drawn, and so does an open roster for its next read.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
-        if self.turn.is_some() {
+        if self.turn.is_some() || matches!(self.view, View::Roster(_)) {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }
@@ -2667,6 +3245,23 @@ enum Leave {
     /// the loop already fed to the app comes along: the panic message
     /// arrives that way, and the app is never drawn again.
     Lost(tokio::task::JoinError, Vec<String>),
+}
+
+/// Where the transcript printed on the way out goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DumpRoute {
+    /// Fd 1, back to the terminal once the work task let go of it.
+    Terminal,
+    /// The screen's own descriptor: a task left running still holds fds
+    /// 1 and 2 captured, and what went there would never be seen.
+    ScreenFd,
+}
+
+fn dump_route(leave: &Leave) -> DumpRoute {
+    match leave {
+        Leave::Outlived(_) => DumpRoute::ScreenFd,
+        Leave::Finished(..) | Leave::Abandoned(_) | Leave::Lost(..) => DumpRoute::Terminal,
+    }
 }
 
 /// The work task the UI gave up waiting for.
@@ -2936,6 +3531,19 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
 
     if let Err(err) = screen.leave() {
         warn!("Failed to restore the terminal: {err}");
+    }
+    // The transcript goes first, on every way out, so what the exit
+    // itself printed, or the message of a task that died, follows it.
+    if app.config.tui_dump_on_exit {
+        let text = dump::transcript_text(app.committed_cells(), &app.config);
+        if !text.is_empty() {
+            match dump_route(&leave) {
+                DumpRoute::Terminal => write_to_terminal(&text),
+                DumpRoute::ScreenFd => {
+                    let _ = screen.print_line(text.strip_suffix('\n').unwrap_or(&text));
+                }
+            }
+        }
     }
     // What the exit printed goes to the restored terminal with its colours
     // but without anything that could move the cursor or change a mode.
@@ -3385,6 +3993,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
                 warn!("Failed to re-enter the alternate screen: {err}");
             }
             app.schedule_frame();
+        }
+        let requests = app.take_control_requests();
+        if let Some(control) = &app.control {
+            for request in requests {
+                spawn_control_request(request, Arc::clone(control), tx.clone());
+            }
         }
         if quit_requested
             && task.is_none()
@@ -9569,7 +10183,7 @@ mod tests {
 
     /// A task id in the source names the owner of a debt marker and
     /// nothing else: every line carrying one is a lint suppression, a
-    /// `todo!`, an ignored test, or the one pre-existing marker below.
+    /// `todo!`, an ignored test, or an entry of the allowlist below.
     /// An id quoted as data (inside a string literal or a backtick code
     /// span, the way the planning-debris lint and its fixtures spell
     /// theirs) is a needle, not a reference. The needles here are spelled
@@ -9598,10 +10212,7 @@ mod tests {
         ];
         // Each entry is a refusal or a parked test whose line carries the
         // id of the work that removes it.
-        let allowlisted: &[(&str, &str)] = &[(
-            "tests/tui_binary.rs",
-            "the transcript is not yet printed on the normal screen when the UI leaves",
-        )];
+        let allowlisted: &[(&str, &str)] = &[];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
         for dir in ["src", "tests"] {
@@ -9631,6 +10242,715 @@ mod tests {
             offenders.is_empty(),
             "task ids outside a debt marker:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    fn press_ctrl(harness: &mut Harness, c: char) {
+        harness
+            .app
+            .handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    /// The pager reads the whole output a tool printed, where its row in
+    /// the transcript keeps the newest lines only; `q` gives the
+    /// transcript back as it was.
+    #[test]
+    fn ctrl_t_shows_a_tools_whole_output_and_q_closes_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("count", false);
+        narrate(
+            &mut harness,
+            "call-1",
+            "Call execute_command {\"command\":\"seq 30\"}",
+        );
+        start_tool(&mut harness, "call-1", "execute_command", None);
+        let output: String = (1..=30).map(|n| format!("count {n:02}\n")).collect();
+        tool_output(&mut harness, "call-1", &output);
+        finish_tool(&mut harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let Some(Cell::Tool { output: tail, .. }) = harness.app.transcript.cells().get(1) else {
+            panic!("the tool row is gone");
+        };
+        assert_eq!(tail.first().map(String::as_str), Some("count 11"));
+        let before = harness.draw();
+
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Char('g'));
+        let frame = harness.draw();
+        insta::assert_snapshot!("pager_over_a_turn_80x24", &frame);
+        assert!(frame.contains("count 01"), "{frame}");
+        assert!(frame.contains("Thread: root thread"), "{frame}");
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.pager.is_none());
+        assert_eq!(harness.draw(), before);
+    }
+
+    fn counted_turn(harness: &mut Harness, lines: usize) {
+        harness.app.begin_turn("count", false);
+        narrate(
+            harness,
+            "call-1",
+            "Call execute_command {\"command\":\"seq\"}",
+        );
+        start_tool(harness, "call-1", "execute_command", None);
+        let output: String = (1..=lines).map(|n| format!("count {n:02}\n")).collect();
+        tool_output(harness, "call-1", &output);
+        finish_tool(harness, "call-1", true, None);
+        harness.app.end_turn(false, &TurnOutcome::default());
+    }
+
+    /// Enter closes the find field on the first match and keeps the text,
+    /// so `n` and `N` step through the matches from the key legend.
+    #[test]
+    fn enter_in_the_pagers_find_field_leaves_n_and_shift_n_stepping() {
+        let mut harness = Harness::standalone(80, 24);
+        counted_turn(&mut harness, 30);
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Char('g'));
+        harness.press(KeyCode::Char('/'));
+        for c in "count 0".chars() {
+            harness.press(KeyCode::Char(c));
+        }
+        harness.press(KeyCode::Enter);
+        let top_line = |frame: &str| frame.lines().nth(1).unwrap_or_default().to_string();
+        let frame = harness.draw();
+        assert!(top_line(&frame).contains("count 01"), "{frame}");
+        assert!(
+            frame.lines().last().unwrap_or_default().contains("/ find"),
+            "the key legend is not back: {frame}"
+        );
+        harness.press(KeyCode::Char('n'));
+        let frame = harness.draw();
+        assert!(top_line(&frame).contains("count 02"), "{frame}");
+        harness.press(KeyCode::Char('N'));
+        let frame = harness.draw();
+        assert!(top_line(&frame).contains("count 01"), "{frame}");
+    }
+
+    /// Under the pager the wheel scrolls the pager, a click does nothing
+    /// and a paste reaches the find field only; the composer and the
+    /// transcript under it are left as they were.
+    #[test]
+    fn the_pager_keeps_the_mouse_and_pastes_from_what_it_covers() {
+        let mut harness = Harness::standalone(80, 24);
+        counted_turn(&mut harness, 60);
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Char('g'));
+        let top = harness.draw();
+        let mouse = |kind: MouseEventKind| {
+            TermInput::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        harness.app.handle_input(mouse(MouseEventKind::ScrollDown));
+        let scrolled = harness.draw();
+        assert_ne!(scrolled, top, "the wheel did not move the pager");
+        harness
+            .app
+            .handle_input(mouse(MouseEventKind::Down(MouseButton::Left)));
+        assert!(!harness.app.transcript.focused());
+        assert_eq!(harness.draw(), scrolled);
+
+        harness
+            .app
+            .handle_input(TermInput::Paste("dropped-p5x".to_string()));
+        harness.press(KeyCode::Char('/'));
+        harness
+            .app
+            .handle_input(TermInput::Paste("count\n59".to_string()));
+        let frame = harness.draw();
+        assert!(
+            frame
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .contains("/count 59"),
+            "{frame}"
+        );
+        assert!(!frame.contains("dropped-p5x"), "{frame}");
+        assert_eq!(harness.app.composer.text(), "");
+    }
+
+    /// A question arriving while the pager is open closes the pager: it
+    /// must never wait out of sight.
+    #[test]
+    fn a_question_closes_the_pager() {
+        let mut harness = Harness::standalone(80, 24);
+        press_ctrl(&mut harness, 't');
+        assert!(harness.app.pager.is_some());
+        let (reply, _answer) = mpsc::channel();
+        harness.app.handle_msg(UiMsg::Prompt {
+            req: Box::new(confirm_request(None)),
+            reply,
+        });
+        assert!(harness.app.pager.is_none());
+        assert!(harness.draw().contains("Proceed? tui-x7x"));
+    }
+
+    fn supervisor() -> Arc<parking_lot::RwLock<crate::supervisor::Supervisor>> {
+        Arc::new(parking_lot::RwLock::new(
+            crate::supervisor::Supervisor::new(4, 3).with_max_concurrent_jobs(4),
+        ))
+    }
+
+    /// `.agent` swaps the supervisor and drops the escalation queue on
+    /// the context; the next return replaces what the roster and the
+    /// control context hold, and the queue the roster reads is the one
+    /// the context will hand its children.
+    #[test]
+    fn every_return_of_the_context_replaces_the_handles_the_roster_holds() {
+        let mut ctx = chat_ctx();
+        let first = supervisor();
+        ctx.supervisor = Some(Arc::clone(&first));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        let queue = ctx
+            .escalation_queue
+            .clone()
+            .expect("the queue is made on the return");
+        let held = &harness.app.roster_sources;
+        assert!(Arc::ptr_eq(held.supervisor.as_ref().unwrap(), &first));
+        assert!(Arc::ptr_eq(held.escalations.as_ref().unwrap(), &queue));
+        let control = harness.app.control.clone().unwrap();
+        assert!(Arc::ptr_eq(control.supervisor.as_ref().unwrap(), &first));
+        assert!(Arc::ptr_eq(
+            control.escalation_queue.as_ref().unwrap(),
+            &queue
+        ));
+        assert!(!control.persists_session);
+
+        let second = supervisor();
+        ctx.supervisor = Some(Arc::clone(&second));
+        ctx.escalation_queue = None;
+        harness.app.sync_from_ctx(&mut ctx);
+        let fresh = ctx.escalation_queue.clone().unwrap();
+        assert!(!Arc::ptr_eq(&fresh, &queue));
+        let held = &harness.app.roster_sources;
+        assert!(Arc::ptr_eq(held.supervisor.as_ref().unwrap(), &second));
+        assert!(Arc::ptr_eq(held.escalations.as_ref().unwrap(), &fresh));
+        let control = harness.app.control.clone().unwrap();
+        assert!(Arc::ptr_eq(control.supervisor.as_ref().unwrap(), &second));
+
+        harness.app.begin_exit();
+        assert!(harness.app.control.is_none());
+        assert!(harness.app.roster_sources.supervisor.is_none());
+    }
+
+    fn running_job(id: &str) -> crate::supervisor::JobHandle {
+        use crate::supervisor::{JobHandle, JobResult, JobState, JobStatus};
+        JobHandle {
+            id: id.to_string(),
+            tool: "execute_command".to_string(),
+            started_at: Instant::now(),
+            join_handle: tokio::spawn(std::future::pending::<Result<JobResult>>()),
+            abort_signal: create_abort_signal(),
+            state: Arc::new(parking_lot::Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            })),
+            output_buf: Arc::new(parking_lot::Mutex::new(
+                crate::function::jobs::RingBuf::default(),
+            )),
+            no_change_checks: 0,
+            last_check_state: None,
+        }
+    }
+
+    fn finished_agent(id: &str) -> crate::supervisor::AgentHandle {
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+        let result_id = id.to_string();
+        AgentHandle {
+            id: id.to_string(),
+            agent_name: "reviewer".to_string(),
+            depth: 1,
+            inbox: Arc::new(crate::supervisor::mailbox::Inbox::new()),
+            abort_signal: create_abort_signal(),
+            join_handle: tokio::spawn(async move {
+                Ok(AgentResult {
+                    id: result_id,
+                    agent_name: "reviewer".to_string(),
+                    output: String::new(),
+                    exit_status: AgentExitStatus::Completed,
+                    session_id: None,
+                })
+            }),
+            child_supervisor: None,
+            session_id: None,
+        }
+    }
+
+    /// Runs what the roster or pager queued the way the loop does and
+    /// hands the app the one message that comes back.
+    async fn run_control_requests(harness: &mut Harness) {
+        let (tx, mut rx) = unbounded_channel();
+        let control = harness.app.control.clone().expect("a control context");
+        let requests = harness.app.take_control_requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        for request in requests {
+            spawn_control_request(request, Arc::clone(&control), tx.clone());
+        }
+        let msg = rx.recv().await.expect("the request reports back");
+        harness.app.handle_msg(msg);
+    }
+
+    /// `x` cancels through the same `job__cancel` and `agent__cancel`
+    /// the model calls, mid-turn included: the control context reaches
+    /// the supervisor the running turn has. The rows go from the roster
+    /// and the outcome lands in the transcript.
+    #[test]
+    #[serial]
+    fn x_cancels_the_focused_task_through_the_public_cancel_tools() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-roster-cancel");
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            tasks.write().register(running_job("job-x7x")).unwrap();
+            tasks.write().register(finished_agent("agent-x7x")).unwrap();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness.app.begin_turn("work on", false);
+
+            harness.press(KeyCode::F(3));
+            let frame = harness.draw();
+            assert!(frame.contains("agent-x7x"), "{frame}");
+            assert!(frame.contains("job-x7x"), "{frame}");
+            harness.press(KeyCode::Down);
+            harness.press(KeyCode::Char('x'));
+            run_control_requests(&mut harness).await;
+            assert!(!tasks.read().has_job("job-x7x"));
+            let frame = harness.draw();
+            assert!(!frame.contains("job-x7x  running"), "{frame}");
+
+            harness.press(KeyCode::Char('x'));
+            run_control_requests(&mut harness).await;
+            assert!(!tasks.read().has_agent("agent-x7x"));
+            harness.press(KeyCode::Esc);
+            let frame = harness.draw();
+            assert!(frame.contains("Cancelled job-x7x"), "{frame}");
+            assert!(frame.contains("Cancelled agent 'reviewer'"), "{frame}");
+        });
+    }
+
+    #[test]
+    fn a_refused_or_failed_cancel_is_reported_as_a_warning() {
+        let refused = serde_json::json!({"status": "error", "message": "No job 'j' is registered"});
+        assert_eq!(
+            cancel_report("j", &Ok(refused)),
+            (
+                NoticeKind::ToolWarning,
+                "Cancel of j refused: No job 'j' is registered".to_string()
+            )
+        );
+        assert_eq!(
+            cancel_report("j", &Err("No supervisor active".to_string())),
+            (
+                NoticeKind::ToolWarning,
+                "Cancel of j failed: No supervisor active".to_string()
+            )
+        );
+    }
+
+    fn escalate(
+        queue: &crate::supervisor::escalation::EscalationQueue,
+        options: Option<Vec<String>>,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        queue.submit(crate::supervisor::escalation::EscalationRequest {
+            id: "esc_x7x".to_string(),
+            from_agent_id: "agent-x7x".to_string(),
+            from_agent_name: "reviewer".to_string(),
+            question: "Which branch? x7x".to_string(),
+            options,
+            reply_tx,
+        });
+        reply_rx
+    }
+
+    /// Enter on a question's row asks it in the prompt modal, a list
+    /// over the agent's options; the choice reaches the waiting agent
+    /// through `reply_escalation`. Esc on the modal leaves it waiting.
+    #[test]
+    #[serial]
+    fn enter_on_a_question_answers_it_through_the_modal() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let mut reply = escalate(&queue, Some(vec!["main".to_string(), "dev".to_string()]));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+
+        harness.press(KeyCode::F(3));
+        let frame = harness.draw();
+        assert!(frame.contains("Which branch? x7x"), "{frame}");
+        harness.press(KeyCode::Enter);
+        let frame = harness.draw();
+        assert_welcome_snapshot("escalation_modal_80x24", &frame);
+        assert_eq!(
+            harness.app.prompts.front().map(PendingPrompt::kind),
+            Some(ModalKind::Select {
+                custom_field_open: false
+            })
+        );
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Esc);
+        assert!(queue.has_pending(), "Esc answered the question");
+        assert!(reply.try_recv().is_err());
+
+        harness.press(KeyCode::F(3));
+        harness.draw();
+        harness.press(KeyCode::Enter);
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Down);
+        harness.press(KeyCode::Enter);
+        assert_eq!(reply.try_recv().as_deref(), Ok("dev"));
+        assert!(!queue.has_pending());
+    }
+
+    /// A question with no options is asked for free text.
+    #[test]
+    #[serial]
+    fn a_question_without_options_takes_typed_text() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let mut reply = escalate(&queue, None);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press(KeyCode::F(3));
+        harness.draw();
+        harness.press(KeyCode::Enter);
+        assert_eq!(
+            harness.app.prompts.front().map(PendingPrompt::kind),
+            Some(ModalKind::Input)
+        );
+        harness.type_text("release");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Enter);
+        assert_eq!(reply.try_recv().as_deref(), Ok("release"));
+    }
+
+    /// The `[kind] ` an agent's user tool puts in front of an escalated
+    /// question names the modal, and the question is shown without it.
+    #[test]
+    fn an_escalated_questions_kind_prefix_picks_the_modal() {
+        assert_eq!(
+            escalation_kind("[checkbox] Which files?"),
+            (Some(PromptAction::Checkbox), "Which files?")
+        );
+        assert_eq!(
+            escalation_kind("[confirm] Ship it?"),
+            (Some(PromptAction::Confirm), "Ship it?")
+        );
+        assert_eq!(escalation_kind("[later] plain"), (None, "[later] plain"));
+    }
+
+    /// A confirm escalation asks with the confirm modal and relays `yes`,
+    /// the way the answer is published everywhere else.
+    #[test]
+    #[serial]
+    fn a_confirm_escalation_relays_yes() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let (reply_tx, mut reply) = tokio::sync::oneshot::channel();
+        queue.submit(crate::supervisor::escalation::EscalationRequest {
+            id: "esc_c4f".to_string(),
+            from_agent_id: "agent-c4f".to_string(),
+            from_agent_name: "reviewer".to_string(),
+            question: "[confirm] Ship it? c4f".to_string(),
+            options: None,
+            reply_tx,
+        });
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press(KeyCode::F(3));
+        harness.draw();
+        harness.press(KeyCode::Enter);
+        assert!(matches!(
+            harness.app.prompts.front().map(PendingPrompt::kind),
+            Some(ModalKind::Confirm { .. })
+        ));
+        let frame = harness.draw();
+        assert!(frame.contains("Ship it? c4f"), "{frame}");
+        assert!(!frame.contains("[confirm]"), "{frame}");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Char('y'));
+        assert_eq!(reply.try_recv().as_deref(), Ok("yes"));
+    }
+
+    fn write_child(root: &ChildSessionRoot, session_id: &str, body: &str) -> PathBuf {
+        let file = root.child_session_file(session_id);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, body).unwrap();
+        file
+    }
+
+    fn child_yaml(reply: &str) -> String {
+        format!(
+            "model: openai:test-model\nmessages:\n- role: user\n  content: review it\n\
+             - role: assistant\n  content: {reply}\n"
+        )
+    }
+
+    /// A child's thread is read again when the child says it wrote its
+    /// file, and only then; a file that no longer parses leaves an error
+    /// line next to what was last read.
+    #[test]
+    #[serial]
+    fn an_open_child_thread_is_read_again_when_the_child_flushes() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-pager-child");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 7 };
+            write_child(&root, "reviewer-x7x", &child_yaml("first draft v1"));
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+
+            harness
+                .app
+                .open_child("reviewer-x7x".to_string(), "reviewer".to_string());
+            run_control_requests(&mut harness).await;
+            let frame = harness.draw();
+            insta::assert_snapshot!("pager_child_thread_80x24", &frame);
+            assert!(frame.contains("first draft v1"), "{frame}");
+
+            write_child(&root, "reviewer-x7x", &child_yaml("second draft v2"));
+            harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+                session_id: "planner-other".to_string(),
+                root: None,
+            });
+            assert!(harness.app.take_control_requests().is_empty());
+            harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+                session_id: "reviewer-x7x".to_string(),
+                root: None,
+            });
+            run_control_requests(&mut harness).await;
+            let frame = harness.draw();
+            assert!(frame.contains("second draft v2"), "{frame}");
+            assert!(!frame.contains("first draft v1"), "{frame}");
+
+            write_child(&root, "reviewer-x7x", "model: [unclosed\nmessages: {");
+            harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+                session_id: "reviewer-x7x".to_string(),
+                root: None,
+            });
+            run_control_requests(&mut harness).await;
+            let frame = harness.draw();
+            assert!(frame.contains("Cannot read this transcript"), "{frame}");
+            assert!(frame.contains("second draft v2"), "{frame}");
+        });
+    }
+
+    /// A child whose file never parsed shows the error alone, and one
+    /// with no file at all says so the same way.
+    #[test]
+    #[serial]
+    fn a_malformed_or_missing_child_file_degrades_to_an_error_line() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-pager-bad-child");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 8 };
+            write_child(&root, "broken-x7x", "messages: - [");
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            for session_id in ["broken-x7x", "missing-x7x"] {
+                harness
+                    .app
+                    .open_child(session_id.to_string(), "reviewer".to_string());
+                run_control_requests(&mut harness).await;
+                let frame = harness.draw();
+                assert!(frame.contains("Cannot read this transcript"), "{frame}");
+                assert!(!frame.contains("Loading..."), "{frame}");
+            }
+        });
+    }
+
+    /// The first flush of a child the root has not handed back yet names
+    /// where the children live, and the picker lists them from there.
+    #[test]
+    #[serial]
+    fn a_childs_flush_names_the_root_the_picker_lists() {
+        let _guard = TestConfigDirGuard::new("tui-pager-picker");
+        let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 9 });
+        let mut harness = Harness::standalone(80, 24);
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Tab);
+        assert!(harness.draw().contains("No child sessions yet"));
+        harness.press(KeyCode::Esc);
+
+        let meta = crate::config::child_sessions::ChildMeta::new_running(
+            "reviewer-x7x",
+            "reviewer",
+            "agent-x7x",
+            crate::utils::process::ProcessStamp::current(),
+            None,
+            None,
+            "review it",
+            None,
+        );
+        std::fs::create_dir_all(root.children_dir()).unwrap();
+        root.save_child_meta(&meta).unwrap();
+        harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+            session_id: "reviewer-x7x".to_string(),
+            root: Some(Arc::clone(&root)),
+        });
+        harness.press(KeyCode::Tab);
+        assert!(
+            harness.draw().contains("No child sessions yet"),
+            "a flush outside a turn named the root"
+        );
+        harness.press(KeyCode::Esc);
+
+        harness.app.begin_turn("review it", false);
+        harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+            session_id: "reviewer-x7x".to_string(),
+            root: Some(Arc::clone(&root)),
+        });
+        harness.press(KeyCode::Tab);
+        let frame = harness.draw();
+        assert!(frame.contains("reviewer  reviewer-x7x  running"), "{frame}");
+    }
+
+    /// Two flushes during the first read leave that read alone in flight
+    /// and ask for exactly one more, which shows the newest file.
+    #[test]
+    #[serial]
+    fn flushes_during_a_child_read_queue_one_more_read() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-pager-child-flushes");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 10 };
+            write_child(&root, "reviewer-x7x", &child_yaml("first draft v1"));
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness
+                .app
+                .open_child("reviewer-x7x".to_string(), "reviewer".to_string());
+            let first = harness.app.take_control_requests();
+            assert_eq!(first.len(), 1, "{first:?}");
+            for _ in 0..2 {
+                harness.app.handle_msg(UiMsg::ChildTranscriptFlushed {
+                    session_id: "reviewer-x7x".to_string(),
+                    root: None,
+                });
+            }
+            assert!(harness.app.take_control_requests().is_empty());
+            write_child(&root, "reviewer-x7x", &child_yaml("third draft v3"));
+            let (tx, mut rx) = unbounded_channel();
+            let control = harness.app.control.clone().expect("a control context");
+            for request in first {
+                spawn_control_request(request, Arc::clone(&control), tx.clone());
+            }
+            let msg = rx.recv().await.expect("the read reports back");
+            harness.app.handle_msg(msg);
+            run_control_requests(&mut harness).await;
+            assert!(harness.app.take_control_requests().is_empty());
+            let frame = harness.draw();
+            assert!(frame.contains("third draft v3"), "{frame}");
+        });
+    }
+
+    /// A session id that could leave the child root is never read, from
+    /// the roster or from a flush.
+    #[test]
+    fn a_session_id_with_a_path_in_it_is_refused() {
+        for id in ["../etc", "a/b", "a\\b", "nul\0", ""] {
+            assert!(!is_plain_session_id(id), "{id:?}");
+        }
+        assert!(is_plain_session_id("reviewer-x7x"));
+        let mut ctx = chat_ctx();
+        ctx.child_session_root = Some(Arc::new(ChildSessionRoot::Proc { pid: 1, start: 11 }));
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness
+            .app
+            .open_child("../../etc".to_string(), "reviewer".to_string());
+        assert!(harness.app.pager.is_none());
+        assert!(harness.app.take_control_requests().is_empty());
+    }
+
+    /// The sink forwards a child's flush to the loop with its root.
+    #[test]
+    fn the_sink_forwards_a_childs_flush() {
+        let (tx, mut rx) = unbounded_channel();
+        let root = Arc::new(ChildSessionRoot::Proc { pid: 1, start: 2 });
+        TuiSink::new(tx).on_event(&Event::ChildTranscriptFlushed {
+            session_id: "reviewer-x7x".to_string(),
+            root: Some(Arc::clone(&root)),
+        });
+        match rx.try_recv() {
+            Ok(UiMsg::ChildTranscriptFlushed {
+                session_id,
+                root: Some(sent),
+            }) => {
+                assert_eq!(session_id, "reviewer-x7x");
+                assert!(Arc::ptr_eq(&sent, &root));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// What the exit prints is the turns that ended: the exit's own
+    /// output is printed apart from it.
+    #[test]
+    fn the_dump_covers_the_committed_turns_only() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("hello there", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("general kenobi".to_string()));
+        assert!(
+            harness.app.committed_cells().is_empty(),
+            "a running turn was counted as committed"
+        );
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.begin_exit();
+        harness
+            .app
+            .push_notice(NoticeKind::Routing, "Saved the session".to_string());
+        let text = dump::transcript_text(harness.app.committed_cells(), &harness.app.config);
+        assert_eq!(render::plain_text(&text), "> hello there\ngeneral kenobi\n");
+    }
+
+    /// A signal mid-turn leaves the half-finished turn out of what is
+    /// printed, even after the turn is wound up during the exit.
+    #[test]
+    fn the_dump_leaves_out_a_turn_the_exit_cut_short() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("first", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("one".to_string()));
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.app.begin_turn("second", false);
+        harness
+            .app
+            .handle_msg(UiMsg::AssistantText("half of tw".to_string()));
+        harness.app.begin_exit();
+        harness.app.end_turn(false, &TurnOutcome::default());
+        let text = dump::transcript_text(harness.app.committed_cells(), &harness.app.config);
+        assert_eq!(render::plain_text(&text), "> first\none\n");
+    }
+
+    /// Only a task left running keeps fds 1 and 2 captured; its dump goes
+    /// through the screen's descriptor, every other one to fd 1.
+    #[test]
+    fn the_dump_goes_round_a_task_left_running() {
+        assert_eq!(
+            dump_route(&Leave::Outlived(Unfinished::Turn)),
+            DumpRoute::ScreenFd
+        );
+        assert_eq!(
+            dump_route(&Leave::Outlived(Unfinished::Exit)),
+            DumpRoute::ScreenFd
+        );
+        assert_eq!(
+            dump_route(&Leave::Finished(Ok(()), String::new())),
+            DumpRoute::Terminal
         );
     }
 

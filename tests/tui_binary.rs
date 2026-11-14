@@ -30,14 +30,16 @@ use serial_test::serial;
 /// capture that gave up before the drain thread ran would instead leave
 /// the cell empty and show the table a blank row lower, as a notice. The
 /// table is a `Command` cell inside the alternate screen, so once the
-/// screen is left nothing of it may reach the terminal the shell gets
-/// back: the only bytes after the leave are the wrapper's own report.
+/// screen is left nothing of it may leak to the terminal the shell gets
+/// back. The transcript printed on exit would carry the cell on purpose,
+/// so it is switched off here: what is left after the leave is the
+/// wrapper's own report.
 #[test]
 #[serial]
 fn a_command_prints_into_the_transcript_and_ctrl_d_leaves_the_tty_cooked() {
     let dir = fresh_config_dir("ctrl-d");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_config(&dir, "save_session: false\ntui_dump_on_exit: false\n");
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1322,8 +1324,9 @@ fn a_second_ctrl_d_during_teardown_changes_nothing() {
 }
 
 /// The first run ever: no cache dir, no sessions, no config beyond the
-/// dry-run file. The UI comes up with its chrome, and leaving creates no
-/// stray file next to the tty report.
+/// dry-run file. The UI comes up with its chrome, and leaving prints the
+/// transcript and nothing else (no log line, no warning about the missing
+/// directories) ahead of the tty report.
 #[test]
 #[serial]
 fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
@@ -1349,10 +1352,43 @@ fn a_cold_start_with_no_cache_dir_comes_up_and_leaves_clean() {
         &pty.raw()[rfind(pty.raw(), LEAVE_ALT).unwrap()..],
     ));
     let report_at = after.find("exit=").unwrap();
+    let printed: Vec<&str> = after[..report_at]
+        .trim()
+        .lines()
+        .map(str::trim_end)
+        .collect();
+    // The dry-run reply echoes the whole request, system prompt included,
+    // so only its last line is pinned: the rendered user message.
+    let prompt = "> **zebra** and `quartz` marker";
+    let reply = "zebra and quartz marker";
+    assert_eq!(printed.first(), Some(&prompt), "{printed:#?}");
+    assert_eq!(printed.last(), Some(&reply), "{printed:#?}");
+    for line in [prompt, reply] {
+        assert_eq!(
+            printed.iter().filter(|printed| **printed == line).count(),
+            1,
+            "{line:?} is not printed exactly once: {printed:#?}"
+        );
+    }
+    let leaked: Vec<&&str> = printed
+        .iter()
+        .filter(|line| {
+            let line = line.trim_start();
+            [
+                "WARN", "ERROR", "INFO", "DEBUG", "Failed", "warning:", "error:", "Error:",
+                "Warning:",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+                || line.contains("panicked")
+                || [" WARN ", " ERROR ", " INFO ", " DEBUG "]
+                    .iter()
+                    .any(|level| line.contains(level))
+        })
+        .collect();
     assert!(
-        after[..report_at].trim().is_empty(),
-        "bytes reached the terminal between the leave and the report: {:?}",
-        after[..report_at].trim()
+        leaked.is_empty(),
+        "the bytes between the leave and the report are not just the transcript: {leaked:#?}"
     );
 }
 
@@ -2696,7 +2732,6 @@ fn esc_on_an_idle_empty_composer_does_not_quit() {
 /// reply are printed where the shell prompt will follow.
 #[test]
 #[serial]
-#[ignore = "the transcript is not yet printed on the normal screen when the UI leaves"] // TASK-317
 fn ctrl_d_prints_the_committed_transcript_on_the_normal_screen() {
     let dir = fresh_config_dir("ctrl-d-dump");
     let _guard = TempDirGuard(dir.clone());

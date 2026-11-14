@@ -107,7 +107,6 @@ pub enum TaskKind {
 /// Where a supervised task stands. `Finished` is a task whose future has
 /// returned but whose outcome is only known once it is collected: every
 /// agent ends this way, and a job does when its state was never updated.
-#[allow(dead_code)] // TASK-317
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskRowStatus {
     Running,
@@ -118,7 +117,6 @@ pub enum TaskRowStatus {
 
 /// One row of a task listing, detached from the handle so callers can keep
 /// it past the supervisor lock.
-#[allow(dead_code)] // TASK-317
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
     pub id: String,
@@ -352,7 +350,6 @@ impl Supervisor {
     }
 
     /// Every registered task as an owned row, sorted by id.
-    #[allow(dead_code)] // TASK-317
     pub fn task_snapshot(&self) -> Vec<TaskRow> {
         let mut rows: Vec<TaskRow> = self
             .handles

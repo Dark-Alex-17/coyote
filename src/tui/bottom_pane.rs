@@ -1,12 +1,13 @@
 //! What the bottom pane shows besides the composer. The composer is always
 //! there; a view is a band of rows that sits on top of it: the command
-//! palette, the history search, the rewind picker. The prompt modal is
-//! not a view: a question outranks all of them and closes whatever is
-//! open.
+//! palette, the history search, the rewind picker, the task roster. The
+//! prompt modal is not a view: a question outranks all of them and closes
+//! whatever is open.
 
 use super::DIM;
 use super::cells::{Cell, RewindBarrier};
 use super::history::ComposerHistory;
+use super::roster::RosterState;
 use crate::config::{CommandPrefix, RequestContext, StateFlags};
 use crate::repl::{command_candidates, macro_candidates, split_line};
 use ratatui::buffer::Buffer;
@@ -29,6 +30,7 @@ pub(super) enum View {
     Palette(PaletteState),
     HistorySearch(SearchState),
     Rewind(RewindState),
+    Roster(RosterState),
 }
 
 impl View {
@@ -40,12 +42,13 @@ impl View {
             View::Palette(palette) => palette.band_rows(),
             View::HistorySearch(search) => search.band_rows(),
             View::Rewind(rewind) => rewind.band_rows(),
+            View::Roster(roster) => roster.band_rows(),
         }
     }
 }
 
 /// Clamps a list's highlight moved by `delta` rows to its rows.
-fn step_highlight(highlight: usize, delta: i32, len: usize) -> usize {
+pub(super) fn step_highlight(highlight: usize, delta: i32, len: usize) -> usize {
     let last = len.saturating_sub(1);
     let moved = highlight as i64 + i64::from(delta);
     usize::try_from(moved.max(0)).unwrap_or(last).min(last)
@@ -65,7 +68,7 @@ pub(super) fn first_line(text: &str) -> (String, String) {
     (first, tail)
 }
 
-fn rows_within_cap(len: usize) -> u16 {
+pub(super) fn rows_within_cap(len: usize) -> u16 {
     u16::try_from(len)
         .unwrap_or(BAND_MAX_ROWS)
         .min(BAND_MAX_ROWS)
@@ -404,7 +407,12 @@ impl RewindState {
 /// the second dim after it, the highlighted row reversed. Given fewer
 /// rows than the list has, the band keeps the highlight in view and
 /// ends with how many rows are not shown.
-fn render_rows(rows: &[(&str, &str)], highlight: Option<usize>, area: Rect, buf: &mut Buffer) {
+pub(super) fn render_rows(
+    rows: &[(&str, &str)],
+    highlight: Option<usize>,
+    area: Rect,
+    buf: &mut Buffer,
+) {
     let area = area.intersection(*buf.area());
     if area.is_empty() {
         return;
@@ -442,7 +450,7 @@ fn render_rows(rows: &[(&str, &str)], highlight: Option<usize>, area: Rect, buf:
 
 /// A one-row header over the rows under it; the rest of the area is
 /// what is left for them.
-fn render_header(line: Line<'_>, area: Rect, buf: &mut Buffer) -> Rect {
+pub(super) fn render_header(line: Line<'_>, area: Rect, buf: &mut Buffer) -> Rect {
     let area = area.intersection(*buf.area());
     if area.is_empty() {
         return area;

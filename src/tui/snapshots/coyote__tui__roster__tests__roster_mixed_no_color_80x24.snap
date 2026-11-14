@@ -1,0 +1,28 @@
+---
+source: src/tui/roster.rs
+expression: terminal.backend().to_string()
+---
+"Tasks  j/k = move  x = cancel  o = open  Enter = answer  Esc = close            "
+"agent reviewer         agent-1  running                                         "
+"job   execute_command  job-2    failed  75.0s                                   "
+"ask   reviewer         Ship the fix to main?  +1 line                           "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "

@@ -29,17 +29,6 @@ use serial_test::serial;
 // slow or die under the full-screen UI.
 // ---------------------------------------------------------------------------
 
-/// Writes `extra` top-level YAML after the fake-LLM config, so a case can
-/// add `document_loaders` while keeping the fake model (whose served count
-/// proves whether a document ever reached the model).
-fn write_fake_llm_config_with(dir: &Path, fake: &FakeLlm, extra: &str) {
-    write_fake_llm_config(dir, fake);
-    let path = dir.join("config.yaml");
-    let mut config = fs::read_to_string(&path).unwrap();
-    config.push_str(extra);
-    fs::write(&path, config).unwrap();
-}
-
 /// Pumps the pty until `marker` is on screen after `from` (whitespace
 /// squeezed), answering each modal on the way with the key paired with
 /// its squeezed question in `answers`, in whatever order they come up.
@@ -1291,13 +1280,14 @@ const SAVED_LINE: &[u8] = b"Saved the session to";
 /// confirmation) lands in the transcript inside the alternate screen, on
 /// a row below the `.exit session` command, the footer goes back to "no
 /// session", the UI keeps taking keys, and nothing of the line leaks to
-/// the normal screen after Ctrl+D.
+/// the normal screen after Ctrl+D. The transcript printed on exit would
+/// carry the line on purpose, so it is switched off here.
 #[test]
 #[serial]
 fn dot_exit_session_saving_on_y_prints_where_it_saved_in_the_transcript() {
     let dir = fresh_config_dir("exit-session-saved-line");
     let _guard = TempDirGuard(dir.clone());
-    write_config(&dir, "");
+    write_config(&dir, "tui_dump_on_exit: false\n");
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();

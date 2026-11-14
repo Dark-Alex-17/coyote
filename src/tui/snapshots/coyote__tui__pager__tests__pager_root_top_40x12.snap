@@ -1,0 +1,16 @@
+---
+source: src/tui/pager.rs
+expression: "&frame"
+---
+"Thread: root thread              1-10/47"
+"> count to forty                        "
+"                                        "
+"execute_command({"command":"seq"})  1.5s"
+"ok                                      "
+"Call execute_command {"command":"seq"}  "
+"line 001                                "
+"line 002                                "
+"line 003                                "
+"line 004                                "
+"line 005                                "
+"j/k scroll  g/G top/end  / find  n/N nex"
