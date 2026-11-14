@@ -7,7 +7,6 @@
 
 use std::fs;
 use std::path::Path;
-#[cfg(unix)]
 use std::process::Command;
 
 fn asset_file(dir: &str, rel: &str) -> String {
