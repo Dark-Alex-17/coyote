@@ -61,6 +61,7 @@ if (( GATE_TIMED_OUT == 1 )); then
     '{
       "tests_ok": false,
       "tests_output": ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR + "\nTIMED OUT after " + env.GATE_DEADLINE + " s (test_timeout); the suite was killed before it finished.\n\n" + .),
+      "tests_verdict": ("TIMED OUT after " + env.GATE_DEADLINE + " s"),
       "gate_error": ("verify_tests TIMED OUT after " + env.GATE_DEADLINE + " s (test_timeout) before the suite finished. This is not a red run: raise test_timeout or pass a narrower test_command."),
       "_next": "end_failure"
     }'
@@ -146,6 +147,7 @@ trim_output "$output" | jq -Rsc \
       | {
           "tests_ok": false,
           "tests_output": ($ran + "\nExit code: " + ($rc | tostring) + $crash + $block + "\n\n" + .),
+          "tests_verdict": ("failed (exit " + ($rc | tostring) + ")"),
           "_next": "fix_loop_gate"
         }
     end'

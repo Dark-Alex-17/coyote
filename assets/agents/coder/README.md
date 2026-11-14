@@ -73,9 +73,10 @@ End nodes emit one of three sentinel outcomes for the caller:
     when the suite failed only in ways the baseline already recorded
     (`unidentified (<reason>)` stands in for the ids when none could be read).
   - `Review: clean`, `Review: unresolved notes (review budget exhausted):`
-    followed by the notes on the next lines, or `Review: NOT RUN: ...` when
-    the self-review ended without a verdict. `not run` on any of the three
-    means the run never reached that check.
+    followed by the notes on the next lines, each indented two spaces so no
+    note can pass for a report field, or `Review: NOT RUN: ...` when the
+    self-review ended without a verdict. `not run` on any of the three means
+    the run never reached that check.
 
   The `Design:` block always comes last.
   Its `Design:` line carries the self-review's `design_notes`: every pattern
@@ -106,8 +107,9 @@ End nodes emit one of three sentinel outcomes for the caller:
   anything else asks again.
 - `CODER_FAILED` — fix-loop exhausted; build/tests still failing — or the
   verification gate crashed twice (see `Verification gate error:`), or
-  `route_review_result` / `self_review_fault` crashed (see
-  `Last script error:`). A routing script that died has decided nothing, so
+  `route_review_result` / `self_review_fault` / `parse_approval` crashed (see
+  `Last script error:`); a crashed `parse_approval` is never read as a
+  rejection. A routing script that died has decided nothing, so
   the run does not end as `CODER_COMPLETE` on its behalf. The one gate that
   falls toward a human instead is `route_complexity`: a crash there asks for
   plan approval rather than skipping it.
@@ -135,7 +137,8 @@ stored so a later run on the same commit reuses it:
   `$(git rev-parse --git-path coyote-baselines)/tests-<key>.json`, where the
   key is the first 16 hex characters of the sha256 of the HEAD commit, the
   directory relative to the work tree root (`.` for the root) and the test
-  command, one per line. Only green and red runs are stored, and an existing
+  command as the gate runs it (after the `--no-fail-fast` rewrite), one per
+  line. Only green and red runs are stored, and an existing
   record is never replaced.
 - A stored record is reused whether or not the tree has changed since; the
   suite is not run again.
@@ -143,8 +146,9 @@ stored so a later run on the same commit reuses it:
   (untracked files count, ignored files do not). On a tree that already holds
   changes, `baseline_status` is `dirty` and no baseline is taken, so every
   failing test counts as the run's own.
-- Outside a git work tree, or before the first commit, `baseline_status` is
-  `none` and no baseline is taken.
+- Outside a git work tree, before the first commit, when `git status` fails,
+  or when a stored record cannot be read, `baseline_status` is `none` and no
+  baseline is taken; the note says which.
 
 To retake a baseline, delete its record from that directory.
 

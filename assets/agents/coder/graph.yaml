@@ -545,8 +545,9 @@ nodes:
       When the tests passed only because their failures match the pre-run
       baseline, accepting those failures is a scope judgement nobody else
       reviews: if any accepted failure is within what the request asked for,
-      set review_clean=false and name it in review_notes. A test result
-      reported as NOT RUN was not verified, so never describe it as verified.
+      set review_clean=false and name it in review_notes. A build or test
+      result reported as NOT RUN was not verified, so never describe it as
+      verified or skip a check on the strength of it.
 
       Project directory: {{project_dir}}
     prompt: |
