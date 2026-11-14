@@ -23,22 +23,22 @@ re-reads, no judgment. The gate's hard rules:
     not as a DIVERGES finding: the nested graph completed with a dead stage
     behind it, so its verdict is not a judgment on the code;
   - an adversary DIVERGES verdict blocks with the adversary's own numbered
-    complaints (the column-0 items under its `Complaints:` line), one
+    complaints (the column-0 items under its `Complaints:` line, each read
+    whole whatever line boundaries its model-written fields carry), one
     blocker each, so a fix round can act on them: at most
     ADVERSARY_COMPLAINTS_MAX, each clipped to ADVERSARY_COMPLAINT_CHARS, the
-    rest folded into one line of their heads; a report without that block
-    keeps one generic DIVERGES blocker;
+    rest folded into one line naming every remaining complaint's head; a
+    report without that block keeps one generic DIVERGES blocker;
   - a non-zero critical count in the code-review report blocks regardless
     of the lane's own verdict line — derived from render.py's deterministic
     summary line (`*Reviewed N files, found X critical, …*`); the raw 🔴
     count is used only when that summary line is missing;
   - a code-review lane whose OWN verdict line opens its reason with
-    `review incomplete:` (finding verification failed as a whole, so its
-    unverified findings sit in a separate section and count as no 🔴) is an
+    `review incomplete:` (finding verification failed as a whole) is an
     incomplete review: the row blocks and the lane is named on the
-    GAUNTLET_REVIEW_INCOMPLETE: machine line, never routed as findings to fix;
-    single unverified findings and criticals the anchor gate could not anchor
-    are named attention lines, never blockers;
+    GAUNTLET_REVIEW_INCOMPLETE: machine line. Its unverified findings keep
+    their stated severity, so an unverified 🔴 is in the critical count and
+    blocks like any other; single unverified findings add an attention line;
   - NEEDS-HUMAN without 🔴 passes but is surfaced as attention required;
   - probe INCONCLUSIVE blocks with an ENVIRONMENT note — it is never
     treated as PASS or FAIL (fix the environment per the plan's local-run
@@ -147,23 +147,37 @@ def selection_lines(summary):
 ADVERSARY_COMPLAINTS_MAX = 8
 ADVERSARY_COMPLAINT_CHARS = 600
 ADVERSARY_OVERFLOW_HEAD_CHARS = 120
+# A report section after the complaints: `Verification runs:`,
+# `Non-blocking observations:`, `Met criteria (evidence):`.
+SECTION_HEADING = re.compile(r"[^\s\d].*:\s*$", re.S)
 
 
 def adversary_complaints(report):
-    """The column-0 numbered items under the adversary's `Complaints:` line, in order; a wrapped item's lines are joined."""
-    lines = report.splitlines()
+    """The column-0 numbered items under the adversary's `Complaints:` line,
+    in order, each with its continuation lines joined.
+
+    The report is split on `\\n` only: an item's fields are model text and may
+    carry any other line-boundary character, a blank line or a line that
+    opens with a number. An item runs until the line that opens the NEXT
+    number, or until a blank line followed by a section heading (a
+    non-numbered line ending in `:`, such as `Verification runs:`)."""
+    lines = [ln[:-1] if ln.endswith("\r") else ln for ln in report.split("\n")]
     start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "Complaints:"), None)
-    items = []
-    for ln in lines[start:] if start is not None else []:
-        if not ln.strip():
+    body = lines[start:] if start is not None else []
+    items, number = [], None
+    for k, ln in enumerate(body):
+        m = re.match(r"(\d+)\.\s+(.*)", ln, re.S)
+        if m and (number is None or int(m.group(1)) == number + 1):
+            number = int(m.group(1))
+            items.append(m.group(2).strip())
+        elif not items:
             break
-        m = re.match(r"\d+\.\s+(.*)", ln)
-        if m:
-            items.append(m.group(1).strip())
-        elif items:
-            items[-1] += " " + ln.strip()
+        elif not ln.strip():
+            nxt = next((b for b in body[k + 1 :] if b.strip()), None)
+            if nxt is None or SECTION_HEADING.match(nxt):
+                break
         else:
-            break
+            items[-1] += " " + ln.strip()
     return [one_line(c) for c in items if c.strip()]
 
 
@@ -182,7 +196,7 @@ def adversary_divergence_blockers(report):
     if len(complaints) > ADVERSARY_COMPLAINTS_MAX:
         rest = complaints[ADVERSARY_COMPLAINTS_MAX:]
         heads = "; ".join(clip(c, ADVERSARY_OVERFLOW_HEAD_CHARS) for c in rest)
-        out.append(clip(f"adversary: DIVERGES -- {len(rest)} more complaint(s): {heads}", ADVERSARY_COMPLAINT_CHARS))
+        out.append(f"adversary: DIVERGES -- {len(rest)} more complaint(s): {heads}")
     return out
 
 
@@ -289,37 +303,32 @@ def main():
         reds = int(sums[-1]) if sums else cr.count("🔴")
         # CONTRACT: code-reviewer/verdict.py. Verification that failed as a
         # whole OPENS the reason with "review incomplete:" and is an
-        # incomplete review; single unverified findings and unanchored
-        # criticals are attention items, never blockers. Same
-        # first-verdict-line scoping as the fault anchor.
+        # incomplete review. Unverified findings keep their stated severity,
+        # so an unverified 🔴 is already in `reds`; single unverified findings
+        # add an attention line. Same first-verdict-line scoping as the fault
+        # anchor.
         line = verdict_line.group(0) if verdict_line else ""
         m_incomplete = re.search(
             r"^\*\*Verdict: NEEDS-HUMAN\*\* \u2014 review incomplete: finding verification "
             r"failed, (\d+) finding",
             line,
         )
-        m_unverified = re.search(r"(\d+) finding\(s\) unverified, listed separately", line)
-        m_unanchored = re.search(r"(\d+) 🔴 finding\(s\) could not be anchored", line)
+        m_unverified = re.search(r"(\d+) finding\(s\) unverified, kept at their stated severity", line)
         if m_incomplete:
             n_unverified = m_incomplete.group(1)
             incomplete_detail["code-review"] = (
                 f"code-review: finding verification failed; {n_unverified} unverified "
-                "finding(s) are listed separately in the lane report"
+                "finding(s) are kept at their stated severity in the lane report"
             )
             blockers.append(
                 "code-review: review incomplete \u2014 finding verification failed; "
-                f"{n_unverified} unverified finding(s) are listed separately in the lane report "
-                "and are not blocking defects"
+                f"{n_unverified} unverified finding(s) are kept at their stated severity in the "
+                "lane report"
             )
         elif m_unverified:
             attention.append(
-                f"code-review: {m_unverified.group(1)} unverified finding(s) listed separately "
-                "for a human; not blocking"
-            )
-        if m_unanchored:
-            attention.append(
-                f"code-review: {m_unanchored.group(1)} critical finding(s) could not be "
-                "anchored; listed for a human"
+                f"code-review: {m_unverified.group(1)} unverified finding(s) kept at their "
+                "stated severity; check each one against the code"
             )
         if m_fault:
             blockers.append(
