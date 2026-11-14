@@ -4786,6 +4786,11 @@ rc, u, err = entry("claim_task", heal_base(current_task=None))
 check("entry claim_task: current_task null and none saved -> back to select_tasks with a ledger line, nothing claimed",
       rc == 0 and u.get("_next") == "select_tasks" and any("claim_task has no current task" in d for d in u.get("decisions", [])),
       f"rc={rc} {err} {u.get('_next')}")
+heal_disk()
+rc, u, err = entry("verify_gate", heal_base(current_task=None, verify_scope="task"))
+check("entry verify_gate: current_task null and none saved -> state_fault naming the review, never a silent skip to select_tasks",
+      rc == 0 and u.get("_next") == "escalate_gate" and u.get("escalation", {}).get("kind") == "state_fault"
+      and "no current task to review" in u.get("escalation", {}).get("question", ""), f"rc={rc} {err} {u.get('_next')}")
 heal_disk(current_task=T1)
 _s = heal_base()
 _s.pop("current_task")
