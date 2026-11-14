@@ -1349,7 +1349,7 @@ fn anchor_gate_marks_unanchored_findings_and_keeps_them_whole() {
 /// pipeline fault, never an unchecked pass; an unanchored critical is listed
 /// under "Not anchored in the diff" and still counts and blocks.
 #[test]
-fn anchor_gate_faults_and_drops_reach_the_verdict() {
+fn anchor_gate_faults_and_unanchored_findings_reach_the_verdict() {
     if !python_available() {
         return;
     }
@@ -1573,7 +1573,7 @@ fn synthesis_and_reviewer_wording_is_in_place() {
     for rel in ["domain-reviewer/config.yaml", "file-reviewer/config.yaml"] {
         let text = read(rel).split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
-            "**Anchor every finding in the diff.**",
+            "**Anchor every finding you can in the diff.**",
             "A caller, consumer or unchanged twin outside the diff, in this repository or another, is anchored at the changed line with the external location (repo + path:line) cited as evidence.",
             "or lines within 3 of it",
             "a script notes that it does not anchor, and never drops it.",
@@ -1595,6 +1595,11 @@ fn synthesis_and_reviewer_wording_is_in_place() {
     assert!(graph.contains("within 3 lines of a changed hunk"));
     let readme = read("code-reviewer/README.md");
     assert!(readme.contains("The `probe` lane is not grounded"));
+    let domain_readme = read("domain-reviewer/README.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(domain_readme.contains("notes that it does not anchor and never drops it"));
 }
 
 /// A repository whose head renames-and-edits a file, adds files whose names
@@ -1945,6 +1950,10 @@ fn a_severity_without_an_icon_keeps_its_stated_level() {
         ("lower", "high", "#### lower", "🔴"),
         ("warn", "Warning", "#### warn", "🟡"),
         ("nit", "nit", "#### nit", "💡"),
+        ("minor", "minor", "#### minor", "🟢"),
+        ("negated", "non-blocking suggestion", "#### negated", "🟢"),
+        ("two-levels", "low/high", "#### two-levels", "🔴"),
+        ("high-level", "high-level nit", "#### high-level", "💡"),
         (
             "from-block",
             "",
@@ -2004,41 +2013,91 @@ fn adversary_blockers(report: &str) -> Vec<String> {
         .unwrap()
         .lines()
         .filter_map(|l| l.strip_prefix("- adversary: DIVERGES -- "))
-        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .map(words)
         .collect()
 }
 
+/// Words separated by single spaces; every character Python's
+/// `str.splitlines()` treats as a line boundary counts as a separator.
+fn words(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if "\n\r\u{b}\u{c}\u{1c}\u{1d}\u{1e}\u{85}\u{2028}\u{2029}".contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The complaint lines adversary/scripts/verdict.py renders for `extra`.
+fn render_adversary_complaints(extra: &Value) -> Vec<String> {
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import contextlib, importlib.util, io, json, sys\n\
+             spec = importlib.util.spec_from_file_location('adversary_verdict', sys.argv[1])\n\
+             m = importlib.util.module_from_spec(spec)\n\
+             with contextlib.redirect_stdout(io.StringIO()):\n\
+             \x20   spec.loader.exec_module(m)\n\
+             lines = []\n\
+             m.append_criterion_complaints(lines, [], json.loads(sys.argv[2]), 0)\n\
+             print(json.dumps(lines))\n",
+        ])
+        .arg(manifest().join("assets/agents/adversary/scripts/verdict.py"))
+        .arg(extra.to_string())
+        .env("GRAPH_STATE", "{}")
+        .env_remove("GRAPH_STATE_FILE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
 /// Complaint fields are model text: any line-boundary character, a blank
-/// line or a wrapped paragraph inside one never ends or splits the list, and
-/// the section after it is never read as a complaint. The first two items
-/// are the property test's minimal failing input as the adversary renders it.
+/// line, a wrapped paragraph or a heading-like line inside one never ends or
+/// splits the list, and the section after it is never read as a complaint.
+/// The report is the adversary renderer's own output; its first two items are
+/// the property test's minimal failing input.
 #[test]
 fn adversary_complaints_round_trip_multiline_fields() {
     if !python_available() {
         return;
     }
-    let report = "ADVERSARIAL_REVIEW: DIVERGES\n\
-        Criteria: 0/1 met, 0 partial, 1 unmet/diverged.\n\
-        Complaints:\n\
-        1.  \u{2014}  \u{2014}  \u{2014} \u{1c}\n\
-        2.  \u{2014}  \u{2014}  \u{2014} \n\
-        3. Interface substitution \u{2014} api/h.go:20 \u{2014} the handler returns\n\
-        a map\n\
-        \n\
-        where the plan says a struct \u{2014} use the struct\n\
-        4. kind \u{2014} x.py \u{2014} a\u{2028}b\u{85}c \u{2014} f\n\
-        \n\
-        Verification runs:\n\
-        - [PASS] `true` -- exit 0\n";
-    assert_eq!(
-        adversary_blockers(report),
-        [
-            "complaint 1: \u{2014} \u{2014} \u{2014}",
-            "complaint 2: \u{2014} \u{2014} \u{2014}",
-            "complaint 3: Interface substitution \u{2014} api/h.go:20 \u{2014} the handler returns a map where the plan says a struct \u{2014} use the struct",
-            "complaint 4: kind \u{2014} x.py \u{2014} a b c \u{2014} f",
-        ]
+    let extra = json!([
+        {"kind": "", "location": "", "violation": "", "fix": "\u{1c}"},
+        {"kind": "", "location": "", "violation": "", "fix": ""},
+        {"kind": "Interface substitution", "location": "api/h.go:20",
+         "violation": "the handler returns\na map\n\nwhere the plan says a struct", "fix": "use the struct"},
+        {"kind": "kind", "location": "x.py", "violation": "a\u{2028}b\u{85}c", "fix": "f"},
+        {"kind": "kind", "location": "y.py", "violation": "wrong shape\n\nExpected:\n  a struct",
+         "fix": "see above"},
+    ]);
+    let lines = render_adversary_complaints(&extra);
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    let report = format!(
+        "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 0/1 met, 0 partial, 1 unmet/diverged.\n\
+         Complaints:\n{}\n\nVerification runs:\n- [PASS] `true` -- exit 0\n",
+        lines.join("\n")
     );
+    let want: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let body = l.split_once(". ").unwrap().1;
+            format!("complaint {}: {}", i + 1, words(body))
+        })
+        .collect();
+    assert_eq!(adversary_blockers(&report), want, "{report:?}");
 
     // Past the per-blocker cap, the overflow line keeps every complaint head.
     let mut many = String::from("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 0/1 met.\nComplaints:\n");

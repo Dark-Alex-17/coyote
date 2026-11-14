@@ -147,9 +147,14 @@ def selection_lines(summary):
 ADVERSARY_COMPLAINTS_MAX = 8
 ADVERSARY_COMPLAINT_CHARS = 600
 ADVERSARY_OVERFLOW_HEAD_CHARS = 120
-# A report section after the complaints: `Verification runs:`,
-# `Non-blocking observations:`, `Met criteria (evidence):`.
-SECTION_HEADING = re.compile(r"[^\s\d].*:\s*$", re.S)
+# The sections adversary/scripts/verdict.py renders after its complaints,
+# each after a blank line. Exact names, so a model-written field holding a
+# blank line and a line ending in `:` stays inside its complaint.
+SECTIONS_AFTER_COMPLAINTS = (
+    "Non-blocking observations:",
+    "Met criteria (evidence):",
+    "Verification runs:",
+)
 
 
 def adversary_complaints(report):
@@ -157,16 +162,16 @@ def adversary_complaints(report):
     in order, each with its continuation lines joined.
 
     The report is split on `\\n` only: an item's fields are model text and may
-    carry any other line-boundary character, a blank line or a line that
-    opens with a number. An item runs until the line that opens the NEXT
-    number, or until a blank line followed by a section heading (a
-    non-numbered line ending in `:`, such as `Verification runs:`)."""
+    carry any other line-boundary character or a blank line. An item runs
+    until a line that opens the NEXT number (so a field line opening with
+    that exact number does start a new item), or until a blank line followed
+    by one of SECTIONS_AFTER_COMPLAINTS."""
     lines = [ln[:-1] if ln.endswith("\r") else ln for ln in report.split("\n")]
     start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == "Complaints:"), None)
     body = lines[start:] if start is not None else []
     items, number = [], None
     for k, ln in enumerate(body):
-        m = re.match(r"(\d+)\.\s+(.*)", ln, re.S)
+        m = re.match(r"(\d+)\.\s+(.*)", ln)
         if m and (number is None or int(m.group(1)) == number + 1):
             number = int(m.group(1))
             items.append(m.group(2).strip())
@@ -174,7 +179,7 @@ def adversary_complaints(report):
             break
         elif not ln.strip():
             nxt = next((b for b in body[k + 1 :] if b.strip()), None)
-            if nxt is None or SECTION_HEADING.match(nxt):
+            if nxt is None or nxt.strip() in SECTIONS_AFTER_COMPLAINTS:
                 break
         else:
             items[-1] += " " + ln.strip()
