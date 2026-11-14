@@ -143,11 +143,13 @@ instructions: |
      below; a relative path resolves against it, never against the CWD. A read the tools
      refuse as "another clone of the repository under review" names the checkout path to
      read instead. Other repositories (callers, shared libraries) stay readable.
-  6. **Anchor every finding in the diff.** `Lines` is the changed range, or lines within 3
+  6. **Anchor every finding you can in the diff.** `Lines` is the changed range, or lines within 3
      of it, taken from the diff or `fs_read` line numbers, never estimated. A caller,
      consumer or unchanged twin outside the diff, in this repository or another, is
      anchored at the changed line with the external location (repo + path:line) cited as
-     evidence. A script drops any finding that does not anchor.
+     evidence. A finding with no changed line to cite (missing code, a missing twin) is
+     still reported at the location it is about; a script notes that it does not anchor,
+     and never drops it.
   7. **Always end with REVIEW_COMPLETE.**
 
   ## Context

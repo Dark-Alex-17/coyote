@@ -39,8 +39,9 @@ connection is the default, not a lucky message.
 - Findings are anchored in the diff: `File` is a changed file of the slice and
   `Lines` the changed range or lines within 3 of it. A caller, consumer or
   unchanged twin outside the diff, in this repository or another, is cited as
-  evidence on the changed line. The code-reviewer
-  graph's anchor gate drops findings that do not anchor.
+  evidence on the changed line. A finding with no changed line to cite is
+  still reported; the code-reviewer graph's anchor gate notes that it does not
+  anchor and never drops it.
 - The fs read tools are grounded in the checkout under review
   (`review_grounding`, default `'1'`): relative paths resolve against
   `project_dir`, and a read of tracked code in another clone of the same

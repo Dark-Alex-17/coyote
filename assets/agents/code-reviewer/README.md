@@ -32,7 +32,7 @@ flowchart TD
     F -. "fallback" .-> AF["aux_fault (script): PIPELINE-FAULT lane-skip note"]
     AF --> I
     G --> I
-    I --> AG["anchor_gate (script): drop findings not anchored in the diff"]
+    I --> AG["anchor_gate (script): note findings not anchored in the diff (advisory)"]
     AG --> J["verify: finding-verifier (agent node, unskippable, max_attempts: 2)"]
     I -. "fallback" .-> K
     J --> K["verdict (script): FALSE-drops, rigor folding, fault accounting, MERGE-READY / NEEDS-HUMAN arithmetic"]
@@ -54,23 +54,25 @@ trip it), and the report is always emitted: the verdict script's own crash guard
 `PIPELINE-FAULT` NEEDS-HUMAN, and render bypasses its "No changes to review." stub for fault
 verdicts — a fault renders as a full report, never silence.
 
-**Unverified findings never block.** A 🔴/🟡 finding whose verification did not complete moves to
-an `Unverified findings (verification incomplete)` section and stays out of the critical count.
-Two severities: when verification failed as a whole (a dead verifier, or one that verified
-nothing) the verdict reason opens with `review incomplete:` and the review gauntlet names the lane
-on its `GAUNTLET_REVIEW_INCOMPLETE:` line; when single findings went unverified (a per-finding
-fault, or no verdict returned for them) the round is NEEDS-HUMAN with the count in the reason and
-an attention line, never blocking and never an incomplete review.
+**Only the verifier removes a finding.** A 🔴/🟡 finding whose verification did not complete
+keeps its stated severity and its rigor section, is counted (an unverified 🔴 blocks), and
+carries an `(unverified: ...)` note. When verification failed as a whole (a dead verifier, or one
+that verified nothing) the verdict reason opens with `review incomplete:` and the review gauntlet
+also names the lane on its `GAUNTLET_REVIEW_INCOMPLETE:` line; when single findings went
+unverified (a per-finding fault, or no verdict returned for them) the count is in the reason and
+an attention line. A severity with no icon keeps the level its text states (`CRITICAL`, `high`,
+`warning`, `nit`, or the block's Severity line); one that states no level is held at 🔴 with a
+note, never read as a suggestion.
 
-**Findings are anchored in the diff.** `anchor_gate` runs between synthesis and verification and
-keeps a finding only when its file is a reviewed changed file (relative to the checkout) and one
-of its cited ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines
-of deleted lines by their old-side numbers. Everything else (a path outside the diff or outside
-the checkout, a generated file, a line past the end of the file, a range far from every change,
-no range) is listed under `Could not anchor` with the reason; a dropped 🔴 keeps the round
-NEEDS-HUMAN and becomes a named attention line in the gauntlet. A caller, consumer or unchanged
-twin outside the diff, in this repository or another, is anchored at the changed line with the
-external location cited as evidence. Prior-art incident notes are context: they
+**Anchoring is advisory.** `anchor_gate` runs between synthesis and verification. A finding is
+anchored when its file is a reviewed changed file (relative to the checkout) and one of its cited
+ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines of deleted
+lines by their old-side numbers. Every other finding (a path outside the diff or outside the
+checkout, a generated file, a line past the end of the file, a range far from every change, no
+range) is kept whole: the reason goes into its block as an anchor note for the verifier, and the
+report lists it under `Not anchored in the diff`. A broken caller in an unchanged file, missing
+code or a consumer in another repository is a real finding; it is cited at the changed line when
+there is one, with the external location as evidence. Prior-art incident notes are context: they
 become a finding only when the diff deletes or weakens the guard they name.
 
 **Generated files are not reviewed.** `facts` drops files marked `linguist-generated` in

@@ -433,11 +433,13 @@ nodes:
           the consuming repo + file:line as evidence in the description;
         - repo-level linter residue that maps to no single file → a finding under the
           owning surface (severity per the linter's own level; buf breaking = 🔴).
-      - **Anchor every finding in the diff.** `file` is a changed file of this diff,
-        relative to the checkout, and `lines` is a range inside or next to a changed hunk,
-        copied from the domain report. Never invent or widen a line range, and never move a
-        finding onto a file the diff did not change: a script drops any finding that does
-        not anchor and lists it under "Could not anchor". Generated files are not reviewed.
+      - **Anchor every finding you can in the diff.** `file` is a changed file of this
+        diff, relative to the checkout, and `lines` is a range inside or next to a changed
+        hunk, copied from the domain report. Never invent or widen a line range. A finding
+        about code outside the diff (a caller or consumer the change breaks, missing code,
+        an unchanged twin) is legitimate: keep it, citing the location it is about. A
+        script notes each finding that does not anchor for the verifier and lists it under
+        "Not anchored in the diff"; it never drops one. Generated files are not reviewed.
       - **Prior-art and incident notes are context, not requirements.** An incident, alert
         or prior-PR note from the operational-history lane never becomes a "guard that must
         remain intact", a finding or an attention flag on its own; it does only when the
@@ -540,7 +542,7 @@ nodes:
   anchor_gate:
     id: anchor_gate
     type: script
-    description: Mechanical anchor check before verification and reporting. Keeps a finding only when its file is a reviewed changed file of the diff and one of its cited ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines of deleted lines by their old-side numbers; every other finding moves to `unanchored` with the reason and is listed under "Could not anchor". A crash keeps the findings and records anchor_error, which verdict.py reports as a pipeline fault.
+    description: Advisory anchor check before verification and reporting. A finding is anchored when its file is a reviewed changed file of the diff and one of its cited ranges lies inside the file and within 3 lines of a changed hunk, or within 3 lines of deleted lines by their old-side numbers. Every other finding is kept whole, carries the reason as an anchor note for the verifier, and is listed under "Not anchored in the diff"; no finding is dropped or lowered here. A crash keeps the findings and records anchor_error, which verdict.py reports as a pipeline fault.
     script: scripts/anchor_gate.py
     timeout: 120
     next: verify

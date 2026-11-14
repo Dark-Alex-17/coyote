@@ -4,6 +4,10 @@
 The model that wrote the findings never grades its own homework:
 - verifier verdicts are applied mechanically (FALSE → drop, tallied;
   VERIFIED → evidence attached; UNVERIFIABLE → kept, marked);
+- a finding's severity is the icon or level word its severity field states,
+  else the one its block's Severity line states; a finding that states no
+  level is held at 🔴 with a note for a reviewer to restate, never read as
+  the lowest level;
 - rigor folding is arithmetic over severity + [convention]/[correctness]
   markers, exactly per the published rules;
 - MERGE-READY/NEEDS-HUMAN is computed from counts + always-human triggers
@@ -11,14 +15,17 @@ The model that wrote the findings never grades its own homework:
 Fail-closed: any PIPELINE-FAULT recorded upstream (dead domain lane, dead
 verifier, verifier verdicts carrying a PIPELINE-FAULT note or the
 `pipeline-fault` sentinel id, dead synthesis, missing domain reports)
-forces NEEDS-HUMAN. A 🔴/🟡 finding whose verification did not complete is
-never blocking: it moves to the `unverified` section. Two severities:
+forces NEEDS-HUMAN. Only a verifier refutation (FALSE) removes a finding: a
+🔴/🟡 finding whose verification did not complete keeps its stated severity
+and its rigor section, is counted, and carries an unverified note. Two cases:
   - verification failed as a whole (the verifier died, or verified nothing):
     the reason opens with `review incomplete:` and the review gauntlet names
     the lane as an incomplete review;
   - single findings went unverified (a per-finding fault, or no verdict
-    returned for them): the round is NEEDS-HUMAN with the count in the reason
-    and an attention line, never blocking and never an incomplete review.
+    returned for them): the count is in the reason and an attention line,
+    never an incomplete review.
+A finding the anchor gate could not anchor in the diff is counted like any
+other: its anchor note is advisory and never lowers the verdict.
 A degraded run can never read MERGE-READY. Faults
 always lead the attention list; the display cap applies only to the
 non-fault entries so a degraded run can never hide a fault.
@@ -38,6 +45,17 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
         _stream.reconfigure(encoding="utf-8", errors="replace")
 
 MAX_DETAIL_CHARS = 500
+ICONS = ("🔴", "🟡", "🟢", "💡")
+# Most severe first, so a text naming two levels keeps the higher one.
+SEVERITY_WORDS = (
+    ("🔴", re.compile(r"\b(?:critical|blocker|high(?!-level)|severe)\b", re.I)),
+    ("🟡", re.compile(r"\b(?:warning|warn|medium|major|moderate)\b", re.I)),
+    ("🟢", re.compile(r"\b(?:suggestion|low|minor)\b", re.I)),
+    ("💡", re.compile(r"\b(?:nit|nitpick|info|hint)\b", re.I)),
+)
+# "non-blocking", "not critical": a negated word states no level.
+NEGATED = re.compile(r"\b(?:non|not|no)[-\s]+\w+", re.I)
+BLOCK_SEVERITY = re.compile(r"^\W*severity\W*[:\s](.*)$", re.I | re.M)
 
 
 def load_state():
@@ -47,11 +65,29 @@ def load_state():
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
 
-def sev_icon(severity):
-    for icon in ("🔴", "🟡", "🟢", "💡"):
-        if icon in (severity or ""):
+def stated_icon(text):
+    for icon in ICONS:
+        if icon in text:
             return icon
-    return "🟢"
+    text = NEGATED.sub(" ", text)
+    for icon, words in SEVERITY_WORDS:
+        if words.search(text):
+            return icon
+    return None
+
+
+def sev_icon(severity, block=""):
+    """(icon, note): the level the severity field states, else the one the
+    block's Severity line states; with neither, 🔴 and a note saying so."""
+    if icon := stated_icon(str(severity or "")):
+        return icon, ""
+    for m in BLOCK_SEVERITY.finditer(str(block or "")):
+        if icon := stated_icon(m.group(1)):
+            return icon, ""
+    return "🔴", (
+        f"severity unreadable ({str(severity or '')!r}); held at 🔴 until a reviewer "
+        "states its level"
+    )
 
 
 def parse_verifier_entries(text):
@@ -103,13 +139,15 @@ def main():
 
     kept, dropped_titles = [], []
     for f in findings:
-        icon = sev_icon(f.get("severity"))
-        v = verdicts.get(str(f.get("id")))
         block = f.get("block") or f"#### {f.get('title', '(untitled)')}"
+        icon, severity_note = sev_icon(f.get("severity"), block)
+        if severity_note:
+            block += f"\n- *({severity_note})*"
+        v = verdicts.get(str(f.get("id")))
         incomplete = False
         if icon in ("🔴", "🟡"):
-            # Verification that did not complete leaves the finding unverified,
-            # and an unverified finding is never reported as blocking.
+            # Verification that did not complete leaves the finding unverified
+            # at its stated severity; only a completed refutation drops it.
             incomplete = verifier_dead or verified_nothing or not v or is_fault_note(v)
         if v and icon in ("🔴", "🟡"):
             if v.get("verdict") == "FALSE" and not incomplete:
@@ -128,9 +166,6 @@ def main():
         marker = (f.get("marker") or "").lower()
         icon = f["icon"]
         section = "blocking"
-        if f["verification_incomplete"]:
-            f["section"] = "unverified"
-            continue
         if icon == "🔴":
             section = "blocking"
         elif rigor == "prototype" and ((icon == "🟡" and marker == "convention") or icon == "🟢"):
@@ -144,9 +179,9 @@ def main():
     final = [f for f in kept if f["section"] != "dropped-by-poc"]
     blocking = [f for f in final if f["section"] == "blocking"]
     deferred = [f for f in final if f["section"] == "deferred"]
-    unverified = [f for f in final if f["section"] == "unverified"]
+    unverified = [f for f in blocking if f["verification_incomplete"]]
 
-    counts = {i: sum(1 for f in blocking if f["icon"] == i) for i in ("🔴", "🟡", "🟢", "💡")}
+    counts = {i: sum(1 for f in blocking if f["icon"] == i) for i in ICONS}
     yellow_correctness = sum(
         1 for f in blocking if f["icon"] == "🟡" and (f.get("marker") or "").lower() == "correctness"
     )
@@ -202,9 +237,8 @@ def main():
     ]
     # parse_fault's sentinel = the verifier verified NOTHING (hard fault, lane-
     # degrading). Per-finding verify_fault / crash-guard notes = those findings
-    # simply stand UNVERIFIED (soft: proportionate NEEDS-HUMAN attention — a
-    # ~1 h lane re-run to re-check a few findings is the wrong trade, and the
-    # verify_gate node already retried the verifier locally once).
+    # stand UNVERIFIED at their stated severity (soft: no lane re-run, since
+    # the verify_gate node already retried the verifier locally once).
     hard_fv = [v for v in fv_faults if v.get("id") == "pipeline-fault"]
     soft_fv = [v for v in fv_faults if v.get("id") != "pipeline-fault"]
 
@@ -224,8 +258,8 @@ def main():
     if soft_fv:
         soft_notes.append(
             f"Verifier: {len(soft_fv)} finding(s) could not be verified (verifier "
-            f"branch fault: {_fv_detail(soft_fv)}); they are listed under the "
-            "unverified findings, not as blocking; verify them manually"
+            f"branch fault: {_fv_detail(soft_fv)}); they stay at their stated severity, "
+            "marked unverified; verify them manually"
         )
     # Files beyond facts.py's 300-file cap were never grouped or reviewed —
     # disclose the gap and force NEEDS-HUMAN with wording that does NOT match
@@ -259,13 +293,14 @@ def main():
             "checked against the diff"
         )
     unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
-    unanchored_red = sum(1 for u in unanchored if sev_icon(u.get("severity")) == "🔴")
+    reported = {str(f.get("id")) for f in final}
+    unanchored_reported = [u for u in unanchored if str(u.get("id")) in reported]
     anchor_notes = []
-    if unanchored:
+    if unanchored_reported:
         anchor_notes.append(
-            f"Could not anchor: {len(unanchored)} finding(s) name a file or lines outside "
-            "this diff; they are listed under 'Could not anchor' and were not reported as "
-            "findings"
+            f"Not anchored: {len(unanchored_reported)} reported finding(s) cite a file or lines "
+            "outside this diff's changes; they keep their stated severity and are listed under "
+            "'Not anchored in the diff'"
         )
     if changed and not reports:
         faults.append(
@@ -280,14 +315,13 @@ def main():
     if unverified and verification_failed:
         incomplete_notes.append(
             f"Review incomplete: finding verification failed, so {len(unverified)} "
-            "finding(s) are listed under 'Unverified findings (verification incomplete)' and "
-            "are NOT blocking defects; re-run the review or check each one by hand"
+            "finding(s) are unverified; they stay at their stated severity, marked "
+            "unverified; re-run the review or check each one by hand"
         )
     elif unverified:
         incomplete_notes.append(
-            f"Unverified: {len(unverified)} finding(s) could not be verified and are listed "
-            "under 'Unverified findings (verification incomplete)', not as blocking; check "
-            "each one by hand"
+            f"Unverified: {len(unverified)} finding(s) could not be verified; they stay at "
+            "their stated severity, marked unverified; check each one by hand"
         )
     attention = faults + incomplete_notes + soft_notes + anchor_notes + coverage_notes + attention[:5]
 
@@ -297,10 +331,10 @@ def main():
     if unverified and verification_failed:
         reasons.append(
             f"review incomplete: finding verification failed, {len(unverified)} finding(s) "
-            "unverified, listed separately and not blocking"
+            "unverified, kept at their stated severity"
         )
     elif unverified:
-        reasons.append(f"{len(unverified)} finding(s) unverified, listed separately and not blocking")
+        reasons.append(f"{len(unverified)} finding(s) unverified, kept at their stated severity")
     if counts["🔴"]:
         reasons.append(f"{counts['🔴']} 🔴 CRITICAL finding(s)")
     if yellow_correctness:
@@ -310,16 +344,13 @@ def main():
         reasons.append("pipeline fault(s) recorded — degraded run")
     if soft_notes:
         # Deliberately does NOT match the gauntlet's degraded-run anchors:
-        # unverified findings are a human-attention item, not a re-runnable
-        # lane fault.
+        # a per-finding verifier fault is not a re-runnable lane fault.
         reasons.append(f"{len(soft_fv)} finding(s) unverified (verifier branch fault)")
     generated = [g for g in (state.get("generated_files") or []) if isinstance(g, str)]
     if generated and not changed:
         # A diff of generated files only is a review of nothing: never the
         # "No changes to review." stub, never MERGE-READY.
         reasons.append(f"{len(generated)} generated file(s) changed, none reviewed")
-    if unanchored_red:
-        reasons.append(f"{unanchored_red} 🔴 finding(s) could not be anchored in the diff")
     if coverage_notes:
         reasons.append(f"{total_files - len(changed)} changed file(s) not reviewed (file cap)")
     if has_triggers:

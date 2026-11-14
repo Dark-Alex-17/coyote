@@ -9,11 +9,14 @@
 //!   `project_dir` of `.` the guard is inert;
 //! - the review agents declare the `review_grounding` variable that turns the
 //!   guard on;
-//! - code-reviewer never reports an unverified finding as blocking, and the
-//!   review gauntlet reads a verification that failed as a whole as an
-//!   incomplete review;
-//! - code-reviewer's anchor gate drops findings that do not point at a change
-//!   of this diff, and facts.py keeps generated files out of review;
+//! - code-reviewer keeps an unverified finding at its stated severity (only a
+//!   verifier refutation drops one), and the review gauntlet reads a
+//!   verification that failed as a whole as an incomplete review;
+//! - code-reviewer's anchor gate marks findings that do not point at a change
+//!   of this diff and keeps them whole, a severity with no icon keeps its
+//!   stated level, and facts.py keeps generated files out of review;
+//! - the gauntlet reads every adversary complaint whole, whatever line
+//!   boundaries its model-written fields carry;
 //! - the synthesis wording keeps prior-art notes as context and anchors
 //!   consumer findings at the changed line.
 //!
@@ -867,39 +870,43 @@ fn review_round(mut state: Value) -> (Value, String, Value) {
     (verdict, report, gauntlet)
 }
 
-/// No unverified finding is blocking, the report lists them separately, and
-/// the gauntlet never routes them as findings to fix.
-fn no_blocking_criticals(label: &str, verdict: &Value, report: &str, gauntlet: &Value) {
-    assert_eq!(verdict["counts"]["🔴"], 0, "{label}: {verdict}");
+/// Every unverified critical still blocks: it is counted, rendered under the
+/// detailed findings with its unverified note, and the gauntlet routes it as
+/// a finding to fix. Only a verifier refutation removes a finding.
+fn unverified_criticals_block(
+    label: &str,
+    n: usize,
+    verdict: &Value,
+    report: &str,
+    gauntlet: &Value,
+) {
+    assert_eq!(verdict["counts"]["🔴"], n, "{label}: {verdict}");
     assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{label}: {verdict}");
     assert!(
         verdict["findings_final"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|f| f["section"] != "blocking"),
-        "{label}: no unverified finding may be blocking: {verdict}"
+            .all(|f| f["section"] == "blocking"),
+        "{label}: an unverified critical stays blocking: {verdict}"
     );
     assert!(
-        report.contains("## Unverified findings (verification incomplete)"),
+        report.contains(&format!("found {n} critical")),
         "{label}: {report}"
     );
-    assert!(report.contains("found 0 critical"), "{label}: {report}");
-    let detailed = report
-        .split("## Detailed Findings")
-        .nth(1)
-        .unwrap()
-        .split("## Unverified findings")
-        .next()
-        .unwrap();
+    let detailed = report.split("## Detailed Findings").nth(1).unwrap();
     assert!(
-        detailed.contains("No blocking findings."),
-        "{label}: unverified findings must not render as detailed findings: {report}"
+        detailed.contains("#### critical f1") && detailed.contains("*(unverified: "),
+        "{label}: an unverified finding renders whole with its note: {report}"
     );
     let text = gauntlet["gauntlet_report"].as_str().unwrap();
     assert!(
-        !text.contains("🔴 CRITICAL finding(s)"),
-        "{label}: the gauntlet must not route unverified criticals as findings to fix: {text}"
+        text.contains(&format!("code-review: {n} 🔴 CRITICAL finding(s)")),
+        "{label}: the gauntlet must route unverified criticals as findings: {text}"
+    );
+    assert_eq!(
+        gauntlet["gauntlet_verdict"], "BLOCKED",
+        "{label}: {gauntlet}"
     );
 }
 
@@ -913,12 +920,12 @@ fn code_review_row(gauntlet: &Value) -> String {
         .to_string()
 }
 
-/// The #1001 failure: the verifier faulted and the unverified criticals were
-/// posted as blockers. A verification that failed as a whole is an
-/// incomplete review; single unverified findings are attention. Neither is
-/// ever a blocking finding. Each row pins its exact signal.
+/// A verifier that faults, returns no verdict for a finding, or dies never
+/// turns a critical into a pass: the finding keeps blocking at its stated
+/// severity. A verification that failed as a whole is also an incomplete
+/// review. Each row pins its exact signal.
 #[test]
-fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
+fn unverified_criticals_keep_blocking() {
     if !python_available() {
         return;
     }
@@ -932,55 +939,45 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
     state["verifier_output"] = json!(soft);
     let (verdict, report, gauntlet) = review_round(state);
     assert_eq!(
-        verdict["counts"]["🔴"], 1,
-        "a verified critical still blocks beside an unverified one: {verdict}"
+        verdict["counts"]["🔴"], 2,
+        "a verified and an unverified critical both block: {verdict}"
     );
     assert!(
         verdict["reason"]
             .as_str()
             .unwrap()
-            .starts_with("1 finding(s) unverified, listed separately and not blocking"),
+            .starts_with("1 finding(s) unverified, kept at their stated severity"),
         "{verdict}"
     );
-    assert!(report.contains("## Unverified findings (verification incomplete)"));
+    assert!(report.contains("found 2 critical"), "{report}");
     assert_eq!(gauntlet["gauntlet_incomplete_line"], "", "{gauntlet}");
     assert_eq!(
         code_review_row(&gauntlet),
-        "| code-review | BLOCKED | 1 🔴 finding(s) |",
+        "| code-review | BLOCKED | 2 🔴 finding(s) |",
         "{gauntlet}"
     );
 
-    // (label, verifier output, reason prefix, gauntlet verdict, incomplete
-    // line, code-review row)
+    // (label, verifier output, reason prefix, incomplete line, code-review row)
     let whole = "review incomplete: finding verification failed, 2 finding(s) unverified";
     let incomplete_line = "\nGAUNTLET_REVIEW_INCOMPLETE: code-review";
-    let degraded_row = "| code-review | BLOCKED | PIPELINE-FAULT (degraded lane) |";
-    let attention_row =
-        "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴; 2 unverified finding(s) |";
-    for (label, verifier_output, reason, gauntlet_verdict, machine, row) in [
+    let degraded_row = "| code-review | BLOCKED | PIPELINE-FAULT (degraded lane); 2 🔴 |";
+    let blocked_row = "| code-review | BLOCKED | 2 🔴 finding(s) |";
+    let kept = "2 finding(s) unverified, kept at their stated severity";
+    for (label, verifier_output, reason, machine, row) in [
         (
             "per-finding faults",
             json!(
                 r#"[{"id":"f1","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"},{"id":"f2","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: x"}]"#
             ),
-            "2 finding(s) unverified, listed separately and not blocking",
-            "PASS",
+            kept,
             "",
-            attention_row,
+            blocked_row,
         ),
-        (
-            "no verdicts returned",
-            json!("[]"),
-            "2 finding(s) unverified, listed separately and not blocking",
-            "PASS",
-            "",
-            attention_row,
-        ),
+        ("no verdicts returned", json!("[]"), kept, "", blocked_row),
         (
             "dead verifier",
             json!("Agent node failed: timed out"),
             whole,
-            "BLOCKED",
             incomplete_line,
             degraded_row,
         ),
@@ -991,7 +988,6 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
 [{"id":"pipeline-fault","verdict":"UNVERIFIABLE","evidence":"","note":"PIPELINE-FAULT: parse failed"}]"#
             ),
             whole,
-            "BLOCKED",
             incomplete_line,
             degraded_row,
         ),
@@ -999,14 +995,10 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
         let mut state = base.clone();
         state["verifier_output"] = verifier_output;
         let (verdict, report, gauntlet) = review_round(state);
-        no_blocking_criticals(label, &verdict, &report, &gauntlet);
+        unverified_criticals_block(label, 2, &verdict, &report, &gauntlet);
         assert!(
             verdict["reason"].as_str().unwrap().starts_with(reason),
             "{label}: {verdict}"
-        );
-        assert_eq!(
-            gauntlet["gauntlet_verdict"], gauntlet_verdict,
-            "{label}: {gauntlet}"
         );
         assert_eq!(
             gauntlet["gauntlet_incomplete_line"], machine,
@@ -1014,9 +1006,15 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
         );
         assert_eq!(code_review_row(&gauntlet), row, "{label}: {gauntlet}");
         let text = gauntlet["gauntlet_report"].as_str().unwrap();
-        if gauntlet_verdict == "PASS" {
+        assert!(
+            !text.contains("not blocking"),
+            "{label}: an unverified finding is never called non-blocking: {text}"
+        );
+        if machine.is_empty() {
             assert!(
-                text.contains("- code-review: 2 unverified finding(s) listed separately for a human; not blocking"),
+                text.contains(
+                    "- code-review: 2 unverified finding(s) kept at their stated severity"
+                ),
                 "{label}: {text}"
             );
         } else {
@@ -1026,6 +1024,21 @@ fn verifier_fault_yields_review_incomplete_and_no_blocking_findings() {
             );
         }
     }
+
+    // Rigor folding still applies to an unverified finding: a deferred
+    // convention warning stays deferred, never promoted to a blocker.
+    let mut state = base;
+    state["resolved_rigor"] = json!("prototype");
+    state["findings"] = json!([{
+        "id": "f1", "severity": "🟡 WARNING", "marker": "convention", "file": "internal/plan.go",
+        "lines": "10", "title": "naming", "block": "#### naming"
+    }]);
+    state["verifier_output"] = json!("[]");
+    let verdict = run_script("code-reviewer/scripts/verdict.py", &state)["verdict_out"].clone();
+    assert_eq!(
+        verdict["findings_final"][0]["section"], "deferred",
+        "{verdict}"
+    );
 }
 
 /// Control: a completed verification keeps its verified criticals blocking and
@@ -1194,11 +1207,13 @@ fn generated_files_are_excluded_from_review_and_listed() {
     );
 }
 
-/// The anchor gate keeps findings inside or next to a changed hunk and drops
-/// the rest with a reason: a path outside the diff, a generated file, a line
-/// past the end of the file, a range far from every change, no range at all.
+/// The anchor gate is advisory. Every finding goes on whole (block and
+/// marker included) to verification; one outside or far from every changed
+/// hunk carries the reason as an anchor note in its block: a path outside
+/// the diff, a generated file, a line past the end of the file, a range far
+/// from every change (a broken caller, missing code), no range at all.
 #[test]
-fn anchor_gate_drops_unanchored_findings_and_keeps_valid_ones() {
+fn anchor_gate_marks_unanchored_findings_and_keeps_them_whole() {
     if !python_available() || !tools_available() {
         return;
     }
@@ -1232,6 +1247,10 @@ fn anchor_gate_drops_unanchored_findings_and_keeps_valid_ones() {
         finding("far", "🟡 WARNING", "internal/plan.go", "15-17"),
         finding("no-lines", "🟢 SUGGESTION", "internal/plan.go", "")
     ]);
+    state["findings"][8]["marker"] = json!("correctness");
+    state["findings"][8]["block"] = json!(
+        "#### finding far\n- **Description**: the caller at line 16 still passes the old unit"
+    );
     let out = run_script("code-reviewer/scripts/anchor_gate.py", &state);
     assert_eq!(out["anchor_checked"], true, "{out}");
     assert_eq!(out["anchor_error"], "", "{out}");
@@ -1244,13 +1263,34 @@ fn anchor_gate_drops_unanchored_findings_and_keeps_valid_ones() {
     assert_eq!(
         kept,
         [
+            ("past-eof", "internal/plan.go"),
             ("on-change", "internal/plan.go"),
             ("adjacent", "internal/plan.go"),
             ("appended", "internal/plan.go"),
             ("repo-prefixed", "internal/plan.go"),
             ("absolute", "internal/plan.go"),
+            ("not-in-diff", "internal/other.go"),
+            ("generated", "gen/go/admin/v1/service.pb.go"),
+            ("far", "internal/plan.go"),
+            ("no-lines", "internal/plan.go"),
         ],
-        "{out}"
+        "no finding is removed by the anchor check: {out}"
+    );
+    let far = &out["findings"][8];
+    assert_eq!(far["marker"], "correctness", "{out}");
+    let block = far["block"].as_str().unwrap();
+    assert!(
+        block.contains("still passes the old unit")
+            && block.contains("not within 3 lines of a change")
+            && far["anchor_note"]
+                .as_str()
+                .unwrap()
+                .contains("not within 3 lines"),
+        "the full block survives and carries the anchor fact: {out}"
+    );
+    assert!(
+        out["findings"][1].get("anchor_note").is_none(),
+        "an anchored finding carries no note: {out}"
     );
     let reasons: Vec<(&str, &str)> = out["unanchored"]
         .as_array()
@@ -1271,13 +1311,45 @@ fn anchor_gate_drops_unanchored_findings_and_keeps_valid_ones() {
     assert!(reason("far").contains("not within 3 lines of a change"));
     assert!(reason("no-lines").contains("no line range"));
     assert_eq!(reasons.len(), 5, "{out}");
+
+    // The unanchored correctness warning keeps the round NEEDS-HUMAN once
+    // the verifier confirms it, exactly as an anchored one would.
+    let mut state = state;
+    for key in ["findings", "unanchored", "anchor_checked", "anchor_error"] {
+        state[key] = out[key].clone();
+    }
+    state["domain_reports"] = json!(["clean report. DOMAIN_REVIEW_COMPLETE"]);
+    state["findings"] = json!([out["findings"][8].clone()]);
+    state["unanchored"] = json!([out["unanchored"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == "far")
+        .unwrap()
+        .clone()]);
+    state["verifier_output"] =
+        json!(r#"[{"id":"far","verdict":"VERIFIED","evidence":"line 16","note":""}]"#);
+    let (verdict, report, _) = review_round(state);
+    assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{verdict}");
+    assert!(
+        verdict["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 🟡 [correctness] finding(s)"),
+        "{verdict}"
+    );
+    let detailed = report.split("## Detailed Findings").nth(1).unwrap();
+    assert!(
+        detailed.contains("still passes the old unit"),
+        "the unanchored finding renders as a full finding: {report}"
+    );
 }
 
 /// A gate that never ran (state still at its seeded false) or crashed is a
-/// pipeline fault, never an unchecked pass; dropped criticals keep the round
-/// NEEDS-HUMAN and are listed under "Could not anchor".
+/// pipeline fault, never an unchecked pass; an unanchored critical is listed
+/// under "Not anchored in the diff" and still counts and blocks.
 #[test]
-fn anchor_gate_faults_and_drops_reach_the_verdict() {
+fn anchor_gate_faults_and_unanchored_findings_reach_the_verdict() {
     if !python_available() {
         return;
     }
@@ -1326,48 +1398,44 @@ fn anchor_gate_faults_and_drops_reach_the_verdict() {
 
     let mut state = base;
     state["anchor_checked"] = json!(true);
+    let reason = "lines 45-50 are outside internal/plan.go (38 lines)";
+    state["findings"] = json!([{
+        "id": "f9", "severity": "🔴 CRITICAL", "marker": "", "title": "store.SetEndDate is unsafe",
+        "file": "internal/plan.go", "lines": "45-50", "anchor_note": reason,
+        "block": format!("#### store.SetEndDate is unsafe\n- *(not anchored in the diff: {reason})*")
+    }]);
     state["unanchored"] = json!([{
         "id": "f9", "severity": "🔴 CRITICAL", "title": "store.SetEndDate is unsafe",
-        "file": "internal/plan.go", "lines": "45-50",
-        "reason": "lines 45-50 are outside internal/plan.go (38 lines)"
+        "file": "internal/plan.go", "lines": "45-50", "reason": reason
     }]);
+    state["verifier_output"] = json!("[]");
     let (verdict, report, gauntlet) = review_round(state);
     assert_eq!(verdict["verdict"], "NEEDS-HUMAN", "{verdict}");
-    assert!(
-        verdict["reason"]
-            .as_str()
-            .unwrap()
-            .contains("1 🔴 finding(s) could not be anchored in the diff"),
-        "{verdict}"
-    );
+    assert_eq!(verdict["counts"]["🔴"], 1, "{verdict}");
     let section = report
-        .split("## Could not anchor")
+        .split("## Not anchored in the diff")
         .nth(1)
         .unwrap_or_else(|| panic!("{report}"));
     assert!(
         section.contains("store.SetEndDate is unsafe") && section.contains("38 lines"),
         "{report}"
     );
-    assert!(report.contains("found 0 critical"), "{report}");
-    assert!(
-        gauntlet["gauntlet_report"].as_str().unwrap().contains(
-            "- code-review: 1 critical finding(s) could not be anchored; listed for a human"
-        ),
-        "{gauntlet}"
-    );
+    assert!(report.contains("found 1 critical"), "{report}");
     assert_eq!(
         code_review_row(&gauntlet),
-        "| code-review | GREEN (attention) | NEEDS-HUMAN, no 🔴 |"
+        "| code-review | BLOCKED | 1 🔴 finding(s) |",
+        "{gauntlet}"
     );
 }
 
 /// The #1001 round end to end: a stale clone of the same repository sits in
 /// the engine's cwd under the repository name, a reviewer reads a relative
-/// path, the synthesis invents a range past the end of a file, the verifier
-/// faults. The read is redirected, the fabricated finding is dropped, and the
-/// round carries no blocker.
+/// path, the synthesis invents a range past the end of a file. The read is
+/// redirected; the fabricated finding goes to verification with its anchor
+/// note and is dropped only by the verifier's refutation. When the verifier
+/// dies instead, nothing is dropped and every critical still blocks.
 #[test]
-fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
+fn regression_pr_1001_shape_drops_fabrications_only_by_refutation() {
     if !python_available() || !tools_available() {
         return;
     }
@@ -1453,13 +1521,31 @@ fn regression_pr_1001_shape_posts_no_fabricated_blockers() {
     for key in ["findings", "unanchored", "anchor_checked", "anchor_error"] {
         state[key] = anchored[key].clone();
     }
-    assert_eq!(state["findings"].as_array().unwrap().len(), 1, "{state}");
+    assert_eq!(state["findings"].as_array().unwrap().len(), 3, "{state}");
+    assert_eq!(state["unanchored"].as_array().unwrap().len(), 2, "{state}");
     state["domain_reports"] = json!(["clean report. DOMAIN_REVIEW_COMPLETE"]);
-    state["verifier_output"] = json!("Agent node failed: verification could not be completed");
-    let (verdict, report, gauntlet) = review_round(state);
-    no_blocking_criticals("pr-1001", &verdict, &report, &gauntlet);
-    assert!(report.contains("## Could not anchor"), "{report}");
+    let mut refuted = state.clone();
+    refuted["verifier_output"] = json!(
+        r#"[{"id":"fabricated","verdict":"FALSE","evidence":"","note":"the file has 38 lines"},{"id":"generated","verdict":"FALSE","evidence":"","note":"generated output"},{"id":"real","verdict":"VERIFIED","evidence":"line 5","note":""}]"#
+    );
+    let (verdict, report, gauntlet) = review_round(refuted);
+    assert_eq!(verdict["counts"]["🔴"], 1, "{verdict}");
+    assert_eq!(verdict["dropped_count"], 2, "{verdict}");
+    assert!(report.contains("## Not anchored in the diff"), "{report}");
     assert!(report.contains("## Generated, not reviewed"), "{report}");
+    assert_eq!(
+        code_review_row(&gauntlet),
+        "| code-review | BLOCKED | 1 🔴 finding(s) |",
+        "{gauntlet}"
+    );
+    state["verifier_output"] = json!("Agent node failed: verification could not be completed");
+    let (verdict, _, gauntlet) = review_round(state);
+    assert_eq!(verdict["counts"]["🔴"], 3, "{verdict}");
+    assert_eq!(gauntlet["gauntlet_verdict"], "BLOCKED", "{gauntlet}");
+    assert_eq!(
+        gauntlet["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: code-review",
+        "{gauntlet}"
+    );
 }
 
 /// The synthesis keeps prior-art notes as context and anchors consumer
@@ -1473,7 +1559,9 @@ fn synthesis_and_reviewer_wording_is_in_place() {
         "An incident id that appears nowhere in the diff is context only.",
         "ANCHORED AT THE CHANGED LINE IN THIS",
         "naming\n          the consuming repo + file:line as evidence",
-        "**Anchor every finding in the diff.**",
+        "**Anchor every finding you can in the diff.**",
+        "about code outside the diff (a caller or consumer the change breaks",
+        "it never drops one.",
         "next: anchor_gate",
         "script: scripts/anchor_gate.py",
     ] {
@@ -1485,9 +1573,10 @@ fn synthesis_and_reviewer_wording_is_in_place() {
     for rel in ["domain-reviewer/config.yaml", "file-reviewer/config.yaml"] {
         let text = read(rel).split_whitespace().collect::<Vec<_>>().join(" ");
         for needle in [
-            "**Anchor every finding in the diff.**",
+            "**Anchor every finding you can in the diff.**",
             "A caller, consumer or unchanged twin outside the diff, in this repository or another, is anchored at the changed line with the external location (repo + path:line) cited as evidence.",
             "or lines within 3 of it",
+            "a script notes that it does not anchor, and never drops it.",
             "**Read the checkout under review.**",
         ] {
             assert!(text.contains(needle), "{rel} lacks {needle:?}");
@@ -1506,6 +1595,11 @@ fn synthesis_and_reviewer_wording_is_in_place() {
     assert!(graph.contains("within 3 lines of a changed hunk"));
     let readme = read("code-reviewer/README.md");
     assert!(readme.contains("The `probe` lane is not grounded"));
+    let domain_readme = read("domain-reviewer/README.md")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(domain_readme.contains("notes that it does not anchor and never drops it"));
 }
 
 /// A repository whose head renames-and-edits a file, adds files whose names
@@ -1597,11 +1691,22 @@ fn anchor_gate_reads_renames_and_awkward_paths() {
         "non-ascii",
         "deleted-side",
         "multi-range",
+        "outside",
     ];
     if cfg!(unix) {
         expected.push("quote");
     }
     assert_eq!(kept, expected, "{out}");
+    assert!(
+        out["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f.get("anchor_note").is_some())
+            .map(|f| f["id"].as_str().unwrap())
+            .eq(["outside"]),
+        "only the finding outside the checkout carries an anchor note: {out}"
+    );
     let dropped = &out["unanchored"][0];
     assert_eq!(dropped["id"], "outside", "{out}");
     assert!(
@@ -1830,4 +1935,182 @@ fn the_guard_never_passes_a_checkout_path_to_git() {
         !helper.contains("git -C"),
         "every git call goes through _review_git"
     );
+}
+
+/// A severity with no icon keeps the level its text states (the field, else
+/// the block's Severity line); one that states no level at all is held at
+/// the most severe level with a note, never silently read as a suggestion.
+#[test]
+fn a_severity_without_an_icon_keeps_its_stated_level() {
+    if !python_available() {
+        return;
+    }
+    let cases = [
+        ("caps", "CRITICAL", "#### caps", "🔴"),
+        ("lower", "high", "#### lower", "🔴"),
+        ("warn", "Warning", "#### warn", "🟡"),
+        ("nit", "nit", "#### nit", "💡"),
+        ("minor", "minor", "#### minor", "🟢"),
+        ("negated", "non-blocking suggestion", "#### negated", "🟢"),
+        ("two-levels", "low/high", "#### two-levels", "🔴"),
+        ("high-level", "high-level nit", "#### high-level", "💡"),
+        (
+            "from-block",
+            "",
+            "#### from-block\n- **Severity**: 🔴 CRITICAL",
+            "🔴",
+        ),
+        ("unreadable", "???", "#### unreadable", "🔴"),
+    ];
+    let findings: Vec<Value> = cases
+        .iter()
+        .map(|(id, sev, block, _)| {
+            json!({"id": id, "severity": sev, "marker": "", "file": "a.go",
+                   "lines": "1", "title": id, "block": block})
+        })
+        .collect();
+    let verified: Vec<Value> = cases
+        .iter()
+        .map(|(id, ..)| json!({"id": id, "verdict": "VERIFIED", "evidence": "line 1", "note": ""}))
+        .collect();
+    let state = json!({
+        "changed_files": ["a.go"],
+        "domain_reports": ["clean report. DOMAIN_REVIEW_COMPLETE"],
+        "findings": findings,
+        "verifier_output": Value::Array(verified).to_string(),
+    });
+    let verdict = run_script("code-reviewer/scripts/verdict.py", &state)["verdict_out"].clone();
+    let finals = verdict["findings_final"].as_array().unwrap();
+    for (id, _, _, icon) in cases {
+        let f = finals
+            .iter()
+            .find(|f| f["id"] == id)
+            .unwrap_or_else(|| panic!("{id} must not be dropped: {verdict}"));
+        assert_eq!(f["icon"], icon, "{id}: {verdict}");
+    }
+    let held = finals.iter().find(|f| f["id"] == "unreadable").unwrap();
+    assert!(
+        held["block"]
+            .as_str()
+            .unwrap()
+            .contains("severity unreadable"),
+        "{verdict}"
+    );
+}
+
+fn adversary_blockers(report: &str) -> Vec<String> {
+    let gauntlet = run_script(
+        "review-gauntlet/scripts/verdict_gate.py",
+        &json!({
+            "code_review_results": [],
+            "adversary_results": [report],
+            "security_results": [],
+            "probe_results": []
+        }),
+    );
+    gauntlet["gauntlet_report"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.strip_prefix("- adversary: DIVERGES -- "))
+        .map(words)
+        .collect()
+}
+
+/// Words separated by single spaces; every character Python's
+/// `str.splitlines()` treats as a line boundary counts as a separator.
+fn words(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if "\n\r\u{b}\u{c}\u{1c}\u{1d}\u{1e}\u{85}\u{2028}\u{2029}".contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The complaint lines adversary/scripts/verdict.py renders for `extra`.
+fn render_adversary_complaints(extra: &Value) -> Vec<String> {
+    let out = Command::new("python3")
+        .args([
+            "-c",
+            "import contextlib, importlib.util, io, json, sys\n\
+             spec = importlib.util.spec_from_file_location('adversary_verdict', sys.argv[1])\n\
+             m = importlib.util.module_from_spec(spec)\n\
+             with contextlib.redirect_stdout(io.StringIO()):\n\
+             \x20   spec.loader.exec_module(m)\n\
+             lines = []\n\
+             m.append_criterion_complaints(lines, [], json.loads(sys.argv[2]), 0)\n\
+             print(json.dumps(lines))\n",
+        ])
+        .arg(manifest().join("assets/agents/adversary/scripts/verdict.py"))
+        .arg(extra.to_string())
+        .env("GRAPH_STATE", "{}")
+        .env_remove("GRAPH_STATE_FILE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+/// Complaint fields are model text: any line-boundary character, a blank
+/// line, a wrapped paragraph or a heading-like line inside one never ends or
+/// splits the list, and the section after it is never read as a complaint.
+/// The report is the adversary renderer's own output; its first two items are
+/// the property test's minimal failing input.
+#[test]
+fn adversary_complaints_round_trip_multiline_fields() {
+    if !python_available() {
+        return;
+    }
+    let extra = json!([
+        {"kind": "", "location": "", "violation": "", "fix": "\u{1c}"},
+        {"kind": "", "location": "", "violation": "", "fix": ""},
+        {"kind": "Interface substitution", "location": "api/h.go:20",
+         "violation": "the handler returns\na map\n\nwhere the plan says a struct", "fix": "use the struct"},
+        {"kind": "kind", "location": "x.py", "violation": "a\u{2028}b\u{85}c", "fix": "f"},
+        {"kind": "kind", "location": "y.py", "violation": "wrong shape\n\nExpected:\n  a struct",
+         "fix": "see above"},
+    ]);
+    let lines = render_adversary_complaints(&extra);
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    let report = format!(
+        "ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 0/1 met, 0 partial, 1 unmet/diverged.\n\
+         Complaints:\n{}\n\nVerification runs:\n- [PASS] `true` -- exit 0\n",
+        lines.join("\n")
+    );
+    let want: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let body = l.split_once(". ").unwrap().1;
+            format!("complaint {}: {}", i + 1, words(body))
+        })
+        .collect();
+    assert_eq!(adversary_blockers(&report), want, "{report:?}");
+
+    // Past the per-blocker cap, the overflow line keeps every complaint head.
+    let mut many = String::from("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 0/1 met.\nComplaints:\n");
+    for i in 1..=14 {
+        many.push_str(&format!("{i}. head {i} {}\n", "x".repeat(130)));
+    }
+    let blockers = adversary_blockers(&many);
+    assert_eq!(blockers.len(), 9, "{blockers:?}");
+    let overflow = &blockers[8];
+    for i in 9..=14 {
+        assert!(
+            overflow.contains(&format!("head {i} x")),
+            "complaint {i} head lost: {overflow}"
+        );
+    }
 }
