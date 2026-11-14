@@ -3279,6 +3279,66 @@ fn shared_python(program: &str, args: &[&str]) -> Value {
     serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stdout}"))
 }
 
+/// The debt-marker table catches suppression, skip and stub directives of
+/// any language without firing on flags, prose, CSS selectors or the
+/// `NotImplemented` sentinel, and the generated `grep -E` fallback agrees
+/// with `MARKER_RE` on every line.
+#[cfg(unix)]
+#[test]
+fn debt_markers_grep_pattern_and_marker_re_agree_on_precise_markers() {
+    if which::which("python3").is_err() || which::which("grep").is_err() {
+        eprintln!("skipping: python3 or grep not available");
+        return;
+    }
+    let markers = [
+        "_ = os.Remove(p) //nolint:errcheck",
+        "\tt.Skip(\"flaky on CI\")",
+        "import os  # noqa: F401",
+        "@pytest.mark.skip(reason=\"slow\")",
+        "@pytest.mark.skipif(sys.platform == \"win32\", reason=\"posix\")",
+        "np = pytest.importorskip(\"numpy\")",
+        "    raise NotImplementedError",
+        "x = f()  # type: ignore[attr-defined]",
+        "// eslint-disable-next-line no-console",
+        "it.skip(\"renders\", () => {});",
+        "// @ts-ignore",
+        "int x = y;  // NOLINT",
+        "// NOLINTNEXTLINE(bugprone-branch-clone)",
+        "#pragma GCC diagnostic ignored \"-Wunused\"",
+        "#pragma clang diagnostic push",
+    ];
+    let clean = [
+        "rg --no-ignore -n pattern",
+        "# Note: ignore the header row",
+        "#btn-disable {",
+        "    return NotImplemented",
+        "let v = opt.expect(\"present\");",
+    ];
+    let program = "import json, os, subprocess, sys; sys.path.insert(0, sys.argv[1]); \
+                   import debt_markers as m; \
+                   env = {**os.environ, 'LC_ALL': 'C'}; \
+                   print(json.dumps([[bool(m.MARKER_RE.search(l)), \
+                   subprocess.run(['grep', '-E', m.GREP_PATTERN], input='+' + l + '\\n', \
+                   text=True, capture_output=True, env=env).returncode == 0] \
+                   for l in sys.argv[2:]]))";
+    let lines: Vec<&str> = markers.iter().chain(clean.iter()).copied().collect();
+    let out = shared_python(program, &lines);
+    let verdicts = out.as_array().unwrap_or_else(|| panic!("{out}"));
+    for (line, verdict) in lines.iter().zip(verdicts) {
+        let expected = markers.contains(line);
+        assert_eq!(
+            verdict[0].as_bool(),
+            Some(expected),
+            "MARKER_RE on {line:?}: {verdict}"
+        );
+        assert_eq!(
+            verdict[1].as_bool(),
+            Some(expected),
+            "GREP_PATTERN on {line:?}: {verdict}"
+        );
+    }
+}
+
 /// classify() reads manifests and lockfiles by generic name shapes, takes
 /// `spec/` as a test root only at the top level, counts `.txt` as docs only
 /// under a docs dir or as a README-style name, and sees generic process
@@ -3290,8 +3350,8 @@ fn diff_signals_classify_reads_generic_manifest_test_and_docs_shapes() {
         return;
     }
     let program = "import json, sys; sys.path.insert(0, sys.argv[1]); import diff_signals as d; \
-                   print(json.dumps({f: d.classify([f], '') for f in sys.argv[2:]} | \
-                   {'exec': d.classify(['src/a.rs'], 'let c = Command::new(\"ls\");')}))";
+                   print(json.dumps({**{f: d.classify([f], '') for f in sys.argv[2:]}, \
+                   'exec': d.classify(['src/a.rs'], 'let c = Command::new(\"ls\");')}))";
     let out = shared_python(
         program,
         &[
@@ -3307,6 +3367,13 @@ fn diff_signals_classify_reads_generic_manifest_test_and_docs_shapes() {
             "docs/notes.txt",
             "LICENSE.txt",
             "app/server.py",
+            "packages.lock.json",
+            "bun.lockb",
+            "ios/App.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+            "requirements/dev.txt",
+            "requirements/base.in",
+            "src/file-lock.rs",
+            "app/models/user.rb",
         ],
     );
     let flag = |path: &str, key: &str| out[path][key].as_bool().unwrap_or_else(|| panic!("{out}"));
@@ -3316,9 +3383,22 @@ fn diff_signals_classify_reads_generic_manifest_test_and_docs_shapes() {
         "tools/deps.lockfile",
         "go.work",
         "src/App.csproj",
+        "packages.lock.json",
+        "bun.lockb",
+        "ios/App.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+        "requirements/dev.txt",
+        "requirements/base.in",
     ] {
         assert!(flag(lock, "touches_deps"), "{lock} is a manifest: {out}");
     }
+    assert!(
+        !flag("src/file-lock.rs", "touches_deps"),
+        "a source file named -lock is not a lockfile: {out}"
+    );
+    assert!(
+        !flag("app/models/user.rb", "consumer_surface"),
+        "an app/ dir alone is not consumer surface: {out}"
+    );
     assert!(
         !flag("api/spec/openapi.yaml", "tests_docs_only"),
         "an API spec dir is not a test root: {out}"
@@ -3382,8 +3462,8 @@ fn gauntlet_signals_without_the_shared_module_reports_signals_error() {
 #[cfg(unix)]
 #[test]
 fn code_reviewer_facts_reads_generated_headers_in_any_comment_syntax() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    if which::which("python3").is_err() || which::which("git").is_err() {
+        eprintln!("skipping: python3 or git not available");
         return;
     }
     let dir = fixture_dir("facts-generated-headers");
@@ -3399,6 +3479,18 @@ fn code_reviewer_facts_reads_generated_headers_in_any_comment_syntax() {
         ),
         ("api/foo.pb.go", "package api\n\nfunc Hand() {}\n"),
         ("src/main.go", "package main\n"),
+        (
+            "src/lint.rs",
+            "//! Files marked @generated are skipped by the linter\npub fn f() {}\n",
+        ),
+        (
+            "src/Model.Designer.cs",
+            "// <auto-generated>\n//     This code was generated by a tool.\n// </auto-generated>\nclass Model {}\n",
+        ),
+        (
+            "web/consts.js",
+            "// This file was automatically generated.\n// Do not edit.\nexport const a = 1;\n",
+        ),
     ];
     for (path, text) in files {
         let full = repo.join(path);
@@ -3432,12 +3524,19 @@ fn code_reviewer_facts_reads_generated_headers_in_any_comment_syntax() {
     generated.sort_unstable();
     assert_eq!(
         generated,
-        ["proto/messages_pb2.py", "web/page.html"],
+        [
+            "proto/messages_pb2.py",
+            "src/Model.Designer.cs",
+            "web/consts.js",
+            "web/page.html"
+        ],
         "{out}"
     );
     let changed = out["changed_files"].to_string();
     assert!(
-        changed.contains("\"api/foo.pb.go\"") && changed.contains("\"src/main.go\""),
+        changed.contains("\"api/foo.pb.go\"")
+            && changed.contains("\"src/main.go\"")
+            && changed.contains("\"src/lint.rs\""),
         "a name-only match is still reviewed: {out}"
     );
     assert!(
@@ -3455,8 +3554,8 @@ fn code_reviewer_facts_reads_generated_headers_in_any_comment_syntax() {
 #[cfg(unix)]
 #[test]
 fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    if which::which("python3").is_err() || which::which("git").is_err() {
+        eprintln!("skipping: python3 or git not available");
         return;
     }
     let dir = fixture_dir("downstream-sweep-generic");
@@ -3470,7 +3569,14 @@ fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths(
             "server/server.go",
             "package server\n\nfunc (s *Server) HandleThing(w Writer) {}\n",
         ),
-        ("src/config.rs", "pub fn parse_config() {}\n"),
+        (
+            "src/config.rs",
+            "pub fn parse_config() {\n    let some_local_value = 1;\n}\n",
+        ),
+        (
+            "proto/admin.proto",
+            "syntax = \"proto3\";\nservice AdminService {\n}\n",
+        ),
     ];
     for (path, text) in files {
         let full = repo.join(path);
@@ -3489,6 +3595,16 @@ fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths(
     fs::write(consumers.join("call.go"), "srv.HandleThing(w)\n").unwrap();
     fs::write(consumers.join("main.rs"), "svc::parse_config();\n").unwrap();
     fs::write(consumers.join("metrics.txt"), "handle_requests_total 3\n").unwrap();
+    fs::write(consumers.join("a.js"), "require('app/handlers')\n").unwrap();
+    fs::write(consumers.join("b.js"), "import x from \"app/handlers\"\n").unwrap();
+    fs::write(
+        consumers.join("admin.go"),
+        "c := NewAdminServiceClient(conn)\n",
+    )
+    .unwrap();
+    fs::write(consumers.join("locals.rs"), "some_local_value\n").unwrap();
+    fs::write(consumers.join("pool.js"), "// use the server pool\n").unwrap();
+    fs::write(consumers.join("README.md"), "load settings from config\n").unwrap();
     let (code, stdout, stderr) = run(Command::new("python3")
         .arg("-B")
         .arg(asset("code-reviewer/scripts/downstream_sweep.py"))
@@ -3513,7 +3629,7 @@ fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths(
     let notes = out["downstream_notes"].as_str().unwrap_or_default();
     assert!(
         notes.contains(
-            "token families extracted: route literals 0, schema names 0, definitions 3, import paths "
+            "token families extracted: route literals 0, schema names 1, definitions 3, import paths "
         ),
         "{notes}"
     );
@@ -3521,7 +3637,10 @@ fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths(
         ("client.py", "handle_request"),
         ("call.go", "HandleThing"),
         ("main.rs", "parse_config"),
-        ("client.py", "app.handlers"),
+        ("client.py", "app/handlers"),
+        ("a.js", "app/handlers"),
+        ("b.js", "app/handlers"),
+        ("admin.go", "AdminService"),
     ] {
         assert!(
             notes
@@ -3535,6 +3654,16 @@ fn code_reviewer_downstream_sweep_extracts_generic_definitions_and_import_paths(
         !notes.contains("metrics.txt"),
         "identifiers are matched on word boundaries: {notes}"
     );
+    assert!(
+        !notes.contains("some_local_value"),
+        "an indented local is not a definition: {notes}"
+    );
+    for file in ["pool.js", "README.md"] {
+        assert!(
+            !notes.contains(&format!("/{file} ")),
+            "{file} has no import-shaped line: {notes}"
+        );
+    }
 }
 
 fn parse_findings(findings: &Value) -> Value {
@@ -3625,7 +3754,7 @@ fn step_runner_debt_hits_default_parses_to_the_manual_fallback() {
         hits.starts_with("DEBT_SCAN_FAILED: the debt_scan node did not run."),
         "{hits}"
     );
-    let grep = r#"grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|skipIf|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented|panic\("(TODO|not implemented|unimplemented)|(//|#|--|;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|@?[A-Za-z_]+[-:] ?(disable|ignore|nocheck|expect-error)|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'"#;
+    let grep = r#"grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|[sS][kK][iI][pP][iI][fF]|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|importorskip\(|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented(Error|Exception)|panic\("(TODO|not implemented|unimplemented)|(//|#|-- |;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|NOLINT(NEXTLINE|BEGIN|END)?([^A-Za-z0-9_]|$)|@?[A-Za-z_]+-(disable|ignore|nocheck|expect-error)($|[-=,:[]| +($|[a-z@#/*-]))|@?[A-Za-z_]+: ?(disable|ignore|nocheck)($|[-=,[]| +[#A-Z])|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|pragma +(GCC|clang) +diagnostic +(ignored|push)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'"#;
     assert_eq!(hits.matches(grep).count(), 1, "{hits}");
     assert!(hits.contains("fs_grep tool"), "{hits}");
 }

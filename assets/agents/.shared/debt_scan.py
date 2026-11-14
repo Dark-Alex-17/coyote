@@ -78,8 +78,7 @@ DIFF_FLAGS = [
 # Only `git diff` with no revision prints these during an unresolved merge;
 # their multi-parent hunks do not number lines the way the parser counts them.
 COMBINED_MARKERS = ("diff --cc ", "diff --combined ", "@@@")
-# Twin of debris.py's helpers (this script runs via runpy from shims, so it
-# cannot import debris.py); a test keeps the two copies identical.
+# Twin of debris.py's helpers; a test keeps the two copies identical.
 C_ESCAPE_RE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
 C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]")
