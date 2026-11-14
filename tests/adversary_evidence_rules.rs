@@ -752,3 +752,121 @@ fn holistic_severity_and_criterion_format_fallback() {
         "{text}"
     );
 }
+
+/// The two holistic complaints a field run blocked on: scope drift whose
+/// every location sits in the run's own planning files.
+fn planning_drift_complaints() -> Value {
+    json!([
+        {"kind": "Scope drift / out-of-scope",
+         "location": "plans/tasks/TASK-005-entitlements-time-accessors/log.md:17 (fix-round-2 entry)",
+         "violation": "TASK-005 may only touch entitlements/resolver.go, resolver_test.go, catalog.go, \
+    billing/service.go and cmd/billingd/main.go (index.md `files:`). In fix-round-2 it also ran \
+    `git rm --cached` on httpapi/usage_webhook_probe_test.go",
+         "fix": "keep the task inside its file list",
+         "blocking": true},
+        {"kind": "Scope drift / out-of-scope",
+         "location": "plans/PLAN-subscription-discounts.md:363 (also :288, \
+    plans/tasks/TASK-004-store-discounts-repository/index.md:43)",
+         "violation": "TASK-004's file list is store/discounts.go, store/discounts_test.go and \
+    billing/service.go (plan row T4 at :242, index.md:9-12). The diff goes beyond that and rewrites \
+    acceptance criteria in the plan",
+         "fix": "leave the plan to the planner",
+         "blocking": true}
+    ])
+}
+
+#[test]
+fn scope_drift_confined_to_the_planning_dirs_is_advisory() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("planning-drift");
+    let mut state = verdict_state(json!([met("c1"), met("c2")]));
+    state["debris_exclude"] = json!(r#"["plans"]"#);
+    state["extra_complaints"] = planning_drift_complaints();
+    let text = report(&dir.0, "replay", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(
+            "Non-blocking holistic complaints:\n\
+             - Scope drift / out-of-scope -- plans/tasks/TASK-005-entitlements-time-accessors/log.md:17"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("\n- Scope drift / out-of-scope -- plans/PLAN-subscription-discounts.md:363"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("scope drift confined to the run's planning files")
+            .count(),
+        2,
+        "{text}"
+    );
+}
+
+#[test]
+fn scope_drift_outside_the_planning_dirs_still_blocks() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("genuine-drift");
+    let complaint = |kind: &str, location: &str| {
+        json!({"kind": kind, "location": location, "violation": "edits outside the task",
+               "fix": "revert it", "blocking": true})
+    };
+    for (label, extra) in [
+        (
+            "code-path",
+            complaint("Scope drift / out-of-scope", "src/billing/other.go:12"),
+        ),
+        (
+            "mixed",
+            complaint("Scope drift / out-of-scope", "plans/x.md:3, src/a.go:9"),
+        ),
+        (
+            "other-kind",
+            complaint("Gamed tests", "plans/tasks/T/index.md:4"),
+        ),
+        (
+            "no-path",
+            complaint("Scope drift / out-of-scope", "the task log"),
+        ),
+    ] {
+        let mut state = verdict_state(json!([met("c1")]));
+        state["debris_exclude"] = json!(r#"["plans"]"#);
+        let mut complaints = planning_drift_complaints();
+        complaints.as_array_mut().unwrap().push(extra);
+        state["extra_complaints"] = complaints;
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES") && text.contains("\n1. "),
+            "{label}: {text}"
+        );
+        assert_eq!(
+            text.matches("scope drift confined to the run's planning files")
+                .count(),
+            2,
+            "{label}: only the planning-file complaints are demoted: {text}"
+        );
+    }
+
+    for (label, exclude) in [
+        ("unset", None),
+        ("empty", Some("")),
+        ("invalid", Some("[1]")),
+    ] {
+        let mut state = verdict_state(json!([met("c1")]));
+        if let Some(value) = exclude {
+            state["debris_exclude"] = json!(value);
+        }
+        state["extra_complaints"] = json!([planning_drift_complaints()[0].clone()]);
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
+                && text.contains("\n1. Scope drift / out-of-scope")
+                && !text.contains("Non-blocking holistic complaints:"),
+            "{label}: without configured excludes nothing is demoted: {text}"
+        );
+    }
+}
