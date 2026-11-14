@@ -11,12 +11,21 @@ baseline runs in run_checks.py: HEAD for staged, worktree, and an `auto` that
 found staged or unstaged changes; HEAD~1 for an `auto` that fell back to it;
 A for `A..B`; the merge-base of A and B for `A...B`; and the normalized base
 for a revision. It is empty when the base cannot be resolved.
+
+`bookkeeping_files` lists the changed files under the configured
+`debris_exclude` dirs, the run's own planning files; it is empty when none
+are configured or the value is unusable (debris_lint.py faults on that).
+`changed_files` and `diff_text` keep those files.
 """
 
 import json
 import re
 import os
 import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
 MAX_DIFF_CHARS = 60000
 
@@ -103,7 +112,17 @@ def normalize_base(spec):
     return base, f" (diff spec {spec!r} normalized to merge-base {base[:12]} — three-dot semantics)"
 
 
-out = {"diff_note": "", "project_dir": proj}
+def bookkeeping(files):
+    try:
+        import debris
+
+        excludes = debris.parse_excludes(state.get("debris_exclude"))
+    except (ImportError, ValueError):
+        return []
+    return [f for f in files if debris.under_excludes(f, excludes)]
+
+
+out = {"diff_note": "", "project_dir": proj, "bookkeeping_files": []}
 base_rev = ""
 try:
     if spec.startswith("-"):
@@ -144,6 +163,7 @@ try:
         if line.startswith("+++ b/")
     })
     out["changed_files"] = files[:300]
+    out["bookkeeping_files"] = bookkeeping(files)
     if len(files) > 300:
         out["diff_note"] += (
             f" (file list capped at 300 of {len(files)} changed files — use the fs "
