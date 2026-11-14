@@ -112,7 +112,7 @@ initial_state:
   # Overwritten by the debt_scan node; this default is what edge_case_sweep
   # sees if that script crash-forwards, so it must carry the manual fallback.
   debt_hits: 'DEBT_SCAN_FAILED: the debt_scan node did not run. Manual fallback (<base> normally HEAD):
-    git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE ''^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'' ;
+    git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE ''^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|skipIf|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented|panic\("(TODO|not implemented|unimplemented)|(//|#|--|;|/\*|\*|<!--|%|''\''''|REM ) *(@?no(lint|qa|sec|check|inspection)|@?[A-Za-z_]+[-:] ?(disable|ignore|nocheck|expect-error)|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'' ;
     grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'
   needs_independent_review: false
   review_report: ''
