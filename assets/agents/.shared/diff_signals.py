@@ -8,9 +8,16 @@ changed-file list and the ADDED lines; no git, no LLM.
 """
 import re
 
-DOCS_RE = r"\.(md|rst|txt|adoc)$"
+# `.txt` is prose only under a docs dir or as a README/CHANGELOG-style name,
+# so build inputs such as CMakeLists.txt and requirements.txt are not docs.
+DOCS_RE = (
+    r"\.(md|rst|adoc)$|(^|/)docs?/.*\.txt$"
+    r"|(^|/)(readme|changelog|changes|history|license|licence|copying|notice|authors|contributing)[^/]*\.txt$"
+)
+# `spec/` is a test root only at the top level or inside a test dir; a spec/
+# elsewhere (an OpenAPI or design spec) is code or docs.
 TESTS_RE = (
-    r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
+    r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|^spec/"
     r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
 )
 # auth(?!or(?!i[sz])) admits auth/authn/authz/oauth/authoriz(e|ation) but not
@@ -25,18 +32,70 @@ AUTH_ADDED_RE = (
     r"auth(?!or(?!i[sz]))|password|token|secret|credential|jwt|session|bearer"
     r"|permission|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b"
 )
-DEPS_RE = (
-    r"go\.(mod|sum)$|package(-lock)?\.json$|yarn\.lock$|pnpm-lock\.yaml$"
-    r"|Cargo\.(toml|lock)$|requirements[^/]*\.txt$|pyproject\.toml$"
-    r"|Gemfile(\.lock)?$|pom\.xml$|build\.gradle|composer\.(json|lock)$"
+# Manifest and lockfile basenames, as anchored regex fragments. Any `*.lock`,
+# `*.lock.*`, `*.lockb`, `*.lockfile` or data-shaped `*-lock.*` counts too, so
+# a lockfile missing from the list still selects the lane.
+DEPS_BASENAMES = (
+    r"[^/]*\.lock",
+    r"[^/]*\.lock\.[^/]*",
+    r"[^/]*\.lockb",
+    r"[^/]*-lock\.(json|ya?ml|toml)",
+    r"[^/]*\.lockfile",
+    r"go\.(mod|sum|work|work\.sum)",
+    r"package\.json",
+    r"npm-shrinkwrap\.json",
+    r"Cargo\.toml",
+    r"requirements[^/]*\.(txt|in)",
+    r"requirements/[^/]*\.(txt|in)",
+    r"constraints[^/]*\.txt",
+    r"pyproject\.toml",
+    r"Pipfile",
+    r"setup\.(py|cfg)",
+    r"environment\.ya?ml",
+    r"Gemfile",
+    r"[^/]*\.gemspec",
+    r"pom\.xml",
+    r"build\.gradle(\.kts)?",
+    r"settings\.gradle(\.kts)?",
+    r"gradle\.properties",
+    r"libs\.versions\.toml",
+    r"build\.sbt",
+    r"composer\.json",
+    r"[^/]*\.(csproj|fsproj|vbproj)",
+    r"packages\.config",
+    r"Directory\.Packages\.props",
+    r"[^/]*\.nuspec",
+    r"Package\.swift",
+    r"Package\.resolved",
+    r"Podfile",
+    r"Cartfile",
+    r"pubspec\.yaml",
+    r"mix\.exs",
+    r"rebar\.config",
+    r"[^/]*\.cabal",
+    r"stack\.yaml",
+    r"dune-project",
+    r"[^/]*\.opam",
+    r"deps\.edn",
+    r"project\.clj",
+    r"DESCRIPTION",
+    r"cpanfile",
+    r"vcpkg\.json",
+    r"conanfile\.(txt|py)",
+    r"flake\.nix",
+    r"WORKSPACE(\.bazel)?",
+    r"MODULE\.bazel",
 )
+DEPS_RE = r"(^|/)(" + "|".join(DEPS_BASENAMES) + r")$"
 EXEC_RE = (
     r"exec\.Command|subprocess|os/exec|Runtime\.getRuntime"
-    r"|shell_exec|\beval\(|\bsystem\(|child_process"
+    r"|shell_exec|\beval\(|\bsystem\(|child_process|Command::new|\bpopen\("
+    r"|ProcessBuilder|Process\.Start|\bspawn\(|\bexec[lv]p?e?\("
 )
 CONSUMER_RE = (
     r"routes?|handlers?|\bapi\b|endpoints?|\bcmd/|\bcli\b|\.proto$"
     r"|openapi|swagger|controllers?|graphql"
+    r"|(^|/)(servers?|views|urls|wsgi|asgi)(\.[^/]*)?(/|$)"
 )
 PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
 MIGRATIONS_RE = r"migrations?/|\.sql$"
