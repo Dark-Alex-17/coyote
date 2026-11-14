@@ -4037,7 +4037,8 @@ check("caps: do it here past the sizing cap keeps the reason, plans in this run,
 _sc2 = gates.route_intent(base_state(**{**_ss, "sizing": "plan_shaped"})).get("escalation", {})
 check("caps: a second sizing cap after a granted extension recommends the architect handoff, still no stop",
       recommended(_sc2) == [gates.SIZING_ARCHITECT], recommended(_sc2))
-_sp = gates.record_subtasks(base_state(**{**sz, "subtasks": subs + [subs[0]], "sizing_rounds": CLARIFY_MAX}))
+_sp = gates.record_subtasks(base_state(**{**sz, "subtasks": subs + [{"title": "sx", "outcome": "ox"}],
+                                          "sizing_rounds": CLARIFY_MAX}))
 _sp_esc = _sp.get("escalation", {})
 check("caps: a sizing cap after the planner overflowed recommends the architect; do it here stays offered",
       _sp_esc.get("kind") == "sizing_cap" and _lib.as_dict(_sp_esc.get("data")).get("planned") is True
@@ -4275,6 +4276,25 @@ check("subtask heal: a non-int subtask_index is never read as a number -> end_bl
 u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=-1, run_dir=_edir))
 check("subtask heal: a negative subtask_index -> end_blocked, never a review of no subtask",
       u["_next"] == "end_blocked" and "subtask_index -1 is out of step" in u["failure_reason"], u.get("failure_reason"))
+u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=None, run_dir=_edir))
+check("subtask heal: a None subtask_index -> end_blocked naming it missing",
+      u["_next"] == "end_blocked" and "subtask_index is missing" in u["failure_reason"], u.get("failure_reason"))
+u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=1, task_number=2, run_dir=_edir))
+check("subtask heal: an in-range index behind task_number -> end_blocked naming both, never a repeated review",
+      u["_next"] == "end_blocked" and "subtask_index 1 is out of step with task_number 2" in u["failure_reason"],
+      u.get("failure_reason"))
+_ddir = _lib.ensure_run_dir("dedup-seal")
+u = gates.record_subtasks(base_state(subtasks=[_hsubs[0], _hsubs[1], _hsubs[0]], run_dir=_ddir))
+_sealed = json.loads(_lib.read_artifact(_ddir, "subtasks.json"))
+check("record_subtasks: exact duplicates are dropped before the seal and the count is ledgered",
+      u["_next"] == "next_subtask" and u["subtasks"] == _hsubs[:2] and _sealed == _hsubs[:2]
+      and any("dropped 1 exact duplicate" in d for d in u["decisions"]), (u.get("subtasks"), u.get("decisions")))
+_sdir = _lib.ensure_run_dir("single-seal")
+_si = gates.route_intent(base_state(intent="implementation", sizing="single", brief="fix the parser", run_dir=_sdir))
+u = gates.next_subtask(base_state(subtasks="corrupted", subtask_index=0, run_dir=_sdir, intent="implementation"))
+check("subtask heal: a single-subtask run with a str subtasks heals from the list route_intent sealed",
+      _si.get("_next") == "next_subtask" and u["_next"] == "plan_research" and u.get("subtasks") == _si.get("subtasks")
+      and any("rebuilt the list of 1 from subtasks.json" in d for d in u["decisions"]), (_si.get("_next"), u))
 
 # ---------------------------------------------------------------- fault routes carry a reason
 for _bad, _shape in ((None, "missing"), ([{"kind": "clarify"}], "a list"), ({"question": "q"}, "without a kind")):
@@ -4285,6 +4305,9 @@ for _bad, _shape in ((None, "missing"), ([{"kind": "clarify"}], "a list"), ({"qu
           and _shape in _ud["failure_reason"] and _ud["failure_reason"].startswith("ask_dispatch:")
           and _shape in _up["failure_reason"] and _up["failure_reason"].startswith("parse_answer:"),
           (_ud.get("_next"), _ud.get("failure_reason"), _up.get("_next"), _up.get("failure_reason")))
+_ub = gates.parse_answer(base_state(escalation=escalation("clarify", "  ", [option("a", True)]), last_answer_text="1"))
+check("escalation fault: a blank question -> end_blocked naming the empty question",
+      _ub["_next"] == "end_blocked" and "empty question" in _ub.get("failure_reason", ""), _ub)
 u = gates.record_subtasks(base_state(subtasks=None, top_level=True, run_dir=_edir))
 check("record_subtasks: missing subtasks -> end_blocked naming it missing, not a sizing verdict",
       u["_next"] == "end_blocked" and "subtasks is missing" in u["failure_reason"] and "escalation" not in u,
@@ -4321,6 +4344,18 @@ _ps = gates.parse_answer(base_state(escalation=_rc, last_answer_text="stop"))
 _pt = gates.parse_answer(base_state(escalation=_rc, last_answer_text="drop the session cache entirely"))
 _ok = _ps["_next"] == "apply_answer" and _pt["_next"] == "interpret_reply" and "- answer:" in _pt["reply_accepts"]
 check("rejected cap: parse_answer takes a bare stop to apply_answer and interprets typed changes", _ok, (_ps, _pt))
+u = gates.route_coder_result(base_state(coder_result="CODER_REJECTED\nno", rejected_rounds=STRIKE_LIMIT,
+                                        rejected_cap_resets=gates.FIX_ROUND_CEILING))
+_rcs = u.get("escalation") or {}
+_ph = gates.parse_answer(base_state(escalation=_rcs, last_answer_text=_lib.HEADLESS_GUIDANCE))
+_ah = gates.apply_answer(base_state(**{**_ph, "escalation": _rcs}))
+check("rejected cap: at the reset ceiling Stop is recommended and a headless pick ends blocked",
+      recommended(_rcs) == [_RC_STOP] and f"{gates.FIX_ROUND_CEILING}/{gates.FIX_ROUND_CEILING} rejection budget resets"
+      in _rcs.get("evidence", "") and _ah.get("_next") == "end_blocked", (recommended(_rcs), _ph, _ah))
+u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_CONTINUE, rejected_cap_resets=1))
+_ns = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=0, rejected_cap_resets=2, run_dir=_edir))
+check("rejected cap: continue counts a reset and next_subtask clears the count",
+      u.get("rejected_cap_resets") == 2 and _ns.get("rejected_cap_resets") == 0, (u.get("rejected_cap_resets"), _ns))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

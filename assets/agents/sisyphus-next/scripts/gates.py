@@ -741,10 +741,12 @@ def _route_intent(state, u):
     elif truthy(state.get("architecture_scale")):
         u["subtasks"] = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
         u["subtask_index"] = 0
+        _seal_subtasks(state, u["subtasks"])
         u["_next"] = "architecture_review"
     else:
         u["subtasks"] = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
         u["subtask_index"] = 0
+        _seal_subtasks(state, u["subtasks"])
         u["_next"] = "next_subtask"
     snapshot(state, u, "route_intent")
     return u
@@ -799,6 +801,11 @@ def record_subtasks(state):
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
     subtasks = _fold_publish(state, u, subtasks)
     subtasks = _merge_tests_first(state, u, subtasks)
+    unique = list({json.dumps(s, sort_keys=True, default=str): s for s in subtasks}.values())
+    if len(unique) < len(subtasks):
+        # next_subtask rejects a list holding a duplicate, so one is never sealed
+        ledger(state, u, f"subtasks: dropped {len(subtasks) - len(unique)} exact duplicate subtask(s) before sealing")
+        subtasks = unique
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
         if truthy(state.get("top_level")):
@@ -818,7 +825,7 @@ def record_subtasks(state):
     if publish:
         lines += ["## Publish step (after review, checked by a script)", ""] + [f"- {c}" for c in publish] + [""]
     write_artifact(state.get("run_dir", ""), "tasklog.md", "\n".join(lines))
-    write_artifact(state.get("run_dir", ""), SEALED_SUBTASKS, json.dumps(subtasks, indent=1, default=str))
+    _seal_subtasks(state, subtasks)
     u["subtasks"] = subtasks
     u["subtask_index"] = 0
     ledger(state, u, f"subtasks: {len(subtasks)} sealed in-run subtasks recorded")
@@ -1086,24 +1093,35 @@ def _sealed_subtasks(state):
     return (logged, "tasklog.md") if logged else ([], "")
 
 
+def _subtasks_fault(state, u, why):
+    u["failure_reason"] = f"next_subtask: {why}; stopped so no subtask review is skipped"
+    ledger(state, u, u["failure_reason"])
+    u["_next"] = "end_blocked"
+    return None
+
+
 def _checked_subtasks(state, u):
     """The subtask list to pop from, healed from the sealed list when the state's is broken; None after routing a
     run whose list cannot be trusted to end_blocked, so no review is skipped without a stated reason."""
     raw, idx = state.get("subtasks"), state.get("subtask_index")
-    problem = _subtasks_problem(raw, idx)
-    if not problem:
-        return as_list(raw)
-    sealed, source = _sealed_subtasks(state)
-    still = _subtasks_problem(sealed, idx) if sealed else "no sealed subtask list in the run dir"
-    if not still:
-        u["subtasks"] = sealed
+    subtasks = as_list(raw)
+    if problem := _subtasks_problem(raw, idx):
+        sealed, source = _sealed_subtasks(state)
+        still = _subtasks_problem(sealed, idx) if sealed else "no sealed subtask list in the run dir"
+        if still:
+            return _subtasks_fault(state, u, f"{problem}, and the list could not be rebuilt ({still})")
+        u["subtasks"] = subtasks = sealed
         ledger(state, u, f"subtasks: {problem}; rebuilt the list of {len(sealed)} from {source}")
-        return sealed
-    u["failure_reason"] = (f"next_subtask: {problem}, and the list could not be rebuilt ({still}); stopped so no "
-                           "subtask review is skipped")
-    ledger(state, u, u["failure_reason"])
-    u["_next"] = "end_blocked"
-    return None
+    # outside the final review the index advances with task_number, so a mismatch means one of them is stale
+    step = as_int(state.get("task_number"))
+    if step > 0 and not truthy(state.get("final_review")) and idx != step:
+        return _subtasks_fault(state, u, f"subtask_index {idx} is out of step with task_number {step}")
+    return subtasks
+
+
+def _seal_subtasks(state, subtasks):
+    """The list next_subtask heals from; every writer of `subtasks` seals it so a resumed run can rebuild it."""
+    write_artifact(state.get("run_dir", ""), SEALED_SUBTASKS, json.dumps(subtasks, indent=1, default=str))
 
 
 def next_subtask(state):
@@ -1133,7 +1151,7 @@ def next_subtask(state):
         "current_task": text, "task_number": idx + 1, "subtask_index": idx + 1,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False, "oracle_retries": 0,
-        "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "context_pack": "",
+        "design_ask_rounds": 0, "rejected_rounds": 0, "rejected_cap_resets": 0, "strikeout_rounds": 0, "context_pack": "",
         "context_pack_degraded": False, "explore_findings": [], "librarian_findings": [],
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
@@ -1174,7 +1192,8 @@ def _start_final_review(state, u, n):
         "final_review": True, "base_sha": base, "debt_base": base, "current_task": task,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
-        "oracle_retries": 0, "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": brief,
+        "oracle_retries": 0, "design_ask_rounds": 0, "rejected_rounds": 0, "rejected_cap_resets": 0, "strikeout_rounds": 0,
+        "coder_brief": brief,
         "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
         # rejections made against a subtask's scope are no ruling on the parent criteria
@@ -1554,6 +1573,8 @@ def _escalation_fault(state, u, node):
         shape = f"a {type(raw).__name__} ({_one_line(json.dumps(raw, default=str), 120)}), not an object"
     elif not str(esc.get("kind") or "").strip():
         shape = f"an object without a kind (keys: {', '.join(sorted(map(str, esc)))})"
+    elif not str(esc.get("question") or "").strip():
+        shape = f"a {esc.get('kind')} escalation with an empty question"
     else:
         return False
     u["failure_reason"] = f"{node}: the escalation state is {shape}, so there is no question to ask"
@@ -2194,9 +2215,10 @@ def apply_answer(state):
         if reason == NO_STATED_REASON:
             reason = ("No changes were stated; address the last rejection:\n"
                       + str(as_dict(esc.get("data")).get("last_rejection") or "(none recorded)"))
-        u.update({"rejected_rounds": 0, "fix_source": "rejected", "fix_note": reason})
-        ledger(state, u, f"coder: rejection budget reset after {rounds} rejected rounds at the user's pick; planning "
-                         f"again with: {tail(reason, 300)}")
+        resets = as_int(state.get("rejected_cap_resets")) + 1
+        u.update({"rejected_rounds": 0, "rejected_cap_resets": resets, "fix_source": "rejected", "fix_note": reason})
+        ledger(state, u, f"coder: rejection budget reset after {rounds} rejected rounds at the user's pick "
+                         f"({resets}/{FIX_ROUND_CEILING} resets this subtask); planning again with: {tail(reason, 300)}")
         u["_next"] = "compose_fix"
     elif kind == "engine_fault":
         if stop:
@@ -2248,6 +2270,7 @@ def apply_answer(state):
             subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
             cur = max(as_int(state.get("subtask_index")) - 1, 0)
             subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [answer]
+            _seal_subtasks(state, subtasks)
             u["subtasks"] = subtasks
             ledger(state, u, f"plan amendment (user) to subtask {cur + 1}: {answer}")
             u["_next"] = "build_gauntlet_prompt"
@@ -2670,14 +2693,19 @@ def route_coder_result(state):
         u["coder_sentinel"] = "CODER_REJECTED"
         if rounds > STRIKE_LIMIT:
             last = tail(result, 1500)
+            resets = as_int(state.get("rejected_cap_resets"))
+            # past the ceiling Stop is recommended, so a headless run ends instead of resetting forever
+            spent = resets >= FIX_ROUND_CEILING
+            note = f"{resets}/{FIX_ROUND_CEILING} rejection budget resets used in this subtask"
             ledger(state, u, f"coder: plan rejected {rounds} times, past the STRIKE_LIMIT budget of {STRIKE_LIMIT}; asking")
             return raise_escalation(state, u, escalation(
                 "coder_rejected_cap", f"The coder's plan was rejected {rounds} times, past the budget of "
                                       f"{STRIKE_LIMIT}. Plan again with your changes, or stop?",
-                [option(REJECTED_CONTINUE, True, "the rejection budget starts over; your changes go to the coder"),
-                 option(REJECTED_STOP)],
+                [option(REJECTED_CONTINUE, not spent,
+                        f"the rejection budget starts over; your changes go to the coder; {note}"),
+                 option(REJECTED_STOP, spent)],
                 evidence=f"Rejected rounds used: {rounds} (budget STRIKE_LIMIT = {STRIKE_LIMIT})\n"
-                         f"Last rejection (tail):\n{last}",
+                         f"{note}\nLast rejection (tail):\n{last}",
                 hard_trigger=True, tier3_ok=False, data={"rounds": rounds, "last_rejection": last}))
         return raise_escalation(state, u, escalation(
             "coder_rejected",
