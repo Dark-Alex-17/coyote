@@ -21,6 +21,7 @@ if [[ -z "$cmd" ]]; then
   jq -nc '{
     "tests_ok": true,
     "tests_output": "(GATE NOT RUN: no test command configured or detected. This is NOT evidence that tests passed; set the test_command variable or TEST_CMD, and never report the suite as green.)",
+    "tests_verdict": "NOT RUN: no test command configured or detected",
     "_next": "self_review"
   }'
   exit 0
@@ -122,6 +123,11 @@ trim_output "$output" | jq -Rsc \
       | {
           "tests_ok": true,
           "tests_output": ((if $report == "" then "" else $report + "\n\n" end) + $ran + (if $rc == 0 then "" else "\nExit code: \($rc)" end) + "\n\n" + .),
+          "tests_verdict": (
+            if $rc == 0 then "passed"
+            else "red, matches the pre-run baseline (exit \($rc)); accepted pre-existing failures: "
+              + (if ($cur | length) > 0 then $cur | gate_cap(", ") else "unidentified (\(env.GATE_REASON))" end)
+            end),
           "baseline_report": (if $report == "" then "" else "\n" + $report end),
           "_next": "self_review"
         }

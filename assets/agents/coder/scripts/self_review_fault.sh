@@ -24,5 +24,8 @@ printf '%s' "$state" | jq -c '
       | join("\n")
     ),
     "review_notes": ("self-review did not run; " + ((.review_notes // "") | tostring)),
+    "review_verdict": (
+      "NOT RUN: self-review ended without a verdict (iteration cap, timeout or provider failure); the diff was not self-reviewed"
+      + ((.review_notes // "") | tostring | if . == "" then "" else "\nEarlier review notes:\n" + . end)),
     "_next": "end_success"
   }'
