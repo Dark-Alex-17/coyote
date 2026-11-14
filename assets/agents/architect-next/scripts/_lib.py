@@ -871,7 +871,7 @@ def new_task(state, slug, title, body, blocked_by=(), task_type="chore", batch="
 HEAL_PATH_KEYS = ("run_dir", "code_repo_path", "plans_root", "tasks_root", "plan_path", "design_doc_path", "reference_root_path",
                   "seed_path", "draft_path")
 # The path keys a gate cannot run without. Any other path key is optional configuration whose absence means
-# something (no planning store declared, no design doc), so it is healed only when present with a wrong value.
+# something (no planning root declared, no design doc), so it is healed only when present with a wrong value.
 HEAL_ABSENT_PATH_KEYS = ("run_dir", "code_repo_path", "tasks_root", "plan_path")
 HEAL_PATH_VARS = {"code_repo_path": CODE_VAR, "plans_root": PLANNING_VAR, "design_doc_path": "design_doc"}
 # The keys whose empty value would send a gate somewhere wrong (git in the current directory, a run with no tasks
