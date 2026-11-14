@@ -309,7 +309,7 @@ nodes:
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
-      Run bookkeeping files (under the caller-configured planning dirs; being in the diff and outside a task's file list is not scope drift): {{bookkeeping_files}}
+      Run bookkeeping files (the run's own planning files under the caller-configured planning dirs; a task's file list never names them): {{bookkeeping_files}}
 
       Criterion to verify (JSON):
       {{criterion}}
@@ -361,9 +361,11 @@ nodes:
       The one exception is `format_rulings`, below.
 
       The checklist (each hit becomes one complaint with kind, file:line
-      location, the violation, the fix, and `blocking`). A complaint is
-      blocking (`blocking: true`) when the change does not conform to the
-      plan: every kind below except spec-endorsed waste.
+      location, the violation, the fix, and `blocking`). The `location` names
+      the file the violation concerns; for an action a log records, that is
+      the file acted on, not the log. A complaint is blocking
+      (`blocking: true`) when the change does not conform to the plan: every
+      kind below except spec-endorsed waste.
       - **Absence** — something the PLAN requires that maps to no criterion and
         never showed up in the diff (the dog that didn't bark). A missing
         retry/redelivery spec is an absence ONLY for a handler that carries state
@@ -411,7 +413,7 @@ nodes:
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
-      Run bookkeeping files (under the caller-configured planning dirs; being in the diff and outside a task's file list is not scope drift, while an edit there that changes acceptance criteria, verification commands or recorded decisions is judged under its own kind): {{bookkeeping_files}}
+      Run bookkeeping files (the run's own planning files under the caller-configured planning dirs; a task's file list never names them): {{bookkeeping_files}}
 
       Acceptance criteria: {{criteria}}
       Per-criterion verdicts (final, except UNVERIFIED ones awaiting your format ruling): {{crit_verdicts}}

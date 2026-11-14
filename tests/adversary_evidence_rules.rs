@@ -825,6 +825,18 @@ fn scope_drift_outside_the_planning_dirs_still_blocks() {
             complaint("Scope drift / out-of-scope", "plans/x.md:3, src/a.go:9"),
         ),
         (
+            "mixed-anchored-name",
+            complaint("Scope drift / out-of-scope", "plans/x.md:3, Makefile:12"),
+        ),
+        (
+            "mixed-hash-anchor",
+            complaint("Scope drift / out-of-scope", "plans/x.md, main.go#L3"),
+        ),
+        (
+            "escaping-path",
+            complaint("Scope drift / out-of-scope", "plans/../src/a.go:9"),
+        ),
+        (
             "other-kind",
             complaint("Gamed tests", "plans/tasks/T/index.md:4"),
         ),
@@ -848,6 +860,30 @@ fn scope_drift_outside_the_planning_dirs_still_blocks() {
                 .count(),
             2,
             "{label}: only the planning-file complaints are demoted: {text}"
+        );
+    }
+
+    for (label, location, changed) in [
+        (
+            "basename",
+            "plans/x.md:3 (see other.go:4)",
+            json!(["plans/x.md", "src/other.go"]),
+        ),
+        (
+            "bare-basename",
+            "plans/x.md:3 (see Makefile)",
+            json!(["plans/x.md", "build/Makefile"]),
+        ),
+    ] {
+        let mut state = verdict_state(json!([met("c1")]));
+        state["debris_exclude"] = json!(r#"["plans"]"#);
+        state["changed_files"] = changed;
+        state["extra_complaints"] = json!([complaint("Scope drift / out-of-scope", location)]);
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
+                && !text.contains("Non-blocking holistic complaints:"),
+            "{label}: a changed file outside the planning dirs blocks: {text}"
         );
     }
 
@@ -882,11 +918,13 @@ fn diff_facts_lists_the_changed_files_under_the_configured_excludes() {
     fs::create_dir_all(repo.join("src")).unwrap();
     git(&repo, &["init", "-q"]);
     fs::write(repo.join("README.md"), "base\n").unwrap();
+    fs::write(repo.join("plans/old.md"), "amendment\n").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-q", "-m", "base"]);
+    fs::remove_file(repo.join("plans/old.md")).unwrap();
     fs::write(repo.join("plans/tasks/T/log.md"), "entry\n").unwrap();
     fs::write(repo.join("src/a.txt"), "code\n").unwrap();
-    git(&repo, &["add", "."]);
+    git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "work"]);
 
     let facts = |label: &str, exclude: &str| {
@@ -902,8 +940,8 @@ fn diff_facts_lists_the_changed_files_under_the_configured_excludes() {
     let out = facts("configured", r#"["plans"]"#);
     assert_eq!(
         out["bookkeeping_files"],
-        json!(["plans/tasks/T/log.md"]),
-        "{out}"
+        json!(["plans/old.md", "plans/tasks/T/log.md"]),
+        "a deleted planning file is bookkeeping too: {out}"
     );
     assert_eq!(
         out["changed_files"],
@@ -919,4 +957,20 @@ fn diff_facts_lists_the_changed_files_under_the_configured_excludes() {
     );
     let out = facts("unset", "");
     assert_eq!(out["bookkeeping_files"], json!([]), "{out}");
+}
+
+#[test]
+fn review_prompts_carry_the_bookkeeping_files_fact() {
+    let graph: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("adversary/graph.yaml")).unwrap()).unwrap();
+    for node in ["check_criterion", "holistic"] {
+        let prompt = graph["nodes"][node]["prompt"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{node}: prompt"));
+        assert!(prompt.contains("{{bookkeeping_files}}"), "{node}: {prompt}");
+    }
+    assert_eq!(
+        graph["initial_state"]["bookkeeping_files"],
+        serde_yaml::Value::Sequence(vec![])
+    );
 }

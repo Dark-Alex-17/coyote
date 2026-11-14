@@ -466,13 +466,16 @@ def parse_excludes(value):
 
 def under_excludes(path, excludes):
     """Whether a repo-relative `path`, optionally `./`-prefixed or ending in a
-    `:line` reference, is one of the checked `excludes` or lies below one."""
+    `:line` reference, is one of the checked `excludes` or lies below one.
+    An empty or absolute path, or one with a `..` segment, never is."""
     path = LINE_SUFFIX_RE.sub("", path.strip())
     if BACKSLASH_IS_SEPARATOR:
         path = path.replace("\\", "/")
     while path.startswith("./"):
         path = path[2:]
     path = path.rstrip("/")
+    if not path or path.startswith("/") or os.path.isabs(path) or ".." in path.split("/"):
+        return False
     return any(path == e or path.startswith(e + "/") for e in excludes)
 
 

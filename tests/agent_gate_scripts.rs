@@ -3459,7 +3459,7 @@ fn gauntlet_signals_without_the_shared_module_reports_signals_error() {
 
 /// signals.py names the configured `debris_exclude` dirs in one
 /// `bookkeeping_note` sentence, empty when none are configured or the value
-/// is unusable, and every review lane prompt carries it.
+/// is unusable, and every agent lane prompt carries it.
 #[test]
 fn gauntlet_bookkeeping_note_names_the_configured_dirs_in_every_lane() {
     if which::which("python3").is_err() {
@@ -3489,7 +3489,9 @@ fn gauntlet_bookkeeping_note_names_the_configured_dirs_in_every_lane() {
     assert!(
         configured.contains("docs/planning/")
             && configured.contains("notes/")
-            && configured.contains("never scope drift"),
+            && configured.contains("the run's own planning files")
+            && configured.contains("a task's file list never names them")
+            && !configured.contains("not part of the change under review"),
         "{configured}"
     );
     assert!(note(Some("notes")).contains("notes/"));
@@ -3500,16 +3502,21 @@ fn gauntlet_bookkeeping_note_names_the_configured_dirs_in_every_lane() {
     let gauntlet: serde_yaml::Value =
         serde_yaml::from_str(&fs::read_to_string(asset("review-gauntlet/graph.yaml")).unwrap())
             .unwrap();
-    for lane in [
-        "run_code_review",
-        "run_adversary",
-        "run_security",
-        "run_probe",
-    ] {
-        let prompt = gauntlet["nodes"][lane]["prompt"]
+    let lanes: Vec<_> = gauntlet["nodes"]
+        .as_mapping()
+        .expect("nodes mapping")
+        .iter()
+        .filter(|(_, node)| node["type"].as_str() == Some("agent"))
+        .collect();
+    assert!(lanes.len() >= 4, "agent lanes: {}", lanes.len());
+    for (lane, node) in lanes {
+        let prompt = node["prompt"]
             .as_str()
-            .unwrap_or_else(|| panic!("{lane}: prompt"));
-        assert!(prompt.contains("{{bookkeeping_note}}"), "{lane}: {prompt}");
+            .unwrap_or_else(|| panic!("{lane:?}: prompt"));
+        assert!(
+            prompt.contains("{{bookkeeping_note}}"),
+            "{lane:?}: {prompt}"
+        );
     }
     assert_eq!(
         gauntlet["initial_state"]["bookkeeping_note"],

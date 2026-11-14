@@ -65,11 +65,15 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   spec-endorsed waste, whose criterion stays MET) are listed under
   `Non-blocking holistic complaints:` in either verdict.
 - The changed files under the configured `debris_exclude` dirs reach the criterion checks and the
-  holistic pass as `bookkeeping_files`, the run's own planning files; the diff and the changed-file
-  list still include them. A scope-drift complaint (kind containing `scope drift` or
-  `out-of-scope`) whose every location path lies under those dirs is listed as non-blocking too,
-  marked `scope drift confined to the run's planning files`. Other kinds, and locations that also
-  name a path outside them, still block; with no `debris_exclude` nothing is demoted.
+  holistic pass as `bookkeeping_files`, the run's own planning files (deleted ones included); the
+  diff and the changed-file list still include them. A scope-drift complaint (kind containing
+  `scope drift` or `out-of-scope`) whose every location path lies under those dirs is listed as
+  non-blocking too, marked `scope drift confined to the run's planning files`. Other kinds, and
+  locations that also name a file outside them (a path, a name with a `:N`, `:LN` or `#LN` anchor,
+  or the basename of a changed file outside them) or a path that escapes them with `..`, still
+  block; with no `debris_exclude` nothing is demoted. The demotion keys only on the scope-drift
+  kind and a location confined to the planning dirs, so an edit there that weakens acceptance
+  criteria or verification commands is expected to be flagged under its own kind.
 - INSPECTED criteria are listed under `Inspected, not test-proven:` with their evidence and
   `no_test_reason`.
 - A criterion whose check output stays unreadable after two re-asks is recorded UNVERIFIED with the
