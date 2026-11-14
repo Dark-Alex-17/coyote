@@ -71,7 +71,6 @@ def main():
             desc_by_file[row["file"]] = row.get("desc", "")
     blocking = [f for f in findings if f.get("section") == "blocking"]
     deferred = [f for f in findings if f.get("section") == "deferred"]
-    unverified = [f for f in findings if f.get("section") == "unverified"]
     for f in changed:
         per = [x for x in blocking if x.get("file") == f]
         tally = " ".join(
@@ -92,29 +91,21 @@ def main():
                 lines += [x.get("block", ""), ""]
     else:
         lines += ["No blocking findings.", ""]
-    if unverified:
-        lines += [
-            "## Unverified findings (verification incomplete)",
-            "",
-            "Finding verification did not complete, so these findings were NOT verified and are "
-            "NOT blocking. Re-run the review or check each one against the code before acting "
-            "on it.",
-            "",
-        ]
-        for x in unverified:
-            lines += [x.get("block", ""), ""]
 
     unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
     if unanchored:
+        icon_by_id = {str(x.get("id")): x.get("icon", "") for x in findings}
         lines += [
-            "## Could not anchor",
+            "## Not anchored in the diff",
             "",
-            "These findings name a file or lines that are not part of this diff, so they were "
-            "dropped before verification and are not reported as findings:",
+            "These findings cite a file or lines outside this diff's changes (a caller, a "
+            "consumer or missing code can be). Each went to verification with that fact and is "
+            "reported in full at its stated severity unless marked not reported:",
             "",
         ]
         lines += [
-            f"- {one_line(u.get('severity', ''))} {one_line(u.get('title', ''))} -- "
+            f"- {icon_by_id.get(str(u.get('id')), '(not reported: refuted by the verifier or dropped by the quality bar)')} "
+            f"{one_line(u.get('title', ''))} -- "
             f"`{one_line(u.get('file', ''))}:{one_line(u.get('lines', ''))}` "
             f"({one_line(u.get('reason', ''))})"
             for u in unanchored
