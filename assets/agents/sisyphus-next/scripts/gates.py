@@ -790,6 +790,12 @@ def draft_fault(state):
 def record_subtasks(state):
     u = {}
     harvest_anomalies(state, u, "plan_subtasks")
+    if shape := _not_a_list(state.get("subtasks")):
+        u["failure_reason"] = (f"plan_subtasks returned no subtask list: subtasks is {shape}; nothing was planned or "
+                               "started")
+        ledger(state, u, f"subtasks: {u['failure_reason']}")
+        u["_next"] = "end_blocked"
+        return u
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
     subtasks = _fold_publish(state, u, subtasks)
     subtasks = _merge_tests_first(state, u, subtasks)
@@ -812,6 +818,7 @@ def record_subtasks(state):
     if publish:
         lines += ["## Publish step (after review, checked by a script)", ""] + [f"- {c}" for c in publish] + [""]
     write_artifact(state.get("run_dir", ""), "tasklog.md", "\n".join(lines))
+    write_artifact(state.get("run_dir", ""), SEALED_SUBTASKS, json.dumps(subtasks, indent=1, default=str))
     u["subtasks"] = subtasks
     u["subtask_index"] = 0
     ledger(state, u, f"subtasks: {len(subtasks)} sealed in-run subtasks recorded")
@@ -1009,10 +1016,102 @@ def _merge_tests_first(state, u, subtasks):
     return kept
 
 
+SEALED_SUBTASKS = "subtasks.json"
+
+
+def _not_a_list(raw):
+    """How a raw `subtasks` value fails to be a list (a JSON list in a str counts as one), or "" when it is one."""
+    if isinstance(raw, list):
+        return ""
+    if raw is None:
+        return "missing"
+    if isinstance(raw, str):
+        try:
+            if isinstance(json.loads(raw), list):
+                return ""
+        except json.JSONDecodeError:
+            pass
+        return f"a str ({_one_line(raw, 80)!r}), not a list"
+    return f"a {type(raw).__name__}, not a list"
+
+
+def _subtasks_problem(raw, idx):
+    """Why the subtask list and the index into it cannot be trusted to pick the next review, or ""."""
+    if shape := _not_a_list(raw):
+        return f"subtasks is {shape} (subtask_index {idx!r})"
+    subtasks = as_list(raw)
+    if not subtasks:
+        return f"subtasks is an empty list (subtask_index {idx!r})"
+    seen = {}
+    for i, s in enumerate(subtasks):
+        key = json.dumps(s, sort_keys=True, default=str)
+        if key in seen:
+            return f"subtasks holds a duplicate: index {i} repeats index {seen[key]} (subtask_index {idx!r})"
+        seen[key] = i
+    if idx is None:
+        return "subtask_index is missing"
+    if type(idx) is not int:
+        return f"subtask_index is a {type(idx).__name__} ({idx!r}), not an int"
+    if not 0 <= idx <= len(subtasks):
+        return f"subtask_index {idx} is out of step with the {len(subtasks)} subtasks"
+    return ""
+
+
+def _tasklog_subtasks(text):
+    """The subtasks record_subtasks wrote to tasklog.md, read back; criteria are single lines there."""
+    body = text.split("\n## Publish step", 1)[0]
+    parts = re.split(r"(?m)^## \d+\. (.*)$", body)
+    out = []
+    for title, section in zip(parts[1::2], parts[2::2]):
+        head, _, criteria = section.partition("\nAcceptance criteria:\n")
+        head, _, constraints = head.strip().partition("\n\nConstraints: ")
+        out.append({"title": title.strip(), "outcome": head.removeprefix("Outcome: ").strip(),
+                    "constraints": constraints.strip(),
+                    "acceptance_criteria": [l[2:] for l in criteria.splitlines() if l.startswith("- ")]})
+    return out
+
+
+def _sealed_subtasks(state):
+    """(list, source) from the run dir: the sealed list record_subtasks wrote (a resumed run keeps its run dir),
+    else the tasklog; ([], "") when neither holds one."""
+    run_dir = state.get("run_dir") or ""
+    raw = read_artifact(run_dir, SEALED_SUBTASKS) if run_dir else ""
+    try:
+        sealed = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        sealed = []
+    if isinstance(sealed, list) and sealed:
+        return sealed, SEALED_SUBTASKS
+    logged = _tasklog_subtasks(read_artifact(run_dir, "tasklog.md")) if run_dir else []
+    return (logged, "tasklog.md") if logged else ([], "")
+
+
+def _checked_subtasks(state, u):
+    """The subtask list to pop from, healed from the sealed list when the state's is broken; None after routing a
+    run whose list cannot be trusted to end_blocked, so no review is skipped without a stated reason."""
+    raw, idx = state.get("subtasks"), state.get("subtask_index")
+    problem = _subtasks_problem(raw, idx)
+    if not problem:
+        return as_list(raw)
+    sealed, source = _sealed_subtasks(state)
+    still = _subtasks_problem(sealed, idx) if sealed else "no sealed subtask list in the run dir"
+    if not still:
+        u["subtasks"] = sealed
+        ledger(state, u, f"subtasks: {problem}; rebuilt the list of {len(sealed)} from {source}")
+        return sealed
+    u["failure_reason"] = (f"next_subtask: {problem}, and the list could not be rebuilt ({still}); stopped so no "
+                           "subtask review is skipped")
+    ledger(state, u, u["failure_reason"])
+    u["_next"] = "end_blocked"
+    return None
+
+
 def next_subtask(state):
     u = {}
-    subtasks = as_list(state.get("subtasks"))
-    idx = as_int(state.get("subtask_index"))
+    subtasks = _checked_subtasks(state, u)
+    if subtasks is None:
+        return u
+    idx = state.get("subtask_index")
     if idx >= len(subtasks):
         if len(subtasks) > 1 and not truthy(state.get("final_review")):
             return _start_final_review(state, u, len(subtasks))
@@ -1443,8 +1542,30 @@ def _terminal_prompt(esc):
     return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
+def _escalation_fault(state, u, node):
+    """Route a run whose `escalation` holds no askable question to end_blocked with the bad state named, and say so.
+
+    as_dict reads a list or a malformed value as {}, which would otherwise reach a prompt with no question at all."""
+    raw = state.get("escalation")
+    esc = as_dict(raw)
+    if raw is None or raw == "" or raw == {}:
+        shape = "missing"
+    elif not esc:
+        shape = f"a {type(raw).__name__} ({_one_line(json.dumps(raw, default=str), 120)}), not an object"
+    elif not str(esc.get("kind") or "").strip():
+        shape = f"an object without a kind (keys: {', '.join(sorted(map(str, esc)))})"
+    else:
+        return False
+    u["failure_reason"] = f"{node}: the escalation state is {shape}, so there is no question to ask"
+    ledger(state, u, u["failure_reason"])
+    u["_next"] = "end_blocked"
+    return True
+
+
 def ask_dispatch(state):
     u = {}
+    if _escalation_fault(state, u, "ask_dispatch"):
+        return u
     esc = as_dict(state.get("escalation"))
     u["parked"] = esc.get("kind", "")
     snapshot(state, u, "parked")
@@ -1497,6 +1618,8 @@ def ask_owner_route(state):
 
 def parse_answer(state):
     u = {}
+    if _escalation_fault(state, u, "parse_answer"):
+        return u
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
@@ -1556,6 +1679,7 @@ ACCEPTED_INSTRUCTIONS = {
     "sizing_verdict": ("narrow",),
     "clarify_cap": ("answer",),
     "sizing_cap": ("here",),
+    "coder_rejected_cap": ("answer",),
 }
 INSTRUCTION_HELP = {
     "answer": "answer the question in the user's own words; value: the answer",
@@ -1782,7 +1906,7 @@ STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and 
 # the kinds whose apply_answer branch reads a whole-reply stop; only these take a bare "abort" without interpreting it
 STOP_AWARE_KINDS = ("clarify", "clarify_cap", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow",
                     "sizing_cap", "oracle_fault", "engine_fault", "plan_defect", "review_incomplete", "strikeout",
-                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment")
+                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment", "coder_rejected_cap")
 
 
 def _whole_reply_stop(answer, options=(), stop_options=None):
@@ -2058,6 +2182,21 @@ def apply_answer(state):
     elif kind == "coder_rejected":
         u["fix_source"] = "rejected"
         u["fix_note"] = answer
+        u["_next"] = "compose_fix"
+    elif kind == "coder_rejected_cap" and stop:
+        u["failure_reason"] = (f"stopped at the user's request after the coder's plan was rejected "
+                               f"{as_int(as_dict(esc.get('data')).get('rounds'))} times: {answer}")
+        u["_next"] = "end_blocked"
+    elif kind == "coder_rejected_cap":
+        # any reply that is no stop states the changes for the next plan; a bare pick re-plans against the last rejection
+        rounds = as_int(as_dict(esc.get("data")).get("rounds"))
+        reason = _stated_reason(answer, options)
+        if reason == NO_STATED_REASON:
+            reason = ("No changes were stated; address the last rejection:\n"
+                      + str(as_dict(esc.get("data")).get("last_rejection") or "(none recorded)"))
+        u.update({"rejected_rounds": 0, "fix_source": "rejected", "fix_note": reason})
+        ledger(state, u, f"coder: rejection budget reset after {rounds} rejected rounds at the user's pick; planning "
+                         f"again with: {tail(reason, 300)}")
         u["_next"] = "compose_fix"
     elif kind == "engine_fault":
         if stop:
@@ -2503,6 +2642,11 @@ def inbox_route(state):
     return u
 
 
+# Past the rejection budget: another plan round with the user's changes, or a stop.
+REJECTED_CONTINUE = "Plan again with these changes (state them)"
+REJECTED_STOP = "Stop and report"
+
+
 def _coder_error_tail(result):
     m = re.search(r"(Verification gate error:.*)", result, re.S)
     body = m.group(1) if m else result
@@ -2525,9 +2669,16 @@ def route_coder_result(state):
         u["rejected_rounds"] = rounds
         u["coder_sentinel"] = "CODER_REJECTED"
         if rounds > STRIKE_LIMIT:
-            u["failure_reason"] = f"the coder's plan was rejected {rounds} times"
-            u["_next"] = "end_blocked"
-            return u
+            last = tail(result, 1500)
+            ledger(state, u, f"coder: plan rejected {rounds} times, past the STRIKE_LIMIT budget of {STRIKE_LIMIT}; asking")
+            return raise_escalation(state, u, escalation(
+                "coder_rejected_cap", f"The coder's plan was rejected {rounds} times, past the budget of "
+                                      f"{STRIKE_LIMIT}. Plan again with your changes, or stop?",
+                [option(REJECTED_CONTINUE, True, "the rejection budget starts over; your changes go to the coder"),
+                 option(REJECTED_STOP)],
+                evidence=f"Rejected rounds used: {rounds} (budget STRIKE_LIMIT = {STRIKE_LIMIT})\n"
+                         f"Last rejection (tail):\n{last}",
+                hard_trigger=True, tier3_ok=False, data={"rounds": rounds, "last_rejection": last}))
         return raise_escalation(state, u, escalation(
             "coder_rejected",
             "The coder's plan was rejected at the approval gate. What should change before it plans again?",
@@ -2752,11 +2903,12 @@ def bookkeeping_scan(state):
         # The engine leaves debt_hits untouched on a crash, so it holds the initial_state
         # default (first pass) or a previous round's report; neither describes this worktree.
         if not hits.startswith("DEBT_SCAN_FAILED"):
-            u["debt_hits"] = hits = DEBT_HITS_STALE
+            hits = u["debt_hits"] = DEBT_HITS_STALE
             ledger(state, u, "debt_scan: the node did not run this round; the previous round's report was discarded")
     if hits.startswith("DEBT_SCAN_FAILED"):
         failures[scope] = hits.splitlines()[0].strip()
-        ledger(state, u, f"debt_scan: scan FAILED ({scope}): {failures[scope]}; the diff was not scanned")
+        # the reason is in debt_hits and the report; the crash text would read as a second discard here
+        ledger(state, u, f"debt_scan: scan FAILED ({scope}); the diff was not scanned and the report lists the failure")
     else:
         failures.pop(scope, None)
         for line in hits.splitlines():

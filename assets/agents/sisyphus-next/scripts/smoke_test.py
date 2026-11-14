@@ -1209,7 +1209,8 @@ check("route_coder_result: no sentinel -> strike with the reason", u["coder_sent
 u = gates.route_coder_result(base_state(coder_result="CODER_REJECTED\nPlan: p", rejected_rounds=0))
 check("route_coder_result: REJECTED -> coder_rejected escalation", u["escalation"]["kind"] == "coder_rejected" and u["rejected_rounds"] == 1)
 u = gates.route_coder_result(base_state(coder_result="CODER_REJECTED", rejected_rounds=STRIKE_LIMIT))
-check("route_coder_result: B7 rejected bound -> end_blocked", u["_next"] == "end_blocked")
+check("route_coder_result: B7 rejected bound -> coder_rejected_cap escalation, never end_blocked",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "coder_rejected_cap")
 u = gates.compose_fix(base_state(fix_source="review", fix_items=["adversary: criterion 2 unmet"], fix_round=1))
 check("compose_fix: review items verbatim, round incremented", "criterion 2 unmet" in u["fix_instructions"] and u["fix_round"] == 2 and u["_next"] == "render_coder_prompt")
 open(os.path.join(REPO, "dirty.txt"), "w").write("x")
@@ -4217,6 +4218,89 @@ u = gates.bookkeeping_scan(base_state(debt_hits="", debt_scan_failures={"task": 
 _r = gates.final_report(base_state(**u))["report"]
 check("debt: a clean scan of a task without subtasks clears its failure and the report reads none",
       u.get("debt_scan_failures") == {} and "Debt left behind:\n- none" in _r, _r[-800:])
+
+# ---------------------------------------------------------------- subtask list checked before each review
+_hsubs = [{"title": f"h{i}", "outcome": f"ho{i}", "constraints": "", "acceptance_criteria": [f"hc{i}"]} for i in range(3)]
+_hdir = _lib.ensure_run_dir("heal-sealed")
+gates.record_subtasks(base_state(subtasks=_hsubs, run_dir=_hdir))
+u = gates.next_subtask(base_state(subtasks="not a list", subtask_index=1, run_dir=_hdir, intent="implementation"))
+check("subtask heal: a str subtasks is rebuilt from the sealed list, ledgered, and subtask 2 is reviewed",
+      u["_next"] == "plan_research" and u.get("subtasks") == _hsubs and u["task_number"] == 2
+      and any("subtasks is a str" in d and "rebuilt the list of 3 from subtasks.json" in d for d in u["decisions"]),
+      (u.get("_next"), u.get("decisions")))
+u = gates.next_subtask(base_state(subtasks=[_hsubs[0], _hsubs[0], _hsubs[2]], subtask_index=1, run_dir=_hdir,
+                                  intent="implementation"))
+check("subtask heal: a duplicate subtask is rebuilt from the sealed list, so the real subtask 2 is reviewed",
+      u["_next"] == "plan_research" and "h1" in u["current_task"]
+      and any("index 1 repeats index 0" in d for d in u["decisions"]), (u.get("current_task"), u.get("decisions")))
+u = gates.next_subtask(base_state(subtasks=_hsubs[:1], subtask_index=2, run_dir=_hdir, intent="implementation"))
+check("subtask heal: an index out of step with a stale list is healed from the sealed list, never a silent finish",
+      u["_next"] == "plan_research" and u["task_number"] == 3
+      and any("subtask_index 2 is out of step with the 1 subtasks" in d for d in u["decisions"]), u.get("decisions"))
+if os.path.exists(os.path.join(_hdir, "subtasks.json")):
+    os.remove(os.path.join(_hdir, "subtasks.json"))
+u = gates.next_subtask(base_state(subtasks=None, subtask_index=0, run_dir=_hdir, intent="implementation"))
+check("subtask heal: with no sealed list, missing subtasks are rebuilt from tasklog.md",
+      u["_next"] == "plan_research" and [s["title"] for s in u.get("subtasks", [])] == ["h0", "h1", "h2"]
+      and u["subtasks"][1]["acceptance_criteria"] == ["hc1"]
+      and any("subtasks is missing" in d and "from tasklog.md" in d for d in u["decisions"]), u.get("subtasks"))
+_edir = _lib.ensure_run_dir("heal-none")
+u = gates.next_subtask(base_state(subtasks="oops", subtask_index=0, run_dir=_edir))
+check("subtask heal: no sealed source -> end_blocked naming the field, its type and the index",
+      u["_next"] == "end_blocked" and "subtasks is a str" in u["failure_reason"] and "subtask_index 0" in u["failure_reason"]
+      and "no sealed subtask list" in u["failure_reason"], u.get("failure_reason"))
+u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index="1", run_dir=_edir))
+check("subtask heal: a non-int subtask_index is never read as a number -> end_blocked naming its type",
+      u["_next"] == "end_blocked" and "subtask_index is a str ('1')" in u["failure_reason"], u.get("failure_reason"))
+u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=-1, run_dir=_edir))
+check("subtask heal: a negative subtask_index -> end_blocked, never a review of no subtask",
+      u["_next"] == "end_blocked" and "subtask_index -1 is out of step" in u["failure_reason"], u.get("failure_reason"))
+
+# ---------------------------------------------------------------- fault routes carry a reason
+for _bad, _shape in ((None, "missing"), ([{"kind": "clarify"}], "a list"), ({"question": "q"}, "without a kind")):
+    _ud = gates.ask_dispatch(base_state(escalation=_bad, top_level=True))
+    _up = gates.parse_answer(base_state(escalation=_bad, last_answer_text="1"))
+    check(f"escalation fault: {_shape} escalation -> end_blocked with the bad state named, never an empty ask",
+          _ud["_next"] == "end_blocked" and _up["_next"] == "end_blocked"
+          and _shape in _ud["failure_reason"] and _ud["failure_reason"].startswith("ask_dispatch:")
+          and _shape in _up["failure_reason"] and _up["failure_reason"].startswith("parse_answer:"),
+          (_ud.get("_next"), _ud.get("failure_reason"), _up.get("_next"), _up.get("failure_reason")))
+u = gates.record_subtasks(base_state(subtasks=None, top_level=True, run_dir=_edir))
+check("record_subtasks: missing subtasks -> end_blocked naming it missing, not a sizing verdict",
+      u["_next"] == "end_blocked" and "subtasks is missing" in u["failure_reason"] and "escalation" not in u,
+      (u.get("_next"), u.get("failure_reason")))
+u = gates.record_subtasks(base_state(subtasks="three steps", top_level=False, run_dir=_edir))
+check("record_subtasks: a str subtasks -> a reason naming the str, apart from the over-bound message",
+      u["_next"] == "end_blocked" and "subtasks is a str" in u["failure_reason"] and "bound" not in u["failure_reason"]
+      and "redirect_reason" not in u, (u.get("_next"), u.get("failure_reason"), u.get("redirect_reason")))
+
+# ---------------------------------------------------------------- coder-rejection budget escalates
+# the option texts are spelled out rather than read from gates, so a reworded option shows up here
+_RC_CONTINUE, _RC_STOP = "Plan again with these changes (state them)", "Stop and report"
+u = gates.route_coder_result(base_state(coder_result="CODER_REJECTED\nPlan: use sessions\nuser: no sessions",
+                                        rejected_rounds=STRIKE_LIMIT))
+_rc = u.get("escalation") or escalation("coder_rejected_cap", "q", [option(_RC_CONTINUE, True), option(_RC_STOP)])
+check("rejected cap: past the budget -> a hard-trigger escalation with the rounds used and the last rejection",
+      u["_next"] == "escalate_gate" and "escalation" in u and _rc["kind"] == "coder_rejected_cap" and _rc["hard_trigger"]
+      and f"Rejected rounds used: {STRIKE_LIMIT + 1}" in _rc["evidence"] and "no sessions" in _rc["evidence"]
+      and [o["text"] for o in _rc["options"]] == [_RC_CONTINUE, _RC_STOP]
+      and "failure_reason" not in u, _rc)
+u = gates.apply_answer(base_state(escalation=_rc, last_answer=f"{_RC_CONTINUE}: use signed cookies",
+                                  rejected_rounds=STRIKE_LIMIT + 1))
+check("rejected cap: continue with changes resets the budget, ledgers it, and re-plans with the changes",
+      u["_next"] == "compose_fix" and u.get("rejected_rounds") == 0 and u.get("fix_source") == "rejected"
+      and u.get("fix_note") == "use signed cookies" and any("rejection budget reset" in d for d in u.get("decisions", [])),
+      u)
+u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_CONTINUE))
+check("rejected cap: a bare continue re-plans against the last rejection",
+      u["_next"] == "compose_fix" and "no sessions" in u.get("fix_note", ""), u.get("fix_note"))
+u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_STOP))
+check("rejected cap: stop -> end_blocked with the rounds in the reason",
+      u["_next"] == "end_blocked" and f"rejected {STRIKE_LIMIT + 1} times" in u.get("failure_reason", ""), u)
+_ps = gates.parse_answer(base_state(escalation=_rc, last_answer_text="stop"))
+_pt = gates.parse_answer(base_state(escalation=_rc, last_answer_text="drop the session store entirely"))
+_ok = _ps["_next"] == "apply_answer" and _pt["_next"] == "interpret_reply" and "- answer:" in _pt["reply_accepts"]
+check("rejected cap: parse_answer takes a bare stop to apply_answer and interprets typed changes", _ok, (_ps, _pt))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
