@@ -48,11 +48,13 @@ MAX_DETAIL_CHARS = 500
 ICONS = ("🔴", "🟡", "🟢", "💡")
 # Most severe first, so a text naming two levels keeps the higher one.
 SEVERITY_WORDS = (
-    ("🔴", re.compile(r"\b(?:critical|blocker|blocking|high|severe)\b", re.I)),
+    ("🔴", re.compile(r"\b(?:critical|blocker|high(?!-level)|severe)\b", re.I)),
     ("🟡", re.compile(r"\b(?:warning|warn|medium|major|moderate)\b", re.I)),
     ("🟢", re.compile(r"\b(?:suggestion|low|minor)\b", re.I)),
     ("💡", re.compile(r"\b(?:nit|nitpick|info|hint)\b", re.I)),
 )
+# "non-blocking", "not critical": a negated word states no level.
+NEGATED = re.compile(r"\b(?:non|not|no)[-\s]+\w+", re.I)
 BLOCK_SEVERITY = re.compile(r"^\W*severity\W*[:\s](.*)$", re.I | re.M)
 
 
@@ -67,6 +69,7 @@ def stated_icon(text):
     for icon in ICONS:
         if icon in text:
             return icon
+    text = NEGATED.sub(" ", text)
     for icon, words in SEVERITY_WORDS:
         if words.search(text):
             return icon
@@ -290,12 +293,14 @@ def main():
             "checked against the diff"
         )
     unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
+    reported = {str(f.get("id")) for f in final}
+    unanchored_reported = [u for u in unanchored if str(u.get("id")) in reported]
     anchor_notes = []
-    if unanchored:
+    if unanchored_reported:
         anchor_notes.append(
-            f"Not anchored: {len(unanchored)} finding(s) cite a file or lines outside this "
-            "diff's changes; they are reported at their stated severity (unless the verifier "
-            "refuted them) and listed under 'Not anchored in the diff'"
+            f"Not anchored: {len(unanchored_reported)} reported finding(s) cite a file or lines "
+            "outside this diff's changes; they keep their stated severity and are listed under "
+            "'Not anchored in the diff'"
         )
     if changed and not reports:
         faults.append(

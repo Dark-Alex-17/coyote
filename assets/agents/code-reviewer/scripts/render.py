@@ -94,16 +94,18 @@ def main():
 
     unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
     if unanchored:
+        icon_by_id = {str(x.get("id")): x.get("icon", "") for x in findings}
         lines += [
             "## Not anchored in the diff",
             "",
             "These findings cite a file or lines outside this diff's changes (a caller, a "
             "consumer or missing code can be). Each went to verification with that fact and is "
-            "reported in full at its stated severity unless the verifier refuted it:",
+            "reported in full at its stated severity unless marked not reported:",
             "",
         ]
         lines += [
-            f"- {one_line(u.get('severity', ''))} {one_line(u.get('title', ''))} -- "
+            f"- {icon_by_id.get(str(u.get('id')), '(not reported: refuted by the verifier or dropped by the quality bar)')} "
+            f"{one_line(u.get('title', ''))} -- "
             f"`{one_line(u.get('file', ''))}:{one_line(u.get('lines', ''))}` "
             f"({one_line(u.get('reason', ''))})"
             for u in unanchored
