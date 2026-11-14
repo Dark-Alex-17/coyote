@@ -202,6 +202,28 @@ if isinstance(_prompt, str) and _prompt:
 out["rereview_spec"] = _rr_spec
 out["settled_lanes"] = _settled
 
+
+def bookkeeping_note(value):
+    """One sentence naming the configured `debris_exclude` dirs as the run's
+    own planning files, or "" when none are configured or the value is
+    unusable (the debris lane reports the latter as a fault)."""
+    try:
+        import debris
+
+        excludes = debris.parse_excludes(value)
+    except (ImportError, ValueError):
+        return ""
+    if not excludes:
+        return ""
+    dirs = ", ".join(f"{d}/" for d in excludes)
+    return (
+        f"Files under {dirs} are the run's own planning bookkeeping, not part of "
+        "the change under review: their presence in the diff is never scope drift."
+    )
+
+
+out["bookkeeping_note"] = bookkeeping_note(state.get("debris_exclude"))
+
 # retry_gate measures its wall-clock budget from this stamp; it is set
 # before the git work so a failed diff still starts the clock.
 if not state.get("gauntlet_started_at"):
