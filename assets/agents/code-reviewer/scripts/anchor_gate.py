@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Mechanical anchor check between synthesis and verification.
+"""Advisory anchor check between synthesis and verification.
 
-Every finding must point at code this diff changed. A finding is kept only
-when its file is one of the reviewed changed files (relative to the
-checkout) and one of its line ranges is anchored: on the new side, inside
-the file and inside, or within ADJACENT lines of, a changed hunk; on the old
-side, within ADJACENT lines of lines the diff deleted (a citation of removed
-code). Anything else (a path outside the diff or outside the checkout, a
-generated file, a line past the end of the file, a range far from every
-change, no line range at all) is moved to `unanchored` with the reason, and
-the report lists it under "Could not anchor" instead of as a finding. A
-cross-repo consumer finding therefore anchors at the changed line in this
-diff and cites the external caller as evidence.
+A finding is anchored when its file is one of the reviewed changed files
+(relative to the checkout) and one of its line ranges is: on the new side,
+inside the file and inside, or within ADJACENT lines of, a changed hunk; on
+the old side, within ADJACENT lines of lines the diff deleted (a citation of
+removed code). Anything else (a path outside the diff or outside the
+checkout, a generated file, a line past the end of the file, a range far
+from every change, no line range at all) is NOT removed: a broken caller in
+an unchanged file, missing code or a consumer outside the diff is a real
+finding with no changed line to cite. The finding goes on whole to
+verification with the reason as `anchor_note` and appended to its block, and
+`unanchored` lists it so the report can name it. Only the verifier may
+refute a finding; this check never drops one or lowers its severity.
 
 Paths are normalized before matching: a leading `./`, `a/` or `b/`, an
 absolute path under the checkout, a trailing `:line`, Windows separators
@@ -22,8 +23,8 @@ diff is read with the same git settings as facts.py: paths verbatim, renames
 as a deletion plus an addition.
 
 Fail-closed: `anchor_checked` is set only by a completed run, so verdict.py
-can tell a gate that never ran from one that kept everything; an internal
-error keeps every finding and records `anchor_error`, which verdict.py
+can tell a gate that never ran from one that completed; an internal error
+keeps every finding unchanged and records `anchor_error`, which verdict.py
 reports as a pipeline fault.
 """
 
@@ -243,25 +244,34 @@ def main():
     )
     hunks = parse_hunks(git(proj, "diff", *DIFF_FLAGS, "-U0", *args, "--"))
 
-    kept, unanchored = [], []
+    out, unanchored = [], []
     for f in findings:
         path, reason = check(f, reviewed, generated, hunks, top)
         if reason is None:
-            kept.append({**f, "file": path})
-        else:
-            unanchored.append(
-                {
-                    "id": f.get("id", ""),
-                    "severity": f.get("severity", ""),
-                    "title": f.get("title", ""),
-                    "file": f.get("file", ""),
-                    "lines": f.get("lines", ""),
-                    "reason": reason,
-                }
-            )
+            out.append({**f, "file": path})
+            continue
+        block = f.get("block") or f"#### {f.get('title', '(untitled)')}"
+        out.append(
+            {
+                **f,
+                "file": path or f.get("file", ""),
+                "anchor_note": reason,
+                "block": f"{block}\n- *(not anchored in the diff: {reason})*",
+            }
+        )
+        unanchored.append(
+            {
+                "id": f.get("id", ""),
+                "severity": f.get("severity", ""),
+                "title": f.get("title", ""),
+                "file": f.get("file", ""),
+                "lines": f.get("lines", ""),
+                "reason": reason,
+            }
+        )
     print(
         json.dumps(
-            {"findings": kept, "unanchored": unanchored, "anchor_checked": True, "anchor_error": ""}
+            {"findings": out, "unanchored": unanchored, "anchor_checked": True, "anchor_error": ""}
         )
     )
 
@@ -273,7 +283,10 @@ except Exception as e:  # noqa: BLE001 - a crash must keep the findings and say 
         json.dumps(
             {
                 "anchor_checked": True,
-                "anchor_error": f"PIPELINE-FAULT: anchor check failed, findings are unanchored: {e}",
+                "anchor_error": (
+                    f"PIPELINE-FAULT: anchor check failed, findings were not checked against "
+                    f"the diff: {e}"
+                ),
             }
         )
     )

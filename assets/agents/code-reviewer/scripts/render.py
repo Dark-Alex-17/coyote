@@ -71,7 +71,6 @@ def main():
             desc_by_file[row["file"]] = row.get("desc", "")
     blocking = [f for f in findings if f.get("section") == "blocking"]
     deferred = [f for f in findings if f.get("section") == "deferred"]
-    unverified = [f for f in findings if f.get("section") == "unverified"]
     for f in changed:
         per = [x for x in blocking if x.get("file") == f]
         tally = " ".join(
@@ -92,25 +91,15 @@ def main():
                 lines += [x.get("block", ""), ""]
     else:
         lines += ["No blocking findings.", ""]
-    if unverified:
-        lines += [
-            "## Unverified findings (verification incomplete)",
-            "",
-            "Finding verification did not complete, so these findings were NOT verified and are "
-            "NOT blocking. Re-run the review or check each one against the code before acting "
-            "on it.",
-            "",
-        ]
-        for x in unverified:
-            lines += [x.get("block", ""), ""]
 
     unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
     if unanchored:
         lines += [
-            "## Could not anchor",
+            "## Not anchored in the diff",
             "",
-            "These findings name a file or lines that are not part of this diff, so they were "
-            "dropped before verification and are not reported as findings:",
+            "These findings cite a file or lines outside this diff's changes (a caller, a "
+            "consumer or missing code can be). Each went to verification with that fact and is "
+            "reported in full at its stated severity unless the verifier refuted it:",
             "",
         ]
         lines += [

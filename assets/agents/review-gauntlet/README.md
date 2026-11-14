@@ -66,11 +66,11 @@ those rules are *structure*:
   regardless of its verdict line; a code-review lane whose own verdict line
   records a pipeline fault blocks (a degraded review is never a pass); a
   code-review lane whose own verdict reason opens with `review incomplete:`
-  (finding verification failed as a whole, so its unverified findings sit in
-  a separate section and count as no 🔴) blocks as an incomplete review and is
-  named on the incomplete line, never routed as findings to fix; single
-  unverified findings and criticals the anchor gate could not anchor are named
-  attention lines on a GREEN (attention) row, never blockers; the
+  (finding verification failed as a whole) blocks as an incomplete review and
+  is named on the incomplete line; unverified findings keep their stated
+  severity, so an unverified 🔴 is in the critical count and blocks, and
+  single unverified findings add an attention line; every adversary
+  complaint is read whole, whatever line boundaries its fields carry; the
   adversary's own degraded-run header (the `Criteria: …` line directly under
   its sentinel recording a pipeline fault, died criterion checks, or its
   verdict script's crash stub) blocks as a pipeline fault,
