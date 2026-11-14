@@ -611,6 +611,111 @@ check("answers: plan_defect replies that negate their continue word stop, with o
                     "Stop - do not continue", "1 - stop, don't proceed", "stop; the amendment is wrong")))
 check("answers: the navigator's numbered amendment still continues once continue words are read at word boundaries",
       aa("plan_defect", f"{PD_CONT}: {PD_REPLY[4:]}", spec_text="AC")["_next"] == "build_gauntlet_prompt")
+# one tolerant picker: wrapped numbers, the rendered label echoed back, and two option numbers that never resolve
+ROUTE3 = [option("Proceed with the plan", True), option("Abort the run"), option("Narrow the scope")]
+r3 = escalation("approach", "Which way?", ROUTE3)
+check("answers: '(2)', '**2**', '[2]' and the echoed label pick option 2 in match_option, parse_answer and consult_route",
+      all(_lib.match_option(t, ROUTE3) == "Abort the run" for t in ("(2)", " (2)\n", "**2**", "[2]", "`2`", "Option 2.",
+                                                                     "Option 2: Abort the run"))
+      and all(gates.parse_answer(base_state(escalation=r3, last_answer_text=t))["last_answer"] == "Abort the run"
+              for t in ("(2)", "**2**", "Option 2: Abort the run"))
+      and all(gates.consult_route(base_state(escalation=r3, consult_result=f"CONSULT: ANSWER {t}"))["last_answer"]
+              == "Abort the run" for t in ("(2)", "**2**", "Option 2: Abort the run")))
+check("answers: a reply naming two option numbers resolves to no option (match_option, parse_answer, consult_route)",
+      all(_lib.match_option(t, ROUTE3) is None and _lib.split_option_reply(t, ROUTE3)[0] is None
+          for t in ("3) or 2", "2. 1", "1 - no wait, 3", "2: actually 1", "Option 2 (not 3)", "1 \u2014 no, 3", "1/3"))
+      and all(gates.parse_answer(base_state(escalation=r3, last_answer_text=t))["_next"] == "interpret_reply"
+              for t in ("3) or 2", "2. 1", "1 - no wait, 3")))
+_amb = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - no wait, 3", ask_question="Q?"))
+check("answers: a navigator answer naming two options goes to the owner with the navigator's words, never applied",
+      _amb["_next"] == "ask_dispatch" and "1 - no wait, 3" in _amb["ask_question"] and "last_answer" not in _amb)
+_free = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER go with whatever is safest"))
+check("answers: a navigator answer naming no option goes to the owner, never applied as raw text",
+      _free["_next"] == "ask_dispatch" and "last_answer" not in _free
+      and gates.consult_route(base_state(escalation=escalation("clarify", "q", []),
+                                         consult_result="CONSULT: ANSWER the read path only"))["last_answer"]
+      == "the read path only")
+check("answers: a picked number with a later quantity or fraction in its note is still that pick",
+      _lib.split_option_reply("2: only for the first 3 files", ROUTE3) == ("Abort the run", "only for the first 3 files")
+      and _lib.split_option_reply("2 - see 1/3 of it", ROUTE3) == ("Abort the run", "see 1/3 of it"))
+check("answers: the navigator's last CONSULT line decides; an echoed template line is skipped",
+      gates.consult_route(base_state(escalation=r3, consult_result=(
+          "CONSULT: ANSWER <option number or text>   (confident)\nfirst thought: CONSULT: ANSWER 1\nCONSULT: ANSWER 3"
+      )))["last_answer"] == "Narrow the scope"
+      and gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1\nCONSULT: DEFER owner's taste"
+                                         ))["_next"] == "ask_dispatch")
+check("answers: a prefix picks only at a word boundary and only when one option fits",
+      _lib.match_option("a", ROUTE3) is None and _lib.match_option("abort", ROUTE3) == "Abort the run"
+      and _lib.match_option("n", [option("Narrow it"), option("Never mind")]) is None)
+so_nav = [option("Apply the oracle's direction in ONE more coder round", True), option("Abort and report")]
+s2, u = chain(base_state(escalation=escalation("strikeout", "q", so_nav), strikeout_rounds=0,
+                         consult_result="CONSULT: ANSWER Option 1 (recommended)"), "consult_route", "apply_answer")
+check("answers: the navigator echoing 'Option 1 (recommended)' on a strikeout applies option 1, never end_aborted",
+      u["_next"] == "compose_fix" and s2["last_answer"] == so_nav[0]["text"], u.get("_next"))
+of_nav = [option("Retry the consult", True), option("Proceed without the oracle (the context pack alone directs the coder)"),
+          option("Abort this task")]
+s2, u = chain(base_state(escalation=escalation("oracle_fault", "q", of_nav), oracle_retries=0,
+                         consult_result="CONSULT: ANSWER **Option 1 (recommended)**"), "consult_route", "apply_answer")
+check("answers: the navigator echoing the recommended label on an oracle fault retries, never proceeds without it",
+      u["_next"] == "consult_oracle", u.get("_next"))
+dc = escalation("design_choice", "Which design?", [option("Cookie sessions", True), option("Bearer tokens")])
+u = gates.consult_route(base_state(escalation=dc, consult_result="CONSULT: ANSWER Option 2"))
+check("answers: a navigator label pick on a design choice ledgers the design, never the label",
+      u["last_answer"] == "Bearer tokens" and any("Bearer tokens" in d for d in u["decisions"]))
+for _wrap in ("**2** \u2014 ", "(2) \u2014 ", "Option 2: "):
+    s2, u = chain(base_state(escalation=pd, consult_result=f"CONSULT: ANSWER {_wrap}{PD_REPLY[4:]}",
+                             subtasks=PD_SUBTASKS, subtask_index=1, spec_text="AC"), "consult_route", "apply_answer")
+    check(f"answers: the seed plan_defect amendment led by {_wrap.strip()!r} continues with the amendment",
+          u["_next"] == "build_gauntlet_prompt" and s2["last_answer"].startswith(PD_CONT)
+          and PD_REPLY[4:] in s2["subtasks"][0]["amendments"][0], u.get("_next"))
+# an answer apply_answer cannot act on is asked again; at the cap only a recommended option that keeps going is taken
+SO3 = [option("Abort and report", True), option("One more fix round anyway"), option("Accept the findings unresolved and proceed")]
+_UNMATCHED = [("strikeout", so_nav), ("lane_stuck", SO3), ("review_exhausted", SO3), ("oracle_fault", of_nav),
+              ("plan_defect", pd["options"]),
+              ("review_incomplete", [option("Retry the review again"), option("Accept NEEDS-HUMAN: proceed"),
+                                     option("Abort this task")]),
+              ("ci_unsure", [option("Re-run the failing checks once"), option("Resume with a coder fix round"),
+                             option("Leave the PR in draft and report", True)]),
+              ("pr_review_closed", [option("Stop watching and report", True), option("Keep watching (the PR was reopened)")]),
+              ("pr_review_exhausted", [option("Stop watching and report", True), option("Retry the review watch")]),
+              ("pr_review_push_unconfirmed", [option("Retry the push check"), option("Stop watching and report", True)])]
+_first = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", o), last_answer="hmm, not sure", ask_question="Q?",
+                                           strikeout_rounds=0, oracle_retries=0)) for k, o in _UNMATCHED}
+check("answers: an unmatched reply to an abort- or stop-defaulting question is asked again, never acted on",
+      all(u["_next"] == "ask_dispatch" and u["apply_reasks"] == 1 and "hmm, not sure" in u["ask_question"]
+          for u in _first.values()), {k: u.get("_next") for k, u in _first.items()})
+_cap = {k: gates.apply_answer(base_state(escalation=escalation(k, "q", o), last_answer="hmm, not sure",
+                                         apply_reasks=gates.APPLY_REASK_MAX, strikeout_rounds=0, oracle_retries=0))
+        for k, o in _UNMATCHED}
+check("answers: at the re-ask cap a non-stop recommendation is taken, otherwise the run never aborts on a guess",
+      _cap["strikeout"]["_next"] == "compose_fix" and _cap["oracle_fault"]["_next"] == "consult_oracle"
+      and _cap["ci_unsure"]["_next"] == "final_report" and _cap["lane_stuck"]["_next"] == "end_blocked"
+      and _cap["plan_defect"]["_next"] == "end_blocked" and _cap["pr_review_closed"]["_next"] == "final_report"
+      and all(u["_next"] != "end_aborted" for u in _cap.values()), {k: u.get("_next") for k, u in _cap.items()})
+_hp = gates.apply_answer(base_state(escalation=escalation("handoff_path", "q", [option("Abort the run")], hard_trigger=True),
+                                    last_answer="/no/such/handoff.md"))
+_spent = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
+                                       apply_reasks=gates.APPLY_REASK_MAX, strikeout_rounds=RERUN_ONCE))
+check("answers: at the cap a recommendation whose branch is spent is not taken; the run blocks, never aborts",
+      _spent["_next"] == "end_blocked" and any("would abort here" in d for d in _spent["decisions"]), _spent.get("_next"))
+_late = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - hmm, actually let's go with 3"))
+check("answers: a navigator note naming another option number anywhere goes to the owner, never applied",
+      _late["_next"] == "ask_dispatch" and "last_answer" not in _late
+      and "1 - hmm, actually let's go with 3" in _late["escalation"]["question"])
+check("answers: an echoed option text, in either rendered shape, is a clean pick even when the text holds a number",
+      _lib.split_option_reply("Option 1: Use 2 caches", [option("Use 2 caches"), option("Use one")]) == ("Use 2 caches", "")
+      and _lib.split_option_reply("1) Proceed with the plan (recommended)", ROUTE3) == ("Proceed with the plan", ""))
+_re = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm", ask_question="Q?"))
+check("answers: the re-ask note goes into the escalation question so a remote owner sees it, once",
+      "Could not act on the reply 'hmm'" in _re["escalation"]["question"]
+      and gates.apply_answer(base_state(escalation=_re["escalation"], last_answer="huh"))["escalation"]["question"]
+      .count("Could not act on the reply") == 1)
+check("answers: an unreadable typed handoff path is asked again before the run blocks", _hp["_next"] == "ask_dispatch")
+_ea = gates.parse_answer(base_state(escalation={**escalation("lane_stuck", "q", SO3), "data": {"multiple_choice": True}},
+                                    last_answer_text="", reask_rounds=REASK_MAX))
+check("answers: an empty reply after the re-asks never takes a recommended option that aborts",
+      _ea["last_answer"] == "" and gates.apply_answer({**base_state(escalation=escalation("lane_stuck", "q", SO3)),
+                                                      **_ea})["_next"] == "ask_dispatch")
 for kind, opts, pick in (
         ("engine_fault", [option("Retry the coder round", True), option("Abort this task")], "2 - abort, retrying won't help"),
         ("strikeout", [option("Abort and report (code left in a working state)", True), option("One more fix round anyway"),
@@ -675,7 +780,9 @@ check("apply_answer: strikeout / lane_stuck replies that mention abort are no ab
                                         review_rounds=0))["_next"] == "compose_fix"
           for k in ("strikeout", "lane_stuck") for t in ("one more round, not abort", "not abort, one more round"))
       and gates.apply_answer(base_state(escalation=escalation("lane_stuck", "q", so), last_answer="Abort and report"))["_next"] == "end_aborted"
-      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever"))["_next"] == "end_aborted")
+      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever"))["_next"] == "ask_dispatch"
+      and gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so), last_answer="whatever",
+                                        apply_reasks=gates.APPLY_REASK_MAX))["_next"] == "end_blocked")
 
 # ---------------------------------------------------------------- multiple-choice prompts
 mc_opts = [option("Proceed without the oracle"), option("Retry the consult", True, "one retry is in bounds"),
@@ -865,8 +972,9 @@ check("record_subtasks: over the cap at the top level -> sizing_verdict without 
       and e3["data"]["planned"] is True and "- t6" in e3["evidence"] and "subtask_index" not in u
       and gates.ask_dispatch(s3)["_next"] == "ask_choice_2")
 u = gates.apply_answer({**s3, "last_answer": gates.SIZING_HERE})
-check("record_subtasks: a typed do-it-here after the planner overflowed is no pick -> end_redirect, nothing started",
-      u["_next"] == "end_redirect")
+u2 = gates.apply_answer({**s3, "last_answer": gates.SIZING_HERE, "apply_reasks": gates.APPLY_REASK_MAX})
+check("record_subtasks: a typed do-it-here after the planner overflowed is no pick -> asked again, then end_redirect",
+      u["_next"] == "ask_dispatch" and "subtask_index" not in u and u2["_next"] == "end_redirect")
 s2, u = chain({**ss, "last_answer": "Option 3", "last_answer_text": "Option 3"}, "parse_answer", "apply_answer")
 check("sizing: 'Narrow the scope' asks for the narrower scope as free text (ask_user)",
       s2["escalation"]["kind"] == "sizing_narrow" and gates.ask_dispatch(s2)["_next"] == "ask_user")
@@ -884,14 +992,20 @@ check("sizing: a whole-reply abort ends the run; the verdict re-asks at most CLA
 SDIR = os.path.join(SREPO, "plans", "engineer-handoffs")
 _before = sorted(os.listdir(SDIR))
 s2, u = chain({**ss, "last_answer": "don't hand it to the architect, do it here", "run_id": "sz3"}, "apply_answer")
-check("sizing: only an exact option counts - a negated reply naming the architect picks none -> end_redirect, nothing written",
-      u["_next"] == "end_redirect" and "picked none of the sizing options" in s2["redirect_reason"]
-      and sorted(os.listdir(SDIR)) == _before and not s2.get("architect_handoff"))
+s3, u3 = chain({**ss, "last_answer": "don't hand it to the architect, do it here", "run_id": "sz3",
+                "apply_reasks": gates.APPLY_REASK_MAX}, "apply_answer")
+check("sizing: only an exact option counts - a negated reply naming the architect picks none -> asked again, then "
+      "end_redirect, nothing written",
+      u["_next"] == "ask_dispatch" and u3["_next"] == "end_redirect" and "picked none of the sizing options" in s3["redirect_reason"]
+      and sorted(os.listdir(SDIR)) == _before and not s2.get("architect_handoff") and not s3.get("architect_handoff"))
 s2, u = chain({**ss, "last_answer_text": "", "last_answer": "", "reask_rounds": REASK_MAX, "run_id": "sz3"},
               "parse_answer", "apply_answer")
+s3, u3 = chain({**ss, "last_answer_text": "", "last_answer": "", "reask_rounds": REASK_MAX, "run_id": "sz3",
+                "apply_reasks": gates.APPLY_REASK_MAX}, "parse_answer", "apply_answer")
 check("sizing: an empty reply after the re-asks never picks the hard-trigger recommendation -> end_redirect, no file",
-      u["_next"] == "end_redirect" and s2["last_answer"] == "" and sorted(os.listdir(SDIR)) == _before
-      and not any("the recommended option" in d for d in s2["decisions"]))
+      u["_next"] == "ask_dispatch" and u3["_next"] == "end_redirect" and s3["last_answer"] == ""
+      and sorted(os.listdir(SDIR)) == _before
+      and not any("the recommended option" in d for d in s2["decisions"] + s3["decisions"]))
 s2, u = chain({**ss, "top_level": False, "last_answer": gates.SIZING_ARCHITECT, "run_id": "sz3"}, "apply_answer")
 check("sizing: the architect option in a delegated run writes no handoff -> end_redirect, ledgered",
       u["_next"] == "end_redirect" and sorted(os.listdir(SDIR)) == _before
@@ -2058,8 +2172,12 @@ _a = untrusted_answer("Stop watching and report")
 check("pr_tracking review: apply_answer untrusted stop -> final_report naming the urls",
       _a["_next"] == "final_report" and "https://github.com/o/r/pull/7#c7" in _a["follow_ups"][0] and "r7" in _a["follow_ups"][0]
       and _SECRET not in json.dumps(_a))
-check("pr_tracking review: apply_answer untrusted offers no fix path",
-      untrusted_answer("Fix them as the reviewer asks")["_next"] == "final_report")
+_fix = untrusted_answer("Fix them as the reviewer asks")
+_fix_cap = untrusted_answer("Fix them as the reviewer asks", apply_reasks=gates.APPLY_REASK_MAX)
+check("pr_tracking review: apply_answer untrusted offers no fix path: asked again, then the report, no round started",
+      _fix["_next"] == "ask_dispatch" and _fix_cap["_next"] == "final_report"
+      and not any(k in x for x in (_fix, _fix_cap) for k in ("fix_source", "pr_review_queue", "pr_review_addressed"))
+      and any("stayed unanswered" in f for f in _fix_cap["follow_ups"]))
 
 
 def mixed_comment(cid, author, association, body):

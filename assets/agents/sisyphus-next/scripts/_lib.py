@@ -374,6 +374,7 @@ def raise_escalation(state, updates, esc):
     updates["last_answer"] = ""
     updates["last_answer_text"] = ""
     updates["reask_rounds"] = 0
+    updates["apply_reasks"] = 0
     updates["reply_interpreted"] = False
     updates["_next"] = "escalate_gate"
     return updates
@@ -398,20 +399,63 @@ def review_fault(blocker):
     return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
 
 
-def split_option_reply(text, options):
-    """(option text, free text after it) for a reply led by an in-range option number ("2", "Option 2 - x",
-    "2: x", "2) x", or an em or en dash); (None, text) otherwise. Free text that is only punctuation counts as none."""
+_OPTION_LEAD_RE = re.compile(r"(?is)^[\s(\[*_`]*(?:option\s*)?(\d+)(\s*\(recommended\))?([)\]*_`]*)\s*(.*)$")
+_OPTION_SEPARATORS = "-:).\u2014\u2013"
+# an option number standing alone in the free text: not part of a fraction, a decimal or a word
+_OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d+)(?![\w/]|\.\d)")
+
+
+def _names_another_option(rest, picked, count, strict=False):
+    """Whether the free text after a picked number reads as naming a different option ("no wait, 3", "or 2", "1"):
+    an in-range number other than the pick, after "option" or within the first two words (anywhere when `strict`)."""
+    for m in _OPTION_NUMBER_RE.finditer(rest):
+        n = int(m.group(1))
+        if n == picked or not 1 <= n <= count:
+            continue
+        before = rest[:m.start()]
+        if strict or re.search(r"(?i)\boption\s*$", before) or len(re.findall(r"[^\W\d_]+", before)) <= 2:
+            return True
+    return False
+
+
+def _echoes_option(rest, own):
+    """Whether free text only repeats the picked option's own text, as rendered ("<text> (recommended)" too)."""
+    def bare(s):
+        return re.sub(r"[\W_]+$", "", re.sub(r"(?i)\s*\(recommended\)", "", s.strip())).lower()
+    return bool(rest) and bare(rest) == bare(own)
+
+
+def split_option_reply(text, options, strict=False):
+    """(option text, free text after it) for a reply led by an in-range option number; (None, text) otherwise.
+
+    The number may be wrapped ("(2)", "**2**", "[2]"), labelled ("Option 2", the rendered "Option 1 (recommended)")
+    and followed by a separator ("2: x", "2) x", "2 - x", an em or en dash). Free text that is only punctuation, or
+    only the picked option's own text echoed back, counts as none. A reply whose free text names a different option
+    number ("3) or 2", "2. 1", "1 - no wait, 3") names no single option, so it is (None, text) too; `strict` counts
+    a different option number anywhere in the free text, fractions and decimals aside."""
     text = (text or "").strip()
-    m = re.match(r"(?is)^(?:option\s+)?(\d+)\s*(?:$|[-:).\u2014\u2013]\s*(.*)$)", text)
-    if not m or not 1 <= int(m.group(1)) <= len(options or []):
+    options = options or []
+    m = _OPTION_LEAD_RE.match(text)
+    if not m or not 1 <= int(m.group(1)) <= len(options):
         return None, text
-    rest = (m.group(2) or "").strip()
-    return options[int(m.group(1)) - 1]["text"], rest if re.search(r"\w", rest) else ""
+    picked, rest = int(m.group(1)), m.group(4)
+    if rest[:1] and rest[0] in _OPTION_SEPARATORS:
+        rest = rest[1:]
+    elif rest and not (m.group(2) or m.group(3)):
+        # a bare number running into prose ("2 or 3", "2 because") is not a pick
+        return None, text
+    rest = rest.strip()
+    own = options[picked - 1]["text"]
+    if _echoes_option(rest, own):
+        return own, ""
+    if _names_another_option(rest, picked, len(options), strict):
+        return None, text
+    return own, rest if re.search(r"\w", rest) else ""
 
 
 def match_option(text, options):
-    """Map a user reply to an option text: a 1-based number (free text after it is dropped), exact, prefix, or
-    'recommended'."""
+    """Map a user reply to an option text: a 1-based number (free text after it is dropped), exact, a prefix that
+    ends on a word boundary and fits one option only, or 'recommended'."""
     text = (text or "").strip()
     if not options:
         return text or None
@@ -422,14 +466,22 @@ def match_option(text, options):
     for o in options:
         if o["text"].strip().lower() == low:
             return o["text"]
-    for o in options:
-        if low and o["text"].strip().lower().startswith(low):
-            return o["text"]
+    prefixed = [o["text"] for o in options if low and _word_prefix(low, o["text"].strip().lower())]
+    if len(prefixed) == 1:
+        return prefixed[0]
     if low in ("recommended", "the recommended option", "go with the recommendation"):
         for o in options:
             if o.get("recommended"):
                 return o["text"]
     return None
+
+
+def _word_prefix(low, option_low):
+    """Whether `low` starts `option_low` and stops at a word boundary ("abort" for "abort the run", never "a")."""
+    if not option_low.startswith(low):
+        return False
+    nxt = option_low[len(low):len(low) + 1]
+    return not nxt or not (nxt.isalnum() and low[-1].isalnum())
 
 
 # ---------------------------------------------------------------- handoff frontmatter

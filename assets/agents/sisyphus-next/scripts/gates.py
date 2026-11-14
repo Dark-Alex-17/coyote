@@ -37,6 +37,8 @@ from _lib import (  # noqa: E402
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+# apply_answer asks a reply naming none of the options again once: the re-run-once family
+APPLY_REASK_MAX = RERUN_ONCE
 
 SUBTASK_FILES_SHOWN = 40     # files a per-subtask review prompt lists as the subtask's own
 # Each git call of _worktree_tree and _snapshot_base. review_gate's two stay under the 30 s script-node default;
@@ -1317,20 +1319,48 @@ def ladder_route(state):
     return u
 
 
+_CONSULT_VERDICT_RE = re.compile(r"CONSULT:[ \t]*(ANSWER|DEFER)\b[ \t]*(.*)")
+
+
+def _note_question(u, esc, note):
+    """Ask `esc` again with `note` above its original question; the note goes into the escalation itself so a remote
+    owner sees it too, and a later note replaces it."""
+    data = as_dict(esc.get("data"))
+    asked = data.get("asked") or esc.get("question", "")
+    u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"{note}\n\n{asked}"}
+    u["ask_question"] = render_question(u["escalation"])
+
+
+def _consult_verdict(text):
+    """(verdict, value) of the navigator's last CONSULT line, skipping an echo of the prompt's own template line."""
+    found = [(m.group(1), m.group(2).strip()) for m in _CONSULT_VERDICT_RE.finditer(text or "")]
+    found = [(v, val) for v, val in found if not val.startswith("<")]
+    return found[-1] if found else (None, "")
+
+
 def consult_route(state):
     u = {}
     note_script_error(state, u, "consult_navigator")
     esc = as_dict(state.get("escalation"))
-    text = state.get("consult_result") or ""
-    m = re.search(r"CONSULT:\s*ANSWER\s+(.+)", text)
-    if m:
-        choice = _pick_with_note(m.group(1).strip(), esc.get("options") or []) or m.group(1).strip()
-        u.update({"last_answer": choice, "last_answer_text": choice})
-        ledger(state, u, f"consult: {esc.get('kind')}: {choice} (navigator)")
-        u["_next"] = "apply_answer"
+    kind = esc.get("kind")
+    options = esc.get("options") or []
+    verdict, value = _consult_verdict(state.get("consult_result") or "")
+    if verdict == "ANSWER" and value:
+        # a navigator's note naming another option number anywhere ("1 - hmm, actually 3") names no single option
+        ambiguous = bool(split_option_reply(value, options)[0]) and not split_option_reply(value, options, True)[0]
+        choice = None if ambiguous else _pick_with_note(value, options) if options else value
+        if choice:
+            u.update({"last_answer": choice, "last_answer_text": choice})
+            ledger(state, u, f"consult: {kind}: {choice} (navigator)")
+            u["_next"] = "apply_answer"
+            return u
+        # an answer naming no option, or several, is the owner's call; the navigator's words go with the question
+        ledger(state, u, f"consult: {kind}: the navigator's answer names no single option -> owner: {value}")
+        _note_question(u, esc, f"The navigator answered {value!r}, which names no single option; your call.")
+        u["_next"] = "ask_dispatch"
         return u
-    reason = "deferred" if "CONSULT: DEFER" in text else "no parseable consult verdict (timeout/fault)"
-    ledger(state, u, f"consult: {esc.get('kind')}: {reason} -> owner")
+    reason = "deferred" if verdict == "DEFER" else "no parseable consult verdict (timeout/fault)"
+    ledger(state, u, f"consult: {kind}: {reason} -> owner")
     u["_next"] = "ask_dispatch"
     return u
 
@@ -1433,8 +1463,8 @@ def parse_answer(state):
                                  f"free text stands after {REASK_MAX} tries).\n\n" + state.get("ask_question", ""))
             u["_next"] = _terminal_prompt(esc)
             return u
-        if not text and options and picker and not esc.get("hard_trigger"):
-            # a hard trigger is the user's call: an empty reply never picks its recommended option
+        if not text and options and picker and not esc.get("hard_trigger") and not _is_stop_text(options[0].get("text")):
+            # a hard trigger is the user's call: an empty reply never picks its recommended option, nor one that stops
             choice = options[0].get("text", "")
             ledger(state, u, f"choice: {kind}: empty reply after {REASK_MAX} re-asks -> the recommended option: "
                              f"{tail(choice, 200)}")
@@ -1490,11 +1520,12 @@ def _apply_instruction(state, shape, value, text):
 
 
 def _exact_option(reply, options):
-    """The option a reply names exactly (case-insensitive) or by its 1-based number; None for anything looser."""
+    """The option a reply names exactly (case-insensitive) or by its 1-based number or label alone; None for anything
+    looser."""
     reply = (reply or "").strip()
-    if re.fullmatch(r"\d+", reply):
-        i = int(reply)
-        return options[i - 1].get("text") if 1 <= i <= len(options) else None
+    picked, rest = split_option_reply(reply, options)
+    if picked or re.fullmatch(r"\d+", reply):
+        return None if rest else picked
     return next((o.get("text") for o in options if o.get("text", "").strip().lower() == reply.lower()), None) if reply else None
 
 
@@ -1706,7 +1737,60 @@ def _named_option(answer, options):
                  if o.get("text", "").strip() and low.startswith(o["text"].strip().lower() + ":")), None)
 
 
+def _is_stop_text(text):
+    """Whether an option text stops or aborts the run."""
+    return (text or "").strip().lower().startswith(("stop", "abort"))
+
+
+def _watch_unanswered(state, kind):
+    """The review watch's end when its question stays unanswered: the report, with the open question a follow-up."""
+    return {"follow_ups": list(as_list(state.get("follow_ups"))) + [
+                f"PR review watch stopped: the {kind} question stayed unanswered after being asked again"],
+            "_next": "final_report"}
+
+
+def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
+    """An answer apply_answer cannot act on is asked again, never mapped to a default.
+
+    After APPLY_REASK_MAX re-asks the recommended option is taken when it does not stop the run and the question is
+    no hard trigger; otherwise the run ends blocked with the question open (or as `exhausted` says), so nothing is
+    stopped or aborted on a guess."""
+    kind = esc.get("kind", "")
+    rounds = as_int(state.get("apply_reasks"))
+    why = why or "names none of the options"
+    tries = f"{APPLY_REASK_MAX} re-ask{'s' if APPLY_REASK_MAX != 1 else ''}"
+    if rounds < APPLY_REASK_MAX:
+        u.update({"apply_reasks": rounds + 1, "reask_rounds": 0, "reply_interpreted": False,
+                  "last_answer": "", "last_answer_text": ""})
+        _note_question(u, esc, f"Could not act on the reply {answer!r}: it {why}. Pick an option by its number or "
+                               "its text.")
+        ledger(state, u, f"apply_answer: {kind}: {answer!r} {why} -> asked again ({rounds + 1}/{APPLY_REASK_MAX})")
+        u["_next"] = "ask_dispatch"
+        return u
+    rec = next((o.get("text") for o in esc.get("options") or [] if truthy(o.get("recommended"))), None)
+    if rec and not _is_stop_text(rec) and not esc.get("hard_trigger") and rounds == APPLY_REASK_MAX:
+        taken = {**u, "last_answer": rec, "last_answer_text": rec, "apply_reasks": rounds + 1}
+        ledger(state, taken, f"apply_answer: {kind}: {answer!r} {why} after {tries} -> the recommended option: {rec}")
+        applied = apply_answer({**state, **taken})
+        if applied.get("_next") != "end_aborted":
+            u.update(taken)
+            u.update(applied)
+            return u
+        # a recommendation whose branch is already spent would abort: that is a guess too, so the question stays open
+        ledger(state, u, f"apply_answer: {kind}: the recommended option {rec!r} would abort here; not taken")
+    if exhausted:
+        u.update(exhausted)
+        ledger(state, u, f"apply_answer: {kind}: {answer!r} {why} after {tries} -> {u['_next']}")
+        return u
+    u["failure_reason"] = (f"the {kind} question stayed unanswered: the reply {answer!r} {why} after {tries}, and no "
+                           "recommended option keeps the run going")
+    ledger(state, u, f"apply_answer: {kind}: {u['failure_reason']} -> end_blocked")
+    u["_next"] = "end_blocked"
+    return u
+
+
 _CONTINUE_WORD_RE = re.compile(r"\b(?:continue|treat|amendment|amended|proceed|advance)\b")
+_STOP_WORD_RE = re.compile(r"\b(?:stop|abort|halt|discontinue)")
 
 
 def _says_continue(said):
@@ -1777,8 +1861,7 @@ def apply_answer(state):
             u["handoff_path"] = typed
             _adopt_brief(state, u, _handoff_brief(typed), f"the typed handoff path {typed}")
         else:
-            u["failure_reason"] = f"no readable handoff file at {tail(answer, 200)!r}"
-            u["_next"] = "end_blocked"
+            _reask_unmatched(state, u, esc, answer, "is not a readable handoff file")
     elif kind == "clarify" and stop:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
@@ -1828,20 +1911,24 @@ def apply_answer(state):
                 "sizing_narrow", "Which narrower part of the work should this run do? Describe the scope; it is sized "
                                  "again before any work starts.", [], hard_trigger=True, tier3_ok=False))
         else:
-            u["redirect_reason"] = (f"Plan-shaped work ({state.get('sizing_reason') or 'no reason recorded'}); the "
+            _reask_unmatched(state, u, esc, answer, "picks none of the sizing options", exhausted={
+                "redirect_reason": (f"Plan-shaped work ({state.get('sizing_reason') or 'no reason recorded'}); the "
                                     f"reply {tail(answer, 120)!r} picked none of the sizing options, so nothing was "
-                                    "started: this wants an architect run.")
-            u["_next"] = "end_redirect"
+                                    "started: this wants an architect run."),
+                "_next": "end_redirect"})
     elif kind == "sizing_narrow" and answer.strip():
         _narrow_scope(state, u, answer)
     elif kind == "sizing_narrow":
-        u["redirect_reason"] = "Plan-shaped work and no narrower scope was given: this wants an architect run."
-        u["_next"] = "end_redirect"
+        _reask_unmatched(state, u, esc, answer, "gives no narrower scope", exhausted={
+            "redirect_reason": "Plan-shaped work and no narrower scope was given: this wants an architect run.",
+            "_next": "end_redirect"})
     elif kind == "design_choice":
         u["_next"] = "compose_brief"
     elif kind == "oracle_fault":
-        a = "abort" if stop else _answered(state, {"retry": ["retry"], "proceed": ["proceed"]}, "proceed")
-        if a == "retry" and as_int(state.get("oracle_retries")) < RERUN_ONCE:
+        a = "abort" if stop else _answered(state, {"retry": ["retry"], "proceed": ["proceed"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "retry" and as_int(state.get("oracle_retries")) < RERUN_ONCE:
             u["oracle_retries"] = as_int(state.get("oracle_retries")) + 1
             u["_next"] = "consult_oracle"
         elif a == "abort":
@@ -1886,11 +1973,13 @@ def apply_answer(state):
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "plan_defect":
         # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a reply that is or leads
-        # with a stop stops; a reply naming no side at all, or negating its continue ("do not proceed"), stops
+        # with a stop stops; a reply negating its continue ("do not proceed") stops; one naming no side is asked again
         said = (_named_option(answer, options) or answer).strip().lower()
         leads_stop = stop or said.startswith(("stop", "abort"))
         a = "continue" if _says_continue(said) and not leads_stop else "stop"
-        if a == "continue" and _subtask_phase(state):
+        if not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
+            _reask_unmatched(state, u, esc, answer, "says neither stop nor continue")
+        elif a == "continue" and _subtask_phase(state):
             # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
             subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
             cur = max(as_int(state.get("subtask_index")) - 1, 0)
@@ -1917,8 +2006,10 @@ def apply_answer(state):
                 "provide the local-run recipe / fixture and re-probe"]
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     elif kind == "review_incomplete":
-        a = "abort" if stop else _answered(state, {"retry": ["retry"], "accept": ["accept"]}, "retry")
-        if a == "retry":
+        a = "abort" if stop else _answered(state, {"retry": ["retry"], "accept": ["accept"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "retry":
             u["_next"] = "build_gauntlet_prompt"
         elif a == "accept":
             lanes = as_list(state.get("gauntlet_incomplete")) or ["pipeline"]
@@ -1929,9 +2020,11 @@ def apply_answer(state):
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
     elif kind in ("strikeout", "lane_stuck", "review_exhausted"):
-        a = "abort" if stop else _answered(state, {"round": ["apply", "one more", "round"], "accept": ["accept"]},
-                                           "abort")
-        if a == "round" and as_int(state.get("strikeout_rounds")) < RERUN_ONCE:
+        a = "abort" if stop else _answered(state, {"round": ["apply", "one more", "round"], "accept": ["accept"]})
+        if a is None or (a == "accept" and kind == "strikeout"):
+            # a strikeout offers no accept option, so an accept names none of its options
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "round" and as_int(state.get("strikeout_rounds")) < RERUN_ONCE:
             u["strikeout_rounds"] = as_int(state.get("strikeout_rounds")) + 1
             u["fix_strikes"] = 0
             u["fix_source"] = "strikeout" if kind == "strikeout" else "review"
@@ -1963,12 +2056,14 @@ def apply_answer(state):
             u["_next"] = "render_coder_prompt"
     elif kind in ("ci_unsure", "ci_exhausted", "ci_infra"):
         a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"], "fix": ["resume", "coder", "fix"],
-                              "leave": ["leave", "draft", "report"]}, "leave")
-        if a == "rerun":
+                              "leave": ["leave", "draft", "report", "stop"]})
+        if a is None and not stop:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "rerun" and not stop:
             u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
                       "ci_failing": []})
             u["_next"] = "ci_poll"
-        elif a == "fix":
+        elif a == "fix" and not stop:
             u["fix_source"] = "ci"
             u["_next"] = "compose_fix"
         elif _watch_started(state):
@@ -1988,7 +2083,10 @@ def apply_answer(state):
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
         u["_next"] = "final_report"
     elif kind == "pr_review_push_unconfirmed":
-        if _answered(state, {"retry": ["retry"]}, "stop") == "retry":
+        a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+        elif a == "retry":
             u["_next"] = "pr_review_resolve"
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
@@ -1996,7 +2094,10 @@ def apply_answer(state):
                 "no review thread was resolved"]
             u["_next"] = "final_report"
     elif kind == "pr_review_closed":
-        if _answered(state, {"keep": ["keep"]}, "stop") == "keep":
+        a = "stop" if stop else _answered(state, {"keep": ["keep"], "stop": ["stop"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+        elif a == "keep":
             u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
             u["_next"] = "pr_review_poll"
         else:
@@ -2004,7 +2105,10 @@ def apply_answer(state):
                 f"PR review watch stopped: PR {state.get('pr_review_status') or 'closed'} externally"]
             u["_next"] = "final_report"
     elif kind == "pr_review_exhausted":
-        if _answered(state, {"retry": ["retry"]}, "stop") == "retry":
+        a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+        elif a == "retry":
             u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0})
             u["_next"] = "pr_review_poll"
         else:
@@ -2025,7 +2129,10 @@ def apply_answer(state):
         u["_next"] = "final_report"
     elif kind == "pr_review_owner_judgment" and as_list(as_dict(esc.get("data")).get("untrusted")):
         untrusted = [i for i in as_list(as_dict(esc.get("data")).get("untrusted")) if isinstance(i, dict)]
-        if not stop and _answered(state, {"skip": ["skip"]}, "stop") == "skip":
+        a = "stop" if stop else _answered(state, {"skip": ["skip"], "stop": ["stop"]})
+        if a is None:
+            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+        elif a == "skip":
             ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {len(untrusted)} untrusted item(s) skipped")
             u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
                 {"id": i.get("id"), "kind": i.get("kind"), "url": i.get("url", ""),
@@ -2047,10 +2154,12 @@ def apply_answer(state):
         judged = [j for j in as_list(data.get("judgment")) if isinstance(j, dict)]
         noaction = [n for n in as_list(data.get("noaction")) if isinstance(n, dict)]
         # a stop is the whole reply or the stop option; "please address these, don't stop" is a fix
-        a = "stop" if stop else _answered(state, {"skip": ["skip"], "fix": ["fix", "address"]}, "stop")
+        a = "stop" if stop else _answered(state, {"skip": ["skip"], "fix": ["fix", "address"], "stop": ["stop"]})
         skipped = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
                     "reason": "skipped at the owner's say-so"} for j in judged]
-        if a == "fix":
+        if a is None:
+            _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
+        elif a == "fix":
             asked = [{"id": j.get("id"), "kind": j.get("kind"), "url": j.get("url"),
                       "text": j.get("body") or j.get("question") or ""} for j in judged]
             _start_review_round(state, u, queue + asked, noaction)
