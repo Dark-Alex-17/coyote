@@ -3563,8 +3563,8 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
     run(&["init", "-q"]);
     fs::write(project.join("README.md"), "# demo\n").unwrap();
     let first = commit("base");
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    fs::create_dir_all(project.join("tests")).unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\n").unwrap();
     let second = commit("feature");
     assert_eq!(
         run(&["status", "--porcelain"]),
@@ -4390,7 +4390,7 @@ fn only_dirt_outside_the_in_repo_planning_store_suppresses_the_re_review_lines()
         "no planning store declared: {lines:?} {settled:?}"
     );
 
-    fs::write(repo.join("src/scratch.txt"), "uncommitted\n").unwrap();
+    fs::write(repo.join("tests/scratch.txt"), "uncommitted\n").unwrap();
     let (lines, settled) = compose(Some(&plans));
     assert!(
         lines.is_empty() && settled.is_empty(),
