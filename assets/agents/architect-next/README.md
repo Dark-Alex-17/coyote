@@ -120,17 +120,17 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:687:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
+scripts/_lib.py:702:    r"`[^`]+`|\b(go|cargo|npm|pnpm|yarn|make|pytest|python3?|bash|sh|grep|rg|curl|task|just|mvn|gradle|dotnet|bun)\b\s",
 scripts/gates.py:48:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:3739:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:3748:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:3911:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:3920:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
-scripts/smoke_test.py:1371:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
-scripts/smoke_test.py:1776:   ... "acceptance_criteria": ["`go test ./...`"], ...
-scripts/smoke_test.py:2401:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:1372:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
+scripts/smoke_test.py:1777:   ... "acceptance_criteria": ["`go test ./...`"], ...
+scripts/smoke_test.py:2403:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
 None of these runs a toolchain: `_lib.py:687` is the alternation of the executable-criterion
