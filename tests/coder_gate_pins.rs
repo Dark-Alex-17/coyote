@@ -171,6 +171,11 @@ fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Va
     cmd.arg(asset(rel))
         .current_dir(dir)
         .env("GRAPH_STATE_FILE", &state_file)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .env_remove("GRAPH_STATE")
         .env_remove("CODER_AUTOAPPROVE")
         .env_remove("COYOTE_GATE_OUTPUT_MAX_BYTES")
@@ -1988,6 +1993,52 @@ fn baseline_tests_runs_nothing_on_a_tree_it_cannot_show_is_untouched() {
     }
 }
 
+/// A git status that fails prints nothing, which must not pass for a clean
+/// tree, and a stored record that cannot be read is neither trusted nor
+/// silently replaced: both get no baseline, the suite does not run, and the
+/// note says why (naming the record to delete).
+#[test]
+fn baseline_tests_trusts_neither_a_failed_status_nor_an_unreadable_record() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-unreadable");
+    let cmd = "touch marker.txt; printf 'test a ... FAILED\\n'; exit 101";
+
+    let broken_index = root.0.join("broken-index");
+    committed_project(&broken_index, "here");
+    fs::write(broken_index.join(".git").join("index"), "not an index").unwrap();
+
+    let bad_record = root.0.join("bad-record");
+    committed_project(&bad_record, "here");
+    let head = git(&bad_record, &["rev-parse", "HEAD"]);
+    let key = sha256_hex(&format!("{head}\n.\n{cmd}"))[..16].to_string();
+    fs::create_dir_all(baseline_store(&bad_record)).unwrap();
+    let record = baseline_store(&bad_record).join(format!("tests-{key}.json"));
+    fs::write(&record, "{\"version\":1,\"status\":\"re").unwrap();
+
+    for (dir, note) in [
+        (&broken_index, "git status failed".to_string()),
+        (&bad_record, format!("tests-{key}.json cannot be read")),
+    ] {
+        let out = run_script(BASELINE, &root.0, &project_state(dir), &[("TEST_CMD", cmd)]);
+        assert_baseline_shape(&out);
+        assert_eq!(str_field(&out, "baseline_status"), "none", "{out}");
+        assert!(baseline_ids(&out).is_empty(), "{out}");
+        let got = str_field(&out, "baseline_note");
+        assert!(got.contains(&note), "{note:?} not in {out}");
+        assert!(
+            !dir.join("marker.txt").exists(),
+            "the suite ran in {}",
+            dir.display()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&record).unwrap(),
+        "{\"version\":1,\"status\":\"re"
+    );
+}
+
 /// end_success reports what each check did instead of a literal pass,
 /// seeded `not run` for a run that never reached it, with the `Review:` line
 /// after `Tests:` and the Design block last.
@@ -2039,6 +2090,13 @@ fn verify_gates_emit_passed_and_not_run_verdicts() {
         assert_eq!(str_field(&out, key), not_run, "{}: {out}", gate.rel);
         let out = run_script(gate.rel, &dir.0, &state, &[(gate.cmd_env, "true")]);
         assert_eq!(str_field(&out, key), "passed", "{}: {out}", gate.rel);
+        let out = run_script(gate.rel, &dir.0, &state, &[(gate.cmd_env, "exit 3")]);
+        assert_eq!(
+            str_field(&out, key),
+            "failed (exit 3)",
+            "{}: {out}",
+            gate.rel
+        );
     }
 }
 
@@ -2138,6 +2196,7 @@ fn review_routes_emit_the_review_verdict() {
     let route = "coder/scripts/route_review_result.sh";
     let fault = "coder/scripts/self_review_fault.sh";
     let notes = "x.rs:1 - y\n  z.rs:2 - w  \n";
+    let indented = "  x.rs:1 - y\n    z.rs:2 - w  \n  ";
     let not_run = "NOT RUN: self-review ended without a verdict (iteration cap, timeout or provider failure); the diff was not self-reviewed";
 
     let out = run_script(
@@ -2147,6 +2206,12 @@ fn review_routes_emit_the_review_verdict() {
         &[],
     );
     assert_eq!(str_field(&out, "review_verdict"), "clean", "{out}");
+    let out = run_script(route, &dir.0, &serde_json::json!({}), &[]);
+    assert_eq!(
+        str_field(&out, "review_verdict"),
+        "NOT RUN: self-review returned no verdict",
+        "{out}"
+    );
 
     let exhausted = serde_json::json!({
         "review_clean": false,
@@ -2158,7 +2223,15 @@ fn review_routes_emit_the_review_verdict() {
     assert_eq!(str_field(&out, "_next"), "end_success", "{out}");
     assert_eq!(
         str_field(&out, "review_verdict"),
-        format!("unresolved notes (review budget exhausted):\n{notes}"),
+        format!("unresolved notes (review budget exhausted):\n{indented}"),
+        "{out}"
+    );
+    let mut empty = exhausted.clone();
+    empty["review_notes"] = Value::from("");
+    let out = run_script(route, &dir.0, &empty, &[]);
+    assert_eq!(
+        str_field(&out, "review_verdict"),
+        "unresolved notes (review budget exhausted):\n  (no notes given)",
         "{out}"
     );
 
@@ -2172,7 +2245,7 @@ fn review_routes_emit_the_review_verdict() {
     );
     assert_eq!(
         str_field(&out, "review_verdict"),
-        format!("{not_run}\nEarlier review notes:\n{notes}"),
+        format!("{not_run}\n  Earlier review notes:\n{indented}"),
         "{out}"
     );
 }
@@ -2219,10 +2292,20 @@ fn parse_approval_routes_reworded_answers() {
         ("approve.", "baseline_tests"),
         ("  yes, go ahead!  ", "baseline_tests"),
         ("LGTM", "baseline_tests"),
+        ("ok", "baseline_tests"),
+        ("I approve the plan", "baseline_tests"),
         ("No", "end_rejected"),
         ("reject.", "end_rejected"),
+        ("no thanks", "end_rejected"),
         ("maybe later", "gate_approval"),
         ("yes, but not now", "gate_approval"),
+        ("yes, but rename the module first", "gate_approval"),
+        ("Yes, but don\u{2019}t touch it", "gate_approval"),
+        ("go back and revise the plan", "gate_approval"),
+        ("go", "gate_approval"),
+        ("No problem, go ahead", "gate_approval"),
+        ("no objections", "gate_approval"),
+        ("no wait, yes", "gate_approval"),
         ("", "gate_approval"),
     ] {
         let state = serde_json::json!({ "approval_answer": answer });

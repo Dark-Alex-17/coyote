@@ -5372,10 +5372,18 @@ fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
         &unresolved[..80]
     );
     assert!(unresolved.ends_with(LAST_LINE), "budget arm lost the tail");
+    let body = &unresolved["unresolved notes (review budget exhausted):\n".len()..];
+    let restored: Vec<&str> = body
+        .split('\n')
+        .map(|line| {
+            line.strip_prefix("  ")
+                .expect("every note line is indented")
+        })
+        .collect();
     assert_eq!(
-        unresolved.len(),
-        "unresolved notes (review budget exhausted):\n".len() + TRANSCRIPT_BYTES,
-        "budget arm must carry the notes byte-for-byte"
+        restored.join("\n"),
+        notes,
+        "budget arm must carry the notes byte-for-byte under the indent"
     );
     assert!(out.get("fix_instructions").is_none(), "{out}");
 }

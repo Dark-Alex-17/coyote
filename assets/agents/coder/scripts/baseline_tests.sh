@@ -114,12 +114,22 @@ else
   rel_dir=${workdir#"$top"/}
 fi
 key=$(printf '%s\n%s\n%s' "$head" "$rel_dir" "$cmd" | gate_sha256 | cut -c1-16)
-records_dir=$(git -C "$workdir" rev-parse --git-path coyote-baselines)
+if ! records_dir=$(git -C "$workdir" rev-parse --git-path coyote-baselines 2>/dev/null) || [[ -z "$records_dir" ]]; then
+  BASELINE_NOTE="git could not name a directory to keep the baseline in, so a pristine tree cannot be told from an edited one and no baseline was recorded."
+  printf '' | emit_baseline
+  exit 0
+fi
+records_dir=$(gate_posix_path "$records_dir")
 [[ "$records_dir" == /* ]] || records_dir="$workdir/$records_dir"
 record="$records_dir/tests-$key.json"
 short_head=${head:0:7}
 
-if [[ -f "$record" ]] && jq -e '.version == 1 and (.status == "green" or .status == "red")' "$record" >/dev/null 2>&1; then
+if [[ -e "$record" ]]; then
+  if ! jq -e '.version == 1 and (.status == "green" or .status == "red")' "$record" >/dev/null 2>&1; then
+    BASELINE_NOTE="The stored baseline $record cannot be read, so no baseline was recorded and every failing test counts as this run's to fix. Delete that file to take a new baseline on a clean tree."
+    printf '' | emit_baseline
+    exit 0
+  fi
   BASELINE_STATUS=$(jq -r '.status' "$record")
   BASELINE_EXIT=$(jq -r '.exit_code // 0' "$record")
   BASELINE_HASH=$(jq -r '.failure_hash // ""' "$record")
@@ -131,7 +141,13 @@ if [[ -f "$record" ]] && jq -e '.version == 1 and (.status == "green" or .status
   exit 0
 fi
 
-if [[ -n $(git -C "$workdir" status --porcelain --untracked-files=all 2>/dev/null) ]]; then
+# A git status that fails prints nothing, which must not pass for a clean tree.
+if ! porcelain=$(git -C "$workdir" status --porcelain --untracked-files=all 2>/dev/null); then
+  BASELINE_NOTE="git status failed, so the work tree cannot be shown to be untouched and no baseline was recorded; every failing test counts as this run's to fix."
+  printf '' | emit_baseline
+  exit 0
+fi
+if [[ -n "$porcelain" ]]; then
   BASELINE_STATUS=dirty
   BASELINE_NOTE="The work tree already held uncommitted changes at the start of this run and no baseline is stored for HEAD $short_head, so no baseline was recorded and every failing test counts as this run's to fix."
   printf '' | emit_baseline
