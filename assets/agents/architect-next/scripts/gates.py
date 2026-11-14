@@ -5626,6 +5626,9 @@ def run(name):
         if faulted := [k for k in lost if name in STATE_KEY_READERS[k] and name not in ESCALATION_GATES]:
             raise ValueError("; ".join(f"{k} is {str(lost[k])[:80]!r} with nothing to heal it from" for k in faulted))
         if _lost_task(name, state):
+            if name == "verify_gate":
+                # going back to select_tasks would pass the review round by unseen; the owner decides instead
+                raise ValueError(f"no current task to review ({state.get('current_task')!r} names no task in the list)")
             out = {}
             ledger(state, out, f"state: {name} has no current task ({state.get('current_task')!r}) -> select_tasks")
             out["_next"] = "select_tasks"
