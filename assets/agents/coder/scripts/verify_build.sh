@@ -27,6 +27,7 @@ if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "build_ok": true,
     "build_output": "(GATE NOT RUN: no build/check command configured or detected. This is NOT evidence that the build passed — set BUILD_CMD, and never report the build as verified.)",
+    "build_verdict": "NOT RUN: no build/check command configured or detected",
     "_next": "verify_tests"
   }'
   exit 0
@@ -69,6 +70,7 @@ elif (( exit_code == 0 )); then
     '{
       "build_ok": true,
       "build_output": ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR + "\n\n" + .),
+      "build_verdict": "passed",
       "_next": "verify_tests"
     }'
 else
