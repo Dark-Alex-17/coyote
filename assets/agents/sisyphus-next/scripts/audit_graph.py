@@ -28,18 +28,22 @@ AGENT_DIR = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(o
 # Node -> bound id(s) (the named loop bounds). A cycle is legal
 # only if it passes through at least one of these nodes.
 BOUNDED = {
-    "route_intent": "B1 clarify_rounds<=3 / sizing_rounds<=3 sizing verdicts",
-    "record_subtasks": "B2 subtasks<=6 / sizing_rounds<=3 sizing verdicts",
+    "route_intent": "B1 clarify_rounds<=3 / sizing_rounds<=3 sizing verdicts, then the clarify_cap / sizing_cap "
+                    "escalations (one extension recommended, RERUN_ONCE, then a choice that leaves the loop)",
+    "record_subtasks": "B2 subtasks<=6 / sizing_rounds<=3 sizing verdicts, then the sizing_cap escalation",
     "next_subtask": "B3 list-bounded subtask index",
     "oracle_gate": "B4 once per task",
     "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3",
-    "apply_answer": "B6 strikeout_rounds<=1 / B9 design_ask_rounds<=1 / DRAFT_ROUNDS_MAX redrafts / user-driven choices",
+    "apply_answer": "B6 strikeout_rounds: FIX_ROUND_CEILING recommended extra rounds per subtask, then proceeding is "
+                    "recommended / B9 design_ask_rounds<=1, one question per ASK line / DRAFT_ROUNDS_MAX redrafts / "
+                    "apply_reasks<=APPLY_REASK_MAX re-asks per escalation / user-driven choices",
     "bookkeeping_route": "B8 debt_rounds<=1 / B9 design ask once",
-    "triage_route": "B10 review_rounds<=3 + lane streak<=1",
+    "triage_route": "B10 review_rounds<=3 + lane streak<=1 over unchanged code, <=STUCK_CODE_CHANGED_CAP while the "
+                    "code changed or could not be verified",
     "route_gauntlet": "B11 debris_reruns<=1",
     "observability_route": "B12 obs_rounds<=1",
     "ask_owner_route": "B13 owner_polls<=2",
-    "parse_answer": "B14 reask_rounds<=3",
+    "parse_answer": "B14 reask_rounds<=3 per escalation, not reset by apply_answer's APPLY_REASK_MAX re-asks",
     "interpret_route": "one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask",
     "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
     "ci_poll": "B15 wall clock + poll fails<=3; review mode also stops at REVIEW_CI_POLL_CEILING per run",
@@ -47,7 +51,7 @@ BOUNDED = {
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",
     "pr_review_route": "B16 REVIEW_MAX_ROUNDS fix rounds + REVIEW_CI_POLL_BUDGET",
-    "merge_oracle": "oracle_retries<=1 (via apply_answer)",
+    "merge_oracle": "oracle_retries: one retry per subtask recommended (via apply_answer), then proceeding is",
     "scope_check": "scope_confirmed once / breach -> escalation",
 }
 

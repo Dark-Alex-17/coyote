@@ -23,7 +23,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP,
     CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
-    DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, GH_CALL_SECS, OWNER_POLL_MAX, OWNER_POLL_MINUTES,
+    DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
+    OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
@@ -47,7 +48,8 @@ SUBTASK_FILES_SHOWN = 40     # files a per-subtask review prompt lists as the su
 WORKTREE_TREE_SECS = 10
 GAUNTLET_LANES = ("code-review", "adversary", "security", "probe", "debris")
 RERUN_ONCE_LANES = ("adversary", "security", "probe")
-# The streak at which a re-run-once lane stops even though each fix round changed the code: one round past RERUN_ONCE.
+# The last streak at which a re-run-once lane blocking on the same findings still gets a fix round when its code changed,
+# or could not be verified, since the previous round; the next block goes to the user as lane_stuck.
 STUCK_CODE_CHANGED_CAP = RERUN_ONCE + 2
 # Below this overlap a lane's findings count as a new class, not the same complaint again.
 FINDINGS_SAME_JACCARD = 0.5
@@ -380,6 +382,14 @@ SIZING_ARCHITECT = "Hand it to the architect"
 SIZING_HERE = f"Do it here anyway (up to {SUBTASK_MAX} subtasks)"
 SIZING_NARROW = "Narrow the scope"
 SIZING_NARROW_PREFIX = "Narrow the scope to: "
+# Past CLARIFY_MAX verdicts: doing it here takes a stated reason, recommended until one such extension was granted.
+SIZING_HERE_REASON = f"Do it here anyway, up to {SUBTASK_MAX} subtasks (state the reason)"
+SIZING_STOP = "Stop and report the sizing verdict"
+# Past CLARIFY_MAX clarification rounds the run goes on from a stated reading; once one reading was already
+# assessed, planning it as an implementation task is recommended instead of assessing again.
+CLARIFY_PROCEED = "Proceed on the best reading of the request (state the reading)"
+CLARIFY_IMPLEMENT = "Plan it as an implementation task on the best reading (state the reading)"
+CLARIFY_STOP = "Stop: the request stays ambiguous"
 
 
 def _one_line(text, n=200):
@@ -390,16 +400,12 @@ def _sizing_verdict(state, u, reason, planned=None):
     """Ask a top-level run's user what to do with plan-shaped work, the verdict and its reason stated.
 
     `planned` is the in-run planner's breakdown when it could not fit the work into SUBTASK_MAX subtasks; doing it
-    here is then not offered again. Past CLARIFY_MAX verdicts in one run the work is redirected as before.
+    here is then not offered again. Past CLARIFY_MAX verdicts in one run the user is asked through _sizing_cap.
     """
     rounds = as_int(state.get("sizing_rounds"))
     reason = _one_line(reason) or f"more than {SUBTASK_MAX} subtasks, cross-PR sequencing, or batch/protected semantics"
     if rounds >= CLARIFY_MAX:
-        u["redirect_reason"] = (f"Still plan-shaped after {rounds} sizing verdicts ({reason}): this wants an "
-                                "architect run.")
-        ledger(state, u, f"sizing: {u['redirect_reason']}")
-        u["_next"] = "end_redirect"
-        return u
+        return _sizing_cap(state, u, rounds, reason, planned)
     estimate = as_int(state.get("subtask_estimate"))
     breakdown = [_one_line(b) for b in (planned or as_list(state.get("proposed_breakdown"))) if _one_line(b)]
     u.update({"sizing_rounds": rounds + 1, "sizing_reason": reason, "proposed_breakdown": breakdown})
@@ -422,6 +428,65 @@ def _sizing_verdict(state, u, reason, planned=None):
     return raise_escalation(state, u, escalation(
         "sizing_verdict", question, opts, evidence="\n".join(evidence), hard_trigger=True, tier3_ok=False,
         data={"planned": planned is not None}))
+
+
+def _sizing_cap(state, u, rounds, reason, planned):
+    granted = as_int(state.get("sizing_extensions"))
+    breakdown = [_one_line(b) for b in (planned or as_list(state.get("proposed_breakdown"))) if _one_line(b)]
+    evidence = [f"Sizing verdicts so far: {rounds} (cap CLARIFY_MAX = {CLARIFY_MAX}), all plan-shaped",
+                f"Latest verdict reason: {reason}",
+                f"Intent: {_one_line(state.get('intent_statement'), 400) or '(none stated)'}",
+                f"Do-it-here extensions already granted past the cap: {granted}"]
+    if planned is not None:
+        evidence.append(f"The in-run planner could not fit the work into {SUBTASK_MAX} subtasks")
+    if breakdown:
+        evidence += ["Proposed breakdown:"] + [f"- {b}" for b in breakdown]
+    here = granted < RERUN_ONCE
+    opts = [option(SIZING_HERE_REASON, here, f"plans at most {SUBTASK_MAX} sealed subtasks in this run; the reason is "
+                                             "recorded with the clarifications"),
+            option(SIZING_ARCHITECT, not here, "writes a ready architect handoff that a bare go-ahead in architect-next "
+                                               "picks up"),
+            option(SIZING_STOP)]
+    ledger(state, u, f"sizing: {rounds} plan-shaped verdicts reached the CLARIFY_MAX cap ({reason}); asking")
+    return raise_escalation(state, u, escalation(
+        "sizing_cap", f"Sizing verdict: still plan-shaped after {rounds} verdicts ({reason}). How should the run go on?",
+        opts, evidence="\n".join(evidence), hard_trigger=True, tier3_ok=False,
+        data={"cap": "CLARIFY_MAX", "rounds": rounds, "extensions": granted, "planned": planned is not None}))
+
+
+def _clarify_cap(state, u, rounds, q):
+    granted = as_int(state.get("clarify_extensions"))
+    asked = str(state.get("clarifications") or "").strip()
+    evidence = [f"Clarification rounds so far: {rounds} (cap CLARIFY_MAX = {CLARIFY_MAX})",
+                f"Readings already stated past the cap: {granted}",
+                "Questions asked so far, with their answers:", tail(asked, 3000) or "(none recorded)",
+                f"Still open: {q.get('question') or '(no question stated)'}"]
+    again = granted < RERUN_ONCE
+    opts = [option(CLARIFY_PROCEED, again, "the request is assessed again with the stated reading"),
+            option(CLARIFY_IMPLEMENT, not again, "the stated reading is planned as an implementation task, not assessed "
+                                                 "again"),
+            option(CLARIFY_STOP)]
+    ledger(state, u, f"clarify: still ambiguous after {rounds} rounds, the CLARIFY_MAX cap; asking")
+    return raise_escalation(state, u, escalation(
+        "clarify_cap", f"The request is still ambiguous after {rounds} clarification rounds. How should the run go on?",
+        opts, evidence="\n".join(evidence), data={"cap": "CLARIFY_MAX", "rounds": rounds, "extensions": granted}))
+
+
+def _hand_to_architect(state, u):
+    """Write the ready architect handoff and end there, or redirect with the reason it could not be written."""
+    path, why = _write_architect_handoff(state, u)
+    if path:
+        _consume_handoff(state, u)
+        u["architect_handoff"] = path
+        u["handoff_report"] = (
+            f"Wrote the architect handoff {path} (status: ready, vehicle: architect). Start an architect-next "
+            "run in this project: a bare \"go ahead\" picks the handoff up and asks you to confirm it as the "
+            "design doc; naming the path works too.")
+        ledger(state, u, f"sizing: handed to the architect: {path}")
+        u["_next"] = "end_handoff"
+    else:
+        u["redirect_reason"] = f"Plan-shaped work for the architect; {why}"
+        u["_next"] = "end_redirect"
 
 
 def _handoff_title(state):
@@ -638,13 +703,13 @@ def _route_intent(state, u):
             sizing = u["sizing"] = "compound"
 
     questions = as_list(state.get("clarifying_questions"))
-    if intent == "ambiguous" or (questions and intent not in ("exploration", "design_question")):
+    # past the cap the user chose to go on from a stated reading: assess's remaining questions no longer hold the run
+    past_cap = as_int(state.get("clarify_extensions")) > 0
+    if intent == "ambiguous" or (questions and intent not in ("exploration", "design_question") and not past_cap):
         rounds = as_int(state.get("clarify_rounds"))
-        if rounds >= CLARIFY_MAX:
-            u["failure_reason"] = f"still ambiguous after {CLARIFY_MAX} clarification rounds"
-            u["_next"] = "end_blocked"
-            return u
         q = questions[0] if questions else {"question": "The request is ambiguous. What exactly should be done, and where?"}
+        if rounds >= CLARIFY_MAX:
+            return _clarify_cap(state, u, rounds, q)
         opts = [option(o.get("text", ""), o.get("recommended", False), o.get("evidence", ""))
                 for o in as_list(q.get("options")) if isinstance(o, dict)]
         u["clarify_rounds"] = rounds + 1
@@ -967,7 +1032,7 @@ def next_subtask(state):
     u.update({
         "current_task": text, "task_number": idx + 1, "subtask_index": idx + 1,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
-        "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
+        "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False, "oracle_retries": 0,
         "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "context_pack": "",
         "context_pack_degraded": False, "explore_findings": [], "librarian_findings": [],
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
@@ -1154,12 +1219,12 @@ def merge_oracle(state):
     note_script_error(state, u, "consult_oracle")
     result = (state.get("oracle_result") or "").strip()
     if not result or result.startswith("Agent node failed"):
+        retry = as_int(state.get("oracle_retries")) < RERUN_ONCE
         return raise_escalation(state, u, escalation(
             "oracle_fault",
             "The oracle consult failed and the task depends on its direction. Never 'time out and continue'. How to proceed?",
-            [option("Retry the consult", recommended=as_int(state.get("oracle_retries")) < RERUN_ONCE,
-                    evidence="one retry is within the re-run-once bound"),
-             option("Proceed without the oracle (the context pack alone directs the coder)"),
+            [option("Retry the consult", recommended=retry, evidence="one retry per subtask is within the re-run-once bound"),
+             option("Proceed without the oracle (the context pack alone directs the coder)", recommended=not retry),
              option("Abort this task")],
             evidence=tail(result, 800)))
     pack = (state.get("context_pack") or "") + "\n\n## Oracle direction\n\n" + result
@@ -1487,6 +1552,8 @@ ACCEPTED_INSTRUCTIONS = {
     "handoff_confirm": ("path",),
     "handoff_path": ("path",),
     "sizing_verdict": ("narrow",),
+    "clarify_cap": ("answer",),
+    "sizing_cap": ("here",),
 }
 INSTRUCTION_HELP = {
     "answer": "answer the question in the user's own words; value: the answer",
@@ -1496,13 +1563,15 @@ INSTRUCTION_HELP = {
     "rescope": "proceed with the task's scope re-declared as described; value: the new scope",
     "path": "use the handoff file at a path; value: the path",
     "narrow": "do a narrower part of the work in this run, sized again first; value: the narrower scope",
+    "here": "do the work in this run anyway; value: the reason",
 }
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
 # the owner's own words verbatim.
 INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}",
                        "amendment": "Continue; treat the criterion as amended: {}", "recipe": "Supply it: {}",
-                       "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}"}
-FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope", "narrow")
+                       "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}",
+                       "here": SIZING_HERE_REASON + ": {}"}
+FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope", "narrow", "here")
 
 
 def _accepts_text(kind):
@@ -1709,9 +1778,9 @@ def _answered(state, choices, default=None):
 
 STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and report", "stop and report")
 # the kinds whose apply_answer branch reads a whole-reply stop; only these take a bare "abort" without interpreting it
-STOP_AWARE_KINDS = ("clarify", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow", "oracle_fault",
-                    "engine_fault", "plan_defect", "review_incomplete", "strikeout", "lane_stuck", "review_exhausted",
-                    "scope_breach", "pr_review_owner_judgment")
+STOP_AWARE_KINDS = ("clarify", "clarify_cap", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow",
+                    "sizing_cap", "oracle_fault", "engine_fault", "plan_defect", "review_incomplete", "strikeout",
+                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment")
 
 
 def _whole_reply_stop(answer, options=(), stop_options=None):
@@ -1754,13 +1823,14 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
 
     After APPLY_REASK_MAX re-asks the recommended option is taken when it does not stop the run and the question is
     no hard trigger; otherwise the run ends blocked with the question open (or as `exhausted` says), so nothing is
-    stopped or aborted on a guess."""
+    stopped or aborted on a guess. parse_answer's reask_rounds is left as it stands, so its re-asks and these share
+    one bounded total per escalation."""
     kind = esc.get("kind", "")
     rounds = as_int(state.get("apply_reasks"))
     why = why or "names none of the options"
     tries = f"{APPLY_REASK_MAX} re-ask{'s' if APPLY_REASK_MAX != 1 else ''}"
     if rounds < APPLY_REASK_MAX:
-        u.update({"apply_reasks": rounds + 1, "reask_rounds": 0, "reply_interpreted": False,
+        u.update({"apply_reasks": rounds + 1, "reply_interpreted": False,
                   "last_answer": "", "last_answer_text": ""})
         _note_question(u, esc, f"Could not act on the reply {answer!r}: it {why}. Pick an option by its number or "
                                "its text.")
@@ -1776,7 +1846,7 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
             u.update(taken)
             u.update(applied)
             return u
-        # a recommendation whose branch is already spent would abort: that is a guess too, so the question stays open
+        # a recommendation that still lands on an abort is a guess too, so the question stays open
         ledger(state, u, f"apply_answer: {kind}: the recommended option {rec!r} would abort here; not taken")
     if exhausted:
         u.update(exhausted)
@@ -1869,7 +1939,23 @@ def apply_answer(state):
         u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
         u["assess_faulted"] = False
         u["_next"] = "assess"
-    elif kind in ("sizing_verdict", "sizing_narrow") and stop:
+    elif kind == "clarify_cap" and stop:
+        u["failure_reason"] = f"stopped at the user's request ({kind}): {answer}"
+        u["_next"] = "end_aborted"
+    elif kind == "clarify_cap":
+        # any reply that is no stop states the reading the run goes on from; its text is kept as the stated reason
+        granted = as_int(state.get("clarify_extensions")) + 1
+        u["clarify_extensions"] = granted
+        u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
+        u["assess_faulted"] = False
+        ledger(state, u, f"clarify: past the CLARIFY_MAX cap, going on (extension {granted}) on the stated reading: "
+                         f"{tail(answer, 300)}")
+        if _named_option(answer, options) == CLARIFY_IMPLEMENT:
+            u.update({"intent": "implementation", "sizing": "compound", "clarifying_questions": []})
+            u["_next"] = "route_intent"
+        else:
+            u["_next"] = "assess"
+    elif kind in ("sizing_verdict", "sizing_narrow", "sizing_cap") and stop:
         u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
         u["_next"] = "end_aborted"
     elif kind == "sizing_verdict":
@@ -1883,19 +1969,7 @@ def apply_answer(state):
             ledger(state, u, "sizing: the architect option in a delegated run -> end_redirect, nothing written")
             u["_next"] = "end_redirect"
         elif picked == SIZING_ARCHITECT:
-            path, why = _write_architect_handoff(state, u)
-            if path:
-                _consume_handoff(state, u)
-                u["architect_handoff"] = path
-                u["handoff_report"] = (
-                    f"Wrote the architect handoff {path} (status: ready, vehicle: architect). Start an architect-next "
-                    "run in this project: a bare \"go ahead\" picks the handoff up and asks you to confirm it as the "
-                    "design doc; naming the path works too.")
-                ledger(state, u, f"sizing: handed to the architect: {path}")
-                u["_next"] = "end_handoff"
-            else:
-                u["redirect_reason"] = f"Plan-shaped work for the architect; {why}"
-                u["_next"] = "end_redirect"
+            _hand_to_architect(state, u)
         elif picked == SIZING_HERE:
             u["sizing_note"] = (f"The user chose to do this work here despite a plan-shaped sizing verdict "
                                 f"({state.get('sizing_reason') or 'no reason recorded'}). Fit it into at most "
@@ -1922,13 +1996,37 @@ def apply_answer(state):
         _reask_unmatched(state, u, esc, answer, "gives no narrower scope", exhausted={
             "redirect_reason": "Plan-shaped work and no narrower scope was given: this wants an architect run.",
             "_next": "end_redirect"})
+    elif kind == "sizing_cap":
+        # an option named exactly, by its number, or with its note ("<option>: <reason>"); loose prose picks nothing.
+        # Only a top-level run reaches the cap, so the architect option always writes the handoff.
+        picked = _named_option(answer, options)
+        if picked == SIZING_ARCHITECT:
+            _hand_to_architect(state, u)
+        elif picked == SIZING_HERE_REASON:
+            granted = as_int(state.get("sizing_extensions")) + 1
+            u["sizing_extensions"] = granted
+            u["clarifications"] = (state.get("clarifications") or "") + f"\nQ: {esc.get('question', '')}\nA: {answer}\n"
+            u["sizing_note"] = (f"The user chose to do this work here past {CLARIFY_MAX} plan-shaped sizing verdicts "
+                                f"({state.get('sizing_reason') or 'no reason recorded'}), stating: {answer}. Fit it into "
+                                f"at most {SUBTASK_MAX} sealed subtasks; return an empty list with plan_shaped_reason "
+                                "only when it cannot fit at all.")
+            _consume_handoff(state, u)
+            ledger(state, u, f"sizing: past the CLARIFY_MAX cap, doing it here (extension {granted}); stated reason: "
+                             f"{tail(answer, 300)}")
+            u["_next"] = "plan_subtasks"
+        else:
+            _reask_unmatched(state, u, esc, answer, "picks none of the sizing options", exhausted={
+                "redirect_reason": (f"Plan-shaped work ({state.get('sizing_reason') or 'no reason recorded'}); the "
+                                    f"reply {tail(answer, 120)!r} picked none of the sizing options, so nothing was "
+                                    "started: this wants an architect run."),
+                "_next": "end_redirect"})
     elif kind == "design_choice":
         u["_next"] = "compose_brief"
     elif kind == "oracle_fault":
         a = "abort" if stop else _answered(state, {"retry": ["retry"], "proceed": ["proceed"]})
         if a is None:
             _reask_unmatched(state, u, esc, answer)
-        elif a == "retry" and as_int(state.get("oracle_retries")) < RERUN_ONCE:
+        elif a == "retry":
             u["oracle_retries"] = as_int(state.get("oracle_retries")) + 1
             u["_next"] = "consult_oracle"
         elif a == "abort":
@@ -1952,12 +2050,18 @@ def apply_answer(state):
         dd = list(as_list(state.get("design_decisions"))) + [f"{q} -> {answer}"]
         u["design_decisions"] = dd
         ledger(state, u, f"design-decision: {q} -> {answer}")
-        adopt = _answered(state, {"adopt": ["adopt", "yes", "introduce"]}, None) == "adopt"
-        if adopt and as_int(state.get("design_ask_rounds")) < RERUN_ONCE:
+        data = as_dict(esc.get("data"))
+        adopted = list(as_list(data.get("adopted")))
+        if _answered(state, {"adopt": ["adopt", "yes", "introduce"]}, None) == "adopt":
+            adopted.append(f"{q} -> {answer}")
+        remaining = [a for a in as_list(data.get("remaining")) if isinstance(a, str) and a.strip()]
+        if remaining:
+            raise_escalation(state, u, _design_ask(remaining, adopted))
+        elif adopted and as_int(state.get("design_ask_rounds")) < RERUN_ONCE:
             u["design_ask_rounds"] = as_int(state.get("design_ask_rounds")) + 1
             u["design_asks"] = []
             u["fix_source"] = "design_ask"
-            u["fix_note"] = f"Adopt the pattern the user chose: {answer}"
+            u["fix_note"] = "\n".join(f"Adopt the pattern the user chose: {a}" for a in adopted)
             u["_next"] = "compose_fix"
         else:
             u["design_asks"] = []
@@ -2020,18 +2124,30 @@ def apply_answer(state):
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
             u["_next"] = "end_aborted"
     elif kind in ("strikeout", "lane_stuck", "review_exhausted"):
-        a = "abort" if stop else _answered(state, {"round": ["apply", "one more", "round"], "accept": ["accept"]})
-        if a is None or (a == "accept" and kind == "strikeout"):
-            # a strikeout offers no accept option, so an accept names none of its options
+        a = "abort" if stop else _answered(state, {"round": ["apply", "one more", "round"], "accept": ["accept"],
+                                                   "proceed": ["proceed without"]})
+        # a strikeout's way on is proceeding without its change, the others' is accepting the findings
+        onward = "proceed" if kind == "strikeout" else "accept"
+        if a is None or (a in ("accept", "proceed") and a != onward):
             _reask_unmatched(state, u, esc, answer)
-        elif a == "round" and as_int(state.get("strikeout_rounds")) < RERUN_ONCE:
-            u["strikeout_rounds"] = as_int(state.get("strikeout_rounds")) + 1
+        elif a == "round":
+            rounds = as_int(state.get("strikeout_rounds")) + 1
+            u["strikeout_rounds"] = rounds
             u["fix_strikes"] = 0
             u["fix_source"] = "strikeout" if kind == "strikeout" else "review"
+            ledger(state, u, f"{kind}: one more fix round ({rounds}/{FIX_ROUND_CEILING} extra rounds this subtask"
+                             + (", past the ceiling at the user's pick)" if rounds > FIX_ROUND_CEILING else ")"))
             u["_next"] = "compose_fix"
-        elif a == "accept" and kind != "strikeout":
+        elif a == "accept":
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review blockers accepted unresolved at the user's say-so ({kind}); see the gauntlet report"]
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+        elif a == "proceed":
+            notes = tail(state.get("oracle_result") or "", 1500) or "(the oracle left no notes)"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Strikeout: proceeded without this change at the user's say-so; the failed attempt stays set aside "
+                f"({state.get('strikeout_stash') or 'the worktree was clean'}); the oracle's notes: {notes}"]
+            ledger(state, u, f"strikeout: proceeding without the change; the oracle's notes: {tail(notes, 600)}")
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
         else:
             u["failure_reason"] = f"stopped after repeated failures ({kind}); the code was left in a working state"
@@ -2502,24 +2618,38 @@ def _save_failed_attempt(state, u, root, start, head):
     return f"{ref} {sha} (recover with: {hint})"
 
 
+STRIKEOUT_PROCEED = "Proceed without this change (the failed attempt stays set aside; the oracle's notes go in the report)"
+
+
+def _extra_rounds(state):
+    """(spent, note): whether this subtask's extra fix rounds reached FIX_ROUND_CEILING, and the count as evidence.
+
+    Below the ceiling one more round is recommended; at or past it proceeding is, and the round stays on offer."""
+    used = as_int(state.get("strikeout_rounds"))
+    return used >= FIX_ROUND_CEILING, f"{used}/{FIX_ROUND_CEILING} extra fix rounds used in this subtask"
+
+
 def strikeout_route(state):
     u = {}
     note_script_error(state, u, "oracle_strikeout")
     result = (state.get("oracle_result") or "").strip()
     unresolved = (not result or result.startswith("Agent node failed")
                   or re.search(r"cannot (be )?resolve|unable to resolve|no resolution|cannot determine", result, re.I))
+    spent, note = _extra_rounds(state)
     if unresolved:
-        opts = [option("Abort and report (code left in a working state; the failed attempt is stashed)", recommended=True,
-                       evidence="the oracle could not resolve it"),
-                option("Apply the oracle's notes in one more coder round anyway")]
+        opts = [option("Apply the oracle's notes in one more coder round anyway", not spent,
+                       f"the oracle could not resolve it; {note}"),
+                option(STRIKEOUT_PROCEED, spent, "the subtask's change is left out and recorded as a follow-up"),
+                option("Abort and report (code left in a working state; the failed attempt is stashed)")]
     else:
-        opts = [option("Apply the oracle's direction in ONE more coder round", recommended=True,
-                       evidence="the oracle proposed a concrete resolution"),
+        opts = [option("Apply the oracle's direction in ONE more coder round", not spent,
+                       f"the oracle proposed a concrete resolution; {note}"),
+                option(STRIKEOUT_PROCEED, spent, "the subtask's change is left out and recorded as a follow-up"),
                 option("Abort and report")]
     return raise_escalation(state, u, escalation(
         "strikeout", f"Three fix attempts failed on the same problem. Oracle verdict: "
                      f"{'unresolved' if unresolved else 'resolution proposed'}. How to proceed?",
-        opts, evidence=tail(result, 2500), hard_trigger=bool(unresolved)))
+        opts, evidence=f"{note}\n\n{tail(result, 2500)}", hard_trigger=bool(unresolved)))
 
 
 # ====================================================================== 2.5
@@ -2586,13 +2716,8 @@ def bookkeeping_route(state):
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"Decision text still in docs after one round: {d}" for d in docs]
     asks = [a for a in as_list(state.get("design_asks")) if isinstance(a, str) and a.strip()]
     if asks and as_int(state.get("design_ask_rounds")) < RERUN_ONCE + 1 and not truthy(state.get("design_ask_pending_done")):
-        ask = asks[0]
         u["design_ask_pending_done"] = True
-        return raise_escalation(state, u, escalation(
-            "design_ask", f"Design question: {ask}",
-            [option("Adopt the pattern (one more coder round introduces it)"),
-             option("Keep the code as shipped (answer recorded, no change)")],
-            hard_trigger=True, tier3_ok=False))
+        return raise_escalation(state, u, _design_ask(asks))
     block = (state.get("design_block") or "").strip()
     if block:
         dd = list(as_list(state.get("design_decisions")))
@@ -2604,6 +2729,15 @@ def bookkeeping_route(state):
     u["_next"] = "review_gate"
     snapshot(state, u, "bookkeeping")
     return u
+
+
+def _design_ask(asks, adopted=()):
+    """The design question for the first of `asks`; the ones after it and the adopting answers so far ride in its
+    data, so each ask is asked in turn and one coder round adopts every pattern chosen."""
+    return escalation("design_ask", f"Design question: {asks[0]}",
+                      [option("Adopt the pattern (one more coder round introduces it)"),
+                       option("Keep the code as shipped (answer recorded, no change)")],
+                      hard_trigger=True, tier3_ok=False, data={"remaining": list(asks[1:]), "adopted": list(adopted)})
 
 
 # ====================================================================== 2.6
@@ -2701,42 +2835,27 @@ def _worktree_tree(root):
 
 
 def _snapshot_base(root, head):
-    """A commit of the tracked worktree on top of HEAD, so a later subtask's diff leaves out the earlier subtasks'
-    uncommitted work. Returns (sha, error): HEAD itself when nothing tracked changed, and HEAD with the reason when
-    git cannot build the commit. No ref is created or moved."""
-    index = git_out(root, "rev-parse", "--git-path", "index", default="")
-    if not head or not index:
-        return head, "no HEAD or index"
-    index = index if os.path.isabs(index) else os.path.join(root, index)
-    if not os.path.isfile(index):
-        # with no index, `add -u` stages nothing and the diff base would be an empty tree
-        return head, f"no index file at {index}"
-    fd, tmp = tempfile.mkstemp(prefix="sx-index-")
-    os.close(fd)
-    # Only tracked and intent-to-add paths: a path committed in HEAD but untracked here would read as deleted.
-    env = {**os.environ, "GIT_INDEX_FILE": tmp, "GIT_AUTHOR_NAME": "sisyphus", "GIT_AUTHOR_EMAIL": "sisyphus@localhost",
+    """A commit of the worktree (untracked, non-ignored files included) on top of HEAD, so a later subtask's diff
+    leaves out the earlier subtasks' uncommitted work, new files too. Returns (sha, error): HEAD itself when the
+    worktree matches it, and HEAD with the reason when git cannot build the commit. The tree comes from
+    _worktree_tree's private index, so the real index is never written, and no ref is created or moved."""
+    if not head:
+        return head, "no HEAD"
+    tree = _worktree_tree(root)
+    if not tree:
+        return head, "git could not write a tree of the worktree"
+    if tree == git_out(root, "rev-parse", f"{head}^{{tree}}", default=""):
+        return head, ""
+    env = {**os.environ, "GIT_AUTHOR_NAME": "sisyphus", "GIT_AUTHOR_EMAIL": "sisyphus@localhost",
            "GIT_COMMITTER_NAME": "sisyphus", "GIT_COMMITTER_EMAIL": "sisyphus@localhost"}
     try:
-        shutil.copyfile(index, tmp)
-        out = ""
-        for args in (["add", "-u"], ["write-tree"]):
-            p = subprocess.run(["git", "-C", root, *args], capture_output=True, text=True, env=env,
-                               timeout=WORKTREE_TREE_SECS)
-            if p.returncode != 0:
-                return head, f"git {args[0]}: {p.stderr.strip()[:200]}"
-            out = p.stdout.strip()
-        if out == git_out(root, "rev-parse", f"{head}^{{tree}}", default=""):
-            return head, ""
-        p = subprocess.run(["git", "-C", root, "commit-tree", out, "-p", head, "-m", "sisyphus subtask diff base",
+        p = subprocess.run(["git", "-C", root, "commit-tree", tree, "-p", head, "-m", "sisyphus subtask diff base",
                             "--no-gpg-sign"], capture_output=True, text=True, env=env, timeout=WORKTREE_TREE_SECS)
-        if p.returncode != 0 or not p.stdout.strip():
-            return head, f"git commit-tree: {p.stderr.strip()[:200]}"
-        return p.stdout.strip(), ""
     except (OSError, subprocess.SubprocessError) as e:
         return head, str(e)[:200]
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+    if p.returncode != 0 or not p.stdout.strip():
+        return head, f"git commit-tree: {p.stderr.strip()[:200]}"
+    return p.stdout.strip(), ""
 
 
 def _subtask_changes(state):
@@ -3028,29 +3147,53 @@ def _findings_changed(before, after):
 
 
 def _code_changed(state, root, tree_before, tree_after):
-    """True when the reviewed code differs between two worktree trees; planning-store edits do not count, and a
-    missing tree or a git error reads as unchanged."""
-    if not tree_before or not tree_after or tree_before == tree_after:
-        return False
+    """How the reviewed code compares between two worktree trees, planning-store edits not counted: "changed",
+    "unchanged", or "unknown" when a tree is missing or git cannot compare them."""
+    if not tree_before or not tree_after:
+        return "unknown"
+    if tree_before == tree_after:
+        return "unchanged"
     code, _, _ = git(root, "diff", "--quiet", tree_before, tree_after, "--", ".", *_plans_exclude(state, root),
                      timeout=WORKTREE_TREE_SECS)
-    return code == 1
+    return {0: "unchanged", 1: "changed"}.get(code, "unknown")
 
 
 def _repeat_block(state, root, lane, fixes):
-    """How a lane that blocks again compares with its previous round: "new" findings, the same findings over
-    "changed" code, or the "same" findings over the same code."""
+    """How a lane that blocks again compares with its previous round: "new" findings, or the same findings over
+    "changed", "unchanged" or "unknown" code. Fewer than two recorded rounds is "unknown": only a tree verified
+    unchanged shows a stuck lane."""
     rounds = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict)]
     if len(rounds) < 2:
-        return "same"
+        return "unknown"
     prev, cur = rounds[-2], rounds[-1]
     before = as_list(as_dict(prev.get("lane_blockers")).get(lane))
     after = as_list(as_dict(cur.get("lane_blockers")).get(lane)) or fixes
     if before and _findings_changed(before, after):
         return "new"
-    if _code_changed(state, root, prev.get("code_tree") or "", cur.get("code_tree") or ""):
-        return "changed"
-    return "same"
+    return _code_changed(state, root, prev.get("code_tree") or "", cur.get("code_tree") or "")
+
+
+def _extra_round_options(state):
+    spent, note = _extra_rounds(state)
+    return [option("One more fix round anyway", not spent, note),
+            option("Accept the findings unresolved and proceed", spent, "recorded as a follow-up; the run goes on"),
+            option("Abort and report")]
+
+
+def _stuck_question(unchanged, capped, streak):
+    """The lane_stuck question. Its `The <lanes> lane still blocks` prefix stays fixed: the lane names are parsed
+    from it outside this graph."""
+    lanes = ", ".join(unchanged + capped)
+    if not capped:
+        why = ("after one fix cycle on the same class of findings, over code that did not change since the previous "
+               "round (the plan or the approach may be wrong)")
+    elif not unchanged:
+        why = (f"on the same class of findings in {max(streak[l] for l in capped)} reviews in a row, though the code "
+               "changed (or could not be verified as unchanged) each round")
+    else:
+        why = (f"on the same class of findings: over unchanged code for {', '.join(unchanged)}, and for "
+               f"{', '.join(capped)} though the code changed (or could not be verified) each round")
+    return f"The {lanes} lane still blocks {why}. How to proceed?"
 
 
 def triage_route(state):
@@ -3103,7 +3246,7 @@ def triage_route(state):
 
     if fixes:
         rounds = as_int(state.get("review_rounds"))
-        stuck = []
+        unchanged, capped, notes = [], [], []
         root = state.get("git_root") or state.get("project_dir") or "."
         for lane in sorted(lanes_now):
             streak[lane] = streak.get(lane, 0) + 1
@@ -3113,27 +3256,33 @@ def triage_route(state):
             if repeat == "new":
                 streak[lane] = 1
                 ledger(state, u, f"triage: {lane} blocks again on a new class of findings; its streak restarts")
-            elif repeat == "changed" and streak[lane] < STUCK_CODE_CHANGED_CAP:
+            elif repeat == "unchanged":
+                unchanged.append(lane)
+                notes.append(f"- {lane}: the same findings over code that did not change since its previous round")
+            elif streak[lane] <= STUCK_CODE_CHANGED_CAP and repeat == "changed":
                 ledger(state, u, f"triage: {lane} blocks again on the same findings but the code changed since its "
                                  f"previous round; one more fix round (streak {streak[lane]})")
+            elif streak[lane] <= STUCK_CODE_CHANGED_CAP:
+                ledger(state, u, f"triage: {lane} blocks again on the same findings and the code tree could not be "
+                                 f"verified against its previous round; one more fix round (streak {streak[lane]})")
             else:
-                stuck.append(lane)
+                capped.append(lane)
+                how = "changed" if repeat == "changed" else "could not be verified as unchanged"
+                notes.append(f"- {lane}: the same findings in {streak[lane]} reviews in a row; the code {how} since "
+                             "its previous round, and changed or could not be verified each round before")
         u["lane_block_streak"] = streak
-        if stuck:
+        findings = "\n".join(f"- {f}" for _, f in fixes)
+        # set before either escalation too, so a fix round picked there works this review's findings
+        u["fix_items"] = [f for _, f in fixes]
+        if unchanged or capped:
             return raise_escalation(state, u, escalation(
-                "lane_stuck", f"The {', '.join(stuck)} lane still blocks after one fix cycle on the same class of findings "
-                              "(the plan or the approach may be wrong). How to proceed?",
-                [option("Abort and report", recommended=True, evidence="protocol: re-run once, then stop and escalate"),
-                 option("One more fix round anyway"), option("Accept the findings unresolved and proceed")],
-                evidence="\n".join(f"- {f}" for _, f in fixes)[:2500]))
+                "lane_stuck", _stuck_question(unchanged, capped, streak), _extra_round_options(state),
+                evidence=("\n".join(notes) + "\n\nFindings:\n" + findings)[:2500]))
         if rounds >= STRIKE_LIMIT:
             return raise_escalation(state, u, escalation(
                 "review_exhausted", f"Still blocked after {STRIKE_LIMIT} review fix rounds. How to proceed?",
-                [option("Abort and report", recommended=True), option("One more fix round anyway"),
-                 option("Accept the findings unresolved and proceed")],
-                evidence="\n".join(f"- {f}" for _, f in fixes)[:2500]))
+                _extra_round_options(state), evidence=findings[:2500]))
         u["review_rounds"] = rounds + 1
-        u["fix_items"] = [f for _, f in fixes]
         u["fix_source"] = "review"
         ledger(state, u, f"review: round {rounds + 1} fixes {len(fixes)} finding(s) in lanes {sorted(lanes_now)}")
         u["_next"] = "compose_fix"

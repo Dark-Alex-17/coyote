@@ -3109,6 +3109,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 /// The integer counters and indices `initial_state` seeds, all at zero; the
 /// round counters among them are what the `_lib.py` bounds are checked on.
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
+    "apply_reasks",
     "ci_fix_strikes",
     "ci_poll_fails",
     "ci_polls",
@@ -3154,6 +3155,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("CLARIFY_MAX", "STRIKE_LIMIT"),
     ("DISCUSSION_PARKS_MAX", "3"),
     ("DRAFT_ROUNDS_MAX", "STRIKE_LIMIT"),
+    ("FIX_ROUND_CEILING", "STRIKE_LIMIT"),
     ("GH_CALL_SECS", "90"),
     ("GO_AHEAD_WORDS_MAX", "12"),
     ("OWNER_POLL_MAX", "2"),

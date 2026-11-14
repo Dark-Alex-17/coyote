@@ -228,6 +228,7 @@ initial_state:
   owner_poll_result: ''
   owner_polls: 0
   reask_rounds: 0
+  apply_reasks: 0
   reply_verdict: ''
   reply_option: ''
   reply_instruction: ''

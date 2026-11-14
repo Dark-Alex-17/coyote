@@ -99,9 +99,9 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:2407:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:2633:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:2634:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/gates.py:2523:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:2643:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:2644:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 ```
 
 All three hits are the English verb `make` (one prompt sentence, two battery fixtures);
@@ -274,7 +274,11 @@ delegated run keeps today's behaviour: it never asks and ends at `end_redirect`
 `record_subtasks` still enforces the cap: a top-level plan over 6 subtasks (or none) is never
 trimmed or dropped but raises `sizing_verdict` again with the planner's breakdown and only the
 architect and narrow options, while a delegated one ends at `end_redirect`. `sizing_rounds`
-bounds the verdicts at `CLARIFY_MAX` (3) per run, after which the work is redirected. The
+bounds the verdicts at `CLARIFY_MAX` (3) per run; past it `sizing_cap` asks with the verdicts
+as evidence: do it here on a stated reason (recommended until one such extension was granted,
+then the architect handoff is), hand it to the architect, or stop. `clarify_rounds` caps
+clarification the same way through `clarify_cap`. Neither round counter is ever reset; the
+extensions are counted in `sizing_extensions` and `clarify_extensions`. The
 wrapper's ignored `choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages` tail
 turns the key rows red.
 
