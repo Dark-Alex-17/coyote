@@ -27,7 +27,7 @@ from _lib import (  # noqa: E402
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
-    APPLY_REASK_MAX, STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
+    STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
@@ -37,6 +37,8 @@ from _lib import (  # noqa: E402
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
+# apply_answer asks a reply naming none of the options again once: the re-run-once family
+APPLY_REASK_MAX = RERUN_ONCE
 
 SUBTASK_FILES_SHOWN = 40     # files a per-subtask review prompt lists as the subtask's own
 # Each git call of _worktree_tree and _snapshot_base. review_gate's two stay under the 30 s script-node default;
@@ -1320,6 +1322,15 @@ def ladder_route(state):
 _CONSULT_VERDICT_RE = re.compile(r"CONSULT:[ \t]*(ANSWER|DEFER)\b[ \t]*(.*)")
 
 
+def _note_question(u, esc, note):
+    """Ask `esc` again with `note` above its original question; the note goes into the escalation itself so a remote
+    owner sees it too, and a later note replaces it."""
+    data = as_dict(esc.get("data"))
+    asked = data.get("asked") or esc.get("question", "")
+    u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"{note}\n\n{asked}"}
+    u["ask_question"] = render_question(u["escalation"])
+
+
 def _consult_verdict(text):
     """(verdict, value) of the navigator's last CONSULT line, skipping an echo of the prompt's own template line."""
     found = [(m.group(1), m.group(2).strip()) for m in _CONSULT_VERDICT_RE.finditer(text or "")]
@@ -1335,7 +1346,9 @@ def consult_route(state):
     options = esc.get("options") or []
     verdict, value = _consult_verdict(state.get("consult_result") or "")
     if verdict == "ANSWER" and value:
-        choice = _pick_with_note(value, options) if options else value
+        # a navigator's note naming another option number anywhere ("1 - hmm, actually 3") names no single option
+        ambiguous = bool(split_option_reply(value, options)[0]) and not split_option_reply(value, options, True)[0]
+        choice = None if ambiguous else _pick_with_note(value, options) if options else value
         if choice:
             u.update({"last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
@@ -1343,8 +1356,7 @@ def consult_route(state):
             return u
         # an answer naming no option, or several, is the owner's call; the navigator's words go with the question
         ledger(state, u, f"consult: {kind}: the navigator's answer names no single option -> owner: {value}")
-        u["ask_question"] = (f"The navigator answered {value!r}, which names no single option; your call.\n\n"
-                             + (state.get("ask_question") or ""))
+        _note_question(u, esc, f"The navigator answered {value!r}, which names no single option; your call.")
         u["_next"] = "ask_dispatch"
         return u
     reason = "deferred" if verdict == "DEFER" else "no parseable consult verdict (timeout/fault)"
@@ -1733,7 +1745,7 @@ def _is_stop_text(text):
 def _watch_unanswered(state, kind):
     """The review watch's end when its question stays unanswered: the report, with the open question a follow-up."""
     return {"follow_ups": list(as_list(state.get("follow_ups"))) + [
-                f"PR review watch stopped: the {kind} question stayed unanswered after {APPLY_REASK_MAX} re-asks"],
+                f"PR review watch stopped: the {kind} question stayed unanswered after being asked again"],
             "_next": "final_report"}
 
 
@@ -1746,27 +1758,32 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
     kind = esc.get("kind", "")
     rounds = as_int(state.get("apply_reasks"))
     why = why or "names none of the options"
+    tries = f"{APPLY_REASK_MAX} re-ask{'s' if APPLY_REASK_MAX != 1 else ''}"
     if rounds < APPLY_REASK_MAX:
         u.update({"apply_reasks": rounds + 1, "reask_rounds": 0, "reply_interpreted": False,
                   "last_answer": "", "last_answer_text": ""})
-        u["ask_question"] = (f"Could not act on the reply {answer!r}: it {why}. Pick an option by its number or "
-                             f"its text.\n\n" + render_question(esc))
+        _note_question(u, esc, f"Could not act on the reply {answer!r}: it {why}. Pick an option by its number or "
+                               "its text.")
         ledger(state, u, f"apply_answer: {kind}: {answer!r} {why} -> asked again ({rounds + 1}/{APPLY_REASK_MAX})")
         u["_next"] = "ask_dispatch"
         return u
     rec = next((o.get("text") for o in esc.get("options") or [] if truthy(o.get("recommended"))), None)
     if rec and not _is_stop_text(rec) and not esc.get("hard_trigger") and rounds == APPLY_REASK_MAX:
-        ledger(state, u, f"apply_answer: {kind}: {answer!r} {why} after {APPLY_REASK_MAX} re-asks -> the "
-                         f"recommended option: {rec}")
-        u.update({"last_answer": rec, "last_answer_text": rec, "apply_reasks": rounds + 1})
-        u.update(apply_answer({**state, **u}))
-        return u
+        taken = {**u, "last_answer": rec, "last_answer_text": rec, "apply_reasks": rounds + 1}
+        ledger(state, taken, f"apply_answer: {kind}: {answer!r} {why} after {tries} -> the recommended option: {rec}")
+        applied = apply_answer({**state, **taken})
+        if applied.get("_next") != "end_aborted":
+            u.update(taken)
+            u.update(applied)
+            return u
+        # a recommendation whose branch is already spent would abort: that is a guess too, so the question stays open
+        ledger(state, u, f"apply_answer: {kind}: the recommended option {rec!r} would abort here; not taken")
     if exhausted:
         u.update(exhausted)
-        ledger(state, u, f"apply_answer: {kind}: {answer!r} {why} after {APPLY_REASK_MAX} re-asks -> {u['_next']}")
+        ledger(state, u, f"apply_answer: {kind}: {answer!r} {why} after {tries} -> {u['_next']}")
         return u
-    u["failure_reason"] = (f"the {kind} question stayed unanswered: the reply {answer!r} {why} after "
-                           f"{APPLY_REASK_MAX} re-asks, and no option that keeps the run going is recommended")
+    u["failure_reason"] = (f"the {kind} question stayed unanswered: the reply {answer!r} {why} after {tries}, and no "
+                           "recommended option keeps the run going")
     ledger(state, u, f"apply_answer: {kind}: {u['failure_reason']} -> end_blocked")
     u["_next"] = "end_blocked"
     return u

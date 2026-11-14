@@ -24,7 +24,6 @@ RERUN_ONCE = 1            # adversary/security/probe/debris/debt/obs re-run-once
 SUBTASK_MAX = 6           # A11: in-run subtasks one run takes on; more is the architect's, asked (sizing verdict)
 CLARIFY_MAX = STRIKE_LIMIT
 REASK_MAX = STRIKE_LIMIT
-APPLY_REASK_MAX = 1       # times apply_answer re-asks a reply that reached it naming none of the options
 CHOICE_OPTIONS_MIN = 2    # a multiple-choice escalation offers 2-4 options, one recommended (architect-next's bounds)
 CHOICE_OPTIONS_MAX = 4
 OWNER_POLL_MAX = 2        # ask_owner tool budget: wait 30 / poll 25 minutes
@@ -406,26 +405,34 @@ _OPTION_SEPARATORS = "-:).\u2014\u2013"
 _OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d+)(?![\w/]|\.\d)")
 
 
-def _names_another_option(rest, picked, count):
+def _names_another_option(rest, picked, count, strict=False):
     """Whether the free text after a picked number reads as naming a different option ("no wait, 3", "or 2", "1"):
-    an in-range number other than the pick, after "option" or within the first two words."""
+    an in-range number other than the pick, after "option" or within the first two words (anywhere when `strict`)."""
     for m in _OPTION_NUMBER_RE.finditer(rest):
         n = int(m.group(1))
         if n == picked or not 1 <= n <= count:
             continue
         before = rest[:m.start()]
-        if re.search(r"(?i)\boption\s*$", before) or len(re.findall(r"[^\W\d_]+", before)) <= 2:
+        if strict or re.search(r"(?i)\boption\s*$", before) or len(re.findall(r"[^\W\d_]+", before)) <= 2:
             return True
     return False
 
 
-def split_option_reply(text, options):
+def _echoes_option(rest, own):
+    """Whether free text only repeats the picked option's own text, as rendered ("<text> (recommended)" too)."""
+    def bare(s):
+        return re.sub(r"[\W_]+$", "", re.sub(r"(?i)\s*\(recommended\)", "", s.strip())).lower()
+    return bool(rest) and bare(rest) == bare(own)
+
+
+def split_option_reply(text, options, strict=False):
     """(option text, free text after it) for a reply led by an in-range option number; (None, text) otherwise.
 
     The number may be wrapped ("(2)", "**2**", "[2]"), labelled ("Option 2", the rendered "Option 1 (recommended)")
     and followed by a separator ("2: x", "2) x", "2 - x", an em or en dash). Free text that is only punctuation, or
     only the picked option's own text echoed back, counts as none. A reply whose free text names a different option
-    number ("3) or 2", "2. 1", "1 - no wait, 3") names no single option, so it is (None, text) too."""
+    number ("3) or 2", "2. 1", "1 - no wait, 3") names no single option, so it is (None, text) too; `strict` counts
+    a different option number anywhere in the free text, fractions and decimals aside."""
     text = (text or "").strip()
     options = options or []
     m = _OPTION_LEAD_RE.match(text)
@@ -438,11 +445,11 @@ def split_option_reply(text, options):
         # a bare number running into prose ("2 or 3", "2 because") is not a pick
         return None, text
     rest = rest.strip()
-    if _names_another_option(rest, picked, len(options)):
-        return None, text
     own = options[picked - 1]["text"]
-    if re.sub(r"[\W_]+$", "", rest).lower() == re.sub(r"[\W_]+$", "", own.strip()).lower():
-        rest = ""
+    if _echoes_option(rest, own):
+        return own, ""
+    if _names_another_option(rest, picked, len(options), strict):
+        return None, text
     return own, rest if re.search(r"\w", rest) else ""
 
 

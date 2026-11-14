@@ -694,6 +694,22 @@ check("answers: at the re-ask cap a non-stop recommendation is taken, otherwise 
       and all(u["_next"] != "end_aborted" for u in _cap.values()), {k: u.get("_next") for k, u in _cap.items()})
 _hp = gates.apply_answer(base_state(escalation=escalation("handoff_path", "q", [option("Abort the run")], hard_trigger=True),
                                     last_answer="/no/such/handoff.md"))
+_spent = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm, not sure",
+                                       apply_reasks=gates.APPLY_REASK_MAX, strikeout_rounds=RERUN_ONCE))
+check("answers: at the cap a recommendation whose branch is spent is not taken; the run blocks, never aborts",
+      _spent["_next"] == "end_blocked" and any("would abort here" in d for d in _spent["decisions"]), _spent.get("_next"))
+_late = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - hmm, actually let's go with 3"))
+check("answers: a navigator note naming another option number anywhere goes to the owner, never applied",
+      _late["_next"] == "ask_dispatch" and "last_answer" not in _late
+      and "1 - hmm, actually let's go with 3" in _late["escalation"]["question"])
+check("answers: an echoed option text, in either rendered shape, is a clean pick even when the text holds a number",
+      _lib.split_option_reply("Option 1: Use 2 caches", [option("Use 2 caches"), option("Use one")]) == ("Use 2 caches", "")
+      and _lib.split_option_reply("1) Proceed with the plan (recommended)", ROUTE3) == ("Proceed with the plan", ""))
+_re = gates.apply_answer(base_state(escalation=escalation("strikeout", "q", so_nav), last_answer="hmm", ask_question="Q?"))
+check("answers: the re-ask note goes into the escalation question so a remote owner sees it, once",
+      "Could not act on the reply 'hmm'" in _re["escalation"]["question"]
+      and gates.apply_answer(base_state(escalation=_re["escalation"], last_answer="huh"))["escalation"]["question"]
+      .count("Could not act on the reply") == 1)
 check("answers: an unreadable typed handoff path is asked again before the run blocks", _hp["_next"] == "ask_dispatch")
 _ea = gates.parse_answer(base_state(escalation={**escalation("lane_stuck", "q", SO3), "data": {"multiple_choice": True}},
                                     last_answer_text="", reask_rounds=REASK_MAX))
@@ -2156,8 +2172,12 @@ _a = untrusted_answer("Stop watching and report")
 check("pr_tracking review: apply_answer untrusted stop -> final_report naming the urls",
       _a["_next"] == "final_report" and "https://github.com/o/r/pull/7#c7" in _a["follow_ups"][0] and "r7" in _a["follow_ups"][0]
       and _SECRET not in json.dumps(_a))
-check("pr_tracking review: apply_answer untrusted offers no fix path",
-      untrusted_answer("Fix them as the reviewer asks")["_next"] == "ask_dispatch")
+_fix = untrusted_answer("Fix them as the reviewer asks")
+_fix_cap = untrusted_answer("Fix them as the reviewer asks", apply_reasks=gates.APPLY_REASK_MAX)
+check("pr_tracking review: apply_answer untrusted offers no fix path: asked again, then the report, no round started",
+      _fix["_next"] == "ask_dispatch" and _fix_cap["_next"] == "final_report"
+      and not any(k in x for x in (_fix, _fix_cap) for k in ("fix_source", "pr_review_queue", "pr_review_addressed"))
+      and any("stayed unanswered" in f for f in _fix_cap["follow_ups"]))
 
 
 def mixed_comment(cid, author, association, body):
