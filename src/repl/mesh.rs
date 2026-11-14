@@ -737,7 +737,8 @@ async fn peers(ctx: &RequestContext) -> Result<()> {
         |record| unheard_label(&trust, record),
         |identity| grants_all(&trust, identity),
     ));
-    out_path_text(&render_peers(&rows, &namer, now).render(live_prefix()));
+    let prefix = live_prefix();
+    out_path_text(&render_peers(&rows, &namer, now, prefix).render(prefix));
     Ok(())
 }
 
@@ -1746,7 +1747,7 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
         }
         Answering::OwnQuestion(correlation) => {
             let destination = &correlation.record.peer_destination;
-            out_path_text(&sending_notice(&who, destination).render(live_prefix()));
+            out_path_text(&follow_up_notice(&who, destination).render(live_prefix()));
             if let Some(attachment) = &attachment {
                 out_path_text(&attaching_notice(attachment, destination));
             }
@@ -1757,13 +1758,12 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 parts_of(attachment),
                 &runtime.part_limits(),
             )?;
-            let name = runtime.who_at(destination).to_string();
             let outcome = runtime
                 .send_peer_lending_reference(destination, &out)
                 .await
-                .map_err(|err| quoted_send_failure(err, &name))?;
+                .map_err(|err| quoted_send_failure(err, &who))?;
             out_path_text(
-                &own_reply_sent_line(&outcome, destination, &name, id, SystemTime::now())
+                &own_reply_sent_line(&outcome, destination, &who, id, SystemTime::now())
                     .render(live_prefix()),
             );
         }
@@ -2468,13 +2468,15 @@ fn quoted_access_failure(err: AccessError, destination: &str, who: &str) -> anyh
     session_led(&text, &lead, word, who, destination).unwrap_or_else(|| anyhow!(text))
 }
 
-fn quoted_fetch_failure(err: FileFetchError) -> anyhow::Error {
+/// A fetch failure as the REPL shows it: a peer-side refusal quoted as `quoted_peer_side`
+/// quotes it, with the peer named `who` as `quoted_send_failure` names it.
+fn quoted_fetch_failure(err: FileFetchError, who: &str) -> anyhow::Error {
     match &err {
         FileFetchError::NotTrustedByPeer(refusal) => {
-            quoted_peer_side(&err, refusal, refusal.notice())
+            quoted_peer_side(&err, refusal, refusal.clone().named(Some(who)).notice())
         }
         FileFetchError::NoAnswer(no_answer) => {
-            quoted_peer_side(&err, no_answer, no_answer.notice())
+            quoted_peer_side(&err, no_answer, no_answer.clone().named(Some(who)).notice())
         }
         _ => anyhow!(err.to_string()),
     }
@@ -2569,6 +2571,32 @@ mod peer_side_refusal_tests {
         assert_eq!(other.to_string(), AccessError::NotRunning.to_string());
     }
 
+    /// A fetch the session refused or left unanswered names it the way the fetch line
+    /// named it, `<user> / <session>`, whatever name the transport's error carried.
+    #[test]
+    fn a_refused_or_unanswered_fetch_names_the_session_by_user_and_session() {
+        let destination = "ab".repeat(16);
+        let refused = quoted_fetch_failure(
+            FileFetchError::NotTrustedByPeer(RemoteRefusal::new(
+                &destination,
+                None,
+                "cd".repeat(16),
+            )),
+            "Ann / laptop",
+        )
+        .to_string();
+        assert!(refused.contains("\"Ann / laptop\" (abababab)"), "{refused}");
+        let unanswered = quoted_fetch_failure(
+            FileFetchError::NoAnswer(NoAnswer::new(&destination, "cd".repeat(16))),
+            "Ann / laptop",
+        )
+        .to_string();
+        assert!(
+            unanswered.contains("\"Ann / laptop\" (abababab)"),
+            "{unanswered}"
+        );
+    }
+
     fn shown_as(err: anyhow::Error, prefix: CommandPrefix) -> String {
         command_error_text(
             &MeshVerbError::wrap(err.context("`.mesh files fetch` failed")),
@@ -2585,7 +2613,7 @@ mod peer_side_refusal_tests {
         let refused = refusal().to_string();
         let cases: [(fn() -> anyhow::Error, String); 4] = [
             (
-                || quoted_fetch_failure(FileFetchError::NotTrustedByPeer(refusal())),
+                || quoted_fetch_failure(FileFetchError::NotTrustedByPeer(refusal()), ".session"),
                 refused.clone(),
             ),
             (
@@ -2641,6 +2669,7 @@ mod peer_side_refusal_tests {
         let no_answer = NoAnswer::new(&"ab".repeat(16), "cd".repeat(16));
         let err = AccessError::NoAnswer(no_answer.clone());
         let today = err.to_string();
+        let named = today.replace("from abababab:", "from \"abababab\" (abababab):");
         assert_eq!(
             shown_as(
                 quoted_access_failure(
@@ -2650,14 +2679,15 @@ mod peer_side_refusal_tests {
                 ),
                 CommandPrefix::Dot
             ),
-            shown_as(
-                anyhow!(today.replace("from abababab:", "from \"abababab\" (abababab):")),
-                CommandPrefix::Dot
-            )
+            shown_as(anyhow!(named.clone()), CommandPrefix::Dot)
         );
         let slash = shown_as(
             quoted_access_failure(err, &"ab".repeat(16), "abababab"),
             CommandPrefix::Slash,
+        );
+        assert!(
+            slash.ends_with(&format!("    {}", named.replace(".mesh ", "/mesh "))),
+            "{slash}"
         );
         assert!(today.contains("`.mesh people list`"), "{today}");
         assert!(slash.contains("`/mesh people list`"), "{slash}");
@@ -3669,7 +3699,8 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     };
     let shown = shown_pattern(&args.path);
     let peer = short(&destination);
-    let named = format!("{} ({peer})", runtime.who_at(&destination));
+    let who = runtime.who_at(&destination).to_string();
+    let named = format!("{who} ({peer})");
     if let Some(reason) = spent_attachment(
         runtime.memory(),
         &destination,
@@ -3689,11 +3720,16 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     }
     let route = match route_to(&runtime, &destination, abort_signal).await {
         Ok(route) => route,
-        Err(Unrouted::NoAnswer) => bail!(
-            "{}{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
-            unreachable_head(&destination),
-            left_mesh_hint(Some(&record), SystemTime::now())
-        ),
+        Err(Unrouted::NoAnswer) => {
+            let text = format!(
+                "{}{} A fetch runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
+                unreachable_head(&destination),
+                left_mesh_hint(Some(&record), SystemTime::now())
+            );
+            let lead = format!("Session {destination}");
+            let refusal = session_led(&text, &lead, "", &who, &destination);
+            return Err(refusal.unwrap_or_else(|| anyhow!(text)));
+        }
         Err(Unrouted::Interrupted) => {
             out_path_text(&format!(
                 "Fetch of `{shown}` interrupted; nothing was staged."
@@ -3728,7 +3764,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             );
         }
         Ok(Fetched::NotModified { .. }) => out_path_text(&format!(
-            "The peer's copy of `{shown}` still has the sha256 you hold; nothing was fetched."
+            "That session's copy of `{shown}` still has the sha256 you hold; nothing was fetched."
         )),
         Ok(Fetched::NotShared) => {
             let reason = not_shared_reason(
@@ -3746,7 +3782,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             return Err(invalid_path_refusal(peer, &shown, &rule));
         }
         Ok(Fetched::TooLarge { limit }) => {
-            return Err(too_large_refusal(peer, &shown, limit));
+            return Err(too_large_refusal(&named, &shown, limit));
         }
         Err(FileFetchError::NotServed) => {
             return Err(QuotingError::wrap(not_shared_sentence(
@@ -3765,9 +3801,9 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             | FileFetchError::Corrupt
             | FileFetchError::UnknownStatus),
         ) => {
-            return Err(undelivered_refusal(peer, &shown, &args.path, &err));
+            return Err(undelivered_refusal(&named, peer, &shown, &args.path, &err));
         }
-        Err(err) => return Err(quoted_fetch_failure(err)),
+        Err(err) => return Err(quoted_fetch_failure(err, &who)),
     }
     Ok(())
 }
@@ -3782,19 +3818,27 @@ fn invalid_path_refusal(peer: &str, shown: &str, rule: &str) -> anyhow::Error {
     ))
 }
 
-fn too_large_refusal(peer: &str, shown: &str, limit: u64) -> anyhow::Error {
+fn too_large_refusal(named: &str, shown: &str, limit: u64) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "{peer} serves files of at most {limit} bytes and `{shown}` is larger. Ask {peer}'s human for a smaller copy, or for the file another way.",
-        &[("peer", peer), ("limit", &limit.to_string())],
-        &[("shown", shown)],
+        "{named} serves files of at most {limit} bytes and `{shown}` is larger. Ask the user of {named} for a smaller copy, or for the file another way.",
+        &[("limit", &limit.to_string())],
+        &[("named", named), ("shown", shown)],
     ))
 }
 
-fn undelivered_refusal(peer: &str, shown: &str, path: &str, err: &FileFetchError) -> anyhow::Error {
+/// `named` is the session's `<user> / <session> (<dest8>)` name, quoted as peer text;
+/// the command names it by `peer`, its short hash.
+fn undelivered_refusal(
+    named: &str,
+    peer: &str,
+    shown: &str,
+    path: &str,
+    err: &FileFetchError,
+) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "{peer} did not deliver `{shown}`: {err}. Try `.mesh files fetch {peer} {path}` again; if it repeats, the peer may run a different Coyote.",
+        "{named} did not deliver `{shown}`: {err}. Try `.mesh files fetch {peer} {path}` again; if it repeats, that session may run a different Coyote.",
         &[("peer", peer), ("err", &err.to_string())],
-        &[("shown", shown), ("path", path)],
+        &[("named", named), ("shown", shown), ("path", path)],
     ))
 }
 
@@ -3807,17 +3851,18 @@ mod fetch_path_refusal_tests {
         command_error_text(&MeshVerbError::wrap(err), prefix)
     }
 
-    /// Each refusal for the path `.vault/key` from the peer `1a2b3c4d`, with its dot text.
+    /// Each refusal for the path `.vault/key` from the session `Ann / laptop (1a2b3c4d)`,
+    /// with its dot text.
     fn refusals() -> Vec<(anyhow::Error, String)> {
-        let (peer, path) = ("1a2b3c4d", ".vault/key");
+        let (named, peer, path) = ("Ann / laptop (1a2b3c4d)", "1a2b3c4d", ".vault/key");
         let mut cases = vec![
             (
                 invalid_path_refusal(peer, path, "dot_segment"),
                 "`.vault/key` is not a path the mesh carries (rule `dot_segment`); pass the path exactly as `.mesh files list --peer 1a2b3c4d` or mesh__list shows it.".to_string(),
             ),
             (
-                too_large_refusal(peer, path, 1024),
-                "1a2b3c4d serves files of at most 1024 bytes and `.vault/key` is larger. Ask 1a2b3c4d's human for a smaller copy, or for the file another way.".to_string(),
+                too_large_refusal(named, path, 1024),
+                "Ann / laptop (1a2b3c4d) serves files of at most 1024 bytes and `.vault/key` is larger. Ask the user of Ann / laptop (1a2b3c4d) for a smaller copy, or for the file another way.".to_string(),
             ),
         ];
         for err in [
@@ -3827,9 +3872,9 @@ mod fetch_path_refusal_tests {
         ] {
             let fault = err.to_string();
             cases.push((
-                undelivered_refusal(peer, path, path, &err),
+                undelivered_refusal(named, peer, path, path, &err),
                 format!(
-                    "1a2b3c4d did not deliver `.vault/key`: {fault}. Try `.mesh files fetch 1a2b3c4d .vault/key` again; if it repeats, the peer may run a different Coyote."
+                    "Ann / laptop (1a2b3c4d) did not deliver `.vault/key`: {fault}. Try `.mesh files fetch 1a2b3c4d .vault/key` again; if it repeats, that session may run a different Coyote."
                 ),
             ));
         }
@@ -6166,7 +6211,9 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     out_path_text(
         &sending_notice(
-            &ctx.app.mesh.who_at(&record.peer_destination),
+            &ctx.app
+                .mesh
+                .who(&record.peer_identity, &record.peer_destination),
             &record.peer_destination,
         )
         .render(live_prefix()),
@@ -6211,7 +6258,9 @@ async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let id = &record.id;
     out_path_text(
         &sending_notice(
-            &ctx.app.mesh.who_at(&record.peer_destination),
+            &ctx.app
+                .mesh
+                .who(&record.peer_identity, &record.peer_destination),
             &record.peer_destination,
         )
         .render(live_prefix()),
@@ -8613,7 +8662,7 @@ mod name_addressing_tests {
                 ..HeardFacts::default()
             },
         )];
-        let text = render_peers(&rows, &namer(), now).plain();
+        let text = render_peers(&rows, &namer(), now, CommandPrefix::Dot).plain();
         let row = &table_rows(&text)[0];
         assert_eq!(
             (row[0].as_str(), row[1].as_str()),
@@ -8650,7 +8699,7 @@ mod name_addressing_tests {
             row(ME, TEMP, 7),
             row(MAKI, MAKI_DESK, 8),
         ];
-        let text = render_peers(&rows, &namer(), now).plain();
+        let text = render_peers(&rows, &namer(), now, CommandPrefix::Dot).plain();
         let cells: Vec<(String, String, String)> = table_rows(&text)
             .into_iter()
             .map(|row| (row[0].clone(), row[1].clone(), row[6].clone()))
@@ -9553,6 +9602,15 @@ fn sending_notice(who: &str, destination: &str) -> NoticeText {
     )
 }
 
+/// `sending_notice` for a follow-up on a question or message this node sent.
+fn follow_up_notice(who: &str, destination: &str) -> NoticeText {
+    NoticeText::from_template(
+        "Sending your follow-up to {who} ({dest8}) over the mesh...",
+        &[("dest8", short(destination))],
+        &[("who", who)],
+    )
+}
+
 fn declining_notice(destination: &str) -> String {
     format!(
         "Telling {} that you declined over the mesh...",
@@ -9762,11 +9820,9 @@ pub(crate) mod prompt_script {
         guard
     }
 
-    /// Forces a terminal on stdin and puts every question to `envoy answer`, which runs
-    /// between the verb's prompt and its write, so a test can change the files it is
-    /// about to write while the question stands. Its callers start a node, which the
-    /// tests only do on unix.
-    #[cfg(unix)]
+    /// Forces a terminal on stdin and puts every question to `answer`, which runs
+    /// between the verb's prompt and its write, so a test can change the state it is
+    /// about to write while the question stands.
     #[must_use]
     pub fn install_answering(answer: impl Fn(&str) -> bool + Send + Sync + 'static) -> ScriptGuard {
         let guard = install_with_state(TTY, &[]);
@@ -11482,11 +11538,17 @@ fn unheard_rows(
 }
 
 /// The table is quoted as it stands, since its name cells hold names peers advertised and
-/// your own names and no cell carries a hint; the lines under it follow the prefix. Rows
+/// your own names, so the one hint a cell carries, the command in the `no route` state, is
+/// spelled in `prefix` before it is quoted; the lines under it follow the prefix. Rows
 /// are grouped by user: you first, then the users with a name in name order, then the
 /// rest; within a user the rows keep the order they came in (newest heard first). Every
 /// row reads `<user>`, `<session>` as `namer` names them, with both short hashes last.
-fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText {
+fn render_peers(
+    rows: &[PeerRow],
+    namer: &Namer,
+    now: SystemTime,
+    prefix: CommandPrefix,
+) -> NoticeText {
     if rows.is_empty() {
         return "No users or sessions heard yet. Sessions appear here as their announces arrive."
             .into();
@@ -11512,6 +11574,7 @@ fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText 
     }
     let mut key_changes = Vec::new();
     let mut built: Vec<(Option<String>, Who, [String; 5])> = Vec::with_capacity(rows.len());
+    let no_route = prefix.render_hints(NO_ROUTE_STATE).into_owned();
     for row in rows {
         let (identity, destination, cells) = match row {
             PeerRow::Heard(peer, trust, key_changed, facts) => {
@@ -11525,11 +11588,11 @@ fn render_peers(rows: &[PeerRow], namer: &Namer, now: SystemTime) -> NoticeText 
                     ));
                 }
                 let marker = match successor {
-                    None if facts.own_gone => Some(NO_ROUTE_STATE.to_string()),
+                    None if facts.own_gone => Some(no_route.clone()),
                     None if peer.left_at.is_some() => {
                         peer.left_at.map(|left_at| left_state(now, left_at))
                     }
-                    None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),
+                    None if facts.no_route => Some(no_route.clone()),
                     _ => row_state(peer, successor, now),
                 };
                 let state = [marker, peer.compatibility_line()];
@@ -11677,7 +11740,7 @@ mod peers_route_tests {
     }
 
     fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
-        super::render_peers(rows, &Namer::default(), now)
+        super::render_peers(rows, &Namer::default(), now, CommandPrefix::Dot)
     }
 
     fn at(destination_byte: &str, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
@@ -11685,6 +11748,24 @@ mod peers_route_tests {
             destination_hash: destination_byte.repeat(16),
             ..peer(Some("Ann"), seen_secs_ago, now)
         }
+    }
+
+    /// Under the slash prefix the `no route` state spells its command `/mesh`, though the
+    /// table around it is quoted as it stands.
+    #[test]
+    fn the_no_route_state_spells_its_commands_in_the_live_prefix() {
+        let now = SystemTime::now();
+        let rows = [heard(at("11", 5, now), NO_PATH)];
+
+        let text = super::render_peers(&rows, &Namer::default(), now, CommandPrefix::Slash)
+            .render(CommandPrefix::Slash);
+
+        assert!(NO_ROUTE_STATE.contains(" .mesh people list "));
+        assert_eq!(
+            table_rows(&text)[0][5],
+            NO_ROUTE_STATE.replace(" .mesh ", " /mesh "),
+            "{text}"
+        );
     }
 
     /// A current row the transport holds no path to reads `no route`, and the legend says
@@ -11875,7 +11956,7 @@ mod peers_you_tests {
             ),
         ];
 
-        let text = render_peers(&rows, &namer(), now).plain();
+        let text = render_peers(&rows, &namer(), now, CommandPrefix::Dot).plain();
 
         let names: Vec<(String, String)> = table_rows(&text)
             .into_iter()
@@ -11923,7 +12004,7 @@ mod peers_you_tests {
             ),
         ];
 
-        let text = render_peers(&rows, &namer(), now).plain();
+        let text = render_peers(&rows, &namer(), now, CommandPrefix::Dot).plain();
 
         let cells = table_rows(&text);
         assert_eq!(
@@ -12820,7 +12901,7 @@ impl QuestionRow {
         let state = match record.state {
             PendingState::Open if record.kind == CorrelationKind::Message => "no reply yet",
             PendingState::Open => "open",
-            PendingState::Escalated => "escalated: the peer's human has been asked",
+            PendingState::Escalated => "escalated: that session's user has been asked",
             PendingState::Answered => AWAITING_THE_MODEL,
         };
         Self {
@@ -13380,7 +13461,7 @@ mod tests {
     /// `.mesh people list` as it renders with the mesh off: nothing is named, so every
     /// user and session reads as its short hash.
     fn render_peers(rows: &[PeerRow], now: SystemTime) -> NoticeText {
-        super::render_peers(rows, &Namer::default(), now)
+        super::render_peers(rows, &Namer::default(), now, CommandPrefix::Dot)
     }
 
     pub(super) fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
@@ -15216,7 +15297,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            super::render_peers(&rows, &snapshot_namer(), now).plain(),
+            super::render_peers(&rows, &snapshot_namer(), now, CommandPrefix::Dot).plain(),
             PEERS_SNAPSHOT.replace(
                 "{row separator}",
                 &row_separator(&[12, 16, 11, 6, 11, 177, 21])
@@ -16169,7 +16250,7 @@ mod tests {
         let namer = Namer::new(People::new(&entries, &[]), None, Default::default());
 
         let rows = unheard_rows(vec![record], &[], &[], |_| "trusted", |_| false);
-        let text = super::render_peers(&rows, &namer, now).plain();
+        let text = super::render_peers(&rows, &namer, now, CommandPrefix::Dot).plain();
 
         let rows = table_rows(&text);
         assert_eq!(rows.len(), 1, "{text:?}");
@@ -17651,7 +17732,7 @@ mod tests {
             [open.state, escalated.state, answered.state],
             [
                 "open",
-                "escalated: the peer's human has been asked",
+                "escalated: that session's user has been asked",
                 "answered, awaiting the model"
             ]
         );
@@ -20474,7 +20555,6 @@ mod tests {
         /// `clear` asks first and a no changes nothing; a yes empties the person's view,
         /// says how many the model still has to read, and leaves those for it. Clearing
         /// an empty view asks nothing, and what arrives afterwards is shown new.
-        #[cfg(unix)]
         #[test]
         #[serial]
         fn inbox_clear_asks_then_empties_the_view_and_leaves_the_model_its_unread() {
@@ -20547,7 +20627,6 @@ mod tests {
         /// A message that lands while the `clear` question is open was never counted, so
         /// it is neither cleared nor hidden: the next look shows it, new. The question
         /// says how many of the counted messages the person has not seen.
-        #[cfg(unix)]
         #[test]
         #[serial]
         fn inbox_clear_leaves_a_message_that_lands_while_it_asks() {
@@ -27282,8 +27361,15 @@ mod tests {
                         out.iter()
                             .filter(|line| line.contains("Sending your answer to"))
                             .count(),
-                        2,
-                        "each routed answer announces its destination before sending: {out:?}"
+                        1,
+                        "the answer announces its destination before sending: {out:?}"
+                    );
+                    assert_eq!(
+                        out.iter()
+                            .filter(|line| line.contains("Sending your follow-up to"))
+                            .count(),
+                        1,
+                        "the follow-up announces its destination before sending: {out:?}"
                     );
                     assert!(
                         out.iter().any(|line| line.contains(short(&asker_peer))),
@@ -27298,6 +27384,67 @@ mod tests {
                     assert!(
                         err.contains("unique prefix"),
                         "message never accepts an id: {err}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh messaging follow-up <id>` announces the follow-up as a follow-up to
+            /// the session it goes to, never as an answer, which is what `.mesh envoy
+            /// answer` sends. The peer is unheard, so the send fails fast at the trust
+            /// check after the line.
+            #[test]
+            #[serial]
+            fn a_follow_up_says_sending_your_follow_up_not_your_answer() {
+                use crate::mesh::pending::PENDING_RECORD_VERSION;
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-notice");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-follow-up-notice").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let asked_peer = "ab".repeat(16);
+                    let asked_identity = "cd".repeat(16);
+                    ctx.app
+                        .mesh
+                        .correlations()
+                        .open(crate::mesh::pending::PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: "q1".to_string(),
+                            peer_destination: asked_peer.clone(),
+                            peer_identity: asked_identity.clone(),
+                            thread: "q1".to_string(),
+                            question: "what now?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                            kind: CorrelationKind::Ask,
+                        })
+                        .unwrap();
+                    let before = stdout_lines().len();
+
+                    run(&mut ctx, ".mesh messaging follow-up q1 \"and then?\"")
+                        .await
+                        .unwrap_err();
+
+                    let out = stdout_lines()[before..].to_vec();
+                    let who = ctx.app.mesh.who(&asked_identity, &asked_peer);
+                    assert!(
+                        out.contains(&format!(
+                            "Sending your follow-up to {who} ({}) over the mesh...",
+                            short(&asked_peer)
+                        )),
+                        "{out:?}"
+                    );
+                    assert!(
+                        !out.iter().any(|line| line.contains("Sending your answer")),
+                        "{out:?}"
                     );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
@@ -28017,6 +28164,49 @@ mod tests {
                         started.relay_handle.abort();
                     });
                 }
+
+                /// A `.mesh files fetch` that gets no route opens its refusal on the
+                /// session's `<user> / <session>` name, as the fetch line names it, and
+                /// never spells the full hash.
+                #[test]
+                #[serial]
+                fn fetch_no_answer_leads_with_the_session_name() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-no-route-name");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-fetch-no-route-name").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let runtime = started.runtime.clone();
+                        let now = SystemTime::now();
+                        let (destination, _) = heard_peer(&runtime, "Tia", now);
+                        runtime
+                            .trust()
+                            .trust_destination(
+                                ctx.app.mesh.as_ref(),
+                                &destination,
+                                TrustOptions::default(),
+                                now,
+                            )
+                            .unwrap();
+
+                        let err = refusal(
+                            &mut ctx,
+                            &format!(".mesh files fetch {destination} docs/a.md"),
+                        )
+                        .await;
+
+                        let who = runtime.who_at(&destination).to_string();
+                        assert!(err.starts_with(&format!("{who} ")), "{err}");
+                        assert!(err.contains(short(&destination)), "{err}");
+                        assert!(err.contains("could not be reached"), "{err}");
+                        assert!(err.contains("A fetch runs live or not at all"), "{err}");
+                        assert!(!err.contains(&destination), "{err}");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
             }
 
             /// `.mesh files request` to a trusted peer nothing on the network can route to
@@ -28636,10 +28826,10 @@ mod tests {
                     );
 
                     // Contact verbs: the gate passes and the path lookup names the whole
-                    // destination, which is what would have gone on the wire.
+                    // destination, which is what would have gone on the wire; a fetch
+                    // leads its refusal with the session's name instead.
                     for line in [
                         format!(".mesh access ask {dest8} --yes"),
-                        format!(".mesh files fetch {dest8} docs/a.md"),
                         format!(".mesh people status {dest8}"),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
@@ -28648,6 +28838,14 @@ mod tests {
                             "{line}: {err}"
                         );
                     }
+                    let fetch = format!(".mesh files fetch {dest8} docs/a.md");
+                    let err = run(&mut ctx, &fetch).await.unwrap_err().to_string();
+                    assert!(
+                        err.starts_with(&format!(
+                            "Tia / {dest8} could not be reached: you asked the network for a route to it"
+                        )),
+                        "{fetch}: {err}"
+                    );
                     let out = out_of(&mut ctx, &format!(".mesh messaging send {dest8} \"hi\""))
                         .await
                         .unwrap();
@@ -50723,7 +50921,8 @@ mod tests {
                 /// The default dismissal's own copy: `.mesh messaging inbox` heads it `you ->`,
                 /// answering the question, carries the refused body and a
                 /// `disposition: refused` row read from this node's side; the person at the
-                /// keyboard gets the one idle line `you declined <dest8>'s question`; the
+                /// keyboard gets the one idle line `you declined the question from <who>
+                /// (<dest8>)`; the
                 /// stub heard the same refused reply. A second `.mesh messaging inbox` still shows
                 /// the copy, no longer new.
                 #[test]
@@ -50739,12 +50938,13 @@ mod tests {
                         fx.ctx.app.mesh.set_idle(idle.clone());
                         fx.file("p1", InboundKind::Question, &[]);
                         let dest8 = fx.dest();
+                        let who = fx.who();
 
                         out_of(&mut fx.ctx, ".mesh envoy dismiss p1").await.unwrap();
 
                         assert_eq!(
                             *idle.0.lock(),
-                            [format!("you declined {dest8}'s question")],
+                            [format!("you declined the question from {who} ({dest8})")],
                             "one idle line, saying what the human did"
                         );
                         let heard = fx.stub.seen();
@@ -52040,7 +52240,10 @@ mod tests {
                         assert_eq!(fx.heard(), HUMAN_DECLINED);
                         assert_eq!(
                             idle.0.lock().clone(),
-                            [format!("you declined {dest8}'s question")],
+                            [format!(
+                                "you declined the question from {} ({dest8})",
+                                fx.who()
+                            )],
                             "one idle line, once the asker heard"
                         );
                         assert_eq!(
@@ -52189,7 +52392,7 @@ mod tests {
                                     "question old-r from Stub / {} expired unanswered",
                                     fx.dest()
                                 ),
-                                format!("you declined {dest}'s question"),
+                                format!("you declined the question from {} ({dest})", fx.who()),
                             ],
                             "the expiry line comes before the dismissal's own line"
                         );
@@ -52583,7 +52786,11 @@ mod tests {
                         assert_eq!(
                             lines,
                             [
-                                sending(&fx),
+                                format!(
+                                    "Sending your follow-up to {} ({}) over the mesh...",
+                                    fx.who(),
+                                    fx.dest()
+                                ),
                                 reference_line("big.bin", 1025, &to),
                                 String::new(),
                                 format!(
@@ -54612,7 +54819,7 @@ mod tests {
                             [
                                 fx.fetching("docs/a.md"),
                                 String::new(),
-                                "The peer's copy of `docs/a.md` still has the sha256 you hold; nothing was fetched."
+                                "That session's copy of `docs/a.md` still has the sha256 you hold; nothing was fetched."
                                     .to_string(),
                             ],
                             "{out}"
@@ -54654,8 +54861,8 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{0} serves files of at most 4096 bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
-                                fx.dest()
+                                "{0} serves files of at most 4096 bytes and `docs/a.md` is larger. Ask the user of {0} for a smaller copy, or for the file another way.",
+                                fx.named()
                             )
                         );
 
@@ -54663,8 +54870,8 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{0} serves files of at most 4194304 bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
-                                fx.dest()
+                                "{0} serves files of at most 4194304 bytes and `docs/a.md` is larger. Ask the user of {0} for a smaller copy, or for the file another way.",
+                                fx.named()
                             )
                         );
 
@@ -54723,8 +54930,8 @@ mod tests {
                         assert_eq!(
                             refused,
                             format!(
-                                "{0} serves files of at most {1} bytes and `docs/a.md` is larger. Ask {0}'s human for a smaller copy, or for the file another way.",
-                                fx.dest(),
+                                "{0} serves files of at most {1} bytes and `docs/a.md` is larger. Ask the user of {0} for a smaller copy, or for the file another way.",
+                                fx.named(),
                                 under_one_segment
                             )
                         );
@@ -55019,7 +55226,7 @@ mod tests {
                         let digest = Sha256::digest(b"# a\n");
                         let unchanged = |path: &str| {
                             format!(
-                                "The peer's copy of `{path}` still has the sha256 you hold; nothing was fetched."
+                                "That session's copy of `{path}` still has the sha256 you hold; nothing was fetched."
                             )
                         };
                         let hash_match = |fx: &mut FetchFixture, path: &str| {
@@ -55589,8 +55796,9 @@ mod tests {
                         let dest = fx.stub.destination_hex();
                         let peer = short(&dest);
                         let retry = format!(
-                            "Try `.mesh files fetch {peer} docs/a.md` again; if it repeats, the peer may run a different Coyote."
+                            "Try `.mesh files fetch {peer} docs/a.md` again; if it repeats, that session may run a different Coyote."
                         );
+                        let named = fx.named();
                         let line = format!(".mesh files fetch {dest} docs/a.md");
                         let marker = b"MARKER-BYTES-NEVER-SHOWN";
 
@@ -55607,7 +55815,7 @@ mod tests {
                         assert_eq!(
                             corrupt,
                             format!(
-                                "{peer} did not deliver `docs/a.md`: the peer's bytes do not match the hash it sent. {retry}"
+                                "{named} did not deliver `docs/a.md`: the peer's bytes do not match the hash it sent. {retry}"
                             ),
                             "the mesh__fetch fact for a corrupt body: {corrupt}"
                         );
@@ -55618,7 +55826,7 @@ mod tests {
                         assert_eq!(
                             unknown,
                             format!(
-                                "{peer} did not deliver `docs/a.md`: peer sent an unknown status. {retry}"
+                                "{named} did not deliver `docs/a.md`: peer sent an unknown status. {retry}"
                             )
                         );
 
@@ -55628,7 +55836,7 @@ mod tests {
                         assert_eq!(
                             malformed,
                             format!(
-                                "{peer} did not deliver `docs/a.md`: the peer's reply could not be read: `bytes`. {retry}"
+                                "{named} did not deliver `docs/a.md`: the peer's reply could not be read: `bytes`. {retry}"
                             )
                         );
 

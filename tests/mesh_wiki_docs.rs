@@ -2376,9 +2376,10 @@ fn the_mesh_peers_sample_rows_follow_the_marker_rule_the_code_applies() {
         no_route_marker.starts_with("(no route: "),
         "NO_ROUTE_STATE no longer opens the way this test reads it: {no_route_marker:?}"
     );
+    let render = fn_body("src/repl/mesh.rs", "render_peers");
     assert!(
-        fn_body("src/repl/mesh.rs", "render_peers")
-            .contains("None if facts.no_route => Some(NO_ROUTE_STATE.to_string()),"),
+        render.contains("let no_route = prefix.render_hints(NO_ROUTE_STATE).into_owned();")
+            && render.contains("None if facts.no_route => Some(no_route.clone()),"),
         "render_peers no longer puts the no-route marker in place of stale, below superseded"
     );
     let left_template = string_literals(&fn_body("src/repl/mesh.rs", "left_state"))
@@ -5315,6 +5316,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     let fetch = progress_line("fetch", "over the mesh (up to {} s)...");
     let request = progress_line("send_request", "path(s); Ctrl-C cancels...");
     let sending = progress_line("sending_notice", "over the mesh...");
+    let follow_up = progress_line("follow_up_notice", "over the mesh...");
     let declining = progress_line("declining_notice", "that you declined over the mesh...");
     let route = progress_line(
         "route_request_line",
@@ -5342,6 +5344,16 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
     let sending_span = format!(
         "`{}`",
         sending
+            .replace("{who}", "<user> / <session>")
+            .replace("{dest8}", "<dest8>")
+    );
+    assert!(
+        follow_up.starts_with("Sending your follow-up to {who} ({dest8})"),
+        "the follow_up_notice progress line names the session as sending_notice does: {follow_up:?}"
+    );
+    let follow_up_span = format!(
+        "`{}`",
+        follow_up
             .replace("{who}", "<user> / <session>")
             .replace("{dest8}", "<dest8>")
     );
@@ -5418,6 +5430,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
                 request_span.clone(),
                 fetch_span("<path>"),
                 sending_span.clone(),
+                follow_up_span,
                 span(&declining),
                 route_span.clone(),
             ],
@@ -6210,7 +6223,9 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         "## The verbs",
     ));
     assert!(
-        verbs.contains(&format!("{head} {fetch_tail}")),
+        verbs.contains(&format!(
+            "<user> / <session> (<dest8>) {cause} {fetch_tail}"
+        )),
         "Mesh-File-Sharing.md's verbs do not quote the fetch's path-request refusal"
     );
     assert!(
@@ -7332,17 +7347,16 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         );
     }
     let outbound = string_literals(&method_body("src/repl/mesh.rs", "outbound"));
-    let (no_reply_yet, open, escalated) = (
-        "no reply yet",
-        "open",
-        "escalated: the peer's human has been asked",
+    assert_eq!(
+        outbound,
+        [
+            "no reply yet",
+            "open",
+            "escalated: that session's user has been asked",
+            "sent",
+        ],
+        "QuestionRow::outbound's state words (an open message's first) and label moved"
     );
-    for word in [no_reply_yet, open, escalated, "sent"] {
-        assert!(
-            outbound.iter().any(|literal| literal == word),
-            "QuestionRow::outbound no longer carries the state word or label {word:?}: {outbound:?}"
-        );
-    }
     assert!(
         method_body("src/repl/mesh.rs", "outbound")
             .contains("PendingState::Answered => AWAITING_THE_MODEL,"),
@@ -7350,7 +7364,9 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     );
     let awaiting = const_str("src/repl/mesh.rs", "AWAITING_THE_MODEL");
     assert_eq!(awaiting, "answered, awaiting the model");
-    let outbound: Vec<String> = vec![open.to_string(), escalated.to_string(), awaiting];
+    let outbound: Vec<String> = [outbound[1].clone(), outbound[2].clone(), awaiting]
+        .into_iter()
+        .collect();
     let inbound = string_literals(&method_body("src/repl/mesh.rs", "inbound"));
     assert_eq!(
         inbound,
@@ -9448,12 +9464,12 @@ fn both_pages_quote_the_not_shared_fetch_sentences_as_the_code_renders_them() {
 }
 
 /// Both pages quote the next step the REPL's `fetch` appends to a too-large refusal, the
-/// peer standing as `<dest8>`.
+/// session standing as `<user> / <session> (<dest8>)`.
 #[test]
 fn the_too_large_refusal_is_quoted_with_its_next_step_on_both_pages() {
     let fetch = fn_body("src/repl/mesh.rs", "fetch");
     assert!(
-        fetch.contains("return Err(too_large_refusal(peer, &shown, limit));"),
+        fetch.contains("return Err(too_large_refusal(&named, &shown, limit));"),
         "fetch no longer refuses a too-large file with too_large_refusal:\n{fetch}"
     );
     let next_step = string_literals(&fn_body("src/repl/mesh.rs", "too_large_refusal"))
@@ -9461,10 +9477,10 @@ fn the_too_large_refusal_is_quoted_with_its_next_step_on_both_pages() {
         .find_map(|literal| literal.find(" Ask ").map(|at| literal[at..].to_string()))
         .expect("too_large_refusal builds the refusal with a next step opening ` Ask `");
     assert!(
-        next_step.contains("{peer}") && next_step.ends_with('.'),
-        "the too-large next step names the peer and is a full sentence: {next_step:?}"
+        next_step.contains("{named}") && next_step.ends_with('.'),
+        "the too-large next step names the session and is a full sentence: {next_step:?}"
     );
-    let expected = next_step.replace("{peer}", "<dest8>");
+    let expected = next_step.replace("{named}", "<user> / <session> (<dest8>)");
     assert!(
         !expected.contains('{'),
         "a placeholder of the too-large next step has no wiki stand-in: {next_step:?}"
@@ -9940,33 +9956,33 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
 }
 
 /// A size refusal blames the limit of the node that holds it: `.mesh files fetch` is the client,
-/// so its sentence names the peer's limit; `.mesh files grant` judges a file against this node's
+/// so its sentence names the session's limit; `.mesh files grant` judges a file against this node's
 /// own `mesh.fetch.max_bytes`, so its pre-flight names this node's. The File-Sharing page
-/// quotes both sentences in one blockquote, with `<dest8>`, `<limit>`, `<size>` and `<id>`
-/// standing for the values.
+/// quotes both sentences in one blockquote, with `<user> / <session> (<dest8>)`, `<limit>`,
+/// `<size>` and `<id>` standing for the values.
 #[test]
 fn the_file_sharing_page_quotes_the_size_refusal_for_the_side_that_prints_it() {
     let fetch = fn_body("src/repl/mesh.rs", "fetch");
     assert!(
-        fetch.contains("return Err(too_large_refusal(peer, &shown, limit));"),
+        fetch.contains("return Err(too_large_refusal(&named, &shown, limit));"),
         "fetch no longer refuses a too-large file with too_large_refusal:\n{fetch}"
     );
     let too_large = fn_body("src/repl/mesh.rs", "too_large_refusal");
     assert!(
-        too_large.contains(r#"&[("peer", peer), ("limit", &limit.to_string())],"#)
-            && too_large.contains(r#"&[("shown", shown)],"#),
-        "too_large_refusal no longer frames the peer and its limit and quotes the path:\n{too_large}"
+        too_large.contains(r#"&[("limit", &limit.to_string())],"#)
+            && too_large.contains(r#"&[("named", named), ("shown", shown)],"#),
+        "too_large_refusal no longer frames the limit and quotes the session and the path:\n{too_large}"
     );
     let fetch_literal = string_literals(&too_large)
         .into_iter()
         .find(|literal| literal.contains("serves files of at most {limit} bytes"))
         .expect("too_large_refusal builds the refusal naming the peer's limit");
     assert!(
-        fetch_literal.starts_with("{peer} "),
-        "the `.mesh files fetch` size refusal names the peer first: {fetch_literal:?}"
+        fetch_literal.starts_with("{named} "),
+        "the `.mesh files fetch` size refusal names the session first: {fetch_literal:?}"
     );
     let fetch_side = fetch_literal
-        .replace("{peer}", "<dest8>")
+        .replace("{named}", "<user> / <session> (<dest8>)")
         .replace("{shown}", "docs/guide.md")
         .replace("{limit}", "<limit>");
     let refuse = fn_body("src/repl/mesh.rs", "refuse_unservable");

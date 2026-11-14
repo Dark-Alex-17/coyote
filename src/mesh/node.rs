@@ -1864,7 +1864,9 @@ impl MeshRuntime {
             .clone()
             .ok_or(RequestError::NotRunning)?;
         let sent = envelope.version;
-        // A peer whose last link failed, or that said it left, is not waited on for a path.
+        // A peer whose last link failed, or that said it left, is sent a path request. A
+        // foreground request, one the user typed, waits up to `GONE_PATH_GRACE` for the
+        // path; a background request does not wait and fails at once without one.
         let gone = self.peers.link_failed(&dest_hex)
             || self
                 .peers
@@ -5435,7 +5437,7 @@ impl MeshSlot {
                     if let Err(err) = runtime.send_peer(&destination, &out).await {
                         warn!(
                             "Mesh refusal of {id} to instance {dest8} could not be sent: {}",
-                            redact_hashes(&err.to_string())
+                            redact_hashes(&err.log_text())
                         );
                     }
                 });
@@ -5919,7 +5921,10 @@ impl MeshSlot {
         let dest8 = short(&record.peer_destination).to_string();
         let (text, note) = match reply_kind {
             HumanReply::Declined => (
-                NoticeText::from(format!("you declined {dest8}'s question")),
+                NoticeText::default()
+                    .frame("you declined the question from ")
+                    .peer(self.who(&record.peer_identity, &record.peer_destination))
+                    .frame(format!(" ({dest8})")),
                 "the human declined via `.mesh envoy dismiss`; nothing to do",
             ),
             HumanReply::Answered => {
@@ -10322,6 +10327,7 @@ mod tests {
             "the filed copy reads as this node's own, like an answer"
         );
         let dest8 = &to[..8];
+        let who = slot.who(&stub.identity_hex(), &to);
         let notes = slot.take_model_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(
@@ -10334,7 +10340,10 @@ mod tests {
             .iter()
             .map(|note| note.text.plain())
             .collect();
-        assert_eq!(idle_lines, [format!("you declined {dest8}'s question")]);
+        assert_eq!(
+            idle_lines,
+            [format!("you declined the question from {who} ({dest8})")]
+        );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }
@@ -13939,12 +13948,81 @@ mod tests {
             "{result:?}"
         );
         assert!(
-            waited < Duration::from_secs(1),
+            waited < GONE_PATH_GRACE,
             "a background request does not wait on the path request: {waited:?}"
         );
         assert!(stub.seen().is_empty());
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
+    }
+
+    /// A gone session that nothing answers for: a foreground request waits out
+    /// `GONE_PATH_GRACE` on the path request it sends, then fails naming no known path
+    /// without a second wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreground_request_to_a_gone_session_fails_after_about_the_gone_path_grace() {
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-gone-foreground-silent").await;
+        let runtime = started.runtime.clone();
+        runtime.peers().mark_link_failed(&stub.destination_hex());
+        stub.stop().await;
+        let foreground = RequestOptions {
+            foreground: true,
+            ..RequestOptions::default()
+        };
+        assert!(foreground.link_timeout > GONE_PATH_GRACE);
+
+        let asked = Instant::now();
+        let result = runtime
+            .request(&desc, "/echo", rmpv::Value::Nil, foreground)
+            .await;
+        let waited = asked.elapsed();
+
+        assert!(
+            matches!(&result, Err(RequestError::LinkNotOpened(reason)) if reason.contains("no known path")),
+            "{result:?}"
+        );
+        assert!(
+            waited >= GONE_PATH_GRACE && waited < GONE_PATH_GRACE + Duration::from_secs(2),
+            "the foreground request waited {waited:?} for the path"
+        );
+        assert!(slot.stop().await.unwrap());
+    }
+
+    /// The same silent gone session under a link timeout shorter than `GONE_PATH_GRACE`:
+    /// the foreground wait stops at the link timeout instead.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_short_link_timeout_caps_the_gone_path_grace() {
+        let (stub, started, slot, desc) =
+            held_peer_whose_path_expired("node-gone-foreground-capped").await;
+        let runtime = started.runtime.clone();
+        runtime.peers().mark_link_failed(&stub.destination_hex());
+        stub.stop().await;
+        let link_timeout = Duration::from_millis(500);
+        let foreground = RequestOptions {
+            foreground: true,
+            link_timeout,
+            ..RequestOptions::default()
+        };
+
+        let asked = Instant::now();
+        let result = runtime
+            .request(&desc, "/echo", rmpv::Value::Nil, foreground)
+            .await;
+        let waited = asked.elapsed();
+
+        assert!(
+            matches!(&result, Err(RequestError::LinkNotOpened(reason)) if reason.contains("no known path")),
+            "{result:?}"
+        );
+        assert!(
+            waited >= link_timeout && waited < link_timeout + Duration::from_secs(1),
+            "the foreground request waited {waited:?}, past its {link_timeout:?} link timeout"
+        );
+        assert!(waited < GONE_PATH_GRACE, "{waited:?}");
+        assert!(slot.stop().await.unwrap());
     }
 
     /// After a restart the runtime has heard no announce, so its transport holds neither
