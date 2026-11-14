@@ -9,10 +9,15 @@
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+use std::process::{Command, Output};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn asset(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -523,8 +528,10 @@ fn diff_facts_resolves_the_diff_base_of_each_spec_form() {
 }
 
 /// Kills and reaps the lock holder even when an assertion panics mid-run.
+#[cfg(unix)]
 struct ChildGuard(Child);
 
+#[cfg(unix)]
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.0.kill();
