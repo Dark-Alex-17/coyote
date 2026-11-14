@@ -1873,7 +1873,7 @@ fn baseline_tests_reuses_the_record_stored_on_a_clean_tree() {
     let head = git(&dir.0, &["rev-parse", "HEAD"]);
     let key = sha256_hex(&format!("{head}\n.\n{cmd}"));
     let record = baseline_store(&dir.0).join(format!("tests-{}.json", &key[..16]));
-    assert_eq!(stored_records(&dir.0), [record.clone()]);
+    assert_eq!(stored_records(&dir.0), std::slice::from_ref(&record));
     let stored: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
     let workdir = str_field(&stored, "workdir");
     assert!(
