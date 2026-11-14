@@ -98,6 +98,9 @@ IMPORT_LINE_ERE = (
     "|((const|let|var)[[:space:]]+[A-Za-z0-9_$]+[[:space:]]*=[[:space:]]*)?require[[:space:]]*\\()"
 )
 WORD_BOUNDARY_ERE = "([^A-Za-z0-9_]|$)"
+# Mid-pattern, the boundary before a token is a plain non-word character: BSD
+# grep mishandles a `$` alternative that is not at the end of the pattern.
+NON_WORD_ERE = "[^A-Za-z0-9_]"
 TOKEN_CAP = 5
 IMPORT_TOKEN_CAP = 10
 MIN_TOKEN = 6
@@ -243,7 +246,7 @@ try:
             probes = [
                 (tok, ["-F" if tok in substring_tokens else "-wF", "-e", tok]) for tok in tokens
             ] + [
-                (display, ["-E", "-e", f"{IMPORT_LINE_ERE}(.*{WORD_BOUNDARY_ERE})?{pattern}{WORD_BOUNDARY_ERE}"])
+                (display, ["-E", "-e", f"{IMPORT_LINE_ERE}(.*{NON_WORD_ERE})?{pattern}{WORD_BOUNDARY_ERE}"])
                 for display, pattern in imports
             ]
             for tok, pattern in probes:
