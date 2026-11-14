@@ -20,8 +20,8 @@ YES_FILLER=" please thanks thank you go looks look sounds all right alright the 
 NO_WORDS=" no n nope reject rejected stop abort cancel decline declined "
 NO_FILLER=" please thanks thank you sorry the plan this it that i "
 
-APPROVAL_ANSWER=$(printf '%s' "$state" | jq -r '.approval_answer // "" | tostring | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "")')
-export APPROVAL_ANSWER
+ANSWER_JQ='.approval_answer // "" | tostring | gsub("\\s+"; " ") | sub("^ "; "") | sub(" $"; "")'
+APPROVAL_ANSWER=$(printf '%s' "$state" | jq -r "$ANSWER_JQ")
 # Typographic apostrophes become ASCII ones before everything but letters,
 # digits and apostrophes turns into spaces.
 words=$(printf '%s' "$APPROVAL_ANSWER" | sed "s/$(printf '\342\200\231')/'/g" | tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E "s/[^a-z0-9']+/ /g")
@@ -66,9 +66,11 @@ case "$side" in
     jq -nc '{"_next": "end_rejected", "approval_reask": ""}'
     ;;
   *)
-    jq -nc '{
+    # The answer is echoed from the state JSON, never through the environment,
+    # which does not carry non-ASCII text intact on every platform.
+    printf '%s' "$state" | jq -c "($ANSWER_JQ)"' as $answer | {
       "_next": "gate_approval",
-      "approval_reask": ("Your previous answer \"" + env.APPROVAL_ANSWER + "\" was not understood. Answer exactly yes or no.")
+      "approval_reask": ("Your previous answer \"" + $answer + "\" was not understood. Answer exactly yes or no.")
     }'
     ;;
 esac
