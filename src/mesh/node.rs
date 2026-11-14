@@ -3439,9 +3439,10 @@ fn note_return(runtime: &Weak<MeshRuntime>, destination: &str) {
 /// instance sent just before its farewell can still be let through after it and lift the
 /// fresh mark; the mark is advisory and the instance was alive a moment ago.
 ///
-/// A status request or a message other than a farewell also says the sender trusts this
-/// node, so its card is fetched in the background as `CardTrigger::Contacted` allows.
-/// The fetch is only spawned: the dispatcher waits on nothing here.
+/// A status request also says the sender trusts this node, so its card is fetched in the
+/// background as `CardTrigger::Contacted` allows; the fetch is only spawned, and the
+/// dispatcher waits on nothing here. A message prompts the same fetch once it is taken
+/// in, through `MeshSlot::note_served_by`, which held mail reaches too.
 struct AllowedRequestHook {
     peers: Arc<PeerTable>,
     runtime: Weak<MeshRuntime>,
@@ -3449,31 +3450,38 @@ struct AllowedRequestHook {
 
 impl AllowObserver for AllowedRequestHook {
     fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &rmpv::Value) {
-        let is_status = path_hash == PathHash::of(STATUS_PATH);
-        let is_message = path_hash == PathHash::of(MESSAGE_PATH);
-        if is_message
+        let destination = destination.to_hex_string();
+        self.lift_left_mark(&destination, path_hash, body);
+        if path_hash == PathHash::of(STATUS_PATH)
+            && let Some(runtime) = self.runtime.upgrade()
+        {
+            runtime.consider_card_fetch(&destination, CardTrigger::Contacted);
+        }
+    }
+}
+
+impl AllowedRequestHook {
+    fn lift_left_mark(&self, destination: &str, path_hash: PathHash, body: &rmpv::Value) {
+        // Most requests come from instances not marked left; they skip the body read.
+        if self
+            .peers
+            .get(destination)
+            .is_none_or(|row| row.left_at.is_none())
+        {
+            return;
+        }
+        if path_hash == PathHash::of(MESSAGE_PATH)
             && from_request_body(body)
                 .is_ok_and(|body| is_farewell(body.kind, body.fields.as_ref()))
         {
             return;
         }
-        let destination = destination.to_hex_string();
-        if self
-            .peers
-            .get(&destination)
-            .is_some_and(|row| row.left_at.is_some())
-            && self.peers.clear_left(&destination)
-        {
+        if self.peers.clear_left(destination) {
             debug!(
                 "Mesh instance {} was heard over a link; no longer marked left",
-                short(&destination)
+                short(destination)
             );
-            note_return(&self.runtime, &destination);
-        }
-        if (is_status || is_message)
-            && let Some(runtime) = self.runtime.upgrade()
-        {
-            runtime.consider_card_fetch(&destination, CardTrigger::Contacted);
+            note_return(&self.runtime, destination);
         }
     }
 }

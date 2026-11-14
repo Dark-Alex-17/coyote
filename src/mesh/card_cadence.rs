@@ -39,8 +39,10 @@ pub(crate) enum CardTrigger {
     Heard,
     /// The session sent this node a status request or a message, so it trusts this
     /// node: asked whether or not it served this node, as after the owner's grant. When
-    /// it lifts a refusal stop it is asked at once, since the refused ask brought no card
-    /// and the trust on its side has changed; otherwise the interval applies, so a
+    /// it lifts a stop it is asked at once, since the stopped ask brought no card and the
+    /// trust on its side has changed; that skips the interval once per interval at most,
+    /// so a session that keeps refusing while it keeps writing costs one fetch per
+    /// interval as any other does. Without a stop to lift the interval applies, so a
     /// chatty session costs one fetch per interval at most.
     Contacted,
 }
@@ -67,10 +69,14 @@ struct CadenceState {
     heard: HashSet<String>,
     /// When each destination was last asked in the background.
     last_asked: HashMap<String, Instant>,
-    /// Destinations whose last answer was a refusal; not asked in the background again
-    /// until the trust on either side changes or the owner asks by hand. Kept across
-    /// runs in the instance's card-refusal list, so a restart does not ask again.
+    /// Destinations whose last answer was a refusal or no answer at all, which is how a
+    /// session that does not trust this one yet often looks; not asked in the background
+    /// again until the trust on either side changes or the owner asks by hand. Kept
+    /// across runs in the instance's card-refusal list, so a restart does not ask again.
     refused: HashSet<String>,
+    /// When a contact last skipped the interval of each destination, so it skips it once
+    /// per interval at most.
+    contact_skipped: HashMap<String, Instant>,
 }
 
 impl Default for CardCadence {
@@ -144,14 +150,16 @@ impl CardCadence {
                 }
             }
             CardTrigger::Granted | CardTrigger::OwnerGranted => {
-                if state.refused.remove(destination) {
-                    self.save_refusals(&state);
-                }
+                self.clear_stop(&mut state, destination);
             }
             CardTrigger::Contacted => {
-                if state.refused.remove(destination) {
+                let skipped_lately = state
+                    .contact_skipped
+                    .get(destination)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < CARD_FETCH_MIN_INTERVAL);
+                if self.clear_stop(&mut state, destination) && !skipped_lately {
                     state.last_asked.remove(destination);
-                    self.save_refusals(&state);
+                    state.contact_skipped.insert(destination.to_string(), now);
                 }
             }
         }
@@ -171,7 +179,7 @@ impl CardCadence {
     }
 
     /// The session refused a status request: no background fetch asks it again until
-    /// `lift`.
+    /// `lift`, in this run or a later one.
     pub(crate) fn refused(&self, destination: &str) {
         let mut state = self.state.lock();
         if state.refused.insert(destination.to_string()) {
@@ -184,9 +192,7 @@ impl CardCadence {
     /// later revoke) or the owner asked for its card by hand.
     pub(crate) fn lift(&self, destination: &str) {
         let mut state = self.state.lock();
-        if state.refused.remove(destination) {
-            self.save_refusals(&state);
-        }
+        self.clear_stop(&mut state, destination);
     }
 
     /// The owner forgot the session's user: the session starts out as one never asked,
@@ -195,9 +201,18 @@ impl CardCadence {
         let mut state = self.state.lock();
         state.heard.remove(destination);
         state.last_asked.remove(destination);
-        if state.refused.remove(destination) {
-            self.save_refusals(&state);
+        state.contact_skipped.remove(destination);
+        self.clear_stop(&mut state, destination);
+    }
+
+    /// Lifts the stop `destination` is under, writing the refusals when it changed;
+    /// returns whether there was a stop to lift.
+    fn clear_stop(&self, state: &mut CadenceState, destination: &str) -> bool {
+        let refused = state.refused.remove(destination);
+        if refused {
+            self.save_refusals(state);
         }
+        refused
     }
 
     /// Written under the state lock, so the writes reach the disk in the order the
@@ -501,6 +516,27 @@ mod tests {
         );
         cadence.advance(CARD_FETCH_MIN_INTERVAL);
         assert!(cadence.admit(D, CardTrigger::Contacted, false));
+    }
+
+    /// A session that refuses every ask but keeps contacting this node skips the interval
+    /// once, then costs one fetch per interval like any other.
+    #[test]
+    fn a_contact_skips_the_interval_once_per_interval() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::OwnerGranted, false));
+        cadence.refused(D);
+        assert!(cadence.admit(D, CardTrigger::Contacted, false));
+        cadence.refused(D);
+        assert!(
+            !cadence.admit(D, CardTrigger::Contacted, false),
+            "a second refusal within the interval is not skipped past"
+        );
+        assert!(!cadence.is_refused(D), "the contact still lifts the stop");
+        cadence.refused(D);
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(cadence.admit(D, CardTrigger::Contacted, false));
+        cadence.refused(D);
+        assert!(!cadence.admit(D, CardTrigger::Contacted, false));
     }
 
     #[test]

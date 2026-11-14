@@ -526,14 +526,13 @@ impl PeerTable {
                 let mut served = marks_on_disk
                     .remove(&record.destination_hash)
                     .unwrap_or_default();
-                match &own {
-                    Some(own) => {
-                        served.remove(own);
-                        if record.served_instances.contains(own) {
-                            served.insert(own.clone());
-                        }
+                // Before `claim_served` this node marks nothing, so the disk's marks are
+                // the whole truth.
+                if let Some(own) = &own {
+                    served.remove(own);
+                    if record.served_instances.contains(own) {
+                        served.insert(own.clone());
                     }
-                    None => served.extend(record.served_instances.iter().cloned()),
                 }
                 record.served_instances = served;
                 record

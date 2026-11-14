@@ -3,7 +3,7 @@
 //! fetch outlasts a restart.
 
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
-use crate::mesh::{mesh_cache_dir, redact_hashes, write_atomically};
+use crate::mesh::{mesh_cache_dir, redact_hashes, write_atomically_owner_only};
 
 use anyhow::{Context, Result, anyhow, bail};
 use log::warn;
@@ -71,8 +71,9 @@ pub(crate) fn load_card_refusals(path: &Path) -> Result<HashSet<String>> {
     Ok(file.refused.into_iter().collect())
 }
 
-/// Writes `refused` to `path`. A failed write is only warned about: the set held in
-/// memory still stops the fetch for this run.
+/// Writes `refused` to `path`, readable by its owner only since it names the sessions
+/// that refused this user. A failed write is only warned about: the set held in memory
+/// still stops the fetch for this run.
 pub(crate) fn save_card_refusals(path: &Path, refused: &HashSet<String>) {
     let file = CardRefusalsFile {
         version: CARD_REFUSALS_VERSION,
@@ -80,7 +81,7 @@ pub(crate) fn save_card_refusals(path: &Path, refused: &HashSet<String>) {
     };
     let written = serde_json::to_vec_pretty(&file)
         .context("Failed to serialize the mesh card-refusal list")
-        .and_then(|json| write_atomically(path, &json));
+        .and_then(|json| write_atomically_owner_only(path, &json));
     if let Err(err) = written {
         warn!(
             "Failed to persist mesh card-refusal list: {}",
@@ -128,6 +129,13 @@ mod tests {
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains(says), "{err}");
         assert!(err.ends_with(&Remedy::Cache.sentence()), "{err}");
+        let words = err.replace(&path.display().to_string(), "").to_lowercase();
+        for word in ["peer", "owner", "node", "person"] {
+            assert!(
+                !words.contains(word),
+                "user-facing text says {word:?}: {err}"
+            );
+        }
         assert_eq!(
             fs::read(&path).unwrap(),
             bytes,
