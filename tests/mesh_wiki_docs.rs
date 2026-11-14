@@ -832,6 +832,28 @@ fn the_mesh_page_carries_the_send_ask_and_collect_one_liners_the_declarations_op
     }
 }
 
+/// `mesh__check_inbox` lists escalated questions under `escalated` as bare id strings and
+/// escalated messages apart under `escalated_messages`; the Mesh page's tool row names
+/// both keys and says the messages have nothing to collect. The code side is checked on
+/// every run.
+#[test]
+fn the_mesh_page_names_both_escalated_lists_the_inbox_tool_returns() {
+    let inbox = fn_body("src/function/mesh.rs", "handle_check_inbox");
+    for needle in [
+        "\"escalated\": escalated_of(CorrelationKind::Ask),",
+        "\"escalated_messages\": escalated_of(CorrelationKind::Message),",
+    ] {
+        assert!(
+            inbox.contains(needle),
+            "handle_check_inbox no longer writes {needle:?}"
+        );
+    }
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    let row = "`escalated` lists the ids of your open questions whose session has asked its user, and `escalated_messages` the ids of your open messages in the same state, which have nothing to collect";
+    assert!(page.contains(row), "Mesh.md does not say {row:?}");
+}
+
 /// The `thread` argument both send tools share says to omit it for a new conversation
 /// and that any other value than a continued thread is refused; the Mesh page's
 /// `mesh__send` row says the same of its `thread` cell, the `mesh__ask` row points its
