@@ -7,8 +7,10 @@
 //! roster and its answer reaches the child, and the transcript is printed on
 //! the normal screen when the UI leaves with the pager open. The root agent
 //! and the child talk to two separate fake models, so the order of their
-//! requests is fixed. Unix-only, as the pty it drives is; the cases run one
-//! at a time.
+//! requests is fixed. The pager's own keys over one tool's whole output
+//! (scrolling a long one, CRLF line endings, an output over the per-call
+//! cap) live here too. Unix-only, as the pty it drives is; the cases run
+//! one at a time.
 #![cfg(unix)]
 
 mod common;
@@ -1012,4 +1014,291 @@ fn roster_band(frame: &str) -> &str {
         .rfind("Esc = close")
         .unwrap_or_else(|| panic!("the roster's legend is not on screen:\n{frame}"));
     frame[legend..].split('\u{2500}').next().unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// The pager's scroll keys over a long output, CRLF line endings, and an
+// output over the per-call cap.
+// ---------------------------------------------------------------------------
+
+/// A tool that writes a hundred and twenty numbered lines to stderr.
+const LONG_OUTPUT_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Print a hundred and twenty numbered lines.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   for i in $(seq -w 1 120); do echo \"pq-$i\" >&2; done\n\
+    \x20   echo \"fixture printed many s3k\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Runs `tool` (saved as `file`, called as `name`) in one turn that ends
+/// with `reply`, and hands back the pty once the reply is on screen.
+fn one_tool_turn(dir: &Path, name: &str, file: &str, tool: &str, reply: &str) -> (Pty, FakeLlm) {
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: name.to_string(),
+            arguments: "{}".to_string(),
+        },
+        Reply::Text(reply.to_string()),
+    ]);
+    write_fake_llm_config(dir, &fake);
+    write_tool(dir, file, tool);
+    let mut pty = spawn_tui(dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"run the tool\r").unwrap();
+    wait_for_squeezed(&mut pty, reply, "the reply after the tool");
+    pty.read_for(Duration::from_millis(500));
+    (pty, fake)
+}
+
+fn quit_from_composer(mut pty: Pty) {
+    // One key on an empty composer: a second one typed after the UI left
+    // would be echoed into the report the wrapper prints.
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert!(!transcript.contains("panicked"), "{transcript}");
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The pager over a long output: `G` goes to the end, PgUp leaves it and
+/// PgDn comes back, `g` goes to the top, `j` scrolls down a line at a time
+/// and `k` back up, and `q` closes it with the composer taking keys.
+#[test]
+#[serial]
+fn the_pager_scroll_keys_move_through_a_long_output() {
+    let dir = fresh_config_dir("pager-scroll");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, _fake) = one_tool_turn(
+        &dir,
+        "fixture_long",
+        "fixture_long.sh",
+        LONG_OUTPUT_TOOL,
+        "fixture done s3k",
+    );
+
+    pty.send(b"\x14").unwrap();
+    frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Ctrl+T did not open the pager",
+    );
+
+    pty.send(b"G").unwrap();
+    let end = frame_showing(&mut pty, "pq-120", "G did not show the last output line");
+    assert!(
+        !end.contains("pq-001"),
+        "G left the first line on screen:\n{end}"
+    );
+
+    pty.send(b"\x1b[5~").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let up = frame_showing(&mut pty, "j/k scroll", "the pager went away on PgUp");
+    assert!(
+        !up.contains("pq-120"),
+        "PgUp did not move off the end:\n{up}"
+    );
+    assert!(
+        up.contains("pq-0") || up.contains("pq-1"),
+        "PgUp left no output on screen:\n{up}"
+    );
+
+    pty.send(b"\x1b[6~").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    frame_showing(&mut pty, "pq-120", "PgDn did not come back to the end");
+
+    pty.send(b"g").unwrap();
+    let top = frame_showing(&mut pty, "pq-001", "g did not go to the top");
+    assert!(
+        !top.contains("pq-120"),
+        "g left the last line on screen:\n{top}"
+    );
+
+    for _ in 0..12 {
+        pty.send(b"j").unwrap();
+        pty.read_for(Duration::from_millis(60));
+    }
+    let down = frame_showing(&mut pty, "pq-030", "j scrolled away the whole output");
+    assert!(
+        !down.contains("pq-001"),
+        "twelve j presses did not scroll the first output line off:\n{down}"
+    );
+    for _ in 0..12 {
+        pty.send(b"k").unwrap();
+        pty.read_for(Duration::from_millis(60));
+    }
+    frame_showing(
+        &mut pty,
+        "pq-001",
+        "k did not scroll back to the first line",
+    );
+
+    pty.send(b"q").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let back = frame_showing(&mut pty, "no session", "q did not close the pager");
+    assert!(!squeezed(&back).contains("Thread:rootthread"), "{back}");
+    pty.send(b"after scroll m4t").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "after scroll m4t",
+        "keys did not reach the composer",
+    );
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit_from_composer(pty);
+}
+
+/// A tool whose output lines end in CRLF, some with the `\r` and the
+/// `\n` written apart so they reach the UI in two reads, and one progress
+/// line that rewrites itself with a bare `\r`.
+const CRLF_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Print lines ending in CRLF.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   for i in $(seq -w 1 30); do printf 'cr-%s tail-w7\\r\\n' \"$i\" >&2; done\n\
+    \x20   for i in 1 2 3; do printf 'split-%s end-w7\\r' \"$i\" >&2; sleep 0.3; printf '\\n' >&2; done\n\
+    \x20   printf 'progress 50%%\\r' >&2; sleep 0.3; printf 'progress 99%% p2q\\n' >&2\n\
+    \x20   echo \"fixture printed crlf c6r\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// CRLF line endings in a tool's whole output show in the pager as plain
+/// lines: every line whole and no carriage return reaching the terminal
+/// from the pager's text.
+#[test]
+#[serial]
+fn crlf_line_endings_show_in_the_pager_as_whole_lines() {
+    let dir = fresh_config_dir("pager-crlf");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, _fake) = one_tool_turn(
+        &dir,
+        "fixture_crlf",
+        "fixture_crlf.sh",
+        CRLF_TOOL,
+        "fixture done c6r",
+    );
+    pty.send(b"\x14").unwrap();
+    frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Ctrl+T did not open the pager",
+    );
+    pty.send(b"G").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let wanted: Vec<String> = (28..=30)
+        .map(|i| format!("cr-{i:02} tail-w7"))
+        .chain((1..=3).map(|i| format!("split-{i} end-w7")))
+        .chain(["progress 99% p2q".to_string()])
+        .collect();
+    // Each pass is a real resize (the height flips), so the UI repaints
+    // every cell and the pass holds the whole page.
+    let mut frame = String::new();
+    for rows in [31, 33, 31, 33, 31] {
+        pty.read_for(Duration::from_millis(300));
+        let from = pty.raw().len();
+        pty.resize(rows, 100).unwrap();
+        pty.read_for(Duration::from_millis(900));
+        let raw = pty.raw()[from..].to_vec();
+        assert!(
+            !raw.contains(&b'\r'),
+            "the pager's repaint carries a carriage return: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        frame = strip_ansi(&String::from_utf8_lossy(&raw));
+        if wanted.iter().all(|line| frame.contains(line.as_str())) {
+            break;
+        }
+    }
+    for line in &wanted {
+        assert!(
+            frame.contains(line.as_str()),
+            "the pager lost {line:?}:\n{frame}"
+        );
+    }
+    assert!(!frame.contains("^M"), "the pager shows ^M:\n{frame}");
+    pty.send(b"q").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    quit_from_composer(pty);
+}
+
+/// A tool that prints well over four MiB to stderr, then a last marker.
+const HUGE_OUTPUT_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Print a lot.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   echo \"huge-first-line-b1g\" >&2\n\
+    \x20   yes 'huge-filler-0123456789-abcdefghijklmnopqrstuvwxyz-0123456789' | head -n 90000 >&2\n\
+    \x20   echo \"huge-last-line-b1g\" >&2\n\
+    \x20   echo \"fixture printed huge h9u\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// An output over the per-call cap keeps the UI responsive: the turn
+/// finishes, the pager opens over it, its end is reachable, and at the top
+/// a note says how much of the start was not kept (the cap keeps the
+/// tail, so the first line is gone), and the find still works over the
+/// kept text.
+#[test]
+#[serial]
+fn an_output_over_the_cap_pages_with_a_visible_note() {
+    let dir = fresh_config_dir("pager-huge");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, _fake) = one_tool_turn(
+        &dir,
+        "fixture_huge",
+        "fixture_huge.sh",
+        HUGE_OUTPUT_TOOL,
+        "fixture done h9u",
+    );
+    pty.send(b"\x14").unwrap();
+    frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Ctrl+T did not open the pager",
+    );
+    pty.send(b"G").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    frame_showing(
+        &mut pty,
+        "huge-last-line-b1g",
+        "G did not reach the output's end",
+    );
+    pty.send(b"g").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let top = frame_showing(&mut pty, "fixture_huge({})", "g did not reach the top");
+    assert!(
+        top.contains("bytes not kept"),
+        "no visible note at the top that the output was cut:\n{top}"
+    );
+    assert!(
+        !top.contains("huge-first-line-b1g"),
+        "the output was not cut, the first line is still kept:\n{top}"
+    );
+    pty.send(b"/huge-last-line").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\r").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    let found = frame_showing(
+        &mut pty,
+        "huge-last-line-b1g",
+        "find did not reach the last line of a capped output",
+    );
+    assert!(!found.contains("No match"), "{found}");
+    pty.send(b"q").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"alive after huge").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "alive after huge",
+        "keys did not reach the composer",
+    );
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    quit_from_composer(pty);
 }

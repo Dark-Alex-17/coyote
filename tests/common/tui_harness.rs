@@ -393,10 +393,21 @@ fn both_streams_within(
     )
 }
 
+/// The rest of the first wrapper report line carrying `key`. The key may
+/// sit anywhere on its line, since a restored tty echoes the keys typed
+/// last (`^D` and its backspaces) ahead of the report; an occurrence
+/// right after a `-` is the job-control wrapper's `stopped-` report and
+/// is skipped.
+fn report_field<'a>(transcript: &'a str, key: &str) -> Option<&'a str> {
+    transcript.lines().find_map(|line| {
+        line.match_indices(key)
+            .find(|(at, _)| !line[..*at].ends_with('-'))
+            .map(|(at, _)| &line[at + key.len()..])
+    })
+}
+
 pub fn tty_flag_tokens(transcript: &str) -> Vec<&str> {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
+    let flags = report_field(transcript, "tty-flags: ")
         .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
     flags
         .split(|c: char| c.is_whitespace() || c == ';')
@@ -422,9 +433,7 @@ pub fn assert_tty_restored(transcript: &str) {
 }
 
 pub fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
+    report_field(transcript, "exit=")
         .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
         .trim()
         .parse()
@@ -432,9 +441,7 @@ pub fn exit_code(transcript: &str) -> i32 {
 }
 
 pub fn child_pid(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("cpid="))
+    report_field(transcript, "cpid=")
         .unwrap_or_else(|| panic!("no cpid= line in the transcript:\n{transcript}"))
         .trim()
         .parse()
@@ -451,6 +458,94 @@ pub fn answer_field_modal(pty: &mut Pty, text: &str) {
 
 pub const ENTER_ALT: &[u8] = b"\x1b[?1049h";
 pub const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
+pub const PASTE_ON: &[u8] = b"\x1b[?2004h";
+pub const PASTE_OFF: &[u8] = b"\x1b[?2004l";
+pub const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
+pub const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+
+/// The UI hides the cursor on every frame and never positions one, so
+/// the only `show` is the leave sequence's: it must come after the last
+/// `hide` and before `before`, the offset at which the shell or the
+/// wrapper's report took over the terminal.
+pub fn assert_cursor_shown_before(raw: &[u8], before: usize, what: &str) {
+    let window = &raw[..before];
+    let shown = rfind(window, CURSOR_SHOW)
+        .unwrap_or_else(|| panic!("the cursor was never shown before {what}"));
+    let hidden = rfind(window, CURSOR_HIDE);
+    assert!(
+        hidden.is_none_or(|hidden| hidden < shown),
+        "the cursor was hidden again after it was shown, before {what} \
+         (hide={hidden:?}, show={shown})"
+    );
+}
+
+/// Kitty keyboard push (`ESC [ > <flags> u`) or pop (`ESC [ < <count> u`),
+/// by its introducer byte.
+fn find_keyboard_stack_op(haystack: &[u8], introducer: u8, from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(start) = find(haystack, &[0x1b, b'[', introducer], at) {
+        let rest = &haystack[start + 3..];
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits > 0 && rest.get(digits) == Some(&b'u') {
+            return Some(start);
+        }
+        at = start + 1;
+    }
+    None
+}
+
+pub fn find_keyboard_push(haystack: &[u8], from: usize) -> Option<usize> {
+    find_keyboard_stack_op(haystack, b'>', from)
+}
+
+pub fn rfind_keyboard_pop(haystack: &[u8]) -> Option<usize> {
+    let mut last = None;
+    let mut from = 0;
+    while let Some(at) = find_keyboard_stack_op(haystack, b'<', from) {
+        last = Some(at);
+        from = at + 1;
+    }
+    last
+}
+
+/// Waits for the alternate screen to be re-entered after `from` and gives
+/// raw mode the moment it needs to be re-applied before any key is sent.
+/// Returns the re-entry offset.
+pub fn wait_for_re_entry(pty: &mut Pty, from: usize) -> usize {
+    let re_entered = pty
+        .wait_for_raw(ENTER_ALT, from, PTY_DEADLINE)
+        .expect("the alternate screen was not re-entered");
+    pty.wait_for_raw(PASTE_ON, re_entered, PTY_DEADLINE)
+        .expect("bracketed paste was not re-enabled on re-entry");
+    // Raw mode is re-applied a few syscalls after the mode sequences are
+    // written; keys sent inside that window are still cooked (echoed,
+    // CR->NL). A person cannot type that fast, so settle first.
+    pty.read_for(Duration::from_millis(300));
+    re_entered
+}
+
+/// The screen the UI comes back to must show its chrome again without
+/// waiting for something else to change: the hint, the model and the
+/// session tokens.
+pub fn assert_repainted_after(pty: &mut Pty, re_entered: usize, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[re_entered..]));
+        let missing: Vec<&str> = ["Type a prompt", "dryrun:dry-model", "no session"]
+            .into_iter()
+            .filter(|token| !repainted.contains(token))
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "after {what} the screen was not repainted; still missing {missing:?}. \
+             Printable bytes since re-entry: {repainted:?}"
+        );
+        pty.read_for(Duration::from_millis(200));
+    }
+}
 
 pub fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     haystack[from.min(haystack.len())..]

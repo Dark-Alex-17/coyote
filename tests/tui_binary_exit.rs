@@ -2,13 +2,13 @@
 //! normal screen when it leaves: on Ctrl+C, `.exit` and SIGTERM, nothing
 //! before any turn or under `tui_dump_on_exit: false`, the printed reply
 //! without colour under `NO_COLOR`, and row for row what the plain REPL
-//! prints for the same reply (the Ctrl+D case and the cold start live in
-//! `tui_binary.rs`). Each case runs the binary on a pseudo-terminal under
-//! a bash wrapper that reports the exit code and `stty -a` afterwards, so
-//! the file is unix-only. The cases run one at a time: each spawn forks a
-//! session leader and takes a controlling tty, and a fork landing between
-//! another test's `openpty` and its `exec` has failed the spawn with a
-//! garbled errno.
+//! prints for the same reply (the Ctrl+D case lives in `tui_binary.rs`,
+//! the cold start in `tui_binary_lifecycle.rs`). Each case runs the binary
+//! on a pseudo-terminal under a bash wrapper that reports the exit code
+//! and `stty -a` afterwards, so the file is unix-only. The cases run one
+//! at a time: each spawn forks a session leader and takes a controlling
+//! tty, and a fork landing between another test's `openpty` and its
+//! `exec` has failed the spawn with a garbled errno.
 #![cfg(unix)]
 
 mod common;
