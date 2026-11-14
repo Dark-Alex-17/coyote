@@ -734,6 +734,62 @@ pub fn squeezed(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// The bytes between the last alternate-screen leave and the wrapper's
+/// report, raw.
+pub fn raw_between_leave_and_report(pty: &Pty) -> Vec<u8> {
+    let raw = pty.raw();
+    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
+    let tail = &raw[left + LEAVE_ALT.len()..];
+    let report = find(tail, b"exit=", 0).expect("no exit= line after the leave");
+    tail[..report].to_vec()
+}
+
+/// Leaves an idle UI with `leave` after one exchange and checks the
+/// prompt and then the reply were printed between the leave and the
+/// report, each once. `leave` gets the coyote process's pid.
+pub fn leaving_prints_the_transcript(
+    name: &str,
+    leave: impl FnOnce(&mut Pty, i32),
+    prompt: &str,
+    reply: &str,
+) {
+    let dir = fresh_config_dir(name);
+    let _guard = TempDirGuard(dir.clone());
+    let fake = FakeLlm::start(vec![Reply::Text(reply.to_string())]);
+    write_fake_llm_config(&dir, &fake);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    let started = pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let pid = child_pid(&started);
+    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
+    wait_for_squeezed(&mut pty, reply, "the reply");
+    pty.read_for(Duration::from_millis(800));
+    leave(&mut pty, pid);
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+
+    let printed = strip_ansi(&String::from_utf8_lossy(&raw_between_leave_and_report(
+        &pty,
+    )));
+    let between = squeezed(&printed);
+    let at = |marker: &str| {
+        let marker = squeezed(marker);
+        assert_eq!(
+            between.matches(&marker).count(),
+            1,
+            "{marker:?} was not printed exactly once after leaving: {:?}",
+            printed.trim()
+        );
+        between.find(&marker).unwrap()
+    };
+    assert!(
+        at(prompt) < at(reply),
+        "the reply was printed ahead of its prompt: {:?}",
+        printed.trim()
+    );
+}
+
 /// Files under `dir` (outside the cache) that were not there before and
 /// carry `name` in their path.
 pub fn new_files_named(dir: &Path, before: &[PathBuf], name: &str) -> Vec<PathBuf> {

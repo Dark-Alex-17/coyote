@@ -1319,6 +1319,9 @@ impl App {
                 Ok((mut renderer, background)) => {
                     renderer.no_color = self.renderer.no_color;
                     self.renderer = renderer;
+                    if let Some(pager) = self.pager.as_mut() {
+                        pager.forget_layout();
+                    }
                     self.composer.set_background(background);
                 }
                 Err(err) => warn!("Keeping the previous render options: {err}"),
@@ -10326,6 +10329,30 @@ mod tests {
         harness.press(KeyCode::Char('q'));
         assert!(harness.app.pager.is_none());
         assert_eq!(harness.draw(), before);
+    }
+
+    /// A new config brings a new renderer; the open pager lays its text
+    /// out again so the styling follows instead of keeping the old one.
+    #[test]
+    fn a_new_renderer_makes_the_open_pager_lay_out_again() {
+        let mut ctx = chat_ctx();
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.app.transcript.push(Cell::user("hello"));
+        press_ctrl(&mut harness, 't');
+        harness.draw();
+        let pager = harness.app.pager.as_ref().unwrap();
+        let first = pager.cell_layouts();
+        assert!(first > 0);
+        harness.draw();
+        let pager = harness.app.pager.as_ref().unwrap();
+        assert_eq!(pager.cell_layouts(), first, "an idle frame laid out again");
+
+        ctx.app = Arc::clone(&chat_ctx().app);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.draw();
+        let pager = harness.app.pager.as_ref().unwrap();
+        assert_eq!(pager.cell_layouts(), 2 * first);
     }
 
     fn counted_turn(harness: &mut Harness, lines: usize) {

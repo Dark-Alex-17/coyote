@@ -340,6 +340,18 @@ impl Pager {
         Self::new(Thread::Root, Jump::Bottom)
     }
 
+    /// Drops every laid-out line so the next frame styles the text anew;
+    /// for when the renderer itself changed.
+    pub(super) fn forget_layout(&mut self) {
+        self.laid_out = None;
+        self.root_lines = RootLines::default();
+    }
+
+    #[cfg(test)]
+    pub(super) fn cell_layouts(&self) -> usize {
+        self.cell_layouts
+    }
+
     /// The root thread from the row of transcript cell `cell`.
     pub(super) fn root_at(cell: usize) -> Self {
         Self::new(Thread::Root, Jump::Cell(cell))
@@ -743,15 +755,27 @@ impl Pager {
 
     /// The thread's name for a title `width` columns wide. A child's
     /// session id too long for it loses its middle: the ids end in what
-    /// tells two runs of one agent apart.
+    /// tells two runs of one agent apart. With too little room even for
+    /// that, the "(read-only)" goes first, since the body says so too,
+    /// and then all but the id's end.
     fn title(&self, width: usize) -> String {
         match &self.thread {
             Thread::Root => format!("Thread: {ROOT_THREAD}"),
             Thread::Child(view) => {
-                let head = render::plain_text(&format!("Thread: {} (read-only) ", view.agent));
+                let agent = render::plain_text(&view.agent);
                 let id = render::plain_text(&view.session_id);
+                let head = format!("Thread: {agent} (read-only) ");
                 let room = width.saturating_sub(head.width());
-                format!("{head}{}", elide_middle(&id, room))
+                if room >= ELIDED_MIN || id.width() <= room {
+                    return format!("{head}{}", elide_middle(&id, room));
+                }
+                let head = format!("Thread: {agent} ");
+                let room = width.saturating_sub(head.width());
+                if room >= ELIDED_MIN {
+                    format!("{head}{}", elide_middle(&id, room))
+                } else {
+                    format!("{head}{}", keep_tail(&id, room))
+                }
             }
         }
     }
@@ -771,11 +795,14 @@ impl Pager {
     }
 }
 
+/// The fewest columns `elide_middle` cuts to.
+const ELIDED_MIN: usize = 7;
+
 /// `text` cut to `width` characters by dropping its middle for `...`;
 /// whole when it fits or when too little room is left to say anything.
 fn elide_middle(text: &str, width: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= width || width < 7 {
+    if chars.len() <= width || width < ELIDED_MIN {
         return text.to_string();
     }
     let kept = width - 3;
@@ -784,6 +811,21 @@ fn elide_middle(text: &str, width: usize) -> String {
     let mut short: String = chars[..head].iter().collect();
     short.push_str("...");
     short.extend(&chars[chars.len() - tail..]);
+    short
+}
+
+/// `text` cut to its last characters behind `...`, `width` in all; the
+/// end alone when even the `...` does not fit.
+fn keep_tail(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= width {
+        return text.to_string();
+    }
+    if width <= 3 {
+        return chars[chars.len() - width..].iter().collect();
+    }
+    let mut short = "...".to_string();
+    short.extend(&chars[chars.len() - (width - 3)..]);
     short
 }
 
@@ -1427,6 +1469,53 @@ mod tests {
         assert_eq!(elide_middle("abcdefghij", 7), "ab...ij");
         assert_eq!(elide_middle("abcdefghij", 10), "abcdefghij");
         assert_eq!(elide_middle("abcdefghij", 6), "abcdefghij");
+    }
+
+    /// Too narrow for the id beside "(read-only)", the title gives that
+    /// up first and then keeps only the id's end.
+    #[test]
+    fn a_cramped_title_drops_read_only_then_keeps_the_ids_end() {
+        let pager = Pager::child(
+            "reviewer_20260102_0a1b2c3d4e5f".to_string(),
+            "reviewer".to_string(),
+            PathBuf::from("/nonexistent/reviewer.yaml"),
+        );
+        assert_eq!(pager.title(32), "Thread: reviewer review...3d4e5f");
+        assert_eq!(pager.title(23), "Thread: reviewer ...e5f");
+        assert_eq!(pager.title(19), "Thread: reviewer 5f");
+        let pager = Pager::child(
+            "rev-a1".to_string(),
+            "reviewer".to_string(),
+            PathBuf::from("/nonexistent/reviewer.yaml"),
+        );
+        assert_eq!(pager.title(35), "Thread: reviewer (read-only) rev-a1");
+        assert_eq!(keep_tail("abcdefghij", 10), "abcdefghij");
+        assert_eq!(keep_tail("abcdefghij", 5), "...ij");
+    }
+
+    /// A session file past the cap is refused before it is read; the
+    /// file is sparse, so the test writes nothing near that size.
+    #[test]
+    fn a_child_file_past_the_cap_is_refused_unread() {
+        let dir = crate::testing::ScratchDirGuard::new("pager-child-cap");
+        let file = dir.path.join("huge.yaml");
+        std::fs::File::create(&file)
+            .unwrap()
+            .set_len(CHILD_FILE_LIMIT + 1)
+            .unwrap();
+        let ctx = RequestContext::new(
+            Arc::new(crate::config::AppState::test_default()),
+            crate::config::WorkingMode::Repl,
+        );
+        let error = load_child(&file, &ctx).unwrap_err().to_string();
+        assert_eq!(
+            error,
+            format!(
+                "{} holds {} bytes, more than the {CHILD_FILE_LIMIT} the pager reads",
+                file.display(),
+                CHILD_FILE_LIMIT + 1
+            )
+        );
     }
 
     #[test]

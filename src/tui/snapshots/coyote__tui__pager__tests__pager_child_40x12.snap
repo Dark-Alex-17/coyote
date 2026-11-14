@@ -2,7 +2,7 @@
 source: src/tui/pager.rs
 expression: "&frame"
 ---
-"Thread: reviewer (read-only) rev 2-11/11"
+"Thread: reviewer reviewer-a1     2-11/11"
 "show up at the child's next checkpoint. "
 "                                        "
 "> review src/lib.rs                     "

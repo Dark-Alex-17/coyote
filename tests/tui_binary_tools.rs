@@ -2075,6 +2075,10 @@ fn ctrl_t_pages_a_tools_whole_output_and_q_closes_the_pager() {
     pty.read_for(Duration::from_millis(500));
     let inline = repainted_frame(&mut pty, 30, 100);
     assert!(
+        inline.contains("fixture_forty({})"),
+        "the tool row is not in the transcript:\n{inline}"
+    );
+    assert!(
         !inline.contains("pg-01"),
         "the transcript shows a line its tool row drops:\n{inline}"
     );
@@ -2240,6 +2244,18 @@ fn alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Whether `pid` is still a `sleep`; a recorded pid that has exited may
+/// since belong to some other process.
+fn still_sleeping(pid: i32) -> bool {
+    std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .is_ok_and(|out| {
+            let comm = String::from_utf8_lossy(&out.stdout);
+            Path::new(comm.trim()).file_name() == Some("sleep".as_ref())
+        })
+}
+
 /// Kills the recorded sleepers when the test ends, so a failed assertion
 /// does not leave them running for five minutes.
 struct Sleepers(Vec<PathBuf>);
@@ -2250,6 +2266,7 @@ impl Drop for Sleepers {
             if let Some(pid) = fs::read_to_string(file)
                 .ok()
                 .and_then(|text| text.trim().parse::<i32>().ok())
+                .filter(|&pid| alive(pid) && still_sleeping(pid))
             {
                 // SAFETY: kill takes a pid and a signal number and touches no memory.
                 let _ = unsafe { libc::kill(pid, libc::SIGKILL) };

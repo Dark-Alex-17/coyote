@@ -143,7 +143,7 @@ impl Transcript {
             let freed = self
                 .touch(index)
                 .map_or(0, |cell| cell.evict_full_outputs(excess));
-            self.full_output_bytes -= freed;
+            self.full_output_bytes = self.full_output_bytes.saturating_sub(freed);
         }
     }
 

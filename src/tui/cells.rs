@@ -379,7 +379,7 @@ pub(super) enum Cell {
     /// A tool call: a one-line `name(args)` header, then the narration
     /// line and the tail of its output while it runs or when opened. A
     /// bookkeeping tool (memory, skills, agent listing) is only ever its
-    /// header.
+    /// header inline; the pager still shows its output.
     Tool {
         call_id: String,
         name: String,
@@ -802,7 +802,6 @@ impl Cell {
                 summary,
                 status,
                 full,
-                bookkeeping: false,
                 ..
             } => {
                 let mut lines = render::plain_lines(&header, width, DIM);
@@ -1573,6 +1572,33 @@ mod tests {
             }
         ));
         assert_eq!(cell.lines(80, &mut renderer).len(), 1);
+    }
+
+    /// The pager is the whole log, so a bookkeeping row's output shows
+    /// there even though the inline row never opens.
+    #[test]
+    fn a_bookkeeping_rows_output_shows_in_the_pager_only() {
+        let mut renderer = renderer();
+        let mut cell = Cell::tool(
+            "c1".to_string(),
+            "Call memory__search {\"query\":\"x\"}".to_string(),
+            Instant::now(),
+        );
+        let (target, full) = cell.output_for("c1").unwrap();
+        full.push(&append_output(target, b"remembered fact\n"));
+        let inline: String = cell
+            .lines(80, &mut renderer)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        assert!(!inline.contains("remembered fact"), "{inline}");
+        let paged: String = cell
+            .full_lines(80, &mut renderer)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        assert!(paged.contains("memory__search"), "{paged}");
+        assert!(paged.contains("remembered fact"), "{paged}");
     }
 
     #[test]

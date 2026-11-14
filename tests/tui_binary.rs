@@ -2735,37 +2735,12 @@ fn esc_on_an_idle_empty_composer_does_not_quit() {
 #[test]
 #[serial]
 fn ctrl_d_prints_the_committed_transcript_on_the_normal_screen() {
-    let dir = fresh_config_dir("ctrl-d-dump");
-    let _guard = TempDirGuard(dir.clone());
-    let fake = FakeLlm::start(vec![Reply::Text("the reply to keep v7k".to_string())]);
-    write_fake_llm_config(&dir, &fake);
-    let mut pty = spawn_tui(&dir, &[]);
-
-    pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.send(b"prompt to keep u6j\r").unwrap();
-    wait_for_squeezed(&mut pty, "the reply to keep v7k", "the reply");
-    pty.read_for(Duration::from_millis(800));
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
-
-    let raw = pty.raw();
-    let left = rfind(raw, LEAVE_ALT).expect("the alternate screen was never left");
-    let after = strip_ansi(&String::from_utf8_lossy(&raw[left..]));
-    let report_at = after.find("exit=").expect("no exit= line after the leave");
-    let between: String = after[..report_at]
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    for marker in ["prompttokeepu6j", "thereplytokeepv7k"] {
-        assert!(
-            between.contains(marker),
-            "the committed transcript ({marker:?}) was not printed on the normal screen \
-             after the alternate screen was left: {:?}",
-            after[..report_at].trim()
-        );
-    }
+    leaving_prints_the_transcript(
+        "ctrl-d-dump",
+        |pty, _| pty.send(b"\x04").unwrap(),
+        "prompt to keep u6j",
+        "the reply to keep v7k",
+    );
 }
 
 // ---------------------------------------------------------------------
