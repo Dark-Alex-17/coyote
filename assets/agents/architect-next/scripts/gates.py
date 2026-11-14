@@ -37,8 +37,8 @@ from _lib import (  # noqa: E402
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section, review_fault,
     raise_escalation, read_artifact, read_file, render_question, run_dir_for, save_tasks, set_frontmatter,
-    set_task_status, sh, snapshot, tail, task_by_id, task_dir_for, task_section, today, trim_items, truthy, var,
-    write_artifact, write_file,
+    set_task_status, sh, snapshot, split_option_reply, tail, task_by_id, task_dir_for, task_section, today, trim_items,
+    truthy, var, write_artifact, write_file,
 )
 
 SHARED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
@@ -532,7 +532,13 @@ def _choice_pick(text, options):
     reads" qualifies the pick, so it is left to the classifier and recorded in full.
     """
     m = re.match(r"(?i)^\s*option\s+(\d+)(?:\s*\(recommended\))?[\W_]*$", text or "")
-    return match_option(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+    return _bare_pick(m.group(1) if m else re.sub(r"[\W_]+$", "", text or ""), options)
+
+
+def _bare_pick(text, options):
+    """match_option, except that a numbered pick carrying free text ("2: only for reads") names no option."""
+    picked, rest = split_option_reply(text, options)
+    return None if picked and rest else match_option(text, options)
 
 
 def _record_choice(state, u, answer, via=""):
@@ -789,16 +795,23 @@ def reseal_gate(state):
                          f"({'plan changed' if changed else 'plan unchanged - amendment did not land'})")
         over = [k for k, hit in (("source", counts[source] > cap), ("ceiling", cycles > AMEND_CYCLES_MAX)) if hit]
         if over:
+            # a run with no owner takes the recommended option; going on is it while the plan can still be amended
+            # and few continues have been spent past this cap
+            more = _continue_recommended(_cap_continues(state, "amend_cap"))
             return raise_escalation(state, u, escalation(
                 "amend_cap", f"This amendment went past {_amend_cap_reason(source, over)} (A1 cap; {cycles} amendment "
-                             "cycles this run). Allow one more amendment cycle, or stop?",
-                [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)],
+                             "cycles this run). Allow one more amendment cycle (say why it should land), or stop?"
+                             + ("" if more else CAP_SPENT_NOTE),
+                [option(AMEND_ONE_MORE, recommended=more), option("Stop and report")],
                 evidence=trim_items(state.get("amend_summary", ""), 1500), hard_trigger=True,
                 data={"source": source, "over": over}))
     u.update({"plan_revision": rev, "sealed": False, "gate2_verdict": "", "gate1_verdict": ""})
     snapshot(state, u, "reseal")
     u["_next"] = "gate1_build"
     return u
+
+
+AMEND_ONE_MORE = "Allow one more amendment cycle"
 
 
 def _amend_cap_reason(source, over):
@@ -979,13 +992,12 @@ def gate2_route(state):
     u = {}
     note_script_error(state, u, "gate2")
     text = state.get("gate2_result") or ""
-    if not text or text.startswith("Agent node failed") or "PLAN_REVIEW" not in text:
+    verdict = _plan_review_verdict(text)
+    if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The oracle produced no PLAN_REVIEW verdict (agent fault). Retry, or abort?",
             [option("Retry the oracle review", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
             data={"gate": "gate2"}))
-    m = re.search(r"PLAN_REVIEW:\s*(OKAY|REJECT)", text)
-    verdict = m.group(1) if m else "REJECT"
     u["gate2_verdict"] = verdict
     if verdict == "OKAY":
         ledger(state, u, "gate2: OKAY")
@@ -995,15 +1007,61 @@ def gate2_route(state):
     rejects = as_int(state.get("oracle_rejects")) + 1
     u["oracle_rejects"] = rejects
     if rejects > STRIKE_LIMIT:
+        more = _continue_recommended(_cap_continues(state, "gate2_stuck"))
         return raise_escalation(state, u, escalation(
-            "gate2_stuck", f"The oracle still REJECTS the plan after {STRIKE_LIMIT} fix rounds. Stop, or override and promote?",
-            [option("Stop and report", recommended=True), option("Override: promote the plan as reviewed (recorded)")],
+            "gate2_stuck", f"The oracle still REJECTS the plan after {STRIKE_LIMIT} fix rounds. Another fix round (say why "
+                           "it should land this time), override and promote the rejected plan, or stop?"
+                           + ("" if more else CAP_SPENT_NOTE),
+            _gate2_stuck_options(more),
             evidence=trim_items(text, 3000), hard_trigger=True))
-    # whole, so every complaint reaches amend_plan; only a runaway verdict is bounded, per item from its end
-    queue_amendments(u, "gate2", [f"Oracle complaint (round {rejects}): {trim_items(text, GATE2_AMEND_CHARS)}"])
+    queue_amendments(u, "gate2", [_oracle_complaint(text, rejects)])
     ledger(state, u, f"gate2: REJECT round {rejects} -> amend_plan (re-seal follows, A3)")
     u["_next"] = "amend_plan"
     return u
+
+
+GATE2_ANOTHER_ROUND = "Another fix round (state reason)"
+GATE2_OVERRIDE = "Override: promote the plan as reviewed (recorded)"
+PLAN_REVIEW_RE = re.compile(r"(?i)PLAN_REVIEW\s*:\s*(OKAY|REJECT)\b")
+
+
+def _gate2_stuck_options(more=True):
+    return [option(GATE2_ANOTHER_ROUND, recommended=more), option(GATE2_OVERRIDE), option("Stop and report")]
+
+
+CAP_SPENT_NOTE = f" Continuing has been chosen {STRIKE_LIMIT} times past this cap, so no option is recommended."
+
+
+def _cap_continues(state, cap):
+    return as_int(as_dict(state.get("cap_continues")).get(cap))
+
+
+def _continue_recommended(continues):
+    """Going on past a cap is the recommended option until it has been taken STRIKE_LIMIT times; after that no option
+    is, so the owner or the reply interpreter weighs the evidence and a run with no owner cannot loop forever."""
+    return continues < STRIKE_LIMIT
+
+
+def _count_continue(state, u, cap):
+    counts = dict(as_dict(state.get("cap_continues")))
+    counts[cap] = as_int(counts.get(cap)) + 1
+    u["cap_continues"] = counts
+
+
+def _plan_review_verdict(text):
+    """The reviewer's final verdict: the last line reading PLAN_REVIEW: OKAY or REJECT, markdown bold and backticks
+    ignored; a line that names both (an echoed prompt) is no verdict. "" when no line qualifies."""
+    for line in reversed(text.splitlines()):
+        plain = re.sub(r"[*`]", "", line)
+        m = PLAN_REVIEW_RE.search(plain)
+        if m and not (re.search(r"(?i)\bOKAY\b", plain) and re.search(r"(?i)\bREJECT\b", plain)):
+            return m.group(1).upper()
+    return ""
+
+
+def _oracle_complaint(text, rejects):
+    # whole, so every complaint reaches amend_plan; only a runaway verdict is bounded, per item from its end
+    return f"Oracle complaint (round {rejects}): {trim_items(text, GATE2_AMEND_CHARS)}"
 
 
 def autonomy_gate(state):
@@ -1660,6 +1718,14 @@ def route_delegate(state):
         u["_next"] = "oracle_diagnose"
         return u
     ledger(state, u, f"delegate: {task['id']} returned (report r{n + 1}; shas={len(parsed['shas'])}; pr={parsed['pr_number'] or '-'})")
+    if kind == "fix":
+        # the child's rebuttals reach this round's re-review as claims to check; only a PASS settles them
+        rebuttals = list(as_list(state.get("fix_rebuttals")))
+        settled = as_list(state.get("rejected_findings"))
+        fresh = [line for line in _rejections(text)[0] if line not in rebuttals and line not in settled]
+        if fresh:
+            u["fix_rebuttals"] = rebuttals + fresh
+            ledger(state, u, f"delegate: {task['id']} rebutted {len(fresh)} finding(s) with a citation -> claims for the re-review")
     if (kind == "fix" and state.get("fix_source") in ("probe_adopt",)):
         u["_next"] = "post_round"
         return u
@@ -1734,8 +1800,12 @@ def verify_gate(state):
                   "Plan / acceptance criteria:", crit or "(none recorded)"]
     if rl:
         prior = as_list(state.get("rejected_findings"))
-        if prior:
+        rebuttals = as_list(state.get("fix_rebuttals"))
+        if prior or rebuttals:
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
+        if rebuttals:
+            lines += ["Rebuttals from the fix round (claims to verify against the diff, not settled decisions):"]
+            lines += [f"- {r}" for r in rebuttals]
         last = rl[-1]
         if last.get("head") and last["head"] != head and not _code_tree_dirty(state, code):
             lines += [f"Re-review delta: {last['head']}..HEAD"]
@@ -1932,6 +2002,50 @@ def _parse_gauntlet(text, adversary_lane=False):
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
 
 
+CONFORMANCE_ONE_MORE = "One more fix round (state reason)"
+
+
+def _conformance_origin(state, tr):
+    """The fix flow a task's verdict belongs to: its implementation, or the fix round that came from CI, integration,
+    the review watch or elsewhere. A conformance fix round keeps the origin of the verdict it answers."""
+    conformance_round = (state.get("delegation_kind") == "fix" and state.get("fix_source") == "review"
+                         and state.get("fix_return_to") == "verify")
+    if conformance_round and tr.get("conformance_origin"):
+        return tr["conformance_origin"]
+    if state.get("delegation_kind") != "fix":
+        return "implement"
+    return state.get("fix_origin_return") or state.get("fix_source") or "fix"
+
+
+def _finding_key(finding):
+    return re.sub(r"\W+", " ", finding.lower()).strip()
+
+
+def _conformance_escalation(unit, rounds, prior, real):
+    """conformance_stuck after `rounds` fix rounds, with the findings before the last fix round and this round's
+    findings tagged REPEAT (also found before it) or NEW. One more round is recommended until STRIKE_LIMIT rounds;
+    after that no option is, and the owner or the reply interpreter weighs the evidence."""
+    seen = {_finding_key(b) for b in prior}
+    evidence = []
+    if prior:
+        evidence += [f"## Findings before fix round {rounds}"] + [f"- {b}" for b in prior]
+        evidence += [f"## Findings after fix round {rounds}"]
+        evidence += [f"- [{'REPEAT' if _finding_key(b) in seen else 'NEW'}] {b}" for b in real]
+    else:
+        evidence += [f"## Findings after fix round {rounds}"] + [f"- {b}" for b in real]
+    more = _continue_recommended(rounds)
+    question = (f"{unit} still fails conformance after {rounds} fix round(s). Its findings are below, tagged REPEAT or NEW "
+                "against the round before. One more fix round (say why it should land this time), accept the findings "
+                "unresolved, or stop?")
+    if not more:
+        question += f" After {STRIKE_LIMIT} fix rounds no option is recommended."
+    return escalation(
+        "conformance_stuck", question,
+        [option(CONFORMANCE_ONE_MORE, recommended=more),
+         option("Accept the findings unresolved and close the task (recorded)"), option("Stop and report")],
+        evidence=trim_items("\n".join(evidence), 3000), hard_trigger=True, data={"findings": real})
+
+
 def route_verdict(state):
     u = {}
     note_script_error(state, u, state.get("verify_lane") or "run_gauntlet")
@@ -1960,6 +2074,10 @@ def route_verdict(state):
     ledger(state, u, f"verdict: {unit} round {len(rl)} -> {verdict} lanes={lanes} incomplete={incomplete}")
     real = [b for b in blockers if not review_fault(b)]
     if verdict == "PASS" and not real:
+        if tr.get("conformance_rounds") or tr.get("conformance_blockers"):
+            tr.update({"conformance_rounds": 0, "conformance_blockers": []})
+            tr.pop("conformance_origin", None)
+            ledger(state, u, f"verdict: {unit} PASS -> its conformance fix-round count starts again")
         if probe == "PASS" and probe_files and as_int(tr.get("adopt_rounds")) < RERUN_ONCE and scope == "task":
             tr["adopt_rounds"] = as_int(tr.get("adopt_rounds")) + 1
             where = "as a commit on the run branch" if (is_single(state) or MULTI_IS_GROUPS) else "into the task's PR"
@@ -1992,14 +2110,15 @@ def route_verdict(state):
                                "Never fixed by changing scope: amend the plan (re-sealed), or stop?",
                 [option("Amend the plan (type the amendment); re-seal; re-verify", recommended=True), option("Stop and report")],
                 evidence="\n".join(f"- {b}" for b in real)[:3000], hard_trigger=True))
+        origin = _conformance_origin(state, tr)
+        if tr.get("conformance_origin") not in (None, origin):
+            tr.update({"conformance_rounds": 0, "conformance_blockers": []})
+        tr["conformance_origin"] = origin
         used = as_int(tr.get("conformance_rounds"))
+        prior = as_list(tr.get("conformance_blockers"))
+        tr["conformance_blockers"] = real
         if used >= RERUN_ONCE:
-            return raise_escalation(state, u, escalation(
-                "conformance_stuck", f"{unit} still fails conformance after one fix round and one re-run (protocol: re-run ONCE). "
-                                     "How to proceed?",
-                [option("Stop and report", recommended=True), option("One more fix round anyway"),
-                 option("Accept the findings unresolved and close the task (recorded)")],
-                evidence="\n".join(f"- {b}" for b in real)[:3000], hard_trigger=True))
+            return raise_escalation(state, u, _conformance_escalation(unit, used, prior, real))
         tr["conformance_rounds"] = used + 1
         u.update({"delegation_kind": "fix", "fix_source": "review", "fix_return_to": "verify",
                   "fix_items": real, "fix_note": "Fix these plan-conformance / review failures (verbatim below)."})
@@ -2110,6 +2229,16 @@ def fix_done(state):
     return u
 
 
+def _rejections(report):
+    """(cited, uncited) `rejected-finding:` lines of a report; only a rejection citing a file:line or the quality bar
+    becomes a prior review decision, an uncited one stands as a finding."""
+    cited, uncited = [], []
+    for m in re.finditer(r"(?im)^\W*rejected-finding:\s*(.+)$", report or ""):
+        line = m.group(1).strip()
+        (cited if re.search(r"[\w./-]+:\d+", line) or "quality bar" in line.lower() else uncited).append(line)
+    return cited, uncited
+
+
 def harvest_report(state):
     u = {}
     tasks = as_list(state.get("tasks"))
@@ -2127,15 +2256,16 @@ def harvest_report(state):
     for a in as_list(p.get("autonomous")):
         lines.append(f"autonomous (child): {a}")
     text = read_artifact(state.get("run_dir", ""), os.path.join("reports", f"{task.get('id')}-r{_prior_report(state, task.get('id', ''))[1]}.md"))
-    for m in re.finditer(r"(?im)^\W*rejected-finding:\s*(.+)$", text):
-        line = m.group(1).strip()
-        if re.search(r"[\w./-]+:\d+", line) or "quality bar" in line.lower():
-            lines.append(f"rejected-finding: {line}")
-            if line not in rejected:
-                rejected.append(line)
-        else:
-            ledger(state, u, f"harvest: uncited rejection stands as a finding: {tail(line, 120)}")
+    cited, uncited = _rejections(text)
+    for line in cited:
+        lines.append(f"rejected-finding: {line}")
+        if line not in rejected:
+            rejected.append(line)
+    for line in uncited:
+        ledger(state, u, f"harvest: uncited rejection stands as a finding: {tail(line, 120)}")
+    rejected += [line for line in as_list(state.get("fix_rebuttals")) if line not in rejected]
     u["rejected_findings"] = rejected
+    u["fix_rebuttals"] = []
     u["ledger_lines"] = lines
     u["design_asks"] = as_list(p.get("design_asks"))
     u["debt_items"] = as_list(p.get("debt"))
@@ -2754,8 +2884,10 @@ def consult_route(state):
     esc = as_dict(state.get("escalation"))
     text = state.get("consult_result") or ""
     if m := re.search(r"CONSULT:\s*ANSWER\s+(.+)", text):
-        choice = match_option(m.group(1).strip(), esc.get("options") or []) or m.group(1).strip()
-        u.update({"last_answer": choice, "last_answer_text": choice})
+        said = m.group(1).strip()
+        choice = match_option(said, esc.get("options") or []) or said
+        # the navigator's words beside its pick stay in last_answer_text, where apply_answer reads a stated reason
+        u.update({"last_answer": choice, "last_answer_text": said})
         ledger(state, u, f"consult: {esc.get('kind')}: {choice} (navigator)")
         u["_next"] = "apply_answer"
         return u
@@ -2854,7 +2986,7 @@ def parse_answer(state):
         ledger(state, u, f"headless: {esc.get('kind')}: no human available -> the recommended option: {tail(choice, 200)}")
     elif esc.get("kind") == "draft_confirm":
         # a reply that names no option is feedback for the redraft, never a re-ask
-        choice = match_option(text, options) or text
+        choice = _bare_pick(text, options) or text
     elif esc.get("kind") == "seed_confirm" and _typed_doc_path(text):
         choice = text
     elif as_dict(esc.get("data")).get("multiple_choice"):
@@ -2872,7 +3004,8 @@ def parse_answer(state):
             # relayed verbatim to the child: an option only by its number or its exact text, never a prefix
             choice = (text or None) if not options else _exact_option(text, options)
         else:
-            choice = text if typed_path else match_option(text, options)
+            # a numbered pick qualified by free text ("2 - only for reads") is interpreted, so the text is not lost
+            choice = text if typed_path else _bare_pick(text, options)
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
             u["reply_accepts"] = _accepts_text(esc.get("kind", ""))
@@ -2957,11 +3090,14 @@ def _apply_instruction(state, u, esc, shape, value, text):
 
 
 def _exact_option(reply, options):
-    """The option a reply names exactly (case-insensitive) or by its 1-based number; None for anything looser."""
+    """The option a reply names exactly (case-insensitive) or by its 1-based number with no free text after it ("2",
+    "Option 2", "(2)"); None for anything looser."""
     reply = reply.strip()
+    picked, rest = split_option_reply(reply, options)
+    if picked:
+        return None if rest else picked
     if re.fullmatch(r"\d+", reply):
-        i = int(reply)
-        return options[i - 1].get("text") if 1 <= i <= len(options) else None
+        return None
     return next((o.get("text") for o in options if o.get("text", "").strip().lower() == reply.lower()), None) if reply else None
 
 
@@ -3055,6 +3191,19 @@ def _discussion_message(d):
     return "\n".join(lines)
 
 
+def _park_key(state, esc):
+    """The question a discussion park counts against: a multiple-choice question by its kind and its place in the
+    batch, any other by its relay park key or by its kind and the question it asked."""
+    data = as_dict(esc.get("data"))
+    kind = esc.get("kind", "")
+    if data.get("multiple_choice"):
+        return f"{kind}#{as_int(state.get('choice_index'))}"
+    if data.get("park_key"):
+        return data["park_key"]
+    asked = data.get("asked") or esc.get("question", "")
+    return f"{kind}:{hashlib.sha1(asked.encode('utf-8', 'replace')).hexdigest()[:10]}"
+
+
 def choice_park(state):
     """End the run parked on the current question so the user can discuss it in the chat lane.
 
@@ -3066,7 +3215,7 @@ def choice_park(state):
     data = as_dict(esc.get("data"))
     mc = bool(data.get("multiple_choice"))
     queue, idx = (as_list(state.get("choice_queue")), as_int(state.get("choice_index"))) if mc else ([], 0)
-    key = str(idx) if mc else (data.get("park_key") or esc.get("kind", ""))
+    key = _park_key(state, esc)
     where = f"question {idx + 1}/{len(queue)}" if mc else "the question"
     parks = dict(as_dict(state.get("choice_parks")))
     count = as_int(parks.get(key))
@@ -3155,7 +3304,11 @@ def choice_reask(state):
 
 def _answered(state, choices, default=None):
     """The key whose words the answer starts with, else the first key whose words it contains, else default."""
-    ans = (state.get("last_answer") or "").strip().lower()
+    return _keyed(state.get("last_answer") or "", choices, default)
+
+
+def _keyed(text, choices, default=None):
+    ans = (text or "").strip().lower()
     for key, words in choices.items():
         if any(ans.startswith(w) for w in words):
             return key
@@ -3165,19 +3318,63 @@ def _answered(state, choices, default=None):
     return default
 
 
+def _picked_key(answer, options, choices):
+    """The key for the option the reply picks, read from that option's own text; None when it picks none, so a
+    reply's prose ("don't stop, one more round") never stands in for a pick. With no options the reply is read."""
+    return _keyed(match_option(answer, options) or "", choices)
+
+
 STOP_REPLIES = ("stop", "stop and report", "abort", "abort the run")
+ABORT_REPLIES = ("abort", "abort the run")
 
 
 def _whole_reply_stop(answer, options=(), replies=STOP_REPLIES):
-    """A reply that IS a stop or an abort: a stop/abort option it names, or the bare words; never a substring of prose."""
+    """A reply that IS a stop or an abort: an option it names that leads with one of the replies' words, or the bare
+    words; never a substring of prose, so "don't stop" or "stop retrying on timeouts" is not a stop."""
     bare = re.sub(r"[\W_]+$", "", (answer or "").strip().lower())
     picked = _exact_option(answer or "", list(options)) if options else None
-    return bare in replies or bool(picked and picked.lower().startswith(("stop", "abort")))
+    return bare in replies or bool(picked and picked.lower().startswith(tuple({r.split()[0] for r in replies})))
+
+
+def _owner_reason(state, picked, options):
+    """The owner's own words beside the option they picked: the free text after its number, or a typed reply the
+    interpreter read as that option; "" when the reply is the pick alone or the engine's no-human answer."""
+    raw = (state.get("last_answer_text") or "").strip()
+    if not raw or raw == picked or raw == _lib.HEADLESS_GUIDANCE:
+        return ""
+    numbered, rest = split_option_reply(raw, options)
+    if numbered:
+        return rest
+    return "" if _exact_option(raw, options) else raw
+
+
+def _ask_again(state, u, esc, answer):
+    """Raise the same escalation again for a reply that picks none of its options; nothing is acted on. After
+    STRIKE_LIMIT such replies the run stops and reports, which keeps the work and promotes or aborts nothing."""
+    data = as_dict(esc.get("data"))
+    asked = data.get("asked") or esc.get("question", "")
+    reply = trim_items(answer.strip(), 200)
+    unmatched = as_int(data.get("unmatched_replies")) + 1
+    if unmatched >= STRIKE_LIMIT:
+        ledger(state, u, f"{esc.get('kind')}: the reply {reply!r} picks none of the options, {unmatched} replies in a row -> stop and report")
+        u["failure_reason"] = (f"stopped: {esc.get('kind')}: no reply picked an option after {unmatched} asks; the question "
+                               f"was: {trim_items(asked, 500)}")
+        u["_next"] = "end_blocked"
+        return u
+    ledger(state, u, f"{esc.get('kind')}: the reply {reply!r} picks none of the options -> asked again")
+    return raise_escalation(state, u, {**esc, "data": {**data, "asked": asked, "unmatched_replies": unmatched},
+                                       "question": f"Your reply ({reply!r}) picks none of the options: pick one by its "
+                                                   f"number or its text.\n\n{asked}"})
 
 
 def _typed_doc_path(answer):
     """The absolute path of an existing file named by the reply's first token, or ""."""
-    p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
+    token = answer.strip().split()[0] if answer.strip() else ""
+    try:
+        p = os.path.expanduser(token)
+    except UnicodeEncodeError:
+        # a token the file system cannot encode (a lone surrogate) names no file
+        return ""
     return os.path.abspath(p) if p and os.path.isfile(p) else ""
 
 
@@ -3194,12 +3391,13 @@ def apply_answer(state):
     u["parked"] = ""
     tasks = as_list(state.get("tasks"))
     task = task_by_id(tasks, state.get("current_task")) or {}
-    abort = _answered(state, {"abort": ["abort"]}, None) == "abort"
-    stop = _answered(state, {"stop": ["stop and report", "stop;", "stop"]}, None) == "stop"
+    options = esc.get("options") or []
+    abort = _whole_reply_stop(answer, options, ABORT_REPLIES)
+    stop = _whole_reply_stop(answer, options)
 
     if kind == "draft_confirm":
         # matched before the generic abort check: an edit such as "do not abort, add a flag" must not abort
-        picked = match_option(answer, esc.get("options") or [])
+        picked = _bare_pick(answer, esc.get("options") or [])
         draft = as_dict(esc.get("data")).get("draft_path") or state.get("draft_path") or ""
         rounds = as_int(state.get("draft_rounds")) + 1
         if picked == "Abort the run":
@@ -3238,12 +3436,11 @@ def apply_answer(state):
                 u[k] = m.group(1)
         u["_next"] = "orient_read" if state.get("design_doc_path") else "intake"
     elif kind == "need_design_doc":
-        p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
-        if p and os.path.isfile(p):
-            u["design_doc_path"] = os.path.abspath(p)
+        if typed := _typed_doc_path(answer):
+            u["design_doc_path"] = typed
             u["_next"] = "orient_read"
         else:
-            u["failure_reason"] = f"no readable design doc at {p!r}"
+            u["failure_reason"] = f"no readable design doc at {(answer.strip().split() or [''])[0]!r}"
             u["_next"] = "end_blocked"
     elif kind == "seed_confirm":
         seed = as_dict(esc.get("data")).get("seed_path") or state.get("seed_path") or ""
@@ -3262,9 +3459,8 @@ def apply_answer(state):
             ledger(state, u, f"seed: {seed} left ready ({a or 'unmatched'}: {tail(answer, 120)}); asking for a design doc")
             raise_escalation(state, u, _need_design_doc_escalation())
     elif kind == "clarify":
-        p = os.path.expanduser(answer.strip().split()[0]) if answer.strip() else ""
-        if p and os.path.isfile(p):
-            u["design_doc_path"] = os.path.abspath(p)
+        if typed := _typed_doc_path(answer):
+            u["design_doc_path"] = typed
         u["_next"] = "orient_read"
     elif kind in CHOICE_KIND_GATES:
         _record_choice(state, u, answer)
@@ -3276,10 +3472,13 @@ def apply_answer(state):
             data = as_dict(esc.get("data"))
             u["failure_reason"] = f"stopped: the plan went past {_amend_cap_reason(data.get('source'), as_list(data.get('over')))}"
             u["_next"] = "end_blocked"
-        else:
+        elif match_option(answer, options or [option(AMEND_ONE_MORE)]) == AMEND_ONE_MORE:
             # one more cycle of whatever tripped; an escalation that does not say clamps every budget
             data = as_dict(esc.get("data"))
             source, over = data.get("source"), as_list(data.get("over")) or ["source", "ceiling"]
+            reason = _owner_reason(state, answer, options)
+            ledger(state, u, f"amend: one more amendment cycle past {_amend_cap_reason(source, over)}"
+                             + (f": {trim_items(reason, 300)}" if reason else ""))
             counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
             if "source" in over:
                 if source in AMEND_CAPS:
@@ -3289,7 +3488,10 @@ def apply_answer(state):
             u["amend_counts"] = counts
             if "ceiling" in over:
                 u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
+            _count_continue(state, u, "amend_cap")
             u["_next"] = "gate1_build"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "gate1_stuck":
         # the free-text answers often mention stopping ("stop retrying on 5xx"), so only a stop reply stops
         if _whole_reply_stop(answer, esc.get("options") or []):
@@ -3300,13 +3502,32 @@ def apply_answer(state):
             u["leak_fingerprints"] = []
             u["_next"] = "amend_plan"
     elif kind == "gate2_stuck":
+        gate2_options = options or _gate2_stuck_options()
         if stop or abort:
             u["failure_reason"] = "stopped: the oracle still rejects the plan after 3 rounds"
             u["_next"] = "end_blocked"
-        else:
+        elif _exact_option(answer, gate2_options) == GATE2_OVERRIDE:
+            # promoting a rejected plan takes an explicit pick of the override, never a looser match
             ledger(state, u, "gate2: owner override - promoting a REJECTed plan (recorded)")
             u["gate2_verdict"] = "OKAY"
             u["_next"] = "reseal_return"
+        elif match_option(answer, gate2_options) == GATE2_ANOTHER_ROUND:
+            reason = _owner_reason(state, answer, gate2_options)
+            ledger(state, u, "gate2: another fix round on the oracle's rejection"
+                             + (f": {trim_items(reason, 300)}" if reason else ""))
+            rejects = as_int(state.get("oracle_rejects"))
+            # the next rejection asks again, and the amendment this round queues spends no amend_cap of its own
+            u["oracle_rejects"] = STRIKE_LIMIT
+            counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
+            counts["gate2"] = min(counts.get("gate2", 0), AMEND_GATE2_MAX - 1)
+            u["amend_counts"] = counts
+            u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
+            _count_continue(state, u, "gate2_stuck")
+            queue_amendments(u, "gate2", [_oracle_complaint(state.get("gate2_result") or "", rejects)]
+                             + ([f"Owner's reason for another fix round: {reason}"] if reason else []))
+            u["_next"] = "amend_plan"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "gate_fault":
         gate = as_dict(esc.get("data")).get("gate", "gate1")
         if as_int(state.get("gate_fault_retries")) < RERUN_ONCE or "retry" in answer.lower():
@@ -3351,7 +3572,7 @@ def apply_answer(state):
             u["_next"] = "branch_setup"
     elif kind == "branch_name":
         name = answer.strip().split()[0] if answer.strip() else ""
-        if _whole_reply_stop(answer, replies=("abort", "abort the run")):
+        if _whole_reply_stop(answer, replies=ABORT_REPLIES):
             u["failure_reason"] = f"aborted at the user's request ({kind}): {answer}"
             u["_next"] = "end_aborted"
         elif name and git(state.get("code_repo_path") or ".", "check-ref-format", "--branch", name)[0] == 0:
@@ -3363,7 +3584,7 @@ def apply_answer(state):
             raise_escalation(state, u, escalation("branch_name", f"{name!r} is not a valid branch name. Which branch name "
                                                                 "should the run use?", tier3_ok=False, data=as_dict(esc.get("data"))))
     elif kind == "tasks_stuck":
-        a = _answered(state, {"retry": ["retry"], "skip": ["skip"], "stop": ["stop"]}, "stop")
+        a = "stop" if stop else _picked_key(answer, options, {"retry": ["retry"], "skip": ["skip"], "stop": ["stop"]})
         if a == "retry":
             for t in tasks:
                 if t.get("status") in ("failed", "parked"):
@@ -3380,11 +3601,15 @@ def apply_answer(state):
             save_tasks(state, u, tasks)
             u["closeout_scope"] = "run"
             u["_next"] = "phase_f_gate"
-        else:
+        elif a == "stop":
             u["failure_reason"] = "stopped: remaining tasks are blocked"
             u["_next"] = "end_blocked"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "task_failed":
-        a = _answered(state, {"retry": ["retry"], "rescope": ["re-scope", "rescope", "amend"], "abort": ["abort"]}, "abort")
+        rescope = ("re-scope", "rescope", "amend")
+        a = ("abort" if stop or abort else "rescope" if answer.strip().lower().startswith(rescope)
+             else _picked_key(answer, options, {"retry": ["retry"], "rescope": list(rescope), "abort": ["abort"]}))
         rounds = dict(as_dict(state.get("task_rounds")))
         tr = rounds.setdefault(task.get("id", ""), {})
         if a == "retry" and as_int(tr.get("retry_rounds")) < RERUN_ONCE:
@@ -3399,25 +3624,38 @@ def apply_answer(state):
             task["status"] = "pending"
             save_tasks(state, u, tasks)
             u["_next"] = "amend_plan"
-        else:
+        elif a in ("abort", "retry"):
             task["status"] = "failed"
             save_tasks(state, u, tasks)
             u["fix_origin_return"] = ""
             u["failure_reason"] = f"{task.get('id')} failed after Sisyphus recovery; aborted at the user's request"
             u["_next"] = "end_aborted"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "conformance_stuck":
-        a = _answered(state, {"stop": ["stop"], "round": ["one more", "round"], "accept": ["accept"]}, "stop")
-        if a == "round":
+        data = as_dict(esc.get("data"))
+        choice = ((match_option(answer, options) if options else answer) or "").strip().lower()
+        if stop:
+            u["failure_reason"] = f"stopped: {task.get('id')} fails conformance after the re-run"
+            u["_next"] = "end_blocked"
+        elif choice.startswith("one more"):
+            reason = _owner_reason(state, answer, options)
+            rounds = dict(as_dict(state.get("task_rounds")))
+            tr = rounds.setdefault(task.get("id", ""), {})
+            tr["conformance_rounds"] = as_int(tr.get("conformance_rounds")) + 1
+            u["task_rounds"] = rounds
+            ledger(state, u, f"conformance: {task.get('id')}: one more fix round ({tr['conformance_rounds']} so far)"
+                             + (f": {trim_items(reason, 300)}" if reason else ""))
             u.update({"delegation_kind": "fix", "fix_source": "review", "fix_return_to": "verify",
-                      "fix_items": [l[2:] for l in esc.get("evidence", "").splitlines() if l.startswith("- ")],
-                      "fix_note": "One more fix round at the user's request."})
+                      "fix_items": as_list(data.get("findings"))
+                      or [l[2:] for l in esc.get("evidence", "").splitlines() if l.startswith("- ")],
+                      "fix_note": "One more fix round at the user's request." + (f" Their reason: {reason}" if reason else "")})
             u["_next"] = "compose_delegation"
-        elif a == "accept":
+        elif choice.startswith("accept"):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) conformance findings accepted unresolved at the user's say-so"]
             u["_next"] = "post_round"
         else:
-            u["failure_reason"] = f"stopped: {task.get('id')} fails conformance after the re-run"
-            u["_next"] = "end_blocked"
+            _ask_again(state, u, esc, answer)
     elif kind == "plan_defect":
         if stop:
             u["failure_reason"] = f"stopped: the plan is the root cause of a conformance failure on {task.get('id')}"
@@ -3467,7 +3705,7 @@ def apply_answer(state):
             u["pending_fixes"] = fixes
         u["_next"] = "design_ask_gate"
     elif kind == "batch_strikeout":
-        a = _answered(state, {"stop": ["stop"], "round": ["one more", "round"], "accept": ["accept"]}, "stop")
+        a = "stop" if stop else _picked_key(answer, options, {"round": ["one more", "round"], "accept": ["accept"], "stop": ["stop"]})
         batch = state.get("current_batch") or ""
         bs = dict(as_dict(state.get("batch_state")))
         if a == "round":
@@ -3479,9 +3717,11 @@ def apply_answer(state):
             u["batch_state"] = bs
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"(batch {batch}) gauntlet findings accepted unresolved at the user's say-so"]
             u["_next"] = "select_tasks"
-        else:
+        elif a == "stop":
             u["failure_reason"] = f"stopped: batch {batch} struck out"
             u["_next"] = "end_blocked"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "wave_escalation":
         a = _answered(state, {"retry": ["retry"], "accept": ["accept"], "abort": ["abort"]}, "retry")
         if a == "retry":
@@ -3510,7 +3750,8 @@ def apply_answer(state):
                          f"{data.get('child_run_id')}")
         u["_next"] = "compose_delegation"
     elif kind in ("integration_conflict", "integration_red"):
-        a = _answered(state, {"stop": ["stop"], "round": ["one more", "cycle", "round"], "abort": ["abort"]}, "stop")
+        a = ("abort" if abort else "stop" if stop
+             else _picked_key(answer, options, {"round": ["one more", "cycle", "round"], "abort": ["abort"], "stop": ["stop"]}))
         rounds = dict(as_dict(state.get("task_rounds")))
         tr = rounds.setdefault(task.get("id", ""), {})
         if a == "round":
@@ -3523,9 +3764,11 @@ def apply_answer(state):
             save_tasks(state, u, tasks)
             u["fix_origin_return"] = ""
             u["_next"] = "wave_cleanup"
-        else:
+        elif a == "stop":
             u["failure_reason"] = f"stopped: {kind} on {task.get('id')}"
             u["_next"] = "end_blocked"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "approve_next":
         a = _answered(state, {"continue": ["continue"], "park": ["stop here", "park"], "abort": ["abort"]}, "continue")
         if a == "continue":
@@ -3565,9 +3808,15 @@ def apply_answer(state):
         else:
             _leave_in_draft(state, u)
     elif kind in ("review_exhausted", "review_read_truncated", "review_round_cap", "review_owner_judgment"):
-        a = _answered(state, {"stop": ["stop"], "skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
-                              "more": ["one more", "resume", "address", "fix round"]}, "stop")
-        if a == "keep" and kind in ("review_exhausted", "review_read_truncated"):
+        more_words = ["one more", "resume", "address", "fix round"]
+        a = "stop" if stop else _picked_key(answer, options, {"skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
+                                                              "more": more_words, "stop": ["stop"]})
+        if a is None and as_dict(esc.get("data")).get("untrusted"):
+            # untrusted items offer no fix round, so an ask for one is refused below rather than asked again
+            a = _keyed(answer, {"more": more_words})
+        if a is None:
+            _ask_again(state, u, esc, answer)
+        elif a == "keep" and kind in ("review_exhausted", "review_read_truncated"):
             u.update({"review_polls": 0, "review_rounds": 0, "review_poll_fails": 0, "review_started_at": int(time.time()), "review_status": "",
                       "review_truncated": []})
             u["_next"] = "review_poll"

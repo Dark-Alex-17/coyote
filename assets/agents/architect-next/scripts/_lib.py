@@ -175,19 +175,20 @@ def tail(text, n=TAIL_CHARS):
 
 ITEM_START_RE = re.compile(r"^(?:\d+[.)]|[-*+]|#{1,6})\s")
 ITEM_HEAD_MIN = 160    # each item keeps this much of its start while the bound has room for it
-ITEM_HEAD_FLOOR = 40   # below this per item, the trailing items are dropped with a count instead
+ITEM_HEAD_FLOOR = 40   # each item keeps at least this much of its start, past the bound if it must
 ITEM_TRIMMED = " ... [trimmed]"
 BLOCK_TRIMMED = "\n... [trimmed] ...\n"
 
 
 def trim_items(text, n=TAIL_CHARS):
-    """Bound a verdict or report to n chars, keeping the start of every item it can.
+    """Bound a verdict or report to n chars, keeping the start of every item.
 
     The text splits into a preamble and the items that start at column 0 (a numbered or
     bulleted line, or a heading). Each block keeps its start and loses only its end, the
     shortest kept whole first, so item 1's start survives however long the rest is. A text
-    with no items keeps its start and its end. When the items are too many for even
-    ITEM_HEAD_FLOOR characters each, the trailing ones are dropped with a count.
+    with no items keeps its start and its end. No item is ever dropped: each keeps at least
+    ITEM_HEAD_FLOOR characters, so a header line up to that long survives whole, and a text
+    with more items than the bound has room for comes out longer than n.
     """
     text = text or ""
     if len(text) <= n:
@@ -199,8 +200,13 @@ def trim_items(text, n=TAIL_CHARS):
         else:
             blocks[-1] += line
     if len(blocks) == 1:
-        half = max(n - len(BLOCK_TRIMMED), 0) // 2
-        return text[:half] + BLOCK_TRIMMED + (text[-half:] if half else "")
+        room = max(n - len(BLOCK_TRIMMED), 0)
+        head = min(len(text.splitlines()[0]), ITEM_HEAD_FLOOR) if ITEM_START_RE.match(text) else 0
+        start = max(room // 2, head)
+        end = max(room - start, 0)
+        if start + end >= len(text):
+            return text
+        return text[:start] + BLOCK_TRIMMED + (text[-end:] if end else "")
     floor = min(ITEM_HEAD_MIN, max(n // len(blocks) - len(ITEM_TRIMMED), ITEM_HEAD_FLOOR))
     budget = max(n - len(ITEM_TRIMMED) * len(blocks), 0)
     alloc = [0] * len(blocks)
@@ -213,22 +219,11 @@ def trim_items(text, n=TAIL_CHARS):
     for block, keep in zip(blocks, alloc):
         if keep >= len(block):
             out.append(block)
-        else:
-            out.append(block[:keep].rstrip() + ITEM_TRIMMED + ("\n" if block.endswith("\n") else ""))
-    kept, size = [], 0
-    for i, piece in enumerate(out):
-        last = i == len(out) - 1
-        more = f"... [{len(out) - i} more items trimmed]\n"
-        if size + len(piece) + (0 if last else len(more)) > n:
-            if not kept:
-                # the first block's start survives even when it alone fills the bound
-                more = f"... [{len(out) - 1} more items trimmed]\n"
-                kept.append(piece[:max(n - len(more), 0)])
-            kept.append(more)
-            break
-        kept.append(piece)
-        size += len(piece)
-    return "".join(kept)
+            continue
+        # the newline the trimmed block ends with comes out of its own share
+        newline = "\n" if block.endswith("\n") else ""
+        out.append(block[:keep - len(newline)].rstrip() + ITEM_TRIMMED + newline)
+    return "".join(out)
 
 
 def now_iso():
@@ -327,7 +322,8 @@ def write_artifact(run_dir, name, text):
     if not run_dir:
         return
     os.makedirs(os.path.dirname(os.path.join(run_dir, name)) or run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, name), "w", encoding="utf-8") as f:
+    # replies and model text may carry lone surrogates; they are written as escapes, never dropped
+    with open(os.path.join(run_dir, name), "w", encoding="utf-8", errors="backslashreplace") as f:
         f.write(text if text.endswith("\n") else text + "\n")
 
 
@@ -335,7 +331,7 @@ def append_artifact(run_dir, name, line):
     if not run_dir:
         return
     os.makedirs(run_dir, exist_ok=True)
-    with open(os.path.join(run_dir, name), "a", encoding="utf-8") as f:
+    with open(os.path.join(run_dir, name), "a", encoding="utf-8", errors="backslashreplace") as f:
         f.write(line.rstrip("\n") + "\n")
 
 
@@ -508,16 +504,35 @@ def review_fault(blocker):
     return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
 
 
+# a reply led by an option number: "2", "2.", "2)", "(2)", "#2", "Option 2", then optionally a separator and free text
+OPTION_NUMBER_RE = re.compile(r"(?is)^(?:option\s*)?[(#]?\s*(\d{1,9})\s*(?:$|[-:.)\u2014\u2013]\s*(.*)$)")
+
+
+def split_option_reply(text, options):
+    """(option text, free text after it) for a reply led by an in-range option number ("2", "(2)", "#2", "Option 2",
+    "2 - x", "2: x", "2) x", or an em or en dash); (None, text) otherwise. A reply whose free text names another
+    option ("1 - no wait, 3") picks none. Free text that is only punctuation counts as none."""
+    text = (text or "").strip()
+    m = OPTION_NUMBER_RE.match(text)
+    count = len(options or [])
+    if not m or not 1 <= int(m.group(1)) <= count:
+        return None, text
+    picked = int(m.group(1))
+    rest = (m.group(2) or "").strip()
+    if any(len(d) <= 9 and int(d) != picked and 1 <= int(d) <= count for d in re.findall(r"\d+", rest)):
+        return None, text
+    return options[picked - 1]["text"], rest if re.search(r"\w", rest) else ""
+
+
 def match_option(text, options):
-    """Map a user reply to an option text: a 1-based number, exact, prefix, or 'recommended'."""
+    """Map a user reply to an option text: a 1-based number (free text after it is dropped), exact, prefix, or
+    'recommended'. A reply naming two options maps to none."""
     text = (text or "").strip()
     if not options:
         return text or None
-    m = re.match(r"^\s*(\d+)\s*[).:]?\s*$", text)
-    if m:
-        i = int(m.group(1))
-        if 1 <= i <= len(options):
-            return options[i - 1]["text"]
+    picked, _ = split_option_reply(text, options)
+    if picked:
+        return picked
     low = text.lower()
     for o in options:
         if o["text"].strip().lower() == low:
@@ -629,7 +644,7 @@ def read_file(path):
 
 def write_file(path, text):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", errors="backslashreplace") as f:
         f.write(text)
 
 

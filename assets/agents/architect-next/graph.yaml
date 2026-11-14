@@ -227,6 +227,7 @@ initial_state:
   pending_amendments: []
   amend_cycles: 0
   amend_counts: {}
+  cap_continues: {}
   amend_source: ''
   amend_summary: ''
   amended: false
@@ -299,6 +300,7 @@ initial_state:
   debt_items: []
   task_done_report: ''
   rejected_findings: []
+  fix_rebuttals: []
   deferred_findings: []
   skipped_reviews: []
   design_decisions: []
