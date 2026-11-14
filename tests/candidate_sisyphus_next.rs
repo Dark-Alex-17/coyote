@@ -1519,8 +1519,8 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
         ),
         (
             "ci-crash",
-            "    crashed = _review_mode(state) and bool(state.get(\"last_script_error\"))\n",
-            "    crashed = False\n",
+            "    if crashed and _review_mode(state):\n",
+            "    if False:\n",
             "pr_tracking review: a stale green after a ci_poll node error is one read failure and \
              a retry",
         ),
@@ -3172,8 +3172,8 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str)] = &[
     ("REASK_MAX", "STRIKE_LIMIT"),
     ("RERUN_ONCE", "1"),
     ("RESOLVE_DEADLINE_SECS", "480"),
-    ("REVIEW_CI_POLL_BUDGET", "POLL_VISIT_BUDGET - CI_MAX_ROUNDS"),
-    ("REVIEW_CI_POLL_CEILING", "POLL_VISIT_BUDGET"),
+    ("REVIEW_CI_POLL_BUDGET", "60"),
+    ("REVIEW_CI_POLL_CEILING", "90"),
     ("REVIEW_MAX_POLLS", "80"),
     ("REVIEW_MAX_ROUNDS", "STRIKE_LIMIT"),
     ("REVIEW_PERM_SECS", "120"),
@@ -3368,10 +3368,11 @@ fn lib_atom(lib: &str, tokens: &[&str], pos: &mut usize) -> i64 {
 /// visit into `ci_polls_run` in both modes and stops at the run-wide
 /// `POLL_VISIT_BUDGET`, which stays below the engine cap that
 /// `ENGINE_VISIT_CAP` mirrors and leaves room for one watch of
-/// `CI_MAX_ROUNDS` polls after the initial watch and each CI fix strike.
-/// Review mode starts a fix round only below `REVIEW_CI_POLL_BUDGET`, under
-/// its ceiling, and `pr_review_poll` keeps the review poll budget with the
-/// round cap and one visit to spare under the engine cap.
+/// `CI_MAX_ROUNDS` polls after the initial watch and each CI fix strike, plus
+/// the one watch a keep-waiting answer adds. Review mode starts a fix round
+/// only below `REVIEW_CI_POLL_BUDGET`, under its ceiling, and
+/// `pr_review_poll` keeps the review poll budget with the round cap and one
+/// visit to spare under the engine cap.
 #[test]
 fn review_watch_caps_stay_below_the_per_node_visit_cap() {
     let lib = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
@@ -3396,6 +3397,11 @@ fn review_watch_caps_stay_below_the_per_node_visit_cap() {
         run_budget < cap,
         "POLL_VISIT_BUDGET {run_budget} reaches the cap {cap}, so ci_poll could hit the engine \
          cap before its own budget"
+    );
+    assert!(
+        run_budget + watch < cap,
+        "POLL_VISIT_BUDGET {run_budget} plus the keep-waiting watch of CI_MAX_ROUNDS {watch} \
+         reaches the cap {cap}"
     );
     assert!(
         watch * (1 + strikes) <= run_budget,
@@ -4457,9 +4463,9 @@ fn readme_pr_tracking_row_names_the_loop_stops_and_parent_rule() {
     let stale = "in place of the reply and resolve calls";
     assert!(!row.contains(stale), "stale {stale:?} in: {row}");
     let run_budget = "In every mode `ci_polls_run` counts every CI poll of the run, the polls \
-                      before the flip included, and in review mode the crashed polls that \
-                      `ci_route` counts too; the run-wide budget applies before and after the \
-                      flip alike, so a poll that finds the count at the budget stops at once";
+                      before the flip included, and the crashed polls that `ci_route` counts \
+                      too; a poll that finds the count at the run-wide budget, or at \
+                      `REVIEW_CI_POLL_CEILING` once the watch has started, stops at once";
     assert!(row.contains(run_budget), "missing {run_budget:?} in: {row}");
     let owner = "Upstream `OWNER_REMOTE_INPUT` is False, so `ask_owner_poll` never runs: a \
                  stop reaches the parent orchestrator through `ask_user` when the run is a \

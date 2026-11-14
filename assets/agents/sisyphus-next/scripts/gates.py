@@ -28,7 +28,7 @@ from _lib import (  # noqa: E402
     OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
-    REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
+    REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
     set_frontmatter,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
@@ -2408,7 +2408,7 @@ def apply_answer(state):
             u["_next"] = "ci_poll"
         else:
             if _watch_started(state):
-                stopped = f"Review watch stopped: the run's CI polls reached the run-wide budget ({budget})"
+                stopped = f"Review watch stopped: the run's CI polls reached the {_ci_poll_limit_name(state)} ({budget})"
             else:
                 stopped = f"CI watch stopped: the run's CI polls reached the run-wide budget ({budget}); the PR stays in draft"
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
@@ -3815,16 +3815,17 @@ def _publish_checks(state):
     return rows
 
 
-def _pr_view(state):
-    """The current branch's PR as `gh pr view` reports it, or None when it cannot say."""
+def _pr_view(state, ref=""):
+    """The PR named by ref (the current branch's when ref is empty) as `gh pr view` reports it, or None."""
     root = state.get("git_root") or state.get("project_dir") or "."
     cmd = os.environ.get("SISYPHUS_GH_PR_VIEW_CMD")
     try:
         if cmd:
             # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_PR_REF": ref})
         else:
-            p = subprocess.run(["gh", "pr", "view", "--json", "url,isDraft,headRefName,body"],
+            p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json", "url,isDraft,headRefName,body"],
                                cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
         doc = json.loads(p.stdout) if p.returncode == 0 else None
         return doc if isinstance(doc, dict) else None
@@ -3851,16 +3852,12 @@ def _pr_ready(state):
 
 
 def _confirm_pr_ready(state, u):
-    """Record whether the PR reads as ready after the flip task, running `gh pr ready` once when it still does not."""
-    pr = _pr_view(state)
-    if pr is not None and pr.get("isDraft") is False:
-        confirmed, detail = True, "isDraft false on re-read"
-    else:
-        rc = _pr_ready(state)
-        pr = _pr_view(state)
-        seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}"
-        confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False
-        detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
+    """Confirm the flip only when `gh pr ready` exits 0 and a re-read of the same PR shows it is not a draft."""
+    rc = _pr_ready(state)
+    pr = _pr_view(state, _pr_ref(state))
+    seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}"
+    confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False
+    detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
     u["pr_ready_confirmed"] = confirmed
     u["pr_ready_detail"] = detail
     if confirmed:
@@ -4056,12 +4053,19 @@ def _reset_ci_watch(u):
 
 
 def _ci_poll_budget(state):
-    """The run-wide ci_poll visit budget: POLL_VISIT_BUDGET, or the extended one a keep-waiting answer granted."""
-    return as_int(state.get("ci_poll_budget")) or POLL_VISIT_BUDGET
+    """The ci_poll visit budget: POLL_VISIT_BUDGET or the one a keep-waiting answer raised, lowered to
+    REVIEW_CI_POLL_CEILING once the review watch has started."""
+    budget = as_int(state.get("ci_poll_budget")) or POLL_VISIT_BUDGET
+    return min(budget, REVIEW_CI_POLL_CEILING) if _watch_started(state) else budget
+
+
+def _ci_poll_limit_name(state):
+    return "review-mode ceiling" if _watch_started(state) else "run-wide budget"
 
 
 def _ci_watch_fits(state):
-    return as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS < ENGINE_VISIT_CAP
+    """Whether a keep-waiting answer may add one more watch; the review-mode ceiling is never raised."""
+    return not _watch_started(state) and as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS < ENGINE_VISIT_CAP
 
 
 def _ci_leave_option(state):
@@ -4104,7 +4108,13 @@ def ci_poll(state):
         else:
             p = subprocess.run(["gh", "pr", "checks", pr, "--json", "name,state,bucket,link"], cwd=root,
                                capture_output=True, text=True, timeout=GH_CALL_SECS)
-        data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+        if p.returncode == 0 and p.stdout.strip():
+            data = json.loads(p.stdout)
+        elif p.returncode != 0 and "no checks reported" in f"{p.stdout}\n{p.stderr}".lower():
+            # gh exits non-zero on a PR without CI checks; that is an empty check list, not a failed read
+            data = []
+        else:
+            data = None
     except Exception:  # noqa: BLE001
         data = None
     if data is None:
@@ -4117,7 +4127,8 @@ def ci_poll(state):
             u["_next"] = "ci_poll"
         return u
     u["ci_poll_fails"] = 0
-    buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "").lower(), c.get("link", "")) for c in data]
+    buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "unknown").lower(), c.get("link", ""))
+               for c in data]
     failing = [(n, l) for n, b, l in buckets if b in CI_FAIL]
     pending = [n for n, b, _ in buckets if b in CI_PENDING]
     u["ci_checks"] = buckets
@@ -4174,14 +4185,15 @@ def _ci_unclear(state, u, status):
 
 def ci_route(state):
     u = {}
-    crashed = _review_mode(state) and bool(state.get("last_script_error"))
+    crashed = bool(state.get("last_script_error"))
     note_script_error(state, u, "ci_poll")
     status = state.get("ci_status") or "poll_error"
     if crashed:
+        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
+    if crashed and _review_mode(state):
         # A killed poll leaves the previous visit's status behind, so this visit counts as one failed read.
         fails = as_int(state.get("ci_poll_fails")) + 1
         u["ci_poll_fails"] = fails
-        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
         ledger(state, u, f"review-watch: PR #{_pr_ref(state)} CI read failed (poll node error); retry")
         if fails < CI_POLL_FAILS:
             u["_next"] = "ci_poll"
@@ -4214,8 +4226,9 @@ def ci_route(state):
     elif status == "poll_cap":
         polls_run = as_int(state.get("ci_polls_run"))
         budget = _ci_poll_budget(state)
+        limit = _ci_poll_limit_name(state)
         fits = _ci_watch_fits(state)
-        evidence = (f"{polls_run} CI poll(s) used this run; run-wide budget {budget}; engine visit cap {ENGINE_VISIT_CAP}; "
+        evidence = (f"{polls_run} CI poll(s) used this run; {limit} {budget}; engine visit cap {ENGINE_VISIT_CAP}; "
                     f"one more watch takes up to {CI_MAX_ROUNDS} polls")
         prefix = "CI watch stopped"
         if _watch_started(state):
@@ -4225,7 +4238,7 @@ def ci_route(state):
         keep = [option(CI_CAP_KEEP_WAITING, recommended=True, evidence="another full watch still fits under the engine cap")]
         options = (keep if fits else []) + [option(_ci_leave_option(state), recommended=not fits, evidence=evidence)]
         return raise_escalation(state, u, escalation(
-            "ci_poll_cap", f"{prefix}: the run's CI polls reached the run-wide budget ({budget}) after {polls_run} poll(s). "
+            "ci_poll_cap", f"{prefix}: the run's CI polls reached the {limit} ({budget}) after {polls_run} poll(s). "
                            "How to proceed?", options, evidence=evidence, hard_trigger=_watch_started(state)))
     elif _watch_started(state):
         u["pr_review_status"] = f"ci_{status}"
