@@ -204,6 +204,26 @@ def _parked_state(run_id):
     return parked if isinstance(parked, dict) and parked.get("parked") == DISCUSSION_PARKED else {}
 
 
+def _planning_exclude(state, project, top):
+    """The configured plans dir as a `debris_exclude` value relative to the git top level, or "" when it is missing
+    or outside the repository; a preset value wins."""
+    preset = state.get("debris_exclude")
+    if preset:
+        return preset
+    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
+    plans = plans if os.path.isabs(plans) else os.path.join(project, plans)
+    if not os.path.isdir(plans):
+        return ""
+    try:
+        rel = os.path.relpath(os.path.realpath(plans), os.path.realpath(top or project))
+    except ValueError:
+        return ""
+    rel = rel.replace(os.sep, "/")
+    if rel in (".", "..") or rel.startswith("../"):
+        return ""
+    return json.dumps([rel])
+
+
 def intake(state):
     brief = state.get("initial_prompt") or ""
     # Re-entry into a run parked on a discussion: "continue" (with the carried run id) or the run id plus a continue.
@@ -261,7 +281,7 @@ def intake(state):
     u["plans_detected"] = os.path.isdir(os.path.join(plans, "steps")) and os.path.isdir(
         os.path.join(plans, "handoffs")
     )
-    u["debris_exclude"] = '["plans"]' if os.path.isdir(plans) else ""
+    u["debris_exclude"] = _planning_exclude(state, project_abs, root)
     away = os.path.join(os.path.expanduser("~"), ".config", "coyote", "share", "away")
     u["owner_away"] = OWNER_REMOTE_INPUT and os.path.isfile(away)
     u["roster_scope"], u["own_scope"] = _parse_roster(brief)
