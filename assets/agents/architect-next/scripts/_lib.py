@@ -932,7 +932,7 @@ def heal_state(state):
         if saved is not None:
             healed["tasks"], src = saved, "tasks.json"
         elif stored := load_tasks(healed):
-            healed["tasks"], src = stored, "task store"
+            healed["tasks"], src = stored, "the task files"
         elif "tasks" in healed:
             healed["tasks"], src = [], "empty"
         else:

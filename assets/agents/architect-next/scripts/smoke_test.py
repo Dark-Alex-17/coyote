@@ -681,8 +681,8 @@ check("reseal_gate: a design amendment past its cap with no quality bar -> amend
 
 
 def _design_answers_to_gate1():
-    s = base_state(choice_kind="design_round", choice_queue=[{"question": "Which store?", "options": []}], choice_index=1,
-                   choice_answers=[{"question": "Which store?", "answer": "pg", "via": "option"}], design_rounds=1,
+    s = base_state(choice_kind="design_round", choice_queue=[{"question": "Which layout?", "options": []}], choice_index=1,
+                   choice_answers=[{"question": "Which layout?", "answer": "flat", "via": "option"}], design_rounds=1,
                    open_questions=[], quality_recorded=False, quality_rigor="", quality_surfaces=None, rigor_proposal="production",
                    surfaces_proposal="http", amend_counts={}, amend_cycles=0, pending_amendments=[], checklist_done=[])
     s.update(gates.open_questions_gate(s))
@@ -2352,7 +2352,7 @@ for prompt in ("continue please", "continue, but why X?"):
 
 # park counts written under the key format that predates _park_key
 OLD_PARK = dict(escalation=E_DQ, design_rounds=1, choice_kind="design_round", choice_queue=E_QUEUE, choice_index=0, choice_answers=[],
-                parked="choice_discussion", discussion={"run_id": "x"}, last_answer_text="why sqlite?")
+                parked="choice_discussion", discussion={"run_id": "x"}, last_answer_text="why the second option?")
 
 
 def rekeyed(u):
@@ -4823,8 +4823,8 @@ u = AA("state_fault", SF_RETRY, esc={**SF, "data": {"gate": "apply_answer", "pri
 check("apply_answer: state_fault retry of an escalation gate -> the interrupted question is asked again",
       u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == E["kind"], u)
 _s = base_state(run_id="heal-none", run_dir=_lib.run_dir_for("heal-none"), tasks=None, tasks_root=LEDGER_TASKS, plan_path=LEDGER_PLAN)
-guarded("heal_state: tasks null, no tasks.json -> the task store",
-        lambda: (lambda r: (r[0]["tasks"] and r[0]["tasks"] == _lib.load_tasks(_s) and ("tasks", "task store") in r[1], r[1]))(
+guarded("heal_state: tasks null, no tasks.json -> the task files",
+        lambda: (lambda r: (r[0]["tasks"] and r[0]["tasks"] == _lib.load_tasks(_s) and ("tasks", "the task files") in r[1], r[1]))(
             _lib.heal_state(_s)))
 _s = heal_base()
 _s.pop("tasks_root")
