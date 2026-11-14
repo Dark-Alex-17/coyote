@@ -810,7 +810,8 @@ def reseal_gate(state):
                 data={"source": source, "over": over}))
     u.update({"plan_revision": rev, "sealed": False, "gate2_verdict": "", "gate1_verdict": ""})
     snapshot(state, u, "reseal")
-    u["_next"] = "gate1_build"
+    # design-round answers reach here before the quality bar and checklist ran; that chain ends back here once recorded
+    u["_next"] = "gate1_build" if truthy(state.get("quality_recorded")) else "quality_bar_gate"
     return u
 
 
@@ -2682,13 +2683,14 @@ def integration_test(state):
             tr["conflict_cycles"] = cycles
             ledger(state, u, f"integration: merge conflict for {tid} (cycle {cycles}/{CONFLICT_CYCLES_MAX})")
             if cycles > CONFLICT_CYCLES_MAX:
+                more = _continue_recommended(_cap_continues(state, f"integration_conflict:{tid}"))
                 return raise_escalation(state, u, escalation(
-                    "integration_conflict", f"{tid} conflicts with the run branch after {CONFLICT_CYCLES_MAX} rebase cycles. How to proceed?",
-                    [option("Stop and report", recommended=True), option("One more rebase cycle"), option("Abort this task (branch kept)")],
-                    evidence=tail(out + err, 2000), hard_trigger=True))
-            u["fix_request"] = {"task": tid, "source": "integration", "return_to": "integration",
-                                "items": [f"Merge conflict: rebase your task branch {task.get('branch')} onto the current {run_branch}, resolve, re-verify, re-push"],
-                                "note": tail(out + err, 3000)}
+                    "integration_conflict", f"{tid} conflicts with the run branch after {CONFLICT_CYCLES_MAX} rebase cycles. "
+                                            "One more rebase cycle (say why it should land), abort the task, or stop?"
+                                            + ("" if more else CAP_SPENT_NOTE),
+                    [option(INTEGRATION_CONFLICT_MORE, recommended=more), option("Abort this task (branch kept)"), option("Stop and report")],
+                    evidence=tail(out + err, 2000), hard_trigger=True, data={"task": tid}))
+            u["fix_request"] = _conflict_fix_request(tid, task, run_branch, tail(out + err, 3000))
             u["_next"] = "fix_round"
             return u
         tr.update({"merged": True, "merge_head": head, "merge_sha": git_out(code, "rev-parse", "HEAD"), "merge_parent": parent})
@@ -2698,12 +2700,13 @@ def integration_test(state):
         tr["integration_strikes"] = strikes
         ledger(state, u, f"integration: suite RED after merging {tid} (strike {strikes}/{STRIKE_LIMIT})")
         if strikes > STRIKE_LIMIT:
+            more = _continue_recommended(_cap_continues(state, f"integration_red:{tid}"))
             return raise_escalation(state, u, escalation(
-                "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds following {tid}'s merge. How to proceed?",
-                [option("Stop and report", recommended=True), option("One more fix round anyway")], evidence=tail(out, 2500), hard_trigger=True))
-        u["fix_request"] = {"task": tid, "source": "integration", "return_to": "integration",
-                            "items": [f"Post-merge integration failure on {run_branch} (the task was verified against its fork point, not siblings' merged work)"],
-                            "note": tail(out, 4000)}
+                "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds following {tid}'s merge. "
+                                   "One more fix round (say why it should land), or stop?" + ("" if more else CAP_SPENT_NOTE),
+                [option(INTEGRATION_RED_MORE, recommended=more), option("Stop and report")], evidence=tail(out, 2500), hard_trigger=True,
+                data={"task": tid}))
+        u["fix_request"] = _integration_red_fix_request(tid, run_branch, tail(out, 4000))
         u["_next"] = "fix_round"
         return u
     tr["merged"] = False
@@ -2717,6 +2720,29 @@ def integration_test(state):
     ledger(state, u, f"integration: {tid} merged into {run_branch} @ {task['head_sha']}; suite green; pushed")
     u["_next"] = "harvest_report"
     return u
+
+
+INTEGRATION_CONFLICT_MORE = "One more rebase cycle (state reason)"
+INTEGRATION_RED_MORE = "One more fix round (state reason)"
+
+
+def _conflict_fix_request(tid, task, run_branch, note):
+    return {"task": tid, "source": "integration", "return_to": "integration",
+            "items": [f"Merge conflict: rebase your task branch {task.get('branch')} onto the current {run_branch}, resolve, re-verify, re-push"],
+            "note": note}
+
+
+def _integration_red_fix_request(tid, run_branch, note):
+    return {"task": tid, "source": "integration", "return_to": "integration",
+            "items": [f"Post-merge integration failure on {run_branch} (the task was verified against its fork point, not siblings' merged work)"],
+            "note": note}
+
+
+def _final_red_fix_request(state, note):
+    tasks = as_list(state.get("tasks"))
+    return {"task": state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else ""), "source": "integration", "return_to": "integration_check",
+            "items": ["Phase F integration: the full build + test suite is RED on the run branch (integrated result of all tasks)"],
+            "note": note}
 
 
 def _unmerged_reason(state, code, task, run_branch):
@@ -2789,6 +2815,9 @@ def batch_gauntlet_build(state):
     return u
 
 
+BATCH_STRIKEOUT_MORE = "One more batch round (state reason)"
+
+
 def batch_fix_route(state):
     u = {}
     harvest_anomalies(state, u, "batch_triage")
@@ -2806,9 +2835,11 @@ def batch_fix_route(state):
         last = members[-1]["id"] if members else state.get("current_task")
         routed = [{"finding": bl, "task": last} for bl in blockers]
     if b["strikes"] > STRIKE_LIMIT:
+        more = _continue_recommended(_cap_continues(state, f"batch_strikeout:{batch}"))
         return raise_escalation(state, u, escalation(
-            "batch_strikeout", f"Batch {batch} is still BLOCKED after {STRIKE_LIMIT} gauntlet rounds (3 strikes per batch). How to proceed?",
-            [option("Stop and report", recommended=True), option("One more batch round anyway"), option("Accept the batch unresolved (recorded)")],
+            "batch_strikeout", f"Batch {batch} is still BLOCKED after {STRIKE_LIMIT} gauntlet rounds (3 strikes per batch). One more batch "
+                               "round (say why it should land), accept the batch unresolved, or stop?" + ("" if more else CAP_SPENT_NOTE),
+            [option(BATCH_STRIKEOUT_MORE, recommended=more), option("Accept the batch unresolved (recorded)"), option("Stop and report")],
             evidence="\n".join(f"- {r.get('finding')}" for r in routed)[:3000], hard_trigger=True))
     by_task = {}
     for r in routed:
@@ -3470,6 +3501,66 @@ def _rerun_cancelled(state, u, links):
         ledger(state, u, f"ci: PR #{state.get('pr_number')} re-run of cancelled run {run_id} {'requested' if rc == 0 else 'FAILED'}")
 
 
+def _continue_past_cap(state, u, answer, options, cap, what):
+    """Ledger a pick to go on past a cap with the owner's reason, count it toward that cap's continues, and return the reason."""
+    reason = _owner_reason(state, answer, options)
+    ledger(state, u, what + (f": {trim_items(reason, 300)}" if reason else ""))
+    _count_continue(state, u, cap)
+    return reason
+
+
+def _with_reason(request, reason):
+    if reason:
+        request["items"] = list(request["items"]) + [f"Owner's reason for one more round: {trim_items(reason, 300)}"]
+    return request
+
+
+def _integration_round(state, u, esc, answer, options, task):
+    """One more rebase or fix round past an integration cap. The round is dispatched here and its counter set to the
+    cap, so the next conflict or RED asks again."""
+    data = as_dict(esc.get("data"))
+    note = tail(esc.get("evidence", ""), 3000)
+    run_branch = state.get("run_branch") or _run_branch(state)
+    tid = data.get("task") or ""
+    if esc.get("kind") == "integration_red" and not tid:
+        reason = _continue_past_cap(state, u, answer, options, "integration_red:run", "phase_f: one more fix round past the integration RED cap")
+        u["final_integration_strikes"] = STRIKE_LIMIT
+        u["fix_request"] = _with_reason(_final_red_fix_request(state, note), reason)
+    else:
+        tid = tid or task.get("id", "")
+        rounds = dict(as_dict(state.get("task_rounds")))
+        tr = rounds[tid] = dict(as_dict(rounds.get(tid)))
+        if esc.get("kind") == "integration_conflict":
+            reason = _continue_past_cap(state, u, answer, options, f"integration_conflict:{tid}",
+                                        f"integration: one more rebase cycle for {tid} past the conflict cap")
+            tr["conflict_cycles"] = CONFLICT_CYCLES_MAX
+            request = _conflict_fix_request(tid, task_by_id(as_list(state.get("tasks")), tid) or task, run_branch, note)
+        else:
+            reason = _continue_past_cap(state, u, answer, options, f"integration_red:{tid}",
+                                        f"integration: one more fix round for {tid} past the RED cap")
+            tr["integration_strikes"] = STRIKE_LIMIT
+            request = _integration_red_fix_request(tid, run_branch, note)
+        u["task_rounds"] = rounds
+        u["fix_request"] = _with_reason(request, reason)
+    u["_next"] = "fix_round"
+
+
+def _ci_fix_past_cap(state, u, esc, answer, options):
+    """One more coder fix round past the per-check CI fix cap; those checks sit at the cap, so the next red asks again."""
+    data = as_dict(esc.get("data"))
+    pr = str(state.get("pr_number") or "")
+    over = [str(c) for c in as_list(data.get("over"))]
+    reason = _continue_past_cap(state, u, answer, options, _ci_fix_cap(pr, over),
+                                f"ci: one more coder fix round on PR #{pr} past the fix cap for {', '.join(over)}")
+    strikes = dict(as_dict(state.get("ci_fix_strikes")))
+    strikes[pr] = {**as_dict(strikes.get(pr)), **{c: STRIKE_LIMIT for c in over}}
+    u["ci_fix_strikes"] = strikes
+    tasks = as_list(state.get("tasks"))
+    owner = state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else "")
+    u["fix_request"] = _with_reason(_ci_fix_request(state, owner, pr, [str(c) for c in as_list(data.get("failing"))] or over), reason)
+    u["_next"] = "fix_round"
+
+
 def apply_answer(state):
     u = {}
     esc = as_dict(state.get("escalation"))
@@ -3818,6 +3909,8 @@ def apply_answer(state):
         batch = state.get("current_batch") or ""
         bs = dict(as_dict(state.get("batch_state")))
         if a == "round":
+            _continue_past_cap(state, u, answer, options, f"batch_strikeout:{batch}", f"batch: one more batch round on {batch} past the strike cap")
+            # batch_fix_route counts this round's strike, so the cap asks again after it
             bs.setdefault(batch, {})["strikes"] = STRIKE_LIMIT - 1
             u["batch_state"] = bs
             u["_next"] = "batch_fix_route"
@@ -3864,13 +3957,8 @@ def apply_answer(state):
     elif kind in ("integration_conflict", "integration_red"):
         a = ("abort" if abort else "stop" if stop
              else _picked_key(answer, options, {"round": ["one more", "cycle", "round"], "abort": ["abort"], "stop": ["stop"]}))
-        rounds = dict(as_dict(state.get("task_rounds")))
-        tr = rounds.setdefault(task.get("id", ""), {})
         if a == "round":
-            key = "conflict_cycles" if kind == "integration_conflict" else "integration_strikes"
-            tr[key] = as_int(tr.get(key)) - 1
-            u["task_rounds"] = rounds
-            u["_next"] = "integration_test" if state.get("integration_task") else "integration_check"
+            _integration_round(state, u, esc, answer, options, task)
         elif a == "abort":
             task["status"] = "failed"
             save_tasks(state, u, tasks)
@@ -3911,6 +3999,14 @@ def apply_answer(state):
     elif kind == "scope_surprise":
         u["failure_reason"] = f"stopped: the design requires writing outside the code repo: {answer}"
         u["_next"] = "end_blocked"
+    elif kind == "ci_exhausted" and as_dict(esc.get("data")).get("over"):
+        a = "leave" if stop else _picked_key(answer, options, {"fix": ["resume"], "leave": ["leave", "stop watching"]})
+        if a == "fix":
+            _ci_fix_past_cap(state, u, esc, answer, options)
+        elif a == "leave":
+            _ci_leave(state, u, kind)
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind in ("ci_unsure", "ci_exhausted", "ci_infra"):
         a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"], "fix": ["resume", "coder", "fix"], "leave": ["leave", "draft", "report"]}, "leave")
         if a == "rerun":
@@ -4063,7 +4159,6 @@ def phase_f_gate(state):
 def integration_check(state):
     u = {}
     code = state.get("code_repo_path", "")
-    tasks = as_list(state.get("tasks"))
     ok, out = _run_verification(state, code)
     if ok:
         u["integration_checked"] = True
@@ -4074,13 +4169,12 @@ def integration_check(state):
     u["final_integration_strikes"] = strikes
     ledger(state, u, f"phase_f: full suite RED on the run branch (strike {strikes}/{STRIKE_LIMIT})")
     if strikes > STRIKE_LIMIT:
+        more = _continue_recommended(_cap_continues(state, "integration_red:run"))
         return raise_escalation(state, u, escalation(
-            "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds at Phase F. How to proceed?",
-            [option("Stop and report", recommended=True), option("One more fix round anyway")], evidence=tail(out, 2500), hard_trigger=True))
-    owner = state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else "")
-    u["fix_request"] = {"task": owner, "source": "integration", "return_to": "integration_check",
-                        "items": ["Phase F integration: the full build + test suite is RED on the run branch (integrated result of all tasks)"],
-                        "note": tail(out, 4000)}
+            "integration_red", f"The run branch suite is still RED after {STRIKE_LIMIT} fix rounds at Phase F. One more fix round "
+                               "(say why it should land), or stop?" + ("" if more else CAP_SPENT_NOTE),
+            [option(INTEGRATION_RED_MORE, recommended=more), option("Stop and report")], evidence=tail(out, 2500), hard_trigger=True))
+    u["fix_request"] = _final_red_fix_request(state, tail(out, 4000))
     u["_next"] = "fix_round"
     return u
 
@@ -4530,6 +4624,20 @@ def _owning_task(state, diagnosis):
     return tasks[-1]["id"] if tasks else ""
 
 
+CI_FIX_MORE = "Resume with one more coder fix round (state reason)"
+
+
+def _ci_fix_cap(pr, over):
+    return f"ci_exhausted:{pr}:{','.join(sorted(over))}"
+
+
+def _ci_fix_request(state, owner, pr, checks):
+    return {"task": owner, "source": "ci", "return_to": "ci",
+            "items": [f"CI failure on PR #{pr} ({', '.join(checks)}): " + tail(state.get("ci_diagnosis", ""), 400)],
+            "note": "Evidence pack:\n" + tail(state.get("ci_evidence", ""), 5000)
+                    + "\nPost a NEW top-level PR comment '## Update @ <full head SHA>' mapping the fix to its commit; never rewrite the description."}
+
+
 def ci_apply(state):
     u = {}
     started = _lib._now()
@@ -4591,14 +4699,13 @@ def ci_apply(state):
         if over:
             if watching:
                 ledger(state, u, f"review-watch: PR #{pr} stop: ci_exhausted")
+            more = _continue_recommended(_cap_continues(state, _ci_fix_cap(pr, over)))
             return raise_escalation(state, u, escalation(
-                "ci_exhausted", f"CI still red on {over}{during} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?",
-                [option("Resume with one more coder fix round"), option(leave, recommended=True)],
-                evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True))
-        u["fix_request"] = {"task": owner, "source": "ci", "return_to": "ci",
-                            "items": [f"CI failure on PR #{pr} ({', '.join(checks)}): " + tail(state.get("ci_diagnosis", ""), 400)],
-                            "note": "Evidence pack:\n" + tail(state.get("ci_evidence", ""), 5000)
-                                    + "\nPost a NEW top-level PR comment '## Update @ <full head SHA>' mapping the fix to its commit; never rewrite the description."}
+                "ci_exhausted", f"CI still red on {over}{during} after {STRIKE_LIMIT} fix rounds (per check-name per PR #{pr}). How to proceed?"
+                                + ("" if more else CAP_SPENT_NOTE),
+                [option(CI_FIX_MORE, recommended=more), option(leave)],
+                evidence=tail(state.get("ci_evidence", ""), 2000), hard_trigger=True, data={"over": over, "failing": checks}))
+        u["fix_request"] = _ci_fix_request(state, owner, pr, checks)
         ledger(state, u, f"ci: real failure -> fix round to {owner} (strikes {pr_strikes})")
         u["_next"] = "fix_round"
         return u

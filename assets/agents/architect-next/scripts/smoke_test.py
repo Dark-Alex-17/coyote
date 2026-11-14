@@ -658,12 +658,57 @@ u = gates.checklist_round(base_state(checklist_labels=["grpc"], checklist_findin
 check("checklist_round: no items -> reseal_gate (declared)", u["_next"] == "reseal_gate")
 
 # ---------------------------------------------------------------- reseal (B2 / A1) / gates (B3, B5, B23)
-u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_cycles=0, plan_revision="old"))
+u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_cycles=0, plan_revision="old", quality_recorded=True))
 check("reseal_gate: amendment counts a cycle; plan unsealed + unreviewed; -> gate1_build", u["_next"] == "gate1_build" and u["amend_cycles"] == 1 and u["sealed"] is False and u["gate2_verdict"] == "")
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_cycles=AMEND_CYCLES_MAX))
 check("reseal_gate: B2 A1 cap -> escalation amend_cap (hard trigger)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap" and u["escalation"]["hard_trigger"])
-u = gates.reseal_gate(base_state(pending_amendments=[], amend_cycles=AMEND_CYCLES_MAX))
+u = gates.reseal_gate(base_state(pending_amendments=[], amend_cycles=AMEND_CYCLES_MAX, quality_recorded=True))
 check("reseal_gate: no amendment pending -> no cycle counted", "amend_cycles" not in u and u["_next"] == "gate1_build")
+u = gates.reseal_gate(base_state(pending_amendments=["design answers"], amend_source="design", amend_counts={}, amend_cycles=0,
+                                 quality_recorded=False))
+check("reseal_gate: a design-round amendment with no quality bar recorded -> quality_bar_gate, not Gate 1",
+      u["_next"] == "quality_bar_gate" and u["amend_cycles"] == 1 and u["sealed"] is False, u.get("_next"))
+u = gates.reseal_gate(base_state(pending_amendments=["design answers"], amend_source="design", amend_counts={}, amend_cycles=0,
+                                 quality_recorded=True))
+check("reseal_gate: a design-round amendment with the quality bar recorded -> gate1_build", u["_next"] == "gate1_build", u.get("_next"))
+u = gates.reseal_gate(base_state(pending_amendments=["leak answers"], amend_source="gate1", amend_counts={}, amend_cycles=0,
+                                 quality_recorded=True))
+check("reseal_gate: a mid-run amendment of a plan whose quality bar is recorded -> gate1_build", u["_next"] == "gate1_build", u.get("_next"))
+u = gates.reseal_gate(base_state(pending_amendments=["design answers"], amend_source="design",
+                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX}, amend_cycles=0, quality_recorded=False))
+check("reseal_gate: a design amendment past its cap with no quality bar -> amend_cap as before",
+      u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "amend_cap", u.get("_next"))
+
+
+def _design_answers_to_gate1():
+    s = base_state(choice_kind="design_round", choice_queue=[{"question": "Which store?", "options": []}], choice_index=1,
+                   choice_answers=[{"question": "Which store?", "answer": "pg", "via": "option"}], design_rounds=1,
+                   open_questions=[], quality_recorded=False, quality_rigor="", quality_surfaces=None, rigor_proposal="production",
+                   surfaces_proposal="http", amend_counts={}, amend_cycles=0, pending_amendments=[], checklist_done=[])
+    s.update(gates.open_questions_gate(s))
+    nodes = {"open_questions_gate": gates.open_questions_gate, "reseal_gate": gates.reseal_gate,
+             "quality_bar_gate": gates.quality_bar_gate, "record_quality_bar": gates.record_quality_bar,
+             "checklist_gate": gates.checklist_gate, "apply_answer": gates.apply_answer}
+    path = [s["_next"]]
+    for _ in range(20):
+        if s["_next"] == "gate1_build" or s["_next"].startswith("end_"):
+            break
+        if s["_next"] == "amend_plan":
+            s["_next"] = "reseal_gate"
+            continue
+        if s["_next"] == "escalate_gate":
+            s["last_answer"] = next(o["text"] for o in s["escalation"]["options"] if o["recommended"])
+            s["_next"] = "apply_answer"
+        s.update(nodes[s["_next"]](s))
+        path.append(s["_next"])
+    after = gates.reseal_gate({**s, "pending_amendments": ["leak answers"], "amend_source": "gate1"})["_next"]
+    return (path[-1] == "gate1_build" and path.count("gate1_build") == 1 and "record_quality_bar" in path
+            and path.index("checklist_gate") < path.index("gate1_build") and s.get("quality_recorded") is True
+            and after == "gate1_build"), (path, after)
+
+
+guarded("design-round answers -> amend_plan -> reseal_gate -> quality bar -> checklist -> reseal_gate -> gate1_build once",
+        _design_answers_to_gate1)
 u = gates.gate1_build(base_state(task_granularity="micro", gate1_result="PLAN_GATE: LEAKY\n- q1?"))
 check("gate1_build: micro addendum + prior verdict", "Micro-grain addendum" in u["gate1_prompt"] and "Prior verdict" in u["gate1_prompt"])
 u = gates.gate1_build(base_state())
@@ -791,7 +836,7 @@ check("reseal_gate: a source past its own budget -> amend_cap naming that source
       and u["escalation"]["data"] == {"source": "design", "over": ["source"]}
       and "design-round" in u["escalation"]["question"], u.get("escalation"))
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="gate2", amend_cycles=_lib.AMEND_DESIGN_MAX + _lib.AMEND_GATE1_MAX,
-                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}))
+                                 amend_counts={"design": _lib.AMEND_DESIGN_MAX, "gate1": _lib.AMEND_GATE1_MAX}, quality_recorded=True))
 check("reseal_gate: spent design and Gate 1 budgets leave the Gate 2 budget whole -> gate1_build, gate2 cycle 1",
       u["_next"] == "gate1_build" and u["amend_counts"]["gate2"] == 1 and u["amend_source"] == "", u)
 u = gates.reseal_gate(base_state(pending_amendments=["x"], amend_source="", amend_counts={}))
@@ -1753,11 +1798,19 @@ u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integratio
 check("integration_test: merge conflict -> abort + rebase fix round (B15 side 1); tree clean", u["_next"] == "fix_round" and u["fix_request"]["source"] == "integration" and u["task_rounds"][T3]["conflict_cycles"] == 1 and git(CODE, "status", "--porcelain") == "")
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T3, run_branch="feat/PLAN-widgets", task_rounds={T3: {"conflict_cycles": CONFLICT_CYCLES_MAX}}))
 check("integration_test: B15 exhausted -> escalation integration_conflict", u["escalation"]["kind"] == "integration_conflict")
+E_IC = u["escalation"]
+E_IC_SPENT = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T3, run_branch="feat/PLAN-widgets",
+                                               task_rounds={T3: {"conflict_cycles": CONFLICT_CYCLES_MAX}},
+                                               cap_continues={f"integration_conflict:{T3}": STRIKE_LIMIT})).get("escalation")
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets", verification_commands='["false"]', task_rounds={T1: {"merged": True}}))
 check("integration_test: suite RED after merge -> fix round (B14 side 1)", u["_next"] == "fix_round" and u["task_rounds"][T1]["integration_strikes"] == 1)
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets", verification_commands='["false"]', task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}}))
 check("integration_test: B14 exhausted -> escalation integration_red", u["escalation"]["kind"] == "integration_red")
+E_IR = u["escalation"]
+E_IR_SPENT = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets",
+                                               verification_commands='["false"]', task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT}},
+                                               cap_continues={f"integration_red:{T1}": STRIKE_LIMIT})).get("escalation")
 ts_cl = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl, T1).update({"status": "complete", "worktree": wt0, "branch": WAVE[0]["branch"]})
 git(CODE, "push", "-q", "origin", WAVE[0]["branch"])
@@ -1781,6 +1834,9 @@ check("batch_fix_route: owned finding -> fix round queued (re-entry); cross-task
       and u["tasks"][-1]["batch"] == "B1" and u["tasks"][-1]["type"] == "chore" and u["batch_state"]["B1"]["strikes"] == 1)
 u = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[], batch_state={"B1": {"strikes": STRIKE_LIMIT}}))
 check("batch_fix_route: B16 3 strikes per batch -> escalation batch_strikeout", u["escalation"]["kind"] == "batch_strikeout")
+E_BS = u["escalation"]
+E_BS_SPENT = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[],
+                                              batch_state={"B1": {"strikes": STRIKE_LIMIT}}, cap_continues={"batch_strikeout:B1": STRIKE_LIMIT})).get("escalation")
 u = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[], batch_state={}, last_node_output="llm node failed"))
 check("batch_fix_route: dead triage -> everything routed to the batch's last task (fail-open)", u["pending_fixes"][0]["task"] == T2)
 u = gates.batch_close(base_state(plan_path=PROMOTED, tasks=ts_b, current_batch="B1", current_task=T2, verify_unit="B1", round_log={"B1": [{"round": 1, "head": "h"}]}, last_verdict="PASS", batch_state={}))
@@ -2422,9 +2478,12 @@ u = AA("wave_escalation", "Retry the task sequentially (one fix round with the e
 check("apply_answer: wave_escalation retry -> sequential fix round in the worktree", u["_next"] == "compose_delegation" and u["fix_items"] == ["e1"])
 check("apply_answer: wave_escalation accept -> integration_test (single)", AA("wave_escalation", "Accept as-is and close the task (recorded)", current_task=T3, tasks=TS_W)["_next"] == "integration_test")
 check("apply_answer: wave_escalation abort -> wave_cleanup (task failed, branch kept)", AA("wave_escalation", "Abort this task (worktree removed, branch kept)", current_task=T3, tasks=TS_W)["_next"] == "wave_cleanup")
-u = AA("integration_conflict", "One more rebase cycle", current_task=T3, tasks=TS_W, integration_task=T3, task_rounds={T3: {"conflict_cycles": 3}})
-check("apply_answer: integration_conflict one more -> integration_test (cycle decremented)", u["_next"] == "integration_test" and u["task_rounds"][T3]["conflict_cycles"] == 2)
-check("apply_answer: integration_red one more at Phase F -> integration_check", AA("integration_red", "One more fix round anyway", current_task=T1, tasks=TS_W, task_rounds={T1: {"integration_strikes": 4}})["_next"] == "integration_check")
+u = AA("integration_conflict", "One more rebase cycle (state reason)", current_task=T3, tasks=TS_W, integration_task=T3, task_rounds={T3: {"conflict_cycles": 3}})
+check("apply_answer: integration_conflict one more -> a rebase fix round (cycle at the cap)",
+      u["_next"] == "fix_round" and u["fix_request"]["return_to"] == "integration" and u["task_rounds"][T3]["conflict_cycles"] == CONFLICT_CYCLES_MAX)
+u = AA("integration_red", "One more fix round (state reason)", current_task=T1, tasks=TS_W, final_integration_strikes=4)
+check("apply_answer: integration_red one more at Phase F -> a fix round back to integration_check",
+      u["_next"] == "fix_round" and u["fix_request"]["return_to"] == "integration_check" and u["final_integration_strikes"] == STRIKE_LIMIT)
 check("apply_answer: integration_* stop -> end_blocked", AA("integration_red", "Stop and report", current_task=T1, tasks=TS_W)["_next"] == "end_blocked")
 check("apply_answer: approve_next continue -> select_tasks", AA("approve_next", "Continue")["_next"] == "select_tasks")
 u = AA("approve_next", "Stop here (park the run)")
@@ -2601,7 +2660,7 @@ check("choice_park: each question keeps its own park count; a second question of
 
 s7 = base_state(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT + 1, escalation=E_G2,
                 last_answer="Another fix round (state reason)", amend_counts={"gate2": _lib.AMEND_GATE2_MAX},
-                amend_cycles=AMEND_CYCLES_MAX, amend_source="", pending_amendments=[], cap_continues={})
+                amend_cycles=AMEND_CYCLES_MAX, amend_source="", pending_amendments=[], cap_continues={}, quality_recorded=True)
 s7.update(gates.apply_answer(s7))
 g2_next = s7["_next"]
 s7.update(gates.reseal_gate(s7))
@@ -2667,11 +2726,11 @@ check("gate2_route: a reply whose only PLAN_REVIEW text is the echoed prompt is 
 STOP_KINDS = {
     "tasks_stuck": [option("Retry the failed blocker"), option("Skip the blocked tasks and finish (follow-ups)"),
                     option("Stop and report", recommended=True)],
-    "batch_strikeout": [option("Stop and report", recommended=True), option("One more batch round anyway"),
-                        option("Accept the batch unresolved (recorded)")],
-    "integration_conflict": [option("Stop and report", recommended=True), option("One more rebase cycle"),
-                             option("Abort this task (branch kept)")],
-    "integration_red": [option("Stop and report", recommended=True), option("One more fix round anyway")],
+    "batch_strikeout": [option("One more batch round (state reason)", recommended=True), option("Accept the batch unresolved (recorded)"),
+                        option("Stop and report")],
+    "integration_conflict": [option("One more rebase cycle (state reason)", recommended=True), option("Abort this task (branch kept)"),
+                             option("Stop and report")],
+    "integration_red": [option("One more fix round (state reason)", recommended=True), option("Stop and report")],
     "task_failed": [option("Retry with the oracle's direction (one round)", recommended=True),
                     option("Re-scope: amend the plan/task (type the amendment)"), option("Abort this task and stop")],
     "review_round_cap": [option("Resume with one more fix round"), option("Stop watching and report", recommended=True)],
@@ -2687,9 +2746,9 @@ for k, opts in STOP_KINDS.items():
 check("apply_answer: 'don't stop' is no stop and a reply that picks no option asks again, for every cap that offers a stop",
       all(v == ("escalate_gate", k) for (k, _), v in stop_.items()), {k: v for k, v in stop_.items() if v != ("escalate_gate", k[0])})
 picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]), **copy.deepcopy(stop_ctx))["_next"],
-          "batch_strikeout": AA("batch_strikeout", "One more batch round anyway",
+          "batch_strikeout": AA("batch_strikeout", "One more batch round (state reason)",
                                 esc=escalation("batch_strikeout", "q", STOP_KINDS["batch_strikeout"]), **copy.deepcopy(stop_ctx))["_next"],
-          "integration_red": AA("integration_red", "2", esc=escalation("integration_red", "q", STOP_KINDS["integration_red"]),
+          "integration_red": AA("integration_red", "1", esc=escalation("integration_red", "q", STOP_KINDS["integration_red"]),
                                 **copy.deepcopy(stop_ctx))["_next"],
           "integration_conflict abort": AA("integration_conflict", "Abort this task (branch kept)",
                                            esc=escalation("integration_conflict", "q", STOP_KINDS["integration_conflict"]),
@@ -2701,7 +2760,7 @@ picks_ = {"tasks_stuck": AA("tasks_stuck", "1", esc=escalation("tasks_stuck", "q
           "tasks_stuck stop": AA("tasks_stuck", "Stop and report", esc=escalation("tasks_stuck", "q", STOP_KINDS["tasks_stuck"]),
                                  **copy.deepcopy(stop_ctx))["_next"]}
 check("apply_answer: the caps that offer a stop still act on an explicit pick of each option",
-      picks_ == {"tasks_stuck": "select_tasks", "batch_strikeout": "batch_fix_route", "integration_red": "integration_check",
+      picks_ == {"tasks_stuck": "select_tasks", "batch_strikeout": "batch_fix_route", "integration_red": "fix_round",
                  "integration_conflict abort": "wave_cleanup", "task_failed rescope": "amend_plan", "task_failed abort": "end_aborted",
                  "tasks_stuck stop": "end_blocked"}, picks_)
 
@@ -2733,6 +2792,9 @@ u = gates.integration_check(base_state(plan_path=PROMOTED, tasks=ts_f, verificat
 check("integration_check: RED -> fix round (B14 side 1, return_to integration_check)", u["_next"] == "fix_round" and u["fix_request"]["return_to"] == "integration_check")
 u = gates.integration_check(base_state(plan_path=PROMOTED, tasks=ts_f, verification_commands='["false"]', final_integration_strikes=STRIKE_LIMIT))
 check("integration_check: B14 exhausted -> integration_red", u["escalation"]["kind"] == "integration_red")
+E_FR = u["escalation"]
+E_FR_SPENT = gates.integration_check(base_state(plan_path=PROMOTED, tasks=ts_f, verification_commands='["false"]', final_integration_strikes=STRIKE_LIMIT,
+                                                cap_continues={"integration_red:run": STRIKE_LIMIT})).get("escalation")
 u = gates.integrate_route(base_state(integration_amendments=["TASK-3 criterion stale"], integration_follow_ups=["rotate key"], integration_amended=False, anomalies=["x"]))
 check("integrate_route: amendments -> amend_plan (once per Phase F), follow-ups ledgered, A10 consumed", u["_next"] == "amend_plan" and u["integration_amended"] and u["follow_ups"] == ["(integration) rotate key"] and u["after_reseal"] == "phase_f" and u["anomalies_log"])
 check("integrate_route: already amended -> hygiene_create", gates.integrate_route(base_state(integration_amendments=["x"], integration_amended=True))["_next"] == "hygiene_create")
@@ -2802,6 +2864,62 @@ u = gates.ci_apply(base_state(pr_number="99", ci_verdict="flake", failing_checks
 check("ci_apply: budgets are per check-name per PR (lint on #99 fresh although test is exhausted and #98 lint is)", u["_next"] == "ci_poll" and u["ci_reruns"]["99"]["lint"] == 1)
 u = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f))
 check("ci_apply: B18 fix strikes exhausted per check per PR -> ci_exhausted", u["escalation"]["kind"] == "ci_exhausted")
+E_CE = u["escalation"]
+E_CE_SPENT = gates.ci_apply(base_state(pr_number="99", ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")],
+                                       ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}, tasks=ts_f,
+                                       cap_continues={"ci_exhausted:99:test": STRIKE_LIMIT})).get("escalation")
+CAP_CASES = {
+    "integration_conflict": (E_IC, E_IC_SPENT, "One more rebase cycle (state reason)", f"integration_conflict:{T3}",
+                             dict(current_task=T3, tasks=TS_W, integration_task=T3, run_branch="feat/PLAN-widgets",
+                                  task_rounds={T3: {"conflict_cycles": CONFLICT_CYCLES_MAX + 1}})),
+    "integration_red": (E_IR, E_IR_SPENT, "One more fix round (state reason)", f"integration_red:{T1}",
+                        dict(current_task=T1, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets",
+                             task_rounds={T1: {"merged": True, "integration_strikes": STRIKE_LIMIT + 1}})),
+    "integration_red at Phase F": (E_FR, E_FR_SPENT, "One more fix round (state reason)", "integration_red:run",
+                                   dict(tasks=ts_f, final_integration_strikes=STRIKE_LIMIT + 1)),
+    "batch_strikeout": (E_BS, E_BS_SPENT, "One more batch round (state reason)", "batch_strikeout:B1",
+                        dict(current_batch="B1", tasks=copy.deepcopy(ts_b), batch_state={"B1": {"strikes": STRIKE_LIMIT + 1}})),
+    "ci_exhausted": (E_CE, E_CE_SPENT, "Resume with one more coder fix round (state reason)", "ci_exhausted:99:test",
+                     dict(pr_number="99", tasks=ts_f, ci_owning_task=T1, ci_fix_strikes={"99": {"test": STRIKE_LIMIT + 1}})),
+}
+for name, (first, spent, more, key, ctx) in CAP_CASES.items():
+    check(f"{name}: the continue option is first and recommended at the cap; after {STRIKE_LIMIT} continues none is, with the cap-spent note",
+          _cap_offer(first) == (more, [more]) and _cap_offer(spent) == (more, [])
+          and gates.CAP_SPENT_NOTE in (spent or {}).get("question", "") and gates.CAP_SPENT_NOTE not in (first or {}).get("question", ""),
+          (_cap_offer(first), _cap_offer(spent)))
+    v = AA(first["kind"], more, esc=first, last_answer_text="1 - the last round found a new cause", cap_continues={}, **copy.deepcopy(ctx))
+    check(f"apply_answer: {name} continue with a reason -> a real round dispatched, the reason ledgered, one continue counted",
+          v["_next"] in ("fix_round", "batch_fix_route") and any("the last round found a new cause" in d for d in v.get("decisions", []))
+          and _lib.as_dict(v.get("cap_continues")).get(key) == 1, (v["_next"], v.get("cap_continues"), v.get("decisions")))
+    s = base_state(escalation=first, last_answer_text=HG, cap_continues={}, **copy.deepcopy(ctx))
+    s.update(gates.parse_answer(s))
+    picked = s.get("last_answer")
+    s.update(gates.apply_answer(s))
+    check(f"headless: {name} guidance picks the continue option and dispatches the round",
+          picked == more and s["_next"] in ("fix_round", "batch_fix_route"), (picked, s["_next"]))
+cc_ = {n: AA(c[0]["kind"], c[2], esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
+fr_ = {n: _lib.as_dict(v.get("fix_request")) for n, v in cc_.items()}
+check("apply_answer: integration_conflict continue -> a rebase fix round for the task, back to integration, one cycle before it asks again",
+      cc_["integration_conflict"]["_next"] == "fix_round" and fr_["integration_conflict"].get("task") == T3
+      and fr_["integration_conflict"].get("return_to") == "integration" and "rebase" in " ".join(fr_["integration_conflict"].get("items", [])).lower()
+      and cc_["integration_conflict"]["task_rounds"][T3]["conflict_cycles"] == CONFLICT_CYCLES_MAX, (cc_["integration_conflict"]["_next"], fr_["integration_conflict"]))
+check("apply_answer: integration_red continue -> a fix round for the task (not a test-only re-run), back to integration",
+      cc_["integration_red"]["_next"] == "fix_round" and fr_["integration_red"].get("task") == T1
+      and fr_["integration_red"].get("return_to") == "integration" and cc_["integration_red"]["task_rounds"][T1]["integration_strikes"] == STRIKE_LIMIT,
+      (cc_["integration_red"]["_next"], fr_["integration_red"]))
+check("apply_answer: integration_red continue at Phase F -> a fix round back to integration_check",
+      cc_["integration_red at Phase F"]["_next"] == "fix_round" and fr_["integration_red at Phase F"].get("return_to") == "integration_check"
+      and cc_["integration_red at Phase F"].get("final_integration_strikes") == STRIKE_LIMIT, (cc_["integration_red at Phase F"]["_next"], fr_["integration_red at Phase F"]))
+check("apply_answer: batch_strikeout continue -> batch_fix_route with the strikes one below the cap",
+      cc_["batch_strikeout"]["_next"] == "batch_fix_route" and cc_["batch_strikeout"]["batch_state"]["B1"]["strikes"] == STRIKE_LIMIT - 1)
+check("apply_answer: ci_exhausted continue -> a coder fix round for the owning task back to CI, the check one strike before it asks again",
+      cc_["ci_exhausted"]["_next"] == "fix_round" and fr_["ci_exhausted"].get("task") == T1 and fr_["ci_exhausted"].get("return_to") == "ci"
+      and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
+      (cc_["ci_exhausted"]["_next"], fr_["ci_exhausted"], cc_["ci_exhausted"].get("ci_fix_strikes")))
+ask_ = {n: AA(c[0]["kind"], "hmm, not sure", esc=c[0], cap_continues={}, **copy.deepcopy(c[4])) for n, c in CAP_CASES.items()}
+check("apply_answer: a reply that picks none of a cap's options is asked again, never stopped",
+      all(v["_next"] == "escalate_gate" and v["escalation"]["kind"] == CAP_CASES[n][0]["kind"] for n, v in ask_.items()),
+      {n: v["_next"] for n, v in ask_.items()})
 check("ci_apply: infra -> escalation ci_infra (wait-or-escalate)", gates.ci_apply(base_state(pr_number="99", ci_verdict="infra", failing_checks=["test"]))["escalation"]["kind"] == "ci_infra")
 check("ci_apply: unsure defaults UP (never a re-run)", gates.ci_apply(base_state(pr_number="99", ci_verdict="unsure", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
 check("ci_apply: dead diagnose = unsure", gates.ci_apply(base_state(pr_number="99", ci_verdict="", last_node_output="llm node failed", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
@@ -3318,7 +3436,8 @@ check("watch: ci_route timeout while watching -> review-aware ci_exhausted with 
       and ledgered(u, "review-watch: PR #99 stop: ci_exhausted"), esc_shape(u))
 CI_CASES = (
     ("ci_exhausted", dict(ci_verdict="real", failing_checks=["test"], ci_failing=[("test", "l")], ci_fix_strikes={"99": {"test": STRIKE_LIMIT}}),
-     "CI still red on ['test']{d} after 3 fix rounds (per check-name per PR #99). How to proceed?", [("Resume with one more coder fix round", False), ("{l}", True)]),
+     "CI still red on ['test']{d} after 3 fix rounds (per check-name per PR #99). How to proceed?",
+     [("Resume with one more coder fix round (state reason)", True), ("{l}", False)]),
     ("ci_infra", dict(ci_verdict="infra", failing_checks=["test"]),
      "CI failed{d} for infrastructure reasons (runner lost / timeout / 429 / cancelled). Wait and re-watch, or {w}?",
      [("Keep waiting (re-run the watch)", True), ("{l}", False)]),

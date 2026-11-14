@@ -1179,7 +1179,7 @@ nodes:
   reseal_gate:
     id: reseal_gate
     type: script
-    description: A1 - count amendment cycles per source (design, Gate 1 leaks, Gate 2 rejections, rework; each its own budget, under an overall ceiling -> owner); a mutated plan is unsealed and unreviewed; then Gate 1 over the FULL plan.
+    description: A1 - count amendment cycles per source (design, Gate 1 leaks, Gate 2 rejections, rework; each its own budget, under an overall ceiling -> owner); a mutated plan is unsealed and unreviewed; a plan with no quality bar recorded yet goes to the quality bar and checklist first; then Gate 1 over the FULL plan.
     script: scripts/reseal_gate.py
     fallback: end_failure
 
