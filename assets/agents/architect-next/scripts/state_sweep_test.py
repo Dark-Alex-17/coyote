@@ -55,7 +55,7 @@ os.environ["ARCHITECT_SLACK_PING_BIN"] = os.path.join(BIN, "slack_ping")
 os.environ["LLM_ROOT_DIR"] = os.path.join(TMP, "coyote")  # no real core tools reachable
 
 import gates  # noqa: E402
-from _fixture import Store  # noqa: E402
+from _fixture import PlanningFixture  # noqa: E402
 
 
 def git(repo, *a):
@@ -73,11 +73,11 @@ git(CODE, "init", "-q", "--bare", CODE + ".git")
 git(CODE, "remote", "add", "origin", CODE + ".git")
 git(CODE, "push", "-q", "-u", "origin", "main")
 
-STORE = Store(TMP, CODE)
-PLAN = STORE.write_promoted_plan("---\ntitle: Widgets\nslug: widgets\nstatus: in-progress\n---\n\n# Widgets\n\n"
+FIXTURE = PlanningFixture(TMP, CODE)
+PLAN = FIXTURE.write_promoted_plan("---\ntitle: Widgets\nslug: widgets\nstatus: in-progress\n---\n\n# Widgets\n\n"
                                  "## Quality bar\n\nrigor: production\n\n## Task breakdown\n\n"
                                  "| Task | Title | Points | Blocked by | Files |\n|---|---|---|---|---|\n| 1 | Widget model | 1 | | README.md |\n")
-T1, _ = STORE.new_task(gates, "widget-model", files="README.md")
+T1, _ = FIXTURE.new_task(gates, "widget-model", files="README.md")
 git(CODE, "add", ".")
 git(CODE, "commit", "-q", "-m", "chore(plan): tasks")
 DESIGN = os.path.join(TMP, "design.md")
@@ -89,9 +89,9 @@ RUN_DIR = os.path.join(os.environ["ARCHITECT_RUNS_ROOT"], RUN_ID)
 
 
 def base_state():
-    s = STORE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
+    s = FIXTURE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
                         task_granularity="standard", auto_confirm="1")
-    s.update(STORE.normalized())
+    s.update(FIXTURE.normalized())
     s.update({"code_repo_path": CODE, "git_root": CODE, "reference_root_path": TMP, "design_doc_path": DESIGN,
               "run_id": RUN_ID, "run_dir": RUN_DIR, "decisions": [], "anomalies": [], "anomalies_log": [],
               "plan_path": PLAN, "plan_slug": "widgets", "mode_line": "m", "task_rounds": {}, "follow_ups": [],
@@ -115,7 +115,7 @@ def reset(saved):
             json.dump(TASKS, f)
         with open(os.path.join(RUN_DIR, "state.json"), "w") as f:
             json.dump({"run_id": RUN_ID, "run_dir": RUN_DIR, "code_repo_path": CODE, "plan_path": PLAN,
-                       "tasks_root": STORE.tasks_root, "current_task": T1, "phase": "task saved"}, f)
+                       "tasks_root": FIXTURE.tasks_root, "current_task": T1, "phase": "task saved"}, f)
 
 
 def trig_set(key, value):

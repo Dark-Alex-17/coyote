@@ -114,10 +114,10 @@ CODE = os.path.join(TMP, "code")
 CODE_BASE = make_repo(CODE, {"README.md": "# demo\n", "CLAUDE.md": "Run `go test ./...` before committing.\n",
                              "src/a.go": "package a\n", "src/b.go": "package b\n", "api/h.go": "package api\n"})
 
-from _fixture import CLOSE_COMMIT_MARKER, HAS_OWNER_FILE, OWNER, Store  # noqa: E402
+from _fixture import CLOSE_COMMIT_MARKER, HAS_OWNER_FILE, OWNER, PlanningFixture  # noqa: E402
 
-STORE = Store(TMP, CODE)
-PLANS = STORE.root
+FIXTURE = PlanningFixture(TMP, CODE)
+PLANS = FIXTURE.root
 
 # The REAL prose-architect tools.sh through a scratch LLM_ROOT_DIR (copies only; never symlinks).
 ROOT = os.path.join(TMP, "coyote")
@@ -139,7 +139,7 @@ os.environ["PATH"] = GHBIN + os.pathsep + os.environ["PATH"]
 DESIGN = os.path.join(TMP, "design.md")
 write(DESIGN, "# Widget service\n\nAdd a widget endpoint and a worker.\n")
 
-PLAN = STORE.plan_path
+PLAN = FIXTURE.plan_path
 PLAN_TEXT = """---
 title: Widgets
 slug: widgets
@@ -176,9 +176,9 @@ write(PLAN, PLAN_TEXT)
 
 
 def base_state(**over):
-    s = STORE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
+    s = FIXTURE.variables(DESIGN, TMP, autonomy="full", escalation_policy="interactive", parallel_tasks="0", pr_strategy="single",
                         task_granularity="standard", auto_confirm="1")
-    s.update(STORE.normalized())
+    s.update(FIXTURE.normalized())
     s.update({"code_repo_path": CODE, "git_root": CODE, "reference_root_path": TMP, "design_doc_path": DESIGN,
               "run_id": "x", "run_dir": os.path.join(os.environ["ARCHITECT_RUNS_ROOT"], "x"), "decisions": [], "anomalies": [],
               "anomalies_log": [], "plan_path": PLAN, "plan_slug": "widgets", "mode_line": "m", "tasks": [], "task_rounds": {},
@@ -235,24 +235,24 @@ check("RESUME_RE: matches a suffixed run id whole and still the plain form",
 
 
 # ---------------------------------------------------------------- intake / re-entry (A2)
-st = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **STORE.variables(DESIGN, TMP, owner="someone", pr_strategy="single")})
+st = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **FIXTURE.variables(DESIGN, TMP, owner="someone", pr_strategy="single")})
 check("intake: run dir + brief + mode line + normalized paths", st["_next"] == "orient_read" and os.path.isdir(st["run_dir"])
-      and st["code_repo_path"] == CODE and st["tasks_root"] == STORE.tasks_root and "pr_strategy=single" in st["mode_line"])
+      and st["code_repo_path"] == CODE and st["tasks_root"] == FIXTURE.tasks_root and "pr_strategy=single" in st["mode_line"])
 check("intake: design doc resolved from the prompt", st["design_doc_path"] == DESIGN)
 check("intake: owner identity file wins over the owner variable (ledgered)", (not HAS_OWNER_FILE) or (st["owner_name"] == OWNER and any("whoami" in d for d in st["decisions"])))
 check("intake: brief.md + state.json written", os.path.exists(os.path.join(st["run_dir"], "brief.md")) and os.path.exists(os.path.join(st["run_dir"], "state.json")))
 rid = st["run_id"]
-st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="triple")})
+st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="triple")})
 check("intake: unknown mode value -> escalation mode_invalid (fail-safe, never a default)", st_bad["_next"] == "escalate_gate" and st_bad["escalation"]["kind"] == "mode_invalid")
-st_nd = gates.intake({"initial_prompt": "implement the thing", **STORE.variables("", TMP)})
+st_nd = gates.intake({"initial_prompt": "implement the thing", **FIXTURE.variables("", TMP)})
 check("intake draft: no design doc, no seed, a message -> draft_brief with the draft counters reset, no escalation",
       st_nd["_next"] == "draft_brief" and st_nd["draft_rounds"] == 0 and st_nd["draft_feedback"] == "" and st_nd["draft_text"] == ""
       and "escalation" not in st_nd and any(d.startswith("draft: no design doc and no ready seed") for d in st_nd["decisions"]), st_nd.get("_next"))
 check("intake draft: a first draft starts with the drafting node's output keys cleared",
       all(st_nd.get(k) == v for k, v in gates._DRAFT_OUTPUT_RESET.items()), st_nd)
-u = gates.intake({"initial_prompt": "", "previous_turns": "user: add a --dry-run flag to the sync command", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "", "previous_turns": "user: add a --dry-run flag to the sync command", **FIXTURE.variables("", TMP)})
 check("intake draft: a blank message with earlier turns still drafts", u["_next"] == "draft_brief", u.get("_next"))
-u = gates.intake({"initial_prompt": "  ", "previous_turns": " \n", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "  ", "previous_turns": " \n", **FIXTURE.variables("", TMP)})
 check("intake draft: a blank message and blank earlier turns -> escalation need_design_doc, nothing drafted",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "draft_rounds" not in u, u.get("_next"))
 SEED_DIR = os.path.join(PLANS, "engineer-handoffs")
@@ -273,15 +273,15 @@ def seed_status(path):
 seed("other.md", "2030-01-01T00:00:00Z", project=os.path.join(TMP, "elsewhere"))
 seed("used.md", "2030-01-02T00:00:00Z", status="consumed")
 seed("bare.md", "", fm=False)
-u = gates.intake({"initial_prompt": "implement the thing", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "implement the thing", **FIXTURE.variables("", TMP)})
 check("intake seed: another project / consumed / no frontmatter -> ignored, drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path"), u.get("seed_path"))
 SEED_OLD = seed("old.md", "2026-01-01T00:00:00Z")
 SEED = seed("new.md", "2026-02-01T00:00:00Z")
-u = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **STORE.variables(DESIGN, TMP)})
+u = gates.intake({"initial_prompt": f"Implement the design at {DESIGN}", **FIXTURE.variables(DESIGN, TMP)})
 check("intake seed: an explicit design doc wins over a ready seed, seed untouched",
       u["_next"] == "orient_read" and u["design_doc_path"] == DESIGN and not u.get("seed_path") and seed_status(SEED) == "ready")
-st_seed = gates.intake({"initial_prompt": "okay, go ahead and get started", **STORE.variables("", TMP)})
+st_seed = gates.intake({"initial_prompt": "okay, go ahead and get started", **FIXTURE.variables("", TMP)})
 check("intake seed: no doc path + two ready seeds -> hard-trigger seed_confirm escalation on the newest, not yet consumed",
       st_seed["_next"] == "escalate_gate" and st_seed["escalation"]["kind"] == "seed_confirm" and st_seed["escalation"]["hard_trigger"] is True
       and st_seed["seed_path"] == SEED
@@ -292,7 +292,7 @@ os.remove(SEED_OLD)
 _groups = gates.MULTI_IS_GROUPS
 gates.MULTI_IS_GROUPS = False
 try:
-    u = gates.intake({"initial_prompt": "do it", **STORE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
+    u = gates.intake({"initial_prompt": "do it", **FIXTURE.variables("", TMP, pr_strategy="multi", pr_tracking="review")})
 finally:
     gates.MULTI_IS_GROUPS = _groups
 check("intake seed: the review-watch follow-up is recorded once before the seed_confirm escalation",
@@ -348,27 +348,27 @@ gates.research_dispatch(base_state(design_doc_path=SEED, run_id="other-run", exp
 check("research_dispatch: a non-seed design doc is untouched and an already consumed seed keeps its consumer",
       read_file(NOT_SEED) == _not_seed_before and gates.frontmatter(read_file(SEED))[0] == fm_seed, gates.frontmatter(read_file(SEED))[0])
 os.remove(NOT_SEED)
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: a consumed seed is not picked again -> drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path"), u.get("seed_path"))
 SEED_EXPLICIT = seed("explicit.md", "2026-02-15T00:00:00Z")
-u = gates.intake({"initial_prompt": f"Implement the design at {SEED_EXPLICIT}", **STORE.variables(SEED_EXPLICIT, TMP)})
+u = gates.intake({"initial_prompt": f"Implement the design at {SEED_EXPLICIT}", **FIXTURE.variables(SEED_EXPLICIT, TMP)})
 _explicit = [u["_next"], u.get("design_doc_path")]
 gates.research_dispatch(base_state(design_doc_path=u.get("design_doc_path") or "", run_id=u["run_id"], explore_slices=["a"]))
 _explicit.append(seed_status(SEED_EXPLICIT))
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: an explicit path to a ready seed -> consumed at research_dispatch -> a later go-ahead drafts instead",
       _explicit == ["orient_read", SEED_EXPLICIT, "consumed"] and u["_next"] == "draft_brief" and not u.get("seed_path"), (_explicit, u.get("_next")))
 SEED_SISYPHUS = seed("sisyphus.md", "2026-02-20T00:00:00Z", vehicle="sisyphus")
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: vehicle sisyphus -> not a seed, drafts a brief",
       u["_next"] == "draft_brief" and not u.get("seed_path") and seed_status(SEED_SISYPHUS) == "ready", u.get("seed_path"))
 SEED_NO_VEHICLE = seed("no-vehicle.md", "2026-02-10T00:00:00Z")
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables("", TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables("", TMP)})
 check("intake seed: no vehicle key -> treated as architect, offered",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "seed_confirm" and u.get("seed_path") == SEED_NO_VEHICLE, u.get("seed_path"))
 seed("late.md", "2026-03-01T00:00:00Z")
-u = gates.intake({"initial_prompt": "go ahead", **STORE.variables(os.path.join(TMP, "missing-design.md"), TMP)})
+u = gates.intake({"initial_prompt": "go ahead", **FIXTURE.variables(os.path.join(TMP, "missing-design.md"), TMP)})
 check("intake draft: an explicit unreadable doc path with a ready seed present -> need_design_doc, unchanged question, no seed, no draft",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc"
       and u["escalation"]["question"] == gates._need_design_doc_escalation()["question"] and not u.get("seed_path") and "draft_rounds" not in u,
@@ -439,7 +439,7 @@ os.remove(DRAFT_PATH)
 u = gates.apply_answer(base_state(escalation=E_DRAFT, last_answer="Use this draft", draft_rounds=0))
 check("apply_answer: draft_confirm use with the draft file gone -> need_design_doc",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "need_design_doc" and "design_doc_path" not in u, u)
-s = {"initial_prompt": "add a --dry-run flag to the sync command", **STORE.variables("", TMP)}
+s = {"initial_prompt": "add a --dry-run flag to the sync command", **FIXTURE.variables("", TMP)}
 s.update(gates.intake(s))
 chain = [s["_next"]]
 s.update({"draft_possible": True, "draft_title": "Dry run for sync", "draft_markdown": DRAFT_MD, "draft_reason": "", "anomalies": []})
@@ -453,10 +453,10 @@ check("chain: intake (no doc) -> draft_route -> apply_answer use -> orient_read 
       and os.path.isfile(s["design_doc_path"]), (chain, s.get("design_doc_path")))
 write(os.path.join(st["run_dir"], "tasks.json"), json.dumps([{"id": "TASK-101", "status": "complete"}]))
 gates.snapshot(st, {"sealed": True, "gate2_verdict": "OKAY", "plan_path": PLAN}, "task TASK-101 done")
-st2 = gates.intake({"initial_prompt": f"Fix these CI failures: X\nArchitect run id: {rid}", **STORE.variables(DESIGN, TMP)})
+st2 = gates.intake({"initial_prompt": f"Fix these CI failures: X\nArchitect run id: {rid}", **FIXTURE.variables(DESIGN, TMP)})
 check("intake: re-entry loads the prior run state + tasks.json (A2)", st2["_next"] == "resume_route" and st2["run_id"] == rid and st2["resume_mode"] is True
       and st2["tasks"] and st2["tasks"][0]["id"] == "TASK-101" and st2["sealed"] is True)
-st3 = gates.intake({"initial_prompt": f"go {DESIGN}\nArchitect run id: 20200101T000000-deadbeef", **STORE.variables(DESIGN, TMP)})
+st3 = gates.intake({"initial_prompt": f"go {DESIGN}\nArchitect run id: 20200101T000000-deadbeef", **FIXTURE.variables(DESIGN, TMP)})
 check("intake: unknown run id -> fresh run, declared", not st3.get("resume_mode") and "no durable state" in st3["resume_note"])
 for phase, parked, exp in [("task TASK-101 done", "", "select_tasks"), ("phase_f", "", "phase_f_gate"), ("sealed", "", "reseal_gate"), ("x", "design_round", "escalate_gate"),
                            ("choice_discussion", "choice_discussion", "choice_resume")]:
@@ -1003,17 +1003,17 @@ check("promote_verify: no promoted PLAN / no tasks -> one retry (B6 side 1)", u[
 u = gates.promote_verify(base_state(promote_retries=RERUN_ONCE))
 check("promote_verify: B6 exhausted -> escalation promote_failed", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "promote_failed")
 # Simulate promote_tasks: PLAN + three tasks through bin/new-task.
-PROMOTED = STORE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
+PROMOTED = FIXTURE.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
 ids = []
 for slug, files, blocked in [("widget-model", "src/a.go", ""), ("widget-endpoint", "api/h.go", "{0}"), ("widget-worker", "src/b.go", "")]:
-    tid, d = STORE.new_task(gates, slug, files=files, blocked=blocked.format(*ids) if blocked else "", surfaces="http" if "endpoint" in slug else "")
+    tid, d = FIXTURE.new_task(gates, slug, files=files, blocked=blocked.format(*ids) if blocked else "", surfaces="http" if "endpoint" in slug else "")
     ids.append(tid)
 T1, T2, T3 = ids
-u = gates.promote_verify(base_state(promote_retries=0, promote_report=STORE.promote_report() + "\nANOMALY: plan mentions a file that does not exist"))
+u = gates.promote_verify(base_state(promote_retries=0, promote_report=FIXTURE.promote_report() + "\nANOMALY: plan mentions a file that does not exist"))
 check("promote_verify: tasks found; plan_path -> promoted PLAN; tasks.json written; planning commit ran; A10 line harvested",
       u["_next"] == "branch_setup" and u.get("plan_path", PLAN) == PROMOTED and len(u["tasks"]) == 3 and u["tasks"][1]["blocked_by"] == [T1]
       and os.path.exists(os.path.join(base_state()["run_dir"], "tasks.json")) and any("plan mentions" in a for a in u["anomalies_log"])
-      and "promote" in STORE.last_commit())
+      and "promote" in FIXTURE.last_commit())
 TASKS = u["tasks"]
 for t in TASKS:
     t["unit"] = "run"
@@ -1172,7 +1172,7 @@ ts = tasks_with()
 u = gates.claim_task(base_state(plan_path=PROMOTED, tasks=ts, current_task=T1, run_branch="feat/PLAN-widgets"))
 t1 = gates.task_by_id(u["tasks"], T1)
 check("claim_task: claimed in the task store, BASE SHA + PR base recorded, started entry logged",
-      u["_next"] == "compose_delegation" and STORE.claimed(T1) and t1["base_sha"] and t1["pr_base"] == "feat/PLAN-widgets"
+      u["_next"] == "compose_delegation" and FIXTURE.claimed(T1) and t1["base_sha"] and t1["pr_base"] == "feat/PLAN-widgets"
       and "started:" in read_file(os.path.join(t1["dir"], "log.md")) and t1["status"] == "in-progress")
 TS1 = u["tasks"]
 u = gates.compose_delegation(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, run_branch="feat/PLAN-widgets", delegation_kind="implement"))
@@ -1324,7 +1324,7 @@ check("relay: choice_park parks this run on the child's question -> end_discussi
 
 
 def relay_reenter(prompt):
-    r = {"initial_prompt": prompt, "discussion_run_id": RELAY_ID, **STORE.variables(DESIGN, TMP)}
+    r = {"initial_prompt": prompt, "discussion_run_id": RELAY_ID, **FIXTURE.variables(DESIGN, TMP)}
     for gate in (gates.intake, gates.resume_route, gates.choice_resume):
         r.update(gate(r))
     return r
@@ -1392,7 +1392,7 @@ check("verify_gate: standard -> gauntlet, forced adversary only (no consumer sur
       and f"Diff: {t1['base_sha']}..HEAD" in u["gauntlet_prompt"] and u["verification_commands_json"] == '["true"]' and u["round_log"][T1][0]["round"] == 1)
 ts_c = copy.deepcopy(TS1)
 # the debris lint of every conformance reviewer leaves out the planning files inside the git work tree
-# the fixture's planning store is CODE/plans (_fixture.Store), which is also the conventional plans/ directory
+# the fixture's planning root is CODE/plans (_fixture.PlanningFixture), which is also the conventional plans/ directory
 BARE_CODE = os.path.join(TMP, "code-no-plans")
 make_repo(BARE_CODE, {"README.md": "x\n"})
 
@@ -1743,9 +1743,9 @@ check("debt_assign: owner named -> criterion appended to the owner + debt-assign
 u = gates.task_done_verify(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, report_parsed=pr_, ledger_lines=["design-decision: introduced a WidgetStore interface in src/a.go"], task_done_report="edited\nANOMALY: week plan row missing"))
 t1d = gates.task_by_id(u["tasks"], T1)
 check("task_done_verify: completed entry appended by the script when missing; ledger line re-appended; task closed in the store; status complete; A10 harvested",
-      u["_next"] == "stack_gate" and t1d["status"] == "complete" and STORE.closed(T1) and os.path.isdir(t1d["dir"])
+      u["_next"] == "stack_gate" and t1d["status"] == "complete" and FIXTURE.closed(T1) and os.path.isdir(t1d["dir"])
       and "completed" in read_file(os.path.join(t1d["dir"], "log.md")) and "WidgetStore" in read_file(os.path.join(t1d["dir"], "log.md"))
-      and any("week plan" in a for a in u["anomalies_log"]) and CLOSE_COMMIT_MARKER in STORE.last_commit())
+      and any("week plan" in a for a in u["anomalies_log"]) and CLOSE_COMMIT_MARKER in FIXTURE.last_commit())
 TS_DONE1 = u["tasks"]
 u = gates.stack_gate(base_state(plan_path=PROMOTED, tasks=TS_DONE1))
 check("stack_gate: single -> task_done_route", u["_next"] == "task_done_route")
@@ -2093,7 +2093,7 @@ check("choice_park: a non-choice escalation parks the run resumably, keyed by it
       and d.get("kind") == "git_setup_failed" and d.get("question") == E_GIT["question"]
       and s["discussion_message"].startswith("ARCHITECT_AWAITING_DISCUSSION\nA git_setup_failed question is open for discussion:\n")
       and "answer it with that text" in d.get("resume", "") and s["discussion_message"].isascii(), s)
-r = {"initial_prompt": "continue: use base release", "discussion_run_id": NPARK_ID, **STORE.variables(DESIGN, TMP)}
+r = {"initial_prompt": "continue: use base release", "discussion_run_id": NPARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 r.update(gates.intake(r))
 r.update(gates.resume_route(r))
 r.update(gates.choice_resume(r))
@@ -2102,7 +2102,7 @@ check("intake -> choice_resume: 'continue: <answer>' on a parked escalation -> t
       and r["escalation"]["kind"] == "git_setup_failed" and r["parked"] == "", r)
 r.update(gates.parse_answer(r))
 check("choice_resume -> parse_answer: a settled answer that names no option is interpreted", r["_next"] == "interpret_reply", r)
-r = {"initial_prompt": "continue", "discussion_run_id": NPARK_ID, **STORE.variables(DESIGN, TMP)}
+r = {"initial_prompt": "continue", "discussion_run_id": NPARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 r.update(gates.intake(r))
 r.update(gates.resume_route(r))
 r.update(gates.choice_resume(r))
@@ -2184,11 +2184,11 @@ for gone in (False, True):
     ov_dir = os.path.join(TMP, "gone-dir") if gone else WT_HELD
     _lib.snapshot(base_state(run_id=OV_ID, run_dir=_lib.run_dir_for(OV_ID), base_branch_override="release",
                              code_dir_override=ov_dir, run_branch_override="feat/typed"), {}, "task_loop")
-    r = {"initial_prompt": f"Architect run id: {OV_ID}", **STORE.variables(DESIGN, TMP)}
+    r = {"initial_prompt": f"Architect run id: {OV_ID}", **FIXTURE.variables(DESIGN, TMP)}
     r.update(gates.intake(r))
     check(f"intake: re-entry restores the owner's base override and {'drops a code dir that is gone' if gone else 'restores the code dir'}",
           r["_next"] == "resume_route" and r["base_branch_name"] == "release" and r["run_branch_override"] == "feat/typed"
-          and r["code_repo_path"] == (STORE.variables(DESIGN, TMP).get("project_dir", CODE) if gone else WT_HELD), r)
+          and r["code_repo_path"] == (FIXTURE.variables(DESIGN, TMP).get("project_dir", CODE) if gone else WT_HELD), r)
 E_NDD = gates._need_design_doc_escalation()
 u = gates.parse_answer(base_state(escalation=E_NDD, last_answer_text=f"{DESIGN} please"))
 u2 = gates.parse_answer(base_state(escalation=E_NDD, last_answer_text="the doc is the one we wrote yesterday"))
@@ -2283,7 +2283,7 @@ check("choice_park: the ASCII final message names the question, the marked recom
       and "Options:\n  Option 1 (recommended): 8080\n  Option 2: 9090\n" in msg and "Your reply: what does 9090 collide with?" in msg
       and "Answered so far:\n  1. Which store? -> pg\n" in msg and '"continue"' in msg and '"continue: <your answer>"' in msg
       and msg.isascii() and _lib.RESUME_RE.search(msg).group(1) == PARK_ID, msg)
-s = {"initial_prompt": "continue: 9091", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue: 9091", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: 'continue: <answer>' with the carried discussion_run_id -> re-entry into that run, answer stashed, carried key cleared",
       s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["resume_mode"] is True and s["settled_answer"] == "9091"
@@ -2306,7 +2306,7 @@ check("choice_resume: 'continue: Option 2' on the first question -> its option t
       u["choice_answers"] == [{"question": "Which store?", "answer": "sqlite", "via": "settled"}]
       and u2["_next"] == "escalate_gate" and u2["escalation"]["data"]["index"] == 1 and "Which port?" in u2["escalation"]["question"], (u, u2))
 for prompt, carried in (("Continue", PARK_ID), ("resume.", PARK_ID), (f"Architect run id: {PARK_ID}\ncontinue", "")):
-    s = {"initial_prompt": prompt, "discussion_run_id": carried, **STORE.variables(DESIGN, TMP)}
+    s = {"initial_prompt": prompt, "discussion_run_id": carried, **FIXTURE.variables(DESIGN, TMP)}
     s.update(gates.intake(s))
     s.update(gates.resume_route(s))
     s.update(gates.choice_resume(s))
@@ -2315,33 +2315,33 @@ for prompt, carried in (("Continue", PARK_ID), ("resume.", PARK_ID), (f"Architec
           s["run_id"] == PARK_ID and s["escalation"]["kind"] == "design_round" and s["escalation"]["data"]["index"] == 1
           and s["_next"] == "escalate_gate" and s["choice_answers"] == PARK_ANSWERS and s["choice_parks"] == {"design_round#1": 1}
           and s["discussion"] == {} and s["settled_answer"] == "", s)
-s = {"initial_prompt": f"Architect run id: {PARK_ID}\ncontinue: Option 2", **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": f"Architect run id: {PARK_ID}\ncontinue: Option 2", **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: an explicit run id with 'continue: <answer>' -> re-entry with the answer stashed, no carried key needed",
       s["_next"] == "resume_route" and s["run_id"] == PARK_ID and s["settled_answer"] == "Option 2", s)
-s = {"initial_prompt": f"Implement the design at {DESIGN}", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": f"Implement the design at {DESIGN}", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: a message that is not a continue with the carried key -> a fresh run, the key cleared, the left discussion ledgered",
       not s.get("resume_mode") and s["run_id"] != PARK_ID and s["discussion_run_id"] == "" and s["_next"] == "orient_read"
       and any(f"parked discussion of run {PARK_ID} was left" in d for d in s["decisions"]), s)
-s = {"initial_prompt": "continue", **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue", **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 check("intake: 'continue' with no carried key -> a fresh run as before", not s.get("resume_mode") and s["run_id"] != PARK_ID, s)
-s = {"initial_prompt": "continue: use pg", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue: use pg", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 s.update(gates.resume_route(s))
 s.update(gates.choice_resume(s))
 check("intake -> choice_resume: 'continue: use pg' -> 'use pg' recorded for the parked question",
       s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "use pg", "via": "settled"}],
       s.get("choice_answers"))
-s = {"initial_prompt": "resume: option 2", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "resume: option 2", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 s.update(gates.resume_route(s))
 s.update(gates.choice_resume(s))
 check("intake -> choice_resume: 'resume: option 2' -> option 2 recorded for the parked question",
       s.get("resume_mode") is True and s["choice_answers"] == PARK_ANSWERS + [{"question": "Which port?", "answer": "9090", "via": "settled"}],
       s.get("choice_answers"))
-s = {"initial_prompt": "continue.", "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+s = {"initial_prompt": "continue.", "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
 s.update(gates.intake(s))
 s.update(gates.resume_route(s))
 s.update(gates.choice_resume(s))
@@ -2350,7 +2350,7 @@ check("intake -> choice_resume: bare 'continue.' -> the parked question asked ag
       s["run_id"] == PARK_ID and s["_next"] == "escalate_gate" and s["escalation"]["data"]["index"] == 1
       and s["choice_answers"] == PARK_ANSWERS and s["settled_answer"] == "", s)
 for prompt in ("continue please", "continue, but why X?"):
-    s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **STORE.variables(DESIGN, TMP)}
+    s = {"initial_prompt": prompt, "discussion_run_id": PARK_ID, **FIXTURE.variables(DESIGN, TMP)}
     s.update(gates.intake(s))
     check(f"intake: {prompt!r} is prose, not a continue -> a fresh run, no answer recorded, the key cleared, the left discussion ledgered",
           not s.get("resume_mode") and s["run_id"] != PARK_ID and not s.get("settled_answer") and s["discussion_run_id"] == ""
@@ -2391,7 +2391,7 @@ check("choice_resume: an old key whose current key is also present -> one key ho
 
 def resume_chain(run_id, prompt, gate):
     """Re-enter a parked run from its state.json the way the graph does; returns the state and the `_next` of each step."""
-    s = {"initial_prompt": prompt, "discussion_run_id": run_id, **STORE.variables(DESIGN, TMP)}
+    s = {"initial_prompt": prompt, "discussion_run_id": run_id, **FIXTURE.variables(DESIGN, TMP)}
     steps = []
     for step in (gates.intake, gates.resume_route, gates.choice_resume, gate):
         s.update(step(s))
@@ -3033,7 +3033,7 @@ if MULTI_IS_GROUPS:
     check("flip_ready: group close-out -> next group", u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1")
 u = gates.finish_plan(base_state(plan_path=PROMOTED, tasks=ts_f, pr_url="https://github.com/o/r/pull/99", follow_ups=["Provision WIDGET_SECRET"]))
 check("finish_plan: validate run; PLAN status Implemented + PR + follow-ups; final planning commit", u["_next"] == "final_report" and "implemented" in read_file(PROMOTED).lower() and "pull/99" in read_file(PROMOTED)
-      and "**Follow-ups:**" in read_file(PROMOTED) and "implemented" in STORE.last_commit())
+      and "**Follow-ups:**" in read_file(PROMOTED) and "implemented" in FIXTURE.last_commit())
 u = gates.final_report(base_state(plan_path=PROMOTED, tasks=ts_f, pr_url="https://github.com/o/r/pull/99", flipped_ready=True, ci_status="green", escalation_policy="autonomous",
                                   autonomous_digest=["x: y (basis: recommended)"], skipped_reviews=["T1: security"], anomalies_log=["a: b"], follow_ups=["f"], quality_rigor="prototype",
                                   mode_line="m", task_granularity="micro", batch_state={"B1": {"passed": True, "closed_at": "h", "strikes": 1}}))
@@ -3082,12 +3082,12 @@ for tracking in ("", "ci"):
         check(f"review watch: pr_tracking {label} - flip_ready group close-out -> select_tasks, no review_* keys",
               u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1" and u["pr_number"] == "" and not review_keys(u), review_keys(u))
 check("review watch: ci_route green with no watch running -> flip_ready", gates.ci_route(base_state(**RW, ci_status="green"))["_next"] == "flip_ready")
-st_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="ci")})
-st_rv = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="review")})
+st_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="ci")})
+st_rv = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="review")})
 check("review watch: intake mode_line - ci carries no pr_tracking, review appends ' pr_tracking=review'",
       "pr_tracking" not in st_ci["mode_line"] and st_rv["mode_line"] == st_ci["mode_line"] + " pr_tracking=review" and st_ci["_next"] == st_rv["_next"] == "orient_read",
       (st_ci["mode_line"], st_rv["mode_line"]))
-st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="sometimes")})
+st_bad = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="single", pr_tracking="sometimes")})
 check("review watch: intake unknown pr_tracking -> mode_invalid with option 'pr_tracking = ci'",
       st_bad["_next"] == "escalate_gate" and st_bad["escalation"]["kind"] == "mode_invalid" and any(o["text"] == "pr_tracking = ci" for o in st_bad["escalation"]["options"]))
 u = AA("mode_invalid", "pr_tracking = review", design_doc_path="")
@@ -4300,8 +4300,8 @@ try:
 
     UNWATCHED = "review-watch: not started: per-task PRs are not watched (pr_tracking=review needs pr_strategy single or PR groups)"
     gates.MULTI_IS_GROUPS = False
-    st_stack = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
-    st_stack_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="ci")})
+    st_stack = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
+    st_stack_ci = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="ci")})
     check("stack scope: intake per-task-stack multi + review -> ledgered and a follow-up, no escalation, same route as ci",
           ledgered(st_stack, UNWATCHED) and st_stack.get("follow_ups") == [UNWATCHED] and "escalation" not in st_stack
           and st_stack["_next"] == st_stack_ci["_next"] == "orient_read" and not ledgered(st_stack_ci, UNWATCHED), st_stack)
@@ -4310,7 +4310,7 @@ try:
     check("stack scope: flip_ready per-task-stack multi in review mode -> no watch armed, no still-draft line -> finish_plan",
           u.get("_next") == "finish_plan" and not review_keys(u) and not ledgered(u, "still draft") and "follow_ups" not in u, u)
     gates.MULTI_IS_GROUPS = True
-    st_groups = gates.intake({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
+    st_groups = gates.intake({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP, pr_strategy="multi", pr_tracking="review")})
     u = gates.flip_ready(base_state(**RW, **GROUP))
     check("stack scope: PR groups in review mode -> intake ledgers nothing, flip_ready still arms the watch",
           not ledgered(st_groups, UNWATCHED) and not st_groups.get("follow_ups") and u.get("_next") == "review_poll" and u.get("review_watching") is True, u)
@@ -4711,7 +4711,7 @@ env = {**os.environ, "GRAPH_STATE_FILE": sf}
 env.pop("GRAPH_STATE", None)
 p = subprocess.run([sys.executable, os.path.join(HERE, "escalate_gate.py")], capture_output=True, text=True, env=env)
 check("entry script: GRAPH_STATE_FILE path (>32 KiB) -> JSON with _next", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "ask_dispatch", p.stderr[-300:])
-env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}", **STORE.variables(DESIGN, TMP)})}
+env = {**os.environ, "GRAPH_STATE": json.dumps({"initial_prompt": f"go {DESIGN}", **FIXTURE.variables(DESIGN, TMP)})}
 p = subprocess.run([sys.executable, os.path.join(HERE, "intake.py")], capture_output=True, text=True, env=env)
 check("entry script: intake through GRAPH_STATE", p.returncode == 0 and json.loads(p.stdout.strip().splitlines()[-1])["_next"] == "orient_read", p.stderr[-300:])
 
