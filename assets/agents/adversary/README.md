@@ -64,6 +64,12 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
 - Holistic complaints carry a required `blocking` flag. `blocking: false` complaints (for example
   spec-endorsed waste, whose criterion stays MET) are listed under
   `Non-blocking holistic complaints:` in either verdict.
+- The changed files under the configured `debris_exclude` dirs reach the criterion checks and the
+  holistic pass as `bookkeeping_files`, the run's own planning files; the diff and the changed-file
+  list still include them. A scope-drift complaint (kind containing `scope drift` or
+  `out-of-scope`) whose every location path lies under those dirs is listed as non-blocking too,
+  marked `scope drift confined to the run's planning files`. Other kinds, and locations that also
+  name a path outside them, still block; with no `debris_exclude` nothing is demoted.
 - INSPECTED criteria are listed under `Inspected, not test-proven:` with their evidence and
   `no_test_reason`.
 - A criterion whose check output stays unreadable after two re-asks is recorded UNVERIFIED with the

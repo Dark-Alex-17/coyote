@@ -870,3 +870,53 @@ fn scope_drift_outside_the_planning_dirs_still_blocks() {
         );
     }
 }
+
+#[test]
+fn diff_facts_lists_the_changed_files_under_the_configured_excludes() {
+    if missing(&["python3", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("bookkeeping");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(repo.join("plans/tasks/T")).unwrap();
+    fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("README.md"), "base\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    fs::write(repo.join("plans/tasks/T/log.md"), "entry\n").unwrap();
+    fs::write(repo.join("src/a.txt"), "code\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "work"]);
+
+    let facts = |label: &str, exclude: &str| {
+        script(
+            &dir.0,
+            "diff_facts.py",
+            label,
+            &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "HEAD~1",
+                    "debris_exclude": exclude}),
+            &[],
+        )
+    };
+    let out = facts("configured", r#"["plans"]"#);
+    assert_eq!(
+        out["bookkeeping_files"],
+        json!(["plans/tasks/T/log.md"]),
+        "{out}"
+    );
+    assert_eq!(
+        out["changed_files"],
+        json!(["plans/tasks/T/log.md", "src/a.txt"]),
+        "{out}"
+    );
+    assert!(
+        out["diff_text"]
+            .as_str()
+            .unwrap()
+            .contains("+++ b/plans/tasks/T/log.md"),
+        "the diff shown to the model keeps the planning hunks: {out}"
+    );
+    let out = facts("unset", "");
+    assert_eq!(out["bookkeeping_files"], json!([]), "{out}");
+}

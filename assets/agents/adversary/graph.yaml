@@ -55,7 +55,7 @@ variables:
     description: Command prefix for every declared verification command, e.g. `flock -w 240 /path/to/lock`; empty runs them bare.
     default: ''
   - name: debris_exclude
-    description: Repo-relative directories the debris lint leaves out of its diff, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none.
+    description: Repo-relative directories holding the run's own planning files, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none. The debris lint leaves them out of its diff, the review is told the changed files under them are bookkeeping, and a scope-drift complaint located only in them does not block.
     default: ''
 
 settings:
@@ -77,6 +77,7 @@ initial_state:
   scope_notes: ''
   extra_context: ''
   changed_files: []
+  bookkeeping_files: []
   diff_text: ''
   diff_note: ''
   diff_base: ''
@@ -308,6 +309,7 @@ nodes:
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
+      Run bookkeeping files (under the caller-configured planning dirs; being in the diff and outside a task's file list is not scope drift): {{bookkeeping_files}}
 
       Criterion to verify (JSON):
       {{criterion}}
@@ -409,6 +411,7 @@ nodes:
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
+      Run bookkeeping files (under the caller-configured planning dirs; being in the diff and outside a task's file list is not scope drift, while an edit there that changes acceptance criteria, verification commands or recorded decisions is judged under its own kind): {{bookkeeping_files}}
 
       Acceptance criteria: {{criteria}}
       Per-criterion verdicts (final, except UNVERIFIED ones awaiting your format ruling): {{crit_verdicts}}
