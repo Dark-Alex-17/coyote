@@ -5,7 +5,7 @@
 //! and a thread picker sit on top of the text.
 
 use super::bottom_pane::{render_header, render_rows, step_highlight};
-use super::cells::{Cell, LineCache, short_args, without_think_spans};
+use super::cells::{Cell, short_args, without_think_spans};
 use super::keys::PagerMode;
 use super::render::{self, Renderer};
 use super::{ChromeKind, DIM, chrome_style};
@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use unicode_width::UnicodeWidthStr;
@@ -42,7 +43,7 @@ const BOLD: Style = Style::new().add_modifier(Modifier::BOLD);
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 /// One message of a child's session as the pager shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) enum ChildEntry {
     /// Heads the rounds the child's session compressed away.
     Compressed,
@@ -65,8 +66,12 @@ fn entries(messages: &[Message]) -> Vec<ChildEntry> {
                 if !calls.text.trim().is_empty() {
                     entries.push(ChildEntry::Assistant(calls.text.clone()));
                 }
-                entries.extend(calls.tool_results.iter().map(|result| {
-                    ChildEntry::Tool {
+                for result in &calls.tool_results {
+                    // A later round's narration rides on its first result.
+                    if let Some(text) = result.text.as_deref().filter(|t| !t.trim().is_empty()) {
+                        entries.push(ChildEntry::Assistant(text.to_string()));
+                    }
+                    entries.push(ChildEntry::Tool {
                         name: result.call.name.clone(),
                         args: result.call.arguments.to_string(),
                         output: match &result.output {
@@ -74,8 +79,8 @@ fn entries(messages: &[Message]) -> Vec<ChildEntry> {
                             other => serde_json::to_string_pretty(other)
                                 .unwrap_or_else(|_| other.to_string()),
                         },
-                    }
-                }));
+                    });
+                }
                 continue;
             }
             MessageContent::Text(text) => text.clone(),
@@ -193,6 +198,19 @@ struct Picker {
     note: Option<String>,
 }
 
+/// One child entry's lines, with what they were laid out from.
+struct EntryLayout {
+    hash: u64,
+    width: u16,
+    lines: Vec<Line<'static>>,
+}
+
+fn entry_hash(entry: &ChildEntry) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    entry.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub(super) struct ChildView {
     session_id: String,
     agent: String,
@@ -201,7 +219,9 @@ pub(super) struct ChildView {
     /// last good one gave and says why next to it.
     entries: Option<Vec<ChildEntry>>,
     error: Option<String>,
-    cache: LineCache,
+    /// Each entry's lines by position. A re-read of a growing thread
+    /// lays out only the entries that are new or changed.
+    layouts: Vec<EntryLayout>,
     /// The read under way, by generation. At most one runs at a time.
     loading: Option<u64>,
     /// The child wrote its file again while a read was under way: one
@@ -312,6 +332,9 @@ pub(super) struct Pager {
     /// Root cells laid out since the pager opened.
     #[cfg(test)]
     cell_layouts: usize,
+    /// Child entries laid out since the pager opened.
+    #[cfg(test)]
+    entry_layouts: usize,
 }
 
 impl Pager {
@@ -332,6 +355,8 @@ impl Pager {
             root_lines: RootLines::default(),
             #[cfg(test)]
             cell_layouts: 0,
+            #[cfg(test)]
+            entry_layouts: 0,
         }
     }
 
@@ -345,11 +370,9 @@ impl Pager {
     pub(super) fn forget_layout(&mut self) {
         self.laid_out = None;
         self.root_lines = RootLines::default();
-    }
-
-    #[cfg(test)]
-    pub(super) fn cell_layouts(&self) -> usize {
-        self.cell_layouts
+        if let Thread::Child(view) = &mut self.thread {
+            view.layouts.clear();
+        }
     }
 
     /// The root thread from the row of transcript cell `cell`.
@@ -366,7 +389,7 @@ impl Pager {
                 file,
                 entries: None,
                 error: None,
-                cache: LineCache::default(),
+                layouts: Vec::new(),
                 loading: None,
                 stale: false,
             }),
@@ -433,7 +456,6 @@ impl Pager {
             }
             Err(error) => view.error = Some(error),
         }
-        view.cache = LineCache::default();
         let again = std::mem::take(&mut view.stale).then(|| view.file.clone());
         self.laid_out = None;
         again
@@ -618,17 +640,35 @@ impl Pager {
                         chrome_style(ChromeKind::Error, no_color),
                     ));
                 }
-                let ChildView { entries, cache, .. } = view;
+                let ChildView {
+                    entries, layouts, ..
+                } = view;
                 match entries {
                     Some(entries) => {
-                        lines.extend_from_slice(cache.get(width, || {
-                            let mut lines = Vec::new();
-                            for entry in entries.iter() {
-                                lines.push(Line::default());
-                                lines.extend(entry_lines(entry, width, renderer));
+                        layouts.truncate(entries.len());
+                        for (index, entry) in entries.iter().enumerate() {
+                            let hash = entry_hash(entry);
+                            let fresh = layouts
+                                .get(index)
+                                .is_some_and(|layout| layout.hash == hash && layout.width == width);
+                            if !fresh {
+                                let layout = EntryLayout {
+                                    hash,
+                                    width,
+                                    lines: entry_lines(entry, width, renderer),
+                                };
+                                match layouts.get_mut(index) {
+                                    Some(slot) => *slot = layout,
+                                    None => layouts.push(layout),
+                                }
+                                #[cfg(test)]
+                                {
+                                    self.entry_layouts += 1;
+                                }
                             }
-                            lines
-                        }));
+                            lines.push(Line::default());
+                            lines.extend_from_slice(&layouts[index].lines);
+                        }
                     }
                     None if view.error.is_none() => {
                         lines.push(Line::from(Span::styled("Loading...", DIM)));
@@ -1180,6 +1220,34 @@ mod tests {
         pager.set_child_entries(session_id, 1, result);
     }
 
+    /// A re-read of a growing thread lays out the new entry only; a new
+    /// width or a forgotten layout lays out every entry again.
+    #[test]
+    fn a_reread_lays_out_only_the_entries_it_added() {
+        let mut cells = Vec::new();
+        let mut pager = Pager::child(
+            "reviewer-a1".to_string(),
+            "reviewer".to_string(),
+            PathBuf::from("/nonexistent/reviewer-a1.yaml"),
+        );
+        let mut entries = child_entries();
+        deliver(&mut pager, "reviewer-a1", Ok(entries.clone()));
+        draw(&mut pager, &mut cells, 80, 24);
+        assert_eq!(pager.entry_layouts, entries.len());
+
+        entries.push(ChildEntry::Assistant("One more round.".to_string()));
+        deliver(&mut pager, "reviewer-a1", Ok(entries.clone()));
+        let frame = draw(&mut pager, &mut cells, 80, 24);
+        assert!(frame.contains("One more round."), "{frame}");
+        assert_eq!(pager.entry_layouts, entries.len());
+
+        draw(&mut pager, &mut cells, 60, 24);
+        assert_eq!(pager.entry_layouts, 2 * entries.len());
+        pager.forget_layout();
+        draw(&mut pager, &mut cells, 60, 24);
+        assert_eq!(pager.entry_layouts, 3 * entries.len());
+    }
+
     /// The picker opens on the thread on show, and the rounds a child's
     /// session compressed sit under a divider of their own.
     #[test]
@@ -1585,6 +1653,37 @@ mod tests {
                     output: "body".to_string(),
                 },
                 ChildEntry::Assistant("done".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_rounds_narration_comes_before_its_tool() {
+        use crate::client::MessageContentToolCalls;
+        use crate::function::{ToolCall, ToolResult};
+        let result = |name: &str| {
+            let call = ToolCall::new(name.to_string(), serde_json::json!({}), None);
+            ToolResult::new(call, Value::String(format!("{name} out")))
+        };
+        let mut calls = MessageContentToolCalls::new(vec![], String::new());
+        calls.merge(vec![result("first")], "Round one.".to_string());
+        calls.merge(vec![result("second")], "Round two.".to_string());
+        let messages = vec![Message::new(
+            MessageRole::Assistant,
+            MessageContent::ToolCalls(calls),
+        )];
+        let tool = |name: &str| ChildEntry::Tool {
+            name: name.to_string(),
+            args: "{}".to_string(),
+            output: format!("{name} out"),
+        };
+        assert_eq!(
+            entries(&messages),
+            vec![
+                ChildEntry::Assistant("Round one.".to_string()),
+                tool("first"),
+                ChildEntry::Assistant("Round two.".to_string()),
+                tool("second"),
             ]
         );
     }

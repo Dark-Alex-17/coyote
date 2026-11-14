@@ -147,6 +147,17 @@ impl Transcript {
         }
     }
 
+    /// Drops every cell's cached lines and counts each cell as changed,
+    /// so the transcript and the pager both style the text anew; for when
+    /// the renderer itself changed.
+    pub(super) fn forget_layout(&mut self) {
+        for index in 0..self.cells.len() {
+            if let Some(cell) = self.touch(index) {
+                cell.forget_layout();
+            }
+        }
+    }
+
     /// Appends a cell. The greeting gives way to the first real entry,
     /// whatever brings it: a submitted line or a notice.
     pub(super) fn push(&mut self, cell: Cell) {

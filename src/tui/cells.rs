@@ -663,6 +663,19 @@ impl Cell {
         freed
     }
 
+    /// Drops the cell's cached lines so the next layout styles it anew.
+    pub(super) fn forget_layout(&mut self) {
+        match self {
+            Cell::Assistant { cache, .. } => *cache = RenderCache::default(),
+            Cell::User { cache, .. }
+            | Cell::Notice { cache, .. }
+            | Cell::Error { cache, .. }
+            | Cell::Command { cache, .. }
+            | Cell::Welcome { cache, .. } => *cache = LineCache::default(),
+            Cell::Text { .. } | Cell::Tool { .. } | Cell::Job { .. } | Cell::Agent { .. } => {}
+        }
+    }
+
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
         let no_color = renderer.no_color;
         match self {

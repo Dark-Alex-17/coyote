@@ -179,31 +179,57 @@ impl RosterRow {
 #[derive(Debug, Default)]
 pub(super) struct RosterState {
     rows: Vec<RosterRow>,
-    highlight: usize,
+    /// The id of the focused row. None once that row has gone, until
+    /// the user moves onto another, so no key acts on a row they did not
+    /// pick.
+    focus: Option<String>,
+    /// The focused row went in a refresh; the focus stays clear until a
+    /// move, where a roster that never had a row focuses the first one
+    /// it gets.
+    focus_lost: bool,
 }
 
 impl RosterState {
     pub(super) fn new(rows: Vec<RosterRow>) -> Self {
-        Self { rows, highlight: 0 }
+        let focus = rows.first().map(|row| row.id().to_string());
+        Self {
+            rows,
+            focus,
+            focus_lost: false,
+        }
     }
 
-    /// Takes a fresh read, keeping the highlight on its row while that
-    /// row is still listed; a row that went leaves it where it was.
+    /// Takes a fresh read, keeping the focus on its row while that row
+    /// is still listed; a row that went takes the focus with it. With no
+    /// focus that a refresh took, the first row is focused.
     pub(super) fn refresh(&mut self, rows: Vec<RosterRow>) {
-        let current = self.focused().map(|row| row.id().to_string());
         self.rows = rows;
-        let last = self.rows.len().saturating_sub(1);
-        self.highlight = current
-            .and_then(|id| self.rows.iter().position(|row| row.id() == id))
-            .unwrap_or(self.highlight.min(last));
+        if self.focus.is_none() && !self.focus_lost {
+            self.focus = self.rows.first().map(|row| row.id().to_string());
+        } else if self.highlight().is_none() {
+            self.focus = None;
+            self.focus_lost = true;
+        }
     }
 
+    /// With no focus, moving down picks the first row and up the last.
     pub(super) fn move_highlight(&mut self, delta: i32) {
-        self.highlight = step_highlight(self.highlight, delta, self.rows.len());
+        let index = match self.highlight() {
+            Some(index) => step_highlight(index, delta, self.rows.len()),
+            None if delta < 0 => self.rows.len().saturating_sub(1),
+            None => 0,
+        };
+        self.focus = self.rows.get(index).map(|row| row.id().to_string());
+        self.focus_lost = false;
+    }
+
+    fn highlight(&self) -> Option<usize> {
+        let focus = self.focus.as_deref()?;
+        self.rows.iter().position(|row| row.id() == focus)
     }
 
     pub(super) fn focused(&self) -> Option<&RosterRow> {
-        self.rows.get(self.highlight)
+        self.rows.get(self.highlight()?)
     }
 
     pub(super) fn band_rows(&self) -> u16 {
@@ -236,7 +262,8 @@ impl Widget for RosterView<'_> {
             return;
         }
         let height = usize::from(rows_area.height);
-        let start = self.state.highlight.saturating_sub(height - 1);
+        let highlight = self.state.highlight();
+        let start = highlight.unwrap_or(0).saturating_sub(height - 1);
         // Widths over every row, so scrolling does not move the columns.
         let label_width = rows
             .iter()
@@ -264,7 +291,7 @@ impl Widget for RosterView<'_> {
                 Span::styled(row.detail(id_width, self.now), DIM.patch(style)),
             ]);
             Paragraph::new(line).render(line_area, buf);
-            if start + offset == self.state.highlight {
+            if highlight == Some(start + offset) {
                 buf.set_style(line_area, Style::new().add_modifier(Modifier::REVERSED));
             }
         }
@@ -389,8 +416,9 @@ pub(super) mod tests {
         assert!(buf[(0, 2)].modifier.contains(Modifier::REVERSED));
     }
 
-    /// The highlight follows its row through a refresh, and a band too
-    /// short for every row keeps the highlighted one in view.
+    /// The highlight follows its row through a refresh. When that row
+    /// goes, nothing is focused or reversed until a move picks a row. A
+    /// band too short for every row keeps the highlighted one in view.
     #[test]
     fn a_refresh_keeps_the_highlight_on_its_row_and_the_view_follows_it() {
         let mut state = mixed();
@@ -421,6 +449,11 @@ pub(super) mod tests {
             "planner",
             TaskRowStatus::Running,
         )]);
+        assert!(state.focused().is_none());
+        let terminal = draw(&state, 40, 3, false);
+        let buf = terminal.backend().buffer();
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::REVERSED));
+        state.move_highlight(1);
         assert_eq!(
             state.focused().map(RosterRow::id),
             Some("agent_planner_0f1e2d3c")
@@ -435,6 +468,23 @@ pub(super) mod tests {
         let shown: String = terminal.backend().to_string();
         assert!(shown.contains("ask"), "{shown}");
         assert!(!shown.contains("agent"), "{shown}");
+    }
+
+    /// A roster opened with no rows focuses the first row that arrives.
+    #[test]
+    fn a_roster_opened_empty_focuses_the_first_row_to_arrive() {
+        let mut state = RosterState::new(Vec::new());
+        assert!(state.focused().is_none());
+        state.refresh(vec![task(
+            "agent_planner_0f1e2d3c",
+            TaskKind::Agent,
+            "planner",
+            TaskRowStatus::Running,
+        )]);
+        assert_eq!(
+            state.focused().map(RosterRow::id),
+            Some("agent_planner_0f1e2d3c")
+        );
     }
 
     #[test]

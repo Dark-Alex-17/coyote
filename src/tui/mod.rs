@@ -82,7 +82,7 @@ use std::time::{Duration, Instant};
 use terminal::Screen;
 use todo::TodoPanel;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use transcript::{Transcript, WHEEL_LINES};
 
 /// Set while `run` owns the terminal; `RequestContext::ui_kind` reads it.
@@ -245,11 +245,17 @@ const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
 const HOTKEY_IDLE: Duration = Duration::from_secs(1);
 /// How close two idle Escs must come to open the rewind picker.
 const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
+/// How long the exit work waits for the roster's and the pager's control
+/// tasks before it takes the context; those still running are aborted.
+const CONTROL_TASK_WAIT: Duration = Duration::from_secs(2);
 /// How long the UI waits on the exit work. The work itself waits
-/// `EXIT_CANCEL_WAIT` on background tasks before it saves the session and
-/// runs the finished hook, so the wait on it has to outlast that or a
-/// task that ignores cancellation would cost the user the save.
-const EXIT_TEARDOWN_WAIT: Duration = EXIT_CANCEL_WAIT.saturating_add(EXIT_HOOK_DRAIN_TIMEOUT);
+/// `CONTROL_TASK_WAIT` on control tasks and `EXIT_CANCEL_WAIT` on
+/// background tasks before it saves the session and runs the finished
+/// hook, so the wait on it has to outlast both or a task that ignores
+/// cancellation would cost the user the save.
+const EXIT_TEARDOWN_WAIT: Duration = CONTROL_TASK_WAIT
+    .saturating_add(EXIT_CANCEL_WAIT)
+    .saturating_add(EXIT_HOOK_DRAIN_TIMEOUT);
 const TOOL_OUTPUT_TAIL: usize = 20;
 /// Most bytes of one call's output kept for the pager; past it the
 /// oldest go and the pager says how many.
@@ -433,10 +439,12 @@ pub(crate) fn spawn_turn(
 /// may ask to save it) and closes the agent bracket.
 fn spawn_exit(
     mut ctx: RequestContext,
+    controls: JoinSet<()>,
     abort: AbortSignal,
     ui: UnboundedSender<UiMsg>,
 ) -> JoinHandle<(RequestContext, Result<()>, String)> {
     spawn_work(async move {
+        settle_control_tasks(controls, CONTROL_TASK_WAIT).await;
         // Late output (a panic's message among it) reaches the UI the way
         // a turn's does instead of dying in a discarded pipe.
         let guard = match FdRedirect::begin(late_output(ui.clone())) {
@@ -459,6 +467,19 @@ fn spawn_exit(
         let captured = guard.map(FdRedirect::finish).unwrap_or_default();
         (ctx, result, captured)
     })
+}
+
+/// Waits up to `wait` for every task in `controls` to end, then aborts
+/// the ones still running, so no cancel or child read acts on a fork of
+/// the context once the exit work owns it. Aborted tasks are not joined:
+/// a child read that already started on a blocking thread cannot be
+/// stopped, and joining it would hold the exit past its bound.
+async fn settle_control_tasks(mut controls: JoinSet<()>, wait: Duration) {
+    let drained = async { while controls.join_next().await.is_some() {} };
+    if tokio::time::timeout(wait, drained).await.is_err() {
+        controls.abort_all();
+        controls.detach_all();
+    }
 }
 
 /// The footer's left half, read from the context only while the UI holds it.
@@ -1004,7 +1025,9 @@ fn spawn_control_request(
     request: ControlRequest,
     control: Arc<RequestContext>,
     tx: UnboundedSender<UiMsg>,
+    tasks: &mut JoinSet<()>,
 ) {
+    while tasks.try_join_next().is_some() {}
     match request {
         ControlRequest::Cancel {
             id,
@@ -1012,7 +1035,7 @@ fn spawn_control_request(
             child_root,
         } => {
             let mut ctx = cancel_context(&control, child_root);
-            tokio::spawn(async move {
+            tasks.spawn(async move {
                 let args = serde_json::json!({ "id": id });
                 let result = match kind {
                     TaskKind::Job => {
@@ -1036,7 +1059,7 @@ fn spawn_control_request(
             file,
             generation,
         } => {
-            tokio::task::spawn_blocking(move || {
+            tasks.spawn_blocking(move || {
                 let result = pager::load_child(&file, &control).map_err(|err| format!("{err:#}"));
                 let _ = tx.send(UiMsg::ChildLoaded {
                     session_id,
@@ -1201,6 +1224,8 @@ pub(crate) struct App {
     /// Work the roster and the pager asked for; the loop runs each off
     /// itself after the step that queued it.
     control_requests: Vec<ControlRequest>,
+    /// The control requests still running, which the exit work waits on.
+    control_tasks: JoinSet<()>,
     /// Escalations put to the user through the prompt modal, by id, with
     /// the kind of modal asked and where its answer arrives.
     escalation_answers: Vec<(String, PromptAction, mpsc::Receiver<PromptAnswer>)>,
@@ -1273,6 +1298,7 @@ impl App {
             control: None,
             child_root: None,
             control_requests: Vec::new(),
+            control_tasks: JoinSet::new(),
             child_reads: 0,
             escalation_answers: Vec::new(),
         })
@@ -1319,6 +1345,7 @@ impl App {
                 Ok((mut renderer, background)) => {
                     renderer.no_color = self.renderer.no_color;
                     self.renderer = renderer;
+                    self.transcript.forget_layout();
                     if let Some(pager) = self.pager.as_mut() {
                         pager.forget_layout();
                     }
@@ -3610,7 +3637,12 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
         // way an outlived task does instead of hanging a bare terminal.
         Leave::Abandoned(ctx) => {
             let (joined, mut late) = join_unattended(
-                spawn_exit(*ctx, abort.clone(), tx.clone()),
+                spawn_exit(
+                    *ctx,
+                    std::mem::take(&mut app.control_tasks),
+                    abort.clone(),
+                    tx.clone(),
+                ),
                 &mut rx,
                 EXIT_TEARDOWN_WAIT,
             )
@@ -4048,7 +4080,12 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
         let requests = app.take_control_requests();
         if let Some(control) = &app.control {
             for request in requests {
-                spawn_control_request(request, Arc::clone(control), tx.clone());
+                spawn_control_request(
+                    request,
+                    Arc::clone(control),
+                    tx.clone(),
+                    &mut app.control_tasks,
+                );
             }
         }
         if quit_requested
@@ -4056,7 +4093,13 @@ async fn run_loop(shell: &mut Shell<'_>, ctx: RequestContext) -> Leave {
             && let Some(ctx) = ctx.take()
         {
             app.begin_exit();
-            task = Some(Task::Exit(spawn_exit(ctx, abort.clone(), tx.clone())));
+            let controls = std::mem::take(&mut app.control_tasks);
+            task = Some(Task::Exit(spawn_exit(
+                ctx,
+                controls,
+                abort.clone(),
+                tx.clone(),
+            )));
         }
     }
 }
@@ -5984,6 +6027,30 @@ mod tests {
         assert!(started.elapsed() >= deadline);
     }
 
+    /// The exit waits for control tasks only up to its bound: one that
+    /// finishes in time is joined, one that never does is aborted, and
+    /// the wait returns either way.
+    #[tokio::test(start_paused = true)]
+    async fn the_exit_aborts_control_tasks_still_running_at_its_bound() {
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut controls = JoinSet::new();
+        controls.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = finished_tx.send(());
+        });
+        controls.spawn(async move {
+            let _held = held_tx;
+            std::future::pending::<()>().await;
+        });
+        let bound = Duration::from_millis(50);
+        let started = tokio::time::Instant::now();
+        settle_control_tasks(controls, bound).await;
+        assert!(started.elapsed() >= bound);
+        assert_eq!(finished_rx.await, Ok(()));
+        assert!(held_rx.await.is_err(), "the pending task was not aborted");
+    }
+
     /// A work task that panics while the UI waits on it is told apart
     /// from one that ran out of time: the panic comes back as such, with
     /// its message, instead of being reported as a task left behind.
@@ -6077,8 +6144,12 @@ mod tests {
                 assert!(session_files.iter().all(|file| !file.exists()));
                 register_stuck_agent(&mut ctx);
                 let (tx, mut rx) = unbounded_channel();
-                let (joined, _) =
-                    join_unattended(spawn_exit(ctx, abort.clone(), tx), &mut rx, wait).await;
+                let (joined, _) = join_unattended(
+                    spawn_exit(ctx, JoinSet::new(), abort.clone(), tx),
+                    &mut rx,
+                    wait,
+                )
+                .await;
                 let saved = session_files.iter().any(|file| {
                     std::fs::read_to_string(file).is_ok_and(|text| text.contains("persist me e6w"))
                 });
@@ -10336,28 +10407,84 @@ mod tests {
         assert_eq!(harness.draw(), before);
     }
 
-    /// A new config brings a new renderer; the open pager lays its text
-    /// out again so the styling follows instead of keeping the old one.
-    #[test]
-    fn a_new_renderer_makes_the_open_pager_lay_out_again() {
-        let mut ctx = chat_ctx();
-        let mut harness = Harness::for_ctx(&ctx);
-        harness.app.sync_from_ctx(&mut ctx);
-        harness.app.transcript.push(Cell::user("hello"));
-        press_ctrl(&mut harness, 't');
-        harness.draw();
-        let pager = harness.app.pager.as_ref().unwrap();
-        let first = pager.cell_layouts();
-        assert!(first > 0);
-        harness.draw();
-        let pager = harness.app.pager.as_ref().unwrap();
-        assert_eq!(pager.cell_layouts(), first, "an idle frame laid out again");
+    /// The style of the first screen cell of `needle`.
+    fn style_of(harness: &Harness, needle: &str) -> Style {
+        let buffer = harness.terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            let mut text = String::new();
+            let mut starts = Vec::new();
+            for x in 0..buffer.area.width {
+                starts.push(text.len());
+                text.push_str(buffer[(x, y)].symbol());
+            }
+            if let Some(at) = text.find(needle)
+                && let Some(x) = starts.iter().position(|start| *start == at)
+            {
+                return buffer[(u16::try_from(x).unwrap(), y)].style();
+            }
+        }
+        panic!("{needle:?} is not on screen:\n{buffer:?}");
+    }
 
-        ctx.app = Arc::clone(&chat_ctx().app);
-        harness.app.sync_from_ctx(&mut ctx);
-        harness.draw();
-        let pager = harness.app.pager.as_ref().unwrap();
-        assert_eq!(pager.cell_layouts(), 2 * first);
+    /// Hands `ctx` a config that differs from the one it has only in
+    /// whether replies are highlighted.
+    fn swap_highlight(ctx: &mut RequestContext, highlight: bool) {
+        let mut state = (*ctx.app).clone();
+        state.config = Arc::new(AppConfig {
+            highlight,
+            ..(*ctx.app.config).clone()
+        });
+        ctx.app = Arc::new(state);
+    }
+
+    /// A new config brings a new renderer, and every view restyles what
+    /// it already laid out: the transcript, the pager's root thread and
+    /// a child's thread open in the pager.
+    #[test]
+    #[serial]
+    fn a_new_renderer_restyles_the_transcript_and_the_pager() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-renderer-swap");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 15 };
+            write_child(&root, "reviewer-c5s", &child_yaml("'**bold c5s**'"));
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness
+                .app
+                .transcript
+                .push(Cell::assistant("**bold t5s**".to_string(), true));
+
+            harness.draw();
+            let plain_transcript = style_of(&harness, "bold t5s");
+            press_ctrl(&mut harness, 't');
+            harness.draw();
+            let plain_root = style_of(&harness, "bold t5s");
+            harness.press(KeyCode::Char('q'));
+            harness
+                .app
+                .open_child("reviewer-c5s".to_string(), "reviewer".to_string());
+            run_control_requests(&mut harness).await;
+            harness.draw();
+            let plain_child = style_of(&harness, "bold c5s");
+
+            swap_highlight(&mut ctx, true);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness.draw();
+            assert_ne!(style_of(&harness, "bold c5s"), plain_child);
+            harness.press(KeyCode::Char('q'));
+            harness.draw();
+            assert_ne!(style_of(&harness, "bold t5s"), plain_transcript);
+            press_ctrl(&mut harness, 't');
+            harness.draw();
+            assert_ne!(style_of(&harness, "bold t5s"), plain_root);
+
+            swap_highlight(&mut ctx, false);
+            harness.app.sync_from_ctx(&mut ctx);
+            harness.draw();
+            assert_eq!(style_of(&harness, "bold t5s"), plain_root);
+        });
     }
 
     fn counted_turn(harness: &mut Harness, lines: usize) {
@@ -10587,7 +10714,12 @@ mod tests {
         let requests = harness.app.take_control_requests();
         assert_eq!(requests.len(), 1, "{requests:?}");
         for request in requests {
-            spawn_control_request(request, Arc::clone(&control), tx.clone());
+            spawn_control_request(
+                request,
+                Arc::clone(&control),
+                tx.clone(),
+                &mut harness.app.control_tasks,
+            );
         }
         let msg = rx.recv().await.expect("the request reports back");
         harness.app.handle_msg(msg);
@@ -10622,6 +10754,7 @@ mod tests {
             let frame = harness.draw();
             assert!(!frame.contains("job-x7x  running"), "{frame}");
 
+            harness.press(KeyCode::Up);
             harness.press(KeyCode::Char('x'));
             run_control_requests(&mut harness).await;
             assert!(!tasks.read().has_agent("agent-x7x"));
@@ -10629,6 +10762,42 @@ mod tests {
             let frame = harness.draw();
             assert!(frame.contains("Cancelled job-x7x"), "{frame}");
             assert!(frame.contains("Cancelled agent 'reviewer'"), "{frame}");
+        });
+    }
+
+    /// A focused row that leaves the roster takes the focus with it: `x`
+    /// then cancels nothing until a move picks a row.
+    #[test]
+    #[serial]
+    fn x_does_nothing_once_the_focused_row_has_gone() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-roster-lost-focus");
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            tasks.write().register(running_job("job-a7f")).unwrap();
+            tasks.write().register(running_job("job-b7f")).unwrap();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+
+            harness.press(KeyCode::F(3));
+            harness.draw();
+            harness.press(KeyCode::Char('j'));
+            let focused = |harness: &Harness| harness.app.focused_task().map(|task| task.id);
+            assert_eq!(focused(&harness).as_deref(), Some("job-b7f"));
+            tasks.write().take_job("job-b7f");
+            harness.draw();
+            assert_eq!(focused(&harness), None);
+            harness.press(KeyCode::Char('x'));
+            assert!(harness.app.take_control_requests().is_empty());
+
+            harness.press(KeyCode::Char('j'));
+            harness.press(KeyCode::Char('x'));
+            let requests = harness.app.take_control_requests();
+            let [ControlRequest::Cancel { id, .. }] = requests.as_slice() else {
+                panic!("{requests:?}");
+            };
+            assert_eq!(id, "job-a7f");
         });
     }
 
@@ -10995,7 +11164,12 @@ mod tests {
             let (tx, mut rx) = unbounded_channel();
             let control = harness.app.control.clone().expect("a control context");
             for request in first {
-                spawn_control_request(request, Arc::clone(&control), tx.clone());
+                spawn_control_request(
+                    request,
+                    Arc::clone(&control),
+                    tx.clone(),
+                    &mut harness.app.control_tasks,
+                );
             }
             let msg = rx.recv().await.expect("the read reports back");
             harness.app.handle_msg(msg);
