@@ -870,6 +870,9 @@ def new_task(state, slug, title, body, blocked_by=(), task_type="chore", batch="
 # ---------------------------------------------------------------- state heal
 HEAL_PATH_KEYS = ("run_dir", "code_repo_path", "plans_root", "tasks_root", "plan_path", "design_doc_path", "reference_root_path",
                   "seed_path", "draft_path")
+# The path keys a gate cannot run without. Any other path key is optional configuration whose absence means
+# something (no planning store declared, no design doc), so it is healed only when present with a wrong value.
+HEAL_ABSENT_PATH_KEYS = ("run_dir", "code_repo_path", "tasks_root", "plan_path")
 HEAL_PATH_VARS = {"code_repo_path": CODE_VAR, "plans_root": PLANNING_VAR, "design_doc_path": "design_doc"}
 # The keys whose empty value would send a gate somewhere wrong (git in the current directory, a run with no tasks
 # left), so a present but wrong value with nothing to heal it from stays as it is and is reported with this source.
@@ -900,7 +903,7 @@ def _path_sources(state, snap, key):
 
 
 def _heal_path(healed, notes, snap, key):
-    if key in healed and isinstance(healed[key], str):
+    if (key in healed and isinstance(healed[key], str)) or (key not in healed and key not in HEAL_ABSENT_PATH_KEYS):
         return
     found = next(((src, v) for src, v in _path_sources(healed, snap, key) if isinstance(v, str) and v), None)
     if not found and key in healed and key in UNRECOVERABLE_KEYS:
@@ -915,12 +918,12 @@ def _heal_path(healed, notes, snap, key):
 def heal_state(state):
     """Repair the state keys a gate cannot run without: (healed state, [(key, source)]).
 
-    A key is repaired only when it is wrong: a path key that is missing or not a string, `tasks` that is missing or
-    not a list of task dicts, `current_task` that is missing or not a string. A valid value is never replaced. A
-    present but wrong value with no source left becomes the initial-state value, except for UNRECOVERABLE_KEYS: that
-    value is kept and reported with source UNRECOVERABLE. A missing one stays missing. A `current_task` with no saved
-    value is reported with source None and left for the gate to handle. A state with no run yet (no run id and no run
-    dir) is returned unchanged.
+    A key is repaired only when it is wrong: a path key that is not a string, or missing when it is one of
+    HEAL_ABSENT_PATH_KEYS; `tasks` that is missing or not a list of task dicts; `current_task` that is missing or not a
+    string. A valid value is never replaced. A present but wrong value with no source left becomes the initial-state
+    value, except for UNRECOVERABLE_KEYS: that value is kept and reported with source UNRECOVERABLE. A missing one
+    stays missing. A `current_task` with no saved value is reported with source None and left for the gate to handle.
+    A state with no run yet (no run id and no run dir) is returned unchanged.
     """
     if not any(isinstance(state.get(k), str) and state.get(k) for k in ("run_id", "run_dir")):
         return state, []

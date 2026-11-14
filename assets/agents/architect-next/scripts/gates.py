@@ -4822,7 +4822,7 @@ def flip_ready(state):
         if pr:
             cmd = os.environ.get("ARCHITECT_GH_READY_CMD")
             rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "pr", "ready", str(pr)], cwd=code, timeout=GH_CALL_SECS)
-            # a ready claim needs the PR itself to read as no longer a draft, not just a clean exit
+            # a ready claim needs the PR itself to read as no longer a draft; a clean exit alone is not enough
             view_rc, draft = _pr_view(state, pr, "isDraft") if rc == 0 else (1, "")
             u["flipped_ready"] = rc == 0 and view_rc == 0 and draft.strip() == "false"
             if u["flipped_ready"]:

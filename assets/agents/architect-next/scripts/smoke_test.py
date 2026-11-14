@@ -4843,6 +4843,34 @@ _s = heal_base()
 _s.pop("tasks_root")
 guarded("heal_state: tasks_root missing -> recomputed from plans_root",
         lambda: (lambda r: (r[0]["tasks_root"] == os.path.join(_s["plans_root"], "tasks") and ("tasks_root", "plans_root") in r[1], r[1]))(_lib.heal_state(_s)))
+heal_disk(plans_root=PLANS, design_doc_path=DESIGN)
+_s = heal_base()
+for _k in ("plans_root", "design_doc_path"):
+    _s.pop(_k)
+guarded("heal_state: an absent optional key (plans_root, design_doc_path) stays absent even when state.json carries one",
+        lambda: (lambda r: ("plans_root" not in r[0] and "design_doc_path" not in r[0]
+                            and not any(k in ("plans_root", "design_doc_path") for k, _ in r[1]), r[1]))(_lib.heal_state(_s)))
+guarded("heal_state: a null plans_root is still healed from state.json",
+        lambda: (lambda r: (r[0]["plans_root"] == PLANS and ("plans_root", "state.json") in r[1], r[1]))(_lib.heal_state(heal_base(plans_root=None))))
+
+
+def _verify_without_store(declared):
+    s = heal_base(verify_scope="task", round_log=copy.deepcopy(rl))
+    if not declared:
+        s.pop("plans_root")
+    dirt = os.path.join(PLANS, "tasks", "heal-dirt.md")
+    write(dirt, "status: in-progress\n")
+    try:
+        gp = run_gate("verify_gate", s)["gauntlet_prompt"].splitlines()
+    finally:
+        os.remove(dirt)
+    return [l for l in gp if l.startswith(("Re-review delta:", "Settled lanes:"))]
+
+
+guarded("run verify_gate: plans_root absent from state (state.json carries one), planning dirt only -> no Re-review delta and no Settled lanes line",
+        lambda: (lambda declared, absent: (declared != [] and absent == [], (declared, absent)))(
+            _verify_without_store(True), _verify_without_store(False)))
+heal_disk()
 heal_disk(plan_path="/elsewhere.md")
 guarded("heal_state: valid values are never overwritten, and a state with no run is left alone",
         lambda: (lambda a, b: (a[1] == [] and a[0]["plan_path"] == PROMOTED and a[0]["code_repo_path"] == "" and b == ({"tasks": "x"}, []), (a[1], b)))(
