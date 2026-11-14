@@ -904,7 +904,10 @@ fn unverified_criticals_block(
         text.contains(&format!("code-review: {n} 🔴 CRITICAL finding(s)")),
         "{label}: the gauntlet must route unverified criticals as findings: {text}"
     );
-    assert_eq!(gauntlet["gauntlet_verdict"], "BLOCKED", "{label}: {gauntlet}");
+    assert_eq!(
+        gauntlet["gauntlet_verdict"], "BLOCKED",
+        "{label}: {gauntlet}"
+    );
 }
 
 fn code_review_row(gauntlet: &Value) -> String {
@@ -970,13 +973,7 @@ fn unverified_criticals_keep_blocking() {
             "",
             blocked_row,
         ),
-        (
-            "no verdicts returned",
-            json!("[]"),
-            kept,
-            "",
-            blocked_row,
-        ),
+        ("no verdicts returned", json!("[]"), kept, "", blocked_row),
         (
             "dead verifier",
             json!("Agent node failed: timed out"),
@@ -1015,7 +1012,9 @@ fn unverified_criticals_keep_blocking() {
         );
         if machine.is_empty() {
             assert!(
-                text.contains("- code-review: 2 unverified finding(s) kept at their stated severity"),
+                text.contains(
+                    "- code-review: 2 unverified finding(s) kept at their stated severity"
+                ),
                 "{label}: {text}"
             );
         } else {
@@ -1249,8 +1248,9 @@ fn anchor_gate_marks_unanchored_findings_and_keeps_them_whole() {
         finding("no-lines", "🟢 SUGGESTION", "internal/plan.go", "")
     ]);
     state["findings"][8]["marker"] = json!("correctness");
-    state["findings"][8]["block"] =
-        json!("#### finding far\n- **Description**: the caller at line 16 still passes the old unit");
+    state["findings"][8]["block"] = json!(
+        "#### finding far\n- **Description**: the caller at line 16 still passes the old unit"
+    );
     let out = run_script("code-reviewer/scripts/anchor_gate.py", &state);
     assert_eq!(out["anchor_checked"], true, "{out}");
     assert_eq!(out["anchor_error"], "", "{out}");
@@ -1282,7 +1282,10 @@ fn anchor_gate_marks_unanchored_findings_and_keeps_them_whole() {
     assert!(
         block.contains("still passes the old unit")
             && block.contains("not within 3 lines of a change")
-            && far["anchor_note"].as_str().unwrap().contains("not within 3 lines"),
+            && far["anchor_note"]
+                .as_str()
+                .unwrap()
+                .contains("not within 3 lines"),
         "the full block survives and carries the anchor fact: {out}"
     );
     assert!(
@@ -1540,8 +1543,7 @@ fn regression_pr_1001_shape_drops_fabrications_only_by_refutation() {
     assert_eq!(verdict["counts"]["🔴"], 3, "{verdict}");
     assert_eq!(gauntlet["gauntlet_verdict"], "BLOCKED", "{gauntlet}");
     assert_eq!(
-        gauntlet["gauntlet_incomplete_line"],
-        "\nGAUNTLET_REVIEW_INCOMPLETE: code-review",
+        gauntlet["gauntlet_incomplete_line"], "\nGAUNTLET_REVIEW_INCOMPLETE: code-review",
         "{gauntlet}"
     );
 }
@@ -1943,7 +1945,12 @@ fn a_severity_without_an_icon_keeps_its_stated_level() {
         ("lower", "high", "#### lower", "🔴"),
         ("warn", "Warning", "#### warn", "🟡"),
         ("nit", "nit", "#### nit", "💡"),
-        ("from-block", "", "#### from-block\n- **Severity**: 🔴 CRITICAL", "🔴"),
+        (
+            "from-block",
+            "",
+            "#### from-block\n- **Severity**: 🔴 CRITICAL",
+            "🔴",
+        ),
         ("unreadable", "???", "#### unreadable", "🔴"),
     ];
     let findings: Vec<Value> = cases
@@ -1974,7 +1981,10 @@ fn a_severity_without_an_icon_keeps_its_stated_level() {
     }
     let held = finals.iter().find(|f| f["id"] == "unreadable").unwrap();
     assert!(
-        held["block"].as_str().unwrap().contains("severity unreadable"),
+        held["block"]
+            .as_str()
+            .unwrap()
+            .contains("severity unreadable"),
         "{verdict}"
     );
 }
