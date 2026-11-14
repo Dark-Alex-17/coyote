@@ -285,7 +285,7 @@ def intake(state):
         for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtask_tree", "subtask_head", "subtask_started_at",
                   "run_must_not_do", "final_rejections_from", "subtasks", "subtask_index", "current_task", "fix_round",
                   "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
-                  "skipped_reviews", "debt_left_behind", "debris_exemptions", "design_decisions",
+                  "skipped_reviews", "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria"):
             if prior.get(k) is not None:
@@ -2745,13 +2745,20 @@ def bookkeeping_scan(state):
     base = state.get("base_sha") or ""
     hits = state.get("debt_hits") or ""
     items = []
+    failures = dict(as_dict(state.get("debt_scan_failures")))
+    scope = ("final review" if truthy(state.get("final_review"))
+             else f"subtask {as_int(state.get('task_number'))}" if as_list(state.get("subtasks")) else "task")
     if crashed:
         # The engine leaves debt_hits untouched on a crash, so it holds the initial_state
         # default (first pass) or a previous round's report; neither describes this worktree.
         if not hits.startswith("DEBT_SCAN_FAILED"):
-            u["debt_hits"] = DEBT_HITS_STALE
+            u["debt_hits"] = hits = DEBT_HITS_STALE
             ledger(state, u, "debt_scan: the node did not run this round; the previous round's report was discarded")
+    if hits.startswith("DEBT_SCAN_FAILED"):
+        failures[scope] = hits.splitlines()[0].strip()
+        ledger(state, u, f"debt_scan: scan FAILED ({scope}): {failures[scope]}; the diff was not scanned")
     else:
+        failures.pop(scope, None)
         for line in hits.splitlines():
             m = re.match(r"^(\S+?:\d+)\s+--\s+(.*)$", line.strip())
             if not m:
@@ -2759,6 +2766,7 @@ def bookkeeping_scan(state):
             owner = re.search(r"\b[A-Z][A-Z0-9]+-\d{2,}\b", m.group(2))
             items.append({"where": m.group(1), "text": m.group(2).strip(), "owner": owner.group(0) if owner else ""})
     u["debt_items"] = items
+    u["debt_scan_failures"] = failures
     u["changed_files"] = changed_files_since(root, base)
     u["diff_stat"] = tail(git_out(root, "diff", "--stat", base) if base else git_out(root, "diff", "--stat", "HEAD"), 3000)
     u["head_sha"] = git_out(root, "rev-parse", "HEAD", default=state.get("head_sha", ""))
@@ -3549,6 +3557,7 @@ def ci_gate(state):
     task = as_dict(state.get("git_task"))
     ret = task.get("return_to") or "final_report"
     if task.get("kind") == "flip_ready":
+        _confirm_pr_ready(state, u)
         if _review_mode(state) and truthy(state.get("ci_owner")):
             return _start_review_watch(state, u)
         u["_next"] = "final_report"
@@ -3599,8 +3608,14 @@ def ci_gate(state):
             u["pr_ref"] = _pr_ref(state)
         u["_next"] = "ci_poll"
     else:
-        if task.get("open_pr") and not owns:
-            ledger(state, u, "ci: PR lifecycle owned by the parent orchestrator; left in draft")
+        if not task.get("open_pr"):
+            note = "not watched: this run opened no PR"
+        elif not owns:
+            note = "not watched: the PR lifecycle is owned by the parent orchestrator"
+        else:
+            note = "not watched: no PR link found in the publish report"
+        u["ci_watch_note"] = note
+        ledger(state, u, f"ci: {note}" + ("; left in draft" if task.get("open_pr") and not owns else ""))
         if _review_mode(state) and truthy(state.get("delegated")) and task.get("open_pr"):
             ledger(state, u, "review-watch: not started: PR lifecycle owned by the parent orchestrator")
         u["_next"] = "final_report"
@@ -3663,6 +3678,45 @@ def _pr_view(state):
         return doc if isinstance(doc, dict) else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _pr_ready(state):
+    """The return code of one `gh pr ready` on the run's PR, or None when the call could not run."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    ref = _pr_ref(state)
+    cmd = os.environ.get("SISYPHUS_GH_PR_READY_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_PR_REF": ref})
+        else:
+            p = subprocess.run(["gh", "pr", "ready", *([ref] if ref else [])], cwd=root, capture_output=True,
+                               text=True, timeout=GH_CALL_SECS)
+        return p.returncode
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _confirm_pr_ready(state, u):
+    """Record whether the PR reads as ready after the flip task, running `gh pr ready` once when it still does not."""
+    pr = _pr_view(state)
+    if pr is not None and pr.get("isDraft") is False:
+        confirmed, detail = True, "isDraft false on re-read"
+    else:
+        rc = _pr_ready(state)
+        pr = _pr_view(state)
+        seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}"
+        confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False
+        detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
+    u["pr_ready_confirmed"] = confirmed
+    u["pr_ready_detail"] = detail
+    if confirmed:
+        ledger(state, u, f"ci: PR flip to ready confirmed ({detail})")
+    else:
+        watch = "; the review watch starts anyway" if _review_mode(state) and truthy(state.get("ci_owner")) else ""
+        ledger(state, u, f"ci: PR flip to ready NOT confirmed ({detail}){watch}")
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR flip to ready not confirmed: {detail}{watch}"]
 
 
 def _review_mode(state):
@@ -4668,7 +4722,16 @@ def _assemble_report(state, u, pre_publish=False):
                 lines.append(f"  - round {r.get('round')} @ {r.get('head')}: {r.get('verdict', '(running)')}"
                              + (" [" + "; ".join(f"{k}: {v}" for k, v in details.items()) + "]" if details else ""))
     if g("ci_status"):
-        lines.append(f"- CI: {g('ci_status')}" + (" (flipped to ready)" if truthy(g("flip_ready", False)) else ""))
+        green_by = g("ci_green_by") if g("ci_status") == g("ci_green_by") else ""
+        ci = {"no_checks": "no checks configured; finished without CI",
+              "inconclusive": "inconclusive, treated as green by decision"}.get(green_by, g("ci_status"))
+        if truthy(g("pr_ready_confirmed", False)):
+            ci += " (flipped to ready)"
+        elif truthy(g("flip_ready", False)):
+            ci += f" (flip to ready NOT confirmed: {g('pr_ready_detail') or 'the PR was not re-read'})"
+        lines.append(f"- CI: {ci}")
+    else:
+        lines.append(f"- CI: {g('ci_watch_note') or 'not watched: no publish step ran'}")
     for c in as_list(g("publish_checks", [])):
         if isinstance(c, dict):
             lines.append(f"- publish check {c.get('check')}: {'ok' if c.get('ok') else 'FAILED'} ({c.get('detail')})")
@@ -4695,8 +4758,9 @@ def _assemble_report(state, u, pre_publish=False):
     if addressed:
         lines += ["## PR review feedback addressed"] + [
             f"- {a.get('action', '')}: {_item_ref(a)}: {a.get('text') or a.get('reason') or ''}" for a in addressed] + [""]
-    debt = as_list(g("debt_left_behind", []))
-    lines += ["Debt left behind:"] + ([f"- {d}" for d in debt] or ["- none"]) + [""]
+    debt = [f"- {d}" for d in as_list(g("debt_left_behind", []))] + [
+        f"- debt scan FAILED ({s}): {r}; the diff was not scanned" for s, r in as_dict(g("debt_scan_failures", {})).items()]
+    lines += ["Debt left behind:"] + (debt or ["- none"]) + [""]
     ex = as_list(g("debris_exemptions", []))
     lines += ["Debris exemptions:"] + ([f"- {e}" for e in ex] or ["- none"]) + [""]
     dd = as_list(g("design_decisions", []))

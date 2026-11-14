@@ -82,6 +82,11 @@ BASE = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=T
 check("env: no caller SISYPHUS_GH_* seam, poll sleep or owner/Slack binary survives the scrub",
       not [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in SCRUBBED_SEAMS]
       and {"SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN"} <= set(SCRUBBED_SEAMS))
+# every flip_ready row re-reads the PR and may run `gh pr ready`, so the real gh calls must never run here
+_PR_VIEW_DEFAULT = "echo '{\"isDraft\": false}'"
+_PR_READY_DEFAULT = "exit 1"
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
+os.environ["SISYPHUS_GH_PR_READY_CMD"] = _PR_READY_DEFAULT
 
 
 def base_state(**over):
@@ -3586,7 +3591,7 @@ u = gates.ci_gate(dict(pub, publish_retries=1))
 bad = next((r for r in as_list_(u.get("publish_checks")) if r.get("check") == "draft PR"), {})
 bad_ok = bad.get("ok") is False and all(w in str(bad.get("detail")) for w in ("not a draft", "not the current branch", "empty body"))
 check("publish: a ready PR on another head with an empty body fails the draft PR check with all three reasons", bad_ok, bad)
-os.environ.pop("SISYPHUS_GH_PR_VIEW_CMD")
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
 
 # Subtasks never commit, so a later subtask diffed against HEAD reviewed every earlier subtask's work too.
 SNAP_REPO = os.path.join(TMP, "snapshot-repo")
@@ -4101,6 +4106,117 @@ shared_total = (u["_next"] == "ask_dispatch" and _ra.get("reask_rounds") == REAS
                 and _reset["reask_rounds"] == 0 and _reset["apply_reasks"] == 0)
 _rs = (_ra.get("reask_rounds"), u2.get("_next"), u3.get("_next"))
 check("caps: apply_answer's re-ask leaves parse_answer's count, so both share one bounded total per escalation", shared_total, _rs)
+
+# The report claims a flip, a CI watch and a clean debt scan only from what the gates saw.
+_FLIP_MARK = os.path.join(TMP, "flip-ready.mark")
+_FLIP_LOG = os.path.join(TMP, "flip-ready.log")
+_DRAFT_JSON = "echo '{\"isDraft\": true}'"
+_READY_JSON = "echo '{\"isDraft\": false}'"
+_saved_flip_env = {k: os.environ.get(k) for k in ("SISYPHUS_GH_PR_VIEW_CMD", "SISYPHUS_GH_PR_READY_CMD")}
+
+
+def flip_seams(view, ready):
+    if os.path.exists(_FLIP_MARK):
+        os.remove(_FLIP_MARK)
+    os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = view
+    os.environ["SISYPHUS_GH_PR_READY_CMD"] = f"echo \"$SISYPHUS_PR_REF\" >> '{_FLIP_LOG}'; {ready}"
+
+
+_view_after_ready = f"if [ -f '{_FLIP_MARK}' ]; then {_READY_JSON}; else {_DRAFT_JSON}; fi"
+_flip = dict(git_task={"kind": "flip_ready"}, flip_ready=True, git_report="https://github.com/o/r/pull/9")
+flip_seams(_READY_JSON, "exit 0")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: the re-read PR is not a draft -> confirmed without running gh pr ready",
+      u.get("pr_ready_confirmed") is True and u.get("_next") == "final_report" and seam_log(_FLIP_LOG) == ""
+      and any("flip to ready confirmed" in d for d in u["decisions"]), u)
+flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: still a draft -> gh pr ready once on the PR ref, rc 0 and a ready re-read -> confirmed",
+      u.get("pr_ready_confirmed") is True and seam_log(_FLIP_LOG) == "9\n" and not u.get("follow_ups"), u)
+flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'; exit 1")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: gh pr ready rc 1 -> not confirmed with a follow-up, even when the re-read is not a draft",
+      u.get("pr_ready_confirmed") is False and u.get("_next") == "final_report"
+      and any(f.startswith("PR flip to ready not confirmed: gh pr ready rc 1") for f in as_list_(u.get("follow_ups")))
+      and any("flip to ready NOT confirmed" in d for d in u["decisions"]), u)
+flip_seams(_DRAFT_JSON, "exit 0")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: gh pr ready rc 0 but the re-read is still a draft -> not confirmed, the detail names isDraft",
+      u.get("pr_ready_confirmed") is False and "isDraft true" in str(u.get("pr_ready_detail")), u)
+flip_seams("exit 1", "exit 0")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: the re-read itself failing -> not confirmed, the detail says gh pr view failed",
+      u.get("pr_ready_confirmed") is False and "gh pr view failed" in str(u.get("pr_ready_detail")), u)
+flip_seams(_DRAFT_JSON, "exit 0")
+u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=0))
+check("flip: review mode with an unconfirmed flip still starts the watch, and the follow-up says so",
+      u.get("_next") == "pr_review_poll" and u.get("pr_ready_confirmed") is False
+      and any("not confirmed" in f and "review watch" in f for f in as_list_(u.get("follow_ups"))), u)
+seam_log(_FLIP_LOG)
+for _k, _v in _saved_flip_env.items():
+    os.environ[_k] = _v
+check("flip: the PR view and PR ready seams are back at the battery defaults",
+      os.environ.get("SISYPHUS_GH_PR_VIEW_CMD") == _PR_VIEW_DEFAULT
+      and os.environ.get("SISYPHUS_GH_PR_READY_CMD") == _PR_READY_DEFAULT)
+
+_r = gates.final_report(base_state(ci_status="green", flip_ready=True, pr_ready_confirmed=True))["report"]
+check("report: a confirmed flip reads flipped to ready", "- CI: green (flipped to ready)" in _r, _r[-800:])
+_r = gates.final_report(base_state(ci_status="green", flip_ready=True, pr_ready_confirmed=False,
+                                   pr_ready_detail="gh pr ready rc 1, then isDraft true"))["report"]
+check("report: an unconfirmed flip names the detail and never reads flipped to ready",
+      "- CI: green (flip to ready NOT confirmed: gh pr ready rc 1, then isDraft true)" in _r
+      and "flipped to ready" not in _r, _r[-800:])
+_r = gates.final_report(base_state(ci_status="no_checks", ci_green_by="no_checks", flip_ready=True,
+                                   pr_ready_confirmed=True))["report"]
+check("report: finished without CI reads as no checks configured, never a plain green",
+      "- CI: no checks configured; finished without CI (flipped to ready)" in _r and "- CI: green" not in _r, _r[-800:])
+_r = gates.final_report(base_state(ci_status="inconclusive", ci_green_by="inconclusive"))["report"]
+check("report: inconclusive CI treated as green says it was a decision",
+      "- CI: inconclusive, treated as green by decision" in _r and "- CI: green" not in _r, _r[-800:])
+_r = gates.final_report(base_state(ci_status="red", ci_green_by="inconclusive"))["report"]
+check("report: a later non-green CI status wins over an earlier treated-as-green decision",
+      "- CI: red" in _r and "treated as green" not in _r, _r[-800:])
+for _name, _over, _note in (
+        ("delegated batch run", dict(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True}, delegated=True,
+                                     review_cadence="batch", git_report="https://github.com/o/r/pull/5"),
+         "not watched: the PR lifecycle is owned by the parent orchestrator"),
+        ("run that opened no PR", dict(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": False}),
+         "not watched: this run opened no PR"),
+        ("publish report without a PR link", dict(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                                                  git_report="pushed the branch"),
+         "not watched: no PR link found in the publish report")):
+    _s = base_state(**_over)
+    u = gates.ci_gate(_s)
+    _r = gates.final_report({**_s, **u})["report"]
+    check(f"ci_gate: a {_name} skips the watch with a ledgered note and a CI line",
+          u.get("_next") == "final_report" and u.get("ci_watch_note") == _note
+          and any(_note in d for d in u["decisions"]) and f"- CI: {_note}" in _r, (u.get("ci_watch_note"), _r[-600:]))
+_r = gates.final_report(base_state(review_cadence="batch"))["report"]
+check("report: a run with no publish step still has a CI line", "- CI: not watched: no publish step ran" in _r, _r[-600:])
+
+_subs = [{"title": "a"}, {"title": "b"}]
+u = gates.bookkeeping_scan(base_state(debt_hits="DEBT_SCAN_FAILED: rg exited 2\nstderr follows", subtasks=_subs, task_number=2))
+_r = gates.final_report(base_state(**u))["report"]
+check("debt: a scanner failure is recorded for its subtask, ledgered, and the report names it instead of none",
+      u.get("debt_scan_failures") == {"subtask 2": "DEBT_SCAN_FAILED: rg exited 2"}
+      and any("scan FAILED (subtask 2)" in d for d in u["decisions"])
+      and "- debt scan FAILED (subtask 2): DEBT_SCAN_FAILED: rg exited 2; the diff was not scanned" in _r
+      and "Debt left behind:\n- none" not in _r, (u.get("debt_scan_failures"), _r[-800:]))
+u = gates.bookkeeping_scan(base_state(debt_hits="src/b.rs:3 -- todo!()\n", last_script_error="script 'debt_scan' failed: boom",
+                                      final_review=True, debt_scan_failures={"subtask 2": "DEBT_SCAN_FAILED: rg exited 2"}))
+_r = gates.final_report(base_state(**u))["report"]
+check("debt: a scan crash in the final review is recorded under final review and keeps the subtask failure",
+      u.get("debt_scan_failures") == {"subtask 2": "DEBT_SCAN_FAILED: rg exited 2",
+                                      "final review": gates.DEBT_HITS_STALE.splitlines()[0]}
+      and "- debt scan FAILED (final review): DEBT_SCAN_FAILED: the debt_scan node did not run" in _r
+      and "Debt left behind:\n- none" not in _r, (u.get("debt_scan_failures"), _r[-800:]))
+u = gates.bookkeeping_scan(base_state(debt_hits="", subtasks=_subs, task_number=2, debt_scan_failures=u["debt_scan_failures"]))
+check("debt: a later clean scan of the same subtask clears its failure and leaves the other scope's",
+      list(u.get("debt_scan_failures", {})) == ["final review"], u.get("debt_scan_failures"))
+u = gates.bookkeeping_scan(base_state(debt_hits="", debt_scan_failures={"task": "DEBT_SCAN_FAILED: x"}))
+_r = gates.final_report(base_state(**u))["report"]
+check("debt: a clean scan of a task without subtasks clears its failure and the report reads none",
+      u.get("debt_scan_failures") == {} and "Debt left behind:\n- none" in _r, _r[-800:])
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
