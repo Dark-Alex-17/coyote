@@ -12,7 +12,7 @@ found staged or unstaged changes; HEAD~1 for an `auto` that fell back to it;
 A for `A..B`; the merge-base of A and B for `A...B`; and the normalized base
 for a revision. It is empty when the base cannot be resolved.
 
-`bookkeeping_files` lists the changed files under the configured
+`bookkeeping_files` lists the changed or deleted files under the configured
 `debris_exclude` dirs, the run's own planning files; it is empty when none
 are configured or the value is unusable (debris_lint.py faults on that).
 `changed_files` and `diff_text` keep those files.
@@ -163,7 +163,13 @@ try:
         if line.startswith("+++ b/")
     })
     out["changed_files"] = files[:300]
-    out["bookkeeping_files"] = bookkeeping(files)
+    lines = text.splitlines()
+    deleted = {
+        old[6:].strip()
+        for old, new in zip(lines, lines[1:])
+        if old.startswith("--- a/") and new.startswith("+++ /dev/null")
+    }
+    out["bookkeeping_files"] = bookkeeping(sorted(set(files) | deleted))
     if len(files) > 300:
         out["diff_note"] += (
             f" (file list capped at 300 of {len(files)} changed files — use the fs "

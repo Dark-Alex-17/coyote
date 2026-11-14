@@ -49,7 +49,8 @@ RULED_MARKER = "(ruled by holistic: output format failed)"
 PLANNING_DRIFT_NOTE = "not blocking: scope drift confined to the run's planning files"
 SCOPE_DRIFT_KIND_RE = re.compile(r"scope drift|out-of-scope", re.I)
 BARE_LINE_REF_RE = re.compile(r":\d+(?:[-:]\d+)*")
-FILE_NAME_RE = re.compile(r"[\w.-]*\w\.\w+(?::\d+(?:[-:]\d+)*)?")
+LINE_ANCHOR_RE = re.compile(r"(?::L?\d+(?:[-:]L?\d+)*|#L\d+(?:-L?\d+)?)$")
+FILE_NAME_RE = re.compile(r"[\w.-]*\w\.\w+")
 
 
 def died(v):
@@ -73,13 +74,29 @@ def configured_excludes(state):
         return []
 
 
-def planning_drift(complaint, excludes):
+def outside_names(state, excludes):
+    """Basenames of the changed files that lie outside `excludes`."""
+    import debris
+
+    files = state.get("changed_files")
+    if not isinstance(files, list):
+        return set()
+    return {
+        f.rstrip("/").rsplit("/", 1)[-1]
+        for f in files
+        if isinstance(f, str) and not debris.under_excludes(f, excludes)
+    }
+
+
+def planning_drift(complaint, excludes, outside):
     """Whether a holistic complaint is scope drift located only in the run's
     planning files.
 
-    Path-like tokens of the location (a `/` in them, or a file name with an
-    extension) must all lie under `excludes`, at least one must be present,
-    and a bare `:N` line reference counts under the path before it.
+    File-like tokens of the location (a `/` in them, a file name with an
+    extension, a `:N`, `:LN` or `#LN` line anchor, or a name in `outside`,
+    the basenames of changed files outside `excludes`) must all lie under
+    `excludes`, at least one must be present, and a bare `:N` line reference
+    counts under the path before it.
     """
     kind = complaint.get("kind")
     location = complaint.get("location")
@@ -96,9 +113,13 @@ def planning_drift(complaint, excludes):
             if not paths:
                 return False
             continue
-        if "/" not in token and not FILE_NAME_RE.fullmatch(token):
+        anchor = LINE_ANCHOR_RE.search(token)
+        path = token[: anchor.start()] if anchor else token
+        if path in outside:
+            return False
+        if not anchor and "/" not in path and not FILE_NAME_RE.fullmatch(path):
             continue
-        if not debris.under_excludes(token, excludes):
+        if not debris.under_excludes(path, excludes):
             return False
         paths += 1
     return paths > 0
@@ -407,12 +428,13 @@ def main():
     verdicts = apply_format_rulings(verdicts, state.get("format_rulings"))
     holistic = [c for c in (state.get("extra_complaints") or []) if isinstance(c, dict)]
     excludes = configured_excludes(state)
+    outside = outside_names(state, excludes) if excludes else set()
     extra = []
     advisory = []
     for c in holistic:
         if not blocking(c):
             advisory.append((c, ""))
-        elif planning_drift(c, excludes):
+        elif planning_drift(c, excludes, outside):
             advisory.append((c, PLANNING_DRIFT_NOTE))
         else:
             extra.append(c)

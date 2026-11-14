@@ -211,14 +211,14 @@ def bookkeeping_note(value):
         import debris
 
         excludes = debris.parse_excludes(value)
-    except (ImportError, ValueError):
+    except Exception:  # noqa: BLE001 - the debris lane reports a bad value
         return ""
     if not excludes:
         return ""
     dirs = ", ".join(f"{d}/" for d in excludes)
     return (
-        f"Files under {dirs} are the run's own planning bookkeeping, not part of "
-        "the change under review: their presence in the diff is never scope drift."
+        f"Files under {dirs} are the run's own planning files (task records and "
+        "plan amendments); a task's file list never names them."
     )
 
 
