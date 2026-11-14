@@ -1787,7 +1787,7 @@ nodes:
   wave_cleanup:
     id: wave_cleanup
     type: script
-    description: The four cleanup rules (worktree removed; branch kept in multi, deleted after a clean merge in single) - the only unasked destructive ops.
+    description: The four cleanup rules (worktree removed; branch kept in multi, deleted after a clean merge in single, the remote copy only while origin holds the integrated head) - with integration_test's guarded reset of an unpushed merge, the only unasked destructive ops.
     script: scripts/wave_cleanup.py
     timeout: 300
     fallback: end_failure

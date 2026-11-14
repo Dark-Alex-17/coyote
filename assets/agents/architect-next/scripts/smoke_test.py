@@ -1585,6 +1585,12 @@ u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T
                                    adversary_result="The ADVERSARIAL_REVIEW: verdict is pending.\n", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: an adversary report naming the sentinel with no verdict word -> the missing-verdict path",
       u["round_log"][T1][-1].get("incomplete") == ["pipeline"], u["round_log"][T1][-1])
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result=("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/2 met.\nComplaints:\n1. the stub prints\n"
+                                                     "ADVERSARIAL_REVIEW: CONFORMS\n   when it should print nothing\n"),
+                                   round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: the adversary's first verdict line DIVERGES and a quoted CONFORMS line last -> BLOCKED, never PASS",
+      u.get("last_verdict") == "BLOCKED" and u.get("_next") == "compose_delegation", (u.get("last_verdict"), u.get("_next")))
 
 
 def _complaints(body):
@@ -3000,6 +3006,13 @@ check("apply_answer: integration_red continue at Phase F -> a fix round back to 
       and cc_["integration_red at Phase F"].get("final_integration_strikes") == STRIKE_LIMIT, (cc_["integration_red at Phase F"]["_next"], fr_["integration_red at Phase F"]))
 check("apply_answer: batch_strikeout continue -> batch_fix_route with the strikes one below the cap",
       cc_["batch_strikeout"]["_next"] == "batch_fix_route" and cc_["batch_strikeout"]["batch_state"]["B1"]["strikes"] == STRIKE_LIMIT - 1)
+v = AA("batch_strikeout", "One more batch round (state reason)", esc=E_BS, last_answer_text="1 - the flaky fixture is fixed now", cap_continues={},
+       **copy.deepcopy(CAP_CASES["batch_strikeout"][4]))
+u = gates.batch_fix_route(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_b), current_batch="B1", gauntlet_blockers=["x"], finding_routes=[],
+                                     batch_state=v["batch_state"]))
+check("apply_answer: batch_strikeout continue with a reason -> the dispatched batch round's fix items carry the owner's reason",
+      u.get("pending_fixes") and all(any("the flaky fixture is fixed now" in i for i in f["items"]) for f in u["pending_fixes"]),
+      u.get("pending_fixes"))
 check("apply_answer: ci_exhausted continue -> a coder fix round for the owning task back to CI, the check one strike before it asks again",
       cc_["ci_exhausted"]["_next"] == "fix_round" and fr_["ci_exhausted"].get("task") == T1 and fr_["ci_exhausted"].get("return_to") == "ci"
       and _lib.as_dict(_lib.as_dict(cc_["ci_exhausted"].get("ci_fix_strikes")).get("99")).get("test") == STRIKE_LIMIT,
@@ -4842,6 +4855,29 @@ with open(os.path.join(HEAL_DIR, "tasks.json"), "wb") as _f:
 rc, u, err = entry("harvest_report", heal_base(tasks="garbage", code_repo_path=None))
 check("entry harvest_report: state.json and tasks.json not UTF-8 -> no crash, the gate runs or raises state_fault",
       rc == 0 and (u.get("_next") == "design_ask_gate" or (u.get("escalation") or {}).get("kind") == "state_fault"), f"rc={rc} {err}")
+heal_disk()
+os.remove(os.path.join(HEAL_DIR, "tasks.json"))
+EMPTY_TASKS = os.path.join(TMP, "no-task-files")
+os.makedirs(EMPTY_TASKS, exist_ok=True)
+guarded("run: tasks=123 with no tasks.json and no task files -> select_tasks raises state_fault naming tasks, never the Phase F close-out",
+        lambda: (lambda u: (u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault" and "tasks" in u["escalation"]["question"]
+                            and "tasks" not in u, (u.get("_next"), (u.get("escalation") or {}).get("question"))))(
+            run_gate("select_tasks", heal_base(tasks=123, tasks_root=EMPTY_TASKS))))
+guarded("run: tasks=123 with nothing to heal from -> an escalation gate still runs, so the owner can answer",
+        lambda: (lambda u: (u.get("_next") == "end_aborted", u.get("_next")))(
+            run_gate("apply_answer", heal_base(tasks=123, tasks_root=EMPTY_TASKS, last_answer="Abort the run",
+                                               escalation=escalation("state_fault", "q", [option(SF_RETRY), option(SF_RESUME), option("Abort the run")],
+                                                                     data={"gate": "select_tasks"})))))
+write(os.path.join(HEAL_DIR, "state.json"), json.dumps({"run_id": HEAL_RUN, "run_dir": HEAL_DIR, "phase": "task saved"}))
+guarded("run: code_repo_path=5 with nothing to heal from -> a git-using gate raises state_fault before it runs, never git in the current directory",
+        lambda: (lambda u: (u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "state_fault"
+                            and "code_repo_path" in u["escalation"]["question"] and "code_repo_path" not in u, u))(
+            run_gate("integration_test", heal_base(code_repo_path=5, project_dir="relative/dir"), lambda s: {"_next": "the gate ran"})))
+heal_disk()
+_s = heal_base()
+_s.pop("current_task")
+guarded("run: a gate that acts on no task, with current_task missing and none saved -> its state_fault does not name current_task",
+        lambda: (lambda q: ("current_task" not in q, q))(run_gate("harvest_report", _s, boom)["escalation"]["question"]))
 
 # ---------------------------------------------------------------- task branch cleanup only after a verified merge
 RB = "feat/PLAN-widgets"
@@ -4907,6 +4943,17 @@ write(os.path.join(wt_x, "scratch.txt"), "uncommitted\n")
 u = cleanup_task(wt_x, "cl-failed", status="failed")
 check("wave_cleanup: a failed task's dirty worktree -> force-removed, branch kept locally and on origin",
       not os.path.isdir(wt_x) and local("cl-failed") and on_origin("cl-failed"), u["decisions"])
+wt_x, sha_x = task_branch("cl-remote", merge=True)
+write(os.path.join(wt_x, "remote-only.txt"), "pushed from elsewhere\n")
+git(wt_x, "add", ".")
+git(wt_x, "commit", "-q", "-m", "remote-only commit")
+git(CODE, "push", "-q", "origin", "cl-remote")
+git(wt_x, "reset", "-q", "--hard", sha_x)
+remote_head = git(CODE, "ls-remote", "--heads", "origin", "cl-remote").split()[0]
+u = cleanup_task(wt_x, "cl-remote", integrated_sha=sha_x)
+check("wave_cleanup: origin holds a commit the local branch lacks -> local branch deleted, remote kept at its head, the refusal ledgered",
+      not local("cl-remote") and on_origin("cl-remote") and git(CODE, "ls-remote", "--heads", "origin", "cl-remote").split()[0] == remote_head
+      and any("cl-remote" in d and "remote kept" in d for d in u["decisions"]), u["decisions"])
 
 wt_x, sha_x = task_branch("int-green")
 ts_i = copy.deepcopy(TS_W)
@@ -4922,6 +4969,61 @@ check("integration_test: checkout of the run branch fails -> escalation, nothing
       u.get("_next") == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "integration_checkout"
       and git(CODE, "rev-parse", "HEAD") == head0
       and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", "int-checkout", "HEAD"]).returncode != 0, u.get("_next"))
+_esc = u.get("escalation") or {}
+_spent = (gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch="no-such-run-branch", task_rounds={},
+                                            cap_continues={f"integration_checkout:{T1}": STRIKE_LIMIT})).get("escalation") or {})
+check("integration_test: a failed checkout offers the retry first and recommended; after the cap's continues none is, with the cap-spent note",
+      [(o["text"], o["recommended"]) for o in _esc.get("options", [])] == [("Retry the integration", True), ("Stop and report", False)]
+      and not any(o["recommended"] for o in _spent.get("options", [])) and gates.CAP_SPENT_NOTE in _spent.get("question", ""),
+      (_esc.get("options"), _spent.get("options")))
+u = AA("integration_checkout", "1", esc=_esc, tasks=ts_i, current_task=T1, cap_continues={})
+check("apply_answer: integration_checkout retry -> integration_test, one continue counted on the task's checkout cap",
+      u.get("_next") == "integration_test" and _lib.as_dict(u.get("cap_continues")).get(f"integration_checkout:{T1}") == 1, u)
+
+
+def integrate_red_then_fixed(name, between):
+    """A merge whose suite is RED, `between` run on the repo, a fix commit on the task branch, then integration_test again
+    on green; (the run branch before the merge, the RED merge, the fixed head, the green update)."""
+    wt, _ = task_branch(name)
+    ts = copy.deepcopy(TS_W)
+    gates.task_by_id(ts, T1).update({"status": "in-progress", "worktree": wt, "branch": name})
+    git(CODE, "checkout", "-q", RB)
+    before = git(CODE, "rev-parse", RB)
+    red = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts, integration_task=T1, run_branch=RB, task_rounds={},
+                                            verification_commands='["false"]'))
+    rounds = red["task_rounds"]
+    merge = rounds[T1].get("merge_sha", "")
+    rounds[T1]["merged"] = False
+    between()
+    write(os.path.join(wt, f"{name}-fix.txt"), "fixed\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-q", "-m", f"fix: {name}")
+    green = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts, integration_task=T1, run_branch=RB, task_rounds=rounds,
+                                              verification_commands='["true"]'))
+    return before, merge, git(CODE, "rev-parse", name), green
+
+
+before_, merge_, fixed_, u = integrate_red_then_fixed("int-redo", lambda: None)
+check("integration_test: RED after the merge, a fix round, then green -> the unpushed merge undone once, the fixed branch merged once",
+      u.get("_next") == "harvest_report" and git(CODE, "rev-parse", f"{RB}^1") == before_ and git(CODE, "rev-parse", f"{RB}^2") == fixed_
+      and git(CODE, "rev-list", "--count", "--merges", f"{before_}..{RB}") == "1"
+      and sum("unpushed merge" in d and "undone" in d for d in u.get("decisions", [])) == 1, u.get("decisions"))
+
+
+def _commit_on_run_branch():
+    write(os.path.join(CODE, "moved.txt"), "moved\n")
+    git(CODE, "add", "moved.txt")
+    git(CODE, "commit", "-q", "-m", "a commit on top of the merge")
+
+
+before_, merge_, fixed_, u = integrate_red_then_fixed("int-moved", _commit_on_run_branch)
+check("integration_test: HEAD moved past the RED merge -> no reset, the earlier merge stays on the run branch",
+      bool(merge_) and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", merge_, RB]).returncode == 0
+      and not any("unpushed merge" in d for d in u.get("decisions", [])), u.get("decisions"))
+before_, merge_, fixed_, u = integrate_red_then_fixed("int-pushed", lambda: git(CODE, "push", "-q", "origin", RB))
+check("integration_test: the RED merge already on origin -> no reset, the earlier merge stays on the run branch",
+      bool(merge_) and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", merge_, RB]).returncode == 0
+      and not any("unpushed merge" in d for d in u.get("decisions", [])), u.get("decisions"))
 
 
 def finish_fix_round(s):
@@ -4998,6 +5100,23 @@ check("apply_answer: ci_inconclusive reply naming no option -> asked again",
 u = AA("ci_no_checks", CI_NO_CI, esc=ESC_NONE, pr_number="99", tasks=ts_f, ci_status="no_checks")
 check("apply_answer: ci_no_checks finish without CI -> flip_ready with a follow-up, never CI green",
       u.get("_next") == "flip_ready" and any("no CI checks" in f for f in u.get("follow_ups", [])) and u.get("ci_status") != "green", u)
+check("apply_answer: a whole-reply stop or abort on ci_inconclusive or ci_no_checks -> the leave path, as on ci_exhausted",
+      [AA(k, r, esc=e, pr_number="99", tasks=ts_f, ci_status=s)["_next"]
+       for k, e, s in (("ci_inconclusive", ESC_INC, "inconclusive"), ("ci_no_checks", ESC_NONE, "no_checks")) for r in ("stop", "abort")]
+      == ["finish_plan"] * 4)
+u = gates.ci_route(base_state(pr_number="99", ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["e2e", "cancel", "https://ci.example/job/7"]]))
+ESC_NOID = u.get("escalation") or {}
+check("ci_route: a cancelled check with no /actions/runs/<id> link -> the re-run is not recommended, leaving is",
+      [o["text"] for o in ESC_NOID.get("options", []) if o.get("recommended")] == ["Leave the PR in draft and report"], ESC_NOID.get("options"))
+u = AA("ci_inconclusive", CI_RERUN_CANCELLED, esc=ESC_NOID, pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: a re-run that finds no re-runnable run id -> ledgered as such, the watch still restarts",
+      u.get("_next") == "ci_poll" and any("no re-runnable run found" in d for d in u.get("decisions", [])), u.get("decisions"))
+os.environ["ARCHITECT_GH_CHECKS_CMD"] = "echo \"no checks reported on the 'feat/x' branch\" >&2; exit 1"
+u0 = gates.ci_poll(base_state(pr_number="99", ci_polls=0))
+u1 = gates.ci_poll(base_state(pr_number="99", ci_polls=1))
+check("ci_poll: gh exits non-zero with 'no checks reported on the' -> polled again on the first read, then no_checks",
+      (u0.get("ci_status"), u0["_next"], u1.get("ci_status"), u1["_next"]) == ("pending", "ci_poll", "no_checks", "ci_route")
+      and not u1.get("ci_poll_fails"), (u0, u1))
 os.environ["ARCHITECT_GH_READY_CMD"] = "true"
 os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo true"
 u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
