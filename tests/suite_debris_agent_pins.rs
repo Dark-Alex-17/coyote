@@ -483,70 +483,51 @@ fn every_banned_glyph_sentence_names_every_glyph_family_the_debris_lint_reports(
 }
 
 #[test]
-/// The debt-marker regex has ONE home: `MARKER_RE` in the shared `debt_scan.py`.
-/// Its two fallback copies - the manual pipeline the scanner quotes on
-/// `DEBT_SCAN_FAILED` and the step-runner graph's initial-state default (what
-/// the sweep node sees when the scan node crashes and the engine takes its
-/// `fallback:` edge to the sweep) - must carry the same
-/// alternation after their own escaping is undone, no prompt may keep a third
-/// copy, and every `DEBT_MARKERS` entry of the debris lint must be matched.
-fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_markers() {
-    const ALTERNATION: &str = r"(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)";
-    const GREP_TAIL: &str =
-        r"grep -nE '^\+.*(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)'";
+/// The debt-marker table has ONE home: the shared `debt_markers.py`, imported
+/// by both `debt_scan.py` and the debris lint. The manual pipeline the scanner
+/// quotes on `DEBT_SCAN_FAILED` is generated from it, and its python3-less
+/// copies (the Sisyphus tool's heredoc and the graphs' initial-state
+/// defaults, what the sweep node sees when the scan node crashes and the
+/// engine takes its `fallback:` edge) must carry it byte for byte after their
+/// own escaping is undone; no prompt may keep another copy.
+fn debt_grep_regex_has_one_home_in_debt_markers_and_its_fallbacks_match() {
+    const GREP_TAIL: &str = r#"grep -nE '^\+(.*(#!?\[(allow|expect)\(|cfg_attr\(|(@|\[)Suppress|#\[ignore|@([A-Za-z_]+\.)*(skip|[sS][kK][iI][pP][iI][fF]|skipUnless|xfail|Skip|Ignore|Disabled)([^A-Za-z0-9_]|$)|importorskip\(|\[Ignore|Skip *= *"|(todo|unimplemented)!|NotImplemented(Error|Exception)|panic\("(TODO|not implemented|unimplemented)|(//|#|-- |;|/\*|\*|<!--|%|'\''|REM ) *(@?no(lint|qa|sec|check|inspection)|NOLINT(NEXTLINE|BEGIN|END)?([^A-Za-z0-9_]|$)|@?[A-Za-z_]+-(disable|ignore|nocheck|expect-error)($|[-=,:[]| +($|[a-z@#/*-]))|@?[A-Za-z_]+: ?(disable|ignore|nocheck)($|[-=,[]| +[#A-Z])|[A-Za-z_]+ disable=|pragma[: ]+(warning +disable|no ?cover)|pragma +(GCC|clang) +diagnostic +(ignored|push)|(TODO|FIXME|XXX|HACK)([^A-Za-z0-9_]|$)))|(.*[^A-Za-z0-9_.])?((t|b|it|test|describe|context|suite|self|[a-z]*test)\.(skip|Skip|Skipf|SkipNow|skipTest|xfail|todo)\(|x(it|describe|test|context)\(|TODO\())'"#;
 
-    let scanner = agent_file(".shared/debt_scan.py");
-    let marker_re = scanner
-        .split("MARKER_RE = re.compile(r\"")
-        .nth(1)
-        .and_then(|rest| rest.split("\")").next())
-        .expect("debt_scan.py compiles MARKER_RE from a raw string");
-    assert_eq!(marker_re, ALTERNATION, "MARKER_RE drifted");
+    for (rel, import) in [
+        (".shared/debt_scan.py", "from debt_markers import "),
+        (
+            ".shared/debris.py",
+            "from debt_markers import MARKER_RE as DEBT_MARKER_RE",
+        ),
+    ] {
+        assert!(
+            agent_file(rel).contains(import),
+            "{rel} must import the shared marker table"
+        );
+    }
+    assert!(
+        !agent_file(".shared/debris.py").contains("DEBT_MARKERS = ("),
+        "the debris lint must not keep its own marker list"
+    );
 
-    // The quoted manual pipeline is a tuple of adjacent normal Python string
-    // literals: join the quoted segments, then `\\` in source is `\`.
-    let pipeline: String = scanner
-        .split("MANUAL_PIPELINE = (")
-        .nth(1)
-        .and_then(|rest| rest.split("\n)\n").next())
-        .expect("debt_scan.py defines MANUAL_PIPELINE")
-        .split('"')
-        .enumerate()
-        .filter_map(|(i, seg)| (i % 2 == 1).then_some(seg))
-        .collect::<String>()
-        .replace("\\\\", "\\");
-    assert!(
-        pipeline.contains(GREP_TAIL),
-        "the quoted manual pipeline lost the grep: {pipeline}"
-    );
-    assert!(
-        pipeline.contains("ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- ")
-            && pipeline.contains(
-                "git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | "
-            ),
-        "the quoted manual pipeline lost its add -N feed or diff flags: {pipeline}"
-    );
     // The python3-less fallback in the Sisyphus tool is a quoted heredoc, so
-    // it carries the pipeline byte for byte.
+    // it carries the shell-quoted grep byte for byte.
     let tool = sisyphus_debt_scan_tool();
     assert_eq!(
-        tool.matches(pipeline.as_str()).count(),
+        tool.matches(GREP_TAIL).count(),
         1,
-        "the sisyphus debt_scan python3-less fallback must quote MANUAL_PIPELINE exactly once: {tool}"
+        "the sisyphus debt_scan python3-less fallback must carry the grep exactly once: {tool}"
     );
-
     // The graph defaults are YAML single-quoted scalars: `''` in source is `'`.
-    for rel in ["step-runner/graph.yaml", "sisyphus-next/graph.yaml"] {
-        let graph = agent_file(rel).replace("''", "'");
+    let graphs: Vec<(&str, String)> = ["step-runner/graph.yaml", "sisyphus-next/graph.yaml"]
+        .into_iter()
+        .map(|rel| (rel, agent_file(rel).replace("''", "'")))
+        .collect();
+    for (rel, graph) in &graphs {
         assert_eq!(
             graph.matches(GREP_TAIL).count(),
             1,
             "{rel} must carry the fallback grep exactly once (the initial-state default)"
-        );
-        assert_eq!(
-            graph.matches(pipeline.as_str()).count(),
-            1,
-            "{rel}: the debt_hits default must quote MANUAL_PIPELINE exactly once"
         );
     }
     assert!(
@@ -554,25 +535,95 @@ fn debt_grep_regex_has_one_home_in_debt_scan_and_its_fallbacks_match_the_debris_
         "sisyphus prose must not keep its own copy of the debt grep - the tool owns it"
     );
 
-    let shared = agent_file(".shared/debris.py");
-    let markers = shared
-        .split("DEBT_MARKERS = (")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .expect("debris.py defines DEBT_MARKERS");
-    for marker in [
-        "#[allow(",
-        "#![allow(",
-        "#[expect(",
-        "#![expect(",
-        "cfg_attr(",
-        "todo!",
-        "unimplemented!",
-        "#[ignore",
-    ] {
-        assert!(
-            markers.contains(&format!("\"{marker}\"")),
-            "DEBT_MARKERS lost {marker:?}: {markers}"
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available, MANUAL_PIPELINE unchecked");
+        return;
+    }
+    let out = Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg("import sys; sys.path.insert(0, sys.argv[1]); import debt_scan; print(debt_scan.MANUAL_PIPELINE)")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared"))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let pipeline = String::from_utf8_lossy(&out.stdout).trim_end().to_string();
+    assert!(
+        pipeline.ends_with(GREP_TAIL),
+        "MANUAL_PIPELINE must end on the pinned grep, generated from the table: {pipeline}"
+    );
+    assert!(
+        pipeline.contains("ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- ")
+            && pipeline.contains(
+                "git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | "
+            ),
+        "the manual pipeline lost its add -N feed or diff flags: {pipeline}"
+    );
+    assert_eq!(
+        tool.matches(pipeline.as_str()).count(),
+        1,
+        "the sisyphus debt_scan python3-less fallback must quote MANUAL_PIPELINE exactly once: {tool}"
+    );
+    for (rel, graph) in &graphs {
+        assert_eq!(
+            graph.matches(pipeline.as_str()).count(),
+            1,
+            "{rel}: the debt_hits default must quote MANUAL_PIPELINE exactly once"
+        );
+    }
+}
+
+/// The debris lint spares a task id beside a debt marker of any language
+/// (the shared table), and still reports one beside a `.expect(` call or an
+/// `allow(` in prose.
+#[test]
+fn debris_spares_a_task_id_beside_non_rust_debt_markers_only() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let spared = [
+        "//nolint:errcheck // TASK-12",
+        "# noqa: E501  # TASK-12",
+        "# type: ignore  # TASK-12",
+        "// eslint-disable-next-line no-console -- TASK-12",
+        "# TODO TASK-12 drop the retry",
+    ];
+    let reported = [
+        "// TASK-12 beside .expect(\"msg\") is not spared",
+        "# TASK-12 we allow( it in prose",
+        "// TASK-12 with no marker",
+    ];
+    let lines: Vec<&str> = spared.iter().chain(reported.iter()).copied().collect();
+    let out = Command::new("python3")
+        .arg("-B")
+        .arg("-c")
+        .arg(
+            "import json, sys; sys.path.insert(0, sys.argv[1]); import debris; \
+             print(json.dumps([debris.vocab_hits(t) for t in sys.argv[2:]]))",
+        )
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/agents/.shared"))
+        .args(&lines)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("spawn python3");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let hits: Vec<Vec<String>> = serde_json::from_slice(&out.stdout).unwrap();
+    for (line, found) in lines.iter().zip(&hits) {
+        let is_spared = spared.contains(line);
+        assert_eq!(
+            found.is_empty(),
+            is_spared,
+            "{line:?}: spared={is_spared}, hits={found:?}"
         );
     }
 }
@@ -1189,8 +1240,9 @@ fn debt_scan_cli_flags_win_over_an_inherited_graph_state() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(
-        text.starts_with(&format!("Debt scan (diff base: {base}): 1 hit(s)\n"))
-            && text.contains("src/new.rs:1 -- todo!()"),
+        text.starts_with(&format!(
+            "Debt scan (diff base: {base}): 1 hit(s) [scanned: "
+        )) && text.contains("src/new.rs:1 -- todo!()"),
         "plain-text report for the flagged repo, not a JSON envelope: {text}"
     );
 }
@@ -1614,8 +1666,8 @@ fn usage_probe_architect_plans_rel_recipe_and_anchored_sweeps_hold_on_a_scratch_
 /// feed into `git add -N` must make every untracked file the coder created
 /// part of `git diff <base>` whether or not the coder listed it (without it
 /// the sweep reads nothing new), a `.gitignore`d artefact must stay unseen,
-/// the regex must match every marker in the shared lint's DEBT_MARKERS and
-/// no clean line, `-n` must number the diff stream, a clean step must print
+/// the regex must match every Rust attribute and macro marker and no clean
+/// line, `-n` must number the diff stream, a clean step must print
 /// nothing and exit 1 (grep's no-match exit is the no-debt result), and the
 /// Sisyphus twin must read the same hits from the same tree.
 #[cfg(unix)]
@@ -1632,20 +1684,18 @@ fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_rep
     let _guard = ScratchDir(root.clone());
     fs::create_dir_all(&root).unwrap();
 
-    let markers: Vec<String> = agent_file(".shared/debris.py")
-        .split("DEBT_MARKERS = (")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .expect("debris.py defines DEBT_MARKERS")
-        .split(',')
-        .filter_map(|m| {
-            m.trim()
-                .strip_prefix('"')?
-                .strip_suffix('"')
-                .map(str::to_string)
-        })
-        .collect();
-    assert_eq!(markers.len(), 8, "{markers:?}");
+    let markers: Vec<String> = [
+        "#[allow(",
+        "#![allow(",
+        "#[expect(",
+        "#![expect(",
+        "cfg_attr(",
+        "todo!",
+        "unimplemented!",
+        "#[ignore",
+    ]
+    .map(String::from)
+    .to_vec();
 
     // Both sweep twins call the same shared scanner: the step-runner graph
     // through its script node (a shim over the shared module), Sisyphus
@@ -1680,7 +1730,7 @@ fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_rep
     // --- a step that created three files and edited a tracked one ---
     let (repo, base) = make_repo("hits");
     fs::write(repo.join("src/new.rs"), "#[allow(dead_code)]\nfn a() {}\n").unwrap();
-    // One line per DEBT_MARKERS entry. `cfg_attr(` is debt only when it carries
+    // One line per marker. `cfg_attr(` is debt only when it carries
     // allow/expect, so its planted line is the predicate form; a BARE one goes
     // in as the final line and must NOT be a hit.
     let planted: Vec<String> = markers
@@ -1722,7 +1772,7 @@ fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_rep
         assert!(
             hits.iter()
                 .any(|h| *h == format!("src/more.rs:{} -- {line}", i + 1)),
-            "DEBT_MARKERS entry {line:?} is not matched by the scanner at its real line: {text}"
+            "marker line {line:?} is not matched by the scanner at its real line: {text}"
         );
     }
     assert!(
@@ -1807,7 +1857,10 @@ fn usage_probe_step_runner_debt_scan_reads_the_coders_new_files_on_a_scratch_rep
     assert_eq!(code, Some(0), "{text}");
     assert_eq!(
         text.trim(),
-        format!("Debt scan (diff base: {clean_base}): no hits (clean)"),
+        format!(
+            "Debt scan (diff base: {clean_base}): no hits (clean) [scanned: lint/type suppression, \
+             test skip/ignore, unimplemented/todo stubs, TODO/FIXME comments]"
+        ),
         "the clean sentinel is the whole report: {text}"
     );
 }
@@ -1924,7 +1977,7 @@ fn usage_probe_step_runner_debt_scan_edges_new_dirs_odd_names_no_new_files_and_i
     let (code, text, _) = sweep(&repo, &base);
     assert_eq!(code, Some(0), "{text}");
     assert!(
-        text.trim().ends_with("no hits (clean)"),
+        text.contains("no hits (clean) [scanned: "),
         "ignored artefacts are not debt: {text}"
     );
     let status = git(&repo, &["status", "--porcelain", "--ignored"]);
