@@ -12,7 +12,8 @@ fi
 # self_review died (iteration cap, API failure) and the engine took its
 # fallback edge, so design_notes is still the empty seed. The implementer's
 # `Design: ASK -- <question>` lines live in design_trail; carry them, label
-# stripped, so end_success still renders `Design: ASK -- <question>`.
+# stripped, so end_success still renders `Design: ASK -- <question>`. Earlier
+# review notes are indented under the Review: line so none reads as a field.
 printf '%s' "$state" | jq -c '
   def trimmed: sub("^\\s+"; "") | sub("\\s+$"; "");
   {
@@ -24,5 +25,9 @@ printf '%s' "$state" | jq -c '
       | join("\n")
     ),
     "review_notes": ("self-review did not run; " + ((.review_notes // "") | tostring)),
+    "review_verdict": (
+      "NOT RUN: self-review ended without a verdict (iteration cap, timeout or provider failure); the diff was not self-reviewed"
+      + ((.review_notes // "") | tostring
+         | if . == "" then "" else "\n  Earlier review notes:\n" + (split("\n") | map("  " + .) | join("\n")) end)),
     "_next": "end_success"
   }'

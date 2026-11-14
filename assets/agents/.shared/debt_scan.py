@@ -3,13 +3,17 @@
 
 Replaces the hand-run pipeline both sisyphus (instructions "Debt and
 decisions after a coder returns") and step-runner (edge_case_sweep step 5)
-previously asked the MODEL to execute and post-process:
+previously asked the MODEL to execute and post-process (`MANUAL_PIPELINE`
+below, its grep generated from the shared marker table):
 
     git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- \
       && git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- \
-      | grep -nE '^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'
+      | grep -nE '<debt_markers.GREP_PATTERN>'
 
-Improvements over the LLM procedure, with identical match semantics:
+The marker families (lint/type suppression, test skip/ignore, stub and todo
+macros, TODO/FIXME-style comments after any common comment leader) live in
+debt_markers.py, shared with the debris lint. Improvements over the LLM
+procedure, with identical match semantics:
 - real `<file>:<line>` positions come from the diff hunk headers directly -
   no per-hit fs_grep resolution round-trips, no regex-escaping hazards;
 - the "bare cfg_attr( without allow|expect is not debt" rule is applied
@@ -45,11 +49,15 @@ import re
 import subprocess
 import sys
 
-MARKER_RE = re.compile(r"(#!?\[(allow|expect)\(|cfg_attr\(|todo!|unimplemented!|#\[ignore)")
+# The shims run this file through runpy, so the shared table is found next to
+# this file rather than through the caller's sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from debt_markers import FAMILY_NAMES, GREP_PATTERN, MARKER_RE  # noqa: E402
+
 MANUAL_PIPELINE = (
     "git ls-files --others --exclude-standard -z | xargs -0 -r git add -N -- "
     "&& git diff --no-color --no-ext-diff --no-textconv --no-relative <base> -- | grep -nE "
-    "'^\\+.*(#!?\\[(allow|expect)\\(|cfg_attr\\(|todo!|unimplemented!|#\\[ignore)'"
+    "'" + GREP_PATTERN.replace("'", "'\\''") + "'"
 )
 # Per git call; three calls run back to back, so the sum stays inside the
 # graph node's own budget instead of equalling it.
@@ -70,8 +78,7 @@ DIFF_FLAGS = [
 # Only `git diff` with no revision prints these during an unresolved merge;
 # their multi-parent hunks do not number lines the way the parser counts them.
 COMBINED_MARKERS = ("diff --cc ", "diff --combined ", "@@@")
-# Twin of debris.py's helpers (this script runs via runpy from shims, so it
-# cannot import debris.py); a test keeps the two copies identical.
+# Twin of debris.py's helpers; a test keeps the two copies identical.
 C_ESCAPE_RE = re.compile(r'\\([0-3][0-7]{2}|[abtnvfr"\\])')
 C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]")
@@ -110,7 +117,7 @@ def is_debt(text):
     # A bare cfg_attr( carrying neither allow nor expect is not debt, but it
     # must not hide a later marker on the same line.
     for m in MARKER_RE.finditer(text):
-        if m.group(1) != "cfg_attr(" or re.search(r"(allow|expect)\(", text):
+        if not m.group(1).startswith("cfg_attr(") or re.search(r"(allow|expect)\(", text):
             return True
     return False
 
@@ -184,9 +191,10 @@ def scan(project_dir, base):
 
     hits = parse_diff(text_of(diff.stdout))
     header = f"Debt scan (diff base: {base}): "
+    scanned = f" [scanned: {', '.join(FAMILY_NAMES)}]"
     if hits:
-        return header + f"{len(hits)} hit(s)\n" + "\n".join(hits)
-    return header + "no hits (clean)"
+        return header + f"{len(hits)} hit(s){scanned}\n" + "\n".join(hits)
+    return header + "no hits (clean)" + scanned
 
 
 def parse_args(args):

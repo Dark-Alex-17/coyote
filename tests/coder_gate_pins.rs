@@ -11,8 +11,10 @@
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -108,13 +110,58 @@ fn project(dir: &Path, name: &str) {
     fs::write(dir.join("where.txt"), name).unwrap();
 }
 
-fn git_init(dir: &Path) {
-    let status = Command::new("git")
-        .args(["init", "-q"])
+/// Runs git in `dir` without the host's system or global config, so a
+/// fixture commit has an author and never tries to sign.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "user.name=coder-gates",
+            "-c",
+            "user.email=coder-gates@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
         .current_dir(dir)
-        .status()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("HOME", dir)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
         .expect("spawn git");
-    assert!(status.success(), "git init in {}", dir.display());
+    assert!(
+        output.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_init(dir: &Path) {
+    git(dir, &["init", "-q"]);
+}
+
+/// Commits everything under work tree `dir`, with the state and transcript
+/// files run_script and run_transcript write ignored, so the tree stays
+/// clean for baseline_tests.
+fn commit_all(dir: &Path) {
+    fs::write(dir.join(".gitignore"), "state-*.json\ntranscript-*.txt\n").unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "fixture"]);
+}
+
+/// A `project` that is also a git work tree with everything committed, which
+/// is the only kind of tree baseline_tests runs the suite in.
+fn committed_project(dir: &Path, name: &str) {
+    project(dir, name);
+    git_init(dir);
+    commit_all(dir);
 }
 
 fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Value {
@@ -124,6 +171,11 @@ fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Va
     cmd.arg(asset(rel))
         .current_dir(dir)
         .env("GRAPH_STATE_FILE", &state_file)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .env_remove("GRAPH_STATE")
         .env_remove("CODER_AUTOAPPROVE")
         .env_remove("COYOTE_GATE_OUTPUT_MAX_BYTES")
@@ -262,7 +314,10 @@ fn verify_gates_run_in_the_planned_work_tree_when_project_dir_defaulted() {
     project(&orch, "in-orchestrator");
     project(&tree, "in-worktree");
     project(&sub, "in-subdir");
+    git_init(&orch);
+    commit_all(&orch);
     git_init(&tree);
+    commit_all(&tree);
     let planned = tree.join("src/not/created/yet.rs");
     let planned = planned.to_string_lossy();
 
@@ -317,6 +372,7 @@ fn verify_gates_resolve_planned_paths_and_project_dir_before_comparing() {
     project(&tree, "in-worktree");
     project(&tree.join("crates/inner"), "in-subdir");
     git_init(&tree);
+    commit_all(&tree);
 
     let bin = root.0.join("bin");
     fs::create_dir_all(&bin).unwrap();
@@ -390,7 +446,7 @@ fn verify_tests_runs_the_test_command_variable_first() {
         return;
     }
     let dir = temp_dir("test-command");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let state = serde_json::json!({ "project_dir": dir.0.to_string_lossy() });
     let out = run_script(
         "coder/scripts/verify_tests.sh",
@@ -429,7 +485,7 @@ fn verify_gates_report_a_deadline_kill_apart_from_a_red_run() {
         return;
     }
     let dir = temp_dir("deadline");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let state = serde_json::json!({ "project_dir": dir.0.to_string_lossy() });
     let late = dir.0.join("late.txt");
     let cmd = "sh -c 'sleep 4; echo late > late.txt'; echo after > late.txt";
@@ -643,10 +699,14 @@ const BASELINE_KEYS: [&str; 6] = [
     "baseline_status",
 ];
 
-/// Runs `rel` with a TEST_CMD that prints `transcript` and exits `rc`.
+/// Runs `rel` with a TEST_CMD that prints `transcript` and exits `rc`. Each
+/// call reads its own file, so the command differs per call and a baseline
+/// stored for an earlier transcript is never reused for a later one.
 fn run_transcript(rel: &str, dir: &Path, state: &Value, transcript: &str, rc: i32) -> Value {
-    fs::write(dir.join("transcript.txt"), transcript).unwrap();
-    let cmd = format!("cat transcript.txt; exit {rc}");
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let name = format!("transcript-{}.txt", CALLS.fetch_add(1, Ordering::Relaxed));
+    fs::write(dir.join(&name), transcript).unwrap();
+    let cmd = format!("cat {name}; exit {rc}");
     run_script(rel, dir, state, &[("TEST_CMD", cmd.as_str())])
 }
 
@@ -749,7 +809,7 @@ fn baseline_tests_records_the_failing_test_ids_per_runner() {
         return;
     }
     let dir = temp_dir("baseline-ids");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let jest = "\u{25cf}";
     let sep = "\u{203a}";
     let cases: Vec<(&str, String, Vec<&str>)> = vec![
@@ -873,14 +933,14 @@ fn baseline_tests_records_the_failing_test_ids_per_runner() {
 }
 
 /// A green baseline records no failures; a baseline killed at test_timeout
-/// records none either and still hands over to implement.
+/// records none either, is not stored, and still hands over to implement.
 #[test]
 fn baseline_tests_records_green_and_timed_out_runs_without_failures() {
     if tools_missing() {
         return;
     }
     let dir = temp_dir("baseline-green");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let out = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), "ok\n", 0);
     assert_baseline_shape(&out);
     assert_eq!(str_field(&out, "baseline_status"), "green", "{out}");
@@ -900,6 +960,11 @@ fn baseline_tests_records_green_and_timed_out_runs_without_failures() {
     assert_baseline_shape(&out);
     assert_eq!(str_field(&out, "baseline_status"), "timed_out", "{out}");
     assert!(baseline_ids(&out).is_empty(), "{out}");
+    assert_eq!(
+        stored_records(&dir.0).len(),
+        1,
+        "only the green run is stored"
+    );
 }
 
 /// Failures that are a subset of the baseline at the baseline's exit code
@@ -961,7 +1026,7 @@ fn verify_tests_matches_unidentified_failures_by_their_hash() {
         return;
     }
     let dir = temp_dir("verify-hash");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let before = "compiling\nerror: linker failed at 0x7ffd1234 after 0.52s\nsomething else\n";
     let base = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), before, 1);
     assert_eq!(str_field(&base, "baseline_status"), "red", "{base}");
@@ -1191,7 +1256,7 @@ fn coder_graph_runs_the_baseline_once_before_implement() {
         nodes["end_success"]["output"]
             .as_str()
             .unwrap()
-            .contains("Tests: passed{{baseline_report}}\nDesign: ")
+            .contains("Tests: {{tests_verdict}}{{baseline_report}}\nReview: ")
     );
     for key in [
         "baseline_status",
@@ -1212,9 +1277,10 @@ fn coder_graph_runs_the_baseline_once_before_implement() {
     );
 }
 
-/// Only gate_approval (by its routes) and route_complexity (by the `_next`
-/// it prints) lead into baseline_tests, and baseline_tests declares no
-/// `next` or `routes` of its own: it runs once, before implement.
+/// Only gate_approval (by its routes), and route_complexity and
+/// parse_approval (by the `_next` they print) lead into baseline_tests, and
+/// baseline_tests declares no `next` or `routes` of its own: it runs once,
+/// before implement.
 #[test]
 fn only_the_approval_side_routes_into_the_baseline() {
     let graph = graph();
@@ -1245,32 +1311,30 @@ fn only_the_approval_side_routes_into_the_baseline() {
             scripts.push(path.file_name().unwrap().to_string_lossy().into_owned());
         }
     }
-    assert_eq!(scripts, ["route_complexity.sh"]);
+    scripts.sort_unstable();
+    assert_eq!(scripts, ["parse_approval.sh", "route_complexity.sh"]);
 
     let node = &graph["nodes"]["baseline_tests"];
     assert!(node["next"].is_null(), "baseline_tests declares a next");
     assert!(node["routes"].is_null(), "baseline_tests declares routes");
 }
 
-/// With no report the end_success output keeps its old layout; a report
-/// lands on its own lines right after `Tests: passed`.
+/// With no report the `Tests:` line is followed by the `Review:` line; a
+/// report lands on its own lines between them.
 #[test]
 fn end_success_renders_the_baseline_report_after_tests_passed() {
     let template = graph()["nodes"]["end_success"]["output"]
         .as_str()
         .unwrap()
-        .to_string();
+        .replace("{{tests_verdict}}", "passed");
     let plain = template.replace("{{baseline_report}}", "");
-    assert!(
-        plain.contains("Build: passed\nTests: passed\nDesign: "),
-        "{plain}"
-    );
+    assert!(plain.contains("\nTests: passed\nReview: "), "{plain}");
     let reported = template.replace(
         "{{baseline_report}}",
         "\nPre-existing failures: tests/a.py::one",
     );
     assert!(
-        reported.contains("Tests: passed\nPre-existing failures: tests/a.py::one\nDesign: "),
+        reported.contains("Tests: passed\nPre-existing failures: tests/a.py::one\nReview: "),
         "{reported}"
     );
 }
@@ -1349,7 +1413,7 @@ fn baseline_tests_qualifies_ids_by_target_and_file() {
         return;
     }
     let dir = temp_dir("baseline-qualified");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let jest = "\u{25cf}";
     let sep = "\u{203a}";
     let cases: Vec<(&str, String, Vec<&str>)> = vec![
@@ -1426,7 +1490,7 @@ fn baseline_tests_records_why_failures_are_unidentified() {
         return;
     }
     let dir = temp_dir("baseline-unidentified");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let short = "the runner reported 2 failures but only 1 ids were parsed";
     let cases: [(&str, &str, &str); 9] = [
         ("none", "boom error\n", "no test ids could be parsed"),
@@ -1531,7 +1595,7 @@ fn test_gates_run_cargo_test_with_no_fail_fast() {
         return;
     }
     let dir = temp_dir("no-fail-fast");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let fake = "cargo() { printf 'test %s ... FAILED\\n' \"$*\"; return 101; }; ";
     let cases: [(&str, &str, &[&str]); 6] = [
         (
@@ -1592,7 +1656,7 @@ fn test_gates_treat_cargo_stopped_at_the_first_failing_target_as_unidentified() 
         return;
     }
     let dir = temp_dir("cargo-fail-fast");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let out = run_transcript(
         BASELINE,
         &dir.0,
@@ -1652,7 +1716,11 @@ fn test_gates_without_a_test_command_run_nothing() {
         .map(String::as_str)
         .collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["_next", "tests_ok", "tests_output"], "{out}");
+    assert_eq!(
+        keys,
+        ["_next", "tests_ok", "tests_output", "tests_verdict"],
+        "{out}"
+    );
     assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
     assert_eq!(str_field(&out, "_next"), "self_review", "{out}");
     assert!(
@@ -1696,7 +1764,7 @@ fn verify_tests_never_matches_an_empty_failure_hash() {
         return;
     }
     let dir = temp_dir("verify-empty-hash");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let base = run_script(
         BASELINE,
         &dir.0,
@@ -1723,7 +1791,7 @@ fn verify_tests_fails_an_identified_run_against_an_unidentified_baseline() {
         return;
     }
     let dir = temp_dir("verify-unknown-base");
-    project(&dir.0, "here");
+    committed_project(&dir.0, "here");
     let a = "tests/test_a.py::test_one";
     let transcript = pytest_failing(&[a]);
     let base = run_transcript(BASELINE, &dir.0, &project_state(&dir.0), &transcript, 1);
@@ -1741,4 +1809,520 @@ fn verify_tests_fails_an_identified_run_against_an_unidentified_baseline() {
         "{out}"
     );
     assert!(!output.contains("New failures:"), "{out}");
+}
+
+fn baseline_store(dir: &Path) -> PathBuf {
+    dir.join(".git").join("coyote-baselines")
+}
+
+/// The baseline records stored for work tree `dir`, sorted.
+fn stored_records(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(baseline_store(dir)) else {
+        return Vec::new();
+    };
+    let mut records: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+    records.sort();
+    records
+}
+
+/// The hex sha256 of `text`, through the same tools baseline_tests uses.
+fn sha256_hex(text: &str) -> String {
+    let mut child = Command::new(bash_program().expect("bash resolved by tools_missing"))
+        .args([
+            "-c",
+            "if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn bash");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "sha256 of {text:?}");
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// A baseline taken on a clean committed tree is stored under the git dir,
+/// keyed by HEAD, directory and command, and reused as is on later runs at
+/// that commit, even once the tree holds an edit that breaks the suite. A
+/// stored record is never rewritten: a planted one wins over the suite.
+#[test]
+fn baseline_tests_reuses_the_record_stored_on_a_clean_tree() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("baseline-store");
+    committed_project(&dir.0, "here");
+    let cmd = "if [ -e broken.txt ]; then printf 'test edited ... FAILED\\n'; exit 101; fi";
+    let envs = [("TEST_CMD", cmd)];
+    let state = project_state(&dir.0);
+
+    let out = run_script(BASELINE, &dir.0, &state, &envs);
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "green", "{out}");
+
+    let head = git(&dir.0, &["rev-parse", "HEAD"]);
+    let key = sha256_hex(&format!("{head}\n.\n{cmd}"));
+    let record = baseline_store(&dir.0).join(format!("tests-{}.json", &key[..16]));
+    assert_eq!(stored_records(&dir.0), std::slice::from_ref(&record));
+    let stored: Value = serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let workdir = str_field(&stored, "workdir");
+    assert!(
+        Path::new(workdir).file_name() == dir.0.file_name(),
+        "{stored}"
+    );
+    let recorded_at = str_field(&stored, "recorded_at");
+    assert!(
+        recorded_at.len() == 20 && recorded_at.ends_with('Z'),
+        "{stored}"
+    );
+    assert_eq!(
+        stored,
+        serde_json::json!({
+            "version": 1,
+            "head": head,
+            "workdir": workdir,
+            "command": cmd,
+            "recorded_at": recorded_at,
+            "status": "green",
+            "exit_code": 0,
+            "failures": [],
+            "failure_hash": "",
+            "unidentified_reason": "",
+        })
+    );
+
+    fs::write(dir.0.join("broken.txt"), "edit").unwrap();
+    let red = run_script(VERIFY_TESTS, &dir.0, &state, &envs);
+    assert_eq!(red["tests_ok"], Value::Bool(false), "the edit fails: {red}");
+    let out = run_script(BASELINE, &dir.0, &state, &envs);
+    assert_baseline_shape(&out);
+    assert_eq!(str_field(&out, "baseline_status"), "green", "{out}");
+    assert!(baseline_ids(&out).is_empty(), "{out}");
+    let note = str_field(&out, "baseline_note");
+    assert!(
+        note.contains(&format!("recorded on HEAD {} before any edit", &head[..7])),
+        "{note}"
+    );
+    assert!(note.contains("reused"), "{note}");
+
+    let planted = serde_json::json!({
+        "version": 1,
+        "head": head,
+        "workdir": workdir,
+        "command": cmd,
+        "recorded_at": "2000-01-01T00:00:00Z",
+        "status": "red",
+        "exit_code": 101,
+        "failures": ["planted"],
+        "failure_hash": "",
+        "unidentified_reason": "",
+    })
+    .to_string();
+    fs::write(&record, &planted).unwrap();
+    fs::remove_file(dir.0.join("broken.txt")).unwrap();
+    let out = run_script(BASELINE, &dir.0, &state, &envs);
+    assert_eq!(str_field(&out, "baseline_status"), "red", "{out}");
+    assert_eq!(out["baseline_exit_code"], Value::from(101), "{out}");
+    assert_eq!(baseline_ids(&out), ["planted"], "{out}");
+    assert_eq!(fs::read_to_string(&record).unwrap(), planted);
+    assert_eq!(stored_records(&dir.0), [record]);
+}
+
+/// With no stored record, a tree that already holds changes (an untracked
+/// file is enough) gets no baseline and the suite does not run; neither
+/// does a directory outside git or a repository with no commit yet.
+#[test]
+fn baseline_tests_runs_nothing_on_a_tree_it_cannot_show_is_untouched() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-unproven");
+    let dirty = root.0.join("dirty");
+    committed_project(&dirty, "here");
+    fs::write(dirty.join("edit.txt"), "edit").unwrap();
+    let unborn = root.0.join("unborn");
+    project(&unborn, "here");
+    git_init(&unborn);
+    let plain = root.0.join("plain");
+    project(&plain, "here");
+    let head = git(&dirty, &["rev-parse", "--short=7", "HEAD"]);
+
+    let cmd = "touch marker.txt; printf 'test a ... FAILED\\n'; exit 101";
+    let legs: [(&Path, &str, String); 3] = [
+        (
+            &dirty,
+            "dirty",
+            format!(
+                "uncommitted changes at the start of this run and no baseline is stored for HEAD {head}"
+            ),
+        ),
+        (
+            &unborn,
+            "none",
+            "cannot be told from an edited one".to_string(),
+        ),
+        (
+            &plain,
+            "none",
+            "cannot be told from an edited one".to_string(),
+        ),
+    ];
+    for (dir, status, note) in legs {
+        let out = run_script(BASELINE, &root.0, &project_state(dir), &[("TEST_CMD", cmd)]);
+        assert_baseline_shape(&out);
+        assert_eq!(str_field(&out, "baseline_status"), status, "{out}");
+        assert!(baseline_ids(&out).is_empty(), "{out}");
+        assert_eq!(out["baseline_exit_code"], Value::from(0), "{out}");
+        assert!(str_field(&out, "baseline_note").contains(&note), "{out}");
+        assert!(
+            !dir.join("marker.txt").exists(),
+            "{status}: the suite ran in {}",
+            dir.display()
+        );
+        assert!(stored_records(dir).is_empty(), "{status}: stored a record");
+    }
+}
+
+/// A git status that fails prints nothing, which must not pass for a clean
+/// tree, and a stored record that cannot be read is neither trusted nor
+/// silently replaced: both get no baseline, the suite does not run, and the
+/// note says why (naming the record to delete).
+#[test]
+fn baseline_tests_trusts_neither_a_failed_status_nor_an_unreadable_record() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-unreadable");
+    let cmd = "touch marker.txt; printf 'test a ... FAILED\\n'; exit 101";
+
+    let broken_index = root.0.join("broken-index");
+    committed_project(&broken_index, "here");
+    fs::write(broken_index.join(".git").join("index"), "not an index").unwrap();
+
+    let bad_record = root.0.join("bad-record");
+    committed_project(&bad_record, "here");
+    let head = git(&bad_record, &["rev-parse", "HEAD"]);
+    let key = sha256_hex(&format!("{head}\n.\n{cmd}"))[..16].to_string();
+    fs::create_dir_all(baseline_store(&bad_record)).unwrap();
+    let record = baseline_store(&bad_record).join(format!("tests-{key}.json"));
+    fs::write(&record, "{\"version\":1,\"status\":\"re").unwrap();
+
+    for (dir, note) in [
+        (&broken_index, "git status failed".to_string()),
+        (&bad_record, format!("tests-{key}.json cannot be read")),
+    ] {
+        let out = run_script(BASELINE, &root.0, &project_state(dir), &[("TEST_CMD", cmd)]);
+        assert_baseline_shape(&out);
+        assert_eq!(str_field(&out, "baseline_status"), "none", "{out}");
+        assert!(baseline_ids(&out).is_empty(), "{out}");
+        let got = str_field(&out, "baseline_note");
+        assert!(got.contains(&note), "{note:?} not in {out}");
+        assert!(
+            !dir.join("marker.txt").exists(),
+            "the suite ran in {}",
+            dir.display()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&record).unwrap(),
+        "{\"version\":1,\"status\":\"re"
+    );
+}
+
+/// end_success reports what each check did instead of a literal pass,
+/// seeded `not run` for a run that never reached it, with the `Review:` line
+/// after `Tests:` and the Design block last.
+#[test]
+fn end_success_renders_the_gate_and_review_verdicts() {
+    let graph = graph();
+    let output = graph["nodes"]["end_success"]["output"].as_str().unwrap();
+    assert!(!output.contains("Build: passed"), "{output}");
+    assert!(!output.contains("Tests: passed"), "{output}");
+    assert!(
+        output.ends_with(
+            "\nBuild: {{build_verdict}}\nTests: {{tests_verdict}}{{baseline_report}}\nReview: {{review_verdict}}\nDesign: {{design_notes}}\n"
+        ),
+        "{output}"
+    );
+    for key in ["build_verdict", "tests_verdict", "review_verdict"] {
+        assert_eq!(
+            graph["initial_state"][key].as_str(),
+            Some("not run"),
+            "initial_state.{key}"
+        );
+    }
+}
+
+/// Each verify gate states its verdict for the report: `passed` on a green
+/// run, and NOT RUN when there is no command to run.
+#[test]
+fn verify_gates_emit_passed_and_not_run_verdicts() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("gate-verdicts");
+    project(&dir.0, "here");
+    let state = project_state(&dir.0);
+    let legs = [
+        (
+            &GATES[0],
+            "build_verdict",
+            "NOT RUN: no build/check command configured or detected",
+        ),
+        (
+            &GATES[1],
+            "tests_verdict",
+            "NOT RUN: no test command configured or detected",
+        ),
+    ];
+    for (gate, key, not_run) in legs {
+        let out = run_script(gate.rel, &dir.0, &state, &[]);
+        assert_eq!(str_field(&out, key), not_run, "{}: {out}", gate.rel);
+        let out = run_script(gate.rel, &dir.0, &state, &[(gate.cmd_env, "true")]);
+        assert_eq!(str_field(&out, key), "passed", "{}: {out}", gate.rel);
+        let out = run_script(gate.rel, &dir.0, &state, &[(gate.cmd_env, "exit 3")]);
+        assert_eq!(
+            str_field(&out, key),
+            "failed (exit 3)",
+            "{}: {out}",
+            gate.rel
+        );
+    }
+}
+
+/// A red run passed against the baseline says so in its one-line verdict,
+/// naming the accepted failures (capped like every id list), or the reason
+/// they could not be named when the output matched by hash.
+#[test]
+fn verify_tests_verdict_names_the_accepted_baseline_failures() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-verdict");
+    committed_project(&dir.0, "here");
+    let prefix = "red, matches the pre-run baseline (exit 1); accepted pre-existing failures: ";
+    let (a, b) = ("tests/test_a.py::test_one", "tests/test_b.py::test_two");
+    let state = red_baseline(&dir.0, &[a, b], 1, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[a, b]), 1);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "tests_verdict"),
+        format!("{prefix}{a}, {b}"),
+        "{out}"
+    );
+
+    let many: Vec<String> = (1..=23).map(|n| format!("tests/t.py::t{n:02}")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let state = red_baseline(&dir.0, &many, 1, "");
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&many), 1);
+    let verdict = str_field(&out, "tests_verdict");
+    assert!(
+        verdict.starts_with(prefix) && verdict.ends_with("tests/t.py::t20, (+3 more)"),
+        "{out}"
+    );
+
+    let base = run_transcript(
+        BASELINE,
+        &dir.0,
+        &project_state(&dir.0),
+        "error: linker failed at 0x7ffd1234 after 0.52s\n",
+        1,
+    );
+    let state = red_baseline(&dir.0, &[], 1, str_field(&base, "baseline_failure_hash"));
+    let out = run_transcript(
+        VERIFY_TESTS,
+        &dir.0,
+        &state,
+        "error: linker failed at 0x7ffe9999 after 1.03s\n",
+        1,
+    );
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "tests_verdict"),
+        format!("{prefix}unidentified (no test ids could be parsed)"),
+        "{out}"
+    );
+}
+
+/// self_review sees the gate verdicts and the test output, and is told that
+/// a pass resting on baseline failures is a scope call it must make, and
+/// that a test reported NOT RUN is not verified.
+#[test]
+fn self_review_sees_the_test_evidence() {
+    let graph = graph();
+    let node = &graph["nodes"]["self_review"];
+    let prompt = node["prompt"].as_str().unwrap();
+    for section in [
+        "## Build result\n{{build_verdict}}\n",
+        "## Test result\n{{tests_verdict}}{{baseline_report}}\n",
+        "## Test output\n{{tests_output}}\n",
+    ] {
+        assert!(prompt.contains(section), "missing {section:?}: {prompt}");
+    }
+    let instructions = node["instructions"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "passed only because their failures match the pre-run baseline",
+        "if any accepted failure is within what the request asked for, set review_clean=false and name it in review_notes",
+        "reported as NOT RUN was not verified",
+    ] {
+        assert!(instructions.contains(needle), "missing {needle:?}");
+    }
+}
+
+/// The review outcome reaches the report: `clean`, the notes left unresolved
+/// when the review budget ran out (verbatim), or NOT RUN with any earlier
+/// notes when the self-review died.
+#[test]
+fn review_routes_emit_the_review_verdict() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("review-verdict");
+    let route = "coder/scripts/route_review_result.sh";
+    let fault = "coder/scripts/self_review_fault.sh";
+    let notes = "x.rs:1 - y\n  z.rs:2 - w  \n";
+    let indented = "  x.rs:1 - y\n    z.rs:2 - w  \n  ";
+    let not_run = "NOT RUN: self-review ended without a verdict (iteration cap, timeout or provider failure); the diff was not self-reviewed";
+
+    let out = run_script(
+        route,
+        &dir.0,
+        &serde_json::json!({"review_clean": true}),
+        &[],
+    );
+    assert_eq!(str_field(&out, "review_verdict"), "clean", "{out}");
+    let out = run_script(route, &dir.0, &serde_json::json!({}), &[]);
+    assert_eq!(
+        str_field(&out, "review_verdict"),
+        "NOT RUN: self-review returned no verdict",
+        "{out}"
+    );
+
+    let exhausted = serde_json::json!({
+        "review_clean": false,
+        "review_notes": notes,
+        "review_attempts": 1,
+        "max_review_attempts": 1,
+    });
+    let out = run_script(route, &dir.0, &exhausted, &[]);
+    assert_eq!(str_field(&out, "_next"), "end_success", "{out}");
+    assert_eq!(
+        str_field(&out, "review_verdict"),
+        format!("unresolved notes (review budget exhausted):\n{indented}"),
+        "{out}"
+    );
+    let mut empty = exhausted.clone();
+    empty["review_notes"] = Value::from("");
+    let out = run_script(route, &dir.0, &empty, &[]);
+    assert_eq!(
+        str_field(&out, "review_verdict"),
+        "unresolved notes (review budget exhausted):\n  (no notes given)",
+        "{out}"
+    );
+
+    let out = run_script(fault, &dir.0, &serde_json::json!({"review_notes": ""}), &[]);
+    assert_eq!(str_field(&out, "review_verdict"), not_run, "{out}");
+    let out = run_script(
+        fault,
+        &dir.0,
+        &serde_json::json!({"review_notes": notes}),
+        &[],
+    );
+    assert_eq!(
+        str_field(&out, "review_verdict"),
+        format!("{not_run}\n  Earlier review notes:\n{indented}"),
+        "{out}"
+    );
+}
+
+/// An answer other than exactly yes or no goes to parse_approval, never
+/// straight to end_rejected. A crash of it fails closed, never as a
+/// rejection, and the answer and
+/// any re-ask line travel through state.
+#[test]
+fn gate_approval_sends_other_answers_to_parse_approval() {
+    let graph = graph();
+    let gate = &graph["nodes"]["gate_approval"];
+    assert_eq!(gate["on_other"].as_str(), Some("parse_approval"));
+    assert_eq!(
+        gate["state_updates"]["approval_answer"].as_str(),
+        Some("{{choice}}")
+    );
+    assert!(
+        gate["question"]
+            .as_str()
+            .unwrap()
+            .trim_end()
+            .ends_with("{{approval_reask}}")
+    );
+    let node = &graph["nodes"]["parse_approval"];
+    assert_eq!(node["type"].as_str(), Some("script"));
+    assert_eq!(node["script"].as_str(), Some("scripts/parse_approval.sh"));
+    assert_eq!(node["timeout"].as_u64(), Some(5));
+    assert_eq!(node["fallback"].as_str(), Some("end_failure"));
+    assert_eq!(graph["initial_state"]["approval_reask"].as_str(), Some(""));
+}
+
+/// parse_approval honours a reworded yes or no and asks again, saying why,
+/// on anything else, a yes with a negation in it included.
+#[test]
+fn parse_approval_routes_reworded_answers() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("parse-approval");
+    let rel = "coder/scripts/parse_approval.sh";
+    for (answer, next) in [
+        ("Yes", "baseline_tests"),
+        ("approve.", "baseline_tests"),
+        ("  yes, go ahead!  ", "baseline_tests"),
+        ("LGTM", "baseline_tests"),
+        ("ok", "baseline_tests"),
+        ("I approve the plan", "baseline_tests"),
+        ("No", "end_rejected"),
+        ("reject.", "end_rejected"),
+        ("no thanks", "end_rejected"),
+        ("maybe later", "gate_approval"),
+        ("yes, but not now", "gate_approval"),
+        ("yes, but rename the module first", "gate_approval"),
+        ("Yes, but don\u{2019}t touch it", "gate_approval"),
+        ("go back and revise the plan", "gate_approval"),
+        ("go", "gate_approval"),
+        ("No problem, go ahead", "gate_approval"),
+        ("no objections", "gate_approval"),
+        ("no wait, yes", "gate_approval"),
+        ("", "gate_approval"),
+    ] {
+        let state = serde_json::json!({ "approval_answer": answer });
+        let out = run_script(rel, &dir.0, &state, &[]);
+        assert_eq!(str_field(&out, "_next"), next, "{answer:?}: {out}");
+        let reask = str_field(&out, "approval_reask");
+        if next == "gate_approval" {
+            assert_eq!(
+                reask,
+                format!(
+                    "Your previous answer \"{}\" was not understood. Answer exactly yes or no.",
+                    answer.trim()
+                ),
+                "{out}"
+            );
+        } else {
+            assert_eq!(reask, "", "{answer:?}: {out}");
+        }
+    }
 }

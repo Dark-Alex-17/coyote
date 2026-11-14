@@ -27,6 +27,7 @@ if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "build_ok": true,
     "build_output": "(GATE NOT RUN: no build/check command configured or detected. This is NOT evidence that the build passed — set BUILD_CMD, and never report the build as verified.)",
+    "build_verdict": "NOT RUN: no build/check command configured or detected",
     "_next": "verify_tests"
   }'
   exit 0
@@ -60,6 +61,7 @@ if (( GATE_TIMED_OUT == 1 )); then
     '{
       "build_ok": false,
       "build_output": ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR + "\nTIMED OUT after " + env.GATE_DEADLINE + " s (build_timeout); the build was killed before it finished.\n\n" + .),
+      "build_verdict": ("TIMED OUT after " + env.GATE_DEADLINE + " s"),
       "gate_error": ("verify_build TIMED OUT after " + env.GATE_DEADLINE + " s (build_timeout) before the build finished. This is not a red run: raise build_timeout."),
       "_next": "end_failure"
     }'
@@ -69,6 +71,7 @@ elif (( exit_code == 0 )); then
     '{
       "build_ok": true,
       "build_output": ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR + "\n\n" + .),
+      "build_verdict": "passed",
       "_next": "verify_tests"
     }'
 else
@@ -78,6 +81,7 @@ else
     '{
       "build_ok": false,
       "build_output": ("Ran: " + $cmd + "\nRan in: " + env.GATE_DIR + "\nExit code: " + ($rc | tostring) + "\n\n" + .),
+      "build_verdict": ("failed (exit " + ($rc | tostring) + ")"),
       "_next": "fix_loop_gate"
     }'
 fi

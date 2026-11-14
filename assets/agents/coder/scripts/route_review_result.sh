@@ -32,15 +32,25 @@ fi
 
 # end_success renders `Design: {{design_notes}}`; a null from the self-review
 # would print as the literal word, so both end routes re-emit it as a string.
+# It also renders `Review: {{review_verdict}}`, so notes left unresolved when
+# the budget runs out ship in the report rather than vanishing. Each note line
+# is indented so none can pass for a `Design:` line or another report field,
+# and a missing review_clean is reported as no verdict, never as clean.
 if [[ "$review_clean" == "true" ]]; then
-  printf '%s' "$state" | jq -c '{"_next": "end_success", "design_notes": ((.design_notes // "") | tostring)}'
+  printf '%s' "$state" | jq -c '{
+    "_next": "end_success",
+    "review_verdict": (if .review_clean == null then "NOT RUN: self-review returned no verdict" else "clean" end),
+    "design_notes": ((.design_notes // "") | tostring)
+  }'
   exit 0
 fi
 
 if (( review_attempts >= max_review_attempts )); then
   printf '%s' "$state" | jq -c '{
     "_next": "end_success",
-    "review_notes_unresolved": ("Shipped with unresolved review notes (budget exhausted):\n" + ((.review_notes // "") | tostring)),
+    "review_verdict": ("unresolved notes (review budget exhausted):\n"
+      + ((.review_notes // "") | tostring | if . == "" then "(no notes given)" else . end
+         | split("\n") | map("  " + .) | join("\n"))),
     "design_notes": ((.design_notes // "") | tostring)
   }'
   exit 0

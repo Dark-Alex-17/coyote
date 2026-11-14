@@ -48,9 +48,9 @@ those rules are *structure*:
   always runs; adversary runs when a spec/plan is present; security runs on
   attack-surface signals (auth/deps/exec paths or diff content - the surface
   rules come from `agents/.shared/diff_signals.py`, shared with any
-  downstream watch-round classifier; `signals.py` carries a byte-equal copy
-  of its regex constants plus an inline fallback `classify`, held equal to
-  the shared module by a test) or hardened
+  downstream watch-round classifier; `signals.py` keeps no copy, and without
+  the shared module it reports `signals_error`, which widens lane selection)
+  or hardened
   posture; probe runs when consumer-facing surface changed *and* a local-run
   recipe exists. The `select_lanes` LLM can only **widen** the set — a false
   flag never removes a rule-selected lane. `forced_lanes` from the caller

@@ -10,8 +10,9 @@ Two rules, both decidable without judgment:
     and on comment-shaped added lines of code files.
 
 A line carrying the token `debris-exempt` is exempt from both rules. A task id
-on the same line as a debt marker (`#[allow(`, `todo!`, `#[ignore`, ...) is
-the one sanctioned place for one and is not reported.
+on the same line as a debt marker (`#[allow(`, `//nolint`, `# noqa`,
+`t.Skip(`, `todo!`, ...; the table is debt_markers.py, shared with
+debt_scan.py) is the one sanctioned place for one and is not reported.
 
 This module is pure when imported: it never reads GRAPH_STATE. The per-agent
 wrapper scripts own the state keys and the fail-closed output shape. Run
@@ -24,6 +25,9 @@ import os
 import re
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from debt_markers import MARKER_RE as DEBT_MARKER_RE  # noqa: E402
 
 # U+FFFD (the replacement character lossy decoding produces) is deliberately
 # absent: it marks a decoding problem in the diff fetch, not punctuation the
@@ -77,12 +81,6 @@ VOCAB_NEEDLES = [
     )
 ]
 TASK_ID_RE = re.compile(r"(?<![A-Za-z-])TASK-\d+", re.I)
-# Attribute-anchored so a `.expect("...")` call or an `allow(` inside prose
-# never spares a task id.
-DEBT_MARKERS = (
-    "#[allow(", "#![allow(", "#[expect(", "#![expect(", "cfg_attr(",
-    "todo!", "unimplemented!", "#[ignore",
-)
 EXEMPT_TOKEN = "debris-exempt"
 
 PROSE_EXTENSIONS = (".md", ".rst", ".txt", ".adoc", ".yaml", ".yml")
@@ -283,7 +281,7 @@ def unicode_fix(text):
 
 def vocab_hits(text):
     hits = []
-    spared_task_id = any(marker in text for marker in DEBT_MARKERS)
+    spared_task_id = bool(DEBT_MARKER_RE.search(text))
     for needle in VOCAB_NEEDLES:
         for m in needle.finditer(text):
             if spared_task_id and TASK_ID_RE.fullmatch(m.group(0)):

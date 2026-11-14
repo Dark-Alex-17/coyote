@@ -21,6 +21,12 @@ flowchart TD
     gate_approval{{"gate_approval<br/>approval"}}
     gate_approval -->|yes| baseline_tests
     gate_approval -->|no| end_rejected
+    gate_approval -->|"other answer"| parse_approval
+    parse_approval{"parse_approval<br/>script"}
+    parse_approval -->|"reworded yes"| baseline_tests
+    parse_approval -->|"reworded no"| end_rejected
+    parse_approval -->|unclear| gate_approval
+    parse_approval -. "script crashed" .-> end_failure
     baseline_tests{"baseline_tests<br/>script"} --> implement
     baseline_tests -. "script crashed" .-> implement
     implement["implement<br/>llm + fs tools"] --> verify_build
@@ -55,7 +61,24 @@ flowchart TD
 
 End nodes emit one of three sentinel outcomes for the caller:
 
-- `CODER_COMPLETE` — build and tests passed.
+- `CODER_COMPLETE`: the verify gates let the run through (passed, not run,
+  or red only in ways the pre-run baseline already recorded).
+  Its `Build:`, `Tests:` and `Review:` lines say what each check actually
+  did, one line each:
+  - `Build: passed`, or `Build: NOT RUN: ...` when no build command was
+    configured or detected.
+  - `Tests: passed`, `Tests: NOT RUN: ...` when no test command was
+    configured or detected, or
+    `Tests: red, matches the pre-run baseline (exit <rc>); accepted pre-existing failures: <ids>`
+    when the suite failed only in ways the baseline already recorded
+    (`unidentified (<reason>)` stands in for the ids when none could be read).
+  - `Review: clean`, `Review: unresolved notes (review budget exhausted):`
+    followed by the notes on the next lines, each indented two spaces so no
+    note can pass for a report field, or `Review: NOT RUN: ...` when the
+    self-review ended without a verdict. `not run` on any of the three means
+    the run never reached that check.
+
+  The `Design:` block always comes last.
   Its `Design:` line carries the self-review's `design_notes`: every pattern
   the diff introduced that the repo did not already use (pattern, files, call
   sites touched, one per line, reconciled against the implementer's own
@@ -68,7 +91,7 @@ End nodes emit one of three sentinel outcomes for the caller:
   disclosure for the orchestrator's report, not a verdict.
   When the suite was already red before the run (see
   [Baseline tests](#baseline-tests)), a `Pre-existing failures: <ids>` line
-  follows `Tests: passed`, naming the baseline failures that still fail, a
+  follows the `Tests:` line, naming the baseline failures that still fail, a
   `Fixed pre-existing failures: <ids>` line names those that now pass (the
   run exited 0 or its output shows them passing), and a
   `No longer reported failing: <ids>` line names those gone from a red run's
@@ -79,10 +102,14 @@ End nodes emit one of three sentinel outcomes for the caller:
   baseline whose failures could not be identified that turns green reports
   `Fixed pre-existing failures: unidentified, the suite now passes`.
 - `CODER_REJECTED` — user rejected the plan at the approval gate.
+  An answer other than exactly `yes` or `no` goes to `parse_approval`: a reworded yes
+  (`Yes`, `approve.`, `yes, go ahead`) approves, a reworded no rejects, and
+  anything else asks again.
 - `CODER_FAILED` — fix-loop exhausted; build/tests still failing — or the
   verification gate crashed twice (see `Verification gate error:`), or
-  `route_review_result` / `self_review_fault` crashed (see
-  `Last script error:`). A routing script that died has decided nothing, so
+  `route_review_result` / `self_review_fault` / `parse_approval` crashed (see
+  `Last script error:`); a crashed `parse_approval` is never read as a
+  rejection. A routing script that died has decided nothing, so
   the run does not end as `CODER_COMPLETE` on its behalf. The one gate that
   falls toward a human instead is `route_complexity`: a crash there asks for
   plan approval rather than skipping it.
@@ -102,6 +129,28 @@ can read from unittest, pytest, cargo, go, jest and vitest output, and a
 hash of the failure lines with timings and addresses normalised away. The
 `implement` prompt lists those tests under "Tests that already failed before
 this run", and fix-loop instructions name them as pre-existing.
+
+The baseline is only taken from a tree known to be untouched, and it is
+stored so a later run on the same commit reuses it:
+
+- The record lives at
+  `$(git rev-parse --git-path coyote-baselines)/tests-<key>.json`, where the
+  key is the first 16 hex characters of the sha256 of the HEAD commit, the
+  directory relative to the work tree root (`.` for the root) and the test
+  command as the gate runs it (after the `--no-fail-fast` rewrite), one per
+  line. Only green and red runs are stored, and an existing
+  record is never replaced.
+- A stored record is reused whether or not the tree has changed since; the
+  suite is not run again.
+- With no record, the suite runs only when `git status --porcelain` is empty
+  (untracked files count, ignored files do not). On a tree that already holds
+  changes, `baseline_status` is `dirty` and no baseline is taken, so every
+  failing test counts as the run's own.
+- Outside a git work tree, before the first commit, when `git status` fails,
+  or when a stored record cannot be read, `baseline_status` is `none` and no
+  baseline is taken; the note says which.
+
+To retake a baseline, delete its record from that directory.
 
 Cargo ids carry their target (`tests/foo.rs::name`,
 `unittests src/lib.rs::name`), jest ids their file (`src/a.test.js > title`).
@@ -128,7 +177,7 @@ and:
 Anything it cannot match fails as before: a new failing test, or a run whose
 failures cannot be identified against a baseline whose failures could, or a
 run in which a test target was killed by a signal. With a green or timed-out
-baseline, or a crashed `baseline_tests` (its fallback goes straight to
+baseline, a `dirty` or `none` one, or a crashed `baseline_tests` (its fallback goes straight to
 `implement`), there is no baseline and `verify_tests` judges by the exit code
 alone. With no test command `baseline_tests` records no baseline and
 `verify_tests` reports `GATE NOT RUN`, which is not evidence that the tests

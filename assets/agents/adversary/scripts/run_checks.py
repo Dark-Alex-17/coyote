@@ -24,16 +24,38 @@ emitting an extra `verification_commands` key cannot overwrite the declared
 value: the undeclared key is dropped before it reaches state.
 
 Budget: commands run sequentially, so TOTAL runtime is bounded by a deadline
-(TOTAL_DEADLINE_SECS = 3300s, the run_checks node's 3600s timeout minus
-margin). Without it, a handful of hanging commands (4 x 900s) would blow the
+(TOTAL_DEADLINE_SECS = 3300s). The deadline starts once the review-stack lock
+is acquired or its bounded wait (STACK_LOCK_WAIT_SECS = 1200s) gives up, so
+the run_checks node's 4600s timeout covers 1200 + 3300 plus margin for the
+baseline worktree cleanup. Without it, a handful of hanging commands
+(4 x 900s) would blow the
 NODE timeout and the executor would kill this script from OUTSIDE — the
 in-script degradation would never fire. Each command gets
 min(PER_COMMAND_TIMEOUT_SECS, remaining budget); commands the deadline
 leaves no budget for are recorded as {"cmd", "skipped": "deadline"} entries,
-so the in-script handling stays authoritative. The env var
-ADVERSARY_RUN_CHECKS_DEADLINE_SECS overrides the deadline (test seam), and
-ADVERSARY_STACK_LOCK_PATH overrides the review-stack lock file location
-(isolation seam — see acquire_stack_lock).
+so the in-script handling stays authoritative; the verdict reports them as
+not run, not as red. The env vars ADVERSARY_RUN_CHECKS_DEADLINE_SECS and
+ADVERSARY_STACK_LOCK_WAIT_SECS override the deadline and the lock wait (test
+seams), and ADVERSARY_STACK_LOCK_PATH overrides the review-stack lock file
+location (isolation seam, see acquire_stack_lock).
+
+Baseline: every red record (nonzero exit, including the -1 timeout) is run
+again, inside the same deadline, in one temporary detached git worktree of
+the project's repository at `diff_base` (from diff_facts.py), in the same
+subdirectory project_dir names, added with core.hooksPath pointed at an
+empty directory so the user's git hooks do not run. The worktree is removed
+on normal exit. A record that timed out here gets a not-run baseline without
+a base run, so it does not spend the shared deadline.
+The two full outputs are compared with the coder agent's own gate_lib.sh
+helpers through bash, by the rule its verify_tests gate applies: the failure
+is pre-existing only when the base run is red (and did not time out) with
+the same exit code, the current run was not killed by a signal, and either
+every currently failing test id already failed on the base, or neither run
+named a test id and the failure output hashes alike. The red record gains
+`baseline`: {"status": "pre-existing" | "regression" | "not-run", "exit",
+"note"}. not-run means no comparison happened (no diff base, deadline spent,
+worktree or helper failure, base run timed out); it blocks like a
+regression, so a missing comparison never passes.
 
 Process hygiene: commands run through the shell. On POSIX each command gets
 its own session (start_new_session) and a timeout SIGKILLs the whole process
@@ -65,9 +87,11 @@ declaration error and fails closed the same way as a malformed
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 try:
@@ -81,6 +105,11 @@ STACK_LOCK_PATH = os.environ.get("ADVERSARY_STACK_LOCK_PATH") or os.path.expandu
     "~/.cache/coyote/review-stack.lock"
 )
 STACK_LOCK_WAIT_SECS = float(os.environ.get("ADVERSARY_STACK_LOCK_WAIT_SECS") or 1200)
+GATE_LIB = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "..", "coder", "scripts", "gate_lib.sh"
+)
+GIT_CLEANUP_TIMEOUT_SECS = 20
+GATE_CALL_MIN_TIMEOUT_SECS = 10
 
 
 def acquire_stack_lock():
@@ -176,9 +205,10 @@ def tail_of(text):
     return tail
 
 
-def run_one(cmd, proj, budget, prefix=""):
+def run_one(cmd, proj, budget, prefix="", out_path=None):
     """Run one command, hard-bounded by `budget` seconds; return its record.
-    A non-empty `prefix` wraps the command, which keeps its own quoting."""
+    A non-empty `prefix` wraps the command, which keeps its own quoting.
+    With `out_path`, the full combined output is written there."""
     start = time.monotonic()
     popen_kwargs = {"start_new_session": True} if os.name == "posix" else {}
     env = {k: v for k, v in os.environ.items() if not k.startswith("GRAPH_STATE")}
@@ -207,9 +237,10 @@ def run_one(cmd, proj, budget, prefix=""):
         else:
             p.kill()
         try:
-            p.communicate(timeout=DRAIN_TIMEOUT_SECS)
+            out_s, err_s = p.communicate(timeout=DRAIN_TIMEOUT_SECS)
         except subprocess.TimeoutExpired:
-            pass
+            out_s = err_s = ""
+        write_output(out_path, out_s, err_s)
         return {
             "cmd": cmd,
             "exit": -1,
@@ -217,7 +248,7 @@ def run_one(cmd, proj, budget, prefix=""):
             "tail": f"TIMEOUT: no exit within {budget:.0f}s — recorded as a failing run",
             **under,
         }
-    combined = (out_s or "") + (("\n" + err_s) if err_s else "")
+    combined = write_output(out_path, out_s, err_s)
     return {
         "cmd": cmd,
         "exit": p.returncode,
@@ -225,6 +256,199 @@ def run_one(cmd, proj, budget, prefix=""):
         "tail": tail_of(combined),
         **under,
     }
+
+
+def write_output(out_path, out_s, err_s):
+    combined = (out_s or "") + (("\n" + err_s) if err_s else "")
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(combined)
+    return combined
+
+
+class GateUnavailable(RuntimeError):
+    pass
+
+
+def gate_call(fn, path, budget):
+    """Run one gate_lib.sh helper on output file `path`; return (status, stdout)."""
+    if not os.path.isfile(GATE_LIB):
+        raise GateUnavailable(f"{os.path.normpath(GATE_LIB)} not found")
+    try:
+        r = subprocess.run(
+            ["bash", "-c", 'source "$1" || exit 90; "$2" "$3"', "gate", GATE_LIB, fn, path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(budget, GATE_CALL_MIN_TIMEOUT_SECS),
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise GateUnavailable(f"{fn}: {e}") from e
+    if r.returncode == 90:
+        raise GateUnavailable(f"sourcing gate_lib.sh failed: {r.stderr.strip()[:200]}")
+    return r.returncode, r.stdout
+
+
+def gate_output(fn, path, budget):
+    code, out = gate_call(fn, path, budget)
+    if code != 0:
+        raise GateUnavailable(f"{fn} exited {code}")
+    return out
+
+
+def gate_ids(path, budget):
+    return {line for line in gate_output("gate_failing_tests", path, budget).splitlines() if line}
+
+
+def gate_killed(path, budget):
+    code, _ = gate_call("gate_killed_by_signal", path, budget)
+    if code not in (0, 1):
+        raise GateUnavailable(f"gate_killed_by_signal exited {code}")
+    return code == 0
+
+
+def listed(ids):
+    shown = sorted(ids)[:5]
+    more = f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""
+    return ", ".join(shown) + more
+
+
+def classify(cur, cur_path, base, base_path, deadline):
+    """Baseline object for red record `cur` against base-run record `base`."""
+    base_exit, cur_exit = base["exit"], cur["exit"]
+
+    def verdict(status, note):
+        return {"status": status, "exit": base_exit, "note": note}
+
+    if base_exit == 0:
+        return verdict("regression", "the command passed on the diff base")
+    if cur_exit != base_exit:
+        return verdict("regression", f"exit {cur_exit} here but {base_exit} on the diff base")
+    if gate_killed(cur_path, left(deadline)):
+        return verdict(
+            "regression", "a test target was killed by a signal, so this run cannot match the base"
+        )
+    base_ids, cur_ids = gate_ids(base_path, left(deadline)), gate_ids(cur_path, left(deadline))
+    if base_ids:
+        if cur_ids and cur_ids <= base_ids:
+            return verdict("pre-existing", f"the same tests already failed on the diff base: {listed(cur_ids)}")
+        if cur_ids:
+            return verdict("regression", f"new failing tests: {listed(cur_ids - base_ids)}")
+        reason = gate_output("gate_unidentified_reason", cur_path, left(deadline)).strip()
+        return verdict("regression", f"the failures here cannot be identified ({reason}) but the base's could")
+    if cur_ids:
+        return verdict("regression", f"failing tests not named on the diff base: {listed(cur_ids)}")
+    base_hash = gate_output("gate_failure_hash", base_path, left(deadline)).strip()
+    if base_hash and gate_output("gate_failure_hash", cur_path, left(deadline)).strip() == base_hash:
+        reason = gate_output("gate_unidentified_reason", cur_path, left(deadline)).strip()
+        return verdict(
+            "pre-existing",
+            f"same exit and the same failure output on the diff base (tests unidentified: {reason})",
+        )
+    return verdict("regression", "the failure output differs from the diff base's")
+
+
+def not_run(note):
+    return {"status": "not-run", "exit": None, "note": note}
+
+
+def left(deadline):
+    return deadline - time.monotonic()
+
+
+def git_text(args, cwd, timeout):
+    r = subprocess.run(
+        ["git", "-C", cwd, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=max(timeout, 1),
+    )
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:300])
+    return r.stdout.strip()
+
+
+def cleanup_git(top, args):
+    try:
+        git_text(args, top, GIT_CLEANUP_TIMEOUT_SECS)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"WARN: baseline worktree cleanup `git {' '.join(args)}` failed: {e}\n")
+
+
+def remove_worktree(top, path):
+    """The prune after the rmtree drops a registration that a failed
+    `worktree remove` left behind."""
+    cleanup_git(top, ["worktree", "remove", "--force", path])
+    cleanup_git(top, ["worktree", "prune"])
+    shutil.rmtree(path, ignore_errors=True)
+    cleanup_git(top, ["worktree", "prune"])
+
+
+def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
+    """Give every red record a `baseline` from one run at the diff base."""
+    reds = [i for i, r in enumerate(results) if not r.get("skipped") and r.get("exit") != 0]
+    for i in reds:
+        if results[i]["exit"] == -1:
+            results[i]["baseline"] = not_run("the command timed out here, so no comparison applies")
+    reds = [i for i in reds if results[i]["exit"] != -1]
+    if not reds:
+        return
+    diff_base = state.get("diff_base")
+    diff_base = diff_base.strip() if isinstance(diff_base, str) else ""
+    if not diff_base:
+        for i in reds:
+            results[i]["baseline"] = not_run("no diff base was resolved, so nothing to compare against")
+        return
+    if left(deadline) <= 0:
+        for i in reds:
+            results[i]["baseline"] = not_run("the deadline was spent before the baseline run")
+        return
+    try:
+        top = git_text(["rev-parse", "--show-toplevel"], proj, left(deadline))
+        subdir = git_text(["rev-parse", "--show-prefix"], proj, left(deadline))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        for i in reds:
+            results[i]["baseline"] = not_run(f"the project's git repository could not be read: {e}")
+        return
+    tree = os.path.join(work, "base")
+    hooks = os.path.join(work, "no-hooks")
+    try:
+        try:
+            os.mkdir(hooks)
+            git_text(
+                ["-c", f"core.hooksPath={hooks}", "worktree", "add", "--detach", tree, diff_base],
+                top,
+                left(deadline),
+            )
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+            for i in reds:
+                results[i]["baseline"] = not_run(f"the diff-base worktree could not be created: {e}")
+            return
+        base_proj = os.path.join(tree, subdir)
+        for i in reds:
+            remaining = left(deadline)
+            if remaining <= 0:
+                results[i]["baseline"] = not_run("the deadline was spent before this command's baseline run")
+                continue
+            if not os.path.isdir(base_proj):
+                results[i]["baseline"] = not_run(f"the project directory {subdir!r} does not exist at the diff base")
+                continue
+            base_path = os.path.join(work, f"base-{i}.txt")
+            base = run_one(results[i]["cmd"], base_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix, base_path)
+            if base["exit"] == -1:
+                results[i]["baseline"] = not_run("the command timed out on the diff base")
+                continue
+            try:
+                results[i]["baseline"] = classify(results[i], outputs[i], base, base_path, deadline)
+            except GateUnavailable as e:
+                results[i]["baseline"] = dict(
+                    not_run(f"baseline comparison unavailable: {e}"), exit=base["exit"]
+                )
+    finally:
+        remove_worktree(top, tree)
 
 
 def emit_pipeline_fault(state, msg):
@@ -266,15 +490,29 @@ def main():
     proj = os.path.expanduser(
         (state.get("project_dir") or "").strip() or "."
     )
-    deadline = time.monotonic() + TOTAL_DEADLINE_SECS
     results = []
     _stack_lock = acquire_stack_lock() if cmds else None  # noqa: F841 — held until exit
-    for cmd in cmds:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            results.append({"cmd": cmd, "skipped": "deadline"})
-            continue
-        results.append(run_one(cmd, proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix))
+    deadline = time.monotonic() + TOTAL_DEADLINE_SECS
+    work = tempfile.mkdtemp(prefix="adversary-run-checks-")
+    try:
+        outputs = {}
+        for i, cmd in enumerate(cmds):
+            remaining = left(deadline)
+            if remaining <= 0:
+                results.append({"cmd": cmd, "skipped": "deadline"})
+                continue
+            outputs[i] = os.path.join(work, f"current-{i}.txt")
+            results.append(
+                run_one(cmd, proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix, outputs[i])
+            )
+        try:
+            attach_baselines(results, outputs, state, proj, prefix, deadline, work)
+        except Exception as e:  # noqa: BLE001 -- the recorded runs outlive a baseline failure
+            for r in results:
+                if not r.get("skipped") and r.get("exit") != 0 and "baseline" not in r:
+                    r["baseline"] = not_run(f"baseline comparison unavailable: {e}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     print(json.dumps({"exec_results": results}))
 
 

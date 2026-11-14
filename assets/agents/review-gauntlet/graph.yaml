@@ -412,12 +412,12 @@ nodes:
     type: agent
     description: Plan-conformance review lane.
     agent: adversary
-    # Exceeds the adversary graph's own settings.timeout (9000) by 600 so the
+    # Exceeds the adversary graph's own settings.timeout (10000) by 600 so the
     # child's graph timeout, not this lane timeout, is the binding bound.
     # NOTE: the child's own internal retry envelope (its nodes' max_attempts ×
     # timeouts) is not derived here — deliberately out of scope for this
     # change; tracked as a follow-up.
-    timeout: 9600
+    timeout: 10600
     inputs:
       verification_commands: '{{verification_commands}}'
       build_lock: '{{build_lock}}'
