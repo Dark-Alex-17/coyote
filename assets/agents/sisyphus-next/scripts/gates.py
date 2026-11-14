@@ -24,7 +24,7 @@ from _lib import (  # noqa: E402
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
     CI_PASS, CI_PENDING, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
-    ENGINE_VISIT_CAP, POLL_VISIT_BUDGET,
+    ENGINE_VISIT_CAP, POLL_VISIT_BUDGET, CI_NO_CHECKS_SECS,
     OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
@@ -1112,9 +1112,15 @@ def _checked_subtasks(state, u):
             return _subtasks_fault(state, u, f"{problem}, and the list could not be rebuilt ({still})")
         u["subtasks"] = subtasks = sealed
         ledger(state, u, f"subtasks: {problem}; rebuilt the list of {len(sealed)} from {source}")
+    else:
+        sealed, source = _sealed_subtasks(state)
+        if source == SEALED_SUBTASKS and sealed != subtasks and not _subtasks_problem(sealed, idx):
+            u["subtasks"] = subtasks = sealed
+            ledger(state, u, f"subtasks: the state list of {len(as_list(raw))} differs from the sealed list; "
+                             f"rebuilt the list of {len(sealed)} from {source}")
     # outside the final review the index advances with task_number, so a mismatch means one of them is stale
     step = as_int(state.get("task_number"))
-    if step > 0 and not truthy(state.get("final_review")) and idx != step:
+    if not truthy(state.get("final_review")) and idx != step:
         return _subtasks_fault(state, u, f"subtask_index {idx} is out of step with task_number {step}")
     return subtasks
 
@@ -1450,6 +1456,8 @@ def _pick_with_note(text, options):
 
 def escalate_gate(state):
     u = {}
+    if _escalation_fault(state, u, "escalate_gate"):
+        return u
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
@@ -2218,7 +2226,9 @@ def apply_answer(state):
         resets = as_int(state.get("rejected_cap_resets")) + 1
         u.update({"rejected_rounds": 0, "rejected_cap_resets": resets, "fix_source": "rejected", "fix_note": reason})
         ledger(state, u, f"coder: rejection budget reset after {rounds} rejected rounds at the user's pick "
-                         f"({resets}/{FIX_ROUND_CEILING} resets this subtask); planning again with: {tail(reason, 300)}")
+                         f"({resets}/{FIX_ROUND_CEILING} resets this subtask"
+                         + (", past the ceiling at the user's pick" if resets > FIX_ROUND_CEILING else "")
+                         + f"); planning again with: {tail(reason, 300)}")
         u["_next"] = "compose_fix"
     elif kind == "engine_fault":
         if stop:
@@ -3746,8 +3756,7 @@ def ci_gate(state):
         u["_next"] = "pr_review_resolve"
         return u
     if task.get("kind") == "push_fix":
-        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                  "ci_failing": []})
+        _reset_ci_watch(u)
         u["_next"] = "ci_poll"
         return u
     if ret == "run_coder":
@@ -3782,9 +3791,9 @@ def ci_gate(state):
     owns = task.get("open_pr") and not truthy(state.get("delegated"))
     u["ci_owner"] = bool(owns)
     if owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or ""):
-        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                  "ci_failing": []})
-        if _review_mode(state) and not (state.get("pr_ref") or "").strip():
+        _reset_ci_watch(u)
+        # the flip confirmation runs gh pr ready only against this saved ref, never a later report's #N
+        if not (state.get("pr_ref") or "").strip():
             u["pr_ref"] = _pr_ref(state)
         u["_next"] = "ci_poll"
     else:
@@ -3881,11 +3890,14 @@ def _pr_ready(state):
 
 def _confirm_pr_ready(state, u):
     """Confirm the flip only when `gh pr ready` exits 0 and a re-read of the same PR shows it is not a draft."""
-    rc = _pr_ready(state)
-    pr = _pr_view(state, _pr_ref(state))
-    seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}"
-    confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False
-    detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
+    if not str(state.get("pr_ref") or "").strip():
+        confirmed, detail = False, "gh pr ready not run: no PR ref was saved when the watch started"
+    else:
+        rc = _pr_ready(state)
+        pr = _pr_view(state, _pr_ref(state))
+        seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}"
+        confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False
+        detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
     u["pr_ready_confirmed"] = confirmed
     u["pr_ready_detail"] = detail
     if confirmed:
@@ -3986,8 +3998,7 @@ def pr_review_resolve(state):
     ledger(state, u, line)
     u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + pending
     u["pr_review_pending"] = []
-    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-              "ci_failing": []})
+    _reset_ci_watch(u)
     u["_next"] = "ci_poll"
     return u
 
@@ -4077,7 +4088,8 @@ CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
 
 
 def _reset_ci_watch(u):
-    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": []})
+    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": [],
+              "ci_green_by": ""})
 
 
 def _ci_poll_budget(state):
@@ -4164,8 +4176,8 @@ def ci_poll(state):
         u["ci_status"] = "red"
         u["ci_failing"] = failing
         u["_next"] = "ci_route"
-    elif pending or (not buckets and polls == 0):
-        # checks can take a moment to register on a fresh push, so an empty first read is polled again
+    elif pending or (not buckets and time.time() - started < CI_NO_CHECKS_SECS):
+        # checks can take minutes to register on a fresh push, so an early empty list is polled again
         u["ci_status"] = "pending"
         u["_next"] = "ci_poll"
     elif not buckets:
