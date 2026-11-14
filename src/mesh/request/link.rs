@@ -397,7 +397,7 @@ pub(crate) async fn open_link(
 /// pending or in its handshake is closed: one that came up meanwhile may be serving a
 /// concurrent request. A concurrent request still waiting on the closed link ends in its
 /// own activation timeout, since a closed link never activates.
-async fn close_if_never_activated(
+pub(super) async fn close_if_never_activated(
     link: &Arc<tokio::sync::Mutex<Link>>,
     path: &str,
     destination_hex: &str,

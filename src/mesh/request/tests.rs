@@ -1840,6 +1840,55 @@ pub(crate) mod network {
         requester.stop().await;
     }
 
+    /// A waiter whose activation deadline runs out on a link another request has
+    /// already brought up leaves that link open: the request in flight on it still gets
+    /// its answer, and the next request is handed the same link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_shared_with_an_active_request_is_not_closed_when_another_waiters_deadline_runs_out()
+     {
+        let (stall, release) = ReleasableStall::new();
+        let (responder, requester, desc) = pair(stall.clone()).await;
+        let mut events = requester.transport.out_link_events();
+        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let in_flight = {
+            let transport = requester.transport.clone();
+            let link = link.clone();
+            let data = requester.envelope(Value::Nil).into_value();
+            tokio::spawn(async move {
+                request_on_link(&transport, &link, "/slow", data, TRANSFER_REQUEST_TIMEOUT).await
+            })
+        };
+        wait_until("the responder to hold the active request", || {
+            stall.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        link::close_if_never_activated(&link, "/echo", &desc.address_hash.to_hex_string()).await;
+
+        release.send(true).unwrap();
+        let reply = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Value::from("released"));
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !(event.id == link_id && matches!(event.event, LinkEvent::Closed)),
+                "the active link must stay open"
+            );
+        }
+        let next = open_link(&requester.transport, &desc, "/echo", link_deadline())
+            .await
+            .unwrap();
+        assert_eq!(*next.lock().await.id(), link_id);
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// The handler sees the peer's identity only once the peer has proven it on the link;
     /// before that the request reaches it anonymous.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
