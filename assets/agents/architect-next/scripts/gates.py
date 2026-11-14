@@ -863,17 +863,15 @@ def gate1_route(state):
     u = {}
     note_script_error(state, u, "gate1")
     text = state.get("gate1_result") or ""
-    if not text or text.startswith("Agent node failed") or "PLAN_GATE" not in text:
+    verdict = _last_verdict(text, "PLAN_GATE", ("SEALED", "LEAKY", "FRICTION"))
+    if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The gatekeeper produced no verdict (agent fault). Retry the gate, or abort?",
             [option("Retry the gatekeeper", recommended=True), option("Abort the run")], evidence=trim_items(text, 1000),
             data={"gate": "gate1"}))
-    m = re.search(r"PLAN_GATE:\s*(SEALED|LEAKY|FRICTION)", text)
-    verdict = m.group(1) if m else "LEAKY"
-    friction_only = verdict == "FRICTION" or (verdict == "SEALED" and "FRICTION" in text)
     u["gate1_verdict"] = verdict
     if verdict == "SEALED" or verdict == "FRICTION":
-        if friction_only and verdict == "FRICTION":
+        if verdict == "FRICTION":
             ledger(state, u, "gate1: FRICTION-only verdict sealed at discretion (tier 1); accepted findings noted in the plan")
             path = state.get("plan_path", "")
             if path and os.path.isfile(path):
@@ -996,7 +994,7 @@ def gate2_route(state):
     u = {}
     note_script_error(state, u, "gate2")
     text = state.get("gate2_result") or ""
-    verdict = _plan_review_verdict(text)
+    verdict = _last_verdict(text, "PLAN_REVIEW", ("OKAY", "REJECT"))
     if not text or text.startswith("Agent node failed") or not verdict:
         return raise_escalation(state, u, escalation(
             "gate_fault", "The oracle produced no PLAN_REVIEW verdict (agent fault). Retry, or abort?",
@@ -1026,7 +1024,6 @@ def gate2_route(state):
 
 GATE2_ANOTHER_ROUND = "Another fix round (state reason)"
 GATE2_OVERRIDE = "Override: promote the plan as reviewed (recorded)"
-PLAN_REVIEW_RE = re.compile(r"(?i)PLAN_REVIEW\s*:\s*(OKAY|REJECT)\b")
 
 
 def _gate2_stuck_options(more=True):
@@ -1052,13 +1049,16 @@ def _count_continue(state, u, cap):
     u["cap_continues"] = counts
 
 
-def _plan_review_verdict(text):
-    """The reviewer's final verdict: the last line reading PLAN_REVIEW: OKAY or REJECT, markdown bold and backticks
-    ignored; a line that names both (an echoed prompt) is no verdict. "" when no line qualifies."""
+def _last_verdict(text, sentinel, words):
+    """A reviewer's final verdict: the last line reading `SENTINEL: WORD` for one of `words`, case-insensitive,
+    markdown bold and backticks ignored, upper-cased; a line that names more than one of the words (an echoed prompt)
+    is no verdict. "" when no line qualifies."""
+    alternatives = "|".join(words)
+    verdict_re = re.compile(rf"(?i){sentinel}\s*:\s*({alternatives})\b")
     for line in reversed(text.splitlines()):
         plain = re.sub(r"[*`]", "", line)
-        m = PLAN_REVIEW_RE.search(plain)
-        if m and not (re.search(r"(?i)\bOKAY\b", plain) and re.search(r"(?i)\bREJECT\b", plain)):
+        m = verdict_re.search(plain)
+        if m and sum(bool(re.search(rf"(?i)\b{w}\b", plain)) for w in words) == 1:
             return m.group(1).upper()
     return ""
 
@@ -1952,6 +1952,43 @@ def _probe_verdict(text):
     return verdicts[-1] if verdicts else ""
 
 
+def _adversary_verdict(text):
+    return _last_verdict(text, "ADVERSARIAL_REVIEW", ("CONFORMS", "DIVERGES"))
+
+
+# The sections the adversary renders after its complaints, each after a blank
+# line. Exact names, so a complaint holding a blank line and a line ending in
+# `:` stays inside its complaint.
+SECTIONS_AFTER_COMPLAINTS = ("Non-blocking observations:", "Met criteria (evidence):", "Verification runs:")
+# Every character str.splitlines() treats as a line boundary.
+_LINE_BREAKS = re.compile(r"[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]+")
+
+
+def _adversary_complaints(text):
+    """The numbered items under the adversary's column-0 `Complaints:` line, in order, each whole with its
+    continuation lines joined. Split on `\\n` only, since a complaint is model text and may carry any other line
+    boundary or a blank line. An item runs until a line opening the NEXT number, or a blank line followed by one of
+    SECTIONS_AFTER_COMPLAINTS. This follows review-gauntlet's verdict_gate.adversary_complaints; keep the two in step."""
+    lines = [l[:-1] if l.endswith("\r") else l for l in text.split("\n")]
+    start = next((i + 1 for i, l in enumerate(lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(lines))
+    body = lines[start:]
+    items, number = [], None
+    for k, line in enumerate(body):
+        m = re.match(r"(\d+)\.\s+(.*)", line)
+        if m and (number is None or int(m.group(1)) == number + 1):
+            number = int(m.group(1))
+            items.append(m.group(2).strip())
+        elif not items:
+            break
+        elif not line.strip():
+            nxt = next((b for b in body[k + 1:] if b.strip()), None)
+            if nxt is None or nxt.strip() in SECTIONS_AFTER_COMPLAINTS:
+                break
+        else:
+            items[-1] += " " + line.strip()
+    return [_LINE_BREAKS.sub(" ", c).strip() for c in items if c.strip()]
+
+
 # The direct micro-mode adversary's report has no gauntlet header, so on that
 # lane its `ADVERSARIAL_REVIEW:` line is the only verdict (a `GAUNTLET:` line
 # quoted in its verification output is not one) and its complaints are the
@@ -1964,8 +2001,9 @@ def _parse_gauntlet(text, adversary_lane=False):
     header_lines = header.splitlines()
     verdict = "BLOCKED"
     if adversary_lane:
-        if m := re.search(r"ADVERSARIAL_REVIEW:\s*(CONFORMS|DIVERGES)", text):
-            verdict = "PASS" if m.group(1) == "CONFORMS" else "BLOCKED"
+        adversary = _adversary_verdict(text)
+        if adversary:
+            verdict = "PASS" if adversary == "CONFORMS" else "BLOCKED"
     elif m := _GAUNTLET_VERDICT_RE.search(header):
         verdict = m.group(1)
     incomplete = []
@@ -1979,14 +2017,8 @@ def _parse_gauntlet(text, adversary_lane=False):
         sec = re.search(r"(?ims)^#+\s*(Blockers?|Divergences?|Complaints?)\s*\n(.*?)(?=^#+\s|\Z)", text)
         if sec:
             blockers = [l.strip()[1:].strip() for l in sec.group(2).splitlines() if l.strip().startswith(("-", "*"))]
-        text_lines = text.splitlines()
-        start = next((i + 1 for i, l in enumerate(text_lines) if re.fullmatch(r"Complaints:[ \t]*", l)), len(text_lines))
-        for line in text_lines[start:]:
-            if not line.strip():
-                break
-            if m := re.match(r"\d+\.[ \t]+(.+)", line):
-                blockers.append(m.group(1).strip())
-        if verdict == "BLOCKED" and not blockers and "ADVERSARIAL_REVIEW: DIVERGES" in text:
+        blockers += _adversary_complaints(text)
+        if adversary == "DIVERGES" and not blockers:
             blockers = [l.strip()[1:].strip() for l in text.splitlines() if l.strip().startswith(("-", "*"))][:20] or ["adversary: DIVERGES (see report)"]
         blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     else:
@@ -2060,7 +2092,7 @@ def route_verdict(state):
     adversary_lane = state.get("verify_lane") == "adversary"
     text = (state.get("adversary_result") if adversary_lane else state.get("gauntlet_result")) or ""
     verdict, incomplete, lanes, blockers, plan_root, probe_files = _parse_gauntlet(text, adversary_lane)
-    has_verdict = "ADVERSARIAL_REVIEW:" in text if adversary_lane else _has_verdict(_gauntlet_header(text))
+    has_verdict = bool(_adversary_verdict(text)) if adversary_lane else _has_verdict(_gauntlet_header(text))
     if not text or text.startswith("Agent node failed") or not has_verdict:
         verdict, incomplete, blockers = "BLOCKED", incomplete or ["pipeline"], []
     probe = "" if adversary_lane else _probe_verdict(text)
@@ -3667,7 +3699,7 @@ def apply_answer(state):
             if "ceiling" in over:
                 u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
             _count_continue(state, u, "amend_cap")
-            u["_next"] = "gate1_build"
+            u["_next"] = "gate1_build" if truthy(state.get("quality_recorded")) else "quality_bar_gate"
         else:
             _ask_again(state, u, esc, answer)
     elif kind == "gate1_stuck":

@@ -727,6 +727,20 @@ u = gates.gate1_route(base_state(gate1_result="PLAN_GATE: LEAKY\n- A different q
 check("gate1_route: LEAKY on different questions -> answer_leaks again", u["_next"] == "answer_leaks")
 u = gates.gate1_route(base_state(gate1_result="Agent node failed: timeout"))
 check("gate1_route: agent fault -> escalation gate_fault (never a verdict)", u["escalation"]["kind"] == "gate_fault")
+u = gates.gate1_route(base_state(gate1_result="I will end with PLAN_GATE: SEALED if every question is answered.\n"
+                                              "- Where does the infra code go?\nPLAN_GATE: LEAKY\n"
+                                              "(verdict format: PLAN_GATE: SEALED | LEAKY | FRICTION)"))
+check("gate1_route: a sentinel quoted early and a prompt echo naming every verdict after the real one -> the real verdict, LEAKY",
+      u.get("_next") == "answer_leaks" and u.get("gate1_verdict") == "LEAKY", (u.get("_next"), u.get("gate1_verdict")))
+u = gates.gate1_route(base_state(gate1_result="All questions are answered inline.\n\n**PLAN_GATE:** `SEALED`"))
+check("gate1_route: a bold sentinel with a backticked verdict -> SEALED", u.get("_next") == "gate2_build" and u.get("sealed") is True,
+      u.get("_next"))
+u = gates.gate1_route(base_state(gate1_result="The PLAN_GATE verdict could not be reached.\n- Where does the infra code go?"))
+check("gate1_route: no PLAN_GATE verdict line -> gate_fault, never a LEAKY default",
+      u.get("_next") == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "gate_fault", u.get("_next"))
+u = gates.gate1_route(base_state(gate1_result="PLAN_GATE: SEALED\nNo FRICTION findings worth noting."))
+check("gate1_route: FRICTION named outside the verdict line of a SEALED verdict -> sealed with no friction note",
+      u.get("_next") == "gate2_build" and not any("FRICTION-only" in d for d in u.get("decisions", [])), u.get("decisions"))
 u = gates.leak_route(base_state(leak_answers=[{"question": "infra?", "answer": "infra/ per CLAUDE.md:12"}], leak_unanswerable=[]))
 check("leak_route: answers -> amend_plan with pending amendments", u["_next"] == "amend_plan" and u["pending_amendments"] and "infra/" in u["pending_amendments"][0])
 LEAK_Q = {"question": "priority of X vs Y?", "options": [{"text": "X first"}, {"text": "Y first", "recommended": True, "evidence": "the verdict"}]}
@@ -847,7 +861,7 @@ check("reseal_gate: past the overall ceiling alone -> amend_cap naming the ceili
       and "rework" not in u["escalation"]["question"].split("ceiling")[0], u.get("escalation"))
 AMEND_CAP_OPTS = [option("Allow one more amendment cycle"), option("Stop and report", recommended=True)]
 u = gates.apply_answer(base_state(escalation=escalation("amend_cap", "q", AMEND_CAP_OPTS, data={"source": "gate1", "over": ["source"]}),
-                                  last_answer="Allow one more amendment cycle", amend_cycles=9,
+                                  last_answer="Allow one more amendment cycle", amend_cycles=9, quality_recorded=True,
                                   amend_counts={"gate1": _lib.AMEND_GATE1_MAX + 1, "design": 2}))
 check("apply_answer: amend_cap allow on a source budget -> one more cycle of that source, others and the total untouched",
       u["_next"] == "gate1_build" and u["amend_counts"] == {"gate1": _lib.AMEND_GATE1_MAX - 1, "design": 2}
@@ -1561,6 +1575,40 @@ check("route_verdict: a USAGE_PROBE: INCONCLUSIVE quoted in a DIVERGES adversary
 u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
                                    adversary_result="ADVERSARIAL_REVIEW: CONFORMS\nCriteria: 2/2 met (all with tests).\n\nVerification runs:\nGAUNTLET: BLOCKED\n", round_log={T1: [{"round": 1, "head": "h"}]}))
 check("route_verdict: on the adversary lane a CONFORMS report quoting GAUNTLET: BLOCKED -> post_round", u["last_verdict"] == "PASS" and u["_next"] == "post_round")
+GADVECHO = ("I end with ADVERSARIAL_REVIEW: CONFORMS only when every criterion holds.\nCriteria: 1/2 met.\nComplaints:\n"
+            "1. Acceptance criterion \"two\" -- Unmet -- api/h.go:10\n\n**ADVERSARIAL_REVIEW: DIVERGES**\n")
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result=GADVECHO, round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: ADVERSARIAL_REVIEW quoted early as CONFORMS and the real DIVERGES last -> BLOCKED, a fix round",
+      u.get("last_verdict") == "BLOCKED" and u.get("_next") == "compose_delegation", (u.get("last_verdict"), u.get("_next")))
+u = gates.route_verdict(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, verify_scope="task", verify_unit=T1, verify_lane="adversary",
+                                   adversary_result="The ADVERSARIAL_REVIEW: verdict is pending.\n", round_log={T1: [{"round": 1, "head": "h"}]}))
+check("route_verdict: an adversary report naming the sentinel with no verdict word -> the missing-verdict path",
+      u["round_log"][T1][-1].get("incomplete") == ["pipeline"], u["round_log"][T1][-1])
+
+
+def _complaints(body):
+    return gates._parse_gauntlet("ADVERSARIAL_REVIEW: DIVERGES\nCriteria: 1/3 met.\nComplaints:\n" + body, adversary_lane=True)[3]
+
+
+check("_parse_gauntlet: an adversary complaint's continuation line is joined to it",
+      _complaints("1. criterion one fails\n   at api/h.go:10\n2. criterion two fails\n")
+      == ["criterion one fails at api/h.go:10", "criterion two fails"], _complaints("1. criterion one fails\n   at api/h.go:10\n2. criterion two fails\n"))
+check("_parse_gauntlet: a blank line inside an adversary complaint followed by more complaint text keeps that text",
+      _complaints("1. criterion one fails\n\nthe log shows exit 1\n2. criterion two fails\n\nNon-blocking observations:\n- naming\n")
+      == ["criterion one fails the log shows exit 1", "criterion two fails"],
+      _complaints("1. criterion one fails\n\nthe log shows exit 1\n2. criterion two fails\n\nNon-blocking observations:\n- naming\n"))
+check("_parse_gauntlet: a number inside complaint 1 that is not the next one stays in it; the real 2. splits",
+      _complaints("1. steps 1. and 2. both fail\n3. see the log\n2. criterion two fails\n")
+      == ["steps 1. and 2. both fail 3. see the log", "criterion two fails"], _complaints("1. steps 1. and 2. both fail\n3. see the log\n2. criterion two fails\n"))
+ADV_CRLF = "ADVERSARIAL_REVIEW: DIVERGES\r\nComplaints:\r\n1. criterion one\x0bfails\r\n   at api/h.go:10\r\n2. criterion two fails\r\n"
+check("_parse_gauntlet: a \\r\\n adversary report splits on \\n only; other line breaks inside a complaint fold to a space",
+      gates._parse_gauntlet(ADV_CRLF, adversary_lane=True)[3] == ["criterion one fails at api/h.go:10", "criterion two fails"],
+      gates._parse_gauntlet(ADV_CRLF, adversary_lane=True)[3])
+adv_sections = {s: _complaints(f"1. criterion one fails\n   at api/h.go:10\n\n{s}\n2. not a complaint\n")
+                for s in ("Non-blocking observations:", "Met criteria (evidence):", "Verification runs:")}
+check("_parse_gauntlet: a blank line then each section after the complaints ends them",
+      all(v == ["criterion one fails at api/h.go:10"] for v in adv_sections.values()), adv_sections)
 GINC = gauntlet_reply("BLOCKED", [("probe", "BLOCKED", "INCONCLUSIVE (environment)")],
                       blockers=["probe: INCONCLUSIVE - the ENVIRONMENT could not be established; this is not a code verdict"],
                       reports=[("probe", "USAGE_PROBE: INCONCLUSIVE")])
@@ -2418,7 +2466,7 @@ check("apply_answer: quality_bar -> recorded through the queue -> quality_bar_ga
 u = AA("checklist_accept", "Drop", esc=escalation("checklist_accept", "q", data={"multiple_choice": True, "index": 0}))
 check("apply_answer: checklist_accept -> recorded through the queue -> checklist_round", u["_next"] == "checklist_round" and u["choice_index"] == 1)
 check("apply_answer: amend_cap stop -> end_blocked", AA("amend_cap", "Stop and report")["_next"] == "end_blocked")
-u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"design": 9})
+u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_MAX + 1, amend_counts={"design": 9}, quality_recorded=True)
 check("apply_answer: amend_cap allow on an escalation with no source -> one more cycle of every source and the ceiling, then gate1",
       u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1
       and u["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX - 1}, u)
@@ -2532,7 +2580,7 @@ check("apply_answer: stop and abort follow the reply's intent: negated or qualif
 def _surrogate_replies():
     outs = [AA("clarify", "~x\ud800/notes.md"), AA("need_design_doc", "~u\ud800"),
             AA("amend_cap", "Allow one more amendment cycle", esc=E_AC, last_answer_text="1 - keep the \ud800 note")]
-    return (outs[0]["_next"] == "orient_read" and outs[1]["_next"] == "end_blocked" and outs[2]["_next"] == "gate1_build"
+    return (outs[0]["_next"] == "orient_read" and outs[1]["_next"] == "end_blocked" and outs[2]["_next"] == "quality_bar_gate"
             and any("keep the \ud800 note" in d for d in outs[2].get("decisions", []))
             and "keep the" in read_file(os.path.join(base_state()["run_dir"], "decisions.md"))), [o["_next"] for o in outs]
 
@@ -2552,9 +2600,13 @@ ac_opts = [(o["text"], o["recommended"]) for o in u.get("escalation", {}).get("o
 check("reseal_gate: amend_cap offers 'Allow one more amendment cycle' first and recommended; Stop stays, not recommended",
       ac_opts == [("Allow one more amendment cycle", True), ("Stop and report", False)], ac_opts)
 u = AA("amend_cap", "Allow one more amendment cycle", esc=E_AC, amend_counts={"gate1": 9},
-       last_answer_text="1 - the leak questions are new each round")
+       last_answer_text="1 - the leak questions are new each round", quality_recorded=True)
 check("apply_answer: amend_cap allow with a reason -> one more cycle, the owner's reason in the ledger",
       u["_next"] == "gate1_build" and any("the leak questions are new each round" in d for d in u.get("decisions", [])), u.get("decisions"))
+u = AA("amend_cap", "Allow one more amendment cycle", esc=escalation("amend_cap", "q", AMEND_CAP_NEW, data={"source": "design", "over": ["source"]}),
+       amend_counts={"design": 9})
+check("apply_answer: amend_cap allow on a plan with no quality bar recorded -> quality_bar_gate, not Gate 1",
+      u["_next"] == "quality_bar_gate", u.get("_next"))
 u = gates.gate2_route(base_state(gate2_result="PLAN_REVIEW: REJECT\n1. line 4 is wrong", oracle_rejects=STRIKE_LIMIT))
 g2_opts = [(o["text"], o["recommended"]) for o in u["escalation"]["options"]]
 check("gate2_route: gate2_stuck offers 'Another fix round (state reason)' first and recommended; override and stop are explicit picks only",
