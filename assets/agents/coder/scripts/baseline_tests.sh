@@ -114,9 +114,9 @@ else
   rel_dir=${workdir#"$top"/}
 fi
 key=$(printf '%s\n%s\n%s' "$head" "$rel_dir" "$cmd" | gate_sha256 | cut -c1-16)
-store=$(git -C "$workdir" rev-parse --git-path coyote-baselines)
-[[ "$store" == /* ]] || store="$workdir/$store"
-record="$store/tests-$key.json"
+records_dir=$(git -C "$workdir" rev-parse --git-path coyote-baselines)
+[[ "$records_dir" == /* ]] || records_dir="$workdir/$records_dir"
+record="$records_dir/tests-$key.json"
 short_head=${head:0:7}
 
 if [[ -f "$record" ]] && jq -e '.version == 1 and (.status == "green" or .status == "red")' "$record" >/dev/null 2>&1; then
@@ -166,6 +166,6 @@ export BASELINE_HEAD="$head" BASELINE_WORKDIR="$workdir" BASELINE_CMD="$cmd"
 BASELINE_RECORDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 export BASELINE_RECORDED_AT
 if ! store_baseline "$ids_file"; then
-  BASELINE_EXTRA="This baseline could not be stored under $store, so a later run on this commit will not reuse it."
+  BASELINE_EXTRA="This baseline could not be stored under $records_dir, so a later run on this commit will not reuse it."
 fi
 emit_baseline <"$ids_file"
