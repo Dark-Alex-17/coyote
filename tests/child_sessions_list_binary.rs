@@ -208,6 +208,18 @@ fn write_fixture(dir: &Path, port: u16, save_session: bool) {
     .unwrap();
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 /// One REPL turn as a macro: the prompt, then (when `save`) `.save session`
 /// so the headless macro arm (which saves nothing on its own) leaves the
 /// session file.
@@ -219,7 +231,7 @@ fn run_turn(dir: &Path, prompt: &str, save: bool) -> Output {
     }
     fs::write(dir.join("macros/turn.yaml"), macro_text).unwrap();
     let home = dir.join("home");
-    Command::new(env!("CARGO_BIN_EXE_coyote"))
+    scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(["-a", AGENT, "--session", SESSION, "--macro", "turn"])
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)

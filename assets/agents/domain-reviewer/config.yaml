@@ -35,6 +35,9 @@ variables:
   - name: project_dir
     description: Project directory containing the changes under review
     default: '.'
+  - name: review_grounding
+    description: "'1' grounds the fs read tools in the review checkout: relative paths resolve against project_dir, and a read inside another clone of the same origin repository is refused with the checkout path. Reads in other repositories are unaffected. '0' turns it off."
+    default: '1'
   - name: auto_confirm
     description: Auto-confirm command execution
     default: '1'
@@ -156,7 +159,18 @@ instructions: |
      skill's copy).
   4. **Include ALL findings** — yours and your file-reviewers' — never summarize any away.
   5. **Mandatory checks report even when clean.**
-  6. **End with DOMAIN_REVIEW_COMPLETE** on its own line.
+  6. **Read the checkout under review.** Pass absolute paths under the Project directory
+     below; a relative path resolves against it, never against the CWD. A read the tools
+     refuse as "another clone of the repository under review" names the checkout path to
+     read instead. Other repositories (callers, shared libraries, consumers) stay readable.
+  7. **Anchor every finding you can in the diff.** `File` is a changed file of your slice (relative
+     to the checkout) and `Lines` is the changed range, or lines within 3 of it, taken from
+     the diff or `fs_read` line numbers, never estimated. A caller, consumer or unchanged
+     twin outside the diff, in this repository or another, is anchored at the changed line
+     with the external location (repo + path:line) cited as evidence. A finding with no
+     changed line to cite (missing code, a missing twin) is still reported at the location
+     it is about; a script notes that it does not anchor, and never drops it.
+  8. **End with DOMAIN_REVIEW_COMPLETE** on its own line.
 
   ## Context
   - Project: {{project_dir}}

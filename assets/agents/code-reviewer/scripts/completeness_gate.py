@@ -12,6 +12,13 @@ complete.
 import json
 import os
 import re
+import sys
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 REQUIRED = [
     ("## Domain:", "the `## Domain:` header"),
@@ -24,7 +31,7 @@ MAX_RETRIES = 1
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -48,6 +55,18 @@ def main():
                 {
                     "_next": "review_domain",
                     "gate_attempts": attempts + 1,
+                    # The rejection is a FORMAT violation; the rejected report is
+                    # the leader's own same-tree analysis. Hand it back so the
+                    # retry reuses it instead of re-reviewing the slice from
+                    # scratch (a full leader-lane re-run to recover a header).
+                    "gate_prior_report": (
+                        "## YOUR PREVIOUS REPORT (rejected by the completeness gate "
+                        "for the missing sections named in MUST DO - it is your own "
+                        "analysis of this same diff. REUSE it: re-emit the full, "
+                        "corrected report; re-run ONLY checks that are genuinely "
+                        "absent below, and never invent content for a check you did "
+                        "not run.)\n\n" + report
+                    ),
                     "gate_feedback": (
                         "- COMPLETENESS GATE REJECTED your previous report — missing: "
                         + "; ".join(missing)

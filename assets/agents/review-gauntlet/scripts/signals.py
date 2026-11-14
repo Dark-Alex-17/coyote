@@ -22,11 +22,19 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -76,55 +84,50 @@ def git_diff(*args):
 def normalize_base(spec):
     """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
     commits that landed on the base after branching never surface as changes.
-    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    Explicit `..` ranges are the caller's choice and pass through untouched, and
+    so does a checkpoint commit on top of HEAD, whose merge-base would be HEAD."""
     if ".." in spec:
         return spec
     try:
-        return git("merge-base", spec, "HEAD").strip()
+        base = git("merge-base", spec, "HEAD").strip()
     except Exception:  # noqa: BLE001 — the plain diff below reports the real error
         return spec
+    try:
+        head, commit = git("rev-parse", "HEAD", f"{spec}^{{commit}}").split()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    if base != head or head == commit:
+        return base
+    try:
+        # a commit some ref holds is a real base ahead of HEAD, never a checkpoint
+        held = git("for-each-ref", "--count=1", "--contains", commit).strip()
+    except Exception:  # noqa: BLE001 -- the merge-base stands
+        return base
+    return base if held else spec
 
 
 # Shared surface patterns: the primary diff and the re-review delta are
-# classified with the SAME rules, so "would the delta alone have selected
-# this lane" (build_items' narrowing test) is answered on the same evidence
-# basis the original selection used.
-DOCS_RE = r"\.(md|rst|txt|adoc)$"
-TESTS_RE = (
-    r"(^|/)tests?/|(^|/)testdata/|(^|/)__tests__/|(^|/)spec/"
-    r"|_test\.|\.test\.|(^|/)test_|_spec\.|\.spec\."
+# classified with the SAME rules, so
+# "would the delta alone have selected this lane" (build_items' narrowing
+# test) is answered on the same evidence basis the original selection used.
+# The one copy of the rules is agents/.shared/diff_signals.py. Without it the
+# signals are unavailable: diff_signals() raises and the signals_error path
+# below degrades lane selection WIDER instead of guessing.
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared")
 )
-# auth(?!or(?!i[sz])) admits auth/authn/authz/oauth/authoriz(e|ation) but not
-# "author". Deliberately wider than code-reviewer's touches_auth (token,
-# session, secret; tests and docs included).
-# Over-firing here is the safe direction: it only ADDS a lane.
-AUTH_PATH_RE = (
-    r"auth(?!or(?!i[sz]))|login|logout|token|session|permission|rbac|\bacl\b|credential|secret"
-)
-# Superset of code-reviewer facts.py's content vocabulary plus token/session.
-AUTH_ADDED_RE = (
-    r"auth(?!or(?!i[sz]))|password|token|secret|credential|jwt|session|bearer"
-    r"|permission|rbac|\bacl\b|csrf|saml|oidc|\bsso\b|\bmfa\b|\botp\b"
-)
-DEPS_RE = (
-    r"go\.(mod|sum)$|package(-lock)?\.json$|yarn\.lock$|pnpm-lock\.yaml$"
-    r"|Cargo\.(toml|lock)$|requirements[^/]*\.txt$|pyproject\.toml$"
-    r"|Gemfile(\.lock)?$|pom\.xml$|build\.gradle|composer\.(json|lock)$"
-)
-EXEC_RE = (
-    r"exec\.Command|subprocess|os/exec|Runtime\.getRuntime"
-    r"|shell_exec|\beval\(|\bsystem\(|child_process"
-)
-CONSUMER_RE = (
-    r"routes?|handlers?|\bapi\b|endpoints?|\bcmd/|\bcli\b|\.proto$"
-    r"|openapi|swagger|controllers?|graphql"
-)
-PROTO_RE = r"\.proto$|buf\.(yaml|gen\.yaml)$"
-MIGRATIONS_RE = r"migrations?/|\.sql$"
+try:
+    from diff_signals import classify as _classify
+    _classify_error = ""
+except Exception as e:  # noqa: BLE001 - reported through signals_error
+    _classify = None
+    _classify_error = f"shared diff_signals module unavailable: {e}"
 
 
 def diff_signals(spec_):
     """Changed files + lane-selection signals for one diff spec."""
+    if _classify is None:
+        raise RuntimeError(_classify_error)
     if spec_.startswith("-"):
         raise ValueError(
             f"diff spec {spec_!r} is option-shaped; pass a revision, a range, or worktree"
@@ -140,26 +143,7 @@ def diff_signals(spec_):
     added = "\n".join(
         l for l in difftext.splitlines() if l.startswith("+") and not l.startswith("+++")
     )
-
-    def any_path(pattern):
-        return any(re.search(pattern, f, re.I) for f in files)
-
-    return {
-        "files": files,
-        "touches_proto": any_path(PROTO_RE),
-        "touches_migrations": any_path(MIGRATIONS_RE),
-        "touches_auth": any_path(AUTH_PATH_RE)
-        or bool(re.search(AUTH_ADDED_RE, added, re.I)),
-        "touches_deps": any_path(DEPS_RE),
-        "touches_exec": bool(re.search(EXEC_RE, added)),
-        "consumer_surface": any_path(CONSUMER_RE),
-        "docs_only": bool(files)
-        and all(re.search(DOCS_RE, f, re.I) for f in files),
-        "tests_docs_only": bool(files)
-        and all(
-            re.search(DOCS_RE, f, re.I) or re.search(TESTS_RE, f, re.I) for f in files
-        ),
-    }
+    return _classify(files, added)
 
 
 out = {"project_dir": proj, "diff_spec_resolved": spec}

@@ -94,6 +94,18 @@ fn install_stub_sbx(root: &Path) -> PathBuf {
     log
 }
 
+/// Removes every inherited `COYOTE_*` variable, so a developer's own
+/// override (`COYOTE_CONFIG_FILE` beats the scratch config dir) never
+/// reaches the child; the harness then sets the ones it needs.
+fn scrub_coyote_env(cmd: &mut Command) -> &mut Command {
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| k.starts_with("COYOTE_")) {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
 fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let home = root.join("home");
     let path = format!(
@@ -102,7 +114,7 @@ fn run_coyote_in(root: &Path, cwd: &Path, args: &[&str], extra_env: &[(&str, &st
         env::var("PATH").unwrap_or_default()
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    command
+    scrub_coyote_env(&mut command)
         .args(args)
         .current_dir(cwd)
         .env("PWD", cwd)
@@ -446,7 +458,7 @@ exit 0
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let mut child = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(["--sandbox", "--sandbox-name", "probe", "--headless"])
         .current_dir(&root)
         .env("PWD", &root)
@@ -538,7 +550,7 @@ fn usage_probe_terminal_launch_picks_run_or_exec_by_mode() {
             root.join("bin").display(),
             env::var("PATH").unwrap_or_default()
         );
-        let out = command
+        let out = scrub_coyote_env(&mut command)
             .current_dir(&root)
             .env("PWD", &root)
             .env("COYOTE_CONFIG_DIR", root.join("config"))
@@ -653,7 +665,7 @@ exit 0
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let out = command
+    let out = scrub_coyote_env(&mut command)
         .current_dir(&root)
         .env("PWD", &root)
         .env("COYOTE_CONFIG_DIR", root.join("config"))
@@ -720,7 +732,7 @@ exit 0
         root.join("bin").display(),
         env::var("PATH").unwrap_or_default()
     );
-    let child = Command::new(env!("CARGO_BIN_EXE_coyote"))
+    let child = scrub_coyote_env(&mut Command::new(env!("CARGO_BIN_EXE_coyote")))
         .args(["--sandbox", "--sandbox-name", "probe", "--headless", "hi"])
         .current_dir(&root)
         .env("PWD", &root)

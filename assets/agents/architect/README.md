@@ -153,6 +153,7 @@ coyote -a architect \
 | `escalation_policy` | `interactive` | `interactive` (pause and ask) · `autonomous` (self-resolve decisions covered by a standing ruling in `~/.config/coyote/share/standing-rulings.md` or a clearly recommended option; everything self-resolved lands in a “Decisions taken autonomously” digest in the Phase F report and PR body; secrets/money/destructive actions and novel conflicts still escalate). |
 | `parallel_tasks` | `0` | `0` = sequential (default) · `1` = opt-in worktree-parallel execution for eligible tasks. |
 | `pr_strategy` | `single` | `single` = one draft PR for the whole design doc (default) · `multi` = the plan partitions tasks into PR groups, each landing as its own stacked draft PR at group close-out. |
+| `task_granularity` | `standard` | `standard` = ~1 engineer-day tasks (default; the render is byte-identical to before the variable existed) · `micro` = one-seam tasks (<=3 files, compile-atomicity floor) with exact signatures and EXECUTABLE acceptance criteria, grouped into plan-section batches (`batch:` / `protected:` task frontmatter). Cadence: per task, Sisyphus runs coder verification only (spawned with `review_cadence: batch`) + the architect's direct adversary criteria check; per batch (last task, or early at a `protected` task) the full review gauntlet over the batch delta, with a resume-fix-renarrow failure loop bounded at 3 strikes per batch. Gate 1 / Gate 2 invoke the `plan-gatekeeping` / `plan-authoring` **Micro-grain addendum** sections by name (inert otherwise). |
 | `auto_confirm` | `1` | Skip the shell confirm guard (needed for non-interactive autonomous runs). |
 | `build_lock` | *(empty)* | Command prefix (e.g. `flock -w 240 /tmp/coyote-cargo.lock`) forwarded to every Sisyphus spawn and from there to the coder/step-runner gates and the review-gauntlet/adversary verification runs, so parallel worktrees sharing one target directory serialise their builds. Empty runs them bare. The value is substituted raw into a JSON string on every hop, so it must be free of double quotes and backslashes; quote paths with single quotes (`flock '/tmp/my lock'`). |
 
@@ -161,12 +162,26 @@ coyote -a architect \
 `config.yaml` sets `dynamic_instructions: true`: at session start the `_instructions` tool
 (tools.sh) renders `instructions.md`, resolving `<!-- when:<var>[=value] --> ... <!-- end -->`
 blocks against the agent variables (`autonomy`, `escalation_policy`, `parallel_tasks`,
-`pr_strategy`) via the shared `render_instructions` helper in `agents/.shared/utils.sh`. Only the
+`pr_strategy`, `task_granularity`) via the shared `render_instructions` helper in
+`agents/.shared/utils.sh`. Only the
 sections matching the active values reach the model — a sequential run never carries the
 parallel-mode worktree machinery, an interactive run never carries the autonomous-escalation
 ladder, a single-PR run never carries the PR-group stacking mechanics — which trims context and
 removes inapplicable-mode hallucination bait. The static `instructions:` field in `config.yaml` is
 a placeholder; edit `instructions.md`.
+
+### Bookkeeping tools (tools.sh)
+
+The mechanical, ground-truth-on-disk Phase F steps are tool calls; judgment stays with the
+model (the Problem/Approach summary, acceptance verdicts):
+
+| Tool | Replaces |
+|---|---|
+| `collect_ledger_lines --tag ... --plan ... --dir ... [--tasks TASK-a,TASK-b]` | re-reading every `log.md` for `rejected-finding:` / `design-decision` / `debris-exempt` / `Follow-ups:` / `(deferred by quality bar)` rollups - grep-complete instead of attention-complete; `--plan` (required) keeps the read to the named plan's `status: complete` tasks, since the tasks dir is shared across plans (a task whose `index.md` has no `plan:` or no `status:` field is kept and named in a `NOTE`), and `--tasks` narrows it to a PR group's members; `plan_tasks.py` holds that one selection rule for both tools |
+| `assemble_pr_body --plan ... --tasks-dir ... --summary-file ... [--tasks TASK-a,TASK-b] [--followups] [--quality-note ...]` | hand-assembling the draft PR body (Quality bar from plan `rigor:`, task checklist with `completed`-entry SHAs, ledger sections; `--tasks` scopes the checklist and the ledger rollups to a PR group's members); `assemble_pr_body.py` does the derivation and prints `NOTE` lines for anything it could not derive |
+
+Both fail open to the manual path they replace: a non-zero return or a `NOTE` leaves the
+architect exactly where the prose would have had it, and says what to fix.
 
 ## Autonomy
 

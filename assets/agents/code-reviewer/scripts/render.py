@@ -8,10 +8,17 @@ ever added or removed here.
 
 import json
 import os
+import sys
+
+# State, diffs and reports carry emoji and non-ASCII paths; never decode them
+# with the platform default (cp1252 on Windows).
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 def load_state():
     if path := os.environ.get("GRAPH_STATE_FILE"):
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return json.loads(os.environ.get("GRAPH_STATE", "{}"))
 
@@ -37,7 +44,8 @@ def main():
     faulted = str(v.get("reason") or "").startswith("PIPELINE-FAULT:") or any(
         isinstance(a, str) and a.startswith("PIPELINE-FAULT:") for a in v.get("attention") or []
     )
-    if not changed and not faulted:
+    generated = [g for g in (state.get("generated_files") or []) if isinstance(g, str)]
+    if not changed and not faulted and not generated:
         print(json.dumps({"final_report": "# Code Review Summary\n\nNo changes to review."}))
         return
 
@@ -83,6 +91,30 @@ def main():
                 lines += [x.get("block", ""), ""]
     else:
         lines += ["No blocking findings.", ""]
+
+    unanchored = [u for u in (state.get("unanchored") or []) if isinstance(u, dict)]
+    if unanchored:
+        icon_by_id = {str(x.get("id")): x.get("icon", "") for x in findings}
+        lines += [
+            "## Not anchored in the diff",
+            "",
+            "These findings cite a file or lines outside this diff's changes (a caller, a "
+            "consumer or missing code can be). Each went to verification with that fact and is "
+            "reported in full at its stated severity unless marked not reported:",
+            "",
+        ]
+        lines += [
+            f"- {icon_by_id.get(str(u.get('id')), '(not reported: refuted by the verifier or dropped by the quality bar)')} "
+            f"{one_line(u.get('title', ''))} -- "
+            f"`{one_line(u.get('file', ''))}:{one_line(u.get('lines', ''))}` "
+            f"({one_line(u.get('reason', ''))})"
+            for u in unanchored
+        ]
+        lines += [""]
+    if generated:
+        lines += ["## Generated, not reviewed", ""]
+        lines += [f"- `{one_line(g)}`" for g in generated]
+        lines += [""]
 
     lines += ["## Cross-File Concerns", state.get("cross_file") or "None", ""]
     if (state.get("operational_history") or "").strip():

@@ -9,7 +9,10 @@ or confirmation-bias the check. A graph can't: the structure IS the discipline.
 
 ```mermaid
 flowchart TD
-    A["parse (llm, max_attempts 2)"] --> B["verify_each (map, max_concurrency 4): one branch per finding"]
+    S["parse_script (script): start node, parses the findings JSON"] --> B["verify_each (map, max_concurrency 4): one branch per finding"]
+    S -->|"any anomaly"| A["parse (llm, max_attempts 2)"]
+    S -. "script crashed" .-> A
+    A --> B
     A -. "fallback" .-> PF["parse_fault (script): verdicts = one UNVERIFIABLE PIPELINE-FAULT entry"]
     PF --> D
     B -. "spawns × N" .-> C["verify_one (llm + fs tools, max_attempts 2)"]
@@ -19,8 +22,12 @@ flowchart TD
     B --> D(["done (end): FINDING_VERIFIER_RESULTS"])
 ```
 
-1. **parse** — extracts every 🔴/🟡 finding from the spawn prompt into a structured list
-   (id, severity verbatim, path, lines, self-contained claim). Extraction only — no judging.
+1. **parse_script** (the start node) parses the structured findings JSON the caller embeds
+   in the spawn prompt, with no LLM call. On ANY anomaly (unparseable JSON, a missing or
+   mistyped field, an unclassifiable severity, an empty id) it routes to the LLM **parse**
+   node instead, and a crash of the script falls forward to the same node. **parse**
+   extracts every critical/warning finding from the spawn prompt into a structured list
+   (id, severity verbatim, path, lines, self-contained claim). Extraction only, no judging.
    Gets two attempts (`max_attempts: 2`); if both fail, its `fallback` routes to
    `parse_fault`, which rewrites `verdicts` to a single UNVERIFIABLE entry naming the fault
    and jumps straight to `done`.
@@ -68,6 +75,7 @@ installed, code-reviewer runs the same contract inline as a fallback.
 
 - `graph.yaml` — the agent (no tools.sh; the graph grants `fs_read`/`fs_cat`/`fs_grep`
   per node).
+- `scripts/parse_findings.py` - the deterministic start-node parse.
 - `scripts/verdict_gate.py` — the deterministic contract gate.
 - `scripts/parse_fault.py`, `scripts/verify_fault.py` — the fault markers behind the
   dashed fallback edges.
