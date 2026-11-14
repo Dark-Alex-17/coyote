@@ -244,15 +244,19 @@ def main():
                     f"round and {why}"
                 )
 
+        # Security narrows only on a tests/docs-only delta: a source change
+        # with no auth/deps/exec signal can still alter input handling.
         narrow(
             "security",
-            not (
+            bool(state.get("delta_tests_docs_only"))
+            and not (
                 state.get("delta_touches_auth")
                 or state.get("delta_touches_deps")
                 or state.get("delta_touches_exec")
                 or state.get("security_posture") == "hardened"
             ),
-            f"the re-review delta ({delta_summary}) has no attack-surface signals",
+            f"the re-review delta ({delta_summary}) is tests/docs-only with no "
+            "attack-surface signals",
         )
         narrow(
             "probe",
