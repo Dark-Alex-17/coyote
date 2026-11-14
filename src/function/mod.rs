@@ -1849,7 +1849,7 @@ impl ToolCall {
                         json!({"tool_call_error": error_msg})
                     })
             }
-            _ => match run_llm_function(
+            _ => match run_llm_function_off_worker(
                 cmd_name,
                 cmd_args,
                 envs,
@@ -1861,7 +1861,9 @@ impl ToolCall {
                     Origin::from(&*ctx),
                 ),
                 ctx.session_abort.clone(),
-            ) {
+            )
+            .await
+            {
                 Ok(Some(contents)) => serde_json::from_str(&contents)
                     .ok()
                     .unwrap_or_else(|| json!({"output": contents})),
@@ -2536,6 +2538,35 @@ impl ToolIo {
         self.prompter = Some(prompt_channel::ToolPrompter::new(prompter, memory, origin));
         self
     }
+}
+
+/// Runs [`run_llm_function`] on the blocking pool. Its wait loop sleeps
+/// its thread for the whole tool run; on a runtime worker that can strand
+/// the IO and time drivers, which only parked workers service, and every
+/// timer and socket in the process (the TUI's frames included) then waits
+/// for the tool to end.
+pub(crate) async fn run_llm_function_off_worker(
+    cmd_name: String,
+    cmd_args: Vec<String>,
+    envs: HashMap<String, String>,
+    agent_name: Option<String>,
+    tool_timeout: Option<u64>,
+    io: ToolIo,
+    abort: Option<AbortSignal>,
+) -> Result<Option<String>> {
+    tokio::task::spawn_blocking(move || {
+        run_llm_function(
+            cmd_name,
+            cmd_args,
+            envs,
+            agent_name,
+            tool_timeout,
+            io,
+            abort,
+        )
+    })
+    .await
+    .unwrap_or_else(|err| Err(anyhow!("tool task panicked: {err}")))
 }
 
 pub fn run_llm_function(

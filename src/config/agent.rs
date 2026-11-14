@@ -908,15 +908,29 @@ impl Agent {
     }
 
     fn run_instructions_fn(&self, tool_timeout: Option<u64>) -> Result<String> {
-        let value = run_llm_function(
-            self.name().to_string(),
-            vec!["_instructions".into(), "{}".into()],
-            self.variable_envs(),
-            Some(self.name().to_string()),
-            tool_timeout,
-            ToolIo::new(Arc::new(SilentSink), None, 0),
-            None,
-        )?;
+        let run = || {
+            run_llm_function(
+                self.name().to_string(),
+                vec!["_instructions".into(), "{}".into()],
+                self.variable_envs(),
+                Some(self.name().to_string()),
+                tool_timeout,
+                ToolIo::new(Arc::new(SilentSink), None, 0),
+                None,
+            )
+        };
+        // The tool blocks its thread until it exits; on a multi-thread
+        // worker that would strand the runtime's drivers. block_in_place
+        // panics on a current-thread runtime, so it is used only on the
+        // multi-thread flavour.
+        let on_multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        let value = if on_multi_thread {
+            tokio::task::block_in_place(run)
+        } else {
+            run()
+        }?;
         instructions_from_tool_output(value)
     }
 
