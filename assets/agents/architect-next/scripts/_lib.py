@@ -376,8 +376,13 @@ def snapshot(state, updates, phase):
 
 
 def read_snapshot(run_dir):
-    """The run's last snapshot (<run_dir>/state.json); {} when there is none."""
-    return as_dict(read_artifact(run_dir, "state.json")) if isinstance(run_dir, str) and run_dir else {}
+    """The run's last snapshot (<run_dir>/state.json); {} when there is none or it is not UTF-8 JSON."""
+    if not (isinstance(run_dir, str) and run_dir):
+        return {}
+    try:
+        return as_dict(read_artifact(run_dir, "state.json"))
+    except ValueError:
+        return {}
 
 
 def ledger(state, updates, line):
@@ -919,8 +924,8 @@ def heal_state(state):
         _heal_path(healed, notes, snap, key)
     if _task_list(healed.get("tasks")) is None:
         run_dir = healed.get("run_dir")
-        raw = read_artifact(run_dir, "tasks.json") if isinstance(run_dir, str) and run_dir else ""
         try:
+            raw = read_artifact(run_dir, "tasks.json") if isinstance(run_dir, str) and run_dir else ""
             saved = _task_list(json.loads(raw)) if raw else None
         except ValueError:
             saved = None

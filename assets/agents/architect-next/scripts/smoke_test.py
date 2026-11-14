@@ -1745,6 +1745,7 @@ u = gates.wave_integrate(base_state(plan_path=PROMOTED, tasks=TS_W, wave_results
 check("wave_integrate: per-task-stack multi conforms -> PR already open -> harvest_report", MULTI_IS_GROUPS or (u["_next"] == "harvest_report" and gates.task_by_id(u["tasks"], T1)["pr_number"] == "42"))
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=TS_W, integration_task=T1, run_branch="feat/PLAN-widgets", verification_commands='["true"]'))
 check("integration_test: merge --no-ff + suite green -> push + harvest_report", u["_next"] == "harvest_report" and "Widget()" in read_file(os.path.join(CODE, "src", "a.go")) and git(CODE, "rev-parse", "origin/feat/PLAN-widgets") == git(CODE, "rev-parse", "HEAD"))
+INTEGRATED = u["task_rounds"]
 write(os.path.join(CODE, "src", "b.go"), "package b // main side\n"); git(CODE, "add", "."); git(CODE, "commit", "-q", "-m", "run branch edit")
 wt1 = WAVE[1]["worktree"]
 write(os.path.join(wt1, "src", "b.go"), "package b // task side\n"); git(wt1, "add", "."); git(wt1, "commit", "-q", "-m", f"feat({T3}): worker")
@@ -1760,7 +1761,7 @@ check("integration_test: B14 exhausted -> escalation integration_red", u["escala
 ts_cl = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl, T1).update({"status": "complete", "worktree": wt0, "branch": WAVE[0]["branch"]})
 git(CODE, "push", "-q", "origin", WAVE[0]["branch"])
-u = gates.wave_cleanup(base_state(plan_path=PROMOTED, tasks=ts_cl, current_task=T1, run_branch="feat/PLAN-widgets", wave_results=[]))
+u = gates.wave_cleanup(base_state(plan_path=PROMOTED, tasks=ts_cl, current_task=T1, run_branch="feat/PLAN-widgets", wave_results=[], task_rounds=INTEGRATED))
 check("wave_cleanup: single + merged -> worktree removed + task branch deleted (local + remote)", not os.path.isdir(wt0) and git(CODE, "branch", "--list", WAVE[0]["branch"]) == "" and u["_next"] == "select_tasks")
 ts_cl2 = copy.deepcopy(TS_W)
 gates.task_by_id(ts_cl2, T3).update({"status": "complete", "worktree": wt1, "branch": WAVE[1]["branch"]})
@@ -2805,8 +2806,9 @@ check("ci_apply: infra -> escalation ci_infra (wait-or-escalate)", gates.ci_appl
 check("ci_apply: unsure defaults UP (never a re-run)", gates.ci_apply(base_state(pr_number="99", ci_verdict="unsure", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
 check("ci_apply: dead diagnose = unsure", gates.ci_apply(base_state(pr_number="99", ci_verdict="", last_node_output="llm node failed", failing_checks=["test"]))["escalation"]["kind"] == "ci_unsure")
 os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo false"
 u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
-check("flip_ready: single green -> gh pr ready -> finish_plan", u["flipped_ready"] and u["_next"] == "finish_plan")
+check("flip_ready: single green -> gh pr ready, isDraft re-read false -> finish_plan", u["flipped_ready"] and u["_next"] == "finish_plan")
 if MULTI_IS_GROUPS:
     u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f, pr_strategy="multi", closeout_scope="group", closeout_unit="g1"))
     check("flip_ready: group close-out -> next group", u["_next"] == "select_tasks" and u["closeout_done_for"] == "g1")
@@ -3937,20 +3939,26 @@ u = gates.post_round(base_state(**WATCH, current_task=T1, verify_unit=T1, delega
 check("fix origin: post_round with delegation_kind already reset to implement and origin review -> fix_done", u.get("_next") == "fix_done", u.get("_next"))
 u = AA("task_failed", "Abort this task and stop", current_task=T1, tasks=tasks_with(), fix_origin_return="review")
 check("fix origin: task_failed abort clears fix_origin_return", u.get("_next") == "end_aborted" and u.get("fix_origin_return") == "", u.get("fix_origin_return"))
-for ret in ("integration", "batch"):
-    s, steps = fix_origin_chain(ret, GBLOCK, GPASS)
-    s.update(gates.post_round(s))
-    u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
-    check(f"fix origin scope: a BLOCKED {ret} fix round keeps fix_origin_return empty; fix_done follows fix_return_to verify -> select_tasks",
-          steps[0].get("fix_return_to") == ret and all(st.get("fix_origin_return") == "" for st in steps) and steps[1].get("fix_return_to") == "verify"
-          and u.get("_next") == "select_tasks", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+s, steps = fix_origin_chain("batch", GBLOCK, GPASS)
+s.update(gates.post_round(s))
+u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+check("fix origin scope: a BLOCKED batch fix round keeps fix_origin_return empty; fix_done follows fix_return_to verify -> select_tasks",
+      steps[0].get("fix_return_to") == "batch" and all(st.get("fix_origin_return") == "" for st in steps) and steps[1].get("fix_return_to") == "verify"
+      and u.get("_next") == "select_tasks", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+s, steps = fix_origin_chain("integration", GBLOCK, GPASS)
+s.update(gates.post_round(s))
+u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
+check("fix origin scope: a BLOCKED integration fix round keeps the integration origin through the conformance round; fix_done -> integration_test",
+      steps[1].get("fix_return_to") == "verify" and all(st.get("fix_origin_return") == "integration" for st in steps)
+      and u.get("_next") == "integration_test", ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
 for ret, pend, want in (("integration", [], "integration_test"), ("batch", [], "batch_gauntlet_build"),
                         ("batch", [{"task": T2, "items": ["y"], "source": "batch", "return_to": "batch"}], "select_tasks")):
     s, steps = fix_origin_chain(ret, GPASS, pending_fixes=pend)
     s.update(gates.post_round(s))
     u = gates.fix_done(s) if s.get("_next") == "fix_done" else {}
-    check(f"fix origin scope: a passing {ret} fix round{' with pending fixes' if pend else ''} keeps fix_origin_return empty; fix_done -> {want}",
-          all(st.get("fix_origin_return") == "" for st in steps) and u.get("_next") == want, ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
+    origin = "integration" if ret == "integration" else ""
+    check(f"fix origin scope: a passing {ret} fix round{' with pending fixes' if pend else ''} keeps fix_origin_return {origin or 'empty'}; fix_done -> {want}",
+          all(st.get("fix_origin_return") == origin for st in steps) and u.get("_next") == want, ([st.get("fix_origin_return") for st in steps], s.get("_next"), u.get("_next")))
 
 # ---------------------------------------------------------------- truncation: a review read that overflows a page stops the watch
 def paged(decision="", **lists):
@@ -4619,6 +4627,183 @@ heal_disk(plan_path="/elsewhere.md")
 guarded("heal_state: valid values are never overwritten, and a state with no run is left alone",
         lambda: (lambda a, b: (a[1] == [] and a[0]["plan_path"] == PROMOTED and a[0]["code_repo_path"] == "" and b == ({"tasks": "x"}, []), (a[1], b)))(
             _lib.heal_state(heal_base(plan_path=PROMOTED, code_repo_path="")), _lib.heal_state({"tasks": "x"})))
+heal_disk()
+with open(os.path.join(HEAL_DIR, "state.json"), "wb") as _f:
+    _f.write(b"\xff\xfe{not json")
+with open(os.path.join(HEAL_DIR, "tasks.json"), "wb") as _f:
+    _f.write(b"\xff\xfe[not json")
+rc, u, err = entry("harvest_report", heal_base(tasks="garbage", code_repo_path=None))
+check("entry harvest_report: state.json and tasks.json not UTF-8 -> no crash, the gate runs or raises state_fault",
+      rc == 0 and (u.get("_next") == "design_ask_gate" or (u.get("escalation") or {}).get("kind") == "state_fault"), f"rc={rc} {err}")
+
+# ---------------------------------------------------------------- task branch cleanup only after a verified merge
+RB = "feat/PLAN-widgets"
+git(CODE, "checkout", "-q", RB)
+
+
+def task_branch(name, merge=False):
+    """A task branch with one commit in its own worktree, pushed; merged into the run branch and pushed when asked."""
+    wt = os.path.join(CODE, ".worktrees", name)
+    git(CODE, "worktree", "add", "-q", wt, "-b", name, RB)
+    write(os.path.join(wt, f"{name}.txt"), name + "\n")
+    git(wt, "add", ".")
+    git(wt, "commit", "-q", "-m", f"feat: {name}")
+    git(CODE, "push", "-q", "origin", name)
+    if merge:
+        git(CODE, "merge", "-q", "--no-ff", "--no-edit", name)
+        git(CODE, "push", "-q", "origin", RB)
+    return wt, git(CODE, "rev-parse", name)
+
+
+def on_origin(branch):
+    return git(CODE, "ls-remote", "--heads", "origin", branch) != ""
+
+
+def local(branch):
+    return git(CODE, "branch", "--list", branch) != ""
+
+
+def cleanup_task(wt, branch, status="complete", **rounds):
+    ts = copy.deepcopy(TS_W)
+    gates.task_by_id(ts, T1).update({"status": status, "worktree": wt, "branch": branch})
+    return gates.wave_cleanup(base_state(plan_path=PROMOTED, tasks=ts, current_task=T1, run_branch=RB, wave_results=[],
+                                         task_rounds={T1: rounds} if rounds else {}))
+
+
+wt_x, sha_x = task_branch("cl-unmerged")
+u = cleanup_task(wt_x, "cl-unmerged")
+check("wave_cleanup: a complete task whose branch was never merged -> branch kept locally and on origin, the reason ledgered",
+      local("cl-unmerged") and on_origin("cl-unmerged") and any("cl-unmerged kept" in d for d in u["decisions"]), u["decisions"])
+wt_x, sha_x = task_branch("cl-unverified", merge=True)
+u = cleanup_task(wt_x, "cl-unverified")
+check("wave_cleanup: merged but no passed integration test recorded -> branch kept locally and on origin",
+      local("cl-unverified") and on_origin("cl-unverified"), u["decisions"])
+wt_x, sha_x = task_branch("cl-merged", merge=True)
+u = cleanup_task(wt_x, "cl-merged", integrated_sha=sha_x)
+check("wave_cleanup: head is the integrated sha and an ancestor of the run branch -> worktree removed, branch deleted (local + origin)",
+      not os.path.isdir(wt_x) and not local("cl-merged") and not on_origin("cl-merged"), u["decisions"])
+wt_x, sha_x = task_branch("cl-moved", merge=True)
+write(os.path.join(wt_x, "late.txt"), "late\n")
+git(wt_x, "add", ".")
+git(wt_x, "commit", "-q", "-m", "late commit")
+git(CODE, "push", "-q", "origin", "cl-moved")
+u = cleanup_task(wt_x, "cl-moved", integrated_sha=sha_x)
+check("wave_cleanup: branch moved past the integrated sha -> branch kept locally and on origin",
+      local("cl-moved") and on_origin("cl-moved"), u["decisions"])
+wt_x, sha_x = task_branch("cl-dirty", merge=True)
+write(os.path.join(wt_x, "scratch.txt"), "uncommitted\n")
+u = cleanup_task(wt_x, "cl-dirty", integrated_sha=sha_x)
+check("wave_cleanup: a worktree that will not remove cleanly -> kept (never forced), follow-up recorded, branch kept",
+      os.path.isdir(wt_x) and local("cl-dirty") and any("cl-dirty" in f for f in u.get("follow_ups", [])), (u["decisions"], u.get("follow_ups")))
+wt_x, sha_x = task_branch("cl-failed")
+write(os.path.join(wt_x, "scratch.txt"), "uncommitted\n")
+u = cleanup_task(wt_x, "cl-failed", status="failed")
+check("wave_cleanup: a failed task's dirty worktree -> force-removed, branch kept locally and on origin",
+      not os.path.isdir(wt_x) and local("cl-failed") and on_origin("cl-failed"), u["decisions"])
+
+wt_x, sha_x = task_branch("int-green")
+ts_i = copy.deepcopy(TS_W)
+gates.task_by_id(ts_i, T1).update({"status": "in-progress", "worktree": wt_x, "branch": "int-green"})
+u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch=RB, task_rounds={}, verification_commands='["true"]'))
+check("integration_test: a green merge records the merged branch head as integrated_sha",
+      u["_next"] == "harvest_report" and u["task_rounds"][T1].get("integrated_sha") == sha_x, u.get("task_rounds"))
+wt_x, sha_x = task_branch("int-checkout")
+gates.task_by_id(ts_i, T1).update({"worktree": wt_x, "branch": "int-checkout"})
+head0 = git(CODE, "rev-parse", "HEAD")
+u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch="no-such-run-branch", task_rounds={}))
+check("integration_test: checkout of the run branch fails -> escalation, nothing merged",
+      u.get("_next") == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "integration_checkout"
+      and git(CODE, "rev-parse", "HEAD") == head0
+      and subprocess.run(["git", "-C", CODE, "merge-base", "--is-ancestor", "int-checkout", "HEAD"]).returncode != 0, u.get("_next"))
+
+
+def finish_fix_round(s):
+    """post_round then fix_done on a finished fix round; (post_round's next, the merged state)."""
+    s.update({"round_log": {T1: [{"round": 1, "head": "h"}]}, "last_verdict": "PASS", "verify_unit": T1})
+    s.update(gates.post_round(s))
+    first = s["_next"]
+    if first == "fix_done":
+        s.update(gates.fix_done(s))
+    return first, s
+
+
+ts_f1 = copy.deepcopy(TS_W)
+gates.task_by_id(ts_f1, T1).update({"status": "in-progress", "worktree": WAVE[0]["worktree"]})
+s = base_state(plan_path=PROMOTED, tasks=ts_f1, current_task=T1, run_branch=RB, integration_task="", task_rounds={T1: {"merged": True, "integration_strikes": 1}},
+               fix_request={"task": T1, "source": "integration", "return_to": "integration", "items": ["Post-merge integration failure"]})
+s.update(gates.fix_round(s))
+s.update({"fix_source": "review", "fix_return_to": "verify"})
+first, s = finish_fix_round(s)
+check("integration fix round (with a conformance round inside) finishing -> fix_done -> integration_test, merged cleared",
+      first == "fix_done" and s["_next"] == "integration_test" and s.get("integration_task") == T1 and not s["task_rounds"][T1].get("merged"),
+      (first, s.get("_next"), s.get("integration_task"), s.get("task_rounds")))
+s = base_state(plan_path=PROMOTED, tasks=copy.deepcopy(ts_f1), current_task=T1, integration_task=T3,
+               last_answer="Retry the task sequentially (one fix round with the evidence)",
+               escalation=gates.escalation("wave_escalation", "q", [gates.option("Retry the task sequentially (one fix round with the evidence)")], evidence="- e"))
+s.update(gates.apply_answer(s))
+first, s = finish_fix_round(s)
+check("wave retry fix round finishing (single) -> integration_test for that task",
+      first == "fix_done" and s["_next"] == "integration_test" and s.get("integration_task") == T1, (first, s.get("_next"), s.get("integration_task")))
+
+# ---------------------------------------------------------------- CI verdicts: only all-pass is green; draft state re-read after gh pr ready
+_ci_saved = {k: os.environ.get(k) for k in ("ARCHITECT_GH_CHECKS_CMD", "ARCHITECT_GH_READY_CMD", "ARCHITECT_GH_VIEW_CMD", "ARCHITECT_GH_RERUN_CMD")}
+CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
+CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
+CI_NO_CI = "Finish without CI (no checks configured; recorded)"
+checks(("build", "pass"), ("e2e", "cancel"))
+u_cancel = gates.ci_poll(base_state(pr_number="99", ci_polls=1))
+check("ci_poll: a cancelled check beside a pass -> inconclusive, not green", u_cancel.get("ci_status") == "inconclusive" and u_cancel["_next"] == "ci_route", u_cancel.get("ci_status"))
+checks(("lint", "skipping"))
+check("ci_poll: skipped checks only -> inconclusive", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "inconclusive")
+checks(("build", "pass"), ("docs", "neutral"))
+check("ci_poll: a neutral check beside a pass -> inconclusive", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "inconclusive")
+checks(("build", "pass"), ("odd", "mystery"))
+check("ci_poll: an unknown bucket -> inconclusive", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "inconclusive")
+checks()
+u = gates.ci_poll(base_state(pr_number="99", ci_polls=1))
+check("ci_poll: an empty check list -> no_checks -> ci_route", u.get("ci_status") == "no_checks" and u["_next"] == "ci_route", u.get("ci_status"))
+checks(("build", "pass"), ("test", "success"))
+check("ci_poll: every check pass or success -> green", gates.ci_poll(base_state(pr_number="99", ci_polls=1)).get("ci_status") == "green")
+u = gates.ci_route(base_state(pr_number="99", ci_status="inconclusive", ci_checks=u_cancel["ci_checks"]))
+ESC_INC = u.get("escalation") or {}
+check("ci_route: inconclusive -> ci_inconclusive evidence escalation naming every check and bucket, re-run recommended when one was cancelled",
+      u["_next"] == "escalate_gate" and ESC_INC.get("kind") == "ci_inconclusive" and "build: pass" in ESC_INC.get("evidence", "")
+      and "e2e: cancel" in ESC_INC.get("evidence", "") and [o["text"] for o in ESC_INC["options"] if o.get("recommended")] == [CI_RERUN_CANCELLED], ESC_INC)
+u = gates.ci_route(base_state(pr_number="99", ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["docs", "skipping", ""]]))
+ESC_SKIP = u.get("escalation") or {}
+check("ci_route: only skipped checks beside a pass -> treat as green recommended",
+      [o["text"] for o in ESC_SKIP.get("options", []) if o.get("recommended")] == [CI_TREAT_GREEN], ESC_SKIP)
+u = gates.ci_route(base_state(pr_number="99", ci_status="no_checks", ci_checks=[]))
+ESC_NONE = u.get("escalation") or {}
+check("ci_route: no_checks -> ci_no_checks escalation, finish without CI recommended",
+      ESC_NONE.get("kind") == "ci_no_checks" and [o["text"] for o in ESC_NONE.get("options", []) if o.get("recommended")] == [CI_NO_CI], ESC_NONE)
+u = AA("ci_inconclusive", CI_TREAT_GREEN, esc=ESC_SKIP, last_answer_text="2 - the docs job is skipped by design", pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive treat as green -> flip_ready with the reason ledgered and recorded, CI status not green",
+      u.get("_next") == "flip_ready" and any("treated as green" in d and "skipped by design" in d for d in u.get("decisions", []))
+      and any("treated as green" in f for f in u.get("follow_ups", [])) and u.get("ci_status") != "green", u)
+u = AA("ci_inconclusive", CI_TREAT_GREEN, esc=ESC_SKIP, **WATCH, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive treat as green while watching -> review_poll", u.get("_next") == "review_poll", u.get("_next"))
+u = AA("ci_inconclusive", "1", esc=ESC_INC, pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive re-run -> ci_poll with the watch reset", u.get("_next") == "ci_poll" and u.get("ci_polls") == 0, u.get("_next"))
+u = AA("ci_inconclusive", "whatever you think", esc=ESC_INC, pr_number="99", tasks=ts_f, ci_status="inconclusive")
+check("apply_answer: ci_inconclusive reply naming no option -> asked again",
+      u.get("_next") == "escalate_gate" and u["escalation"]["kind"] == "ci_inconclusive" and u["escalation"]["data"].get("unmatched_replies") == 1, u.get("_next"))
+u = AA("ci_no_checks", CI_NO_CI, esc=ESC_NONE, pr_number="99", tasks=ts_f, ci_status="no_checks")
+check("apply_answer: ci_no_checks finish without CI -> flip_ready with a follow-up, never CI green",
+      u.get("_next") == "flip_ready" and any("no CI checks" in f for f in u.get("follow_ups", [])) and u.get("ci_status") != "green", u)
+os.environ["ARCHITECT_GH_READY_CMD"] = "true"
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo true"
+u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
+check("flip_ready: gh pr ready exit 0 but isDraft still true -> flipped_ready False, no 'flipped to ready' line",
+      u.get("flipped_ready") is False and not any("flipped to ready" in d for d in u.get("decisions", [])), u.get("decisions"))
+os.environ["ARCHITECT_GH_VIEW_CMD"] = "echo false"
+u = gates.flip_ready(base_state(pr_number="99", tasks=ts_f))
+check("flip_ready: gh pr ready exit 0 and isDraft re-read false -> flipped_ready True", u.get("flipped_ready") is True, u.get("decisions"))
+for _k, _v in _ci_saved.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")

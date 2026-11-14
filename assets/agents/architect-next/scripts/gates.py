@@ -2151,7 +2151,7 @@ def fix_round(state):
     ret = f.get("return_to", "select_tasks")
     u.update({"current_task": f.get("task") or state.get("current_task"), "delegation_kind": "fix",
               "fix_items": as_list(f.get("items")), "fix_source": f.get("source", "review"),
-              "fix_return_to": ret, "fix_origin_return": ret if ret in ("ci", "review") else "",
+              "fix_return_to": ret, "fix_origin_return": ret if ret in ("ci", "review", "integration") else "",
               "fix_note": f.get("note", ""), "fix_request": {}})
     u["_next"] = "compose_delegation"
     return u
@@ -2196,7 +2196,9 @@ def post_round(state):
         ledger(state, u, f"pr-comment: {task['id']} PR #{task['pr_number']} round {n}: {'posted' if ok else 'FAILED ' + tail(out, 120)}")
     if state.get("fix_source") == "probe_adopt" and state.get("delegation_kind") == "fix":
         u.update({"delegation_kind": "implement", "fix_source": "", "fix_items": []})
-    if task.get("status") == "complete" and (state.get("delegation_kind") == "fix" or state.get("fix_origin_return")):
+    # A fix that integration asked for ends at integration_test, where the branch is merged and verified again.
+    if state.get("fix_origin_return") == "integration" or (
+            task.get("status") == "complete" and (state.get("delegation_kind") == "fix" or state.get("fix_origin_return"))):
         u["_next"] = "fix_done"
     else:
         u["_next"] = "harvest_report"
@@ -2219,6 +2221,9 @@ def fix_done(state):
         else:
             u["_next"] = "batch_gauntlet_build"
     elif ret == "integration":
+        rounds = dict(as_dict(state.get("task_rounds")))
+        rounds[task.get("id", "")] = {**as_dict(rounds.get(task.get("id", ""))), "merged": False}
+        u.update({"task_rounds": rounds, "integration_task": task.get("id") or state.get("integration_task") or ""})
         u["_next"] = "integration_test"
     elif ret == "integration_check":
         u["_next"] = "integration_check"
@@ -2637,6 +2642,17 @@ def _run_verification(state, cwd):
     return True, "\n".join(out_all)
 
 
+def _drop_unpushed_merge(state, u, code, run_branch, tr):
+    """Undo this task's earlier merge while it is still the unpushed tip of the run branch, so a fixed branch merges once."""
+    sha, parent = tr.pop("merge_sha", ""), tr.pop("merge_parent", "")
+    if not sha or not parent or git_out(code, "rev-parse", "HEAD") != sha:
+        return
+    if git(code, "merge-base", "--is-ancestor", sha, f"origin/{run_branch}")[0] == 0:
+        return
+    if git(code, "reset", "--quiet", "--keep", parent)[0] == 0:
+        ledger(state, u, f"integration: unpushed merge {sha[:12]} undone before merging the fixed branch")
+
+
 def integration_test(state):
     u = {}
     tasks = as_list(state.get("tasks"))
@@ -2649,7 +2665,16 @@ def integration_test(state):
     u["task_rounds"] = rounds
     u["current_task"] = tid
     if not truthy(tr.get("merged")):
-        git(code, "checkout", "--quiet", run_branch)
+        rc, out, err = git(code, "checkout", "--quiet", run_branch)
+        if rc != 0:
+            ledger(state, u, f"integration: checkout of {run_branch} failed; {tid} not merged")
+            return raise_escalation(state, u, escalation(
+                "integration_checkout", f"The run branch {run_branch} could not be checked out in {code}, so {tid} was not merged. "
+                                        "Retry once the checkout can succeed, or stop?",
+                [option("Retry the integration"), option("Stop and report", recommended=True)], evidence=tail(out + err, 2000), hard_trigger=True))
+        _drop_unpushed_merge(state, u, code, run_branch, tr)
+        parent = git_out(code, "rev-parse", "HEAD")
+        head = git_out(code, "rev-parse", "--verify", "--quiet", task["branch"]) if task.get("branch") else ""
         rc, out, err = git(code, "merge", "--no-ff", "--no-edit", task.get("branch", ""))
         if rc != 0:
             git(code, "merge", "--abort")
@@ -2666,7 +2691,7 @@ def integration_test(state):
                                 "note": tail(out + err, 3000)}
             u["_next"] = "fix_round"
             return u
-        tr["merged"] = True
+        tr.update({"merged": True, "merge_head": head, "merge_sha": git_out(code, "rev-parse", "HEAD"), "merge_parent": parent})
     ok, out = _run_verification(state, code)
     if not ok:
         strikes = as_int(tr.get("integration_strikes")) + 1
@@ -2682,6 +2707,10 @@ def integration_test(state):
         u["_next"] = "fix_round"
         return u
     tr["merged"] = False
+    tr.pop("merge_sha", None)
+    tr.pop("merge_parent", None)
+    if integrated := tr.pop("merge_head", ""):
+        tr["integrated_sha"] = integrated
     git(code, "push", "--quiet", "origin", run_branch)
     task["head_sha"] = git_out(code, "rev-parse", "HEAD", default="")
     save_tasks(state, u, tasks)
@@ -2690,24 +2719,51 @@ def integration_test(state):
     return u
 
 
+def _unmerged_reason(state, code, task, run_branch):
+    """Why a task branch is not provably merged; "" when its head is the head a green integration test recorded and
+    that head is an ancestor of the run branch."""
+    want = as_dict(as_dict(state.get("task_rounds")).get(task.get("id", ""))).get("integrated_sha")
+    head = git_out(code, "rev-parse", "--verify", "--quiet", task["branch"])
+    if not want:
+        return "no passed integration test recorded"
+    if head != want:
+        return f"head {head[:12] or 'unknown'} is not the integrated {want[:12]}"
+    if git(code, "merge-base", "--is-ancestor", head, run_branch)[0] != 0:
+        return f"not an ancestor of {run_branch}"
+    return ""
+
+
 def wave_cleanup(state):
-    """The four cleanup rules (markers 4-6 / 72-74): the ONLY unasked destructive ops."""
+    """The four cleanup rules (markers 4-6 / 72-74): the ONLY unasked destructive ops. A task branch is deleted only
+    when provably merged, and a worktree is forced out only for a failed task, whose branch is kept."""
     u = {}
     tasks = as_list(state.get("tasks"))
     task = task_by_id(tasks, state.get("current_task")) or {}
     code = state.get("code_repo_path", "")
+    run_branch = state.get("run_branch") or _run_branch(state)
     wt = task.get("worktree", "")
     if wt:
         rc, out, err = git(code, "worktree", "remove", wt)
-        if rc != 0:
-            git(code, "worktree", "remove", "--force", wt)
-        task["worktree"] = ""
-        ledger(state, u, f"cleanup: worktree {wt} removed")
-    if (is_single(state) or MULTI_IS_GROUPS) and task.get("status") == "complete" and task.get("branch") and task["branch"] != (state.get("run_branch") or _run_branch(state)):
-        git(code, "branch", "-D", task["branch"])
-        git(code, "push", "--quiet", "origin", "--delete", task["branch"])
-        ledger(state, u, f"cleanup: merged task branch {task['branch']} deleted (local + remote)")
-        task["branch"] = state.get("run_branch") or _run_branch(state)
+        if rc != 0 and task.get("status") in ("failed", "aborted"):
+            rc, out, err = git(code, "worktree", "remove", "--force", wt)
+        if rc == 0:
+            task["worktree"] = ""
+            ledger(state, u, f"cleanup: worktree {wt} removed")
+        else:
+            line = f"cleanup: worktree {wt} kept, it did not remove cleanly: {tail(err, 200)}"
+            ledger(state, u, line)
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) {line}"]
+    if (is_single(state) or MULTI_IS_GROUPS) and task.get("status") == "complete" and task.get("branch") and task["branch"] != run_branch:
+        why = _unmerged_reason(state, code, task, run_branch)
+        if not why:
+            rc, out, err = git(code, "branch", "-d", task["branch"])
+            why = f"branch -d refused: {tail(err, 200)}" if rc != 0 else ""
+        if why:
+            ledger(state, u, f"cleanup: task branch {task['branch']} kept (local + remote): {why}")
+        else:
+            git(code, "push", "--quiet", "origin", "--delete", task["branch"])
+            ledger(state, u, f"cleanup: merged task branch {task['branch']} deleted (local + remote)")
+            task["branch"] = run_branch
     elif task.get("branch"):
         ledger(state, u, f"cleanup: task branch {task['branch']} kept ({'multi: never deleted' if not (is_single(state) or MULTI_IS_GROUPS) else 'not cleanly merged'})")
     git(code, "worktree", "prune")
@@ -3391,6 +3447,29 @@ def _leave_in_draft(state, u):
     u["_next"] = "finish_plan"
 
 
+def _ci_leave(state, u, kind):
+    """The CI escalations' leave pick: a running review watch closes with the stop recorded, else the PR stays in draft."""
+    if truthy(state.get("review_watching")):
+        status = f"{kind} (CI {state.get('ci_status') or 'unresolved'})"
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
+        _review_event(state, u, f"stopped by the owner: {status}")
+        _close_review_watch(state, u, kind)
+        u["_next"] = "finish_plan"
+    else:
+        _leave_in_draft(state, u)
+
+
+def _rerun_cancelled(state, u, links):
+    """Ask for one re-run of each workflow run behind a cancelled check."""
+    cmd = os.environ.get("ARCHITECT_GH_RERUN_CMD")
+    for run_id in sorted({m.group(1) for link in as_list(links) if (m := re.search(r"/actions/runs/(\d+)", link or ""))}):
+        if cmd:
+            rc, _ = sh(["bash", "-c", cmd, "_", run_id], timeout=GH_CALL_SECS)
+        else:
+            rc, _ = sh(["gh", "run", "rerun", run_id, "--failed"], cwd=state.get("code_repo_path", ""), timeout=GH_CALL_SECS)
+        ledger(state, u, f"ci: PR #{state.get('pr_number')} re-run of cancelled run {run_id} {'requested' if rc == 0 else 'FAILED'}")
+
+
 def apply_answer(state):
     u = {}
     esc = as_dict(state.get("escalation"))
@@ -3757,7 +3836,9 @@ def apply_answer(state):
         if a == "retry":
             task["status"] = "in-progress"
             save_tasks(state, u, tasks)
+            # a retried branch goes back through integration_test before cleanup may delete it
             u.update({"delegation_kind": "fix", "fix_source": "wave", "fix_return_to": "verify",
+                      "fix_origin_return": "integration" if (is_single(state) or MULTI_IS_GROUPS) else "",
                       "fix_items": [l[2:] for l in esc.get("evidence", "").splitlines() if l.startswith("- ")] or ["Address the evidence below"],
                       "fix_note": tail(esc.get("evidence", ""), 3000), "delegate_project_dir": task.get("worktree") or state.get("code_repo_path", "")})
             u["_next"] = "compose_delegation"
@@ -3765,6 +3846,7 @@ def apply_answer(state):
             task["status"] = "in-progress"
             save_tasks(state, u, tasks)
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"({task.get('id')}) parallel task accepted as-is at the user's say-so"]
+            u["integration_task"] = task.get("id", "")
             u["_next"] = "integration_test" if (is_single(state) or MULTI_IS_GROUPS) else "harvest_report"
         else:
             task["status"] = "failed"
@@ -3799,6 +3881,15 @@ def apply_answer(state):
             u["_next"] = "end_blocked"
         else:
             _ask_again(state, u, esc, answer)
+    elif kind == "integration_checkout":
+        a = "stop" if stop else _picked_key(answer, options, {"retry": ["retry"], "stop": ["stop"]})
+        if a == "retry":
+            u["_next"] = "integration_test"
+        elif a == "stop":
+            u["failure_reason"] = f"stopped: the run branch could not be checked out to integrate {task.get('id')}"
+            u["_next"] = "end_blocked"
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind == "approve_next":
         a = _answered(state, {"continue": ["continue"], "park": ["stop here", "park"], "abort": ["abort"]}, "continue")
         if a == "continue":
@@ -3829,14 +3920,33 @@ def apply_answer(state):
             u["fix_request"] = {"task": state.get("ci_owning_task") or (tasks[-1]["id"] if tasks else ""), "source": "ci", "return_to": "ci",
                                 "items": [f"CI failure (user-directed fix round): {tail(state.get('ci_diagnosis', ''), 300)}"], "note": tail(state.get("ci_evidence", ""), 4000)}
             u["_next"] = "fix_round"
-        elif truthy(state.get("review_watching")):
-            status = f"{kind} (CI {state.get('ci_status') or 'unresolved'})"
-            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR #{state.get('pr_number')} review watch stopped: {status}: {tail(state.get('ci_diagnosis', ''), 300)}"]
-            _review_event(state, u, f"stopped by the owner: {status}")
-            _close_review_watch(state, u, kind)
-            u["_next"] = "finish_plan"
         else:
-            _leave_in_draft(state, u)
+            _ci_leave(state, u, kind)
+    elif kind in ("ci_inconclusive", "ci_no_checks"):
+        picked = match_option(answer, options)
+        a = _keyed(picked or "", {"rerun": ["re-run", "keep waiting"], "green": ["treat as green", "finish without ci"],
+                                  "leave": ["leave", "stop watching"]})
+        pr, status = state.get("pr_number"), state.get("ci_status") or kind
+        if a == "rerun":
+            _rerun_cancelled(state, u, as_dict(esc.get("data")).get("cancelled_links"))
+            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_rounds": 0, "ci_started_at": int(time.time())})
+            u["_next"] = "ci_poll"
+        elif a == "green":
+            if kind == "ci_no_checks":
+                line = f"ci: PR #{pr} has no CI checks configured; finished without CI at the owner's pick"
+                note = f"PR #{pr}: no CI checks configured; finished without CI (CI never ran, not green)"
+            else:
+                reason = _owner_reason(state, picked, options) or "no reason stated"
+                non_pass = ", ".join(as_list(as_dict(esc.get("data")).get("non_pass"))) or "none named"
+                line = f"ci: PR #{pr} CI {status} treated as green: {trim_items(reason, 300)}; non-pass checks: {non_pass}"
+                note = f"PR #{pr}: CI {status} treated as green ({trim_items(reason, 300)}); non-pass checks: {non_pass}"
+            ledger(state, u, line)
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [note]
+            u["_next"] = "review_poll" if truthy(state.get("review_watching")) else "flip_ready"
+        elif a == "leave":
+            _ci_leave(state, u, kind)
+        else:
+            _ask_again(state, u, esc, answer)
     elif kind in ("review_exhausted", "review_read_truncated", "review_round_cap", "review_owner_judgment"):
         more_words = ["one more", "resume", "address", "fix round"]
         a = "stop" if stop else _picked_key(answer, options, {"skip": ["skip"], "keep": ["keep watching", "keep", "re-arm"],
@@ -4234,6 +4344,17 @@ def pr_round_comments(state):
     return u
 
 
+CI_PASS = ("pass", "success")
+CI_FAIL = ("fail", "failure")
+CI_PENDING = ("pending", "queued", "in_progress", "")
+CI_CANCELLED = ("cancel", "cancelled")
+CI_QUIET = ("skipping", "skipped", "neutral")
+CI_KEEP_WAITING = "Keep waiting (re-run the watch)"
+CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
+CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
+CI_NO_CI = "Finish without CI (no checks configured; recorded)"
+
+
 def ci_poll(state):
     u = {}
     polls = as_int(state.get("ci_polls"))
@@ -4271,16 +4392,47 @@ def ci_poll(state):
         return u
     u["ci_poll_fails"] = 0
     buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "").lower(), c.get("link", "")) for c in data]
-    failing = [(n, l) for n, b, l in buckets if b in ("fail", "failure", "cancelled")]
-    pending = [n for n, b, _ in buckets if b in ("pending", "queued", "in_progress", "")]
+    failing = [(n, l) for n, b, l in buckets if b in CI_FAIL]
+    pending = [n for n, b, _ in buckets if b in CI_PENDING]
     u["ci_checks"] = buckets
     if failing:
         u.update({"ci_status": "red", "ci_failing": failing, "_next": "ci_route"})
-    elif pending:
+    elif pending or (not buckets and polls == 0):
+        # checks can take a moment to register on a fresh push, so an empty first read is polled again
         u.update({"ci_status": "pending", "_next": "ci_poll"})
-    else:
+    elif not buckets:
+        u.update({"ci_status": "no_checks", "_next": "ci_route"})
+    elif all(b in CI_PASS for _, b, _ in buckets):
         u.update({"ci_status": "green", "_next": "ci_route"})
+    else:
+        u.update({"ci_status": "inconclusive", "_next": "ci_route"})
     return u
+
+
+def _ci_unclear_escalation(state, status):
+    """The evidence escalation for a CI read that is neither green nor red: every check is listed with its bucket."""
+    pr = state.get("pr_number")
+    if truthy(state.get("review_watching")):
+        leave, leave_q = "Stop watching and report", "stop watching and report"
+    else:
+        leave, leave_q = "Leave the PR in draft and report", "leave the PR in draft"
+    rows = [(str(c[0]), str(c[1]), str(c[2]) if len(c) > 2 else "") for c in as_list(state.get("ci_checks"))
+            if isinstance(c, (list, tuple)) and len(c) >= 2]
+    evidence = "\n".join(f"- {n}: {b or '(no bucket)'}" for n, b, _ in rows) or "(the PR reports an empty check list)"
+    if status == "no_checks":
+        return escalation(
+            "ci_no_checks", f"PR #{pr} reports no CI checks, so CI cannot go green. Finish without CI (recorded as a follow-up; "
+                            f"the report never says CI green), keep waiting, or {leave_q}?",
+            [option(CI_NO_CI, recommended=True), option(CI_KEEP_WAITING), option(leave)], evidence=evidence)
+    cancelled = [l for _, b, l in rows if b in CI_CANCELLED]
+    non_pass = [f"{n}: {b or '(no bucket)'}" for n, b, _ in rows if b not in CI_PASS]
+    quiet = any(b in CI_PASS for _, b, _ in rows) and all(b in CI_PASS + CI_QUIET for _, b, _ in rows)
+    return escalation(
+        "ci_inconclusive", f"CI on PR #{pr} has no failing or pending check, but not every check passed ({', '.join(non_pass)}). "
+                           f"Re-run, treat it as green (say why), or {leave_q}?",
+        [option(CI_RERUN_CANCELLED if cancelled else CI_KEEP_WAITING, recommended=bool(cancelled)),
+         option(CI_TREAT_GREEN, recommended=quiet and not cancelled), option(leave, recommended=not cancelled and not quiet)],
+        evidence=evidence, data={"cancelled_links": cancelled, "non_pass": non_pass})
 
 
 def ci_route(state):
@@ -4303,6 +4455,9 @@ def ci_route(state):
         u["_next"] = "review_poll" if watching else "flip_ready"
     elif status == "red":
         u["_next"] = "ci_evidence"
+    elif status in ("inconclusive", "no_checks"):
+        ledger(state, u, f"ci: PR #{pr} {status}; asking before anything is called green")
+        return raise_escalation(state, u, _ci_unclear_escalation(state, status))
     elif status == "visit_cap":
         if watching:
             ledger(state, u, f"review-watch: PR #{pr} stop: watch_visit_cap")
@@ -4473,8 +4628,15 @@ def flip_ready(state):
         if pr:
             cmd = os.environ.get("ARCHITECT_GH_READY_CMD")
             rc, out = sh(["bash", "-c", cmd], timeout=GH_CALL_SECS) if cmd else sh(["gh", "pr", "ready", str(pr)], cwd=code, timeout=GH_CALL_SECS)
-            u["flipped_ready"] = rc == 0
-            ledger(state, u, f"pr: #{pr} {'flipped to ready' if rc == 0 else 'flip FAILED: ' + tail(out, 200)}")
+            # a ready claim needs the PR itself to read as no longer a draft, not just a clean exit
+            view_rc, draft = _pr_view(state, pr, "isDraft") if rc == 0 else (1, "")
+            u["flipped_ready"] = rc == 0 and view_rc == 0 and draft.strip() == "false"
+            if u["flipped_ready"]:
+                ledger(state, u, f"pr: #{pr} flipped to ready")
+            elif rc == 0:
+                ledger(state, u, f"pr: #{pr} still reads as a draft after gh pr ready (isDraft: {tail(draft, 100).strip() or 'unread'})")
+            else:
+                ledger(state, u, f"pr: #{pr} flip FAILED: {tail(out, 200)}")
     drafts, unchecked = [], []
     for t in tasks:
         if t.get("pr_number") and not (is_single(state) or MULTI_IS_GROUPS):
@@ -5233,27 +5395,27 @@ def _state_fault(state, name, notes, err):
 
 
 def run(name):
-    """Heal the state, run the gate, and turn a gate exception into a state_fault escalation.
+    """Heal the state, run the gate, and turn an exception in either into a state_fault escalation.
 
     The healed values and one ledger line per heal ride along with the gate's own updates, which win on a clash.
     """
     gate = GATES[name]
-    state, notes = heal_state(load_state())
-    u = {}
-    for key, source in notes:
-        if source:
-            u[key] = state[key]
-            ledger(state, u, f"state: healed {key} from {source}")
-    state = {**state, **u}
-    if _lost_task(name, state):
-        out = {}
-        ledger(state, out, f"state: {name} has no current task ({state.get('current_task')!r}) -> select_tasks")
-        out["_next"] = "select_tasks"
-    else:
-        try:
+    state, notes, u = load_state(), [], {}
+    try:
+        state, notes = heal_state(state)
+        for key, source in notes:
+            if source:
+                u[key] = state[key]
+                ledger(state, u, f"state: healed {key} from {source}")
+        state = {**state, **u}
+        if _lost_task(name, state):
+            out = {}
+            ledger(state, out, f"state: {name} has no current task ({state.get('current_task')!r}) -> select_tasks")
+            out["_next"] = "select_tasks"
+        else:
             out = gate(state)
-        except Exception as e:  # noqa: BLE001
-            if name in BRANCH_GATES:
-                raise
-            out = _state_fault(state, name, notes, e)
+    except Exception as e:  # noqa: BLE001
+        if name in BRANCH_GATES:
+            raise
+        out = _state_fault(state, name, notes, e)
     emit({**u, **out})
