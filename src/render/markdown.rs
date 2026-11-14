@@ -1603,9 +1603,11 @@ std::error::Error>> {
     #[test]
     fn parse_table_row_keeps_escaped_pipes_inside_cells() {
         assert_eq!(
-            parse_table_row(r"| `.mesh memory forget <identity\|all>` | [--yes\|--dry-run] | x |"),
+            parse_table_row(
+                r"| `.mesh envoy memory forget <identity\|all>` | [--yes\|--dry-run] | x |"
+            ),
             vec![
-                "`.mesh memory forget <identity|all>`",
+                "`.mesh envoy memory forget <identity|all>`",
                 "[--yes|--dry-run]",
                 "x",
             ],

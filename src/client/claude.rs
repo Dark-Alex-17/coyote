@@ -324,6 +324,15 @@ pub async fn claude_chat_completions_streaming(
                         debug!("token-usage: {usage:?}");
                         handler.usage(usage);
                     }
+                    if data["delta"]["stop_reason"].as_str() == Some("refusal") {
+                        if !handler.has_received_visible_output() {
+                            return Err(ProviderRefusal::from_stop_details(
+                                &data["delta"]["stop_details"],
+                            )
+                            .into());
+                        }
+                        debug!("stream ended with a provider refusal after partial output");
+                    }
                 }
                 _ => {}
             }
@@ -733,7 +742,12 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
             }
         }
     }
+    let refusal = (data["stop_reason"].as_str() == Some("refusal"))
+        .then(|| ProviderRefusal::from_stop_details(&data["stop_details"]));
     if text.is_empty() && tool_calls.is_empty() {
+        if let Some(refusal) = refusal {
+            return Err(refusal.into());
+        }
         bail!("Invalid response data: {data}");
     }
 
@@ -742,6 +756,7 @@ pub fn claude_extract_chat_completions(data: &Value) -> Result<ChatCompletionsOu
         tool_calls,
         thinking,
         usage: claude_parse_usage(&data["usage"]),
+        refusal,
     };
     Ok(output)
 }
@@ -1840,5 +1855,164 @@ mod tests {
             is_stock,
             "bundled models.yaml must not carry a claude oauth block: it would silently drop the Claude Code spoof for stock Pro/Max users"
         );
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serves one canned SSE body to the first request, then closes.
+    async fn serve_sse(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    async fn stream(body: &'static str) -> (Result<()>, SseHandler) {
+        let url = serve_sse(body).await;
+        let (sender, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handler = SseHandler::new(sender, crate::utils::create_abort_signal());
+        handler.set_silent(true);
+        let builder = ReqwestClient::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(url);
+        let res = claude_chat_completions_streaming(
+            builder,
+            &mut handler,
+            &Model::new("claude", "claude-test"),
+        )
+        .await;
+        (res, handler)
+    }
+
+    #[test]
+    fn non_streaming_refusal_is_a_typed_error_with_its_category() {
+        let data = json!({
+            "id": "msg_x",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-opus-4-1",
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"category": "cyber", "explanation": "looks like an attack"},
+            "usage": {"input_tokens": 10, "output_tokens": 0}
+        });
+
+        let err = claude_extract_chat_completions(&data).unwrap_err();
+
+        let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
+        assert_eq!(refusal.category.as_deref(), Some("cyber"));
+        assert_eq!(
+            refusal.explanation.as_deref(),
+            Some("looks like an attack")
+        );
+        let rendered = format!("{err:#}");
+        assert_eq!(
+            rendered,
+            "the model declined to answer (provider refusal: cyber)"
+        );
+    }
+
+    #[test]
+    fn refusal_without_a_category_renders_the_fallback() {
+        let data = json!({"content": [], "stop_reason": "refusal"});
+
+        let err = claude_extract_chat_completions(&data).unwrap_err();
+
+        assert_eq!(
+            format!("{err:#}"),
+            "the model declined to answer (provider refusal: no category given)"
+        );
+    }
+
+    #[test]
+    fn empty_reply_without_refusal_is_still_invalid_data() {
+        let data = json!({"content": [], "stop_reason": "end_turn"});
+
+        let err = claude_extract_chat_completions(&data).unwrap_err();
+
+        assert!(err.downcast_ref::<ProviderRefusal>().is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_refusal_is_a_typed_error_with_its_category() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\",\"stop_details\":{\"category\":\"cyber\"}},\"usage\":{\"output_tokens\":0}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let (res, handler) = stream(body).await;
+
+        let err = res.unwrap_err();
+        let refusal = err.downcast_ref::<ProviderRefusal>().unwrap();
+        assert_eq!(refusal.category.as_deref(), Some("cyber"));
+        assert!(!format!("{err:#}").contains('{'));
+        let (_, _, _, usage) = handler.take();
+        assert_eq!(usage.unwrap().output_tokens, Some(0));
+    }
+
+    #[tokio::test]
+    async fn streaming_refusal_after_text_keeps_the_text() {
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"partial\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"}}\n\n",
+        );
+
+        let (res, handler) = stream(body).await;
+
+        res.unwrap();
+        let (text, _, _, _) = handler.take();
+        assert_eq!(text, "partial");
+    }
+
+    mod non_stream_refusal_tests {
+        use super::*;
+
+        #[test]
+        fn a_refusal_after_text_keeps_the_text_and_carries_the_refusal() {
+            let data = json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": "refusal",
+                "stop_details": {"category": "cyber"}
+            });
+
+            let output = claude_extract_chat_completions(&data).unwrap();
+
+            assert_eq!(output.text, "partial");
+            let refusal = output.refusal.expect("the refusal rides with the text");
+            assert_eq!(refusal.category.as_deref(), Some("cyber"));
+        }
+
+        #[test]
+        fn an_ordinary_stop_after_text_carries_no_refusal() {
+            let data = json!({
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "end_turn"
+            });
+
+            let output = claude_extract_chat_completions(&data).unwrap();
+
+            assert!(output.refusal.is_none());
+        }
     }
 }

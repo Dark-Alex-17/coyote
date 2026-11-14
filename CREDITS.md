@@ -42,10 +42,57 @@ AIChat project.
 AIChat is licensed under the MIT License. The MIT license text and its
 copyright notice are preserved in the [LICENSE-MIT](./LICENSE-MIT) file.
 
+## LXMF-rs (Reticulum and LXMF)
+
+Coyote depends on the `lxmf-wire` crate from
+[LXMF-rs](https://github.com/FreeTAKTeam/LXMF-rs) by FreeTAKTeam, and on
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport),
+Coyote's fork of LXMF-rs's `reticulum-rs-transport`, a derivative work
+published under the same `EPL-2.0 OR GPL-2.0-or-later` license. Those crates
+are a Rust implementation of the Reticulum Network Stack and the LXMF
+messaging format, both originally designed and implemented in Python by Mark
+Qvist ([markqvist/Reticulum](https://github.com/markqvist/Reticulum),
+[markqvist/LXMF](https://github.com/markqvist/LXMF)).
+
+LXMF-rs is dual-licensed `EPL-2.0 OR GPL-2.0-or-later`, with the Secondary
+Licenses Notice offering GPL-2.0-or-later written into its LICENSE file.
+Coyote relies on the GPL-2.0-or-later arm, the only arm compatible with
+AGPL-3.0-only; the same holds for the fork. The license texts those
+dependencies rely on are in this repository: the GNU General Public License
+version 2 in [LICENSE-GPL-2.0](./LICENSE-GPL-2.0) for the mesh crates, and the
+BSD 3-Clause License with the copyright notices of the dalek crates and
+`subtle` in [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause). One obligation
+remains open for Coyote, settling the license expression for the combined
+work, which is tracked separately. [NOTICE](./NOTICE) records it.
+
+`coyote-rns-transport` brings a few third parties in transitively. Its
+default `storage` feature pulls in `rusqlite` with a bundled SQLite
+amalgamation (MIT; SQLite itself is public domain). Independently of any
+feature it pulls in `bzip2`/`bzip2-sys`, which ships libbzip2 and compiles it
+on Windows and wherever pkg-config finds no system copy (MIT here; libbzip2
+is BSD-style), `x25519-dalek` (BSD 3-Clause), and `tokio-serial` with
+`mio-serial` (MIT) and `serialport` (MPL-2.0). [NOTICE](./NOTICE) carries the
+copyright notices where a license requires one, and says what each obligation
+is and how far it is discharged.
+
+## windows-sys
+
+On Windows targets Coyote links against
+[`windows-sys`](https://github.com/microsoft/windows-rs), Copyright (c)
+Microsoft Corporation, distributed under `MIT OR Apache-2.0` and used here
+under the MIT License.
+
 ## Licensing
 
 Coyote as a whole is licensed under the GNU Affero General Public License
 v3.0 only (AGPL-3.0-only); see [LICENSE](./LICENSE). Substantial portions
 derived from AIChat remain under the MIT License (Copyright (c) sigoden),
-preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) for the
-combined-licensing summary.
+preserved in [LICENSE-MIT](./LICENSE-MIT). The GNU General Public License
+version 2 and BSD 3-Clause texts the mesh dependencies rely on are in
+[LICENSE-GPL-2.0](./LICENSE-GPL-2.0) and [LICENSE-BSD-3-Clause](./LICENSE-BSD-3-Clause).
+See [NOTICE](./NOTICE) for the combined-licensing summary.
+
+The LXMF-rs dependencies add GPL-2.0-or-later code to that mix. The license
+expression for the resulting combined work has not been settled, and neither
+the `license` field in `Cargo.toml` nor the summary in `README.md` has been
+changed; see [NOTICE](./NOTICE).

@@ -17,6 +17,10 @@ project_dir=$(resolve_gate_dir "$project_dir")
 
 if [[ -n "${TEST_CMD:-}" ]]; then
   cmd="$TEST_CMD"
+elif [[ -n "${LLM_AGENT_VAR_TEST_COMMAND:-}" ]]; then
+  # The `test_command` graph variable: a targeted command the spawner chose so
+  # the gate fits its timeout on a project whose full suite does not.
+  cmd="$LLM_AGENT_VAR_TEST_COMMAND"
 else
   project_info=$(detect_project "$project_dir")
   cmd=$(echo "$project_info" | jq -r '.test // ""')
@@ -25,7 +29,7 @@ fi
 if [[ -z "$cmd" || "$cmd" == "null" ]]; then
   jq -nc '{
     "tests_ok": true,
-    "tests_output": "(GATE NOT RUN: no test command configured or detected. This is NOT evidence that tests passed — set TEST_CMD, and never report the suite as green.)",
+    "tests_output": "(GATE NOT RUN: no test command configured or detected. This is NOT evidence that tests passed: set TEST_CMD or the test_command variable, and never report the suite as green.)",
     "_next": "edge_case_sweep"
   }'
   exit 0

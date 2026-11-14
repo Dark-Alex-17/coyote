@@ -17,6 +17,7 @@ use indexmap::IndexMap;
 use inquire::{
     MultiSelect, Select, Text, list_option::ListOption, required, validator::Validation,
 };
+use parking_lot::Mutex;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -396,6 +397,10 @@ pub struct ChatCompletionsOutput {
     pub tool_calls: Vec<ToolCall>,
     pub thinking: Vec<ThinkingBlock>,
     pub usage: Option<TokenUsage>,
+    /// Set when the provider stopped on a refusal after writing some of the reply. The
+    /// text is still returned as the answer; the non-streaming callers raise the
+    /// context's `refused_after_output` for it and nothing else changes.
+    pub refusal: Option<ProviderRefusal>,
 }
 
 impl ChatCompletionsOutput {
@@ -407,7 +412,7 @@ impl ChatCompletionsOutput {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct TokenUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -425,11 +430,12 @@ impl TokenUsage {
 
     /// Prompt-side tokens the API reported for one request: fresh input plus
     /// cache writes and cache reads. The buckets are disjoint (see
-    /// [`Self::cost_usd`]), so the terms sum without adjustment.
+    /// [`Self::cost_usd`]), so the terms sum without adjustment; saturating.
     pub fn total_prompt_tokens(&self) -> u64 {
-        self.input_tokens.unwrap_or(0)
-            + self.cache_creation_input_tokens.unwrap_or(0)
-            + self.cache_read_input_tokens.unwrap_or(0)
+        self.input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0))
     }
 
     pub fn accumulate(&mut self, other: &TokenUsage) {
@@ -469,6 +475,50 @@ impl TokenUsage {
             + term(self.cache_read_input_tokens, model.cache_read_price())?
             + term(self.cache_creation_input_tokens, model.cache_write_price())?;
         (total > 0.0).then_some(total)
+    }
+}
+
+/// Usage of one whole run: every API call that reported usage from a context and its
+/// branch forks, readable by whoever holds a clone of the handle after the context
+/// itself is gone.
+#[derive(Debug, Default)]
+pub struct RunUsage {
+    inner: Mutex<RunUsageSnapshot>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct RunUsageSnapshot {
+    pub tokens: TokenUsage,
+    /// Summed over the priced calls only; `None` until one call is priced.
+    pub cost_usd: Option<f64>,
+    /// Every `record` call; the caller decides what counts as reported usage.
+    pub calls: u32,
+    /// Calls whose usage could not be priced, so `cost_usd` undercounts by them.
+    pub unpriced_calls: u32,
+}
+
+impl RunUsage {
+    pub fn record(&self, usage: &TokenUsage, cost_usd: Option<f64>) {
+        let mut inner = self.inner.lock();
+        inner.tokens.accumulate(usage);
+        match cost_usd {
+            Some(cost) => inner.cost_usd = Some(inner.cost_usd.unwrap_or(0.0) + cost),
+            None => inner.unpriced_calls = inner.unpriced_calls.saturating_add(1),
+        }
+        inner.calls = inner.calls.saturating_add(1);
+    }
+
+    pub fn snapshot(&self) -> RunUsageSnapshot {
+        self.inner.lock().clone()
+    }
+}
+
+impl RunUsageSnapshot {
+    /// Prompt-side tokens (input, cache reads, cache writes) plus output, saturating.
+    pub fn total_tokens(&self) -> u64 {
+        self.tokens
+            .total_prompt_tokens()
+            .saturating_add(self.tokens.output_tokens.unwrap_or(0))
     }
 }
 
@@ -677,6 +727,7 @@ pub async fn call_chat_completions(
                 tool_calls,
                 thinking,
                 usage,
+                refusal,
             } = ret;
             if !text.is_empty() {
                 if extract_code {
@@ -687,6 +738,9 @@ pub async fn call_chat_completions(
                 }
             }
             ctx.record_token_usage(usage, client.model());
+            if refusal.is_some() {
+                ctx.note_refusal_after_output();
+            }
             finish_completion(ctx, text, tool_calls, thinking).await
         }
         Err(err) => {
@@ -864,8 +918,12 @@ pub async fn call_chat_completions_streaming_quiet(
             tool_calls,
             thinking,
             usage,
+            refusal,
         } = output;
         ctx.record_token_usage(usage, client.model());
+        if refusal.is_some() {
+            ctx.note_refusal_after_output();
+        }
         if abort_signal.aborted() {
             hooks::fire(
                 HookEvent::LlmRequestFailed,
@@ -963,6 +1021,55 @@ impl std::fmt::Display for ApiStatusError {
 
 impl std::error::Error for ApiStatusError {}
 
+/// The model's provider refused the request. Claude reports this
+/// as `stop_reason: refusal`; Bedrock Converse as `stopReason:
+/// content_filtered`, which carries no category; Gemini as a
+/// `promptFeedback.blockReason` or a `finishReason: SAFETY`.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderRefusal {
+    pub category: Option<String>,
+    pub explanation: Option<String>,
+}
+
+impl ProviderRefusal {
+    pub fn from_stop_details(details: &Value) -> Self {
+        Self {
+            category: details["category"].as_str().map(str::to_string),
+            explanation: details["explanation"].as_str().map(str::to_string),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the model declined to answer (provider refusal: {})",
+            refusal_category_label(self.category.as_deref())
+        )
+    }
+}
+
+impl std::error::Error for ProviderRefusal {}
+
+pub fn refusal_category_label(category: Option<&str>) -> &str {
+    category.unwrap_or("no category given")
+}
+
+/// One plain sentence for an HTTP status, so a caller can report a provider
+/// failure without echoing the response body.
+pub fn api_status_sentence(status: u16) -> &'static str {
+    match status {
+        503 | 529 => "the model is overloaded",
+        429 => "the provider is rate limiting requests",
+        401 => "the provider rejected the credentials",
+        403 => "the provider refused access to this model",
+        500..=599 => "the provider had an error",
+        400..=499 => "the provider rejected the request",
+        _ => "the provider returned an unexpected status",
+    }
+}
+
 /// True when the error chain bottoms out in an [`ApiStatusError`] with
 /// status 401 EXACTLY. 403 (entitlement) and 429 (rate limit) are never
 /// auth failures, and message text is never inspected.
@@ -1007,6 +1114,11 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
             json_str_from_map(error, "message"),
         ) {
             return Err(api_error(format!("{message} (code: {typ})")));
+        } else if let (Some(message), Some(status)) = (
+            json_str_from_map(error, "message"),
+            json_str_from_map(error, "status"),
+        ) {
+            return Err(api_error(format!("{message} (status: {status})")));
         }
     } else if let Some(error) = data["errors"][0].as_object() {
         if let (Some(code), Some(message)) = (
@@ -1033,6 +1145,44 @@ pub fn catch_error(data: &Value, status: u16) -> Result<()> {
     Err(api_error(format!(
         "Invalid response data: {data} (status: {status})"
     )))
+}
+
+#[cfg(test)]
+mod catch_error_tests {
+    use super::*;
+
+    #[test]
+    fn a_gemini_shaped_503_body_is_a_status_error_without_the_body() {
+        let body = json!({"error": {
+            "code": 503,
+            "message": "The model is overloaded due to high demand. Please try again later.",
+            "status": "UNAVAILABLE"
+        }});
+
+        let err = catch_error(&body, 503).unwrap_err();
+
+        let api = err.downcast_ref::<ApiStatusError>().unwrap();
+        assert_eq!(api.status, 503);
+        assert!(!format!("{err:#}").contains('{'), "{err:#}");
+        assert_eq!(
+            format!("{err:#}"),
+            "The model is overloaded due to high demand. Please try again later. (status: UNAVAILABLE)"
+        );
+        let line = format!("{} {}", api.status, api_status_sentence(api.status));
+        assert_eq!(line, "503 the model is overloaded");
+    }
+
+    #[test]
+    fn credentials_and_access_get_their_own_sentences() {
+        assert_eq!(
+            api_status_sentence(401),
+            "the provider rejected the credentials"
+        );
+        assert_eq!(
+            api_status_sentence(403),
+            "the provider refused access to this model"
+        );
+    }
 }
 
 pub fn json_str_from_map<'a>(
@@ -1232,6 +1382,76 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(total.input_tokens, Some(u64::MAX));
+    }
+
+    #[test]
+    fn test_run_usage_sums_tokens_and_priced_cost_and_counts_unpriced_calls() {
+        let run = RunUsage::default();
+        assert_eq!(run.snapshot(), RunUsageSnapshot::default());
+        assert_eq!(run.snapshot().total_tokens(), 0);
+
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(10),
+                cache_creation_input_tokens: Some(20),
+                cache_read_input_tokens: None,
+            },
+            Some(0.5),
+        );
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(30),
+            },
+            None,
+        );
+        run.record(&TokenUsage::default(), Some(0.25));
+
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.tokens.input_tokens, Some(101));
+        assert_eq!(snapshot.tokens.output_tokens, Some(12));
+        assert_eq!(snapshot.tokens.cache_creation_input_tokens, Some(20));
+        assert_eq!(snapshot.tokens.cache_read_input_tokens, Some(30));
+        assert_eq!(snapshot.cost_usd, Some(0.75));
+        assert_eq!(snapshot.calls, 3);
+        assert_eq!(snapshot.unpriced_calls, 1);
+        assert_eq!(snapshot.total_tokens(), 163);
+    }
+
+    #[test]
+    fn test_run_usage_cost_stays_none_while_every_call_is_unpriced() {
+        let run = RunUsage::default();
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(u64::MAX),
+                output_tokens: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.cost_usd, None);
+        assert_eq!((snapshot.calls, snapshot.unpriced_calls), (1, 1));
+        assert_eq!(snapshot.total_tokens(), u64::MAX);
+    }
+
+    #[test]
+    fn test_run_usage_total_saturates_across_two_full_prompt_buckets() {
+        let run = RunUsage::default();
+        run.record(
+            &TokenUsage {
+                input_tokens: Some(u64::MAX),
+                cache_read_input_tokens: Some(u64::MAX),
+                ..Default::default()
+            },
+            None,
+        );
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.tokens.total_prompt_tokens(), u64::MAX);
+        assert_eq!(snapshot.total_tokens(), u64::MAX);
     }
 
     fn priced_model(
@@ -1533,6 +1753,7 @@ mod tests {
                 tool_calls: vec![paced_tool_call()],
                 thinking: vec![paced_thinking()],
                 usage: None,
+                refusal: None,
             })
         }
 

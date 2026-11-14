@@ -387,6 +387,100 @@ mod prefix_tests {
         assert!(values.iter().all(|v| v.starts_with('/')), "{values:?}");
     }
 
+    #[test]
+    fn mesh_verbs_complete_under_the_configured_sigil() {
+        // The mesh groups are multi-word entries like every other built-in, so
+        // a `/`-typed `mesh` token lists them with the typed sigil under
+        // slash and both, the dot form keeps working under both, and the
+        // sigil the prefix rejects yields nothing. A group's verbs and then
+        // their arguments complete from the command table.
+        for prefix in [CommandPrefix::Slash, CommandPrefix::Both] {
+            let groups = values(prefix, "/mesh pe");
+            assert!(
+                groups.contains(&"/mesh people ".to_string()),
+                "{prefix}: {groups:?}"
+            );
+            assert!(
+                groups.iter().all(|v| v.starts_with("/mesh ")),
+                "{prefix}: {groups:?}"
+            );
+            let verbs = values(prefix, "/mesh access tr");
+            assert!(verbs.contains(&"trust ".to_string()), "{prefix}: {verbs:?}");
+            let mut people = values(prefix, "/mesh people ");
+            people.sort();
+            assert_eq!(people, ["info ", "list ", "name ", "status "], "{prefix}");
+            // The argument stage is reached through the slash token too.
+            let args: Vec<String> = values(prefix, "/mesh status ")
+                .into_iter()
+                .map(|v| v.trim_end().to_string())
+                .collect();
+            assert!(args.contains(&"clear".to_string()), "{prefix}: {args:?}");
+        }
+        let dot = values(CommandPrefix::Both, ".mesh pe");
+        assert!(dot.contains(&".mesh people ".to_string()), "{dot:?}");
+        let dot = values(CommandPrefix::Both, ".mesh access tr");
+        assert!(dot.contains(&"trust ".to_string()), "{dot:?}");
+        assert!(
+            values(CommandPrefix::Dot, "/mesh pe").is_empty(),
+            "a slash token is chat under dot"
+        );
+        assert!(
+            values(CommandPrefix::Slash, ".mesh pe").is_empty(),
+            "a dot token is chat under slash"
+        );
+        assert!(
+            values(CommandPrefix::Dot, "/mesh people ").is_empty(),
+            "a slash token is chat under dot"
+        );
+    }
+
+    /// The group stage offers `messaging` and never a cut verb: `.mesh mes` completes
+    /// to the one group, `.mesh messaging se` to `send` and `sent`, and a typed `rep`
+    /// finds nothing (the match is fuzzy, so `he` offers `help` among others, but no
+    /// row ending in `reply`). The same under the slash sigil.
+    #[test]
+    fn mesh_messaging_completes_at_the_group_stage_and_cut_verbs_never_do() {
+        let values_of = |prefix, line: &str| -> Vec<String> {
+            values(prefix, line)
+                .into_iter()
+                .map(|v| v.trim_end().to_string())
+                .collect()
+        };
+        assert_eq!(
+            values_of(CommandPrefix::Dot, ".mesh mes"),
+            [".mesh messaging"]
+        );
+        let mut se = values_of(CommandPrefix::Dot, ".mesh messaging se");
+        se.sort();
+        assert_eq!(se, ["send", "sent"]);
+        assert!(
+            values_of(CommandPrefix::Dot, ".mesh rep").is_empty(),
+            "{:?}",
+            values_of(CommandPrefix::Dot, ".mesh rep")
+        );
+        let he = values_of(CommandPrefix::Dot, ".mesh he");
+        assert!(he.contains(&".mesh help".to_string()), "{he:?}");
+        assert!(!he.iter().any(|v| v.ends_with(" reply")), "{he:?}");
+
+        assert_eq!(
+            values_of(CommandPrefix::Slash, "/mesh mes"),
+            ["/mesh messaging"]
+        );
+        assert!(values_of(CommandPrefix::Slash, "/mesh rep").is_empty());
+
+        // Every `.mesh` row the completer knows is a top-level verb or a group the
+        // table has; none is a cut verb.
+        let all = values_of(CommandPrefix::Dot, ".mesh ");
+        assert_eq!(all.len(), 10, "{all:?}");
+        for cut in [" reply", " message", " peers"] {
+            assert!(!all.iter().any(|v| v.ends_with(cut)), "{cut}: {all:?}");
+        }
+        let messaging = values_of(CommandPrefix::Dot, ".mesh messaging ");
+        for cut in ["reply", "message", "pending", "answer"] {
+            assert!(!messaging.iter().any(|v| v == cut), "{cut}: {messaging:?}");
+        }
+    }
+
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
