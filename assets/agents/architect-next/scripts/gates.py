@@ -2312,6 +2312,11 @@ def _rejections(report):
     return cited, uncited
 
 
+# A child that could not run its debt scan says so under `Debt left behind:`; that line asks for a re-run, not a chore.
+DEBT_SCAN_FAILED_RE = re.compile(r"(?i)^(?:debt scan FAILED \((.+?)\)|DEBT_SCAN_FAILED):\s*(.*?)(?:;\s*the diff was not scanned)?\s*$")
+DEBT_RESCAN_FOLLOW_UP_RE = re.compile(r"(?i)^Re-run the debt scan for (.+?):")
+
+
 def harvest_report(state):
     u = {}
     tasks = as_list(state.get("tasks"))
@@ -2341,11 +2346,23 @@ def harvest_report(state):
     u["fix_rebuttals"] = []
     u["ledger_lines"] = lines
     u["design_asks"] = as_list(p.get("design_asks"))
-    u["debt_items"] = as_list(p.get("debt"))
     fus = list(as_list(state.get("follow_ups")))
     for f in as_list(p.get("follow_ups")):
         if f.lower() != "none":
             fus.append(f"({task.get('id')}) {f}")
+    rescans = {m.group(1).strip().lower() for f in as_list(p.get("follow_ups")) if (m := DEBT_RESCAN_FOLLOW_UP_RE.match(f))}
+    debt = []
+    for d in as_list(p.get("debt")):
+        m = DEBT_SCAN_FAILED_RE.match(d)
+        if not m:
+            debt.append(d)
+            continue
+        scope = (m.group(1) or "the diff").strip()
+        if scope.lower() not in rescans:
+            rescans.add(scope.lower())
+            fus.append(f"({task.get('id')}) Re-run the debt scan for {scope}: {m.group(2) or 'no reason given'}")
+        ledger(state, u, f"debt: scan failure for {scope} routed to a re-run follow-up, not a debt chore")
+    u["debt_items"] = debt
     u["follow_ups"] = fus
     u["_next"] = "design_ask_gate"
     return u
