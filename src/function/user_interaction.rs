@@ -353,7 +353,12 @@ async fn await_escalation_reply(
     };
     let reply = tokio::select! {
         reply = reply => reply,
-        () = aborted => return Ok(escalation_cancelled()),
+        () = aborted => {
+            return Ok(json!({
+                "error": "Escalation withdrawn: this agent was cancelled",
+                "fallback": "Make your best judgment and proceed",
+            }));
+        }
     };
 
     match reply {
@@ -1031,7 +1036,7 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "error": "Escalation was cancelled. The parent agent dropped the request",
+                "error": "Escalation withdrawn: this agent was cancelled",
                 "fallback": "Make your best judgment and proceed",
             })
         );

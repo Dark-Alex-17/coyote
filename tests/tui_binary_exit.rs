@@ -2,17 +2,21 @@
 //! normal screen when it leaves: on Ctrl+C, `.exit` and SIGTERM, nothing
 //! before any turn or under `tui_dump_on_exit: false`, the printed reply
 //! without colour under `NO_COLOR`, and row for row what the plain REPL
-//! prints for the same reply (the Ctrl+D case lives in `tui_binary.rs`,
-//! the cold start in `tui_binary_lifecycle.rs`). Each case runs the binary
-//! on a pseudo-terminal under a bash wrapper that reports the exit code
-//! and `stty -a` afterwards, so the file is unix-only. The cases run one
-//! at a time: each spawn forks a session leader and takes a controlling
-//! tty, and a fork landing between another test's `openpty` and its
-//! `exec` has failed the spawn with a garbled errno.
+//! prints for the same reply, and a bounded, clean exit while a roster
+//! cancel still waits out a job's kill grace (the Ctrl+D case lives in
+//! `tui_binary.rs`, the cold start in `tui_binary_lifecycle.rs`). Each
+//! case runs the binary on a pseudo-terminal under a bash wrapper that
+//! reports the exit code and `stty -a` afterwards, so the file is
+//! unix-only. The cases run one at a time: each spawn forks a session
+//! leader and takes a controlling tty, and a fork landing between another
+//! test's `openpty` and its `exec` has failed the spawn with a garbled
+//! errno.
 #![cfg(unix)]
 
 mod common;
 
+use std::fs;
+use std::path::Path;
 use std::time::Duration;
 
 use common::fake_llm::{FakeLlm, Reply};
@@ -237,4 +241,107 @@ fn the_transcript_printed_on_exit_renders_the_reply_like_the_repl() {
         .cloned()
         .collect();
     assert_eq!(dump_reply, repl_reply, "dump rows differ from the REPL's");
+}
+
+/// A job that shrugs off SIGTERM: it records its pid and loops forever.
+fn term_ignoring_tool(pid_file: &Path) -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         \n\
+         # @describe Ignore SIGTERM and loop.\n\
+         \n\
+         # @env LLM_OUTPUT=/dev/stdout The output path\n\
+         \n\
+         main() {{\n\
+         \x20   trap '' TERM\n\
+         \x20   echo $$ > \"{}\"\n\
+         \x20   for _ in $(seq 1 600); do sleep 0.5; done\n\
+         }}\n",
+        pid_file.display()
+    )
+}
+
+/// `x` on a job that ignores SIGTERM starts a cancel that has to sit
+/// through the kill grace; the user leaves at once. The exit is bounded,
+/// exits 0, restores the terminal and prints the transcript.
+#[test]
+#[serial]
+fn leaving_during_a_slow_roster_cancel_is_bounded_and_clean() {
+    let dir = fresh_config_dir("roster-slow-cancel-exit");
+    let _guard = TempDirGuard(dir.clone());
+    let job_pid = dir.join("job.pid");
+    let blocker_pid = dir.join("blocker.pid");
+    let _sleepers = Sleepers(vec![blocker_pid.clone()]);
+    let fake = FakeLlm::start(vec![
+        Reply::ToolCall {
+            name: "job__start".to_string(),
+            arguments: r#"{"tool":"fixture_stubborn","arguments":{}}"#.to_string(),
+        },
+        Reply::ToolCall {
+            name: "fixture_block".to_string(),
+            arguments: "{}".to_string(),
+        },
+    ]);
+    write_fake_llm_config_with(
+        &dir,
+        &fake,
+        "enabled_tools:\n  - fixture_stubborn\n  - fixture_block\n",
+    );
+    write_tool(&dir, "fixture_stubborn.sh", &term_ignoring_tool(&job_pid));
+    write_tool(&dir, "fixture_block.sh", &sleeping_tool(&blocker_pid));
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b"start the stubborn one s5w\r").unwrap();
+    wait_for_file(&mut pty, &job_pid, "the job's pid file");
+    wait_for_file(&mut pty, &blocker_pid, "the blocking tool's pid file");
+    pty.read_for(Duration::from_millis(1200));
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    let pid: i32 = fs::read_to_string(&job_pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    struct KillOnDrop(i32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            let _ = unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+    let _kill = KillOnDrop(pid);
+    assert!(alive(pid), "the job died with the interrupted turn");
+
+    pty.send(b"\x1bOR").unwrap();
+    let roster = repainted_frame_showing(&mut pty, "fixture_stubborn", "F3 did not list the job");
+    assert!(
+        roster_band(&roster).contains("running"),
+        "the job is not running on the roster:\n{roster}"
+    );
+    pty.send(b"x").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    let from = pty.raw().len();
+    let started = std::time::Instant::now();
+    pty.send(b"\x04").unwrap();
+    let transcript = pty
+        .wait_for("tty-probe-done", Duration::from_secs(40))
+        .unwrap_or_else(|err| panic!("the UI did not leave within 40s: {err:?}"));
+    let took = started.elapsed();
+    let tail = String::from_utf8_lossy(&pty.raw()[from..]).to_string();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+    assert!(!transcript.contains("panicked"), "{transcript}");
+    let printed = strip_ansi(&tail);
+    let left = printed.rfind("exit=").unwrap_or(printed.len());
+    assert!(
+        printed[..left].contains("s5w"),
+        "the transcript was not printed on exit:\n{printed}"
+    );
+    assert!(
+        took < Duration::from_secs(30),
+        "leaving during a slow cancel took {took:?}"
+    );
 }

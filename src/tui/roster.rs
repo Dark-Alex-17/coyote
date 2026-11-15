@@ -170,9 +170,9 @@ pub(super) struct RosterState {
     /// the user moves onto another, so no key acts on a row they did not
     /// pick.
     focus: Option<String>,
-    /// The focused row went in a refresh; the focus stays clear until a
-    /// move, where a roster that never had a row focuses the first one
-    /// it gets.
+    /// The focused row went in a refresh. The focus stays clear, where a
+    /// roster that never had a row focuses the first one it gets, until a
+    /// move lands on a row.
     focus_lost: bool,
 }
 
@@ -494,6 +494,7 @@ pub(super) mod tests {
             TaskRowStatus::Running,
         )]);
         assert!(state.focused().is_none());
+        assert!(state.focus_lost);
     }
 
     #[test]

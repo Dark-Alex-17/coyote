@@ -5,12 +5,16 @@
 //! session file and read again when the child flushes it, a child file that
 //! does not parse degrades without a panic, a child's question reaches the
 //! roster and its answer reaches the child, and the transcript is printed on
-//! the normal screen when the UI leaves with the pager open. The root agent
-//! and the child talk to two separate fake models, so the order of their
-//! requests is fixed. The pager's own keys over one tool's whole output
-//! (scrolling a long one, CRLF line endings, an output over the per-call
-//! cap) live here too. Unix-only, as the pty it drives is; the cases run
-//! one at a time.
+//! the normal screen when the UI leaves with the pager open. A question
+//! leaves the roster when its asker is cancelled, along with a grandchild's
+//! question when its parent is cancelled, and a question asked after that
+//! cancel is never listed; answering a question whose asker stopped
+//! waiting says the reply was not delivered. The root agent and the child
+//! talk to separate fake models, so the order of their requests is fixed.
+//! The pager's own keys over one tool's whole output (scrolling a long
+//! one, CRLF line endings, runs of CRs before an LF, an output over the
+//! per-call cap) live here too. Unix-only, as the pty it drives is; the
+//! cases run one at a time.
 #![cfg(unix)]
 
 mod common;
@@ -1201,6 +1205,301 @@ fn crlf_line_endings_show_in_the_pager_as_whole_lines() {
     quit_from_composer(pty);
 }
 
+// ---------------------------------------------------------------------------
+// A withdrawn question, and a grandchild's question.
+// ---------------------------------------------------------------------------
+
+/// Opens the roster, waits for a question row naming `tag`, and opens it
+/// in its modal. Returns the modal frame.
+fn open_question_row(pty: &mut Pty, tag: &str) -> String {
+    pty.send(b"\x1bOR").unwrap();
+    let (asked, roster) = frame_until(pty, Duration::from_secs(15), |frame| {
+        frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains(tag)
+    });
+    assert!(asked, "the question {tag} is not on the roster:\n{roster}");
+    let mut last = String::new();
+    for _ in 0..4 {
+        pty.send(b"j").unwrap();
+        pty.read_for(Duration::from_millis(300));
+        pty.send(b"\r").unwrap();
+        pty.read_for(Duration::from_millis(800));
+        last = flipped_frame(pty);
+        if squeezed(&last).contains(tag) && !last.contains("Esc = close") {
+            return last;
+        }
+    }
+    panic!("Enter did not open the question {tag}:\n{last}");
+}
+
+/// The kid asks with a short escalation timeout; the user opens the
+/// question, the kid stops waiting (but keeps running), and only then the
+/// user answers. The answer is not delivered and the UI says so.
+#[test]
+#[serial]
+fn answering_a_question_whose_asker_timed_out_says_not_delivered() {
+    let scene = scene(
+        "thr-withdrawn",
+        |gate| {
+            vec![
+                Reply::ToolCall {
+                    name: "user__confirm".to_string(),
+                    arguments: r#"{"question":"may the kid go w4q?"}"#.to_string(),
+                },
+                // The kid stays alive after its wait runs out.
+                Reply::After {
+                    gate: gate.to_path_buf(),
+                    reply: Box::new(Reply::Text("kid moved on w4a".to_string())),
+                },
+            ]
+        },
+        "",
+    );
+    fs::write(
+        scene.dir.join("agents").join("kid").join("config.yaml"),
+        "name: kid\n\
+         description: Does the kid task.\n\
+         model: kidfake:fake-model\n\
+         instructions: You are the kid.\n\
+         escalation_timeout: 10\n\
+         global_tools:\n\
+         \x20 - kid_mark.sh\n",
+    )
+    .unwrap();
+    let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".agent boss\r").unwrap();
+    pty.read_for(Duration::from_millis(2500));
+    pty.send(b"go boss\r").unwrap();
+    wait_for_file(&mut pty, &scene.root_started, "the root's mark tool");
+    let deadline = Instant::now() + PTY_DEADLINE;
+    while scene.kid.served() < 1 && Instant::now() < deadline {
+        pty.read_for(Duration::from_millis(200));
+    }
+    let modal = open_question_row(&mut pty, "w4q");
+    // Outlast the kid's timeout with the modal up.
+    pty.read_for(Duration::from_secs(12));
+    let (_, mid) = frame_until(&mut pty, Duration::from_secs(1), |_| false);
+    pty.send(b"y").unwrap();
+    pty.read_for(HOTKEY_GAP);
+    pty.send(b"\r").unwrap();
+    let (said, after) = frame_until(&mut pty, Duration::from_secs(8), |frame| {
+        squeezed(frame).contains("notdelivered")
+    });
+    assert!(
+        said,
+        "answering a withdrawn question did not say the reply was not delivered\n\
+         modal:\n{modal}\nafter timeout:\n{mid}\nafter answer:\n{after}"
+    );
+    let roster_open = |frame: &str| frame.rfind("Esc = close").is_some();
+    let (mut shown, mut roster) = frame_until(&mut pty, Duration::from_secs(2), roster_open);
+    if !shown {
+        pty.send(b"\x1bOR").unwrap();
+        (shown, roster) = frame_until(&mut pty, Duration::from_secs(10), roster_open);
+    }
+    assert!(shown, "the roster did not open after the answer:\n{roster}");
+    assert!(
+        !squeezed(roster_band(&roster)).contains("w4q"),
+        "the withdrawn question is still on the roster:\n{roster}"
+    );
+    let _ = pty.send(b"\x1b");
+    let transcript = leave(&mut pty, &scene);
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+/// Three clients: `fake` (boss), `kidfake` (kid), `gkfake` (grandkid).
+fn write_three_model_config(dir: &Path, boss: &FakeLlm, kid: &FakeLlm, gk: &FakeLlm) {
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    let client = |name: &str, base: String| {
+        format!(
+            "\x20 - type: openai-compatible\n\
+             \x20   name: {name}\n\
+             \x20   api_base: '{base}'\n\
+             \x20   api_key: 'unused'\n\
+             \x20   models:\n\
+             \x20     - name: fake-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n"
+        )
+    };
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: fake:fake-model\n\
+             function_calling_support: true\n\
+             stream: true\n\
+             save_session: false\n\
+             vault_password_file: '{}'\n\
+             clients:\n{}{}{}\
+             workspace_instructions: false\n\
+             memory: false\n",
+            vault_pass.display(),
+            client("fake", boss.api_base()),
+            client("kidfake", kid.api_base()),
+            client("gkfake", gk.api_base()),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("agents").join("kid").join("config.yaml"),
+        "name: kid\n\
+         description: Does the kid task.\n\
+         model: kidfake:fake-model\n\
+         instructions: You are the kid.\n\
+         can_spawn_agents: true\n\
+         global_tools:\n\
+         \x20 - kid_mark.sh\n",
+    )
+    .unwrap();
+    let gk = dir.join("agents").join("gkid");
+    fs::create_dir_all(&gk).unwrap();
+    fs::write(
+        gk.join("config.yaml"),
+        "name: gkid\n\
+         description: Does the grandkid task.\n\
+         model: gkfake:fake-model\n\
+         instructions: You are the grandkid.\n",
+    )
+    .unwrap();
+}
+
+fn grandkid_scene(name: &str, gk_replies: Vec<Reply>) -> (Scene, FakeLlm) {
+    let scene = scene(
+        name,
+        |gate| {
+            vec![
+                Reply::ToolCall {
+                    name: "agent__spawn".to_string(),
+                    arguments: r#"{"agent":"gkid","prompt":"grandkid task g0k"}"#.to_string(),
+                },
+                Reply::After {
+                    gate: gate.to_path_buf(),
+                    reply: Box::new(Reply::Text("kid done z4p".to_string())),
+                },
+            ]
+        },
+        "",
+    );
+    let gk = FakeLlm::start(gk_replies);
+    write_three_model_config(&scene.dir, &scene.boss, &scene.kid, &gk);
+    (scene, gk)
+}
+
+/// Starts the boss and waits until the grandkid has asked its model at
+/// least once.
+fn start_boss_until_the_grandkid_asks(pty: &mut Pty, scene: &Scene, gk: &FakeLlm) {
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".agent boss\r").unwrap();
+    pty.read_for(Duration::from_millis(2500));
+    pty.send(b"go boss\r").unwrap();
+    wait_for_file(pty, &scene.root_started, "the root's mark tool");
+    let deadline = Instant::now() + PTY_DEADLINE;
+    while gk.served() < 1 && Instant::now() < deadline {
+        pty.read_for(Duration::from_millis(200));
+    }
+    assert!(gk.served() >= 1, "the grandkid never asked its model");
+    pty.read_for(Duration::from_millis(1500));
+}
+
+/// Cancels the kid from an open roster: the kid's row takes the focus on
+/// open, so `x` acts on it.
+fn cancel_the_kid_from_the_roster(pty: &mut Pty) -> String {
+    pty.send(b"x").unwrap();
+    let (cancelled, last) = frame_until(pty, Duration::from_secs(15), |frame| {
+        frame.rfind("Esc = close").is_some_and(|_| {
+            let band = roster_band(frame);
+            !band
+                .lines()
+                .any(|l| l.contains("kid") && !l.contains("gkid") && l.contains("running"))
+        })
+    });
+    assert!(
+        cancelled,
+        "could not cancel the kid from the roster:\n{last}"
+    );
+    last
+}
+
+/// A grandchild asks while its parent runs; cancelling the parent from
+/// the roster takes the grandchild's question off the roster too, since
+/// the subtree that would receive the answer is gone.
+#[test]
+#[serial]
+fn cancelling_the_parent_drops_the_grandchilds_question() {
+    let (scene, gk) = grandkid_scene(
+        "thr-gk-ask",
+        vec![
+            Reply::ToolCall {
+                name: "user__confirm".to_string(),
+                arguments: r#"{"question":"may the grandkid go g7q?"}"#.to_string(),
+            },
+            Reply::Text("grandkid heard g7a".to_string()),
+        ],
+    );
+    let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+    start_boss_until_the_grandkid_asks(&mut pty, &scene, &gk);
+    pty.send(b"\x1bOR").unwrap();
+    let (asked, roster) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+        frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains("g7q")
+    });
+    assert!(
+        asked,
+        "the grandkid's question is not on the roster:\n{roster}"
+    );
+    cancel_the_kid_from_the_roster(&mut pty);
+    let (cleared, after) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+        frame.rfind("Esc = close").is_some() && !squeezed(roster_band(frame)).contains("g7q")
+    });
+    assert!(
+        cleared,
+        "the grandkid's question outlived its cancelled parent: {:?}\n{after}",
+        roster_band(&after)
+    );
+    pty.send(b"\x1b").unwrap();
+    let transcript = leave(&mut pty, &scene);
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+/// The grandchild's question would come only after its parent was
+/// cancelled; the question never lands on the roster as one to answer.
+#[test]
+#[serial]
+fn a_grandchild_question_after_its_parent_is_cancelled_is_not_listed() {
+    let gk_gate_holder = std::env::temp_dir().join(format!("thr-gk-gate-{}", std::process::id()));
+    let _ = fs::remove_file(&gk_gate_holder);
+    let (scene, gk) = grandkid_scene(
+        "thr-gk-late",
+        vec![
+            Reply::After {
+                gate: gk_gate_holder.clone(),
+                reply: Box::new(Reply::ToolCall {
+                    name: "user__confirm".to_string(),
+                    arguments: r#"{"question":"late grandkid asks l8q?"}"#.to_string(),
+                }),
+            },
+            Reply::Text("grandkid heard l8a".to_string()),
+        ],
+    );
+    let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+    start_boss_until_the_grandkid_asks(&mut pty, &scene, &gk);
+    pty.send(b"\x1bOR").unwrap();
+    repainted_frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
+    cancel_the_kid_from_the_roster(&mut pty);
+    fs::write(&gk_gate_holder, "").unwrap();
+    let (listed, frame) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
+        frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains("l8q")
+    });
+    let _ = fs::remove_file(&gk_gate_holder);
+    assert!(
+        !listed,
+        "a question from the cancelled kid's grandchild landed on the roster: {:?}",
+        roster_band(&frame)
+    );
+    pty.send(b"\x1b").unwrap();
+    let transcript = leave(&mut pty, &scene);
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
 /// A tool that prints well over four MiB to stderr, then a last marker.
 const HUGE_OUTPUT_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
@@ -1330,6 +1629,21 @@ fn a_cancelled_askers_question_leaves_the_roster() {
     assert!(
         cancelled,
         "could not cancel the kid from the roster:\n{last}"
+    );
+    let kid_requests = || {
+        scene
+            .kid
+            .bodies()
+            .iter()
+            .filter(|body| body.contains("kid task q7k"))
+            .count()
+    };
+    assert_eq!(kid_requests(), 1, "the kid asked its model more than once");
+    pty.read_for(Duration::from_secs(2));
+    assert_eq!(
+        kid_requests(),
+        1,
+        "the kid asked its model again after it was cancelled"
     );
     let (cleared, after) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
         frame.rfind("Esc = close").is_some() && !squeezed(roster_band(frame)).contains("d9q")

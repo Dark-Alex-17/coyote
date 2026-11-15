@@ -6120,6 +6120,7 @@ mod tests {
     /// from one that ran out of time: the panic comes back as such, with
     /// its message, instead of being reported as a task left behind.
     #[tokio::test]
+    #[serial]
     async fn join_unattended_reports_a_panicking_task_as_panicked() {
         let (_tx, mut rx) = unbounded_channel();
         let handle = tokio::task::spawn_blocking(|| -> () { panic!("boom-j4p") });
@@ -6137,6 +6138,7 @@ mod tests {
     /// channel is read ahead of the task, so nothing lands between the
     /// two is lost, and a prompt raised meanwhile is still answered.
     #[tokio::test]
+    #[serial]
     async fn join_unattended_keeps_the_notices_that_arrive_during_the_wait() {
         let (tx, mut rx) = unbounded_channel();
         let early = late_output(tx.clone());
@@ -10941,6 +10943,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn a_panicking_cancel_is_reported_as_a_failed_cancel() {
         let result = catch_cancel(async { panic!("the cancel broke c4p") }).await;
         assert_eq!(

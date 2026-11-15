@@ -62,6 +62,8 @@ impl EscalationQueue {
         });
     }
 
+    /// The requests still waiting for an answer; drops the ones whose
+    /// asker stopped waiting.
     pub fn pending(&self) -> Vec<PendingEscalation> {
         self.prune_closed()
             .values()
@@ -93,6 +95,8 @@ impl EscalationQueue {
             .collect()
     }
 
+    /// Whether any request still waits for an answer; drops the ones
+    /// whose asker stopped waiting.
     pub fn has_pending(&self) -> bool {
         !self.prune_closed().is_empty()
     }
