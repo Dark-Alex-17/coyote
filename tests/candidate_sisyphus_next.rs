@@ -1694,8 +1694,9 @@ fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "url-only-pr-ref",
-                "u[\"pr_ref\"] = _pr_url_ref(state)",
-                "u[\"pr_ref\"] = _pr_ref(state)",
+                "or _branch_pr_ref(state)) if linked",
+                "or _branch_pr_ref(state) or \"\".join(re.findall(r\"#(\\d+)\", \
+                 state.get(\"git_report\") or \"\"))) if linked",
                 "flip: a publish report naming only Closes #12 never runs gh pr ready on 12; the \
                  ref comes from gh pr view",
             ),

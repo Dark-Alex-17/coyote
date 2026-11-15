@@ -82,8 +82,10 @@ BASE = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=T
 check("env: no caller SISYPHUS_GH_* seam, poll sleep or owner/Slack binary survives the scrub",
       not [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in SCRUBBED_SEAMS]
       and {"SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN"} <= set(SCRUBBED_SEAMS))
-# every flip_ready row re-reads the PR and may run `gh pr ready`, so the real gh calls must never run here
-_PR_VIEW_DEFAULT = "echo '{\"isDraft\": false}'"
+# every flip_ready row re-reads the PR and may run `gh pr ready`, so the real gh calls must never run here; the
+# default PR has the fixture repo's branch as its head, so a report's pull URL resolves to it
+BRANCH = subprocess.run(["git", "-C", REPO, "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
+_PR_VIEW_DEFAULT = "echo '{\"isDraft\": false, \"headRefName\": \"" + BRANCH + "\"}'"
 _PR_READY_DEFAULT = "exit 1"
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
 os.environ["SISYPHUS_GH_PR_READY_CMD"] = _PR_READY_DEFAULT
@@ -4222,8 +4224,8 @@ check("caps: apply_answer's re-ask leaves parse_answer's count, so both share on
 _FLIP_MARK = os.path.join(TMP, "flip-ready.mark")
 _FLIP_LOG = os.path.join(TMP, "flip-ready.log")
 _VIEW_LOG = os.path.join(TMP, "flip-view.log")
-_DRAFT_JSON = "echo '{\"isDraft\": true}'"
-_READY_JSON = "echo '{\"isDraft\": false}'"
+_DRAFT_JSON = "echo '{\"isDraft\": true, \"headRefName\": \"" + BRANCH + "\"}'"
+_READY_JSON = _PR_VIEW_DEFAULT
 _saved_flip_env = {k: os.environ.get(k) for k in ("SISYPHUS_GH_PR_VIEW_CMD", "SISYPHUS_GH_PR_READY_CMD")}
 
 
@@ -4264,6 +4266,7 @@ flip_seams("echo not-json", "exit 0")
 u = gates.ci_gate(base_state(**_flip))
 check("flip: a re-read that prints unparseable output -> not confirmed, the detail says gh pr view failed",
       u.get("pr_ready_confirmed") is False and "gh pr view failed" in str(u.get("pr_ready_detail")), u)
+flip_seams(_READY_JSON, "exit 0")
 _watch = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                                   git_report="opened https://github.com/o/r/pull/9"))
 seam_log(_FLIP_LOG)
@@ -4279,13 +4282,54 @@ _w12 = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_ga
                                 git_report="opened the draft PR. Closes #12"))
 u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_w12.get("pr_ref"), git_report="Closes #12")))
 _ready12 = seam_log(_FLIP_LOG)
+_fake_gh = os.path.join(TMP, "fake-gh")
+os.makedirs(_fake_gh)
+_gh_log = os.path.join(TMP, "fake-gh.log")
+with open(os.path.join(_fake_gh, "gh"), "w") as fh:
+    fh.write(f"#!/bin/sh\necho \"$*\" >> '{_gh_log}'\necho '[{{\"name\": \"build\", \"bucket\": \"pass\"}}]'\n")
+os.chmod(os.path.join(_fake_gh, "gh"), 0o755)
+_saved_gh_env = {k: os.environ.get(k) for k in ("PATH", "SISYPHUS_GH_CHECKS_CMD")}
+os.environ["PATH"] = _fake_gh + os.pathsep + os.environ["PATH"]
+os.environ.pop("SISYPHUS_GH_CHECKS_CMD", None)
+_p12 = gates.ci_poll(base_state(git_report="opened the draft PR. Closes #12", pr_ref=_w12.get("pr_ref"), ci_polls=0,
+                                ci_started_at=int(time.time())))
+_checks12 = seam_log(_gh_log)
+for _k, _v in _saved_gh_env.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 flip_seams("echo '{\"url\": \"https://github.com/o/r/pull/9\", \"isDraft\": true}'", "exit 0")
 _wv = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                                git_report="opened the draft PR. Closes #12"))
 check("flip: a publish report naming only Closes #12 never runs gh pr ready on 12; the ref comes from gh pr view",
-      _w12.get("_next") == "ci_poll" and _w12.get("pr_ref") == "" and _ready12 == ""
+      _w12.get("_next") == "final_report" and not _w12.get("pr_ref") and _ready12 == ""
+      and _w12.get("ci_watch_note") == "not watched: no PR found for the current branch"
+      and _checks12 == "pr checks --json name,state,bucket,link\n" and _p12.get("ci_status") == "green"
       and u.get("pr_ready_confirmed") is False and "no PR ref" in str(u.get("pr_ready_detail"))
-      and _wv.get("pr_ref") == "9", (_w12.get("pr_ref"), _ready12, u.get("pr_ready_detail"), _wv.get("pr_ref")))
+      and _wv.get("pr_ref") == "9", (_w12, _ready12, _checks12, u.get("pr_ready_detail"), _wv.get("pr_ref")))
+_other41 = "41) echo '{\"isDraft\": true, \"headRefName\": \"other\"}';;"
+_ours9 = ("echo '{\"url\": \"https://github.com/o/r/pull/9\", \"isDraft\": false, \"headRefName\": \"" + BRANCH
+          + "\"}'")
+_publish41 = dict(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                  git_report="opened the draft PR; supersedes https://github.com/o/r/pull/41")
+flip_seams(f"case \"$SISYPHUS_PR_REF\" in {_other41} *) {_ours9};; esac", "exit 0")
+_w41 = gates.ci_gate(base_state(**_publish41))
+u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_w41.get("pr_ref"), git_report=_publish41["git_report"])))
+_ready41 = seam_log(_FLIP_LOG)
+flip_seams(f"case \"$SISYPHUS_PR_REF\" in {_other41} *) exit 1;; esac", "exit 0")
+_n41 = gates.ci_gate(base_state(**_publish41))
+check("flip: a publish report whose first pull URL is another PR (pull/41) never saves 41 or runs gh pr ready on it",
+      _w41.get("pr_ref") == "9" and _w41.get("_next") == "ci_poll" and u.get("pr_ready_confirmed") is True
+      and _ready41 == "9\n" and not _n41.get("pr_ref") and _n41.get("_next") == "final_report"
+      and _n41.get("ci_watch_note") == "not watched: no PR found for the current branch",
+      (_w41.get("pr_ref"), _ready41, _n41))
+flip_seams("echo '{\"isDraft\": false, \"headRefName\": \"other\"}'", "exit 0")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: a re-read whose head is not the current branch -> not confirmed, the detail names both branches",
+      u.get("pr_ready_confirmed") is False and "'other'" in str(u.get("pr_ready_detail"))
+      and repr(BRANCH) in str(u.get("pr_ready_detail")), u)
+seam_log(_FLIP_LOG)
 flip_seams(_DRAFT_JSON, "exit 0")
 u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=0))
 check("flip: review mode with an unconfirmed flip still starts the watch, and the follow-up says so",
