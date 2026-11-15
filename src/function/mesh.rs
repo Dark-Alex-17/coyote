@@ -1210,15 +1210,15 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
     // A first contact is asked for before the send, as the send would ask, so the
     // session's user is known and the correlation is open before anything goes out: a
     // reply over a fast link that beats the acknowledgement then still lands as a reply.
-    if runtime.identity_at(&destination).is_none() && runtime.trust().may_be_asked_for(&destination)
+    if runtime.identity_at(&destination).is_none()
+        && runtime.trust().may_be_asked_for(&destination)
+        && let Err(miss) = runtime.peer_asking_if_unheard(&destination).await
     {
-        if let Err(miss) = runtime.peer_asking_if_unheard(&destination).await {
-            return Ok(named_send_error(
-                &SendError::Unheard { destination, miss },
-                &naming,
-                None,
-            ));
-        }
+        return Ok(named_send_error(
+            &SendError::Unheard { destination, miss },
+            &naming,
+            None,
+        ));
     }
     if let Some(identity) = runtime.identity_at(&destination) {
         open_message_correlation(slot, &destination, &identity, &out, SystemTime::now());
