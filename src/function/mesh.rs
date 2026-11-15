@@ -1204,26 +1204,36 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
         Err(err) => return Ok(send_error(&err)),
     };
     let naming = Naming::of_runtime(runtime);
-    let known = runtime.identity_at(&destination);
-    if let Some(identity) = &known {
-        open_message_correlation(slot, &destination, identity, &out, SystemTime::now());
+    // A first contact is asked for before the send, as the send would ask, so the
+    // session's user is known and the correlation is open before anything goes out: a
+    // reply over a fast link that beats the acknowledgement then still lands as a reply.
+    if runtime.identity_at(&destination).is_none() && runtime.trust().may_be_asked_for(&destination)
+    {
+        if let Err(miss) = runtime.peer_asking_if_unheard(&destination).await {
+            return Ok(named_send_error(
+                &SendError::Unheard { destination, miss },
+                &naming,
+                None,
+            ));
+        }
+    }
+    if let Some(identity) = runtime.identity_at(&destination) {
+        open_message_correlation(slot, &destination, &identity, &out, SystemTime::now());
     }
     let sent = runtime.send_peer(to, &out).await;
-    // Read after the send: a first contact files the session's row on the way.
     let identity = runtime.identity_at(&destination);
     match sent {
         Ok(outcome) => {
-            // A first contact learns the identity only from the send, so the correlation
-            // opens after it; a reply over a fast link can arrive before this open and is
-            // then delivered as a plain message.
-            if known.is_none()
-                && let Some(identity) = &identity
-            {
-                open_message_correlation(slot, &destination, identity, &out, SystemTime::now());
-            }
             let thread = sent_thread(&out);
             if let Some(thread) = thread {
                 slot.remember_sent_thread(thread);
+                if out.kind == PeerKind::Message && out.in_reply_to.is_none() {
+                    slot.remember_sent_recipient(
+                        thread,
+                        &destination,
+                        identity.as_deref().unwrap_or_default(),
+                    );
+                }
             }
             let mut result = json!({
                 "status": "sent",
@@ -12326,6 +12336,95 @@ mod tests {
 
                 assert!(ctx.app.mesh.stop().await.unwrap());
                 started.relay_handle.abort();
+            }
+
+            /// On a first contact the message's correlation is open before anything goes
+            /// out: when A files B's message, which is before A acknowledges it, B already
+            /// waits on it, so a reply A sent at once, ahead of the acknowledgement, would
+            /// land as a reply in the message's thread.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_first_contact_send_opens_its_correlation_before_the_peer_acknowledges() {
+                use crate::mesh::idle::{IdleNotify, IdleSink};
+
+                struct SeenAtReceipt {
+                    b: Arc<MeshSlot>,
+                    open: parking_lot::Mutex<Vec<usize>>,
+                }
+
+                impl IdleSink for SeenAtReceipt {
+                    fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
+                        self.open.lock().push(self.b.correlations().list().len());
+                        let _ = note;
+                        Ok(())
+                    }
+
+                    fn request_sync(&self) {}
+                }
+
+                let _guard = TestConfigDirGuard::new("mesh-tool-first-contact-open-early");
+                let (relay, a, b) =
+                    pair_where_b_has_not_heard_a("mesh-tool-first-contact-open-early").await;
+                let to_a = a.runtime.current_destination_hash();
+                let to_b = b.runtime.current_destination_hash();
+                let slot_a = Arc::new(MeshSlot::default());
+                slot_a.install(a.runtime.clone()).unwrap();
+                let mut ctx = plain_ctx();
+                ctx.app.mesh.install(b.runtime.clone()).unwrap();
+                let seen = Arc::new(SeenAtReceipt {
+                    b: ctx.app.mesh.clone(),
+                    open: parking_lot::Mutex::new(Vec::new()),
+                });
+                slot_a.set_idle(seen.clone());
+                let identity_of_a = current_identity(&mesh_paths(&a.tmp).identity_path)
+                    .unwrap()
+                    .address_hash()
+                    .to_hex_string();
+                b.runtime
+                    .trust()
+                    .trust_identity(
+                        ctx.app.mesh.as_ref(),
+                        &identity_of_a,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+                a.runtime
+                    .trust()
+                    .trust_destination(
+                        slot_a.as_ref(),
+                        &to_b,
+                        TrustOptions::default(),
+                        SystemTime::now(),
+                    )
+                    .unwrap();
+
+                let (sent, _) = call(
+                    &mut ctx,
+                    "send",
+                    &json!({"to": to_a, "message": "first contact"}),
+                )
+                .await;
+                assert_eq!(sent["status"], "sent", "{sent}");
+                wait_until("A to file B's message", || !seen.open.lock().is_empty()).await;
+
+                assert_eq!(
+                    seen.open.lock()[0],
+                    1,
+                    "B's correlation was open when A filed the message"
+                );
+                let opened = ctx
+                    .app
+                    .mesh
+                    .correlations()
+                    .get(sent["id"].as_str().unwrap())
+                    .expect("the correlation stays open for the reply");
+                assert_eq!(opened.record.peer_identity, identity_of_a);
+                assert_eq!(opened.record.peer_destination, to_a);
+
+                assert!(ctx.app.mesh.stop().await.unwrap());
+                slot_a.stop().await.unwrap();
+                relay.stop().await;
             }
 
             /// B, restarted with no peer table, learns of A only by asking. B trusts A's

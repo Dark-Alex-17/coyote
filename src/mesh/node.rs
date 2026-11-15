@@ -1208,11 +1208,15 @@ impl MeshRuntime {
     }
 
     /// A trusted session at `destination` sent this node a message it filed: it served
-    /// this node, which the background card fetch asks before it asks anything.
-    pub(crate) fn note_served_by(&self, destination: &str) {
+    /// this node, which the background card fetch asks before it asks anything. Only a
+    /// message that came over a live link lifts a refusal stop: one a propagation node
+    /// held may predate the session's revoke, so it says nothing about its trust now.
+    pub(crate) fn note_served_by(&self, destination: &str, via: PeerVia) {
         if !destination.is_empty() {
             self.peers.mark_served(destination);
-            self.card_cadence.lift(destination);
+            if via == PeerVia::Direct {
+                self.card_cadence.lift(destination);
+            }
             self.card_cadence.note_heard(destination);
         }
     }
@@ -5030,6 +5034,14 @@ impl MeshSlot {
         self.remember_thread(|store| store.record_sent(thread));
     }
 
+    /// Records where the message that opened `thread` went, so a follow-up after its
+    /// reply goes back to that session.
+    pub(crate) fn remember_sent_recipient(&self, thread: &str, destination: &str, identity: &str) {
+        if let Some(store) = self.sent_threads() {
+            store.record_recipient(thread, destination, identity);
+        }
+    }
+
     /// Records `thread` as one a peer sent, so the tools accept it as a thread to
     /// continue.
     pub(crate) fn remember_received_thread(&self, thread: &str) {
@@ -6131,16 +6143,17 @@ impl MeshSlot {
     }
 
     /// `MeshRuntime::note_served_by`, after the background card fetch a message from a
-    /// session this node trusts prompts (`CardTrigger::Contacted`), so a stored message
-    /// fetches the card as one over a link does; a no-op while the mesh is off. The fetch
-    /// is considered first, since it is what lifts a refusal stop and gives back the
-    /// interval the refused ask took.
-    pub(crate) fn note_served_by(&self, destination: &str) {
+    /// session this node trusts over a live link prompts (`CardTrigger::Contacted`); a
+    /// no-op while the mesh is off. The fetch is considered first, since it is what lifts
+    /// a refusal stop and gives back the interval the refused ask took. A message a
+    /// propagation node held prompts nothing: it may have been sent before that session
+    /// revoked this one.
+    pub(crate) fn note_served_by(&self, destination: &str, via: PeerVia) {
         if let Some(runtime) = self.get() {
-            if !destination.is_empty() {
+            if !destination.is_empty() && via == PeerVia::Direct {
                 runtime.consider_card_fetch(destination, CardTrigger::Contacted);
             }
-            runtime.note_served_by(destination);
+            runtime.note_served_by(destination, via);
         }
     }
 
@@ -6703,12 +6716,12 @@ impl PeerSurface for MeshSlot {
     }
 
     fn deliver_peer(&self, message: PeerMessage) {
-        self.note_served_by(&message.source_destination);
+        self.note_served_by(&message.source_destination, message.via);
         MeshSlot::deliver_peer(self, message);
     }
 
     fn file_peer(&self, mut message: PeerMessage) {
-        self.note_served_by(&message.source_destination);
+        self.note_served_by(&message.source_destination, message.via);
         let answered = self.answer_correlation(&mut message);
         self.remember_references(&message);
         self.remember_received_thread(message.thread());

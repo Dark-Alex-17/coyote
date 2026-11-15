@@ -31,6 +31,28 @@ pub(crate) struct SentThreadsFile {
     pub received: Vec<String>,
 }
 
+/// Where a message this instance sent went: its thread, and the session and user it was
+/// sent to, so a follow-up after the reply closed it goes back to that session and to no
+/// one else who wrote in the thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SentRecipient {
+    pub thread: String,
+    pub destination: String,
+    pub identity: String,
+}
+
+pub(crate) const SENT_RECIPIENTS_VERSION: u64 = 1;
+
+/// `sent-recipients-<instance_id>.json`, oldest first. Cache: a file that cannot be read
+/// starts the list empty, and a follow-up on a thread it no longer names is refused.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SentRecipientsFile {
+    version: u64,
+    recipients: Vec<SentRecipient>,
+}
+
 #[derive(Default)]
 struct Held {
     sent: VecDeque<String>,
@@ -88,6 +110,8 @@ pub(crate) struct SentThreads {
     path: PathBuf,
     held: Mutex<Held>,
     write_lock: Mutex<()>,
+    recipients_path: PathBuf,
+    recipients: Mutex<VecDeque<SentRecipient>>,
 }
 
 impl SentThreads {
@@ -125,10 +149,14 @@ impl SentThreads {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Held::default(),
             Err(err) => set_aside_corrupt(&path, "could not be read", &err.to_string()),
         };
+        let recipients_path = recipients_path_of(&path);
+        let recipients = load_recipients(&recipients_path);
         Ok(Self {
             path,
             held: Mutex::new(held),
             write_lock: Mutex::new(()),
+            recipients_path,
+            recipients: Mutex::new(recipients),
         })
     }
 
@@ -148,6 +176,59 @@ impl SentThreads {
     /// Whether this instance sent or opened `thread`, as opposed to only receiving it.
     pub(crate) fn was_sent(&self, thread: &str) -> bool {
         self.held.lock().sent.iter().any(|other| other == thread)
+    }
+
+    /// The threads this instance sent, newest first.
+    pub(crate) fn sent(&self) -> Vec<String> {
+        self.held.lock().sent.iter().rev().cloned().collect()
+    }
+
+    /// The session and user the message that opened `thread` was sent to.
+    pub(crate) fn recipient(&self, thread: &str) -> Option<SentRecipient> {
+        self.recipients
+            .lock()
+            .iter()
+            .rev()
+            .find(|recipient| recipient.thread == thread)
+            .cloned()
+    }
+
+    /// Records where the message that opened `thread` went, newest last and capped as
+    /// the threads are. A recipient already on record for the thread is kept: the thread
+    /// belongs to the session it was first sent to.
+    pub(crate) fn record_recipient(&self, thread: &str, destination: &str, identity: &str) {
+        if !is_wire_id(thread) || destination.is_empty() {
+            return;
+        }
+        let mut recipients = self.recipients.lock();
+        if recipients
+            .iter()
+            .any(|recipient| recipient.thread == thread)
+        {
+            return;
+        }
+        recipients.push_back(SentRecipient {
+            thread: thread.to_string(),
+            destination: destination.to_string(),
+            identity: identity.to_string(),
+        });
+        while recipients.len() > SENT_THREADS_MAX_ENTRIES {
+            recipients.pop_front();
+        }
+        let file = SentRecipientsFile {
+            version: SENT_RECIPIENTS_VERSION,
+            recipients: recipients.iter().cloned().collect(),
+        };
+        let written = serde_json::to_vec(&file)
+            .context("Failed to serialize the mesh sent-recipients list")
+            .and_then(|json| write_atomically_owner_only(&self.recipients_path, &json));
+        if let Err(err) = written {
+            warn!(
+                "Mesh sent-recipients list '{}' could not be written ({}); a follow-up on this thread works until the node stops",
+                self.recipients_path.display(),
+                redact_hashes(&format!("{err:#}"))
+            );
+        }
     }
 
     /// Records `thread` as one this instance sent or opened, moving it out of the
@@ -196,6 +277,60 @@ impl SentThreads {
         let _write = self.write_lock.lock();
         drop(held);
         write_atomically_owner_only(&self.path, &json)
+    }
+}
+
+/// `sent-recipients-<instance_id>.json` beside `sent-threads-<instance_id>.json`, so the
+/// threads files `instances_holding_thread` reads never include it.
+fn recipients_path_of(threads: &Path) -> PathBuf {
+    let name = threads
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sent-threads.json");
+    let recipients = match name.strip_prefix("sent-threads") {
+        Some(rest) => format!("sent-recipients{rest}"),
+        None => format!("{name}.recipients"),
+    };
+    threads.with_file_name(recipients)
+}
+
+/// The recipients on file at `path`; empty when there is none, and, with a debug line,
+/// when it cannot be read: the list is cache.
+fn load_recipients(path: &Path) -> VecDeque<SentRecipient> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return VecDeque::new(),
+        Err(err) => {
+            debug!(
+                "Mesh sent-recipients list '{}' could not be read ({}); starting it empty",
+                path.display(),
+                redact_hashes(&err.to_string())
+            );
+            return VecDeque::new();
+        }
+    };
+    match serde_json::from_slice::<SentRecipientsFile>(&bytes) {
+        Ok(file) if file.version == SENT_RECIPIENTS_VERSION => file
+            .recipients
+            .into_iter()
+            .filter(|recipient| is_wire_id(&recipient.thread))
+            .collect(),
+        Ok(file) => {
+            debug!(
+                "Mesh sent-recipients list '{}' is version {}, not {SENT_RECIPIENTS_VERSION}; starting it empty",
+                path.display(),
+                file.version
+            );
+            VecDeque::new()
+        }
+        Err(err) => {
+            debug!(
+                "Mesh sent-recipients list '{}' could not be parsed ({}); starting it empty",
+                path.display(),
+                redact_hashes(&err.to_string())
+            );
+            VecDeque::new()
+        }
     }
 }
 

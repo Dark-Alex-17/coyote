@@ -695,6 +695,7 @@ mod tests {
 #[cfg(all(test, unix))]
 mod network {
     use super::*;
+    use crate::mesh::message::{PeerKind, PeerMessage, PeerSurface, PeerVia, RawPeerMessage};
     use crate::mesh::node::MeshSlot;
     use crate::mesh::request::STATUS_PATH;
     use crate::mesh::test_support::{
@@ -871,11 +872,38 @@ mod network {
             a_rt.remote_refusal(&b_dest).to_string().contains("Bea"),
             "the owner's own alias still names the peer"
         );
-        a_rt.note_served_by(&b_dest);
-        assert!(
-            !a_rt.card_cadence().is_refused(&b_dest),
-            "a message from B is a trust change on B's side and lifts the stop"
+        // A message B sent before it revoked A, held on a propagation node and fetched
+        // now, is no contact: it says nothing of B's trust today, so the stop stays and
+        // nothing more is asked of B.
+        let asked = status_requests(a_rt);
+        PeerSurface::deliver_peer(
+            slot_a.as_ref(),
+            PeerMessage::new(RawPeerMessage {
+                source_identity: b_identity.clone(),
+                source_destination: b_dest.clone(),
+                destination: a_rt.current_destination_hash(),
+                title: None,
+                content: "sent before the revoke".to_string(),
+                fields: None,
+                timestamp: 1_790_000_000.0,
+                message_id: "4d".repeat(16),
+                in_reply_to: None,
+                kind: PeerKind::Message,
+                via: PeerVia::StoreAndForward,
+                thread: None,
+                disposition: None,
+                retry_after: None,
+                parts: Vec::new(),
+                dropped_parts: 0,
+            }),
         );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            a_rt.card_cadence().is_refused(&b_dest),
+            "a held message from B lifts no stop"
+        );
+        assert_eq!(status_requests(a_rt), asked, "nothing is asked of B");
+        assert_eq!(knocks_from_a(b_rt), 1, "nothing more is filed at B");
 
         assert!(slot_a.stop().await.unwrap());
         assert!(slot_b.stop().await.unwrap());
@@ -1049,7 +1077,7 @@ mod network {
             )
             .unwrap();
 
-        slot_a.note_served_by(&b_dest);
+        slot_a.note_served_by(&b_dest, PeerVia::Direct);
         let person_of_b = || {
             a_rt.trust()
                 .people(&[])

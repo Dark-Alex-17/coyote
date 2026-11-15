@@ -1174,7 +1174,7 @@ async fn peer_status(
     );
     result_follows();
     let card = tokio::select! {
-        outcome = runtime.request_status(route) => outcome.map_err(quoted_status_failure)?,
+        outcome = runtime.request_status(route) => outcome.map_err(|err| quoted_status_failure(err, &who))?,
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_text("Status request interrupted.");
             return Ok(());
@@ -1682,7 +1682,12 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
     let runtime = live(ctx)?;
     let now = SystemTime::now();
     ctx.app.mesh.sweep_expired_pending(now);
-    let id = &pending_id(ctx, id, now)?;
+    let closed = if wanted == AnswerRoute::Outbound {
+        closed_follow_up_ids(ctx)
+    } else {
+        Vec::new()
+    };
+    let id = &pending_id_among(ctx, id, now, closed)?;
     let inbound = match ctx.app.mesh.inbound_store() {
         Some(store) => store.get(id)?,
         None => None,
@@ -1725,12 +1730,13 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
             )
         }
         (_, None, None) if wanted == AnswerRoute::Outbound => match closed_sent_thread(ctx, id) {
-            Some(sent) => {
+            Some(Ok(sent)) => {
                 let name = ctx.app.mesh.who(&sent.identity, &sent.destination);
                 (None, Answering::ClosedThread(sent), name)
             }
+            Some(Err(refusal)) => return Err(refusal),
             None => {
-                return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id)));
+                return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_follow_up(id)));
             }
         },
         _ => return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id))),
@@ -1851,23 +1857,66 @@ struct SentThread {
 /// newest reply in that thread still in the inbox says which session to send to. `None`
 /// for a thread another session sent, one a peer started, or one whose replies the
 /// inbox no longer holds.
-fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<SentThread> {
+fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<Result<SentThread>> {
     let sent = ctx.app.mesh.sent_threads()?;
-    let reply = ctx.app.mesh.peer_inbox().newest(|message| {
-        !message.source_destination.is_empty()
-            && [
-                Some(message.message_id.as_str()),
-                message.in_reply_to.as_deref(),
-                Some(message.thread()),
-            ]
-            .contains(&Some(id))
-            && sent.was_sent(message.thread())
-    })?;
-    Some(SentThread {
-        thread: reply.thread().to_string(),
-        destination: reply.source_destination,
-        identity: reply.source_identity,
+    let thread = if sent.was_sent(id) {
+        id.to_string()
+    } else {
+        ctx.app
+            .mesh
+            .peer_inbox()
+            .newest(|message| {
+                !message.source_destination.is_empty()
+                    && (message.message_id == id || message.in_reply_to.as_deref() == Some(id))
+                    && sent.was_sent(message.thread())
+            })?
+            .thread()
+            .to_string()
+    };
+    Some(match sent.recipient(&thread) {
+        Some(recipient) => Ok(SentThread {
+            thread: recipient.thread,
+            destination: recipient.destination,
+            identity: recipient.identity,
+        }),
+        None => Err(QuotingError::wrap(
+            NoticeText::default()
+                .frame("Message ")
+                .peer(short(&thread))
+                .frame(" was sent before this session kept where each message went, so a follow-up has no session to go to; `.mesh messaging send <session> \"text\"` starts a new conversation."),
+        )),
     })
+}
+
+/// The ids `messaging follow-up` takes for a message this session sent whose reply
+/// already closed it: each sent thread whose recipient is on record, and the ids of the
+/// replies the inbox holds in those threads.
+fn closed_follow_up_ids(ctx: &RequestContext) -> Vec<String> {
+    let Some(sent) = ctx.app.mesh.sent_threads() else {
+        return Vec::new();
+    };
+    let mut ids: Vec<String> = sent
+        .sent()
+        .into_iter()
+        .filter(|thread| sent.recipient(thread).is_some())
+        .collect();
+    ctx.app.mesh.peer_inbox().newest(|message| {
+        if !message.source_destination.is_empty() && sent.was_sent(message.thread()) {
+            ids.push(message.message_id.clone());
+        }
+        false
+    });
+    ids
+}
+
+/// The refusal for a follow-up whose id names nothing this session sent or asked.
+fn no_open_follow_up(id: &str) -> anyhow::Error {
+    QuotingError::wrap(
+        NoticeText::default()
+            .frame("Nothing you asked or sent has id ")
+            .peer(id)
+            .frame(". `.mesh messaging sent` lists what is still open, and `.mesh messaging inbox` shows the thread a reply came in."),
+    )
 }
 
 /// The line a follow-up on a message whose reply already closed it ends with: the new
@@ -2443,6 +2492,9 @@ async fn message(
         }
     };
     ctx.app.mesh.remember_sent_thread(&out.id);
+    ctx.app
+        .mesh
+        .remember_sent_recipient(&out.id, &destination, &peer.identity_hash);
     out_path_text(
         &sent_line(&outcome, &destination, &name, &who.user, SystemTime::now())
             .render(live_prefix()),
@@ -2515,10 +2567,17 @@ fn quoted_peer_side(
     QuotingError::wrap(text)
 }
 
-fn quoted_status_failure(err: StatusError) -> anyhow::Error {
+/// A status failure as the REPL shows it: a peer-side refusal or silence quoted as
+/// `quoted_peer_side` quotes it, the session named `who`, its `<user> / <session>`
+/// name, as the progress line named it.
+fn quoted_status_failure(err: StatusError, who: &str) -> anyhow::Error {
     match &err {
-        StatusError::NotTrustedByPeer(refusal) => quoted_peer_side(&err, refusal, refusal.notice()),
-        StatusError::NoAnswer(no_answer) => quoted_peer_side(&err, no_answer, no_answer.notice()),
+        StatusError::NotTrustedByPeer(refusal) => {
+            quoted_peer_side(&err, refusal, refusal.clone().named(Some(who)).notice())
+        }
+        StatusError::NoAnswer(no_answer) => {
+            quoted_peer_side(&err, no_answer, no_answer.clone().named(Some(who)).notice())
+        }
         _ => err.into(),
     }
 }
@@ -2771,8 +2830,8 @@ mod peer_side_refusal_tests {
                 refused.clone(),
             ),
             (
-                || quoted_status_failure(StatusError::NotTrustedByPeer(refusal())),
-                StatusError::NotTrustedByPeer(refusal()).to_string(),
+                || quoted_status_failure(StatusError::NotTrustedByPeer(refusal()), ".session"),
+                StatusError::NotTrustedByPeer(refusal().named(Some(".session"))).to_string(),
             ),
         ];
         for (quoted, today) in cases {
@@ -9097,6 +9156,17 @@ mod name_addressing_tests {
 /// refuse by name. A store that cannot be read contributes nothing rather than failing
 /// the verb, which reads it again itself.
 fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<String> {
+    pending_id_among(ctx, token, now, Vec::new())
+}
+
+/// `pending_id` with `more` ids held besides the open ones: the closed messages a
+/// follow-up still continues.
+fn pending_id_among(
+    ctx: &RequestContext,
+    token: &str,
+    now: SystemTime,
+    more: Vec<String>,
+) -> Result<String> {
     let inbound = ctx
         .app
         .mesh
@@ -9121,6 +9191,7 @@ fn pending_id(ctx: &RequestContext, token: &str, now: SystemTime) -> Result<Stri
                     .map(|correlation| (correlation.record.id, None)),
             )
             .chain(others.into_iter().map(|(ask, _)| (ask.record.id, None)))
+            .chain(more.into_iter().map(|id| (id, None)))
             .collect(),
     )
 }
@@ -38081,6 +38152,69 @@ mod tests {
                 });
             }
 
+            /// A session that knows this one but has not trusted it refuses `.mesh people
+            /// status`; the refusal names it as the progress line just did, by the names
+            /// its card advertised, its `<user> / <session>` name quoted with the short
+            /// hash after it, as `files fetch` and `files list` refusals do, not by its
+            /// bare hashes.
+            #[test]
+            #[serial]
+            fn a_status_refusal_names_the_session_as_the_asking_line_did() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-status-refusal-name");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-status-refusal-name-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started =
+                        started_runtime_on("repl-mesh-status-refusal-name", stub.port()).await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    stub.know_identity(started.runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    let peers = started.runtime.peers();
+                    stub.wait_to_be_filed(&peers, &peer).await;
+                    run(
+                        &mut ctx,
+                        &format!(".mesh access trust session {peer} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    // The names its status card advertised, as a card fetched while
+                    // it still trusted this session would have recorded them.
+                    started
+                        .runtime
+                        .trust()
+                        .record_advertised(&stub.identity_hex(), &peer, Some("Tia"), Some("laptop"))
+                        .unwrap();
+
+                    let before = stdout_lines().len();
+                    let err = refusal(&mut ctx, &format!(".mesh people status {peer}")).await;
+                    let out = stdout_lines()[before..].to_vec();
+                    let tail =
+                        format!(" ({}) for its status card; Ctrl-C cancels...", short(&peer));
+                    let asking = out
+                        .iter()
+                        .find_map(|line| line.strip_prefix("Asking ")?.strip_suffix(&tail))
+                        .unwrap_or_else(|| panic!("no Asking line: {out:?}"))
+                        .to_string();
+                    assert_eq!(asking, "Tia / laptop");
+                    assert!(err.contains("refused"), "{err}");
+                    assert!(
+                        err.starts_with(&format!("\"{asking}\" ({})", short(&peer))),
+                        "named as the Asking line named it ({asking}): {err}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+
             /// `.mesh messaging broadcast --yes` to Bea (who trusts this instance) and Cee (who only
             /// knows its identity): the report lists Bea delivered, Cee on one line that is
             /// the peer's own refusal sentence - the same words `.mesh messaging send` prints for
@@ -53218,6 +53352,12 @@ mod tests {
                             !fx.ctx.app.mesh.correlations().is_open(&id),
                             "the reply closed the message"
                         );
+                        // Someone else writes in the thread last; the follow-up still goes
+                        // to the session the message was sent to.
+                        let mut stranger = from_stub(&"6b".repeat(16), None, &id);
+                        stranger.source_destination = "5a".repeat(16);
+                        stranger.source_identity = "5c".repeat(16);
+                        fx.ctx.app.mesh.deliver_peer(stranger);
 
                         let out = out_of(
                             &mut fx.ctx,
@@ -53288,10 +53428,75 @@ mod tests {
                             )
                             .await,
                             format!(
-                                "No open question has id {theirs}. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
+                                "Nothing you asked or sent has id {theirs}. `.mesh messaging sent` lists what is still open, and `.mesh messaging inbox` shows the thread a reply came in."
                             )
                         );
                         assert_eq!(fx.stub.seen().len(), 3, "nothing was sent");
+
+                        fx.stop().await;
+                    });
+                }
+
+                /// The inbox shows a closed message's thread by its short id
+                /// (`thread <id8>`), and that short id is the only one the REPL ever
+                /// prints for it, so `.mesh messaging follow-up <id8>` must reach the
+                /// thread after the reply closed it, as the whole id does.
+                #[test]
+                #[serial]
+                fn messaging_follow_up_by_the_short_id_the_inbox_shows_continues_a_closed_thread() {
+                    use crate::mesh::message::RawPeerMessage;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-closed-short");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-closed-short").await;
+                        let to = fx.stub.destination_hex();
+                        out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging send {to} --yes \"can you review it?\""),
+                        )
+                        .await
+                        .unwrap();
+                        let id = fx.stub.seen()[0].id.clone();
+                        let reply = PeerMessage::new(RawPeerMessage {
+                            source_identity: fx.stub.identity_hex(),
+                            source_destination: fx.stub.destination_hex(),
+                            destination: fx.started.runtime.current_destination_hash(),
+                            title: None,
+                            content: "done".to_string(),
+                            fields: None,
+                            timestamp: 1_790_000_000.0,
+                            message_id: "7e".repeat(16),
+                            in_reply_to: Some(id.clone()),
+                            kind: PeerKind::Reply,
+                            via: PeerVia::Direct,
+                            thread: Some(id.clone()),
+                            disposition: Some(Disposition::Answered),
+                            retry_after: None,
+                            parts: Vec::new(),
+                            dropped_parts: 0,
+                        });
+                        fx.ctx.app.mesh.deliver_peer(reply);
+                        assert!(
+                            !fx.ctx.app.mesh.correlations().is_open(&id),
+                            "the reply closed the message"
+                        );
+
+                        let result = out_of(
+                            &mut fx.ctx,
+                            &format!(
+                                ".mesh messaging follow-up {} \"and the tests too\"",
+                                short(&id)
+                            ),
+                        )
+                        .await;
+
+                        let seen = fx.stub.seen();
+                        assert!(result.is_ok(), "{result:?}");
+                        assert_eq!(seen.len(), 2, "the follow-up went out: {seen:?}");
+                        assert_eq!(seen[1].thread.as_deref(), Some(id.as_str()));
+                        assert_eq!(seen[1].content, "and the tests too");
 
                         fx.stop().await;
                     });

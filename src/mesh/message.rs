@@ -3189,7 +3189,10 @@ impl PeerInbox {
 
     /// The newest peer message still held that `wanted` picks, whatever either reader has
     /// read or the human cleared; neither reader's mark moves.
-    pub(crate) fn newest(&self, wanted: impl Fn(&PeerMessage) -> bool) -> Option<PeerMessage> {
+    pub(crate) fn newest(
+        &self,
+        mut wanted: impl FnMut(&PeerMessage) -> bool,
+    ) -> Option<PeerMessage> {
         let state = self.state.lock();
         state
             .entries
