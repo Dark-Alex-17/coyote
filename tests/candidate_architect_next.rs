@@ -942,9 +942,9 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
             (
                 "base-not-checked-out",
                 "            steps = [(\"checkout\", \"--quiet\", \"--no-track\", \"-b\", branch, \
-                 start)]\n",
+                 \"--end-of-options\", start)]\n",
                 "            steps = [(\"checkout\", \"--quiet\", base), (\"checkout\", \"--quiet\", \
-                 \"--no-track\", \"-b\", branch, start)]\n",
+                 \"--no-track\", \"-b\", branch, \"--end-of-options\", start)]\n",
                 "branch_setup: base main held by another worktree -> the run branch is cut from the \
                  fetched origin/main, no checkout of main",
             ),
@@ -958,7 +958,7 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "local-ahead-kept",
-                "    if git(code, \"merge-base\", \"--is-ancestor\", remote, \
+                "    if git(code, \"merge-base\", \"--is-ancestor\", \"--end-of-options\", remote, \
                  f\"refs/heads/{base}\")[0] == 0:\n        return base\n",
                 "    if False:\n        return base\n",
                 "branch_setup: single -> run branch created + pushed",
@@ -3040,10 +3040,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4315, 4324],
+        vec![51, 4350, 4359],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4315, 4324] {
+    for line in [4350, 4359] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4235,6 +4235,88 @@ fn gauntlet_adversary_complaints_become_the_fix_items() {
         json!([format!("adversary: DIVERGES -- complaint 1: {complaint}")]),
         "{routed}"
     );
+}
+
+/// `gates._adversary_complaints` is a copy of the review gauntlet's
+/// `verdict_gate.adversary_complaints`, so both read the same complaint
+/// list from every report shape. The gauntlet's script runs its gate at
+/// import, so its source is executed under another module name with that
+/// output swallowed and `sys.path` put back afterwards; nothing under the
+/// review gauntlet is written.
+#[test]
+fn adversary_complaints_copy_matches_the_review_gauntlet_reader() {
+    use std::io::Write;
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("complaints-pin");
+    let cases: [(&str, serde_json::Value); 8] = [
+        (
+            "ADVERSARIAL_REVIEW: DIVERGES\n1. not under a complaints line\n",
+            json!([]),
+        ),
+        (
+            "Complaints:\n1. first thing\n2. second thing\n",
+            json!(["first thing", "second thing"]),
+        ),
+        (
+            "Complaints:\n1. first part\n   continued here\n2. next\n",
+            json!(["first part continued here", "next"]),
+        ),
+        (
+            "Complaints:\n1. one\n\nsecond paragraph of one\n2. two\n\nNon-blocking observations:\n- obs\n",
+            json!(["one second paragraph of one", "two"]),
+        ),
+        (
+            "Complaints:\r\n1. one\r\n  more\r\n2. two\r\n\r\nVerification runs:\r\n- run\r\n",
+            json!(["one more", "two"]),
+        ),
+        (
+            "Complaints:\n1. one\n3. three is not next\n2. two\n",
+            json!(["one 3. three is not next", "two"]),
+        ),
+        ("Complaints:\n", json!([])),
+        (
+            "Complaints:\n1. field a\u{2028}field b\rfield c\n2. two\u{b}more\n",
+            json!(["field a field b field c", "two more"]),
+        ),
+    ];
+    let reports: Vec<&str> = cases.iter().map(|(report, _)| *report).collect();
+    let verdict_gate = agents_dir().join("review-gauntlet/scripts/verdict_gate.py");
+    let mut cmd = battery(&python, &scratch);
+    cmd.current_dir(candidate_dir().join("scripts"))
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .arg("-c")
+        .arg(
+            "import contextlib, io, json, sys\n\
+             import gates\n\
+             reports = json.loads(sys.stdin.read())\n\
+             path = sys.argv[1]\n\
+             saved = list(sys.path)\n\
+             ns = {\"__name__\": \"verdict_gate_pin\", \"__file__\": path}\n\
+             with contextlib.redirect_stdout(io.StringIO()):\n    \
+                 exec(compile(open(path, encoding=\"utf-8\").read(), path, \"exec\"), ns)\n\
+             sys.path[:] = saved\n\
+             print(json.dumps([[gates._adversary_complaints(r), ns[\"adversary_complaints\"](r)] for r in reports]))\n",
+        )
+        .arg(&verdict_gate)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json!(reports).to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_no_bytecode_under_candidate();
+    let pairs = parse_json_stdout("adversary_complaints pin", &out);
+    for ((report, expected), pair) in cases.iter().zip(pairs.as_array().unwrap()) {
+        assert_eq!(pair[0], pair[1], "the two readers differ on {report:?}");
+        assert_eq!(pair[0], *expected, "{report:?}");
+    }
+    assert_eq!(pairs.as_array().unwrap().len(), cases.len(), "{pairs}");
 }
 
 /// The plan-root phrases are read from the whole reply but consulted only

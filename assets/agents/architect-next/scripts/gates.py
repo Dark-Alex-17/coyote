@@ -888,14 +888,24 @@ def gate1_route(state):
     u["leak_questions"] = qs
     if fp in prior:
         ledger(state, u, "gate1: LEAKY on the same question set after the revise-and-re-seal retry (A1) -> owner")
+        more = _continue_recommended(_cap_continues(state, "gate1_stuck"))
         return raise_escalation(state, u, escalation(
             "gate1_stuck", "Gate 1 is still LEAKY on the SAME questions after one revise-and-re-seal retry (A1). "
-                           "The gatekeeper verdict is attached. Answer the questions here, or stop?",
-            [option("Stop and report", recommended=True), option("I will answer: (type the answers)")],
+                           "The gatekeeper verdict is attached. Another revise-and-re-seal round (say why it should pass "
+                           "this time), answer the questions here, or stop?" + ("" if more else CAP_SPENT_NOTE),
+            _gate1_stuck_options(more),
             evidence=trim_items(text, 3000), hard_trigger=True))
     ledger(state, u, f"gate1: LEAKY ({len(qs)} question lines, fp {fp}) -> answer_leaks")
     u["_next"] = "answer_leaks"
     return u
+
+
+GATE1_ANOTHER_ROUND = "Another revise-and-re-seal round (say why it should pass this time)"
+
+
+def _gate1_stuck_options(more=True):
+    return [option(GATE1_ANOTHER_ROUND, recommended=more), option("I will answer: (type the answers)"),
+            option("Stop and report")]
 
 
 LEAK_CARRIED = "(open, could not be framed; carried for the gatekeeper)"
@@ -912,8 +922,11 @@ def _leak_item(q):
 def _leak_amend(state, u, asked):
     """Close the leak round: the held answers and the asked ones become the amendment."""
     held = [a for a in as_list({**state, **u}.get("leak_pending_answers")) if isinstance(a, dict) and a.get("answer")]
-    queue_amendments(u, "gate1", [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in held + asked])
+    reason = str(state.get("leak_owner_reason") or "").strip()
+    queue_amendments(u, "gate1", [f"Gate 1 leak: {a.get('question', '')} -> {a['answer']}" for a in held + asked]
+                     + ([f"Owner's reason for another revise-and-re-seal round: {reason}"] if reason else []))
     u["leak_pending_answers"] = []
+    u["leak_owner_reason"] = ""
     _end_choices(u)
     ledger(state, u, f"gate1: {len(held)} held and {len(asked)} asked answer(s) -> amend_plan")
     u["_next"] = "amend_plan"
@@ -1180,16 +1193,16 @@ def _branch_start(state, u, code, base):
     """
     if not git_out(code, "remote", "get-url", "origin", default=""):
         return base
-    rc, out, err = git(code, "fetch", "--quiet", "origin", base)
-    if rc != 0 or not git_out(code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", default=""):
+    rc, out, err = git(code, "fetch", "--quiet", "--end-of-options", "origin", base)
+    if rc != 0 or not git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/remotes/origin/{base}", default=""):
         ledger(state, u, f"branch: git fetch origin {base} failed ({tail(err or out, 200)}); cutting from the local {base}")
         return base
     remote = f"origin/{base}"
-    if not git_out(code, "rev-parse", "--verify", "--quiet", f"refs/heads/{base}", default=""):
+    if not git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/heads/{base}", default=""):
         return remote
-    if git(code, "merge-base", "--is-ancestor", remote, f"refs/heads/{base}")[0] == 0:
+    if git(code, "merge-base", "--is-ancestor", "--end-of-options", remote, f"refs/heads/{base}")[0] == 0:
         return base
-    if git(code, "merge-base", "--is-ancestor", f"refs/heads/{base}", remote)[0] == 0:
+    if git(code, "merge-base", "--is-ancestor", "--end-of-options", f"refs/heads/{base}", remote)[0] == 0:
         return remote
     return ""
 
@@ -1255,19 +1268,19 @@ def branch_setup(state):
                 base = base if merged else prev
         u["run_branch"] = branch
         u["unit_base_branch"] = base
-        exists = git_out(code, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", default="") or \
-            git_out(code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}", default="")
+        exists = git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/heads/{branch}", default="") or \
+            git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", f"refs/remotes/origin/{branch}", default="")
         if exists:
-            steps = [("checkout", "--quiet", branch)]
+            steps = [("checkout", "--quiet", "--end-of-options", branch)]
         else:
             start = _branch_start(state, u, code, base)
             if not start:
                 ledger(state, u, f"branch: the local {base} and origin/{base} have diverged")
                 return _git_setup_escalation(state, u, branch, base, code, ("fetch", "origin", base),
                                              f"the local {base} and origin/{base} have diverged; reconcile them, or name another base")
-            steps = [("checkout", "--quiet", "--no-track", "-b", branch, start)]
+            steps = [("checkout", "--quiet", "--no-track", "-b", branch, "--end-of-options", start)]
             if git_out(code, "remote", "get-url", "origin", default=""):
-                steps.append(("push", "-u", "origin", branch))
+                steps.append(("push", "-u", "--end-of-options", "origin", branch))
         for s in steps:
             code_, out, err = git(code, *s)
             if code_ != 0:
@@ -1437,7 +1450,7 @@ def _claim(state, u, task, tasks):
         task["base_sha"] = git_out(code, "rev-parse", "HEAD", default="")
     else:
         git(code, "fetch", "--quiet", "origin")
-        task["base_sha"] = git_out(code, "rev-parse", f"origin/{task['pr_base']}", default="") or git_out(code, "rev-parse", "HEAD", default="")
+        task["base_sha"] = git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", f"origin/{task['pr_base']}", default="") or git_out(code, "rev-parse", "HEAD", default="")
     log_event(state, task, f"started: architect-next run {state.get('run_id')}; BASE SHA {task['base_sha']}; PR base {task['pr_base']}")
     return task
 
@@ -2550,7 +2563,9 @@ def wave_claim(state):
         else:
             start = f"origin/{t['pr_base']}"
         wt = os.path.join(code, ".worktrees", f"task-{t['id'].split('-', 1)[1].lower()}")
-        rc, out, err = git(code, "worktree", "add", wt, "-b", t["branch"], start)
+        rc, out, err = git(code, "check-ref-format", "--branch", t["branch"])
+        if rc == 0:
+            rc, out, err = git(code, "worktree", "add", "-b", t["branch"], "--end-of-options", wt, start)
         if rc != 0:
             ledger(state, u, f"wave: worktree add failed for {t['id']}: {tail(err, 200)}")
         t["worktree"] = wt
@@ -2697,9 +2712,9 @@ def _drop_unpushed_merge(state, u, code, run_branch, tr):
     sha, parent = tr.pop("merge_sha", ""), tr.pop("merge_parent", "")
     if not sha or not parent or git_out(code, "rev-parse", "HEAD") != sha:
         return
-    if git(code, "merge-base", "--is-ancestor", sha, f"origin/{run_branch}")[0] == 0:
+    if git(code, "merge-base", "--is-ancestor", "--end-of-options", sha, f"origin/{run_branch}")[0] == 0:
         return
-    if git(code, "reset", "--quiet", "--keep", parent)[0] == 0:
+    if git(code, "reset", "--quiet", "--keep", "--end-of-options", parent)[0] == 0:
         ledger(state, u, f"integration: unpushed merge {sha[:12]} undone before merging the fixed branch")
 
 
@@ -2715,7 +2730,7 @@ def integration_test(state):
     u["task_rounds"] = rounds
     u["current_task"] = tid
     if not truthy(tr.get("merged")):
-        rc, out, err = git(code, "checkout", "--quiet", run_branch)
+        rc, out, err = git(code, "checkout", "--quiet", "--end-of-options", run_branch)
         if rc != 0:
             ledger(state, u, f"integration: checkout of {run_branch} failed; {tid} not merged")
             more = _continue_recommended(_cap_continues(state, f"integration_checkout:{tid}"))
@@ -2726,8 +2741,8 @@ def integration_test(state):
                 data={"task": tid}))
         _drop_unpushed_merge(state, u, code, run_branch, tr)
         parent = git_out(code, "rev-parse", "HEAD")
-        head = git_out(code, "rev-parse", "--verify", "--quiet", task["branch"]) if task.get("branch") else ""
-        rc, out, err = git(code, "merge", "--no-ff", "--no-edit", task.get("branch", ""))
+        head = git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", task["branch"]) if task.get("branch") else ""
+        rc, out, err = git(code, "merge", "--no-ff", "--no-edit", "--end-of-options", task.get("branch", ""))
         if rc != 0:
             git(code, "merge", "--abort")
             cycles = as_int(tr.get("conflict_cycles")) + 1
@@ -2765,7 +2780,7 @@ def integration_test(state):
     tr.pop("merge_parent", None)
     if integrated := tr.pop("merge_head", ""):
         tr["integrated_sha"] = integrated
-    git(code, "push", "--quiet", "origin", run_branch)
+    git(code, "push", "--quiet", "--end-of-options", "origin", run_branch)
     task["head_sha"] = git_out(code, "rev-parse", "HEAD", default="")
     save_tasks(state, u, tasks)
     ledger(state, u, f"integration: {tid} merged into {run_branch} @ {task['head_sha']}; suite green; pushed")
@@ -2800,12 +2815,12 @@ def _unmerged_reason(state, code, task, run_branch):
     """Why a task branch is not provably merged; "" when its head is the head a green integration test recorded and
     that head is an ancestor of the run branch."""
     want = as_dict(as_dict(state.get("task_rounds")).get(task.get("id", ""))).get("integrated_sha")
-    head = git_out(code, "rev-parse", "--verify", "--quiet", task["branch"])
+    head = git_out(code, "rev-parse", "--verify", "--quiet", "--end-of-options", task["branch"])
     if not want:
         return "no passed integration test recorded"
     if head != want:
         return f"head {head[:12] or 'unknown'} is not the integrated {want[:12]}"
-    if git(code, "merge-base", "--is-ancestor", head, run_branch)[0] != 0:
+    if git(code, "merge-base", "--is-ancestor", "--end-of-options", head, run_branch)[0] != 0:
         return f"not an ancestor of {run_branch}"
     return ""
 
@@ -2835,13 +2850,13 @@ def wave_cleanup(state):
     if (is_single(state) or MULTI_IS_GROUPS) and task.get("status") == "complete" and task.get("branch") and task["branch"] != run_branch:
         why = _unmerged_reason(state, code, task, run_branch)
         if not why:
-            rc, out, err = git(code, "branch", "-d", task["branch"])
+            rc, out, err = git(code, "branch", "-d", "--end-of-options", task["branch"])
             why = f"branch -d refused: {tail(err, 200)}" if rc != 0 else ""
         if why:
             ledger(state, u, f"cleanup: task branch {task['branch']} kept (local + remote): {why}")
         else:
             integrated = as_dict(as_dict(state.get("task_rounds")).get(task.get("id", ""))).get("integrated_sha")
-            rc, out, err = git(code, "push", "--quiet", f"--force-with-lease={task['branch']}:{integrated}", "origin", "--delete", task["branch"])
+            rc, out, err = git(code, "push", "--quiet", f"--force-with-lease={task['branch']}:{integrated}", "--delete", "--end-of-options", "origin", task["branch"])
             if rc == 0:
                 ledger(state, u, f"cleanup: merged task branch {task['branch']} deleted (local + remote)")
             else:
@@ -3666,6 +3681,13 @@ def apply_answer(state):
     abort = _whole_reply_stop(answer, options, ABORT_REPLIES)
     stop = _whole_reply_stop(answer, options)
 
+    if not kind:
+        # nothing is open to answer, so the run goes on from its last saved phase rather than failing
+        if phase := read_snapshot(state.get("run_dir")).get("phase"):
+            u["resume_phase"] = str(phase)
+        ledger(state, u, "apply_answer: no open escalation to apply the answer to -> resume_route")
+        u["_next"] = "resume_route"
+        return u
     if kind == "draft_confirm":
         # matched before the generic abort check: an edit such as "do not abort, add a flag" must not abort
         picked = _bare_pick(answer, esc.get("options") or [])
@@ -3765,9 +3787,21 @@ def apply_answer(state):
             _ask_again(state, u, esc, answer)
     elif kind == "gate1_stuck":
         # the free-text answers often mention stopping ("stop retrying on 5xx"), so only a stop reply stops
+        gate1_options = options or _gate1_stuck_options()
         if _whole_reply_stop(answer, esc.get("options") or []):
             u["failure_reason"] = "stopped: Gate 1 LEAKY on the same questions after the A1 retry"
             u["_next"] = "end_blocked"
+        elif match_option(answer, gate1_options) == GATE1_ANOTHER_ROUND:
+            reason = _owner_reason(state, answer, gate1_options)
+            ledger(state, u, "gate1: another revise-and-re-seal round on the same questions"
+                             + (f": {trim_items(reason, 300)}" if reason else ""))
+            counts = {k: as_int(v) for k, v in as_dict(state.get("amend_counts")).items()}
+            counts["gate1"] = min(counts.get("gate1", 0), AMEND_GATE1_MAX - 1)
+            u["amend_counts"] = counts
+            u["amend_cycles"] = min(as_int(state.get("amend_cycles")), AMEND_CYCLES_MAX - 1)
+            _count_continue(state, u, "gate1_stuck")
+            u["leak_owner_reason"] = reason
+            u["_next"] = "answer_leaks"
         else:
             queue_amendments(u, "gate1", [f"Owner's answers to the gatekeeper's open questions:\n{answer}"])
             u["leak_fingerprints"] = []
@@ -4347,12 +4381,12 @@ def hygiene_create(state):
     base_branch = state.get("base_branch_name") or "main"
     git(code, "fetch", "--quiet", "origin")
     if is_single(state) or MULTI_IS_GROUPS:
-        base = state.get("unit_base_sha") or git_out(code, "merge-base", f"origin/{base_branch}", "HEAD", default="")
+        base = state.get("unit_base_sha") or git_out(code, "merge-base", "--end-of-options", f"origin/{base_branch}", "HEAD", default="")
         scope_word, pr_line = "run", " and push the run branch -- NO separate hygiene PR: the hygiene commits ride the run branch into the single PR"
         top = state.get("run_branch") or _run_branch(state)
     else:
         top = unit.get("top_branch", "")
-        base = git_out(code, "merge-base", f"origin/{base_branch}", f"origin/{top}", default="")
+        base = git_out(code, "merge-base", "--end-of-options", f"origin/{base_branch}", f"origin/{top}", default="")
         scope_word, pr_line = "chain", f", and open the hygiene PR as a DRAFT with base `{top}`"
     if not base:
         return raise_escalation(state, u, escalation(

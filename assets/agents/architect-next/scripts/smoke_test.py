@@ -2512,9 +2512,26 @@ u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_
 check("apply_answer: amend_cap allow on an escalation with no source -> one more cycle of every source and the ceiling, then gate1",
       u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1
       and u["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX - 1}, u)
-check("apply_answer: gate1_stuck stop -> end_blocked", AA("gate1_stuck", "Stop and report")["_next"] == "end_blocked")
+_g1_stop = AA("gate1_stuck", "Stop and report", esc=gates.gate1_route(base_state(
+    gate1_result=leaky, leak_fingerprints=[gates._leak_fingerprint(leaky)[0]]))["escalation"])
+check("apply_answer: gate1_stuck stop -> end_blocked, no continue counted",
+      _g1_stop["_next"] == "end_blocked" and "cap_continues" not in _g1_stop, _g1_stop)
 u = AA("gate1_stuck", "infra goes in infra/; DB is pg")
 check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u["_next"] == "amend_plan" and u["leak_fingerprints"] == [])
+_none_dir = os.path.join(TMP, "no-open-escalation")
+write(os.path.join(_none_dir, "state.json"), json.dumps({"phase": "wave"}))
+_none = gates.apply_answer(base_state(escalation={}, last_answer="go on", run_dir=_none_dir))
+_none_bare = gates.apply_answer(base_state(escalation={"kind": ""}, last_answer="go on", run_dir=os.path.join(TMP, "no-snapshot-here")))
+check("apply_answer: no open escalation -> resume_route from the saved phase, ledgered; with no snapshot the phase is left alone",
+      _none["_next"] == "resume_route" and _none.get("resume_phase") == "wave" and "failure_reason" not in _none
+      and any("no open escalation" in d for d in _none["decisions"])
+      and _none_bare["_next"] == "resume_route" and "resume_phase" not in _none_bare, (_none, _none_bare))
+check("resume_route: copes with the state an answer with no open escalation leaves",
+      gates.resume_route({**base_state(run_dir=_none_dir), **_none})["_next"] == "select_tasks"
+      and gates.resume_route({**base_state(resume_phase="", sealed=False), **_none_bare})["_next"] == "reseal_gate")
+_unknown = AA("no_such_kind", "go on")
+check("apply_answer: a non-empty unknown escalation kind still stops -> end_failure",
+      _unknown["_next"] == "end_failure" and "no_such_kind" in _unknown.get("failure_reason", ""), _unknown)
 check("apply_answer: gate2_stuck stop -> end_blocked", AA("gate2_stuck", "Stop and report")["_next"] == "end_blocked")
 check("apply_answer: gate2_stuck override -> reseal_return (recorded)", AA("gate2_stuck", "Override: promote the plan as reviewed (recorded)")["_next"] == "reseal_return")
 u = AA("gate_fault", "Retry the gatekeeper", esc=escalation("gate_fault", "q", data={"gate": "gate1"}), gate_fault_retries=0)
@@ -2787,6 +2804,30 @@ check("gate2_stuck: continue recommended until STRIKE_LIMIT continues past the c
       and _cap_offer(g2_spent.get("escalation")) == ("Another fix round (state reason)", [])
       and _lib.as_dict(g2_one.get("cap_continues")).get("gate2_stuck") == 1,
       (_cap_offer(g2_spent.get("escalation")), g2_one.get("cap_continues")))
+G1_STUCK = "PLAN_GATE: LEAKY\n- Which queue carries the retries?\n- Who owns the retry budget?"
+G1_FP = gates._leak_fingerprint(G1_STUCK)[0]
+E_G1_STUCK = gates.gate1_route(base_state(gate1_result=G1_STUCK, leak_fingerprints=[G1_FP]))["escalation"]
+g1_spent = gates.gate1_route(base_state(gate1_result=G1_STUCK, leak_fingerprints=[G1_FP], cap_continues={"gate1_stuck": STRIKE_LIMIT}))
+check("gate1_stuck: another revise-and-re-seal round recommended first; answering and stopping stay, unrecommended; nothing recommended once the cap is spent",
+      _cap_offer(E_G1_STUCK) == (gates.GATE1_ANOTHER_ROUND, [gates.GATE1_ANOTHER_ROUND])
+      and [o["text"] for o in E_G1_STUCK["options"]][1:] == ["I will answer: (type the answers)", "Stop and report"]
+      and _cap_offer(g1_spent.get("escalation")) == (gates.GATE1_ANOTHER_ROUND, [])
+      and gates.CAP_SPENT_NOTE in g1_spent["escalation"]["question"] and gates.CAP_SPENT_NOTE not in E_G1_STUCK["question"],
+      (E_G1_STUCK["options"], g1_spent.get("escalation")))
+g1_why = "the plan now names the queue in the Context pack"
+g1_one = AA("gate1_stuck", gates.GATE1_ANOTHER_ROUND, esc=E_G1_STUCK, last_answer_text=f"1 - {g1_why}", gate1_result=G1_STUCK,
+            leak_fingerprints=[G1_FP, G1_FP], amend_counts={"gate1": _lib.AMEND_GATE1_MAX}, amend_cycles=AMEND_CYCLES_MAX, cap_continues={})
+check("apply_answer: gate1_stuck another round -> answer_leaks with the reason ledgered and carried, one continue counted, the same-questions check kept",
+      g1_one["_next"] == "answer_leaks" and g1_one.get("leak_owner_reason") == g1_why
+      and any(g1_why in d for d in g1_one["decisions"]) and "leak_fingerprints" not in g1_one
+      and _lib.as_dict(g1_one.get("cap_continues")).get("gate1_stuck") == 1
+      and g1_one["amend_counts"]["gate1"] == _lib.AMEND_GATE1_MAX - 1 and g1_one["amend_cycles"] == AMEND_CYCLES_MAX - 1, g1_one)
+g1_amend = gates.leak_route(base_state(leak_owner_reason=g1_why, leak_answers=[{"question": "Which queue?", "answer": "the retry queue"}],
+                                       leak_unanswerable=[], choice_kind="", choice_queue=[]))
+check("leak_route: the owner's reason for another round reaches amend_plan with the leak answers, then is cleared",
+      g1_amend["_next"] == "amend_plan" and g1_amend["leak_owner_reason"] == ""
+      and any(g1_why in a for a in g1_amend["pending_amendments"]) and any("the retry queue" in a for a in g1_amend["pending_amendments"]),
+      g1_amend)
 
 
 def _headless_past_ceiling():
@@ -4994,6 +5035,37 @@ gates.task_by_id(ts_i, T1).update({"status": "in-progress", "worktree": wt_x, "b
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch=RB, task_rounds={}, verification_commands='["true"]'))
 check("integration_test: a green merge records the merged branch head as integrated_sha",
       u["_next"] == "harvest_report" and u["task_rounds"][T1].get("integrated_sha") == sha_x, u.get("task_rounds"))
+
+
+def recorded_git_argv(run):
+    """The git argv every gates.git call makes while `run` runs, the real git still doing the work."""
+    calls, real = [], gates.git
+
+    def recording(cwd, *args, **kw):
+        calls.append(list(args))
+        return real(cwd, *args, **kw)
+    gates.git = recording
+    try:
+        run()
+    finally:
+        gates.git = real
+    return calls
+
+
+def marker_before(calls, verb, branch):
+    hits = [c for c in calls if c[:1] == [verb] and branch in c]
+    return bool(hits) and all("--end-of-options" in c and c.index("--end-of-options") < c.index(branch) for c in hits)
+
+
+wt_x, sha_x = task_branch("argv-marked")
+ts_m = copy.deepcopy(TS_W)
+gates.task_by_id(ts_m, T1).update({"status": "in-progress", "worktree": wt_x, "branch": "argv-marked"})
+argv_merge = recorded_git_argv(lambda: gates.integration_test(base_state(
+    plan_path=PROMOTED, tasks=ts_m, integration_task=T1, run_branch=RB, task_rounds={}, verification_commands='["true"]')))
+argv_delete = recorded_git_argv(lambda: cleanup_task(wt_x, "argv-marked", integrated_sha=sha_x))
+check("git argv: an end-of-options marker precedes the task branch at the integration merge and the cleanup branch delete",
+      marker_before(argv_merge, "merge", "argv-marked") and marker_before(argv_delete, "branch", "argv-marked") and not local("argv-marked"),
+      ([c for c in argv_merge if c[:1] == ["merge"]], [c for c in argv_delete if c[:1] == ["branch"]]))
 wt_x, sha_x = task_branch("int-checkout")
 gates.task_by_id(ts_i, T1).update({"worktree": wt_x, "branch": "int-checkout"})
 head0 = git(CODE, "rev-parse", "HEAD")
