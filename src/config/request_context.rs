@@ -29934,13 +29934,14 @@ print(json.dumps({
     }
 
     /// A re-review state whose primary signals select security and probe
-    /// and whose delta carries no attack-surface or consumer signals, so
-    /// settling both lanes is the only thing standing between them and a
-    /// narrowed SKIP.
+    /// and whose delta is tests/docs-only with no attack-surface or consumer
+    /// signals, so settling both lanes is the only thing standing between
+    /// them and a narrowed SKIP.
     fn gauntlet_narrowable_state(settled_lanes: &[&str]) -> serde_json::Value {
         json!({
             "settled_lanes": settled_lanes,
             "delta_summary": "2 file(s) in delta (abc1234..HEAD)",
+            "delta_tests_docs_only": true,
             "signals_summary": "6 file(s) changed (diff: worktree)",
             "touches_auth": true,
             "consumer_surface": true,
@@ -29966,6 +29967,32 @@ print(json.dumps({
                 && summary.contains("probe: SKIPPED (narrowed)"),
             "both settled lanes must narrow on a quiet delta: {summary}"
         );
+    }
+
+    /// A settled security lane re-runs when the delta touches source, even
+    /// with no auth, dependency or exec signal: a source fix can change how
+    /// input is handled. The quiet consumer side still narrows probe.
+    #[test]
+    fn gauntlet_build_items_source_delta_keeps_a_settled_security_lane() {
+        if !cmd_available("python3") {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let mut state = gauntlet_narrowable_state(&["security", "probe"]);
+        state["delta_tests_docs_only"] = json!(false);
+        let out = run_gauntlet_script("build_items.py", &state);
+        assert_eq!(
+            out["security_items"],
+            json!([{"lane": "security"}]),
+            "{out}"
+        );
+        assert_eq!(out["probe_items"], json!([]), "{out}");
+        let summary = out["lanes_summary"].as_str().unwrap();
+        assert!(
+            !summary.contains("security: SKIPPED (narrowed)"),
+            "{summary}"
+        );
+        assert!(summary.contains("probe: SKIPPED (narrowed)"), "{summary}");
     }
 
     /// signals.py splits the `Settled lanes:` line on commas and whitespace,

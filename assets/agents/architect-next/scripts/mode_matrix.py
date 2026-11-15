@@ -56,7 +56,7 @@ os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMI
 os.environ.update({"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "user.useConfigOnly", "GIT_CONFIG_VALUE_0": "true"})
 # no system or user git config (signing, hooks) reaches a scratch repository
 os.environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"})
-from _fixture import Store  # noqa: E402
+from _fixture import PlanningFixture  # noqa: E402
 
 MAP_PATH = os.path.join(HERE, "marker_map.json")
 MECHANISMS = {"R", "I", "N", "V", "-"}
@@ -202,21 +202,21 @@ class World:
         git(self.code, "push", "-q", "-u", "origin", "main")
         self.design = os.path.join(self.tmp, "design.md")
         write(self.design, "# Widget service\n\nAdd widgets.\n")
-        self.store = Store(self.tmp, self.code)
-        self.plan_path = self.store.plan_path
+        self.fixture = PlanningFixture(self.tmp, self.code)
+        self.plan_path = self.fixture.plan_path
 
     def variables(self, combo):
-        return self.store.variables(self.design, self.tmp, auto_confirm="1", **combo)
+        return self.fixture.variables(self.design, self.tmp, auto_confirm="1", **combo)
 
     def promote(self, gates, state):
         """Canned promote_tasks: the promoted PLAN + five tasks through the fork's task path."""
-        self.store.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
+        self.fixture.write_promoted_plan(PLAN_TEXT.replace("status: open", "status: in-progress"))
         ids = []
         for slug, files, blocked, batch, prot, group, surf in self.TASKS:
-            tid, _ = self.store.new_task(gates, slug, files=files, blocked=blocked.format(*ids) if blocked else "", batch=batch,
-                                         protected=prot, group=group, surfaces=surf)
+            tid, _ = self.fixture.new_task(gates, slug, files=files, blocked=blocked.format(*ids) if blocked else "", batch=batch,
+                                           protected=prot, group=group, surfaces=surf)
             ids.append(tid)
-        return self.store.promote_report()
+        return self.fixture.promote_report()
 
     def delegate_report(self, gates, state, task_id, project_dir=None):
         """Canned sisyphus: commit a line on the task's branch/worktree; report with a PR URL in multi."""
@@ -229,9 +229,9 @@ class World:
             base = task.get("pr_base") or "main"
             git(self.code, "fetch", "-q", "origin")
             if git(self.code, "rev-parse", "--verify", "--quiet", f"refs/heads/{task.get('branch')}", check_=False) == "":
-                git(self.code, "checkout", "-q", "-b", task.get("branch"), f"origin/{base}" if git(self.code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", check_=False) else base)
+                git(self.code, "checkout", "-q", "-b", task.get("branch"), "--end-of-options", f"origin/{base}" if git(self.code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", check_=False) else base)
             else:
-                git(self.code, "checkout", "-q", task.get("branch"))
+                git(self.code, "checkout", "-q", "--end-of-options", task.get("branch"))
         fname = (task.get("files") or [f"work/{task_id}.txt"])[0]
         path = os.path.join(cwd, fname)
         os.makedirs(os.path.dirname(path), exist_ok=True)

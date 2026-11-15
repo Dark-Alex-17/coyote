@@ -640,6 +640,27 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// The criterion commands `verify_gate` keeps never reach the review's
+/// declaration once the append is removed from a scratch copy, and the
+/// verify_gate row turns red. One battery run, so it stays apart from the
+/// longer list above.
+#[test]
+fn verify_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[(
+            "criterion-commands-declared",
+            "                cmds = json.dumps(arr + extra)\n",
+            "                pass\n",
+            "verify_gate: the git diff commands the criteria name are declared once each after the \
+             declared ones (task, micro, batch)",
+        )],
+    );
+}
+
 /// The rest of the intake guards, each removed from a scratch copy, turn
 /// their smoke row red: the re-check that a seed is still ready before it is
 /// consumed, the consumption at the step after a successful orientation, the
@@ -942,9 +963,9 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
             (
                 "base-not-checked-out",
                 "            steps = [(\"checkout\", \"--quiet\", \"--no-track\", \"-b\", branch, \
-                 start)]\n",
+                 \"--end-of-options\", start)]\n",
                 "            steps = [(\"checkout\", \"--quiet\", base), (\"checkout\", \"--quiet\", \
-                 \"--no-track\", \"-b\", branch, start)]\n",
+                 \"--no-track\", \"-b\", branch, \"--end-of-options\", start)]\n",
                 "branch_setup: base main held by another worktree -> the run branch is cut from the \
                  fetched origin/main, no checkout of main",
             ),
@@ -958,7 +979,7 @@ fn interpret_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "local-ahead-kept",
-                "    if git(code, \"merge-base\", \"--is-ancestor\", remote, \
+                "    if git(code, \"merge-base\", \"--is-ancestor\", \"--end-of-options\", remote, \
                  f\"refs/heads/{base}\")[0] == 0:\n        return base\n",
                 "    if False:\n        return base\n",
                 "branch_setup: single -> run branch created + pushed",
@@ -3040,10 +3061,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![48, 3988, 3997],
+        vec![51, 4359, 4368],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [3988, 3997] {
+    for line in [4359, 4368] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -3491,18 +3512,28 @@ fn gate_json(gate: &str, state: &serde_json::Value, scratch: &TempDirGuard) -> s
     parse_json_stdout(gate, &out)
 }
 
-/// Runs one of the review gauntlet's own scripts on `state`, exactly as the
-/// engine invokes them (no path adjustments; bytecode writing is turned off
-/// so the shared module it imports leaves no cache under `assets/`, and
-/// `HOME`/`TMPDIR` point at the scratch dir), so the test reads the composed
-/// prompt with the real consumer.
+/// Runs one of the review gauntlet's own scripts on `state`, so the test
+/// reads the composed prompt with the real consumer.
 fn gauntlet_script(
     script: &str,
     state: &serde_json::Value,
     scratch: &TempDirGuard,
 ) -> serde_json::Value {
+    agent_script("review-gauntlet", script, state, scratch)
+}
+
+/// Runs one of sibling agent `agent`'s own scripts on `state`, exactly as the
+/// engine invokes them (no path adjustments; bytecode writing is turned off
+/// so the shared module it imports leaves no cache under `assets/`, and
+/// `HOME`/`TMPDIR` point at the scratch dir).
+fn agent_script(
+    agent: &str,
+    script: &str,
+    state: &serde_json::Value,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
     let python = python3().expect("callers skip without python3");
-    let path = agents_dir().join("review-gauntlet/scripts").join(script);
+    let path = agents_dir().join(agent).join("scripts").join(script);
     let mut cmd = Command::new(python);
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
@@ -3563,8 +3594,8 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
     run(&["init", "-q"]);
     fs::write(project.join("README.md"), "# demo\n").unwrap();
     let first = commit("base");
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    fs::create_dir_all(project.join("tests")).unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\n").unwrap();
     let second = commit("feature");
     assert_eq!(
         run(&["status", "--porcelain"]),
@@ -4227,6 +4258,86 @@ fn gauntlet_adversary_complaints_become_the_fix_items() {
     );
 }
 
+/// `gates._adversary_complaints` is a copy of the review gauntlet's
+/// `verdict_gate.adversary_complaints`, so both read the same complaint
+/// list from every report shape. The gauntlet's script runs its gate at
+/// import, so its source is executed under another module name with that
+/// output swallowed and `sys.path` put back afterwards; nothing under the
+/// review gauntlet is written.
+#[test]
+fn adversary_complaints_copy_matches_the_review_gauntlet_reader() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("complaints-pin");
+    let cases: [(&str, serde_json::Value); 11] = [
+        (
+            "ADVERSARIAL_REVIEW: DIVERGES\n1. not under a complaints line\n",
+            json!([]),
+        ),
+        (
+            "Complaints:\n1. first thing\n2. second thing\n",
+            json!(["first thing", "second thing"]),
+        ),
+        (
+            "Complaints:\n1. first part\n   continued here\n2. next\n",
+            json!(["first part continued here", "next"]),
+        ),
+        (
+            "Complaints:\n1. one\n\nsecond paragraph of one\n2. two\n\nNon-blocking observations:\n- obs\n",
+            json!(["one second paragraph of one", "two"]),
+        ),
+        (
+            "Complaints:\r\n1. one\r\n  more\r\n2. two\r\n\r\nVerification runs:\r\n- run\r\n",
+            json!(["one more", "two"]),
+        ),
+        (
+            "Complaints:\n1. one\n3. three is not next\n2. two\n",
+            json!(["one 3. three is not next", "two"]),
+        ),
+        ("Complaints:\n", json!([])),
+        (
+            "Complaints:\n1. field a\u{2028}field b\rfield c\n2. two\u{b}more\n",
+            json!(["field a field b field c", "two more"]),
+        ),
+        ("  Complaints:\n1. one\n2. two\n", json!(["one", "two"])),
+        ("Complaints:\n  1. one\n  2. two\n", json!([])),
+        (
+            "Complaints:\n1. first\n\nVerification runs:\n- r\n\nComplaints:\n1. second\n",
+            json!(["first"]),
+        ),
+    ];
+    let reports: Vec<&str> = cases.iter().map(|(report, _)| *report).collect();
+    let fixtures = scratch.0.join("complaints-fixtures.json");
+    fs::write(&fixtures, json!(reports).to_string()).unwrap();
+    let verdict_gate = agents_dir().join("review-gauntlet/scripts/verdict_gate.py");
+    let mut cmd = battery(&python, &scratch);
+    cmd.current_dir(candidate_dir().join("scripts"))
+        .env_remove("GRAPH_STATE")
+        .env_remove("GRAPH_STATE_FILE")
+        .arg("-c")
+        .arg(
+            "import contextlib, io, json, sys\n\
+             import gates\n\
+             path = sys.argv[1]\n\
+             reports = json.load(open(sys.argv[2], encoding=\"utf-8\"))\n\
+             saved = list(sys.path)\n\
+             ns = {\"__name__\": \"verdict_gate_pin\", \"__file__\": path}\n\
+             with contextlib.redirect_stdout(io.StringIO()):\n    \
+                 exec(compile(open(path, encoding=\"utf-8\").read(), path, \"exec\"), ns)\n\
+             sys.path[:] = saved\n\
+             print(json.dumps([[gates._adversary_complaints(r), ns[\"adversary_complaints\"](r)] for r in reports]))\n",
+        )
+        .arg(&verdict_gate)
+        .arg(&fixtures);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "adversary_complaints pin");
+    assert_no_bytecode_under_candidate();
+    let pairs = parse_json_stdout("adversary_complaints pin", &out);
+    for ((report, expected), pair) in cases.iter().zip(pairs.as_array().unwrap()) {
+        assert_eq!(pair[0], pair[1], "the two readers differ on {report:?}");
+        assert_eq!(pair[0], *expected, "{report:?}");
+    }
+    assert_eq!(pairs.as_array().unwrap().len(), cases.len(), "{pairs}");
+}
+
 /// The plan-root phrases are read from the whole reply but consulted only
 /// on a round that already has real blockers, so a PASS header whose
 /// code-review report quotes one still closes the round (`post_round`) and
@@ -4390,11 +4501,177 @@ fn only_dirt_outside_the_in_repo_planning_store_suppresses_the_re_review_lines()
         "no planning store declared: {lines:?} {settled:?}"
     );
 
-    fs::write(repo.join("src/scratch.txt"), "uncommitted\n").unwrap();
+    fs::write(repo.join("tests/scratch.txt"), "uncommitted\n").unwrap();
     let (lines, settled) = compose(Some(&plans));
     assert!(
         lines.is_empty() && settled.is_empty(),
         "code dirt beside planning-store dirt: {lines:?} {settled:?}"
+    );
+}
+
+/// A criterion that names a command is run and recorded, not left to the
+/// reviewer's reading. With only the brief's declaration the adversary's
+/// `run_checks.py` never runs the diff, and a PARTIAL verdict on that
+/// criterion diverges. `verify_gate` declares the exit-code `git diff` spans
+/// of the task's criteria (not the `git status` one, whose exit does not
+/// decide its criterion) as verification commands; `run_checks.py` runs them
+/// against the diff base and `verdict.py` lists the diff as a passing run
+/// while the two files are untouched, then raises a blocking regression once
+/// one of them changes in the working tree.
+#[test]
+fn criterion_commands_are_run_as_recorded_verification_runs() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("criterion-commands");
+    let repo = scratch.0.join("project");
+    let sql = repo.join("schema/sql");
+    fs::create_dir_all(&sql).unwrap();
+    let git = |args: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        without_git_repo_vars(&mut cmd);
+        cmd.args([
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(&repo)
+        .env("HOME", scratch.0.join("home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let out = output_with_timeout(&mut cmd, GATE_LIMIT, "git");
+        assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    fs::write(sql.join("0001_base.sql"), "CREATE TABLE base (id INT);\n").unwrap();
+    fs::write(sql.join("0002_more.sql"), "CREATE TABLE more (id INT);\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    fs::write(
+        sql.join("0003_alpha.sql"),
+        "CREATE TABLE alpha_records (id INT);\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "alpha"]);
+
+    let pair = "schema/sql/0001_base.sql schema/sql/0002_more.sql";
+    let diff_vs_index = format!("git diff --exit-code -- {pair}");
+    let no_change = format!("git diff --exit-code {pair}");
+    let quiet = format!("git diff --quiet -- {pair}");
+    let task_dir = scratch.0.join("plans/tasks/TASK-100-schema");
+    fs::create_dir_all(&task_dir).unwrap();
+    fs::write(
+        task_dir.join("index.md"),
+        format!(
+            "---\ntitle: schema\nstatus: in-progress\n---\n\n# schema\n\n## Acceptance criteria\n\n\
+             - `git status --short` is clean, and the table list includes `alpha_records`.\n\
+             - 0001 and 0002 are byte-identical: `{diff_vs_index}`.\n\
+             - `{no_change}` shows no change.\n\
+             - `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{quiet}`).\n\
+             - A missing row is reported as `errors.Is(err, x)`.\n"
+        ),
+    )
+    .unwrap();
+    let mut state = verify_state(&repo, &base, json!({}), &scratch);
+    state["tasks"][0]["dir"] = json!(task_dir);
+    let composed = gate_json("verify_gate", &state, &scratch);
+    let declared = composed["verification_commands_json"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no verification_commands_json in {composed}"))
+        .to_string();
+    let commands: Vec<String> = serde_json::from_str(&declared).unwrap();
+    assert_eq!(
+        commands,
+        ["true", &diff_vs_index, &no_change, &quiet],
+        "{composed}"
+    );
+
+    let review = |declared: &str, status: &str| -> (Option<serde_json::Value>, String) {
+        let checks = agent_script(
+            "adversary",
+            "run_checks.py",
+            &json!({"project_dir": repo, "verification_commands": declared, "diff_base": base}),
+            &scratch,
+        );
+        let run = checks["exec_results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("exec_results must be a record list: {checks}"))
+            .iter()
+            .find(|r| r["cmd"].as_str() == Some(diff_vs_index.as_str()))
+            .cloned();
+        let verdict = agent_script(
+            "adversary",
+            "verdict.py",
+            &json!({
+                "pipeline_faults": [],
+                "crit_verdicts": [{"id": "c1", "text": "the files are byte-identical", "status": status,
+                                   "evidence": "recorded run",
+                                   "complaint": if status == "MET" { "" } else { "no recorded run of the diff" },
+                                   "no_test_reason": ""}],
+                "extra_complaints": [],
+                "format_rulings": [],
+                "observations": "",
+                "exec_results": checks["exec_results"],
+                "verification_commands": declared,
+            }),
+            &scratch,
+        );
+        let report = verdict["adv_report"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no adv_report in {verdict}"))
+            .to_string();
+        (run, report)
+    };
+
+    let (run, report) = review(&json!(["true"]).to_string(), "PARTIAL");
+    assert!(
+        run.is_none(),
+        "the original declaration recorded the diff: {run:?}"
+    );
+    assert!(
+        report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+        "{report}"
+    );
+
+    let (run, report) = review(&declared, "MET");
+    let run = run.unwrap_or_else(|| panic!("no recorded run of `{diff_vs_index}`"));
+    assert_eq!(run["exit"], 0, "{run}");
+    assert!(
+        report.starts_with("ADVERSARIAL_REVIEW: CONFORMS")
+            && !report.contains("Verification run `"),
+        "{report}"
+    );
+    let runs = report
+        .split_once("Verification runs:")
+        .unwrap_or_else(|| panic!("no Verification runs section: {report}"))
+        .1;
+    assert!(
+        runs.lines()
+            .any(|l| l.starts_with(&format!("- [PASS] `{diff_vs_index}`"))),
+        "{report}"
+    );
+
+    fs::write(
+        sql.join("0001_base.sql"),
+        "CREATE TABLE base (id INT, extra INT);\n",
+    )
+    .unwrap();
+    let (run, report) = review(&declared, "MET");
+    let run = run.unwrap_or_else(|| panic!("no recorded run of `{diff_vs_index}`"));
+    assert_eq!(run["exit"], 1, "{run}");
+    assert_eq!(run["baseline"]["status"], "regression", "{run}");
+    assert!(
+        report.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
+            && report.contains(&format!("Verification run `{diff_vs_index}`"))
+            && report.contains("baseline on the diff base: regression"),
+        "{report}"
     );
 }
 

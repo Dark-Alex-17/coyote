@@ -33,7 +33,7 @@ def _write(path, text, exe=False):
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
 
-class Store:
+class PlanningFixture:
     """One scratch planning store. `root` is what the fork's planning variable points at."""
 
     def __init__(self, tmp, code_repo):

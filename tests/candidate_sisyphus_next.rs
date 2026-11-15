@@ -931,6 +931,63 @@ print(json.dumps([gates._discussion_message(d, True), gates._discussion_message(
     assert_no_bytecode_under_candidate();
 }
 
+/// Intake hands the review lanes the configured `plans_dir`, relative to the
+/// git top level, as `debris_exclude`: a custom dir and one below a project
+/// subdirectory are named as such, a preset value is kept, and a missing dir
+/// or one outside the repository yields "".
+#[test]
+fn intake_debris_exclude_follows_the_configured_plans_dir() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("planning-exclude");
+    let repo = scratch.0.join("repo");
+    for dir in ["docs/planning", "svc/plans"] {
+        fs::create_dir_all(repo.join(dir)).unwrap();
+    }
+    let outside = scratch.0.join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let mut init = Command::new("git");
+    without_git_repo_vars(&mut init);
+    let init = init.arg("init").arg("-q").arg(&repo).output().unwrap();
+    assert!(init.status.success(), "{}", transcript(&init));
+    let probe = r#"
+import json, sys
+sys.path.insert(0, "scripts")
+import gates
+repo, outside = sys.argv[1], sys.argv[2]
+svc = repo + "/svc"
+print(json.dumps([
+    gates._planning_exclude({"plans_dir": "docs/planning"}, repo, repo),
+    gates._planning_exclude({}, svc, repo),
+    gates._planning_exclude({"debris_exclude": '["kept"]', "plans_dir": "docs/planning"}, repo, repo),
+    gates._planning_exclude({}, repo, repo),
+    gates._planning_exclude({"plans_dir": outside}, repo, repo),
+]))
+"#;
+    let output = battery(&python, &scratch)
+        .args(["-B", "-c", probe])
+        .arg(&repo)
+        .arg(&outside)
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let values: Vec<String> =
+        serde_json::from_str(stdout.lines().last().unwrap_or_default()).expect(&report);
+    assert_eq!(
+        values,
+        [
+            r#"["docs/planning"]"#,
+            r#"["svc/plans"]"#,
+            r#"["kept"]"#,
+            "",
+            ""
+        ],
+        "{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 /// Lists every regular file under `root` as a path relative to it, sorted.
 fn files_under(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
@@ -2832,8 +2889,8 @@ fn two_commit_repo(scratch: &TempDirGuard) -> (PathBuf, String, String) {
     run(&["init", "-q"]);
     fs::write(project.join("README.md"), "# demo\n").unwrap();
     let first = commit("base");
-    fs::create_dir_all(project.join("src")).unwrap();
-    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    fs::create_dir_all(project.join("tests")).unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\n").unwrap();
     let second = commit("feature");
     assert_eq!(
         run(&["status", "--porcelain"]),
@@ -4010,7 +4067,7 @@ fn a_real_gauntlet_reply_round_trips_from_parser_to_narrowed_re_review() {
     let scratch = scratch_dir("rereview-roundtrip");
     let home = scratch.0.join("home");
     let project = scratch.0.join("project");
-    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join("tests")).unwrap();
     let git = which::which("git").unwrap();
     let mut cmd = Command::new(&git);
     without_git_repo_vars(&mut cmd);
@@ -4023,7 +4080,7 @@ fn a_real_gauntlet_reply_round_trips_from_parser_to_narrowed_re_review() {
         .unwrap();
     assert!(init.status.success(), "{}", transcript(&init));
     fs::write(project.join("README.md"), "# demo\n").unwrap();
-    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\n").unwrap();
     let first = git_commit_all(&project, &home, "feature");
 
     let mut state = json!({
@@ -4119,7 +4176,7 @@ fn a_real_gauntlet_reply_round_trips_from_parser_to_narrowed_re_review() {
     merge_updates(&mut state, &routed);
 
     // The fix lands as a commit; HEAD moves past the round-1 head.
-    fs::write(project.join("src/lib.txt"), "hello\nfixed\n").unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\nfixed\n").unwrap();
     let second = git_commit_all(&project, &home, "fix adversary finding");
     assert_ne!(first, second);
 
@@ -4785,7 +4842,7 @@ fn readme_pins_the_run_dir_modes_and_the_checks_seam_trust() {
 fn cold_round_one(scratch: &TempDirGuard) -> (PathBuf, PathBuf, String, serde_json::Value) {
     let home = scratch.0.join("home");
     let project = scratch.0.join("project");
-    fs::create_dir_all(project.join("src")).unwrap();
+    fs::create_dir_all(project.join("tests")).unwrap();
     let git = which::which("git").unwrap();
     let mut cmd = Command::new(&git);
     without_git_repo_vars(&mut cmd);
@@ -4798,7 +4855,7 @@ fn cold_round_one(scratch: &TempDirGuard) -> (PathBuf, PathBuf, String, serde_js
         .unwrap();
     assert!(init.status.success(), "{}", transcript(&init));
     fs::write(project.join("README.md"), "# demo\n").unwrap();
-    fs::write(project.join("src/lib.txt"), "hello\n").unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\n").unwrap();
     let first = git_commit_all(&project, &home, "feature");
     let mut state = json!({
         "project_dir": project,
@@ -4919,7 +4976,11 @@ fn a_column_zero_sentinel_and_green_row_inside_a_real_lane_report_cannot_overrid
     );
     merge_updates(&mut state, &routed);
 
-    fs::write(project.join("src/lib.txt"), "hello\nno token in the log\n").unwrap();
+    fs::write(
+        project.join("tests/lib.txt"),
+        "hello\nno token in the log\n",
+    )
+    .unwrap();
     let second = git_commit_all(&project, &home, "fix security finding");
     assert_ne!(first, second);
 
@@ -5013,7 +5074,7 @@ fn a_narrowed_lane_reports_skipped_and_is_settled_for_one_round_only() {
     );
     merge_updates(&mut state, &routed1);
 
-    fs::write(project.join("src/lib.txt"), "hello\nfixed\n").unwrap();
+    fs::write(project.join("tests/lib.txt"), "hello\nfixed\n").unwrap();
     let second = git_commit_all(&project, &home, "fix adversary finding");
 
     // Round 2: composed from round 1, the three whole-cell GREEN lanes settle.
@@ -5091,7 +5152,11 @@ fn a_narrowed_lane_reports_skipped_and_is_settled_for_one_round_only() {
     assert_eq!(last_round["lanes_with_findings"], json!([]), "{routed2}");
     merge_updates(&mut state, &routed2);
 
-    fs::write(project.join("src/lib.txt"), "hello\nfixed\nobservability\n").unwrap();
+    fs::write(
+        project.join("tests/lib.txt"),
+        "hello\nfixed\nobservability\n",
+    )
+    .unwrap();
     let third = git_commit_all(&project, &home, "observability pass");
     assert_ne!(second, third);
 

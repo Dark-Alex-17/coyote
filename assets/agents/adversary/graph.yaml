@@ -55,7 +55,7 @@ variables:
     description: Command prefix for every declared verification command, e.g. `flock -w 240 /path/to/lock`; empty runs them bare.
     default: ''
   - name: debris_exclude
-    description: Repo-relative directories the debris lint leaves out of its diff, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none.
+    description: Repo-relative directories holding the run's own planning files, as a JSON array string (e.g. '["plans"]') or one directory name; empty = none. The debris lint leaves them out of its diff, the review is told the changed files under them are bookkeeping, and a scope-drift complaint located only in them does not block.
     default: ''
 
 settings:
@@ -77,6 +77,7 @@ initial_state:
   scope_notes: ''
   extra_context: ''
   changed_files: []
+  bookkeeping_files: []
   diff_text: ''
   diff_note: ''
   diff_base: ''
@@ -308,6 +309,7 @@ nodes:
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
+      Run bookkeeping files (the run's own planning files under the caller-configured planning dirs; a task's file list never names them): {{bookkeeping_files}}
 
       Criterion to verify (JSON):
       {{criterion}}
@@ -359,9 +361,11 @@ nodes:
       The one exception is `format_rulings`, below.
 
       The checklist (each hit becomes one complaint with kind, file:line
-      location, the violation, the fix, and `blocking`). A complaint is
-      blocking (`blocking: true`) when the change does not conform to the
-      plan: every kind below except spec-endorsed waste.
+      location, the violation, the fix, and `blocking`). The `location` names
+      the file the violation concerns; for an action a log records, that is
+      the file acted on, not the log. A complaint is blocking
+      (`blocking: true`) when the change does not conform to the plan: every
+      kind below except spec-endorsed waste.
       - **Absence** — something the PLAN requires that maps to no criterion and
         never showed up in the diff (the dog that didn't bark). A missing
         retry/redelivery spec is an absence ONLY for a handler that carries state
@@ -409,6 +413,7 @@ nodes:
     prompt: |
       Repository: {{project_dir}}
       Changed files: {{changed_files}}
+      Run bookkeeping files (the run's own planning files under the caller-configured planning dirs; a task's file list never names them): {{bookkeeping_files}}
 
       Acceptance criteria: {{criteria}}
       Per-criterion verdicts (final, except UNVERIFIED ones awaiting your format ruling): {{crit_verdicts}}

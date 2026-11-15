@@ -11,9 +11,11 @@ reported in their own section. A command the runner's deadline skipped is
 reported as not run and does not block by itself: the criterion checks judge
 the criteria it covers. An ENVIRONMENT runner-error marker blocks when
 commands were declared, since the declared commands never ran.
-Holistic complaints block unless they carry `blocking: false`; those are
-reported as non-blocking. A criterion whose check output stayed unreadable
-(UNVERIFIED) takes the holistic pass's format ruling for it when one exists
+Holistic complaints block unless they carry `blocking: false`, or are scope
+drift whose every location path lies under the configured `debris_exclude`
+dirs (the run's own planning files); both are reported as non-blocking. A
+criterion whose check output stayed unreadable (UNVERIFIED) takes the
+holistic pass's format ruling for it when one exists
 and passes the same contract crit_gate.py enforces (crit_contract.py), and
 is otherwise a PIPELINE-FAULT naming the rejection. Rulings for any other
 criterion are ignored, so the holistic pass never changes a criterion it did
@@ -31,6 +33,7 @@ Never crashes into a silent verdict.
 
 import json
 import os
+import re
 import sys
 
 sys.dont_write_bytecode = True
@@ -43,6 +46,11 @@ MAX_SECTION_TEXT_CHARS = 100
 DIED_MARKER = "criterion check DIED (pipeline fault)"
 DIED_EVIDENCE_PREFIX = "PIPELINE-FAULT: criterion "
 RULED_MARKER = "(ruled by holistic: output format failed)"
+PLANNING_DRIFT_NOTE = "not blocking: scope drift confined to the run's planning files"
+SCOPE_DRIFT_KIND_RE = re.compile(r"scope drift|out-of-scope", re.I)
+BARE_LINE_REF_RE = re.compile(r":\d+(?:[-:]\d+)*")
+LINE_ANCHOR_RE = re.compile(r"(?::L?\d+(?:[-:]L?\d+)*|#L\d+(?:-L?\d+)?)$")
+FILE_NAME_RE = re.compile(r"[\w.-]*\w\.\w+")
 
 
 def died(v):
@@ -53,6 +61,68 @@ def died(v):
 def blocking(complaint):
     """Only an explicit `blocking: false` makes a holistic complaint advisory."""
     return complaint.get("blocking") is not False
+
+
+def configured_excludes(state):
+    """The checked `debris_exclude` dirs, or [] when none are configured or
+    the value is unusable (debris_lint.py already faults on the latter)."""
+    try:
+        import debris
+
+        return debris.parse_excludes(state.get("debris_exclude"))
+    except (ImportError, ValueError):
+        return []
+
+
+def outside_names(state, excludes):
+    """Basenames of the changed files that lie outside `excludes`."""
+    import debris
+
+    files = state.get("changed_files")
+    if not isinstance(files, list):
+        return set()
+    return {
+        f.rstrip("/").rsplit("/", 1)[-1]
+        for f in files
+        if isinstance(f, str) and not debris.under_excludes(f, excludes)
+    }
+
+
+def planning_drift(complaint, excludes, outside):
+    """Whether a holistic complaint is scope drift located only in the run's
+    planning files.
+
+    File-like tokens of the location (a `/` in them, a file name with an
+    extension, a `:N`, `:LN` or `#LN` line anchor, or a name in `outside`,
+    the basenames of changed files outside `excludes`) must all lie under
+    `excludes`, at least one must be present, and a bare `:N` line reference
+    counts under the path before it.
+    """
+    kind = complaint.get("kind")
+    location = complaint.get("location")
+    if not excludes or not isinstance(kind, str) or not isinstance(location, str):
+        return False
+    if not SCOPE_DRIFT_KIND_RE.search(kind):
+        return False
+    import debris
+
+    paths = 0
+    for raw in re.split(r"[\s,;]+", location):
+        token = raw.strip("()[]{}<>\"'`").rstrip(".:")
+        if BARE_LINE_REF_RE.fullmatch(token):
+            if not paths:
+                return False
+            continue
+        anchor = LINE_ANCHOR_RE.search(token)
+        path = token[: anchor.start()] if anchor else token
+        if path in outside:
+            return False
+        if not anchor and "/" not in path and not FILE_NAME_RE.fullmatch(path):
+            continue
+        if not debris.under_excludes(path, excludes):
+            return False
+        paths += 1
+    return paths > 0
 
 
 def str_field(d, key):
@@ -357,8 +427,17 @@ def main():
     verdicts = [v for v in (state.get("crit_verdicts") or []) if isinstance(v, dict)]
     verdicts = apply_format_rulings(verdicts, state.get("format_rulings"))
     holistic = [c for c in (state.get("extra_complaints") or []) if isinstance(c, dict)]
-    extra = [c for c in holistic if blocking(c)]
-    advisory = [c for c in holistic if not blocking(c)]
+    excludes = configured_excludes(state)
+    outside = outside_names(state, excludes) if excludes else set()
+    extra = []
+    advisory = []
+    for c in holistic:
+        if not blocking(c):
+            advisory.append((c, ""))
+        elif planning_drift(c, excludes, outside):
+            advisory.append((c, PLANNING_DRIFT_NOTE))
+        else:
+            extra.append(c)
     observations = (state.get("observations") or "").strip()
     faults = collect_pipeline_faults(state) + unverified_faults(verdicts)
     reds = exec_run_complaints(
@@ -469,10 +548,11 @@ def main():
     if advisory:
         lines.append("")
         lines.append("Non-blocking holistic complaints:")
-        for c in advisory:
+        for c, note in advisory:
             lines.append(
                 f"- {c.get('kind', 'violation')} -- {c.get('location', '?')} -- "
                 f"{c.get('violation', '')} -- {c.get('fix', '')}"
+                + (f" ({note})" if note else "")
             )
 
     if inspected:
