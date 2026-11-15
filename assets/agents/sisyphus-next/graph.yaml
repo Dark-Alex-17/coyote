@@ -626,7 +626,7 @@ nodes:
       Project directory: {{project_dir}}
       Review cadence: {{review_cadence}}   Parallel batch member: {{parallel}}
       Delegated brief (task file / plan / roster present): {{delegated}}
-      Plan repo detected (plans/ with steps/ and handoffs/): {{plans_detected}}
+      Plan repo detected (the plans dir with steps/ and handoffs/): {{plans_detected}}
       Declared quality bar: rigor={{quality_rigor}} surfaces={{quality_surfaces}}
     prompt: |
       ## Message

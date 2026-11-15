@@ -205,14 +205,19 @@ def _parked_state(run_id):
     return parked if isinstance(parked, dict) and parked.get("parked") == DISCUSSION_PARKED else {}
 
 
+def _plans_path(state, project):
+    """The configured plans dir as a path; a relative one resolves against the project dir."""
+    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
+    return plans if os.path.isabs(plans) else os.path.join(project or ".", plans)
+
+
 def _planning_exclude(state, project, top):
     """The configured plans dir as a `debris_exclude` value relative to the git top level, or "" when it is missing
-    or outside the repository; a preset value wins."""
-    preset = state.get("debris_exclude")
+    or outside the repository; a preset value, from the state or the variable environment, wins."""
+    preset = var(state, "debris_exclude")
     if preset:
         return preset
-    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
-    plans = plans if os.path.isabs(plans) else os.path.join(project, plans)
+    plans = _plans_path(state, project)
     if not os.path.isdir(plans):
         return ""
     try:
@@ -278,7 +283,7 @@ def intake(state):
     if q := QUALITY_RE.search(brief):
         u["quality_rigor"] = q.group(1).strip().lower()
         u["quality_surfaces"] = (q.group(2) or "").strip()
-    plans = os.path.join(project_abs, "plans")
+    plans = _plans_path(state, project_abs)
     u["plans_detected"] = os.path.isdir(os.path.join(plans, "steps")) and os.path.isdir(
         os.path.join(plans, "handoffs")
     )
@@ -689,8 +694,7 @@ def _not_a_step_run(state):
     """
     if truthy(state.get("delegated")):
         return "a delegated task brief is implemented here, never handed to the step-runner"
-    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
-    steps = os.path.join(plans if os.path.isabs(plans) else os.path.join(state.get("project_dir") or ".", plans), "steps")
+    steps = os.path.join(_plans_path(state, state.get("project_dir")), "steps")
     return "" if os.path.isdir(steps) else f"there is no step plans directory at {steps}"
 
 

@@ -182,6 +182,20 @@ st3 = gates.intake({"initial_prompt": "do it\nSisyphus run id: 20200101T000000-d
 check("intake: unknown run id -> fresh run, declared", not st3.get("resume_mode") and "no durable state" in st3["resume_note"])
 st4 = gates.intake({"initial_prompt": "typo fix", "project_dir": REPO})
 check("intake: standalone brief is top-level", st4["top_level"] and not st4["delegated"])
+PD_REPO = os.path.join(TMP, "plans-dir-repo")
+for _d in ("steps", "handoffs"):
+    os.makedirs(os.path.join(PD_REPO, "docs", "planning", _d))
+st5 = gates.intake({"initial_prompt": "typo fix", "project_dir": PD_REPO, "plans_dir": "docs/planning"})
+check("intake: a plan repo under the configured plans_dir is detected", st5["plans_detected"] is True, st5.get("plans_detected"))
+st6 = gates.intake({"initial_prompt": "typo fix", "project_dir": PD_REPO})
+check("intake: no plan repo under the default plans/ -> not detected", st6["plans_detected"] is False, st6.get("plans_detected"))
+os.environ["LLM_AGENT_VAR_DEBRIS_EXCLUDE"] = '["preset"]'
+try:
+    st7 = gates.intake({"initial_prompt": "typo fix", "project_dir": REPO})
+finally:
+    del os.environ["LLM_AGENT_VAR_DEBRIS_EXCLUDE"]
+check("intake: a debris_exclude preset through the variable environment wins over the plans dir",
+      st7["debris_exclude"] == '["preset"]', st7.get("debris_exclude"))
 roster, own = gates._parse_roster("Implement TASK-003 ...\nTeammate roster:\n- TASK-002 agent_x scope: src/auth/, src/api/users.go\n- TASK-003 agent_y scope: src/payments/\n")
 check("intake: roster parse", roster.get("TASK-002") == ["src/auth/", "src/api/users.go"] and own == ["src/payments/"])
 
