@@ -1119,16 +1119,60 @@ fn run_password_in_pty_with(
         .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
-    pty.wait_for(marker, PTY_DEADLINE).unwrap();
-    interact(&mut pty).unwrap();
-    pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap()
+    let prompted = pty.wait_for(marker, PTY_DEADLINE);
+    or_diagnose(&pty, prompted);
+    let interacted = interact(&mut pty);
+    or_diagnose(&pty, interacted);
+    let done = pty.wait_for("tty-probe-done", PTY_DEADLINE);
+    or_diagnose(&pty, done)
 }
 
-/// Types part of a secret, then sends the terminal's interrupt character.
+/// Unwraps `result`, failing with the processes on the terminal and its
+/// `stty -a` report beside the error.
+fn or_diagnose<T>(pty: &Pty, result: std::io::Result<T>) -> T {
+    result.unwrap_or_else(|err| panic!("{err}\n{}", pty.diagnostics()))
+}
+
+/// How long the tool gets to exit after the interrupt before it is sent
+/// once more.
+const INTERRUPT_RESEND_AFTER: Duration = Duration::from_secs(2);
+
+/// Waits for echo to be off (the hidden read is armed), types part of a
+/// secret, then sends the terminal's interrupt character. A second one
+/// follows if the tool has not exited within `INTERRUPT_RESEND_AFTER`,
+/// and the resend is logged with the terminal's state.
 fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
+    wait_for_echo_off(pty)?;
     pty.send(TYPED_BEFORE_INTERRUPT)?;
     thread::sleep(Duration::from_millis(100));
-    pty.send(b"\x03")
+    pty.send(b"\x03")?;
+    match pty.wait_for("tool-exit=", INTERRUPT_RESEND_AFTER) {
+        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+            eprintln!(
+                "no tool-exit= {INTERRUPT_RESEND_AFTER:?} after the interrupt; sending it again\n{}",
+                pty.diagnostics()
+            );
+            pty.send(b"\x03")
+        }
+        other => other.map(drop),
+    }
+}
+
+fn wait_for_echo_off(pty: &mut Pty) -> std::io::Result<()> {
+    let deadline = Instant::now() + PTY_DEADLINE;
+    while pty.echoes()? {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "the terminal still echoed {PTY_DEADLINE:?} after the prompt:\n{}",
+                    pty.read_for(Duration::ZERO)
+                ),
+            ));
+        }
+        pty.read_for(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 /// Sends the interrupt character the moment the prompt text is seen, with

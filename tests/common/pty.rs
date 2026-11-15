@@ -282,6 +282,55 @@ impl Pty {
         }
         Ok(size.ws_row)
     }
+
+    /// Whether the terminal echoes input. Termios requests on the master
+    /// act on the slave's line discipline, so this is what the child sees.
+    pub fn echoes(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: termios is plain integers and arrays; all zeroes is a
+        // valid value for tcgetattr to overwrite.
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: tcgetattr writes one termios through a valid pointer.
+        if unsafe { libc::tcgetattr(self.master.as_raw_fd(), &mut termios) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(termios.c_lflag & libc::ECHO != 0)
+    }
+
+    /// The `ps` rows of every process in the child's group and the
+    /// terminal's `stty -a` report, for a failure message about a child
+    /// that stopped responding. The child leads its own session, so its
+    /// pid is the group id its descendants inherit.
+    pub fn diagnostics(&self) -> String {
+        let group = self.child.id().to_string();
+        let ps = match Command::new("ps")
+            .args(["-A", "-o", "pid=,ppid=,pgid=,stat=,command="])
+            .output()
+        {
+            Ok(out) => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|row| row.split_whitespace().nth(2) == Some(group.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(err) => format!("ps failed: {err}"),
+        };
+        let stty = match self
+            .master
+            .try_clone()
+            .and_then(|master| Command::new("stty").arg("-a").stdin(master).output())
+        {
+            Ok(out) => format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+            Err(err) => format!("stty failed: {err}"),
+        };
+        format!(
+            "ps (pid ppid pgid stat command):\n{ps}\nstty -a:\n{}",
+            stty.trim_end()
+        )
+    }
 }
 
 /// Killing the wrapper is not enough on its own: the session leader's
