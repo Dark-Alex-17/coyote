@@ -2366,14 +2366,14 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     )
     .unwrap();
 
-    let header_head = format!("awaiting your answer . {who} ({dest8}) . asked ");
+    let header_head = format!("awaiting your answer . {who} . asked ");
     let footer = format!("  answer: .mesh envoy answer {id} \"<text>\"");
     let block_tail = [
         "  Please delete docs/notes.md.",
         "  envoy asks: Share the plan?",
         footer.as_str(),
     ];
-    let entry_head = format!("  1. {who} ({dest8}) asked ");
+    let entry_head = format!("  1. {who} asked ");
     let entry_tail = [
         "     \"Please delete docs/notes.md.\"",
         "     envoy asks: Share the plan?",
@@ -2436,12 +2436,12 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     session.send("no\r").unwrap();
     let (before, matched) = wait_for_match(
         &mut session,
-        &literally(&format!("({dest8}) over the mesh...")),
+        &literally(&format!("{who} over the mesh...")),
     );
     let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
     assert!(
         sent.contains(&format!(
-            "Sending your answer to {who} ({dest8}) over the mesh..."
+            "Sending your answer to {who} over the mesh..."
         )),
         "the notice names the session as user / session before its hash: {sent:?}"
     );
@@ -2507,14 +2507,14 @@ fn question_blocks_are_bare_under_no_color_and_enter_or_ctrl_c_sends_nothing() {
     )
     .unwrap();
 
-    let header_head = format!("awaiting your answer . {who} ({dest8}) . asked ");
+    let header_head = format!("awaiting your answer . {who} . asked ");
     let footer = format!("  answer: .mesh envoy answer {id} \"<text>\"");
     let block_tail = [
         "  May I rename the branch?",
         "  envoy asks: Rename it now?",
         footer.as_str(),
     ];
-    let entry_head = format!("  1. {who} ({dest8}) asked ");
+    let entry_head = format!("  1. {who} asked ");
     let entry_tail = [
         "     \"May I rename the branch?\"",
         "     envoy asks: Rename it now?",
@@ -2666,7 +2666,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     )
     .unwrap();
 
-    let header_head = format!("awaiting your answer . {who} ({dest8}) . asked ");
+    let header_head = format!("awaiting your answer . {who} . asked ");
     let framed_footer = format!("  answer: .mesh envoy answer {framed_id} \"<text>\"");
     let bare_footer = format!("  answer: .mesh envoy answer {bare_id} \"<text>\"");
 
@@ -2682,7 +2682,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
         .iter()
         .position(|line| line.starts_with("Waiting for YOU (2)"))
         .unwrap_or_else(|| panic!("{pending:?}"));
-    let entry_head = format!("{who} ({dest8}) asked ");
+    let entry_head = format!("{who} asked ");
     let entries: Vec<usize> = (at + 1..lines.len())
         .take_while(|&index| !lines[index].starts_with("Access requests"))
         .filter(|&index| lines[index].contains(&entry_head))
@@ -2728,7 +2728,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
         .unwrap();
     let (before, matched) = wait_for_match(
         &mut session,
-        &literally(&format!("({dest8}) over the mesh...")),
+        &literally(&format!("{who} over the mesh...")),
     );
     let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
     sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
@@ -2757,7 +2757,7 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     assert!(notice_at > header_at + 2, "the block comes first: {sent:?}");
     assert_eq!(
         lines[notice_at],
-        format!("Sending your answer to {who} ({dest8}) over the mesh..."),
+        format!("Sending your answer to {who} over the mesh..."),
         "the notice names the session as user / session before its hash: {sent:?}"
     );
     assert_eq!(
@@ -4284,9 +4284,9 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
 
     // The sweep at the top of `.mesh envoy questions`: the stale pair goes, one idle line
     // each.
-    let header_head = format!("awaiting your answer . {who} ({dest8}) . asked ");
+    let header_head = format!("awaiting your answer . {who} . asked ");
     let access_header = "Access requests (1)         grant: .mesh files grant <id> [--standing] . refuse: .mesh files refuse <id>";
-    let entry_head = format!("{who} ({dest8}) asked ");
+    let entry_head = format!("{who} asked ");
     let (_, escalated) = command_row_and_transcript(
         &mut session,
         ".mesh envoy questions",
@@ -4500,7 +4500,7 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
     // id, the progress line counts one asker, the empty line follows, the failure
     // prints in place, and the summary names the question by its full id with the
     // retry; the store keeps it.
-    let row_head = format!("  {q2} . {who} ({dest8}) . asked ");
+    let row_head = format!("  {q2} . {who} . asked ");
     let all_stayed = format!(
         "Dismissed 0; .mesh envoy questions shows what is still open; 1 could not be told and stay pending: {q2}. Retry, or .mesh envoy dismiss --all --silent."
     );
