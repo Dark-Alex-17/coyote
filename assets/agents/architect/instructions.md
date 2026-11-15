@@ -491,9 +491,14 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      Forced lanes: adversary<, probe — add probe when the task changed consumer-facing surface and the plan carries a local-run recipe>
      Plan / acceptance criteria: <the task's acceptance criteria, pasted verbatim>
      Local-run recipe / usage suites: <from the plan, when present>"
-     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}
      <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
      ```
+
+     `debris_exclude` takes the same `<plans rel>` the run-closing hygiene pass computes for its
+     debris lint's exclude flag ({{plans_dir}} relative to the code repo's top level), as a
+     JSON array string such as `["plans"]`; pass `""` wherever that pass omits the flag.
+     The `adversary` fallback spawn below passes the same value.
 
      Verification commands go in `--variables` (a JSON-array string), never in the prompt: the
      prompt also carries pasted plan text from the repo under review, and whatever is declared
@@ -516,6 +521,8 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      unresolvable, wrote a malformed verdict, or the diff spec itself unusable); re-run the
      gauntlet once only if the cause looks transient, otherwise fix the `Diff:` line or the
      install first, then escalate. This is an infrastructure fault, not a code finding.
+     A `debris_exclude` the lint cannot use (absolute, holding `..` or a glob, `.`, or
+     malformed JSON) faults the same way: check and fix the value you passed before anything else.
      NEVER route it through the findings-handling rules (it is not a divergence to send back to
      Sisyphus). NEVER claim done while it stands.
      Order of operations: for `debris`, that single conditional re-run (or the `Diff:`/install
@@ -562,7 +569,7 @@ For each task, respecting `blocked_by` ordering (a blocked task waits for its bl
      <paste the task index.md body + the relevant PLAN-<slug>.md section VERBATIM>
      <paste the plan's ## Quality bar section VERBATIM — recorded dropped practices are
      conformance facts, not divergences>"
-     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+     --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}
      <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
      ```
 

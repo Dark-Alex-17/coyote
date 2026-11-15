@@ -83,7 +83,18 @@ fn sisyphus_prompt_pins_debris_rules() {
             "the lint's `debris-exempt` token",
             "under a `Debt left behind:` heading",
             "a `Debris exemptions:` heading",
+            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}"#,
+            "`debris_exclude` is the repo-relative directory holding the run's own planning files",
+            "the repo top itself, or it lies outside that repo",
+            "A `debris_exclude` the lint cannot use (absolute, holding `..` or a glob, `.`, or malformed",
         ],
+    );
+    assert_eq!(
+        agent_file("sisyphus/instructions.md")
+            .matches(r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}"#)
+            .count(),
+        2,
+        "both the review-gauntlet spawn and the adversary fallback spawn pass debris_exclude"
     );
     assert!(
         !agent_file("sisyphus/instructions.md").contains("DEBT:"),
@@ -107,7 +118,17 @@ fn architect_prompt_pins_debris_rules() {
             "paste the Sisyphus `HYGIENE:` list VERBATIM",
             "if Sisyphus reported a `Debt left behind:` list",
             "report's `Debris exemptions:` list",
+            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}"#,
+            "`debris_exclude` takes the same `<plans rel>` the run-closing hygiene pass computes",
+            "A `debris_exclude` the lint cannot use (absolute, holding `..` or a glob, `.`, or",
         ],
+    );
+    assert_eq!(
+        agent_file("architect/instructions.md")
+            .matches(r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}"#)
+            .count(),
+        2,
+        "both the review-gauntlet spawn and the adversary fallback spawn pass debris_exclude"
     );
     assert_anchors(
         "architect/README.md",
