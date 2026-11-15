@@ -52,7 +52,7 @@ use crate::mesh::pending::{
     Answered, CorrelationKind, Correlations, InboundKind, InboundRecord, InboundStore,
     OtherSessionAsk, PendingRecord, PendingStore, access_not_a_question, other_sessions_asked,
 };
-use crate::mesh::people::{Namer, People, Who, YOU};
+use crate::mesh::people::{Namer, People, Who, YOU, hash_after};
 use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
@@ -5956,21 +5956,22 @@ impl MeshSlot {
             parts: Vec::new(),
             dropped_parts: 0,
         });
-        let dest8 = short(&record.peer_destination).to_string();
+        let who = self.who(&record.peer_identity, &record.peer_destination);
+        let hash = hash_after(&who, &record.peer_destination);
         let (text, note) = match reply_kind {
             HumanReply::Declined => (
                 NoticeText::default()
                     .frame("you declined the question from ")
-                    .peer(self.who(&record.peer_identity, &record.peer_destination))
-                    .frame(format!(" ({dest8})")),
+                    .peer(who.as_str())
+                    .frame(hash),
                 "the human declined via `.mesh envoy dismiss`; nothing to do",
             ),
             HumanReply::Answered => {
                 let words = reply.capped_words(PEER_LINE_MAX_CHARS);
                 let mut text = NoticeText::default()
                     .frame("you answered ")
-                    .peer(self.who(&record.peer_identity, &record.peer_destination))
-                    .frame(format!(" ({dest8}): "))
+                    .peer(who.as_str())
+                    .frame(format!("{hash}: "))
                     .peer(words.text);
                 if words.cut {
                     text = text.frame(format!(" {INBOX_FULL_TEXT_POINTER}"));
@@ -5985,7 +5986,7 @@ impl MeshSlot {
         self.peer_inbox.deliver(reply);
         self.model_notes.push(mesh_notification(
             "peer_message",
-            &format!("peer:{dest8}"),
+            &format!("peer:{}", short(&record.peer_destination)),
             "mesh",
             true,
             note.to_string(),
@@ -6655,10 +6656,11 @@ fn return_line(name: &str, open: &[PendingRecord], now: SystemTime) -> Option<No
 }
 
 impl PeerSurface for MeshSlot {
-    /// A reply to a question this Coyote asked is admitted without being counted: a peer
-    /// past its limit must still be able to answer a `mesh__ask`, and the correlation
-    /// only accepts the one reply (one escalation, then the answer), from the identity
-    /// it was asked of, so the exemption is spent with it. On a link, a message or
+    /// A reply to a question this Coyote asked, or to a message it sent, is admitted
+    /// without being counted: a session past its limit must still be able to answer a
+    /// `mesh__ask` or a `mesh__send`, and the correlation only accepts the one reply (one
+    /// escalation, then the answer), from the identity it was sent to, so the exemption
+    /// is spent with it. On a link, a message or
     /// question the envoy would run is refused before the hourly count is consulted
     /// when the sender already has a run in flight, when its token or cost window for
     /// the hour is already spent, or when the envoy's queue is full: the link caller's
@@ -10372,7 +10374,6 @@ mod tests {
             slot.is_from_self(recorded),
             "the filed copy reads as this node's own, like an answer"
         );
-        let dest8 = &to[..8];
         let who = slot.who(&stub.identity_hex(), &to);
         let notes = slot.take_model_notes();
         assert_eq!(notes.len(), 1, "{notes:?}");
@@ -10388,7 +10389,7 @@ mod tests {
             .collect();
         assert_eq!(
             idle_lines,
-            [format!("you declined the question from {who} ({dest8})")]
+            [format!("you declined the question from {who}")]
         );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
@@ -11417,7 +11418,7 @@ mod tests {
         let who = slot.who(&record.peer_identity, &record.peer_destination);
         assert_eq!(
             pushed[0].text.plain(),
-            format!("you answered {who} ({dest8}): yes, merge it")
+            format!("you answered {who}: yes, merge it")
         );
     }
 
@@ -11435,7 +11436,6 @@ mod tests {
         slot.record_human_reply(&inbound_record("a-1"), &answer, HumanReply::Answered);
 
         let pushed = idle.pushed.lock();
-        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
         let kept = (0..32)
             .map(|i| format!("w{i:03}"))
             .collect::<Vec<_>>()
@@ -11445,7 +11445,7 @@ mod tests {
         let who = slot.who(&record.peer_identity, &record.peer_destination);
         assert_eq!(
             pushed[0].text.plain(),
-            format!("you answered {who} ({dest8}): {kept}... (full text: .mesh messaging inbox)")
+            format!("you answered {who}: {kept}... (full text: .mesh messaging inbox)")
         );
     }
 

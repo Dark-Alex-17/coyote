@@ -112,7 +112,10 @@ pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
     ("identity.rs", &["Predecessor"]),
     ("peers.rs", &["PeerTableFile", "PeerRecord"]),
     ("protocol.rs", &["Compatibility"]),
-    ("sent_threads.rs", &["SentThreadsFile"]),
+    (
+        "sent_threads.rs",
+        &["SentThreadsFile", "SentRecipientsFile", "SentRecipient"],
+    ),
     ("card_refusals.rs", &["CardRefusalsFile"]),
     ("instances.rs", &["InstancesFile", "InstanceRow"]),
     (

@@ -1831,7 +1831,7 @@ pub(crate) async fn fetch(
     );
     if report.left_for_session > 0 {
         debug!(
-            "Propagation fetch from {node_short}: not asking again for {} left on the node for another session",
+            "Propagation fetch from {node_short}: not asking again for {} left on the propagation node for another session",
             report.left_for_session
         );
     }

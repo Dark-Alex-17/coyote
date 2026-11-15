@@ -12,13 +12,13 @@ use crate::mesh::request::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::sent_threads::instances_holding_thread;
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
+use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically_owner_only};
 use crate::render::QuotingError;
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -413,6 +413,23 @@ pub(crate) fn sibling_owner(
         return None;
     }
     holders.into_iter().next()
+}
+
+/// Holds the correlations in memory to what the store keeps: `evict` applied to their
+/// records, newest first, and every entry it drops let go.
+fn evict_entries(entries: &mut HashMap<String, Correlation>, now: SystemTime) {
+    let mut records: Vec<PendingRecord> =
+        entries.values().map(|entry| entry.record.clone()).collect();
+    records.sort_by(|a, b| {
+        parse_rfc3339(&b.sent_at)
+            .cmp(&parse_rfc3339(&a.sent_at))
+            .then_with(|| b.id.cmp(&a.id))
+    });
+    if evict(&mut records, now) == 0 {
+        return;
+    }
+    let kept: HashSet<String> = records.into_iter().map(|record| record.id).collect();
+    entries.retain(|id, _| kept.contains(id));
 }
 
 fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {
@@ -976,7 +993,7 @@ fn write_jsonl<T: Serialize>(path: &Path, records: &[T], names: StoreNames) -> R
         );
         text.push('\n');
     }
-    write_atomically(path, text.as_bytes())
+    write_atomically_owner_only(path, text.as_bytes())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1092,6 +1109,7 @@ impl Correlations {
                 reply: None,
             },
         );
+        evict_entries(&mut state.entries, SystemTime::now());
         drop(state);
         self.changed.notify_waiters();
         Ok(())
@@ -1335,6 +1353,70 @@ mod tests {
             reply: None,
             kind: CorrelationKind::Ask,
         }
+    }
+
+    /// The pending and inbound stores hold what other sessions asked and sent, so only
+    /// their owner may read them, whatever the umask.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn the_pending_and_inbound_stores_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("pending-owner-only");
+        let pending = PendingStore::new(&tmp.path, "0123456789abcdef0123456789abcdef");
+        pending
+            .upsert(
+                record("q1", SystemTime::now(), PendingState::Open),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let inbound_store = InboundStore::new(&tmp.path, "0123456789abcdef0123456789abcdef");
+        inbound_store
+            .upsert(inbound("p1", SystemTime::now()), SystemTime::now())
+            .unwrap();
+
+        for path in [pending.path(), inbound_store.path()] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{}", path.display());
+        }
+    }
+
+    /// The correlations held in memory are held to the store's rules as each one opens:
+    /// one past its time-to-live goes, and past the cap the oldest go, as on disk.
+    #[test]
+    fn opening_a_correlation_holds_the_ones_in_memory_to_the_stores_ttl_and_cap() {
+        let correlations = Correlations::new();
+        let now = SystemTime::now();
+        correlations
+            .open(record(
+                "old",
+                now - PENDING_TTL - Duration::from_secs(60),
+                PendingState::Open,
+            ))
+            .unwrap();
+        for index in 0..PENDING_MAX_ENTRIES + 1 {
+            correlations
+                .open(record(
+                    &format!("q{index:04}"),
+                    now - Duration::from_secs((PENDING_MAX_ENTRIES + 1 - index) as u64),
+                    PendingState::Open,
+                ))
+                .unwrap();
+        }
+
+        let open: Vec<String> = correlations
+            .list()
+            .into_iter()
+            .map(|correlation| correlation.record.id)
+            .collect();
+        assert_eq!(open.len(), PENDING_MAX_ENTRIES);
+        assert!(!open.contains(&"old".to_string()), "the expired one went");
+        assert!(
+            !open.contains(&"q0000".to_string()),
+            "the oldest went past the cap"
+        );
+        assert!(open.contains(&format!("q{PENDING_MAX_ENTRIES:04}")));
     }
 
     fn reply_to(id: &str) -> PeerMessage {
@@ -2807,7 +2889,7 @@ mod tests {
     async fn correlations_answer_wakes_a_waiter_and_wait_never_removes_the_record() {
         let correlations = std::sync::Arc::new(Correlations::new());
         correlations
-            .open(record("q1", t(1_000), PendingState::Open))
+            .open(record("q1", SystemTime::now(), PendingState::Open))
             .unwrap();
         assert!(correlations.is_open("q1"));
         assert_eq!(
@@ -2854,7 +2936,7 @@ mod tests {
     async fn a_reply_landing_between_the_state_read_and_the_first_poll_still_wakes_the_waiter() {
         let correlations = Correlations::new();
         correlations
-            .open(record("q1", t(1_000), PendingState::Open))
+            .open(record("q1", SystemTime::now(), PendingState::Open))
             .unwrap();
         *correlations.between_read_and_await.lock() =
             Some(Box::new(|correlations: &Correlations| {
@@ -2880,7 +2962,7 @@ mod tests {
     fn an_unmatched_reply_is_not_an_answer() {
         let correlations = Correlations::new();
         correlations
-            .open(record("q1", t(1_000), PendingState::Open))
+            .open(record("q1", SystemTime::now(), PendingState::Open))
             .unwrap();
 
         assert_eq!(correlations.answer("q2", reply_to("q2")), None);
@@ -2904,7 +2986,7 @@ mod tests {
     fn a_reply_from_another_identity_does_not_answer_the_question() {
         let correlations = Correlations::new();
         correlations
-            .open(record("q1", t(1_000), PendingState::Open))
+            .open(record("q1", SystemTime::now(), PendingState::Open))
             .unwrap();
         let mut impostor = reply_to("q1");
         impostor.source_identity = hex_lower(&[0xee; 16]);
@@ -3273,7 +3355,7 @@ mod tests {
     fn a_closing_disposition_ends_the_question(disposition: Disposition, retry_after: u32) {
         let correlations = Correlations::new();
         correlations
-            .open(record("q1", t(1_000), PendingState::Open))
+            .open(record("q1", SystemTime::now(), PendingState::Open))
             .unwrap();
 
         assert_eq!(

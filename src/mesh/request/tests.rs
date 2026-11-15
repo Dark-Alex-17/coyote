@@ -1918,6 +1918,99 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// Forwards each connection to `upstream`, holding what `upstream` sends back while
+    /// `held` is set, so a link request reaches the responder but its proof waits.
+    async fn holding_proxy(upstream: u16, held: Arc<AtomicBool>) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let held = held.clone();
+                tokio::spawn(async move {
+                    let Ok(server) = tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                    else {
+                        return;
+                    };
+                    let (mut client_read, mut client_write) = client.into_split();
+                    let (mut server_read, mut server_write) = server.into_split();
+                    tokio::spawn(async move {
+                        let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
+                    });
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        let read = match server_read.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => read,
+                        };
+                        while held.load(Ordering::SeqCst) {
+                            sleep(Duration::from_millis(10)).await;
+                        }
+                        if client_write.write_all(&buf[..read]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// Two requests wait on one link that is still pending: one with 300 ms, one with
+    /// 3 s. The link comes up at about one second. The short one fails on its own
+    /// deadline but leaves the link alone, since the other still waits on it past that
+    /// deadline, and the long one is handed the activated link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shorter_waiters_deadline_never_closes_a_pending_link_a_longer_waiter_holds() {
+        let (stall, _release) = ReleasableStall::new();
+        let responder = Responder::listen(stall, LEGACY_LINK_MTU).await;
+        let held = Arc::new(AtomicBool::new(false));
+        let proxy = holding_proxy(responder.port, held.clone()).await;
+        let mut requester = Requester::connect(proxy, LEGACY_LINK_MTU).await;
+        responder.announce(None).await;
+        let desc = requester.learn(&responder.desc.address_hash).await;
+        held.store(true, Ordering::SeqCst);
+
+        let short_wait = Duration::from_millis(300);
+        let short = {
+            let transport = requester.transport.clone();
+            tokio::spawn(async move {
+                open_link(&transport, &desc, "/echo", Deadline::after(short_wait)).await
+            })
+        };
+        sleep(Duration::from_millis(50)).await;
+        let long = {
+            let transport = requester.transport.clone();
+            tokio::spawn(async move {
+                open_link(
+                    &transport,
+                    &desc,
+                    "/echo",
+                    Deadline::after(Duration::from_secs(3)),
+                )
+                .await
+            })
+        };
+        sleep(Duration::from_secs(1)).await;
+        held.store(false, Ordering::SeqCst);
+
+        let short = timeout(INTEROP_TIMEOUT, short).await.unwrap().unwrap();
+        let err = short.err().expect("the shorter waiter's deadline runs out");
+        assert!(
+            matches!(err, RequestError::LinkActivationTimeout { after, .. } if after == short_wait),
+            "{err:?}"
+        );
+        let long = timeout(INTEROP_TIMEOUT, long)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the longer waiter is handed the link once it comes up");
+        assert!(!long.lock().await.status().not_yet_active());
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// The same, driven by a second request's own deadline: while an active request holds
     /// the link, a second `open_link` to the same session whose deadline runs out before
     /// it can read the link fails on that deadline alone. The link stays open, the request
@@ -11161,7 +11254,7 @@ pub(crate) mod network {
 
         assert_eq!(err, SendError::NoPropagationNode);
         assert!(
-            err.to_string().starts_with("The peer is unreachable"),
+            err.to_string().starts_with("That session is unreachable"),
             "{err}"
         );
         assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");

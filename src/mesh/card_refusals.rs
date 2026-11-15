@@ -101,6 +101,23 @@ mod tests {
         card_refusals_path(&tmp.path, "0123456789abcdef0123456789abcdef")
     }
 
+    /// The card-refusal list says which sessions refused this one, so only its owner
+    /// may read it, whatever the umask.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn the_card_refusal_list_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("card-refusals-owner-only");
+        let path = path_in(&tmp);
+
+        save_card_refusals(&path, &HashSet::from([D.to_string()]));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn a_missing_file_holds_no_refusals_and_creates_nothing() {
         let tmp = TempDir::new("card-refusals-missing");

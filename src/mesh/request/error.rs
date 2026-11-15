@@ -1,7 +1,7 @@
 use crate::mesh::display_text;
 use crate::mesh::message::left_mesh_hint_when;
 use crate::mesh::notify::NoticeText;
-use crate::mesh::people::WHO_MAX_CHARS;
+use crate::mesh::people::{WHO_MAX_CHARS, hash_after};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::short;
 
@@ -342,6 +342,14 @@ impl RemoteRefusal {
         name_quoted(&self.to_string(), self.display_name.as_deref())
     }
 
+    /// The sentence without the session's name, for a line that has named it already.
+    pub(crate) fn unnamed_text(&self) -> String {
+        let full = self.to_string();
+        full.strip_prefix(&self.named_peer())
+            .map(|rest| rest.trim_start().to_string())
+            .unwrap_or(full)
+    }
+
     /// What the model can still do about it, for a tool result's `next_action`. A
     /// default-closed refusal already filed the request as a request to be trusted on the
     /// peer, so nothing here is left to send; a peer that blocked this session, or one
@@ -367,14 +375,7 @@ fn named_peer(destination: &str, display_name: Option<&str>) -> String {
     match display_name {
         Some(name) => {
             let quoted = format!("\"{}\"", name.replace('"', "'"));
-            let ends_on_hash = name
-                .to_ascii_lowercase()
-                .ends_with(&format!("/ {}", dest8.to_ascii_lowercase()));
-            if ends_on_hash {
-                quoted
-            } else {
-                format!("{quoted} ({dest8})")
-            }
+            format!("{quoted}{}", hash_after(name, destination))
         }
         None => dest8.to_string(),
     }
@@ -452,6 +453,15 @@ impl NoAnswer {
     /// The sentence as the terminal shows it, as `RemoteRefusal::notice` builds it.
     pub(crate) fn notice(&self) -> NoticeText {
         name_quoted(&self.to_string(), self.display_name.as_deref())
+    }
+
+    /// The sentence without the session's name, for a line that has named it already.
+    pub(crate) fn unnamed_text(&self) -> String {
+        self.to_string().replacen(
+            &format!("no answer from {}:", self.named_peer()),
+            "no answer:",
+            1,
+        )
     }
 
     fn named_peer(&self) -> String {

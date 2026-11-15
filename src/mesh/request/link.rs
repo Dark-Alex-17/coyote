@@ -17,9 +17,10 @@ use rns_transport::destination::request::{
 use rns_transport::error::RnsError;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
 use rns_transport::transport::{SendPacketOutcome, Transport};
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::time::{Instant, timeout_at};
 
@@ -362,6 +363,7 @@ pub(crate) async fn open_link(
         }
         Err(err) => return Err(no_link(err)),
     };
+    let waiting = LinkWaiter::register(&link, deadline.at);
     let expired = match deadline
         .bound_activation(
             path,
@@ -377,9 +379,12 @@ pub(crate) async fn open_link(
         Err(err) => Some(err),
     };
     if let Some(err) = expired {
-        close_if_never_activated(&link, path, &destination_hex).await;
+        if !waiting.outlasted() {
+            close_if_never_activated(&link, path, &destination_hex).await;
+        }
         return Err(err);
     }
+    drop(waiting);
     let link_id = deadline
         .bound_locally(path, async { *link.lock().await.id() })
         .await?;
@@ -389,6 +394,50 @@ pub(crate) async fn open_link(
         short(&destination_hex)
     );
     Ok(link)
+}
+
+/// The deadline of every request waiting for each link to activate, keyed by the link's
+/// allocation, which the transport hands every request to the destination while it is
+/// not closed.
+static LINK_WAITERS: LazyLock<parking_lot::Mutex<HashMap<usize, Vec<Instant>>>> =
+    LazyLock::new(Default::default);
+
+/// One request waiting for a link to activate, until it drops. A request whose deadline
+/// runs out closes a link that never activated only when no other request still waits on
+/// it past that deadline: the link may yet come up for the one that waits longer.
+struct LinkWaiter {
+    key: usize,
+    at: Instant,
+}
+
+impl LinkWaiter {
+    fn register(link: &Arc<tokio::sync::Mutex<Link>>, at: Instant) -> Self {
+        let key = Arc::as_ptr(link) as usize;
+        LINK_WAITERS.lock().entry(key).or_default().push(at);
+        Self { key, at }
+    }
+
+    /// Whether another request waits on the same link past this one's deadline.
+    fn outlasted(&self) -> bool {
+        LINK_WAITERS
+            .lock()
+            .get(&self.key)
+            .is_some_and(|deadlines| deadlines.iter().any(|at| *at > self.at))
+    }
+}
+
+impl Drop for LinkWaiter {
+    fn drop(&mut self) {
+        let mut waiters = LINK_WAITERS.lock();
+        if let Some(deadlines) = waiters.get_mut(&self.key) {
+            if let Some(at) = deadlines.iter().position(|at| *at == self.at) {
+                deadlines.swap_remove(at);
+            }
+            if deadlines.is_empty() {
+                waiters.remove(&self.key);
+            }
+        }
+    }
 }
 
 /// The transport hands every request to a destination its one out-link that is not

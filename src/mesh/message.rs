@@ -1475,7 +1475,7 @@ impl fmt::Display for SendError {
             ),
             Self::Refused(code) => write!(
                 f,
-                "The peer refused the message: {code}. {}",
+                "That session refused the message: {code}. {}",
                 refusal_remedy(*code)
             ),
             Self::Throttled { destination } => write!(
@@ -1501,7 +1501,7 @@ impl fmt::Display for SendError {
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh people list` to see the sessions you have heard."
+                "That session is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh people list` to see the sessions you have heard."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
@@ -1509,12 +1509,12 @@ impl fmt::Display for SendError {
             ),
             Self::Propagation(err) => write!(
                 f,
-                "The peer is unreachable and the message could not be stored: {err}. {}",
+                "That session is unreachable and the message could not be stored: {err}. {}",
                 propagation_remedy(err)
             ),
             Self::NotAcknowledged => write!(
                 f,
-                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
+                "That session answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
             ),
         }
     }
@@ -1563,20 +1563,20 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
             "The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
         }
         PropagationError::StampCostAboveCeiling { .. } => {
-            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh people list`), when it goes over the link and needs no stamp"
+            "This Coyote mines no stamp above that ceiling; send it once that session is heard again (`.mesh people list`), when it goes over the link and needs no stamp"
         }
         PropagationError::Encode(_) => {
-            "The message could not be packed by this Coyote, so the node never saw it; report it"
+            "The message could not be packed by this Coyote, so the propagation node never saw it; report it"
         }
         PropagationError::StampExhausted => {
             "The stamp search gave up, which no attainable cost makes it do; report it"
         }
         PropagationError::ClosedAfterTransfer
         | PropagationError::RejectedByNode(RefusalCode::InvalidStamp) => {
-            "The node refused the stamp; sending it again mines a fresh one"
+            "The propagation node refused the stamp; sending it again mines a fresh one"
         }
         PropagationError::RejectedByNode(RefusalCode::InvalidKey | RefusalCode::InvalidData) => {
-            "The node could not read the envelope, so sending it again meets the same answer; report it"
+            "The propagation node could not read the envelope, so sending it again meets the same answer; report it"
         }
         PropagationError::RejectedByNode(code)
         | PropagationError::Link(RequestError::Refused(code))
@@ -1592,10 +1592,10 @@ pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
         }
         PropagationError::Link(RequestError::Decode(_)) => ANOTHER_NODE,
         PropagationError::Link(RequestError::Shutdown | RequestError::NotRunning) => {
-            "The mesh node stopped before the message was stored; run `.mesh on`, then send it again"
+            "This session left the mesh before the message was stored; run `.mesh on`, then send it again"
         }
         PropagationError::Cancelled => {
-            "Cancelled before the node confirmed it, so it may have been stored anyway; send it again only if a second copy is acceptable"
+            "Cancelled before the propagation node confirmed it, so it may have been stored anyway; send it again only if a second copy is acceptable"
         }
         PropagationError::TransferFailed
         | PropagationError::VerdictLost { .. }
@@ -3951,7 +3951,7 @@ mod tests {
         let stored = |err: PropagationError| {
             let text = SendError::Propagation(err.clone()).to_string();
             let head =
-                format!("The peer is unreachable and the message could not be stored: {err}. ");
+                format!("That session is unreachable and the message could not be stored: {err}. ");
             text.strip_prefix(&head)
                 .unwrap_or_else(|| panic!("{text:?} does not start with {head:?}"))
                 .to_string()
@@ -3974,19 +3974,19 @@ mod tests {
         );
         assert_eq!(
             stored(PropagationError::StampCostAboveCeiling { cost: 30, max: 26 }),
-            "This Coyote mines no stamp above that ceiling; send it once the peer is heard again (`.mesh people list`), when it goes over the link and needs no stamp"
+            "This Coyote mines no stamp above that ceiling; send it once that session is heard again (`.mesh people list`), when it goes over the link and needs no stamp"
         );
         assert_eq!(
             stored(PropagationError::Encode("no key".into())),
-            "The message could not be packed by this Coyote, so the node never saw it; report it"
+            "The message could not be packed by this Coyote, so the propagation node never saw it; report it"
         );
         assert_eq!(
             stored(PropagationError::RejectedByNode(RefusalCode::InvalidStamp)),
-            "The node refused the stamp; sending it again mines a fresh one"
+            "The propagation node refused the stamp; sending it again mines a fresh one"
         );
         assert_eq!(
             stored(PropagationError::RejectedByNode(RefusalCode::InvalidData)),
-            "The node could not read the envelope, so sending it again meets the same answer; report it"
+            "The propagation node could not read the envelope, so sending it again meets the same answer; report it"
         );
         assert_eq!(
             stored(PropagationError::Link(RequestError::Oversize {
@@ -4017,16 +4017,16 @@ mod tests {
         // neither names a wait, and `.mesh peers` itself refuses on a stopped node.
         assert_eq!(
             stored(PropagationError::Link(RequestError::Shutdown)),
-            "The mesh node stopped before the message was stored; run `.mesh on`, then send it again"
+            "This session left the mesh before the message was stored; run `.mesh on`, then send it again"
         );
         assert_eq!(
             stored(PropagationError::Cancelled),
-            "Cancelled before the node confirmed it, so it may have been stored anyway; send it again only if a second copy is acceptable"
+            "Cancelled before the propagation node confirmed it, so it may have been stored anyway; send it again only if a second copy is acceptable"
         );
         assert_eq!(
             SendError::NotAcknowledged.to_string(),
             format!(
-                "The peer answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
+                "That session answered but did not acknowledge the message; it may be running an older Coyote that serves nothing at {MESSAGE_PATH}; ask that session's user to upgrade, then send it again"
             )
         );
         // The link-side tail is the request error's, and the refusal tail the code's.
@@ -4044,11 +4044,11 @@ mod tests {
         );
         assert_eq!(
             SendError::Refused(RefusalCode::NotFound).to_string(),
-            "The peer refused the message: not found (0xfd). That session has nothing under that name; check it and try again"
+            "That session refused the message: not found (0xfd). That session has nothing under that name; check it and try again"
         );
         assert_eq!(
             SendError::Refused(RefusalCode::InvalidData).to_string(),
-            "The peer refused the message: invalid data (0xf4). That session could not read what was sent, so sending it again meets the same answer; report it"
+            "That session refused the message: invalid data (0xf4). That session could not read what was sent, so sending it again meets the same answer; report it"
         );
 
         let cleaned_under_cap = format!(

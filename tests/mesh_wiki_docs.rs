@@ -5344,24 +5344,24 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         );
     }
     assert!(
-        sending.contains("{who} ({dest8})"),
+        sending.contains("{who}{hash}"),
         "the sending_notice progress line names the session as user / session before its short hash: {sending:?}"
     );
     let sending_span = format!(
         "`{}`",
         sending
             .replace("{who}", "<user> / <session>")
-            .replace("{dest8}", "<dest8>")
+            .replace("{hash}", " (<dest8>)")
     );
     assert!(
-        follow_up.starts_with("Sending your follow-up to {who} ({dest8})"),
+        follow_up.starts_with("Sending your follow-up to {who}{hash}"),
         "the follow_up_notice progress line names the session as sending_notice does: {follow_up:?}"
     );
     let follow_up_span = format!(
         "`{}`",
         follow_up
             .replace("{who}", "<user> / <session>")
-            .replace("{dest8}", "<dest8>")
+            .replace("{hash}", " (<dest8>)")
     );
     assert!(
         fetch.contains("{shown}") && fetch.contains("{named}") && fetch.matches("{}").count() == 1,
@@ -7402,7 +7402,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         [
             "at an unknown time",
             "{} . ",
-            " ({}) . {} {age} . id ",
+            "{} . {} {age} . id ",
             " . expires in {}",
         ],
         "question_header's literals moved"
@@ -7413,7 +7413,8 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         &[
             r#""{} . ""#,
             ".peer(row.name.clone())",
-            r#"" ({}) . {} {age} . id ""#,
+            r#""{} . {} {age} . id ""#,
+            "hash_after(&row.name, &row.destination),",
             ".peer(short(&row.id))",
         ],
     );
@@ -7847,7 +7848,7 @@ fn the_held_for_a_departed_peer_sentence_reads_on_the_wiki_as_printed() {
 #[test]
 fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
     let left = const_str("src/mesh/idle.rs", "LEFT_FOR_ANOTHER_SESSION");
-    assert_eq!(left, "left on the node for another session");
+    assert_eq!(left, "left on the propagation node for another session");
     let render = fn_body("src/repl/mesh.rs", "render_sync");
     for needle in [
         "\"Nothing new held for you at propagation node {node}: {} listed, {processed}{left} {LEFT_FOR_ANOTHER_SESSION}.\"",
@@ -7973,17 +7974,19 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
     );
     let row_source = fn_body("src/repl/mesh.rs", "dismiss_all_row");
     assert!(
-        row_source.contains(r#"&[("destination", short(destination)), ("asked", asked)],"#)
+        row_source.contains(r#"&[("hash", &hash_after(name, destination)), ("asked", asked)],"#)
             && row_source.contains(r#"&[("id", id), ("name", name)],"#),
         "dismiss_all_row no longer frames the short destination and age and quotes the id and name:\n{row_source}"
     );
-    let row_template = "  {id} . {name} ({destination}) . asked {asked}";
+    let source_template = "  {id} . {name}{hash} . asked {asked}";
     assert!(
         string_literals(&row_source)
             .iter()
-            .any(|literal| literal == row_template),
-        "dismiss_all_row no longer builds {row_template:?}:\n{row_source}"
+            .any(|literal| literal == source_template),
+        "dismiss_all_row no longer builds {source_template:?}:\n{row_source}"
     );
+    // A named session's row, the hash after the name, as the pages show it.
+    let row_template = "  {id} . {name} ({destination}) . asked {asked}";
     let list_row = &row_template
         .replace("{id}", "{}")
         .replace("{name}", "{}")
@@ -9828,10 +9831,22 @@ fn assert_named_peer_quotes_the_name_before_the_hash_once() {
         .map(|(body, _)| body.to_string())
         .expect("src/mesh/request/error.rs declares the free fn named_peer");
     let literals = string_literals(&body);
-    for wanted in ["\"{}\"", "/ {}", "{quoted} ({dest8})"] {
+    for wanted in ["\"{}\"", "{quoted}{}"] {
         assert!(
             literals.iter().any(|literal| literal == wanted),
             "named_peer no longer formats {wanted:?}: {literals:?}"
+        );
+    }
+    assert!(
+        body.contains("hash_after(name, destination)"),
+        "named_peer no longer puts the hash after the name by the shared rule:\n{body}"
+    );
+    let rule = fn_body("src/mesh/people.rs", "hash_after");
+    let rule_literals = string_literals(&rule);
+    for wanted in ["/ {}", " ({dest8})"] {
+        assert!(
+            rule_literals.iter().any(|literal| literal == wanted),
+            "hash_after no longer formats {wanted:?}: {rule_literals:?}"
         );
     }
 }

@@ -411,7 +411,7 @@ impl fmt::Display for AccessError {
             ),
             Self::Refused(code) => write!(
                 f,
-                "The peer refused the access request: {code}. {}",
+                "That session refused the access request: {code}. {}",
                 refusal_remedy(*code)
             ),
             Self::Throttled { destination } => write!(
@@ -422,15 +422,15 @@ impl fmt::Display for AccessError {
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NotServed(_) => write!(
                 f,
-                "The peer does not take access requests; it may be running an older Coyote without an access provider"
+                "That session does not take access requests; it may be running an older Coyote without an access provider"
             ),
             Self::UnknownStatus => write!(
                 f,
-                "The that session sent an unknown status in its answer to the access request; it may be running a newer Coyote"
+                "That session sent an unknown status in its answer to the access request; it may be running a newer Coyote"
             ),
             Self::Malformed(why) => write!(
                 f,
-                "The peer answered the access request with something that is not an access reply: {why}"
+                "That session answered the access request with something that is not an access reply: {why}"
             ),
             Self::Direct(err) => write!(
                 f,
@@ -449,7 +449,7 @@ impl fmt::Display for AccessError {
             ),
             Self::NoPropagationNode => write!(
                 f,
-                "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh people list` to see the sessions you have heard."
+                "That session is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh people list` to see the sessions you have heard."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
@@ -457,7 +457,7 @@ impl fmt::Display for AccessError {
             ),
             Self::Propagation(err) => write!(
                 f,
-                "The peer is unreachable and the access request could not be stored: {err}. {}",
+                "That session is unreachable and the access request could not be stored: {err}. {}",
                 propagation_remedy(err)
             ),
         }
@@ -1890,7 +1890,7 @@ mod no_answer_tests {
         assert_eq!(err, AccessError::NoPropagationNode);
         assert!(
             err.to_string()
-                .starts_with("The peer is unreachable and no propagation node is known yet"),
+                .starts_with("That session is unreachable and no propagation node is known yet"),
             "{err}"
         );
         assert!(slot.stop().await.unwrap());
@@ -5989,7 +5989,7 @@ mod tests {
         assert!(
             AccessError::NotServed(no_provider)
                 .to_string()
-                .contains("peer does not take access requests")
+                .contains("That session does not take access requests")
         );
         assert_eq!(
             read_access_reply(&access_reply("a-1", &AccessOutcome::Pending), "a-1"),
@@ -6046,10 +6046,9 @@ mod tests {
             .to_string()
             .contains(".mesh people list")
         );
-        assert!(
-            AccessError::UnknownStatus
-                .to_string()
-                .contains("that session sent an unknown status")
+        assert_eq!(
+            AccessError::UnknownStatus.to_string(),
+            "That session sent an unknown status in its answer to the access request; it may be running a newer Coyote"
         );
         assert_eq!(
             AccessError::IncompatibleVersion {
@@ -6130,11 +6129,11 @@ mod tests {
         );
         assert_eq!(
             AccessError::Refused(RefusalCode::NotFound).to_string(),
-            "The peer refused the access request: not found (0xfd). That session has nothing under that name; check it and try again"
+            "That session refused the access request: not found (0xfd). That session has nothing under that name; check it and try again"
         );
         assert_eq!(
             AccessError::Propagation(PropagationError::TransferFailed).to_string(),
-            "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when that session was last heard"
+            "That session is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when that session was last heard"
         );
     }
 

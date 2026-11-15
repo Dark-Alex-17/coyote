@@ -501,7 +501,8 @@ impl SyncSchedule {
 
 /// How a sync names the held messages it left for another session of this identity,
 /// after their count.
-pub(crate) const LEFT_FOR_ANOTHER_SESSION: &str = "left on the node for another session";
+pub(crate) const LEFT_FOR_ANOTHER_SESSION: &str =
+    "left on the propagation node for another session";
 
 /// `synced 3 messages from deadbeef: 2 delivered, 1 duplicate`, naming only the non-zero
 /// outcomes of what the sync received, so a message an earlier sync left for another
@@ -642,7 +643,7 @@ mod synced_ask_line_tests {
         };
         assert_eq!(
             synced_line(&report),
-            "synced 2 messages from deadbeef: 1 delivered, 1 left on the node for another session"
+            "synced 2 messages from deadbeef: 1 delivered, 1 left on the propagation node for another session"
         );
         let with_earlier = FetchReport {
             listed: 4,
@@ -651,7 +652,7 @@ mod synced_ask_line_tests {
         };
         assert_eq!(
             synced_line(&with_earlier),
-            "synced 2 messages from deadbeef: 1 delivered, 1 left on the node for another session",
+            "synced 2 messages from deadbeef: 1 delivered, 1 left on the propagation node for another session",
             "only what this sync received is counted, not what an earlier one left"
         );
     }

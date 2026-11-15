@@ -36,7 +36,7 @@ use crate::mesh::pending::{
     PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingRecord, PendingState, access_not_a_question,
     question_not_an_access_request,
 };
-use crate::mesh::people::{AliasSource, Namer, Who, YOU};
+use crate::mesh::people::{AliasSource, Namer, Who, YOU, hash_after, with_hash};
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
     MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
@@ -1930,10 +1930,10 @@ fn thread_follow_up_line(
     now: SystemTime,
 ) -> NoticeText {
     let line = NoticeText::from_template(
-        "Sent {sent} to {name} ({destination}) in thread {thread} (via {via}); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
+        "Sent {sent} to {name}{hash} in thread {thread} (via {via}); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
         &[
             ("sent", short(&outcome.id)),
-            ("destination", short(destination)),
+            ("hash", &hash_after(name, destination)),
             ("via", via_text(outcome.via)),
         ],
         &[("name", name), ("thread", short(thread))],
@@ -1976,10 +1976,10 @@ fn answered_line(id: &str) -> NoticeText {
 /// quoted as `.mesh messaging sent` lists it.
 fn reply_sent_line(sent: &str, destination: &str, name: &str, id: &str, via: &str) -> NoticeText {
     NoticeText::from_template(
-        "Sent {sent} to {name} ({destination}) as a reply to {id} (via {via}).",
+        "Sent {sent} to {name}{hash} as a reply to {id} (via {via}).",
         &[
             ("sent", short(sent)),
-            ("destination", short(destination)),
+            ("hash", &hash_after(name, destination)),
             ("via", via),
         ],
         &[("name", name), ("id", short(id))],
@@ -2200,8 +2200,8 @@ async fn dismiss_all(ctx: &RequestContext, silent: bool, yes: bool, dry_run: boo
 /// takes. The id and the asker's name are quoted as they stand, since a peer chose them.
 fn dismiss_all_row(id: &str, name: &str, destination: &str, asked: &str) -> NoticeText {
     NoticeText::from_template(
-        "  {id} . {name} ({destination}) . asked {asked}",
-        &[("destination", short(destination)), ("asked", asked)],
+        "  {id} . {name}{hash} . asked {asked}",
+        &[("hash", &hash_after(name, destination)), ("asked", asked)],
         &[("id", id), ("name", name)],
     )
 }
@@ -2514,10 +2514,10 @@ fn sent_line(
 ) -> NoticeText {
     match outcome.departed {
         Some(departed) => NoticeText::from_template(
-            "Sent {sent} to {name} ({destination}): ",
+            "Sent {sent} to {name}{hash}: ",
             &[
                 ("sent", short(&outcome.id)),
-                ("destination", short(destination)),
+                ("hash", &hash_after(name, destination)),
             ],
             &[("name", name)],
         )
@@ -2526,10 +2526,17 @@ fn sent_line(
         .peer(user)
         .frame(format!("{HELD_FOR_DEPARTED_END}. {SEE_WHEN_IT_IS_BACK}")),
         None => NoticeText::from_template(
-            "Sent {sent} to {name} ({destination}, via {via}).",
+            "Sent {sent} to {name} ({hash}via {via}).",
             &[
                 ("sent", short(&outcome.id)),
-                ("destination", short(destination)),
+                (
+                    "hash",
+                    &if hash_after(name, destination).is_empty() {
+                        String::new()
+                    } else {
+                        format!("{}, ", short(destination))
+                    },
+                ),
                 ("via", via_text(outcome.via)),
             ],
             &[("name", name)],
@@ -2544,8 +2551,18 @@ const SEE_WHEN_IT_IS_BACK: &str = ".mesh people list shows when it announces aga
 /// by here quoted as it stands.
 fn send_confirmation(name: &str, destination: &str, trust: &str) -> NoticeText {
     NoticeText::from_template(
-        "This sends your text to {name} ({destination}, trust: {trust}) over the mesh.",
-        &[("destination", short(destination)), ("trust", trust)],
+        "This sends your text to {name} ({hash}trust: {trust}) over the mesh.",
+        &[
+            (
+                "hash",
+                &if hash_after(name, destination).is_empty() {
+                    String::new()
+                } else {
+                    format!("{}, ", short(destination))
+                },
+            ),
+            ("trust", trust),
+        ],
         &[("name", name)],
     )
 }
@@ -2631,15 +2648,6 @@ fn session_led(
 
 /// What follows a session's `<user> / <session>` name: its short hash in parentheses,
 /// unless the name already ends on it, as a session with no name of its own does.
-fn hash_after(who: &str, destination: &str) -> String {
-    let dest8 = short(destination);
-    if who.ends_with(&format!("/ {dest8}")) {
-        String::new()
-    } else {
-        format!(" ({dest8})")
-    }
-}
-
 /// A refusal that opens on `Session <hash>`, opened on the session's `<user> / <session>`
 /// name instead, as `session_led` writes it; `text` as it stands when it opens otherwise.
 fn session_led_or_plain(text: String, who: &str, destination: &str) -> anyhow::Error {
@@ -2978,14 +2986,15 @@ async fn heard_or_asked(
     }
 }
 
-/// Why a verb that links to one peer has no route to link over.
+/// Why a verb that links to one session has no route to link over.
 enum Unrouted {
     NoAnswer,
     Interrupted,
 }
 
 /// The route the verb's request links over. A route the transport already holds is
-/// taken at once; otherwise the user is told the network is being asked, since the wait
+/// taken at once, with the route line first when the transport holds the session's
+/// description but no path to it; otherwise the user is told the network is being asked, since the wait
 /// runs up to `PATH_REQUEST_TIMEOUT` and Ctrl-C ends it like the request that follows. A
 /// held description whose path expired is returned at once too, but the request's link
 /// asks for the path, so the same line is printed before that wait. Every route is a
@@ -3906,7 +3915,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let shown = shown_pattern(&args.path);
     let peer = short(&destination);
     let who = runtime.who_at(&destination).to_string();
-    let named = format!("{who} ({peer})");
+    let named = with_hash(&who, &destination);
     if let Some(reason) = spent_attachment(
         runtime.memory(),
         &destination,
@@ -4671,7 +4680,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&report),
-            "Fetched from propagation node deadbeef: 2 listed, 2 wanted, 2 received, 1 delivered, 0 duplicates, 0 discarded, 0 deferred. 1 left on the node for another session.\n`.mesh messaging help` says what the sync counts mean."
+            "Fetched from propagation node deadbeef: 2 listed, 2 wanted, 2 received, 1 delivered, 0 duplicates, 0 discarded, 0 deferred. 1 left on the propagation node for another session.\n`.mesh messaging help` says what the sync counts mean."
         );
         let not_asked_again = FetchReport {
             wanted: 0,
@@ -4682,7 +4691,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&not_asked_again),
-            "Nothing new held for you at propagation node deadbeef: 2 listed, 1 already processed, 1 left on the node for another session."
+            "Nothing new held for you at propagation node deadbeef: 2 listed, 1 already processed, 1 left on the propagation node for another session."
         );
         let only_left = FetchReport {
             listed: 1,
@@ -4690,7 +4699,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&only_left),
-            "Nothing new held for you at propagation node deadbeef: 1 listed, 1 left on the node for another session."
+            "Nothing new held for you at propagation node deadbeef: 1 listed, 1 left on the propagation node for another session."
         );
         let none_served = FetchReport {
             listed: 3,
@@ -4699,7 +4708,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&none_served),
-            "Propagation node deadbeef lists 3 messages for you and 2 were asked for, but none were served; run .mesh messaging sync again or check its logs. 1 left on the node for another session."
+            "Propagation node deadbeef lists 3 messages for you and 2 were asked for, but none were served; run .mesh messaging sync again or check its logs. 1 left on the propagation node for another session."
         );
     }
 }
@@ -9134,7 +9143,7 @@ mod name_addressing_tests {
         };
         let now = SystemTime::now();
         let pending = render_pending_lists(&[], std::slice::from_ref(&row), &[], now, 80, false);
-        let entry = "  1. .info / 22222222 (22222222) asked at an unknown time . id p1";
+        let entry = "  1. .info / 22222222 asked at an unknown time . id p1";
         assert_eq!(pending.render(CommandPrefix::Dot), pending.plain());
         assert!(pending.plain().contains(entry), "{pending}");
         let slash = pending.render(CommandPrefix::Slash);
@@ -9143,7 +9152,7 @@ mod name_addressing_tests {
 
         let block = render_question_block(&row, now, 80, true).render(CommandPrefix::Slash);
         assert!(
-            block.contains("awaiting your answer . .info / 22222222 (22222222) . asked"),
+            block.contains("awaiting your answer . .info / 22222222 . asked"),
             "{block}"
         );
         assert!(block.contains("answer: /mesh envoy answer p1"), "{block}");
@@ -9978,8 +9987,8 @@ fn via_text(via: PeerVia) -> &'static str {
 /// `<user> / <session>`, quoted as it stands with the short hash after it.
 fn sending_notice(who: &str, destination: &str) -> NoticeText {
     NoticeText::from_template(
-        "Sending your answer to {who} ({dest8}) over the mesh...",
-        &[("dest8", short(destination))],
+        "Sending your answer to {who}{hash} over the mesh...",
+        &[("hash", &hash_after(who, destination))],
         &[("who", who)],
     )
 }
@@ -9987,8 +9996,8 @@ fn sending_notice(who: &str, destination: &str) -> NoticeText {
 /// `sending_notice` for a follow-up on a question or message this node sent.
 fn follow_up_notice(who: &str, destination: &str) -> NoticeText {
     NoticeText::from_template(
-        "Sending your follow-up to {who} ({dest8}) over the mesh...",
-        &[("dest8", short(destination))],
+        "Sending your follow-up to {who}{hash} over the mesh...",
+        &[("hash", &hash_after(who, destination))],
         &[("who", who)],
     )
 }
@@ -11231,13 +11240,19 @@ mod tests {
     /// `line: word in literal` for each literal of `source` a user reads that names
     /// someone on the mesh other than as a user or a session. `propagation node` is the
     /// one named term kept, as the messaging help explains it (with its config keys),
-    /// `--peer` is a flag, and a bare lowercase word is a key, never prose.
+    /// `--peer` is a flag, and a bare lowercase word, key or path is never prose. The
+    /// match ignores case, so a sentence that opens on one of the words is caught too.
     fn user_model_word_hits(source: &str) -> Vec<String> {
         shown_literals(source)
             .into_iter()
-            .filter(|(_, literal)| !literal.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .filter(|(_, literal)| {
+                !literal
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_./-".contains(c))
+            })
             .filter_map(|(line, literal)| {
                 let prose = prose_of(&literal)
+                    .replace("mesh__peers", "")
                     .replace("propagation node", "")
                     .replace("propagation_node", "")
                     .replace("--peer", "");
@@ -11261,6 +11276,7 @@ fn shown() {
     let row = NoticeText::from_template("to {peer}", &[("peer", d)], &[]);
     out_text("every trusted peer");
     bail!("its owner decides");
+    out_text("Peer said no; see scope.peer/1");
 }
 const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
 "##;
@@ -11269,6 +11285,7 @@ const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
             [
                 "6: \"peer\" in \"every trusted peer\"",
                 "7: \"owner\" in \"its owner decides\"",
+                "8: \"peer\" in \"Peer said no; see scope.peer/1\"",
             ],
             "the scan misreads its fixture"
         );
@@ -11280,6 +11297,9 @@ const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
                 include_str!("../mesh/request/error.rs"),
             ),
             ("src/mesh/fetch.rs", include_str!("../mesh/fetch.rs")),
+            ("src/mesh/message.rs", include_str!("../mesh/message.rs")),
+            ("src/mesh/card.rs", include_str!("../mesh/card.rs")),
+            ("src/mesh/access.rs", include_str!("../mesh/access.rs")),
         ] {
             let hits = user_model_word_hits(source);
             assert!(
@@ -13470,8 +13490,8 @@ fn question_header(row: &QuestionRow, now: SystemTime) -> NoticeText {
         .frame(format!("{} . ", row.state))
         .peer(row.name.clone())
         .frame(format!(
-            " ({}) . {} {age} . id ",
-            short(&row.destination),
+            "{} . {} {age} . id ",
+            hash_after(&row.name, &row.destination),
             row.when_label
         ))
         .peer(short(&row.id));
@@ -13703,7 +13723,7 @@ fn pending_entry(
     let marker = format!("  {number}. ");
     let peer = NoticeText::default()
         .peer(row.name.clone())
-        .frame(format!(" ({})", short(&row.destination)));
+        .frame(hash_after(&row.name, &row.destination));
     let id = row.id.get(..id_len).unwrap_or(&row.id);
     let head = if outbound {
         let left = row
@@ -13764,10 +13784,10 @@ fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) ->
             }
             RecipientOutcome::Refused { reason } => NoticeText::from(format!("refused: {reason}")),
             RecipientOutcome::NotTrustedByPeer(refusal) => {
-                NoticeText::default().peer(refusal.to_string())
+                NoticeText::default().peer(refusal.unnamed_text())
             }
             RecipientOutcome::NoAnswer(no_answer) => {
-                NoticeText::default().peer(no_answer.to_string())
+                NoticeText::default().peer(no_answer.unnamed_text())
             }
             RecipientOutcome::Throttled { reason } => {
                 NoticeText::from(format!("throttled, not stored: {reason}"))
@@ -13776,10 +13796,11 @@ fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) ->
                 NoticeText::from(format!("not stored: {reason}"))
             }
         };
+        let named = who(&recipient.destination);
         report = report
             .frame("  ")
-            .peer(who(&recipient.destination))
-            .frame(format!(" ({}): ", short(&recipient.destination)))
+            .peer(named.as_str())
+            .frame(format!("{}: ", hash_after(&named, &recipient.destination)))
             .then(status)
             .frame("\n");
     }
@@ -13799,6 +13820,125 @@ fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) ->
         tally.unreachable,
         tally.refused
     ))
+}
+
+/// Every line that names a session `<user> / <session>` puts its short hash after the
+/// name once, and only when the name does not already end on it. The expected lines are
+/// spelled out, never built by the code under test.
+#[cfg(test)]
+mod session_hash_once_tests {
+    use super::*;
+    use crate::mesh::message::{RecipientReport, SendOutcome};
+    use crate::mesh::request::{NoAnswer, RemoteRefusal};
+
+    const DEST: &str = "5e6f7a8b5e6f7a8b5e6f7a8b5e6f7a8b";
+    const UNNAMED: &str = "ab12cd34 / 5e6f7a8b";
+    const NAMED: &str = "Ann / laptop";
+
+    fn outcome() -> SendOutcome {
+        SendOutcome {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            via: PeerVia::Direct,
+            departed: None,
+        }
+    }
+
+    #[test]
+    fn each_line_names_an_unnamed_session_by_its_hash_once_and_a_named_one_with_it() {
+        let now = SystemTime::now();
+        let cases: Vec<(String, &str)> = vec![
+            (
+                sending_notice(UNNAMED, DEST).plain(),
+                "Sending your answer to ab12cd34 / 5e6f7a8b over the mesh...",
+            ),
+            (
+                sending_notice(NAMED, DEST).plain(),
+                "Sending your answer to Ann / laptop (5e6f7a8b) over the mesh...",
+            ),
+            (
+                follow_up_notice(UNNAMED, DEST).plain(),
+                "Sending your follow-up to ab12cd34 / 5e6f7a8b over the mesh...",
+            ),
+            (
+                follow_up_notice(NAMED, DEST).plain(),
+                "Sending your follow-up to Ann / laptop (5e6f7a8b) over the mesh...",
+            ),
+            (
+                sent_line(&outcome(), DEST, UNNAMED, "ab12cd34", now).plain(),
+                "Sent 01234567 to ab12cd34 / 5e6f7a8b (via direct).",
+            ),
+            (
+                sent_line(&outcome(), DEST, NAMED, "Ann", now).plain(),
+                "Sent 01234567 to Ann / laptop (5e6f7a8b, via direct).",
+            ),
+            (
+                reply_sent_line("0123456789abcdef", DEST, UNNAMED, "q1", "direct").plain(),
+                "Sent 01234567 to ab12cd34 / 5e6f7a8b as a reply to q1 (via direct).",
+            ),
+            (
+                thread_follow_up_line(&outcome(), DEST, NAMED, "fedcba9876543210", now).plain(),
+                "Sent 01234567 to Ann / laptop (5e6f7a8b) in thread fedcba98 (via direct); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
+            ),
+            (
+                dismiss_all_row("q1", UNNAMED, DEST, "2m ago").plain(),
+                "  q1 . ab12cd34 / 5e6f7a8b . asked 2m ago",
+            ),
+            (
+                send_confirmation(UNNAMED, DEST, "trusted").plain(),
+                "This sends your text to ab12cd34 / 5e6f7a8b (trust: trusted) over the mesh.",
+            ),
+            (
+                send_confirmation(NAMED, DEST, "trusted").plain(),
+                "This sends your text to Ann / laptop (5e6f7a8b, trust: trusted) over the mesh.",
+            ),
+            (with_hash(UNNAMED, DEST), "ab12cd34 / 5e6f7a8b"),
+            (with_hash(NAMED, DEST), "Ann / laptop (5e6f7a8b)"),
+        ];
+        for (shown, expected) in cases {
+            assert_eq!(shown, expected);
+        }
+    }
+
+    /// A bulletin row names the session once, and the refusal or silence after it says
+    /// what happened without naming the session again.
+    #[test]
+    fn a_broadcast_row_names_the_session_once() {
+        let own = "cd".repeat(16);
+        let row = |outcome: RecipientOutcome| RecipientReport {
+            destination: DEST.to_string(),
+            display_name: None,
+            outcome,
+        };
+        let outcome = BroadcastOutcome {
+            id: "b1".repeat(16),
+            recipients: vec![
+                row(RecipientOutcome::NotTrustedByPeer(RemoteRefusal::new(
+                    DEST,
+                    Some(UNNAMED),
+                    own.clone(),
+                ))),
+                row(RecipientOutcome::NoAnswer(
+                    NoAnswer::new(DEST, own.clone()).named(Some(UNNAMED)),
+                )),
+            ],
+        };
+
+        let text = render_broadcast(&outcome, |_| UNNAMED.to_string()).plain();
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!(
+                "  ab12cd34 / 5e6f7a8b: refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+            )
+        );
+        assert_eq!(
+            lines[1],
+            format!(
+                "  ab12cd34 / 5e6f7a8b: no answer: most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session)."
+            )
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13841,7 +13981,7 @@ mod broadcast_row_tests {
         .plain();
 
         let expected = format!(
-            "  cdcdcdcd / aaaaaaaa (aaaaaaaa): delivered\n  cdcdcdcd / bbbbbbbb (bbbbbbbb): throttled, not stored: bbbbbbbb refused it: busy. Try again in a minute.\n  cdcdcdcd / cccccccc (cccccccc): not stored: The message could not be sent: slow. Try again in a minute\nBulletin {}: 1 delivered, 0 store-and-forward, 0 unreachable, 0 refused, 1 throttled, 1 to retry.",
+            "  cdcdcdcd / aaaaaaaa: delivered\n  cdcdcdcd / bbbbbbbb: throttled, not stored: bbbbbbbb refused it: busy. Try again in a minute.\n  cdcdcdcd / cccccccc: not stored: The message could not be sent: slow. Try again in a minute\nBulletin {}: 1 delivered, 0 store-and-forward, 0 unreachable, 0 refused, 1 throttled, 1 to retry.",
             short(&"b1".repeat(16))
         );
         assert_eq!(text, expected);
@@ -19348,15 +19488,12 @@ mod tests {
         let text = render_broadcast(&outcome, ann).plain();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 7, "{text}");
-        assert_eq!(
-            lines[0],
-            format!("  Ann / {0} ({0}): delivered", "ab".repeat(4))
-        );
+        assert_eq!(lines[0], format!("  Ann / {0}: delivered", "ab".repeat(4)));
         assert!(
             lines
                 .iter()
                 .take(6)
-                .all(|line| line.starts_with("  Ann / abababab (abababab): ")),
+                .all(|line| line.starts_with("  Ann / abababab: ")),
             "every row is named by the namer, never by the name the peer announces: {text}"
         );
         assert!(lines[1].ends_with("store-and-forward"), "{text}");
@@ -19366,7 +19503,7 @@ mod tests {
         // `refused:` prefix in front of a line that already opens with the peer's name.
         assert!(
             lines[5].starts_with(&format!(
-                "  Ann / abababab (abababab): \"Bea\" (abababab) refused the request: it has not trusted this session ({}).",
+                "  Ann / abababab: refused the request: it has not trusted this session ({}).",
                 "0a".repeat(16)
             )),
             "{text}"
@@ -19407,7 +19544,10 @@ mod tests {
                 .render(CommandPrefix::Slash);
             let lines: Vec<&str> = text.lines().collect();
             assert!(
-                lines[0].starts_with(&format!("  .info Bea / .session (abababab): {refusal}")),
+                lines[0].starts_with(&format!(
+                    "  .info Bea / .session (abababab): {}",
+                    refusal.unnamed_text()
+                )),
                 "{text}"
             );
             assert!(
@@ -19415,7 +19555,10 @@ mod tests {
                 "{text}"
             );
             assert!(
-                lines[1].starts_with(&format!("  .info Bea / .session (abababab): {no_answer}")),
+                lines[1].starts_with(&format!(
+                    "  .info Bea / .session (abababab): {}",
+                    no_answer.unnamed_text()
+                )),
                 "{text}"
             );
             let nobody = BroadcastOutcome {
@@ -27888,7 +28031,7 @@ mod tests {
                     let out = stdout_lines()[before..].to_vec();
                     assert!(
                         out.contains(
-                            &"Sending your follow-up to Ann / abababab (abababab) over the mesh..."
+                            &"Sending your follow-up to Ann / abababab over the mesh..."
                                 .to_string()
                         ),
                         "{out:?}"
@@ -27962,7 +28105,7 @@ mod tests {
                         let out = stdout_lines()[before..].to_vec();
                         assert!(
                             out.contains(
-                                &"Sending your answer to Ann / abababab (abababab) over the mesh..."
+                                &"Sending your answer to Ann / abababab over the mesh..."
                                     .to_string()
                             ),
                             "{line}: {out:?}"
@@ -28038,15 +28181,13 @@ mod tests {
                         )
                         .unwrap();
                     let inbound_header = format!(
-                        "awaiting your answer . {} / {} ({}) . asked ",
+                        "awaiting your answer . {} / {} . asked ",
                         short(&"ef".repeat(16)),
-                        short(&asker_peer),
                         short(&asker_peer)
                     );
                     let outbound_header = format!(
-                        "open . {} / {} ({}) . sent ",
+                        "open . {} / {} . sent ",
                         short(&"cd".repeat(16)),
-                        short(&asked_peer),
                         short(&asked_peer)
                     );
 
@@ -28238,15 +28379,13 @@ mod tests {
                         )
                         .unwrap();
                     let inbound_header = format!(
-                        "awaiting your answer . {} / {} ({}) . asked ",
+                        "awaiting your answer . {} / {} . asked ",
                         short(&"ef".repeat(16)),
-                        short(&asker_peer),
                         short(&asker_peer)
                     );
                     let outbound_header = format!(
-                        "open . {} / {} ({}) . sent ",
+                        "open . {} / {} . sent ",
                         short(&"cd".repeat(16)),
-                        short(&asked_peer),
                         short(&asked_peer)
                     );
 
@@ -28437,9 +28576,8 @@ mod tests {
                     let header = out[access_title + 1];
                     assert!(
                         header.starts_with(&format!(
-                            "  1. {} / {} ({}) asked ",
+                            "  1. {} / {} asked ",
                             short(&"ef".repeat(16)),
-                            short(&asker_peer),
                             short(&asker_peer)
                         )),
                         "an unheard peer is named by its short destination: {text}"
@@ -29370,7 +29508,7 @@ mod tests {
                         .unwrap();
                     assert!(
                         out.contains(&format!(
-                            "This sends your text to Tia / {0} ({0}, trust: trusted)",
+                            "This sends your text to Tia / {0} (trust: trusted)",
                             short(&destination)
                         )),
                         "{out}"
@@ -37361,7 +37499,7 @@ mod tests {
                     .to_string();
                     assert!(
                         err.starts_with(
-                            "The peer is unreachable and no propagation node is known yet to hold the message for it."
+                            "That session is unreachable and no propagation node is known yet to hold the message for it."
                         ),
                         "{err}"
                     );
@@ -37374,7 +37512,7 @@ mod tests {
                     .to_string();
                     assert!(
                         err.contains(
-                            "The peer is unreachable and no propagation node is known yet to hold the access request for it."
+                            "That session is unreachable and no propagation node is known yet to hold the access request for it."
                         ),
                         "{err}"
                     );
@@ -37547,7 +37685,7 @@ mod tests {
                     .unwrap();
                     timings.push((".mesh messaging send", started_at.elapsed()));
                     assert!(
-                        out.contains(&format!(" to Tia / {0} ({0}): ", short(&peer))),
+                        out.contains(&format!(" to Tia / {0}: ", short(&peer))),
                         "{out}"
                     );
                     assert!(
@@ -38281,11 +38419,11 @@ mod tests {
 
                     let lines: Vec<&str> = out.lines().collect();
                     assert!(
-                        lines.contains(&format!("  Bea / {bea_d8} ({bea_d8}): delivered").as_str()),
+                        lines.contains(&format!("  Bea / {bea_d8}: delivered").as_str()),
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                        "  Cee / {cee_d8}: refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
@@ -40462,11 +40600,7 @@ mod tests {
             }
 
             fn sending(fx: &PeerFixture) -> String {
-                format!(
-                    "Sending your answer to {} ({}) over the mesh...",
-                    fx.who(),
-                    fx.dest()
-                )
+                format!("Sending your answer to {} over the mesh...", fx.who())
             }
 
             mod share_verbs {
@@ -50487,10 +50621,8 @@ mod tests {
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-one").await;
                         fx.file("p1", InboundKind::Question, &[]);
                         fx.file("p2", InboundKind::Question, &[]);
-                        let header_head = format!(
-                            "awaiting your answer . Stub / {0} ({0}) . asked ",
-                            fx.dest()
-                        );
+                        let header_head =
+                            format!("awaiting your answer . Stub / {0} . asked ", fx.dest());
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss p1").await.unwrap();
 
@@ -50645,8 +50777,7 @@ mod tests {
                         fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
                         ask_stub(&fx, "q1");
                         let dest = fx.dest();
-                        let row =
-                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let row = |id: &str| format!("  {id} . Stub / {dest} . asked 0s ago");
 
                         let script = prompt_script::install(&[]);
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --dry-run")
@@ -50726,8 +50857,7 @@ mod tests {
                         fx.file("acc-1", InboundKind::Access, &["src/x.rs"]);
                         ask_stub(&fx, "q1");
                         let dest = fx.dest();
-                        let row =
-                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let row = |id: &str| format!("  {id} . Stub / {dest} . asked 0s ago");
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --yes")
                             .await
@@ -50809,8 +50939,7 @@ mod tests {
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
                         let dest = fx.dest();
-                        let row =
-                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let row = |id: &str| format!("  {id} . Stub / {dest} . asked 0s ago");
 
                         let out = out_of(&mut fx.ctx, ".mesh envoy dismiss --all --silent --yes")
                             .await
@@ -50863,7 +50992,7 @@ mod tests {
                         assert_eq!(
                             with_ages_zeroed(&out),
                             [
-                                format!("  {id} . Stub / {dest8} ({dest8}) . asked 0s ago"),
+                                format!("  {id} . Stub / {dest8} . asked 0s ago"),
                                 format!(
                                     "`{id}` is being answered by the envoy right now; wait for its hold to lapse, then .mesh envoy dismiss {id}."
                                 ),
@@ -50952,14 +51081,8 @@ mod tests {
 
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(lines.len(), 6, "{out}");
-                        assert_eq!(
-                            lines[0],
-                            format!("  p1 . Stub / {dest8} ({dest8}) . asked 0s ago")
-                        );
-                        assert_eq!(
-                            lines[1],
-                            format!("  s1 . {stranger_who} ({stranger8}) . asked 0s ago")
-                        );
+                        assert_eq!(lines[0], format!("  p1 . Stub / {dest8} . asked 0s ago"));
+                        assert_eq!(lines[1], format!("  s1 . {stranger_who} . asked 0s ago"));
                         assert_eq!(
                             lines[2],
                             "Telling 2 askers that you declined over the mesh..."
@@ -51034,10 +51157,7 @@ mod tests {
                             .unwrap();
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(lines.len(), 5, "{out}");
-                        assert_eq!(
-                            lines[0],
-                            format!("  w1 . {stranger_who} ({stranger8}) . asked 0s ago")
-                        );
+                        assert_eq!(lines[0], format!("  w1 . {stranger_who} . asked 0s ago"));
                         assert_eq!(
                             lines[1],
                             "Telling 1 asker that you declined over the mesh..."
@@ -51139,7 +51259,7 @@ mod tests {
                         let block: Vec<&str> = printed[0].lines().collect();
                         assert!(
                             block[0].starts_with(&format!(
-                                "awaiting your answer . {stranger_who} ({stranger8}) . asked "
+                                "awaiting your answer . {stranger_who} . asked "
                             )) && block[0].ends_with(" . id s1 . expires in 6d"),
                             "{printed:?}"
                         );
@@ -51225,9 +51345,9 @@ mod tests {
                         assert_eq!(
                             &lines[..5],
                             [
-                                format!("  p2 . Stub / {dest8} ({dest8}) . asked 0s ago"),
-                                format!("  s1 . {stranger_who} ({stranger8}) . asked 0s ago"),
-                                format!("  p1 . Stub / {dest8} ({dest8}) . asked 0s ago"),
+                                format!("  p2 . Stub / {dest8} . asked 0s ago"),
+                                format!("  s1 . {stranger_who} . asked 0s ago"),
+                                format!("  p1 . Stub / {dest8} . asked 0s ago"),
                                 "Telling 3 askers that you declined over the mesh...".to_string(),
                                 String::new(),
                             ]
@@ -51285,10 +51405,7 @@ mod tests {
 
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(lines.len(), 3, "{out}");
-                        assert_eq!(
-                            lines[0],
-                            format!("  p1 . Stub / {dest8} ({dest8}) . asked 0s ago")
-                        );
+                        assert_eq!(lines[0], format!("  p1 . Stub / {dest8} . asked 0s ago"));
                         assert!(
                             lines[1].starts_with("Failed to write '")
                                 && lines[1].contains("Permission denied"),
@@ -51656,7 +51773,7 @@ mod tests {
 
                         assert_eq!(
                             *idle.0.lock(),
-                            [format!("you declined the question from {who} ({dest8})")],
+                            [format!("you declined the question from {who}")],
                             "one idle line, saying what the human did"
                         );
                         let heard = fx.stub.seen();
@@ -51799,10 +51916,8 @@ mod tests {
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-singular-race").await;
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         let dest = fx.dest();
-                        let row =
-                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
-                        let header_head =
-                            format!("awaiting your answer . Stub / {dest} ({dest}) . asked ");
+                        let row = |id: &str| format!("  {id} . Stub / {dest} . asked 0s ago");
+                        let header_head = format!("awaiting your answer . Stub / {dest} . asked ");
                         let race = |id: &str| {
                             format!(
                                 "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
@@ -52181,10 +52296,8 @@ mod tests {
                         let mut fx = PeerFixture::new("repl-mesh-dismiss-race-before-node").await;
                         let store = fx.ctx.app.mesh.inbound_store().unwrap();
                         let dest = fx.dest();
-                        let row =
-                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
-                        let header_head =
-                            format!("awaiting your answer . Stub / {dest} ({dest}) . asked ");
+                        let row = |id: &str| format!("  {id} . Stub / {dest} . asked 0s ago");
+                        let header_head = format!("awaiting your answer . Stub / {dest} . asked ");
                         let race = |id: &str| {
                             format!(
                                 "`{id}` was already closed by another process, so nothing more was done. .mesh envoy questions and .mesh files requests show what is still open."
@@ -52685,12 +52798,12 @@ mod tests {
                         assert_eq!(lines.len(), 6, "{out}");
                         assert_eq!(
                             lines[0],
-                            format!("  {told_id} . Stub / {dest8} ({dest8}) . asked 0s ago"),
+                            format!("  {told_id} . Stub / {dest8} . asked 0s ago"),
                             "the rows carry the full id: {out}"
                         );
                         assert_eq!(
                             lines[1],
-                            format!("  {stayed_id} . {stranger_who} ({stranger8}) . asked 0s ago"),
+                            format!("  {stayed_id} . {stranger_who} . asked 0s ago"),
                             "{out}"
                         );
                         assert!(
@@ -52771,7 +52884,7 @@ mod tests {
                         let lines = with_ages_zeroed(&out);
                         assert_eq!(
                             lines[0],
-                            format!("  {kept_id} . Stub / {dest8} ({dest8}) . asked 0s ago"),
+                            format!("  {kept_id} . Stub / {dest8} . asked 0s ago"),
                             "{out}"
                         );
                         assert!(
@@ -52868,7 +52981,7 @@ mod tests {
                         assert_eq!(printed.len(), 3, "{printed:?}");
                         assert!(
                             printed[0].lines().next().unwrap().starts_with(&format!(
-                                "awaiting your answer . Stub / {dest8} ({dest8}) . asked "
+                                "awaiting your answer . Stub / {dest8} . asked "
                             )),
                             "{printed:?}"
                         );
@@ -52952,10 +53065,7 @@ mod tests {
                         assert_eq!(fx.heard(), HUMAN_DECLINED);
                         assert_eq!(
                             idle.0.lock().clone(),
-                            [format!(
-                                "you declined the question from {} ({dest8})",
-                                fx.who()
-                            )],
+                            [format!("you declined the question from {}", fx.who())],
                             "one idle line, once the asker heard"
                         );
                         assert_eq!(
@@ -53018,8 +53128,7 @@ mod tests {
                             "old-q is planted and unswept"
                         );
                         let dest = fx.dest();
-                        let row =
-                            |id: &str| format!("  {id} . Stub / {dest} ({dest}) . asked 0s ago");
+                        let row = |id: &str| format!("  {id} . Stub / {dest} . asked 0s ago");
                         let expiry = format!(
                             "question old-q from Stub / {} expired unanswered",
                             fx.dest()
@@ -53104,7 +53213,7 @@ mod tests {
                                     "question old-r from Stub / {} expired unanswered",
                                     fx.dest()
                                 ),
-                                format!("you declined the question from {} ({dest})", fx.who()),
+                                format!("you declined the question from {}", fx.who()),
                             ],
                             "the expiry line comes before the dismissal's own line"
                         );
@@ -53200,12 +53309,7 @@ mod tests {
                 fn sent_line(fx: &PeerFixture) -> String {
                     let seen = fx.stub.seen();
                     assert_eq!(seen.len(), 1, "{seen:?}");
-                    format!(
-                        "Sent {} to {} ({}, via direct).",
-                        short(&seen[0].id),
-                        fx.who(),
-                        fx.dest()
-                    )
+                    format!("Sent {} to {} (via direct).", short(&seen[0].id), fx.who())
                 }
 
                 /// A root message opens a correlation under its own id, as a question
@@ -53249,7 +53353,7 @@ mod tests {
 
                         let listed = out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap();
                         let lines: Vec<&str> = listed.lines().collect();
-                        let head = format!("  1. -> {} ({}) ", fx.who(), fx.dest());
+                        let head = format!("  1. -> {} ", fx.who());
                         let entry = lines
                             .iter()
                             .position(|line| {
@@ -53387,18 +53491,13 @@ mod tests {
                         assert_eq!(
                             lines,
                             [
-                                format!(
-                                    "Sending your follow-up to {} ({}) over the mesh...",
-                                    fx.who(),
-                                    fx.dest()
-                                )
+                                format!("Sending your follow-up to {} over the mesh...", fx.who())
                                 .as_str(),
                                 "",
                                 format!(
-                                    "Sent {} to {} ({}) in thread {} (via direct); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
+                                    "Sent {} to {} in thread {} (via direct); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
                                     short(&follow_up),
                                     fx.who(),
-                                    fx.dest(),
                                     short(&id)
                                 )
                                 .as_str(),
@@ -53706,18 +53805,13 @@ mod tests {
                         assert_eq!(
                             lines,
                             [
-                                format!(
-                                    "Sending your follow-up to {} ({}) over the mesh...",
-                                    fx.who(),
-                                    fx.dest()
-                                ),
+                                format!("Sending your follow-up to {} over the mesh...", fx.who()),
                                 reference_line("big.bin", 1025, &to),
                                 String::new(),
                                 format!(
-                                    "Sent {} to {} ({}) as a reply to q1 (via direct).",
+                                    "Sent {} to {} as a reply to q1 (via direct).",
                                     short(&seen[0].id),
-                                    fx.who(),
-                                    fx.dest()
+                                    fx.who()
                                 ),
                             ],
                             "the block, the progress lines, an empty line, then the result: {out}"
@@ -54164,7 +54258,7 @@ mod tests {
                         let header = out.lines().next().unwrap_or_default();
                         assert!(
                             header.starts_with(&format!(
-                                "awaiting your answer . Stub / {0} ({0}) . asked ",
+                                "awaiting your answer . Stub / {0} . asked ",
                                 fx.dest()
                             )),
                             "the heard peer is named in the header: {out}"
@@ -55620,10 +55714,11 @@ mod tests {
                         short(&self.stub.destination_hex()).to_string()
                     }
 
-                    /// The session as the fetch lines name it, `<user> / <session> (<dest8>)`.
+                    /// The session as the fetch lines name it: `<user> / <session>`, its short
+                    /// hash after it unless the name ends on it, which this stub's does.
                     fn named(&self) -> String {
                         let to = self.stub.destination_hex();
-                        format!("{} ({})", self.started.runtime.who_at(&to), self.dest())
+                        self.started.runtime.who_at(&to).to_string()
                     }
 
                     fn fetching(&self, path: &str) -> String {
@@ -55773,6 +55868,104 @@ mod tests {
                             "`.mesh files list <session>` asks that session which files it shares with you; `--peer`, `--effective` and `--all` read your own share rules, so run them without the session, as in `.mesh files list --effective --peer <who>`. Nothing was listed."
                         );
                         assert_eq!(fx.heard().len(), 2, "the refusal asked nothing");
+
+                        fx.stop().await;
+                    });
+                }
+
+                /// `.mesh files list <session>` refuses a session you do not trust before
+                /// anything is asked, ending on the listing's own reason; a session that
+                /// serves no listing, and one whose answer cannot be read, each get their
+                /// own line; a path with a control character is dropped and the rest are
+                /// quoted as the session sent them; a page marker this Coyote does not pass
+                /// on says to narrow the listing instead.
+                #[test]
+                #[serial]
+                fn files_list_of_a_session_refuses_and_reads_every_answer_as_mesh_list_does() {
+                    use crate::mesh::test_support::LIST_PATH;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-files-list-answers");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-files-list-answers", false).await;
+                        let to = fx.stub.destination_hex();
+                        let who = fx.started.runtime.who_at(&to).to_string();
+                        let named = format!("{who}{}", hash_after(&who, &to));
+                        let d8 = short(&to).to_string();
+
+                        let not_served =
+                            refusal(&mut fx.ctx, &format!(".mesh files list {to}")).await;
+                        assert_eq!(
+                            not_served,
+                            format!(
+                                "{named} does not share files: it may run an older Coyote or have sharing off. Nothing was listed."
+                            )
+                        );
+
+                        fx.stub.serve(LIST_PATH, fx.script.clone());
+                        let entry = |path: &str| {
+                            Value::Map(vec![
+                                (Value::from("path"), Value::from(path)),
+                                (Value::from("size"), Value::from(3u64)),
+                                (Value::from("sha256"), Value::Binary(vec![0xab; 32])),
+                                (Value::from("mtime"), Value::F64(1_700_000_000.0)),
+                            ])
+                        };
+                        fx.script.replies.lock().push_back(Value::Map(vec![
+                            (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
+                            (
+                                Value::from("entries"),
+                                Value::Array(vec![
+                                    entry("docs/plain.md"),
+                                    entry("docs/bad\u{1b}[31m.md"),
+                                    entry("docs/with space.md"),
+                                ]),
+                            ),
+                            (Value::from("next"), Value::from("page two!")),
+                        ]));
+                        let out = out_of(&mut fx.ctx, &format!(".mesh files list {to}"))
+                            .await
+                            .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            &lines[2..],
+                            [
+                                format!("{named} shares 2 file(s) with you on this page:"),
+                                format!("  `docs/plain.md` . 3 bytes . sha256 {}", "ab".repeat(32)),
+                                format!(
+                                    "  `docs/with space.md` . 3 bytes . sha256 {}",
+                                    "ab".repeat(32)
+                                ),
+                                "More files remain, but the page marker that session sent is not one this Coyote passes on; narrow the listing with `--prefix <path>`.".to_string(),
+                                format!(
+                                    "`.mesh files fetch {d8} <path>` fetches one into your session's staging inbox."
+                                ),
+                            ],
+                            "{out}"
+                        );
+
+                        fx.script.replies.lock().push_back(Value::Map(vec![(
+                            Value::from("v"),
+                            Value::from(PEER_WIRE_VERSION),
+                        )]));
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh files list {to}")).await,
+                            format!(
+                                "{named} did not list its files: that session's reply could not be read: `entries`. Try `.mesh files list {d8}` again; if it repeats, that session may run a different Coyote."
+                            )
+                        );
+
+                        let heard = fx.heard().len();
+                        fx.started
+                            .runtime
+                            .trust()
+                            .untrust_destination(fx.ctx.app.mesh.as_ref(), &to, false)
+                            .unwrap();
+                        let untrusted =
+                            refusal(&mut fx.ctx, &format!(".mesh files list {to}")).await;
+                        assert!(untrusted.ends_with(LIST_REFUSAL_TAIL), "{untrusted}");
+                        assert_eq!(fx.heard().len(), heard, "nothing was asked");
 
                         fx.stop().await;
                     });

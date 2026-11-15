@@ -26,6 +26,26 @@ pub(crate) const UNNAMED: &str = "unnamed";
 /// The user part of every one of this node's owner's own sessions.
 pub(crate) const YOU: &str = "you";
 
+/// What follows a session's `<user> / <session>` name wherever a line names it: its short
+/// hash in parentheses, unless the name already ends on it, as a session with no name of
+/// its own does. The one rule every such line follows, so no line spells the hash twice.
+pub(crate) fn hash_after(who: &str, destination: &str) -> String {
+    let dest8 = short(destination);
+    let ends_on_hash = who
+        .to_ascii_lowercase()
+        .ends_with(&format!("/ {}", dest8.to_ascii_lowercase()));
+    if ends_on_hash {
+        String::new()
+    } else {
+        format!(" ({dest8})")
+    }
+}
+
+/// `who` with `hash_after` after it.
+pub(crate) fn with_hash(who: &str, destination: &str) -> String {
+    format!("{who}{}", hash_after(who, destination))
+}
+
 /// The two names `you` and `unnamed` stand for this node's owner and for a person with no
 /// name, so neither can be anyone's name.
 const RESERVED_NAMES: [&str; 2] = [YOU, UNNAMED];

@@ -339,7 +339,7 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
         lines.push(format!("session: {session}"));
     }
     if let Some(person_name) = &card.person_name {
-        lines.push(format!("person: {person_name}"));
+        lines.push(format!("user: {person_name}"));
     }
     lines.push(format!(
         "objective: {}",
@@ -660,11 +660,11 @@ impl fmt::Display for StatusError {
             ),
             Self::Malformed(reason) => write!(
                 f,
-                "The mesh peer's status card could not be read: {reason}. Try again; if it repeats, the peer may run a different Coyote"
+                "That session's status card could not be read: {reason}. Try again; if it repeats, that session may run a different Coyote"
             ),
             Self::UnsupportedVersion { found, supported } => write!(
                 f,
-                "The mesh peer's status card is a version {found} record but this Coyote reads version {supported}. Upgrade Coyote if the peer runs a newer Coyote."
+                "That session's status card is a version {found} record but this Coyote reads version {supported}. Upgrade Coyote if that session runs a newer Coyote."
             ),
         }
     }
@@ -2358,7 +2358,7 @@ mod tests {
         assert!(malformed.contains("status card"), "{malformed}");
         assert_eq!(
             malformed,
-            "The mesh peer's status card could not be read: `v` is 0. Try again; if it repeats, the peer may run a different Coyote"
+            "That session's status card could not be read: `v` is 0. Try again; if it repeats, that session may run a different Coyote"
         );
     }
 
