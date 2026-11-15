@@ -77,6 +77,10 @@ struct CadenceState {
     /// When a contact last skipped the interval of each destination, so it skips it once
     /// per interval at most.
     contact_skipped: HashMap<String, Instant>,
+    /// When each destination last contacted this node, so a refusal of an ask that went
+    /// out before the contact is known to be out of date: the contact came while the ask
+    /// was waiting for its answer and found no stop to lift.
+    contacted: HashMap<String, Instant>,
 }
 
 impl Default for CardCadence {
@@ -153,10 +157,8 @@ impl CardCadence {
                 self.clear_stop(&mut state, destination);
             }
             CardTrigger::Contacted => {
-                let skipped_lately = state
-                    .contact_skipped
-                    .get(destination)
-                    .is_some_and(|at| now.saturating_duration_since(*at) < CARD_FETCH_MIN_INTERVAL);
+                state.contacted.insert(destination.to_string(), now);
+                let skipped_lately = Self::skipped_lately(&state, destination, now);
                 if self.clear_stop(&mut state, destination) && !skipped_lately {
                     state.last_asked.remove(destination);
                     state.contact_skipped.insert(destination.to_string(), now);
@@ -178,13 +180,37 @@ impl CardCadence {
         true
     }
 
-    /// The session refused a status request: no background fetch asks it again until
-    /// `lift`, in this run or a later one.
-    pub(crate) fn refused(&self, destination: &str) {
+    fn skipped_lately(state: &CadenceState, destination: &str, now: Instant) -> bool {
+        state
+            .contact_skipped
+            .get(destination)
+            .is_some_and(|at| now.saturating_duration_since(*at) < CARD_FETCH_MIN_INTERVAL)
+    }
+
+    /// The session refused a status request or let it go unanswered: no background fetch
+    /// asks it again until `lift`, in this run or a later one. When the session contacted
+    /// this node after the background ask went out, the answer predates that contact and
+    /// no stop is set; the interval the ask took is given back instead, once per interval
+    /// as a contact's skip is, and `true` says the caller may ask again at once.
+    pub(crate) fn refused(&self, destination: &str) -> bool {
+        let now = self.now();
         let mut state = self.state.lock();
+        let contacted_since_asked = match (
+            state.contacted.get(destination),
+            state.last_asked.get(destination),
+        ) {
+            (Some(contacted), Some(asked)) => contacted > asked,
+            _ => false,
+        };
+        if contacted_since_asked && !Self::skipped_lately(&state, destination, now) {
+            state.last_asked.remove(destination);
+            state.contact_skipped.insert(destination.to_string(), now);
+            return true;
+        }
         if state.refused.insert(destination.to_string()) {
             self.save_refusals(&state);
         }
+        false
     }
 
     /// The trust on the session's side may have changed (it sent this node a message,
@@ -202,6 +228,7 @@ impl CardCadence {
         state.heard.remove(destination);
         state.last_asked.remove(destination);
         state.contact_skipped.remove(destination);
+        state.contacted.remove(destination);
         self.clear_stop(&mut state, destination);
     }
 
@@ -235,7 +262,7 @@ impl CardCadence {
         self.state.lock().last_asked.remove(destination);
     }
 
-    #[cfg(test)]
+    /// Whether the background fetch of `destination` is stopped.
     pub(crate) fn is_refused(&self, destination: &str) -> bool {
         self.state.lock().refused.contains(destination)
     }
@@ -383,7 +410,10 @@ impl MeshRuntime {
         }))
     }
 
-    async fn fetch_card_in_background(&self, destination: &str, trigger: CardTrigger) {
+    /// One background fetch. A refusal that came back after the session contacted this
+    /// node is out of date, so the session is asked once more as the contact would have
+    /// asked it.
+    async fn fetch_card_in_background(self: &Arc<Self>, destination: &str, trigger: CardTrigger) {
         let dest8 = short(destination);
         if !self.path_known(destination).await {
             debug!("Mesh background status card for {dest8} ({trigger:?}) skipped: no path");
@@ -397,7 +427,12 @@ impl MeshRuntime {
         };
         let route = Route::unasked(desc);
         let options = route.options(self.request_timeouts().raise(RequestOptions::default()));
-        let outcome = match self.fetch_status(&route.desc, options).await {
+        let result = self.fetch_status(&route.desc, options).await;
+        let stopped = matches!(
+            result,
+            Err(StatusError::NotTrustedByPeer(_) | StatusError::NoAnswer(_))
+        );
+        let outcome = match result {
             Ok(_) => "read",
             Err(StatusError::NotTrustedByPeer(_)) => "refused",
             Err(StatusError::NoAnswer(_)) => "not answered",
@@ -407,6 +442,12 @@ impl MeshRuntime {
             Err(StatusError::Transport(_)) => "not delivered",
         };
         debug!("Mesh background status card for {dest8} ({trigger:?}): {outcome}");
+        if stopped && !self.card_cadence().is_refused(destination) {
+            debug!(
+                "Mesh background status card for {dest8}: contacted while it was asked, asking again"
+            );
+            self.consider_card_fetch(destination, CardTrigger::Contacted);
+        }
     }
 }
 
@@ -537,6 +578,31 @@ mod tests {
         assert!(cadence.admit(D, CardTrigger::Contacted, false));
         cadence.refused(D);
         assert!(!cadence.admit(D, CardTrigger::Contacted, false));
+    }
+
+    /// A contact that comes while an ask is still waiting for its answer finds no stop to
+    /// lift and the interval taken; when that ask comes back refused, the refusal predates
+    /// the contact, so no stop is set and the session is asked again at once, once per
+    /// interval.
+    #[test]
+    fn a_contact_during_an_ask_outdates_its_refusal() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::OwnerGranted, false));
+        cadence.advance(Duration::from_secs(1));
+        assert!(!cadence.admit(D, CardTrigger::Contacted, false));
+        cadence.advance(Duration::from_secs(1));
+        assert!(cadence.refused(D), "the caller may ask again");
+        assert!(!cadence.is_refused(D));
+        assert!(cadence.admit(D, CardTrigger::Contacted, false));
+        cadence.advance(Duration::from_secs(1));
+        assert!(!cadence.admit(D, CardTrigger::Contacted, false));
+        cadence.advance(Duration::from_secs(1));
+        assert!(!cadence.refused(D), "the skip is spent for this interval");
+        assert!(cadence.is_refused(D));
+        assert!(
+            !cadence.refused(&"e".repeat(32)),
+            "an ask with no contact since stops"
+        );
     }
 
     #[test]

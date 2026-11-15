@@ -7230,7 +7230,6 @@ fn a_sent_messages_reply_lands_in_its_thread_and_closes_it_and_a_refused_send_op
     };
     let dest8 = heard(&mut mine, &carol8);
     let my_dest8 = heard(&mut theirs, &me8);
-    let who = format!("carol / {dest8}");
 
     let mut failures = Vec::new();
     let mut check = |ok: bool, what: &str, out: &str| {
@@ -7269,6 +7268,27 @@ fn a_sent_messages_reply_lands_in_its_thread_and_closes_it_and_a_refused_send_op
         &format!(".mesh access trust session {my_dest8} --yes"),
     );
     check(out.contains("Trusted "), "the other side trusts back", &out);
+
+    // Trusting back sends this session a status request, which lifts the stop that its
+    // refused card fetch left, so the other session's card arrives and names it.
+    let hashes = format!("{carol8} / {dest8}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let list = transcript_at(&mut mine, ".mesh people list", SESSION_PROMPT);
+        let named = all_table_rows(&list)
+            .into_iter()
+            .find(|row| row.last().is_some_and(|cell| *cell == hashes))
+            .and_then(|row| row.get(1).cloned());
+        if named.as_deref() == Some("probe") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the card never named the session that trusted back: {list}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+    let who = "carol / probe".to_string();
 
     let out = people_command(
         &mut mine,
