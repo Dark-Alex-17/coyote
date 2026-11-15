@@ -40,8 +40,8 @@ CI_NO_CHECKS_SECS = 300   # an empty check list must last this long into a watch
 POLL_VISIT_BUDGET = (1 + STRIKE_LIMIT + 1) * CI_MAX_ROUNDS
 ENGINE_VISIT_CAP = 1500   # mirrors graph.yaml settings.max_loop_iterations, the engine's per-node visit cap
 CI_PASS = ("pass", "success")
-CI_FAIL = ("fail", "failure")
-CI_PENDING = ("pending", "queued", "in_progress")
+CI_FAIL = ("fail", "failure", "error", "timed_out", "startup_failure", "action_required")
+CI_PENDING = ("pending", "queued", "in_progress", "expected", "waiting", "requested")
 CI_CANCELLED = ("cancel", "cancelled")
 CI_QUIET = ("skipping", "skipped", "neutral")
 GH_CALL_SECS = 90         # one gh subprocess call; node timeouts budget their sleep plus this per call
@@ -268,7 +268,7 @@ STATE_KEYS = (
     "gauntlet_lanes", "rejected_findings", "deferred_findings", "skipped_reviews",
     "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions", "autonomous_digest",
     "decisions", "follow_ups", "parked", "escalation", "coder_result", "git_report",
-    "ci_status", "anomalies_log",
+    "ci_status", "ci_rerun_ids", "anomalies_log",
 )
 
 

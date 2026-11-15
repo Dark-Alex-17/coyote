@@ -2399,20 +2399,29 @@ def apply_answer(state):
             _reask_unmatched(state, u, esc, answer)
         elif a == "rerun" and not stop:
             root = state.get("git_root") or state.get("project_dir") or "."
+            done = [str(r) for r in as_list(state.get("ci_rerun_ids"))]
             runs = {}
             for name, link in as_list(data.get("cancelled")):
-                if m := re.search(r"/actions/runs/(\d+)", link or ""):
-                    runs.setdefault(m.group(1), []).append(name)
-                else:
+                if not (m := re.search(r"/actions/runs/(\d+)", link or "")):
                     ledger(state, u, f"ci: cancelled check {name} names no run; not re-run")
+                elif m.group(1) in done:
+                    ledger(state, u, f"ci: cancelled run {m.group(1)} ({name}) was already re-run this run; not re-run")
+                else:
+                    runs.setdefault(m.group(1), []).append(name)
             for i, (run_id, names) in enumerate(runs.items()):
                 if i >= CI_LOG_RUNS_MAX:
                     ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) not re-run (CI_LOG_RUNS_MAX reached)")
-                elif _rerun_failed(root, run_id):
-                    ledger(state, u, f"ci: re-ran cancelled run {run_id} ({', '.join(names)})")
                 else:
-                    ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) re-run call failed")
+                    done.append(run_id)
+                    if _rerun_failed(root, run_id):
+                        ledger(state, u, f"ci: re-ran cancelled run {run_id} ({', '.join(names)})")
+                    else:
+                        ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) re-run call failed")
             _reset_ci_watch(u)
+            # a re-run run is never offered again, so a run that stays cancelled cannot loop a headless pick;
+            # ci_polls 1 makes the first re-poll sleep instead of reading the same cancelled state at once
+            u["ci_rerun_ids"] = done
+            u["ci_polls"] = 1
             u["_next"] = "ci_poll"
         elif a == "green" and not stop:
             reason = _stated_reason(answer, options)
@@ -2948,7 +2957,7 @@ def bookkeeping_scan(state):
             hits = u["debt_hits"] = DEBT_HITS_STALE
             ledger(state, u, "debt_scan: the node did not run this round; the previous round's report was discarded")
     if hits.startswith("DEBT_SCAN_FAILED"):
-        failures[scope] = hits.splitlines()[0].strip()
+        failures[scope] = hits.splitlines()[0].removeprefix("DEBT_SCAN_FAILED:").strip()
         # the reason is in debt_hits and the report; the crash text would read as a second discard here
         ledger(state, u, f"debt_scan: scan FAILED ({scope}); the diff was not scanned and the report lists the failure")
     else:
@@ -4093,7 +4102,7 @@ CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
 
 def _reset_ci_watch(u):
     u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": [],
-              "ci_green_by": ""})
+              "ci_green_by": "", "ci_rerun_ids": []})
 
 
 def _ci_poll_budget(state):
@@ -4201,6 +4210,9 @@ def _ci_unclear(state, u, status):
     checks = [(c[0], c[1], c[2]) for c in as_list(state.get("ci_checks"))]
     non_pass = [[n, b] for n, b, _ in checks if b not in CI_PASS]
     cancelled = [[n, link] for n, b, link in checks if b in CI_CANCELLED]
+    done = [str(r) for r in as_list(state.get("ci_rerun_ids"))]
+    rerunnable = [n for n, link in cancelled
+                  if (m := re.search(r"/actions/runs/(\d+)", link or "")) and m.group(1) not in done]
     evidence = "\n".join(f"{n}: {b}" for n, b, _ in checks) or "(the PR reports no CI checks)"
     leave = _ci_leave_option(state)
     prefix = ""
@@ -4217,11 +4229,11 @@ def _ci_unclear(state, u, status):
                  and all(b in CI_QUIET for _, b in non_pass))
         names = ", ".join(f"{n} ({b})" for n, b in non_pass)
         question = f"{prefix}CI finished without a pass on every check (non-pass: {names}). How to proceed?"
-        options = [option(CI_RERUN_CANCELLED if cancelled else CI_KEEP_WAITING, recommended=bool(cancelled),
-                          evidence=", ".join(n for n, _ in cancelled)),
+        options = [option(CI_RERUN_CANCELLED if rerunnable else CI_KEEP_WAITING, recommended=bool(rerunnable),
+                          evidence=", ".join(rerunnable)),
                    option(CI_TREAT_GREEN, recommended=quiet,
                           evidence="every non-pass check is skipped or neutral and at least one passed" if quiet else ""),
-                   option(leave, recommended=not cancelled and not quiet)]
+                   option(leave, recommended=not rerunnable and not quiet)]
     return raise_escalation(state, u, escalation(
         f"ci_{status}", question, options, evidence=evidence, hard_trigger=_watch_started(state),
         data={"non_pass": non_pass, "cancelled": cancelled}))
@@ -4977,6 +4989,7 @@ def _assemble_report(state, u, pre_publish=False):
     if g("observability_artifact"):
         lines += [g("observability_artifact"), ""]
     fus = list(as_list(g("follow_ups", []))) + list(as_list(g("deferred_findings", [])))
+    fus += [f"Re-run the debt scan for {scope}: {why}" for scope, why in as_dict(g("debt_scan_failures", {})).items()]
     if g("whetstone_note"):
         fus.append(g("whetstone_note"))
     lines += ["FOLLOW-UPS:"] + ([f"- {f}" for f in fus] or ["none"]) + [""]

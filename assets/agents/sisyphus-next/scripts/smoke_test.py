@@ -1221,6 +1221,9 @@ check("route_coder_result: REJECTED -> coder_rejected escalation", u["escalation
 u = gates.route_coder_result(base_state(coder_result="CODER_REJECTED", rejected_rounds=STRIKE_LIMIT))
 check("route_coder_result: B7 rejected bound -> coder_rejected_cap escalation, never end_blocked",
       u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "coder_rejected_cap")
+u = gates.route_coder_result(base_state(coder_result="CODER_REJECTED", rejected_rounds=STRIKE_LIMIT - 1))
+check("route_coder_result: the rejection that reaches STRIKE_LIMIT is still coder_rejected, not the cap",
+      u["escalation"]["kind"] == "coder_rejected" and u["rejected_rounds"] == STRIKE_LIMIT, u.get("escalation"))
 u = gates.compose_fix(base_state(fix_source="review", fix_items=["adversary: criterion 2 unmet"], fix_round=1))
 check("compose_fix: review items verbatim, round incremented", "criterion 2 unmet" in u["fix_instructions"] and u["fix_round"] == 2 and u["_next"] == "render_coder_prompt")
 open(os.path.join(REPO, "dirty.txt"), "w").write("x")
@@ -1554,6 +1557,14 @@ u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_c
 check("ci_poll: a check with a blank bucket and state is unknown -> inconclusive, never pending",
       u.get("ci_status") == "inconclusive" and u.get("_next") == "ci_route"
       and ["mystery", "unknown", ""] in [list(c) for c in u.get("ci_checks", [])], u)
+_states = {s: "red" if s in ("error", "timed_out", "startup_failure", "action_required") else "pending"
+           for s in ("error", "timed_out", "startup_failure", "action_required", "expected", "waiting", "requested")}
+_seen = {}
+for _s in _states:
+    os.environ["SISYPHUS_GH_CHECKS_CMD"] = "echo '" + json.dumps([{"name": "c", "bucket": "", "state": _s.upper()}]) + "'"
+    _seen[_s] = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci)).get("ci_status")
+check("ci_poll: a blank-bucket check falls back to its state: error-like states read red, waiting-like states pending",
+      _seen == _states, _seen)
 u = gates.apply_answer(base_state(escalation=_esc_none, last_answer=gates.CI_NO_CI, ci_status="no_checks"))
 _task = u.get("git_task") or {}
 check("apply: ci_no_checks headless pick -> the flip-to-ready path with a CI-never-ran follow-up, never ci_status green",
@@ -1574,9 +1585,28 @@ os.environ["SISYPHUS_GH_RERUN_CMD"] = f"echo \"$SISYPHUS_RUN_ID\" >> '{_rerun_lo
 u = gates.apply_answer(base_state(escalation=_esc_cancel, last_answer=gates.CI_RERUN_CANCELLED, ci_polls=7, ci_poll_fails=2))
 os.environ.pop("SISYPHUS_GH_RERUN_CMD")
 check("apply: ci_inconclusive re-run cancelled -> the cancelled run re-run and ledgered, a fresh watch",
-      u.get("_next") == "ci_poll" and u.get("ci_polls") == 0 and u.get("ci_poll_fails") == 0 and u.get("ci_status") == ""
+      u.get("_next") == "ci_poll" and u.get("ci_polls") == 1 and u.get("ci_poll_fails") == 0 and u.get("ci_status") == ""
+      and u.get("ci_rerun_ids") == ["41"]
       and os.path.exists(_rerun_log) and open(_rerun_log).read().split() == ["41"]
       and "ci: re-ran cancelled run 41 (lint)" in u.get("decisions", []), u)
+_sleeps = []
+_real_sleep = gates.time.sleep
+gates.time.sleep = _sleeps.append
+set_checks(("build", "pass", ""), ("lint", "cancel", _cancel_link))
+_u2 = gates.ci_poll(base_state(**{**u, "git_report": "pull/5"}))
+gates.time.sleep = _real_sleep
+check("ci_poll: the first re-poll after a re-run answer sleeps before reading the checks",
+      len(_sleeps) == 1 and _u2.get("ci_polls") == 2, (_sleeps, _u2))
+_esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=_u2.get("ci_checks", []),
+                                 ci_rerun_ids=u.get("ci_rerun_ids"))).get("escalation", {})
+check("ci_route: a cancelled run already re-run this run -> re-run not offered, leaving the PR in draft recommended",
+      opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
+_esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=[["build", "pass", ""], ["lint", "cancel", ""]])).get("escalation", {})
+check("ci_route: a cancelled check naming no run -> re-run not offered, leaving the PR in draft recommended",
+      opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
+_u2 = {}
+gates._reset_ci_watch(_u2)
+check("ci: a fresh watch forgets the runs re-run in the previous one", _u2.get("ci_rerun_ids") == [], _u2)
 u = gates.apply_answer(base_state(escalation=_esc_cancel, last_answer=_LEAVE, ci_status="inconclusive"))
 check("apply: ci_inconclusive leave -> final_report with the non-pass checks in the follow-up",
       u.get("_next") == "final_report" and u.get("follow_ups") == ["PR left in draft with CI inconclusive: lint (cancel)"], u)
@@ -4281,22 +4311,24 @@ _subs = [{"title": "a"}, {"title": "b"}]
 u = gates.bookkeeping_scan(base_state(debt_hits="DEBT_SCAN_FAILED: rg exited 2\nstderr follows", subtasks=_subs, task_number=2))
 _r = gates.final_report(base_state(**u))["report"]
 check("debt: a scanner failure is recorded for its subtask, ledgered, and the report names it instead of none",
-      u.get("debt_scan_failures") == {"subtask 2": "DEBT_SCAN_FAILED: rg exited 2"}
+      u.get("debt_scan_failures") == {"subtask 2": "rg exited 2"}
       and any("scan FAILED (subtask 2)" in d for d in u["decisions"])
-      and "- debt scan FAILED (subtask 2): DEBT_SCAN_FAILED: rg exited 2; the diff was not scanned" in _r
+      and "Debt left behind:\n- debt scan FAILED (subtask 2): rg exited 2; the diff was not scanned" in _r
+      and "- Re-run the debt scan for subtask 2: rg exited 2" in _r.split("FOLLOW-UPS:", 1)[-1]
       and "Debt left behind:\n- none" not in _r, (u.get("debt_scan_failures"), _r[-800:]))
 u = gates.bookkeeping_scan(base_state(debt_hits="src/b.rs:3 -- todo!()\n", last_script_error="script 'debt_scan' failed: boom",
-                                      final_review=True, debt_scan_failures={"subtask 2": "DEBT_SCAN_FAILED: rg exited 2"}))
+                                      final_review=True, debt_scan_failures={"subtask 2": "rg exited 2"}))
 _r = gates.final_report(base_state(**u))["report"]
 check("debt: a scan crash in the final review is recorded under final review and keeps the subtask failure",
-      u.get("debt_scan_failures") == {"subtask 2": "DEBT_SCAN_FAILED: rg exited 2",
-                                      "final review": gates.DEBT_HITS_STALE.splitlines()[0]}
-      and "- debt scan FAILED (final review): DEBT_SCAN_FAILED: the debt_scan node did not run" in _r
+      u.get("debt_scan_failures") == {"subtask 2": "rg exited 2",
+                                      "final review": gates.DEBT_HITS_STALE.splitlines()[0].removeprefix("DEBT_SCAN_FAILED: ")}
+      and "- debt scan FAILED (final review): the debt_scan node did not run" in _r
+      and "- Re-run the debt scan for final review: the debt_scan node did not run" in _r.split("FOLLOW-UPS:", 1)[-1]
       and "Debt left behind:\n- none" not in _r, (u.get("debt_scan_failures"), _r[-800:]))
 u = gates.bookkeeping_scan(base_state(debt_hits="", subtasks=_subs, task_number=2, debt_scan_failures=u["debt_scan_failures"]))
 check("debt: a later clean scan of the same subtask clears its failure and leaves the other scope's",
       list(u.get("debt_scan_failures", {})) == ["final review"], u.get("debt_scan_failures"))
-u = gates.bookkeeping_scan(base_state(debt_hits="", debt_scan_failures={"task": "DEBT_SCAN_FAILED: x"}))
+u = gates.bookkeeping_scan(base_state(debt_hits="", debt_scan_failures={"task": "x"}))
 _r = gates.final_report(base_state(**u))["report"]
 check("debt: a clean scan of a task without subtasks clears its failure and the report reads none",
       u.get("debt_scan_failures") == {} and "Debt left behind:\n- none" in _r, _r[-800:])

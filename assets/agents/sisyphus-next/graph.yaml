@@ -1123,7 +1123,9 @@ nodes:
   escalate_gate:
     id: escalate_gate
     type: script
-    description: Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder.
+    description: >-
+      Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder;
+      a malformed escalation (missing, not an object, no kind or a blank question) -> end_blocked.
     script: scripts/escalate_gate.py
     fallback: end_failure
 
@@ -1235,7 +1237,8 @@ nodes:
     type: script
     description: >-
       Tier 4. Parks the run (A14) and picks the terminal prompt; away/unattended
-      top-level runs go through ask_owner first when the fork provides it.
+      top-level runs go through ask_owner first when the fork provides it; a
+      malformed escalation -> end_blocked instead of a prompt.
     script: scripts/ask_dispatch.py
     fallback: end_failure
 
@@ -1365,7 +1368,7 @@ nodes:
       names no option goes to interpret_reply; after that, unparseable re-asks (B14)
       then the free text stands, except that an empty reply to a multiple-choice
       prompt takes the recommended option; clears the parked marker; ledgers the
-      decision.
+      decision; a malformed escalation -> end_blocked.
     script: scripts/parse_answer.py
     fallback: end_failure
 
@@ -1631,7 +1634,10 @@ nodes:
   route_coder_result:
     id: route_coder_result
     type: script
-    description: Sentinel switch + the 3-strike rule (B5) + CODER_REJECTED rounds (B7); a crashed verification gate is an engine fault to surface.
+    description: >-
+      Sentinel switch + the 3-strike rule (B5) + CODER_REJECTED rounds (B7), past STRIKE_LIMIT a
+      coder_rejected_cap escalation (Stop recommended after FIX_ROUND_CEILING cap resets); a crashed
+      verification gate is an engine fault to surface.
     script: scripts/route_coder_result.py
     fallback: end_failure
 
@@ -2119,7 +2125,10 @@ nodes:
   ci_poll:
     id: ci_poll
     type: script
-    description: Bounded self-loop over gh pr checks (pr-watch poll precedent; wall clock B15).
+    description: >-
+      Bounded self-loop over gh pr checks (pr-watch poll precedent; wall clock B15): CI_MAX_ROUNDS
+      visits per watch, POLL_VISIT_BUDGET visits per run, and an empty check list reads no_checks
+      only after CI_NO_CHECKS_SECS of the watch.
     script: scripts/ci_poll.py
     # CI_POLL_SLEEP (60) + one GH_CALL_SECS read (90) + 30 margin
     timeout: 180
@@ -2128,7 +2137,10 @@ nodes:
   ci_route:
     id: ci_route
     type: script
-    description: green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack.
+    description: >-
+      green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack;
+      inconclusive or no_checks -> escalate with every check and its bucket; poll_cap -> escalate
+      with the polls used against the poll budget.
     script: scripts/ci_route.py
     # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin
     timeout: 300
