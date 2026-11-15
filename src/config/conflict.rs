@@ -255,9 +255,9 @@ pub(crate) mod prompt_script {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompt::{
-        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
-    };
+    #[cfg(unix)]
+    use crate::prompt::{HeadlessPrompter, NeedsHuman};
+    use crate::prompt::{PromptAction, PromptAnswer, ScriptedPrompter};
     use prompt_script::Scripted;
     use serial_test::serial;
     use std::path::PathBuf;
