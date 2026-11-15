@@ -3,7 +3,7 @@ use crate::config::RequestContext;
 use crate::hooks::{self, HookEvent};
 use crate::prompt::{NeedsHuman, PromptAction, PromptAnswer, PromptRequest, headless_reply};
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
-use crate::utils::{ACP_SERVER, HEADLESS, queue_acp_permission};
+use crate::utils::{ACP_SERVER, AbortSignal, HEADLESS, queue_acp_permission, wait_abort_signal};
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -322,37 +322,57 @@ async fn handle_escalated(ctx: &RequestContext, action: UserAction, args: &Value
         None,
     );
 
-    await_escalation_reply(rx, timeout_secs).await
+    await_escalation_reply(rx, timeout_secs, ctx.task_abort.clone()).await
 }
 
 /// Waits for the parent's reply. `timeout_secs == 0` waits indefinitely; a
 /// dropped sender (the parent cancelled the request) resolves either way.
-/// Both fallback arms resolve without touching the escalation queue, so
-/// neither fires an escalation event: the request was never answered.
-async fn await_escalation_reply(rx: oneshot::Receiver<String>, timeout_secs: u64) -> Result<Value> {
-    let reply = if timeout_secs == 0 {
-        rx.await
-    } else {
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-            Ok(reply) => reply,
-            Err(_) => {
-                return Ok(json!({
-                    "error": format!(
-                        "Escalation timed out after {timeout_secs} seconds waiting for user response"
-                    ),
-                    "fallback": "Make your best judgment and proceed",
-                }));
-            }
+/// So does `abort` (the asking agent's own signal) being set: the receiver
+/// is dropped with the wait, which takes the question off the queue's
+/// pending list. The fallback arms resolve without touching the escalation
+/// queue, so none fires an escalation event: the request was never answered.
+async fn await_escalation_reply(
+    rx: oneshot::Receiver<String>,
+    timeout_secs: u64,
+    abort: Option<AbortSignal>,
+) -> Result<Value> {
+    let reply = async {
+        if timeout_secs == 0 {
+            Some(rx.await)
+        } else {
+            tokio::time::timeout(Duration::from_secs(timeout_secs), rx)
+                .await
+                .ok()
         }
+    };
+    let aborted = async {
+        match abort.as_ref() {
+            Some(abort) => wait_abort_signal(abort).await,
+            None => std::future::pending().await,
+        }
+    };
+    let reply = tokio::select! {
+        reply = reply => reply,
+        () = aborted => return Ok(escalation_cancelled()),
     };
 
     match reply {
-        Ok(reply) => Ok(json!({ "answer": reply })),
-        Err(_) => Ok(json!({
-            "error": "Escalation was cancelled. The parent agent dropped the request",
+        Some(Ok(reply)) => Ok(json!({ "answer": reply })),
+        Some(Err(_)) => Ok(escalation_cancelled()),
+        None => Ok(json!({
+            "error": format!(
+                "Escalation timed out after {timeout_secs} seconds waiting for user response"
+            ),
             "fallback": "Make your best judgment and proceed",
         })),
     }
+}
+
+fn escalation_cancelled() -> Value {
+    json!({
+        "error": "Escalation was cancelled. The parent agent dropped the request",
+        "fallback": "Make your best judgment and proceed",
+    })
 }
 
 fn parse_options(args: &Value) -> Result<Vec<String>> {
@@ -932,7 +952,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn zero_timeout_waits_indefinitely_for_the_reply() {
         let (tx, rx) = oneshot::channel();
-        let wait = tokio::spawn(await_escalation_reply(rx, 0));
+        let wait = tokio::spawn(await_escalation_reply(rx, 0, None));
 
         tokio::time::advance(Duration::from_secs(3600)).await;
         assert!(!wait.is_finished());
@@ -945,7 +965,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nonzero_timeout_still_expires_with_the_existing_message() {
         let (tx, rx) = oneshot::channel::<String>();
-        let wait = tokio::spawn(await_escalation_reply(rx, 5));
+        let wait = tokio::spawn(await_escalation_reply(rx, 5, None));
         tokio::task::yield_now().await;
 
         tokio::time::advance(Duration::from_secs(4)).await;
@@ -966,7 +986,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<String>();
         drop(tx);
 
-        let v = tokio::time::timeout(Duration::from_secs(1), await_escalation_reply(rx, 0))
+        let v = tokio::time::timeout(Duration::from_secs(1), await_escalation_reply(rx, 0, None))
             .await
             .expect("the wait must complete once the sender is gone")
             .unwrap();
@@ -978,6 +998,44 @@ mod tests {
             "{v}"
         );
         assert_eq!(v["fallback"], "Make your best judgment and proceed");
+    }
+
+    /// A cancelled asker stops waiting: the wait returns the cancelled
+    /// outcome and drops its receiver, so the queue no longer lists the
+    /// question.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_when_the_askers_signal_is_set() {
+        let queue = EscalationQueue::new();
+        let (reply_tx, rx) = oneshot::channel::<String>();
+        queue.submit(EscalationRequest {
+            id: "esc_ab1".to_string(),
+            from_agent_id: "agent_ab1".to_string(),
+            from_agent_name: "asker".to_string(),
+            question: "[confirm] Still there?".to_string(),
+            options: None,
+            reply_tx,
+        });
+        let abort = crate::utils::create_abort_signal();
+        let wait = tokio::spawn(await_escalation_reply(rx, 0, Some(abort.clone())));
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!wait.is_finished());
+        assert_eq!(queue.pending().len(), 1);
+
+        abort.set_ctrlc();
+        let v = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("the wait must end once the asker's signal is set")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "error": "Escalation was cancelled. The parent agent dropped the request",
+                "fallback": "Make your best judgment and proceed",
+            })
+        );
+        assert!(queue.pending().is_empty());
     }
 
     #[test]

@@ -11563,4 +11563,121 @@ mod tests {
             "the new event stream was opened while the old one still held stdin"
         );
     }
+
+    fn escalate_as(
+        queue: &crate::supervisor::escalation::EscalationQueue,
+        id: &str,
+        question: &str,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        queue.submit(crate::supervisor::escalation::EscalationRequest {
+            id: id.to_string(),
+            from_agent_id: format!("agent-{id}"),
+            from_agent_name: "reviewer".to_string(),
+            question: question.to_string(),
+            options: None,
+            reply_tx,
+        });
+        reply_rx
+    }
+
+    fn last_warning(harness: &Harness) -> Option<String> {
+        harness
+            .app
+            .transcript
+            .cells()
+            .iter()
+            .rev()
+            .find_map(|cell| match cell {
+                Cell::Notice {
+                    kind: NoticeKind::ToolWarning,
+                    text,
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+    }
+
+    /// The UI repaints every frame, so an asker that stops waiting while
+    /// its question is open in the modal is usually seen by a repaint
+    /// before the answer is given. The answer must still say the reply
+    /// was not delivered, not that it was already given.
+    #[test]
+    #[serial]
+    fn an_answer_after_a_repaint_saw_the_asker_go_says_not_delivered() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let reply = escalate_as(&queue, "esc_p1d", "Which tag? p1d");
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press(KeyCode::F(3));
+        harness.draw();
+        harness.press(KeyCode::Enter);
+        harness.draw();
+        drop(reply);
+        harness.draw();
+        harness.draw();
+        harness.type_text("v1");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Enter);
+        harness.draw();
+        let warning = last_warning(&harness);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|text| text.contains("not delivered")),
+            "{warning:?}"
+        );
+    }
+
+    /// Of two questions, the one whose asker is gone has no row; the
+    /// live one is listed and Enter answers that one.
+    #[test]
+    #[serial]
+    fn only_the_live_question_is_listed_and_answered() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let dead = escalate_as(&queue, "esc_d2d", "Dead asks d2d");
+        let mut live = escalate_as(&queue, "esc_l2l", "Live asks l2l");
+        drop(dead);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press(KeyCode::F(3));
+        let frame = harness.draw();
+        assert!(frame.contains("Live asks l2l"), "{frame}");
+        assert!(!frame.contains("d2d"), "{frame}");
+        harness.press(KeyCode::Enter);
+        harness.type_text("ok");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Enter);
+        assert_eq!(live.try_recv().as_deref(), Ok("ok"));
+        assert!(!queue.has_pending());
+        assert!(queue.pending_summary().is_empty());
+    }
+
+    /// A focused question whose asker goes takes the focus with it: the
+    /// row the focus would slide onto by index is not acted on.
+    #[test]
+    #[serial]
+    fn a_focused_question_that_dies_clears_the_focus_not_slides_it() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        let first = escalate_as(&queue, "esc_a3a", "First asks a3a");
+        harness.press(KeyCode::F(3));
+        harness.draw();
+        let mut second = escalate_as(&queue, "esc_b3b", "Second asks b3b");
+        let frame = harness.draw();
+        assert!(frame.contains("a3a") && frame.contains("b3b"), "{frame}");
+        drop(first);
+        let frame = harness.draw();
+        assert!(!frame.contains("a3a"), "{frame}");
+        harness.press(KeyCode::Enter);
+        assert!(
+            harness.app.prompts.is_empty(),
+            "Enter acted on a row the user never picked"
+        );
+        assert!(second.try_recv().is_err());
+    }
 }

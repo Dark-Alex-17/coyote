@@ -46,6 +46,14 @@ impl EscalationQueue {
         self.pending.lock().remove(escalation_id)
     }
 
+    /// Withdraws every question asked by one of `agent_ids`, for askers
+    /// that are being cancelled and will never read an answer.
+    pub fn remove_for_agents(&self, agent_ids: &[&str]) {
+        self.pending
+            .lock()
+            .retain(|_, r| !agent_ids.contains(&r.from_agent_id.as_str()));
+    }
+
     /// Requests whose asker has stopped waiting are dropped here, so no
     /// caller offers a question nobody can receive the answer to.
     pub fn pending(&self) -> Vec<PendingEscalation> {
@@ -277,6 +285,22 @@ mod tests {
         assert_eq!(queue.pending_summary().len(), 1);
         assert!(queue.take("esc_gone").is_none());
         assert!(queue.has_pending());
+    }
+
+    #[test]
+    fn remove_for_agents_withdraws_only_the_named_askers_questions() {
+        let queue = EscalationQueue::new();
+        let (first, _first_rx) = make_request("esc_c1", "agent_c", "First?");
+        queue.submit(first);
+        let (second, _second_rx) = make_request("esc_c2", "agent_c", "Second?");
+        queue.submit(second);
+        let (other, _other_rx) = make_request("esc_o", "agent_o", "Other?");
+        queue.submit(other);
+
+        queue.remove_for_agents(&["agent_c", "agent_gone"]);
+
+        let ids: Vec<String> = queue.pending().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["esc_o"]);
     }
 
     #[test]

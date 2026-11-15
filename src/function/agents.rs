@@ -2140,6 +2140,11 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             }
             let was_running = !handle.join_handle.is_finished();
             handle.abort_signal.set_ctrlc();
+            // Descendants' questions go when their own waits see the abort;
+            // this one goes now so the roster drops it before the cleanup wait.
+            if let Some(queue) = ctx.root_escalation_queue() {
+                queue.remove_for_agents(&[id]);
+            }
             // Written here as well as by the child's own exit, so the
             // sidecar reads cancelled even when the child outlives the
             // cleanup wait below. A child that had already finished keeps
@@ -2368,7 +2373,7 @@ pub(crate) fn reply_escalation(
         }
         None => Ok(json!({
             "status": "error",
-            "message": format!("No pending escalation found with id '{escalation_id}'. It may have already been replied to."),
+            "message": format!("The reply was not delivered: no pending escalation has id '{escalation_id}'. It was already answered, or its asker stopped waiting."),
         })),
     }
 }
@@ -7721,6 +7726,34 @@ mod tests {
         assert_eq!(result["status"], "error");
     }
 
+    /// The cancelled agent's open question leaves the queue with it, even
+    /// while its wait still holds the receiver; other agents' stay.
+    #[test]
+    fn handle_cancel_withdraws_the_agents_pending_questions() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        let queue = ctx.ensure_root_escalation_queue();
+        let mut receivers = Vec::new();
+        for (id, from) in [("esc_c1", "a1"), ("esc_o1", "a2")] {
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            queue.submit(EscalationRequest {
+                id: id.into(),
+                from_agent_id: from.into(),
+                from_agent_name: "explore".into(),
+                question: "Which way?".into(),
+                options: None,
+                reply_tx: tx,
+            });
+            receivers.push(rx);
+        }
+
+        let result = run_async(handle_cancel(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "ok");
+        let ids: Vec<String> = queue.pending().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["esc_o1"]);
+    }
+
     #[test]
     fn handle_cancel_no_supervisor_errors() {
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
@@ -8013,7 +8046,7 @@ mod tests {
         assert_eq!(result["status"], "error");
         assert_eq!(
             result["message"],
-            "No pending escalation found with id 'missing'. It may have already been replied to."
+            "The reply was not delivered: no pending escalation has id 'missing'. It was already answered, or its asker stopped waiting."
         );
     }
 

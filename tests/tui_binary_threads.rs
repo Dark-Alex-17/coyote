@@ -1363,3 +1363,154 @@ fn an_output_over_the_cap_pages_with_a_visible_note() {
     pty.read_for(Duration::from_millis(300));
     quit_from_composer(pty);
 }
+
+// ---------------------------------------------------------------------------
+// A question whose asker is cancelled, and runs of CRs before an LF.
+// ---------------------------------------------------------------------------
+
+/// A kid asks the user a question and is then cancelled from the roster
+/// before anyone answers: its question row goes with it, since nobody is
+/// left to receive the answer.
+#[test]
+#[serial]
+fn a_cancelled_askers_question_leaves_the_roster() {
+    let scene = scene(
+        "thr-dead-ask",
+        |_| {
+            vec![
+                Reply::ToolCall {
+                    name: "user__confirm".to_string(),
+                    arguments: r#"{"question":"may the kid go d9q?"}"#.to_string(),
+                },
+                Reply::Text("kid heard d9a".to_string()),
+            ]
+        },
+        "",
+    );
+    let _guard = TempDirGuard(scene.dir.clone());
+    let mut pty = spawn_tui(&scene.dir, &scene.log_env());
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.send(b".agent boss\r").unwrap();
+    pty.read_for(Duration::from_millis(2500));
+    pty.send(b"go boss\r").unwrap();
+    wait_for_file(&mut pty, &scene.root_started, "the root's mark tool");
+    let deadline = Instant::now() + PTY_DEADLINE;
+    while scene.kid.served() < 1 && Instant::now() < deadline {
+        pty.read_for(Duration::from_millis(200));
+    }
+    pty.read_for(Duration::from_millis(1500));
+
+    pty.send(b"\x1bOR").unwrap();
+    let (asked, roster) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
+        frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains("d9q")
+    });
+    assert!(asked, "the kid's question is not on the roster:\n{roster}");
+    // The kid's agent row is listed first and takes the focus on open.
+    pty.send(b"x").unwrap();
+    let (cancelled, last) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
+        frame.rfind("Esc = close").is_some_and(|_| {
+            let band = roster_band(frame);
+            !(band.contains("kid") && band.contains("running"))
+        })
+    });
+    assert!(
+        cancelled,
+        "could not cancel the kid from the roster:\n{last}"
+    );
+    let (cleared, after) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
+        frame.rfind("Esc = close").is_some() && !squeezed(roster_band(frame)).contains("d9q")
+    });
+    assert!(
+        cleared,
+        "the cancelled kid's question is still on the roster: {:?}\n{after}",
+        roster_band(&after)
+    );
+    pty.send(b"\x1b").unwrap();
+    let transcript = leave(&mut pty, &scene);
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+/// A tool whose lines end in runs of CRs before the LF, one run spread
+/// over three writes.
+const CR_RUN_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Print lines ending in runs of CRs.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   printf 'rr-1 one-v5\\r\\r\\n' >&2\n\
+    \x20   printf 'rr-2 two-v5\\r\\r\\r\\n' >&2\n\
+    \x20   printf 'rr-3 three-v5\\r' >&2; sleep 0.3; printf '\\r' >&2; sleep 0.3; printf '\\r\\n' >&2\n\
+    \x20   printf 'rr-4 four-v5\\n' >&2\n\
+    \x20   echo \"fixture printed runs v5d\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+/// Runs of CRs before an LF show in the pager as plain whole lines, one
+/// after the other with no blank line between them and no CR repainted.
+#[test]
+#[serial]
+fn cr_runs_before_lf_show_as_consecutive_lines_in_the_pager() {
+    let dir = fresh_config_dir("pager-crrun");
+    let _guard = TempDirGuard(dir.clone());
+    let (mut pty, _fake) = one_tool_turn(
+        &dir,
+        "fixture_crrun",
+        "fixture_crrun.sh",
+        CR_RUN_TOOL,
+        "fixture done v5d",
+    );
+    pty.send(b"\x14").unwrap();
+    repainted_frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "Ctrl+T did not open the pager",
+        REPAINTS,
+    );
+    pty.send(b"G").unwrap();
+    pty.read_for(Duration::from_millis(800));
+    let wanted = [
+        "rr-1 one-v5",
+        "rr-2 two-v5",
+        "rr-3 three-v5",
+        "rr-4 four-v5",
+    ];
+    let mut frame = String::new();
+    let mut raw = Vec::new();
+    for rows in [31, 33, 31, 33, 31] {
+        pty.read_for(Duration::from_millis(300));
+        let from = pty.raw().len();
+        pty.resize(rows, 100).unwrap();
+        pty.read_for(Duration::from_millis(900));
+        raw = pty.raw()[from..].to_vec();
+        assert!(
+            !raw.contains(&b'\r'),
+            "the pager's repaint carries a carriage return: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        frame = strip_ansi(&String::from_utf8_lossy(&raw));
+        if wanted.iter().all(|line| frame.contains(line)) {
+            break;
+        }
+    }
+    let rows: Vec<u16> = wanted
+        .iter()
+        .map(|w| {
+            painted_at(&raw, w.as_bytes(), 0)
+                .last()
+                .map(|(row, _)| *row)
+                .unwrap_or_else(|| panic!("the pager lost {w:?}:\n{frame}"))
+        })
+        .collect();
+    for pair in rows.windows(2) {
+        assert_eq!(
+            pair[1],
+            pair[0] + 1,
+            "a run of CRs left a gap between lines (rows {rows:?}):\n{frame}"
+        );
+    }
+    assert!(!frame.contains("^M"), "the pager shows ^M:\n{frame}");
+    pty.send(b"q").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    quit_from_composer(pty);
+}
