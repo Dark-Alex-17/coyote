@@ -137,6 +137,8 @@ fn plan_authoring_skill_pins_debris_rules() {
             "that supersedes them, and that task's acceptance criteria include deleting the scaffolding",
             "A scaffolding task with no superseding task named",
             "Decisions recorded in CONTRIBUTING or README",
+            "| files left untouched | `git diff --exit-code <base> -- <files>` -> exit 0 |",
+            "A criterion that files stay unchanged names the base revision",
         ],
     );
 }
