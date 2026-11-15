@@ -1557,6 +1557,10 @@ u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_c
 check("ci_poll: a check with a blank bucket and state is unknown -> inconclusive, never pending",
       u.get("ci_status") == "inconclusive" and u.get("_next") == "ci_route"
       and ["mystery", "unknown", ""] in [list(c) for c in u.get("ci_checks", [])], u)
+set_checks(("docs", "skipping", ""), ("deploy", "skipping", ""))
+u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=_t_ci))
+check("ci_poll: every check skipped and none passed -> inconclusive, never green",
+      u.get("ci_status") == "inconclusive" and u.get("_next") == "ci_route", u)
 _states = {s: "red" if s in ("error", "timed_out", "startup_failure", "action_required") else "pending"
            for s in ("error", "timed_out", "startup_failure", "action_required", "expected", "waiting", "requested")}
 _seen = {}
@@ -1606,7 +1610,7 @@ check("ci_route: a cancelled check naming no run -> re-run not offered, leaving 
       opts(_esc) == [(_LEAVE, True), (gates.CI_KEEP_WAITING, False), (gates.CI_TREAT_GREEN, False)], _esc)
 _u2 = {}
 gates._reset_ci_watch(_u2)
-check("ci: a fresh watch forgets the runs re-run in the previous one", _u2.get("ci_rerun_ids") == [], _u2)
+check("ci: a new watch on the same head keeps the runs already re-run this run", "ci_rerun_ids" not in _u2, _u2)
 u = gates.apply_answer(base_state(escalation=_esc_cancel, last_answer=_LEAVE, ci_status="inconclusive"))
 check("apply: ci_inconclusive leave -> final_report with the non-pass checks in the follow-up",
       u.get("_next") == "final_report" and u.get("follow_ups") == ["PR left in draft with CI inconclusive: lint (cancel)"], u)
@@ -1634,6 +1638,11 @@ u = gates.apply_answer(base_state(escalation=_esc, last_answer=gates.CI_CAP_KEEP
 check("apply: ci_poll_cap keep waiting -> a fresh watch, the budget raised by one watch, ci_polls_run kept",
       u.get("_next") == "ci_poll" and u.get("ci_polls") == 0 and u.get("ci_poll_fails") == 0 and "ci_polls_run" not in u
       and u.get("ci_poll_budget") == _lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS, u)
+_kw = {"ci_rerun_ids": ["41"], **{k: v for k, v in u.items() if not k.startswith("_")},
+       "ci_status": "inconclusive", "ci_checks": [["build", "pass", ""], ["lint", "cancel", _cancel_link]]}
+_esc_kw = gates.ci_route(base_state(**_kw)).get("escalation", {})
+check("ci_route: after keep waiting at ci_poll_cap, a cancelled run already re-run this run is not offered again",
+      gates.CI_RERUN_CANCELLED not in [t for t, _ in opts(_esc_kw)] and _esc_kw.get("kind") == "ci_inconclusive", _esc_kw)
 check("ci_poll: after a keep-waiting answer the next poll reads CI",
       gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_t_ci, ci_polls_run=_lib.POLL_VISIT_BUDGET,
                                ci_poll_budget=_lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS)).get("ci_status") == "green")
@@ -1906,14 +1915,15 @@ check("pr_tracking review: pr_review_resolve on a failed head read -> push_uncon
       and f"review-watch: PR #7 push not confirmed (remote unreadable, local {_HEAD})" in u["decisions"])
 os.environ["SISYPHUS_GH_HEAD_CMD"] = f"echo {_HEAD}"
 u = gates.pr_review_resolve(rs(pr_review_pending=_round["pr_review_pending"], pr_review_rounds=1, ci_polls=9, ci_poll_fails=2,
-                               ci_started_at=1))
+                               ci_started_at=1, ci_rerun_ids=["41"]))
 _reply_log, _resolve_log = seam_log(_REPLIED), seam_log(_RESOLVED)
 check("pr_tracking review: pr_review_resolve on a matching head resolves the fixed threads only",
       _resolve_log == "t1\n" and _reply_log.startswith("t1|") and _reply_log.count("Addressed in") == 1)
 check("pr_tracking review: the thread reply body carries the own marker",
       _reply_log == f"t1|Addressed in {_HEAD}\n\n{gates.OWN_MARKER}\n")
-check("pr_tracking review: pr_review_resolve -> ci_poll with reset budgets",
-      u["_next"] == "ci_poll" and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0 and u["ci_started_at"] >= _now and "ci_owner" not in u)
+check("pr_tracking review: pr_review_resolve -> ci_poll with reset budgets and no runs re-run on the new head",
+      u["_next"] == "ci_poll" and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0 and u["ci_started_at"] >= _now and "ci_owner" not in u
+      and u["ci_rerun_ids"] == [])
 check("pr_tracking review: pr_review_resolve moves pending to addressed and ledgers the push",
       u["pr_review_pending"] == [] and len(u["pr_review_addressed"]) == 3
       and f"review-watch: PR #7 fix round 1 pushed @ {_HEAD}; 1 thread(s) resolved, 0 no-change thread(s) replied"
@@ -4250,6 +4260,10 @@ flip_seams("exit 1", "exit 0")
 u = gates.ci_gate(base_state(**_flip))
 check("flip: the re-read itself failing -> not confirmed, the detail says gh pr view failed",
       u.get("pr_ready_confirmed") is False and "gh pr view failed" in str(u.get("pr_ready_detail")), u)
+flip_seams("echo not-json", "exit 0")
+u = gates.ci_gate(base_state(**_flip))
+check("flip: a re-read that prints unparseable output -> not confirmed, the detail says gh pr view failed",
+      u.get("pr_ready_confirmed") is False and "gh pr view failed" in str(u.get("pr_ready_detail")), u)
 _watch = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                                   git_report="opened https://github.com/o/r/pull/9"))
 seam_log(_FLIP_LOG)
@@ -4258,8 +4272,20 @@ u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_watch.get("pr_ref"), git_repo
 _noref = gates.ci_gate(base_state(**dict(_flip, pr_ref="")))
 check("flip: ci mode saves pr_ref at the watch start, the flip runs gh pr ready on it and never on a report's other #N",
       _watch.get("pr_ref") == "9" and u.get("pr_ready_confirmed") is True and seam_log(_FLIP_LOG) == "9\n"
-      and _noref.get("pr_ready_confirmed") is False and "no PR ref was saved" in str(_noref.get("pr_ready_detail"))
+      and _noref.get("pr_ready_confirmed") is False and "no PR ref" in str(_noref.get("pr_ready_detail"))
       and seam_log(_FLIP_LOG) == "", (_watch.get("pr_ref"), u, _noref))
+flip_seams(_READY_JSON, "exit 0")
+_w12 = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                                git_report="opened the draft PR. Closes #12"))
+u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_w12.get("pr_ref"), git_report="Closes #12")))
+_ready12 = seam_log(_FLIP_LOG)
+flip_seams("echo '{\"url\": \"https://github.com/o/r/pull/9\", \"isDraft\": true}'", "exit 0")
+_wv = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                               git_report="opened the draft PR. Closes #12"))
+check("flip: a publish report naming only Closes #12 never runs gh pr ready on 12; the ref comes from gh pr view",
+      _w12.get("_next") == "ci_poll" and _w12.get("pr_ref") == "" and _ready12 == ""
+      and u.get("pr_ready_confirmed") is False and "no PR ref" in str(u.get("pr_ready_detail"))
+      and _wv.get("pr_ref") == "9", (_w12.get("pr_ref"), _ready12, u.get("pr_ready_detail"), _wv.get("pr_ref")))
 flip_seams(_DRAFT_JSON, "exit 0")
 u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=0))
 check("flip: review mode with an unconfirmed flip still starts the watch, and the follow-up says so",
@@ -4372,6 +4398,10 @@ check("subtask heal: a negative subtask_index -> end_blocked, never a review of 
 u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=None, run_dir=_edir))
 check("subtask heal: a None subtask_index -> end_blocked naming it missing",
       u["_next"] == "end_blocked" and "subtask_index is missing" in u["failure_reason"], u.get("failure_reason"))
+u = gates.next_subtask(base_state(subtasks=[_hsubs[0], _hsubs[0], _hsubs[2]], subtask_index=1,
+                                  run_dir=_lib.ensure_run_dir("dup-unsealed")))
+check("subtask heal: a duplicate subtask with no sealed list -> end_blocked naming the repeat",
+      u["_next"] == "end_blocked" and "index 1 repeats index 0" in u.get("failure_reason", ""), u.get("failure_reason"))
 u = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=1, task_number=2, run_dir=_edir))
 check("subtask heal: an in-range index behind task_number -> end_blocked naming both, never a repeated review",
       u["_next"] == "end_blocked" and "subtask_index 1 is out of step with task_number 2" in u["failure_reason"],
@@ -4409,8 +4439,10 @@ for _bad, _shape in ((None, "missing"), ([{"kind": "clarify"}], "a list"), ({"qu
           and _shape in _up["failure_reason"] and _up["failure_reason"].startswith("parse_answer:"),
           (_ud.get("_next"), _ud.get("failure_reason"), _up.get("_next"), _up.get("failure_reason")))
 _ub = gates.parse_answer(base_state(escalation=escalation("clarify", "  ", [option("a", True)]), last_answer_text="1"))
+_ubd = gates.ask_dispatch(base_state(escalation=escalation("clarify", "  ", [option("a", True)]), top_level=True))
 check("escalation fault: a blank question -> end_blocked naming the empty question",
-      _ub["_next"] == "end_blocked" and "empty question" in _ub.get("failure_reason", ""), _ub)
+      _ub["_next"] == "end_blocked" and "empty question" in _ub.get("failure_reason", "")
+      and _ubd["_next"] == "end_blocked" and "empty question" in _ubd.get("failure_reason", ""), (_ub, _ubd))
 u = gates.record_subtasks(base_state(subtasks=None, top_level=True, run_dir=_edir))
 check("record_subtasks: missing subtasks -> end_blocked naming it missing, not a sizing verdict",
       u["_next"] == "end_blocked" and "subtasks is missing" in u["failure_reason"] and "escalation" not in u,
@@ -4463,11 +4495,17 @@ _ue = gates.escalate_gate(base_state(escalation=[{"kind": "clarify"}], escalatio
 check("escalation fault: escalate_gate faults a list-typed escalation before the ladder or the ask",
       _ue["_next"] == "end_blocked" and _ue.get("failure_reason", "").startswith("escalate_gate:")
       and "standing_rulings" not in _ue, _ue)
-_wp = gates.ci_gate(base_state(git_task={"kind": "push_fix"}, ci_green_by="inconclusive"))
+_wp = gates.ci_gate(base_state(git_task={"kind": "push_fix"}, ci_green_by="inconclusive", ci_rerun_ids=["41"]))
 _ws = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
-                               git_report="opened https://github.com/o/r/pull/9", ci_green_by="no_checks"))
+                               git_report="opened https://github.com/o/r/pull/9", ci_green_by="no_checks",
+                               ci_rerun_ids=["41"]))
 check("ci watch: a fresh watch (fix push or first start) clears ci_green_by so a later stop is no green decision",
       _wp.get("ci_green_by") == "" and _ws.get("ci_green_by") == "" and _ws.get("_next") == "ci_poll", (_wp, _ws))
+check("ci watch: a new head (fix push or first start) forgets the runs re-run on the old one",
+      _wp.get("ci_rerun_ids") == [] and _ws.get("ci_rerun_ids") == [], (_wp, _ws))
+_pre = gates._assemble_report(base_state(), {}, pre_publish=True)
+check("report: before publishing the CI line says not yet watched, never that no publish step ran",
+      "- CI: not yet watched (set after publishing)" in _pre and "no publish step ran" not in _pre, _pre[-800:])
 u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_CONTINUE, rejected_cap_resets=1))
 _ns = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=0, rejected_cap_resets=2, run_dir=_edir))
 check("rejected cap: continue counts a reset and next_subtask clears the count", u.get("rejected_cap_resets") == 2 and _ns.get("rejected_cap_resets") == 0, (u.get("rejected_cap_resets"), _ns))

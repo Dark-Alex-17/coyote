@@ -1577,9 +1577,12 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
 /// check and the index against `task_number` before each review, the
 /// malformed-escalation fault in `ask_dispatch` and in `parse_answer`, the
 /// not-a-list fault in `record_subtasks` and the coder-rejection budget
-/// escalation.
+/// escalation; then the duplicate drop before the seal, the already-re-run
+/// check on cancelled runs, the treat-as-green decision cleared on a new
+/// watch, the per-watch `CI_MAX_ROUNDS` timeout and the URL-only PR ref the
+/// flip runs `gh pr ready` on.
 #[test]
-#[ignore = "eleven smoke battery runs take about two minutes; run with -- --ignored"]
+#[ignore = "sixteen smoke battery runs take about three minutes; run with -- --ignored"]
 fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
     run_smoke_sabotages(
@@ -1660,6 +1663,41 @@ fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "        if False:\n",
                 "route_coder_result: B7 rejected bound -> coder_rejected_cap escalation, never \
                  end_blocked",
+            ),
+            (
+                "duplicate-drop",
+                "    if len(unique) < len(subtasks):\n",
+                "    if False:\n",
+                "record_subtasks: exact duplicates are dropped before the seal and the count is \
+                 ledgered",
+            ),
+            (
+                "already-re-run",
+                " and m.group(1) not in done]",
+                "]",
+                "ci_route: a cancelled run already re-run this run -> re-run not offered, leaving \
+                 the PR in draft recommended",
+            ),
+            (
+                "green-by-cleared",
+                "\"ci_green_by\": \"\"})",
+                "})",
+                "ci watch: a fresh watch (fix push or first start) clears ci_green_by so a later \
+                 stop is no green decision",
+            ),
+            (
+                "watch-rounds",
+                " or polls + 1 > CI_MAX_ROUNDS:",
+                ":",
+                "ci_poll: a visit past CI_MAX_ROUNDS in one watch -> timeout inside the \
+                 elapsed-time limit",
+            ),
+            (
+                "url-only-pr-ref",
+                "u[\"pr_ref\"] = _pr_url_ref(state)",
+                "u[\"pr_ref\"] = _pr_ref(state)",
+                "flip: a publish report naming only Closes #12 never runs gh pr ready on 12; the \
+                 ref comes from gh pr view",
             ),
         ],
     );

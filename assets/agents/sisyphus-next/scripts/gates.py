@@ -3770,6 +3770,7 @@ def ci_gate(state):
         return u
     if task.get("kind") == "push_fix":
         _reset_ci_watch(u)
+        u["ci_rerun_ids"] = []
         u["_next"] = "ci_poll"
         return u
     if ret == "run_coder":
@@ -3805,9 +3806,10 @@ def ci_gate(state):
     u["ci_owner"] = bool(owns)
     if owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or ""):
         _reset_ci_watch(u)
-        # the flip confirmation runs gh pr ready only against this saved ref, never a later report's #N
+        u["ci_rerun_ids"] = []
+        # the flip confirmation runs gh pr ready only against this saved ref, never a report's bare #N
         if not (state.get("pr_ref") or "").strip():
-            u["pr_ref"] = _pr_ref(state)
+            u["pr_ref"] = _pr_url_ref(state)
         u["_next"] = "ci_poll"
     else:
         if not task.get("open_pr"):
@@ -3875,7 +3877,7 @@ def _pr_view(state, ref=""):
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
                                env={**os.environ, "SISYPHUS_PR_REF": ref})
         else:
-            p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json", "url,isDraft,headRefName,body"],
+            p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json", "number,url,isDraft,headRefName,body"],
                                cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
         doc = json.loads(p.stdout) if p.returncode == 0 else None
         return doc if isinstance(doc, dict) else None
@@ -3886,7 +3888,7 @@ def _pr_view(state, ref=""):
 def _pr_ready(state):
     """The return code of one `gh pr ready` on the run's PR, or None when the call could not run."""
     root = state.get("git_root") or state.get("project_dir") or "."
-    ref = _pr_ref(state)
+    ref = str(state.get("pr_ref") or "").strip()
     cmd = os.environ.get("SISYPHUS_GH_PR_READY_CMD")
     try:
         if cmd:
@@ -3904,10 +3906,11 @@ def _pr_ready(state):
 def _confirm_pr_ready(state, u):
     """Confirm the flip only when `gh pr ready` exits 0 and a re-read of the same PR shows it is not a draft."""
     if not str(state.get("pr_ref") or "").strip():
-        confirmed, detail = False, "gh pr ready not run: no PR ref was saved when the watch started"
+        confirmed, detail = False, ("gh pr ready not run: no PR ref (no pull URL in the publish report and "
+                                    "gh pr view named no PR when the watch started)")
     else:
         rc = _pr_ready(state)
-        pr = _pr_view(state, _pr_ref(state))
+        pr = _pr_view(state, str(state["pr_ref"]).strip())
         seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}"
         confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False
         detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
@@ -4012,6 +4015,7 @@ def pr_review_resolve(state):
     u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + pending
     u["pr_review_pending"] = []
     _reset_ci_watch(u)
+    u["ci_rerun_ids"] = []
     u["_next"] = "ci_poll"
     return u
 
@@ -4082,6 +4086,17 @@ def _resolve_thread(state, thread_id):
         return False
 
 
+def _pr_url_ref(state):
+    """The PR number from a pull URL in the publish report, else the current branch's PR per gh pr view, else ""."""
+    if m := re.search(r"https://github\.com/[^\s)]+/pull/(\d+)", state.get("git_report") or ""):
+        return m.group(1)
+    pr = _pr_view(state) or {}
+    if m := re.search(r"/pull/(\d+)", str(pr.get("url") or "")):
+        return m.group(1)
+    number = pr.get("number")
+    return str(number) if isinstance(number, int) and not isinstance(number, bool) and number > 0 else ""
+
+
 def _pr_ref(state):
     if ref := str(state.get("pr_ref") or "").strip():
         return ref
@@ -4102,7 +4117,7 @@ CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
 
 def _reset_ci_watch(u):
     u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": [],
-              "ci_green_by": "", "ci_rerun_ids": []})
+              "ci_green_by": ""})
 
 
 def _ci_poll_budget(state):
@@ -4951,6 +4966,8 @@ def _assemble_report(state, u, pre_publish=False):
         elif truthy(g("flip_ready", False)):
             ci += f" (flip to ready NOT confirmed: {g('pr_ready_detail') or 'the PR was not re-read'})"
         lines.append(f"- CI: {ci}")
+    elif pre_publish:
+        lines.append("- CI: not yet watched (set after publishing)")
     else:
         lines.append(f"- CI: {g('ci_watch_note') or 'not watched: no publish step ran'}")
     for c in as_list(g("publish_checks", [])):
