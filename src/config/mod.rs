@@ -1622,6 +1622,10 @@ clients:
         assert!(CONFIG_TEMPLATE.contains(
             "tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
         ));
+        assert!(CONFIG_TEMPLATE.contains(
+            "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
+        ));
+        assert!(!CONFIG_TEMPLATE.to_ascii_lowercase().contains("light_theme"));
     }
 
     #[test]
@@ -1662,11 +1666,16 @@ clients:
         assert!(example.contains(
             "\ntui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
         ));
+        assert!(example.contains(
+            "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
+        ));
+        assert!(!example.to_ascii_lowercase().contains("light_theme"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
         assert_eq!(cfg.ui, UiMode::Repl);
         assert!(cfg.tui_dump_on_exit);
+        assert_eq!(cfg.theme, None);
     }
 
     #[test]

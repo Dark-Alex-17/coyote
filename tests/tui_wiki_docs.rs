@@ -839,6 +839,26 @@ fn config_rows_match_the_template() {
         ]) {
             assert!(ui.contains(&needle), "{label} `ui` row names {needle}");
         }
+        let theme = table_row(label, text, "`theme`").join(" ");
+        for needle in [
+            "`light`",
+            "`dark`",
+            "`COYOTE_THEME`",
+            "while `theme` is null",
+        ] {
+            assert!(theme.contains(needle), "{label} `theme` row says {needle}");
+        }
+    }
+    if let [(_, readme), (_, started)] = &tables[..] {
+        let readme_theme = table_row("README.md", readme, "`theme`")[2].replace(
+            "(https://github.com/Dark-Alex-17/coyote/wiki/Themes)",
+            "(Themes)",
+        );
+        assert_eq!(
+            readme_theme,
+            table_row("Getting-Started.md", started, "`theme`")[2],
+            "README.md and Getting-Started.md describe `theme` alike"
+        );
     }
 
     let Some(wiki) = wiki else { return };
@@ -1273,10 +1293,11 @@ fn fits(format: &str, text: &str) -> bool {
         } else if i == pieces.len() - 1 {
             return rest.ends_with(piece) && rest.len() > piece.len();
         } else {
-            let Some(at) = rest[1.min(rest.len())..].find(piece) else {
+            let skip = rest.char_indices().nth(1).map_or(rest.len(), |(at, _)| at);
+            let Some(at) = rest[skip..].find(piece) else {
                 return false;
             };
-            rest = &rest[1 + at + piece.len()..];
+            rest = &rest[skip + at + piece.len()..];
         }
     }
     rest.is_empty()
@@ -1371,6 +1392,8 @@ fn fits_matches_placeholders_anywhere_but_literals_exactly() {
     assert!(!fits("add secret '{secret_name}'", "add a secret 'x'"));
     assert!(fits("plain", "plain"));
     assert!(!fits("plain", "plainer"));
+    assert!(fits("a '{x}' b '{y}'", "a '\u{e9}' b 'z'"));
+    assert!(!fits("a '{x}' b '{y}'", "a '\u{e9}' c 'z'"));
 }
 
 /// The sections and rows this lint covers on each wiki page, labelled.
@@ -1440,9 +1463,9 @@ fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
     texts
 }
 
-/// Non-ASCII characters, planning vocabulary and release narration in
-/// `text`, each as one line naming `label`.
-fn voice_hits(label: &str, text: &str) -> Vec<String> {
+/// Non-ASCII characters, task or plan ids and planning vocabulary in `text`,
+/// each as one line naming `label`.
+fn planning_hits(label: &str, text: &str) -> Vec<String> {
     let mut hits = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if let Some(c) = line.chars().find(|c| !c.is_ascii()) {
@@ -1455,7 +1478,18 @@ fn voice_hits(label: &str, text: &str) -> Vec<String> {
         }
     }
     for word in words(text) {
-        if PLANNING_WORDS.contains(&word.as_str()) || CHANGELOG_WORDS.contains(&word.as_str()) {
+        if PLANNING_WORDS.contains(&word.as_str()) {
+            hits.push(format!("{label}: the word {word:?}"));
+        }
+    }
+    hits
+}
+
+/// [`planning_hits`] plus release narration in `text`.
+fn voice_hits(label: &str, text: &str) -> Vec<String> {
+    let mut hits = planning_hits(label, text);
+    for word in words(text) {
+        if CHANGELOG_WORDS.contains(&word.as_str()) {
             hits.push(format!("{label}: the word {word:?}"));
         }
     }
@@ -1479,4 +1513,62 @@ fn edited_prose_is_ascii_and_plain() {
         .flat_map(|(label, text)| voice_hits(label, text))
         .collect();
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// The `#` comments of the top-level `key:` lines of `yaml` that `keys`
+/// name, each followed by the comment-only lines that continue it.
+fn setting_comments(yaml: &str, keys: &[&str]) -> String {
+    let mut out = Vec::new();
+    let mut continuing = false;
+    for line in yaml.lines() {
+        if continuing && line.starts_with(' ') && line.trim_start().starts_with('#') {
+            out.push(line.trim());
+            continue;
+        }
+        continuing = keys.iter().any(|key| line.starts_with(&format!("{key}: ")));
+        if continuing {
+            let (_, comment) = line
+                .split_once(" #")
+                .unwrap_or_else(|| panic!("the `{line}` setting has a comment"));
+            out.push(comment.trim());
+        }
+    }
+    out.join("\n")
+}
+
+#[test]
+fn comments_carry_no_planning_vocabulary() {
+    let mut hits = Vec::new();
+    for file in ["tui_wiki_docs.rs", "theme_setting_usage.rs"] {
+        let source = read(repo_root().join("tests").join(file));
+        let comments: Vec<&str> = source
+            .lines()
+            .filter(|line| line.trim_start().starts_with("//"))
+            .collect();
+        assert!(!comments.is_empty(), "tests/{file} has comments");
+        hits.extend(planning_hits(
+            &format!("tests/{file} comments"),
+            &comments.join("\n"),
+        ));
+    }
+    for (label, yaml) in [
+        (
+            "config.example.yaml",
+            read(repo_root().join("config.example.yaml")),
+        ),
+        (
+            "assets/config-template.yaml",
+            asset(&["config-template.yaml"]),
+        ),
+    ] {
+        let comments = setting_comments(&yaml, &SETTINGS);
+        assert!(
+            comments.lines().count() > SETTINGS.len(),
+            "{label} comments the UI settings: {comments}"
+        );
+        hits.extend(planning_hits(&format!("{label} comments"), &comments));
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+    assert!(!planning_hits("probe", "the next wave").is_empty());
+    assert!(planning_hits("probe", "now a new setting").is_empty());
 }
