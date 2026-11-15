@@ -196,6 +196,16 @@ finally:
     del os.environ["LLM_AGENT_VAR_DEBRIS_EXCLUDE"]
 check("intake: a debris_exclude preset through the variable environment wins over the plans dir",
       st7["debris_exclude"] == '["preset"]', st7.get("debris_exclude"))
+st8 = gates.intake({"initial_prompt": "typo fix", "project_dir": REPO, "debris_exclude": '["state"]'})
+check("intake: a debris_exclude preset in the state wins over the plans dir",
+      st8["debris_exclude"] == '["state"]', st8.get("debris_exclude"))
+check("plans exclude: the dirty-check pathspec follows the configured plans_dir",
+      gates._plans_exclude({"project_dir": PD_REPO, "plans_dir": "docs/planning"}, PD_REPO) == [":(exclude,literal)docs/planning"]
+      and gates._plans_exclude({"project_dir": PD_REPO}, PD_REPO) == [])
+_git_ops = re.search(r"(?ms)^  git_ops:\n(.*?)(?=^  \w+:\n)", open(os.path.join(HERE, "..", "graph.yaml")).read()).group(1)
+_git_ops = " ".join(_git_ops.split())
+check("git_ops: the instructions forbid gh pr ready and never ask for it",
+      "Never run gh pr ready" in _git_ops and _git_ops.count("gh pr ready") == 1, _git_ops[:200])
 roster, own = gates._parse_roster("Implement TASK-003 ...\nTeammate roster:\n- TASK-002 agent_x scope: src/auth/, src/api/users.go\n- TASK-003 agent_y scope: src/payments/\n")
 check("intake: roster parse", roster.get("TASK-002") == ["src/auth/", "src/api/users.go"] and own == ["src/payments/"])
 
@@ -1404,6 +1414,23 @@ check("build_gauntlet: no command in the criteria -> review_verification_command
 u = gates.build_gauntlet_prompt(base_state(spec_text=f"- `{CC_DIFF}` passes", verification_commands="run the suite"))
 check("build_gauntlet: a verification_commands that is not a JSON list passes through unchanged",
       u["review_verification_commands"] == "run the suite" and not any(d.startswith("verify:") for d in u["decisions"]), u)
+u = gates.build_gauntlet_prompt(base_state(
+    subtasks=[{"title": "one", "outcome": f"`{CC_DIFF}` passes", "constraints": f"`{CC_DIFF}` passes",
+               "acceptance_criteria": ["AC1"]}, CC_SUBS[1]],
+    subtask_index=1, subtask_changed_files=["f"], verification_commands='["true x"]'))
+check("build_gauntlet: a command in a subtask's outcome or constraints is never declared, only its criteria count",
+      u["review_verification_commands"] == '["true x"]', u.get("review_verification_commands"))
+CC_TOP = os.path.join(TMP, "cc-nested-repo")
+CC_NESTED = os.path.join(CC_TOP, "svc")
+os.makedirs(os.path.join(CC_NESTED, "tools"), exist_ok=True)
+subprocess.run(["git", "init", "-q", CC_TOP], check=True)
+with open(os.path.join(CC_NESTED, "tools", "check"), "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 0\n")
+os.chmod(os.path.join(CC_NESTED, "tools", "check"), 0o755)
+u = gates.build_gauntlet_prompt(base_state(project_dir=CC_NESTED, git_root=CC_TOP, base_sha="", head_sha="",
+                                           spec_text="- `./tools/check run` passes", verification_commands='["true x"]'))
+check("build_gauntlet: an in-tree executable is vetted against the project dir the gauntlet runs in, not the git root",
+      json.loads(u["review_verification_commands"]) == ["true x", "./tools/check run"], u.get("review_verification_commands"))
 passed = ("GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | PASS, 0 critical |\n"
           "| adversary | GREEN | CONFORMS |\n| security | GREEN (attention) | PASS (attention items) |\n| probe | SKIPPED | not selected |\n"
           "| debris | GREEN | clean |\n\n## Human attention required\n- check X\n")

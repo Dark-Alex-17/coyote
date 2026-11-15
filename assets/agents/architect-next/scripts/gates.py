@@ -2361,7 +2361,7 @@ def harvest_report(state):
         if scope.lower() not in rescans:
             rescans.add(scope.lower())
             fus.append(f"({task.get('id')}) Re-run the debt scan for {scope}: {m.group(2) or 'no reason given'}")
-        ledger(state, u, f"debt: scan failure for {scope} routed to a re-run follow-up, not a debt chore")
+            ledger(state, u, f"debt: scan failure for {scope} routed to a re-run follow-up, not a debt chore")
     u["debt_items"] = debt
     u["follow_ups"] = fus
     u["_next"] = "design_ask_gate"

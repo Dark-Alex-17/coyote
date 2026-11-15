@@ -152,6 +152,10 @@ Acceptable shapes:
 
 A criterion that files stay unchanged names the base revision: `git diff --exit-code -- <files>`
 without one compares only the working tree with the index, so a committed change passes it.
+The review gates run a quoted command themselves only when its program is a declared
+verification command, an executable inside the repo, or read-only git; it holds no shell
+metacharacters, quotes or leading `NAME=value`; and its exit code decides the criterion. Split a
+chained command into one criterion per command so each one runs.
 
 Not acceptable: "works correctly", "handles errors", "is idiomatic", "reviewer confirms" - a
 prose criterion is a plan defect in micro mode. Where behaviour needs judgment, write the

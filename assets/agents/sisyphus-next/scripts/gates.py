@@ -3119,7 +3119,7 @@ def _literal(paths):
 
 def _plans_exclude(state, root):
     """The pathspec that leaves the in-repo planning store out, or [] when there is none inside root."""
-    plans = os.path.join(state.get("project_dir") or root, "plans")
+    plans = _plans_path(state, state.get("project_dir") or root)
     if os.path.isdir(plans):
         try:
             rel = os.path.relpath(os.path.realpath(plans), os.path.realpath(root))
@@ -3290,7 +3290,12 @@ def build_gauntlet_prompt(state):
         arr = None
     if isinstance(arr, list):
         declared = [c.strip() for c in arr if isinstance(c, str)]
-        kept, capped = criterion_commands(spec, root, declared)
+        source = spec
+        if _subtask_phase(state):
+            # only the subtask's criteria and the user's amendments, never its planner-written outcome or constraints
+            m = re.search(r"^Acceptance criteria:\n((?:.+\n?)*)", spec, re.M)
+            source = m.group(1) if m else ""
+        kept, capped = criterion_commands(source, state.get("project_dir") or root, declared)
         extra = [c for c in kept if c not in declared]
         if extra:
             cmds = json.dumps(arr + extra)
