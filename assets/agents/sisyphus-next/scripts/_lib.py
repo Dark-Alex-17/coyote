@@ -33,15 +33,26 @@ CI_FLAKE_RERUNS = 2       # section 10.12: max 2 re-runs per check per PR
 CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
+CI_MAX_ROUNDS = CI_WALL_SECS // CI_POLL_SLEEP  # ci_poll visits per watch (240), a bound beside the elapsed-time limit
+CI_NO_CHECKS_SECS = 300   # an empty check list must last this long into a watch before it reads no_checks
+# One initial watch, a re-watch after each of the STRIKE_LIMIT CI fix rounds and one watch of headroom (1200);
+# counted over every ci_poll visit of the run and kept below ENGINE_VISIT_CAP so the watch stops by name.
+POLL_VISIT_BUDGET = (1 + STRIKE_LIMIT + 1) * CI_MAX_ROUNDS
+ENGINE_VISIT_CAP = 1500   # mirrors graph.yaml settings.max_loop_iterations, the engine's per-node visit cap
+CI_PASS = ("pass", "success")
+CI_FAIL = ("fail", "failure", "error", "timed_out", "startup_failure", "action_required")
+CI_PENDING = ("pending", "queued", "in_progress", "expected", "waiting", "requested")
+CI_CANCELLED = ("cancel", "cancelled")
+CI_QUIET = ("skipping", "skipped", "neutral")
 GH_CALL_SECS = 90         # one gh subprocess call; node timeouts budget their sleep plus this per call
 CI_LOG_RUNS_MAX = 3       # distinct CI runs whose failed log one ci_route visit fetches, sized with its node timeout
 REVIEW_POLL_SLEEP = 600   # review comments arrive on a human timescale, so the watch reads every ten minutes
-REVIEW_MAX_POLLS = 80     # per run; stays below settings.max_loop_iterations (100), which caps visits per node
+REVIEW_MAX_POLLS = 80     # per run; stays below ENGINE_VISIT_CAP, which caps visits per node
 REVIEW_WALL_SECS = REVIEW_MAX_POLLS * REVIEW_POLL_SLEEP  # the poll budget expressed as wall clock
 REVIEW_MAX_ROUNDS = STRIKE_LIMIT  # review fix rounds per run, the 3-strike family bound
 FIX_ROUND_CEILING = STRIKE_LIMIT  # extra fix rounds per subtask the stuck / exhausted / strikeout questions recommend
-REVIEW_CI_POLL_BUDGET = 60  # a fix round starts only while ci_polls_run is below this, leaving the next CI watch headroom under the per-node cap
-REVIEW_CI_POLL_CEILING = 90  # review mode stops the CI watch here, below the per-node visit cap of 100
+REVIEW_CI_POLL_BUDGET = 60  # a review fix round starts only while ci_polls_run is below this, leaving the next CI watch headroom
+REVIEW_CI_POLL_CEILING = 90  # once the review watch has started, ci_poll stops here instead of at POLL_VISIT_BUDGET
 RESOLVE_DEADLINE_SECS = 480  # below the pr_review_resolve node timeout of 600 with one GH_CALL_SECS call of margin
 REVIEW_PERM_SECS = 120  # per-poll wall-clock budget for uncached permission reads; inside the pr_review_poll node timeout
 TAIL_CHARS = 6000         # trim_output class: evidence tails handed to llm nodes
@@ -252,12 +263,12 @@ def read_artifact(run_dir, name):
 
 STATE_KEYS = (
     "run_id", "base_sha", "head_sha", "git_root", "project_dir", "delegated", "top_level",
-    "parallel_mode", "intent", "sizing", "subtasks", "subtask_index", "current_task",
+    "parallel_mode", "intent", "sizing", "subtasks", "subtask_index", "task_number", "final_review", "current_task",
     "fix_strikes", "fix_round", "review_rounds", "round_heads", "gauntlet_verdict",
     "gauntlet_lanes", "rejected_findings", "deferred_findings", "skipped_reviews",
-    "debt_left_behind", "debris_exemptions", "design_decisions", "autonomous_digest",
+    "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions", "autonomous_digest",
     "decisions", "follow_ups", "parked", "escalation", "coder_result", "git_report",
-    "ci_status", "anomalies_log",
+    "ci_status", "ci_rerun_ids", "anomalies_log",
 )
 
 

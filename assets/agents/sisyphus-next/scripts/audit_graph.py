@@ -33,7 +33,9 @@ BOUNDED = {
     "record_subtasks": "B2 subtasks<=6 / sizing_rounds<=3 sizing verdicts, then the sizing_cap escalation",
     "next_subtask": "B3 list-bounded subtask index",
     "oracle_gate": "B4 once per task",
-    "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3",
+    "route_coder_result": "B5 fix_strikes<=3 / B7 rejected_rounds<=3, then the coder_rejected_cap escalation, whose "
+                          "continue answer resets the budget FIX_ROUND_CEILING times per subtask before Stop is "
+                          "recommended",
     "apply_answer": "B6 strikeout_rounds: FIX_ROUND_CEILING recommended extra rounds per subtask, then proceeding is "
                     "recommended / B9 design_ask_rounds<=1, one question per ASK line / DRAFT_ROUNDS_MAX redrafts / "
                     "apply_reasks<=APPLY_REASK_MAX re-asks per escalation / user-driven choices",
@@ -46,7 +48,7 @@ BOUNDED = {
     "parse_answer": "B14 reask_rounds<=3 per escalation, not reset by apply_answer's APPLY_REASK_MAX re-asks",
     "interpret_route": "one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask",
     "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
-    "ci_poll": "B15 wall clock + poll fails<=3; review mode also stops at REVIEW_CI_POLL_CEILING per run",
+    "ci_poll": "B15 elapsed-time limit + CI_MAX_ROUNDS per watch + poll fails<=3; POLL_VISIT_BUDGET per run in every mode",
     "ci_gate": "publish_retries<=RERUN_ONCE git_ops re-runs after a failed publish check",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",

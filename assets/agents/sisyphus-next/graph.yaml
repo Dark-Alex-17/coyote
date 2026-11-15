@@ -69,11 +69,14 @@ variables:
     default: 'ci'
 
 settings:
-  # Engine backstop only: every cycle carries its own named bound in a script. Worst legitimate visit count of the most-visited node
-  # (run_gauntlet: 1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
-  # per review, x7 reviews (SUBTASK_MAX subtasks + the final whole-task review) = 42); user-driven review retries
-  # ride the headroom.
-  max_loop_iterations: 100
+  # Engine backstop only: the engine caps visits per node, and every cycle carries its own named bound in a script.
+  # The most-visited node is ci_poll: it revisits itself up to CI_MAX_ROUNDS (CI_WALL_SECS / CI_POLL_SLEEP = 240)
+  # times per watch, and the run-wide POLL_VISIT_BUDGET (1 initial watch + STRIKE_LIMIT CI fix re-watches + 1 watch
+  # of headroom = 5 x 240 = 1200) stops it by name first. One more watch granted at that budget still fits
+  # (1200 + 240 = 1440). run_gauntlet peaks at 42 (1 + 3 fix rounds + 1 debris re-run + 1 observability round = 6
+  # per review, x7 reviews: SUBTASK_MAX subtasks + the final whole-task review), and pr_review_poll at
+  # REVIEW_MAX_POLLS (80); user-driven retries ride the headroom. _lib.ENGINE_VISIT_CAP mirrors this value.
+  max_loop_iterations: 1500
   log_state_snapshots: true
   validate_before_run: true
   # Orchestration runs are long by design (the facade's choice); the islands that
@@ -792,14 +795,15 @@ nodes:
       Validate the A11 bound (B2, at most 6) and write tasklog.md; a plan over the
       bound (or none) raises the sizing_verdict escalation in a top-level run (hand it
       to the architect or narrow the scope), never trimmed, and ends in end_redirect
-      in a delegated run.
+      in a delegated run. A subtasks value that is missing or not a list ends in
+      end_blocked with a failure_reason naming its type.
     script: scripts/record_subtasks.py
     fallback: end_failure
 
   next_subtask:
     id: next_subtask
     type: script
-    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish.
+    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish. A broken or stale list or index heals from the sealed subtasks.json (ledgered) or ends in end_blocked with a failure_reason.
     script: scripts/next_subtask.py
     timeout: 60
     fallback: end_failure
@@ -1119,7 +1123,9 @@ nodes:
   escalate_gate:
     id: escalate_gate
     type: script
-    description: Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder.
+    description: >-
+      Ledger the escalation; interactive or hard trigger -> tier 4; autonomous -> the ladder;
+      a malformed escalation (missing, not an object, no kind or a blank question) -> end_blocked.
     script: scripts/escalate_gate.py
     fallback: end_failure
 
@@ -1231,7 +1237,8 @@ nodes:
     type: script
     description: >-
       Tier 4. Parks the run (A14) and picks the terminal prompt; away/unattended
-      top-level runs go through ask_owner first when the fork provides it.
+      top-level runs go through ask_owner first when the fork provides it; a
+      malformed escalation -> end_blocked instead of a prompt.
     script: scripts/ask_dispatch.py
     fallback: end_failure
 
@@ -1361,7 +1368,7 @@ nodes:
       names no option goes to interpret_reply; after that, unparseable re-asks (B14)
       then the free text stands, except that an empty reply to a multiple-choice
       prompt takes the recommended option; clears the parked marker; ledgers the
-      decision.
+      decision; a malformed escalation -> end_blocked.
     script: scripts/parse_answer.py
     fallback: end_failure
 
@@ -1462,6 +1469,8 @@ nodes:
     type: script
     description: The continuation switch on the escalation kind (design doc 2.3).
     script: scripts/apply_answer.py
+    # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each
+    timeout: 300
     fallback: end_failure
 
   # =====================================================================
@@ -1625,7 +1634,10 @@ nodes:
   route_coder_result:
     id: route_coder_result
     type: script
-    description: Sentinel switch + the 3-strike rule (B5) + CODER_REJECTED rounds (B7); a crashed verification gate is an engine fault to surface.
+    description: >-
+      Sentinel switch + the 3-strike rule (B5) + CODER_REJECTED rounds (B7), past STRIKE_LIMIT a
+      coder_rejected_cap escalation (Stop recommended after FIX_ROUND_CEILING cap resets); a crashed
+      verification gate is an engine fault to surface.
     script: scripts/route_coder_result.py
     fallback: end_failure
 
@@ -2106,14 +2118,17 @@ nodes:
       Check the publish step's git and PR state (one git_ops retry, then follow-ups, never a stop); watch checks
       only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
     script: scripts/ci_gate.py
-    # one GH_CALL_SECS read (90) for the PR check, a few local git calls and a margin
-    timeout: 150
+    # 2 x GH_CALL_SECS + 30: the flip confirmation runs gh pr ready and then gh pr view
+    timeout: 210
     fallback: final_report
 
   ci_poll:
     id: ci_poll
     type: script
-    description: Bounded self-loop over gh pr checks (pr-watch poll precedent; wall clock B15).
+    description: >-
+      Bounded self-loop over gh pr checks (pr-watch poll precedent; elapsed-time limit B15): CI_MAX_ROUNDS
+      visits per watch, POLL_VISIT_BUDGET visits per run, and an empty check list reads no_checks
+      only after CI_NO_CHECKS_SECS of the watch.
     script: scripts/ci_poll.py
     # CI_POLL_SLEEP (60) + one GH_CALL_SECS read (90) + 30 margin
     timeout: 180
@@ -2122,7 +2137,10 @@ nodes:
   ci_route:
     id: ci_route
     type: script
-    description: green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack.
+    description: >-
+      green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack;
+      inconclusive or no_checks -> escalate with every check and its bucket; poll_cap -> escalate
+      with the polls used against the poll budget.
     script: scripts/ci_route.py
     # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin
     timeout: 300

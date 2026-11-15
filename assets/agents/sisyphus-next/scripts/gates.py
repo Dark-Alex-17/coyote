@@ -21,9 +21,10 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
-    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_POLL_FAILS, CI_POLL_SLEEP,
-    CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
+    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
+    CI_PASS, CI_PENDING, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
+    ENGINE_VISIT_CAP, POLL_VISIT_BUDGET, CI_NO_CHECKS_SECS,
     OWNER_POLL_MINUTES,
     OWNER_REMOTE_INPUT, OWNER_WAIT_MINUTES, PROBE_HOUSE_NOTE, QUALITY_RE, REASK_MAX, RERUN_ONCE,
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
@@ -303,12 +304,16 @@ def intake(state):
         u["resume_mode"] = True
         for k in ("base_sha", "debt_base", "run_base_sha", "final_review", "subtask_tree", "subtask_head", "subtask_started_at",
                   "run_must_not_do", "final_rejections_from", "subtasks", "subtask_index", "current_task", "fix_round",
-                  "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
-                  "skipped_reviews", "debt_left_behind", "debris_exemptions", "design_decisions",
+                  "task_number", "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
+                  "skipped_reviews", "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
                   "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
+        idx = u.get("subtask_index")
+        if not as_int(u.get("task_number")) and type(idx) is int and idx > 0 and not truthy(u.get("final_review")):
+            u["task_number"] = idx
+            ledger(state, u, f"re-entry: run {run_id}'s state has no task_number; derived {idx} from subtask_index")
         u["resume_note"] = (
             f"Re-entry into run {run_id} (phase at exit: {prior.get('phase')}, base {prior.get('base_sha')}, "
             f"head {prior.get('head_sha')}, fix rounds {prior.get('fix_round')}, review rounds "
@@ -760,10 +765,12 @@ def _route_intent(state, u):
     elif truthy(state.get("architecture_scale")):
         u["subtasks"] = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
         u["subtask_index"] = 0
+        _seal_subtasks(state, u["subtasks"])
         u["_next"] = "architecture_review"
     else:
         u["subtasks"] = [{"title": "task", "outcome": state.get("brief", ""), "constraints": "", "acceptance_criteria": []}]
         u["subtask_index"] = 0
+        _seal_subtasks(state, u["subtasks"])
         u["_next"] = "next_subtask"
     snapshot(state, u, "route_intent")
     return u
@@ -809,9 +816,26 @@ def draft_fault(state):
 def record_subtasks(state):
     u = {}
     harvest_anomalies(state, u, "plan_subtasks")
+    if shape := _not_a_list(state.get("subtasks")):
+        u["failure_reason"] = (f"plan_subtasks returned no subtask list: subtasks is {shape}; nothing was planned or "
+                               "started")
+        ledger(state, u, f"subtasks: {u['failure_reason']}")
+        u["_next"] = "end_blocked"
+        return u
     subtasks = [s for s in as_list(state.get("subtasks")) if isinstance(s, dict)]
     subtasks = _fold_publish(state, u, subtasks)
     subtasks = _merge_tests_first(state, u, subtasks)
+    unique = list({json.dumps(s, sort_keys=True, default=str): s for s in subtasks}.values())
+    if len(unique) < len(subtasks):
+        # next_subtask rejects a list holding a duplicate, so one is never sealed
+        ledger(state, u, f"subtasks: dropped {len(subtasks) - len(unique)} exact duplicate subtask(s) before sealing")
+        subtasks = unique
+    if not subtasks and not str(state.get("plan_shaped_reason") or "").strip() and not truthy(state.get("top_level")):
+        u["failure_reason"] = ("plan_subtasks returned an empty subtask list and no plan-shaped reason; nothing was "
+                               "planned or started")
+        ledger(state, u, f"subtasks: {u['failure_reason']}")
+        u["_next"] = "end_blocked"
+        return u
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
         if truthy(state.get("top_level")):
@@ -819,6 +843,7 @@ def record_subtasks(state):
             ledger(state, u, f"subtasks: {len(subtasks)} planned, bound {SUBTASK_MAX}: {_one_line(why)}; asking")
             return _sizing_verdict(state, u, why, planned=[s.get("title") or s.get("outcome") or "" for s in subtasks])
         u["redirect_reason"] = f"Plan-shaped by A11: {why}. This wants an architect run."
+        ledger(state, u, f"subtasks: {len(subtasks)} planned, bound {SUBTASK_MAX}: {_one_line(why)}; redirected")
         u["_next"] = "end_redirect"
         return u
     lines = ["# In-run subtasks (A11)", ""]
@@ -831,6 +856,7 @@ def record_subtasks(state):
     if publish:
         lines += ["## Publish step (after review, checked by a script)", ""] + [f"- {c}" for c in publish] + [""]
     write_artifact(state.get("run_dir", ""), "tasklog.md", "\n".join(lines))
+    _seal_subtasks(state, subtasks)
     u["subtasks"] = subtasks
     u["subtask_index"] = 0
     ledger(state, u, f"subtasks: {len(subtasks)} sealed in-run subtasks recorded")
@@ -1028,10 +1054,119 @@ def _merge_tests_first(state, u, subtasks):
     return kept
 
 
+SEALED_SUBTASKS = "subtasks.json"
+
+
+def _not_a_list(raw):
+    """How a raw `subtasks` value fails to be a list (a JSON list in a str counts as one), or "" when it is one."""
+    if isinstance(raw, list):
+        return ""
+    if raw is None:
+        return "missing"
+    if isinstance(raw, str):
+        try:
+            if isinstance(json.loads(raw), list):
+                return ""
+        except json.JSONDecodeError:
+            pass
+        return f"a str ({_one_line(raw, 80)!r}), not a list"
+    return f"a {type(raw).__name__}, not a list"
+
+
+def _subtasks_problem(raw, idx):
+    """Why the subtask list and the index into it cannot be trusted to pick the next review, or ""."""
+    if shape := _not_a_list(raw):
+        return f"subtasks is {shape} (subtask_index {idx!r})"
+    subtasks = as_list(raw)
+    if not subtasks:
+        return f"subtasks is an empty list (subtask_index {idx!r})"
+    seen = {}
+    for i, s in enumerate(subtasks):
+        key = json.dumps(s, sort_keys=True, default=str)
+        if key in seen:
+            return f"subtasks holds a duplicate: index {i} repeats index {seen[key]} (subtask_index {idx!r})"
+        seen[key] = i
+    if idx is None:
+        return "subtask_index is missing"
+    if type(idx) is not int:
+        return f"subtask_index is a {type(idx).__name__} ({idx!r}), not an int"
+    if not 0 <= idx <= len(subtasks):
+        return f"subtask_index {idx} is out of step with the {len(subtasks)} subtasks"
+    return ""
+
+
+def _tasklog_subtasks(text):
+    """The subtasks record_subtasks wrote to tasklog.md, read back; criteria are single lines there."""
+    body = text.split("\n## Publish step", 1)[0]
+    parts = re.split(r"(?m)^## \d+\. (.*)$", body)
+    out = []
+    for title, section in zip(parts[1::2], parts[2::2]):
+        head, _, criteria = section.partition("\nAcceptance criteria:\n")
+        head, _, constraints = head.strip().partition("\n\nConstraints: ")
+        out.append({"title": title.strip(), "outcome": head.removeprefix("Outcome: ").strip(),
+                    "constraints": constraints.strip(),
+                    "acceptance_criteria": [l[2:] for l in criteria.splitlines() if l.startswith("- ")]})
+    return out
+
+
+def _sealed_subtasks(state):
+    """(list, source) from the run dir: the sealed list record_subtasks wrote (a resumed run keeps its run dir),
+    else the tasklog; ([], "") when neither holds one."""
+    run_dir = state.get("run_dir") or ""
+    raw = read_artifact(run_dir, SEALED_SUBTASKS) if run_dir else ""
+    try:
+        sealed = json.loads(raw) if raw else []
+    except json.JSONDecodeError:
+        sealed = []
+    if isinstance(sealed, list) and sealed:
+        return sealed, SEALED_SUBTASKS
+    logged = _tasklog_subtasks(read_artifact(run_dir, "tasklog.md")) if run_dir else []
+    return (logged, "tasklog.md") if logged else ([], "")
+
+
+def _subtasks_fault(state, u, why):
+    u["failure_reason"] = f"next_subtask: {why}; stopped so no subtask review is skipped"
+    ledger(state, u, u["failure_reason"])
+    u["_next"] = "end_blocked"
+    return None
+
+
+def _checked_subtasks(state, u):
+    """The subtask list to pop from, healed from the sealed list when the state's is broken; None after routing a
+    run whose list cannot be trusted to end_blocked, so no review is skipped without a stated reason."""
+    raw, idx = state.get("subtasks"), state.get("subtask_index")
+    subtasks = as_list(raw)
+    if problem := _subtasks_problem(raw, idx):
+        sealed, source = _sealed_subtasks(state)
+        still = _subtasks_problem(sealed, idx) if sealed else "no sealed subtask list in the run dir"
+        if still:
+            return _subtasks_fault(state, u, f"{problem}, and the list could not be rebuilt ({still})")
+        u["subtasks"] = subtasks = sealed
+        ledger(state, u, f"subtasks: {problem}; rebuilt the list of {len(sealed)} from {source}")
+    else:
+        sealed, source = _sealed_subtasks(state)
+        if source == SEALED_SUBTASKS and sealed != subtasks and not _subtasks_problem(sealed, idx):
+            u["subtasks"] = subtasks = sealed
+            ledger(state, u, f"subtasks: the state list of {len(as_list(raw))} differs from the sealed list; "
+                             f"rebuilt the list of {len(sealed)} from {source}")
+    # outside the final review the index advances with task_number, so a mismatch means one of them is stale
+    step = as_int(state.get("task_number"))
+    if not truthy(state.get("final_review")) and idx != step:
+        return _subtasks_fault(state, u, f"subtask_index {idx} is out of step with task_number {step}")
+    return subtasks
+
+
+def _seal_subtasks(state, subtasks):
+    """The list next_subtask heals from; every writer of `subtasks` seals it so a resumed run can rebuild it."""
+    write_artifact(state.get("run_dir", ""), SEALED_SUBTASKS, json.dumps(subtasks, indent=1, default=str))
+
+
 def next_subtask(state):
     u = {}
-    subtasks = as_list(state.get("subtasks"))
-    idx = as_int(state.get("subtask_index"))
+    subtasks = _checked_subtasks(state, u)
+    if subtasks is None:
+        return u
+    idx = state.get("subtask_index")
     if idx >= len(subtasks):
         if len(subtasks) > 1 and not truthy(state.get("final_review")):
             return _start_final_review(state, u, len(subtasks))
@@ -1053,7 +1188,7 @@ def next_subtask(state):
         "current_task": text, "task_number": idx + 1, "subtask_index": idx + 1,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False, "oracle_retries": 0,
-        "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "context_pack": "",
+        "design_ask_rounds": 0, "rejected_rounds": 0, "rejected_cap_resets": 0, "strikeout_rounds": 0, "context_pack": "",
         "context_pack_degraded": False, "explore_findings": [], "librarian_findings": [],
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
@@ -1094,7 +1229,8 @@ def _start_final_review(state, u, n):
         "final_review": True, "base_sha": base, "debt_base": base, "current_task": task,
         "fix_strikes": 0, "fix_round": 0, "review_rounds": 0, "debt_rounds": 0, "obs_rounds": 0,
         "lane_block_streak": {}, "debris_reruns": 0, "round_heads": [], "oracle_consulted": False,
-        "oracle_retries": 0, "design_ask_rounds": 0, "rejected_rounds": 0, "strikeout_rounds": 0, "coder_brief": brief,
+        "oracle_retries": 0, "design_ask_rounds": 0, "rejected_rounds": 0, "rejected_cap_resets": 0, "strikeout_rounds": 0,
+        "coder_brief": brief,
         "expected_files": [],
         "fix_instructions": "", "gauntlet_lanes": {}, "run_must_not_do": guards, "subtask_changed_files": None,
         # rejections made against a subtask's scope are no ruling on the parent criteria
@@ -1351,6 +1487,8 @@ def _pick_with_note(text, options):
 
 def escalate_gate(state):
     u = {}
+    if _escalation_fault(state, u, "escalate_gate"):
+        return u
     esc = as_dict(state.get("escalation"))
     kind = esc.get("kind", "unknown")
     ledger(state, u, f"escalation: {kind}: {tail(esc.get('question', ''), 200)}")
@@ -1462,8 +1600,32 @@ def _terminal_prompt(esc):
     return _TERMINAL_PROMPTS.get(esc.get("kind"), "ask_user")
 
 
+def _escalation_fault(state, u, node):
+    """Route a run whose `escalation` holds no askable question to end_blocked with the bad state named, and say so.
+
+    as_dict reads a list or a malformed value as {}, which would otherwise reach a prompt with no question at all."""
+    raw = state.get("escalation")
+    esc = as_dict(raw)
+    if raw is None or raw == "" or raw == {}:
+        shape = "missing"
+    elif not esc:
+        shape = f"a {type(raw).__name__} ({_one_line(json.dumps(raw, default=str), 120)}), not an object"
+    elif not str(esc.get("kind") or "").strip():
+        shape = f"an object without a kind (keys: {', '.join(sorted(map(str, esc)))})"
+    elif not str(esc.get("question") or "").strip():
+        shape = f"a {esc.get('kind')} escalation with an empty question"
+    else:
+        return False
+    u["failure_reason"] = f"{node}: the escalation state is {shape}, so there is no question to ask"
+    ledger(state, u, u["failure_reason"])
+    u["_next"] = "end_blocked"
+    return True
+
+
 def ask_dispatch(state):
     u = {}
+    if _escalation_fault(state, u, "ask_dispatch"):
+        return u
     esc = as_dict(state.get("escalation"))
     u["parked"] = esc.get("kind", "")
     snapshot(state, u, "parked")
@@ -1516,6 +1678,8 @@ def ask_owner_route(state):
 
 def parse_answer(state):
     u = {}
+    if _escalation_fault(state, u, "parse_answer"):
+        return u
     esc = as_dict(state.get("escalation"))
     text = (state.get("last_answer_text") or state.get("last_answer") or "").strip()
     options = esc.get("options") or []
@@ -1575,6 +1739,7 @@ ACCEPTED_INSTRUCTIONS = {
     "sizing_verdict": ("narrow",),
     "clarify_cap": ("answer",),
     "sizing_cap": ("here",),
+    "coder_rejected_cap": ("answer",),
 }
 INSTRUCTION_HELP = {
     "answer": "answer the question in the user's own words; value: the answer",
@@ -1801,7 +1966,7 @@ STOP_REPLIES = ("stop", "abort", "abort the run", "abort this task", "abort and 
 # the kinds whose apply_answer branch reads a whole-reply stop; only these take a bare "abort" without interpreting it
 STOP_AWARE_KINDS = ("clarify", "clarify_cap", "handoff_confirm", "handoff_path", "sizing_verdict", "sizing_narrow",
                     "sizing_cap", "oracle_fault", "engine_fault", "plan_defect", "review_incomplete", "strikeout",
-                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment")
+                    "lane_stuck", "review_exhausted", "scope_breach", "pr_review_owner_judgment", "coder_rejected_cap")
 
 
 def _whole_reply_stop(answer, options=(), stop_options=None):
@@ -2078,6 +2243,24 @@ def apply_answer(state):
         u["fix_source"] = "rejected"
         u["fix_note"] = answer
         u["_next"] = "compose_fix"
+    elif kind == "coder_rejected_cap" and stop:
+        u["failure_reason"] = (f"stopped at the user's request after the coder's plan was rejected "
+                               f"{as_int(as_dict(esc.get('data')).get('rounds'))} times: {answer}")
+        u["_next"] = "end_blocked"
+    elif kind == "coder_rejected_cap":
+        # any reply that is no stop states the changes for the next plan; a bare pick re-plans against the last rejection
+        rounds = as_int(as_dict(esc.get("data")).get("rounds"))
+        reason = _stated_reason(answer, options)
+        if reason == NO_STATED_REASON:
+            reason = ("No changes were stated; address the last rejection:\n"
+                      + str(as_dict(esc.get("data")).get("last_rejection") or "(none recorded)"))
+        resets = as_int(state.get("rejected_cap_resets")) + 1
+        u.update({"rejected_rounds": 0, "rejected_cap_resets": resets, "fix_source": "rejected", "fix_note": reason})
+        ledger(state, u, f"coder: rejection budget reset after {rounds} rejected rounds at the user's pick "
+                         f"({resets}/{FIX_ROUND_CEILING} resets this subtask"
+                         + (", past the ceiling at the user's pick" if resets > FIX_ROUND_CEILING else "")
+                         + f"); planning again with: {tail(reason, 300)}")
+        u["_next"] = "compose_fix"
     elif kind == "engine_fault":
         if stop:
             u["failure_reason"] = "aborted: a verification gate crashed (engine fault)"
@@ -2128,6 +2311,7 @@ def apply_answer(state):
             subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
             cur = max(as_int(state.get("subtask_index")) - 1, 0)
             subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [answer]
+            _seal_subtasks(state, subtasks)
             u["subtasks"] = subtasks
             ledger(state, u, f"plan amendment (user) to subtask {cur + 1}: {answer}")
             u["_next"] = "build_gauntlet_prompt"
@@ -2217,8 +2401,7 @@ def apply_answer(state):
         if a is None and not stop:
             _reask_unmatched(state, u, esc, answer)
         elif a == "rerun" and not stop:
-            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                      "ci_failing": []})
+            _reset_ci_watch(u)
             u["_next"] = "ci_poll"
         elif a == "fix" and not stop:
             u["fix_source"] = "ci"
@@ -2232,13 +2415,77 @@ def apply_answer(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"PR left in draft with CI {state.get('ci_status') or 'unresolved'}: {tail(state.get('ci_diagnosis', ''), 300)}"]
             u["_next"] = "final_report"
-    elif kind == "ci_poll_cap":
-        if _watch_started(state):
-            stopped = f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING ({REVIEW_CI_POLL_CEILING})"
+    elif kind in ("ci_inconclusive", "ci_no_checks"):
+        data = as_dict(esc.get("data"))
+        status = "no_checks" if kind == "ci_no_checks" else "inconclusive"
+        non_pass = ", ".join(f"{n} ({b})" for n, b in as_list(data.get("non_pass"))) or "no CI checks reported"
+        a = _answered(state, {"rerun": ["re-run", "rerun", "keep waiting", "wait"],
+                              "green": ["treat as green", "finish without ci"],
+                              "leave": ["leave", "draft", "report", "stop"]})
+        if a is None and not stop:
+            _reask_unmatched(state, u, esc, answer)
+        elif a == "rerun" and not stop:
+            root = state.get("git_root") or state.get("project_dir") or "."
+            done = [str(r) for r in as_list(state.get("ci_rerun_ids"))]
+            runs = {}
+            for name, link in as_list(data.get("cancelled")):
+                if not (m := re.search(r"/actions/runs/(\d+)", link or "")):
+                    ledger(state, u, f"ci: cancelled check {name} names no run; not re-run")
+                elif m.group(1) in done:
+                    ledger(state, u, f"ci: cancelled run {m.group(1)} ({name}) was already re-run this run; not re-run")
+                else:
+                    runs.setdefault(m.group(1), []).append(name)
+            for i, (run_id, names) in enumerate(runs.items()):
+                if i >= CI_LOG_RUNS_MAX:
+                    ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) not re-run (CI_LOG_RUNS_MAX reached)")
+                else:
+                    done.append(run_id)
+                    if _rerun_failed(root, run_id):
+                        ledger(state, u, f"ci: re-ran cancelled run {run_id} ({', '.join(names)})")
+                    else:
+                        ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) re-run call failed")
+            _reset_ci_watch(u)
+            # a re-run run is never offered again, so a run that stays cancelled cannot loop a headless pick;
+            # ci_polls 1 makes the first re-poll sleep instead of reading the same cancelled state at once
+            u["ci_rerun_ids"] = done
+            u["ci_polls"] = 1
+            u["_next"] = "ci_poll"
+        elif a == "green" and not stop:
+            reason = _stated_reason(answer, options)
+            if status == "no_checks":
+                ledger(state, u, f"ci: finished without CI at the user's say-so ({reason}); no CI checks reported")
+                note = "CI never ran: the PR reports no CI checks; finished without CI"
+                text = "The PR reports no CI checks and the user chose to finish without CI: flip the PR to ready."
+            else:
+                ledger(state, u, f"ci: inconclusive treated as green at the user's say-so ({reason}); non-pass checks: {non_pass}")
+                note = f"CI treated as green with non-pass checks: {non_pass}"
+                text = (f"Not every CI check passed ({non_pass}) and the user chose to treat CI as green: "
+                        "flip the PR to ready.")
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"{note} (reason: {reason})"]
+            u["ci_green_by"] = status
+            _ci_finish_green(state, u, f"{status} accepted", text)
+        elif _watch_started(state):
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Review watch stopped with CI {status} on the ready PR: {non_pass}"]
+            u["_next"] = "final_report"
         else:
-            stopped = f"CI watch stopped: the run's CI polls reached the ceiling ({REVIEW_CI_POLL_CEILING})"
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
-        u["_next"] = "final_report"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR left in draft with CI {status}: {non_pass}"]
+            u["_next"] = "final_report"
+    elif kind == "ci_poll_cap":
+        a = "stop" if stop else _answered(state, {"keep": ["keep waiting"], "stop": ["leave", "stop", "report"]}, "stop")
+        budget = _ci_poll_budget(state)
+        if a == "keep" and _ci_watch_fits(state):
+            _reset_ci_watch(u)
+            u["ci_poll_budget"] = as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS
+            ledger(state, u, f"ci: one more watch inside the engine cap (run-wide budget now {u['ci_poll_budget']} polls)")
+            u["_next"] = "ci_poll"
+        else:
+            if _watch_started(state):
+                stopped = f"Review watch stopped: the run's CI polls reached the {_ci_poll_limit_name(state)} ({budget})"
+            else:
+                stopped = f"CI watch stopped: the run's CI polls reached the run-wide budget ({budget}); the PR stays in draft"
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [stopped]
+            u["_next"] = "final_report"
     elif kind == "pr_review_push_unconfirmed":
         a = "stop" if stop else _answered(state, {"retry": ["retry"], "stop": ["stop"]})
         if a is None:
@@ -2247,7 +2494,7 @@ def apply_answer(state):
             u["_next"] = "pr_review_resolve"
         else:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
-                f"PR review watch stopped: the review fix push to PR #{_pr_ref(state)} was not confirmed; "
+                f"PR review watch stopped: the review fix push to {_pr_label(state)} was not confirmed; "
                 "no review thread was resolved"]
             u["_next"] = "final_report"
     elif kind == "pr_review_closed":
@@ -2281,7 +2528,7 @@ def apply_answer(state):
     elif kind == "pr_review_truncated":
         what = ", ".join(str(t) for t in as_list(state.get("pr_review_truncated"))) or "unknown"
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
-            f"PR review watch stopped: the review read of PR #{_pr_ref(state)} was truncated ({what}); "
+            f"PR review watch stopped: the review read of {_pr_label(state)} was truncated ({what}); "
             "read the review items on GitHub"]
         u["_next"] = "final_report"
     elif kind == "pr_review_owner_judgment" and as_list(as_dict(esc.get("data")).get("untrusted")):
@@ -2290,7 +2537,7 @@ def apply_answer(state):
         if a is None:
             _reask_unmatched(state, u, esc, answer, exhausted=_watch_unanswered(state, kind))
         elif a == "skip":
-            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {len(untrusted)} untrusted item(s) skipped")
+            ledger(state, u, f"review-watch: {_pr_label(state)} {len(untrusted)} untrusted item(s) skipped")
             u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + [
                 {"id": i.get("id"), "kind": i.get("kind"), "url": i.get("url", ""),
                  "reason": "untrusted author; skipped at the owner's say-so", "action": "skip"} for i in untrusted]
@@ -2468,6 +2715,11 @@ def inbox_route(state):
     return u
 
 
+# Past the rejection budget: another plan round with the user's changes, or a stop.
+REJECTED_CONTINUE = "Plan again with these changes (state them)"
+REJECTED_STOP = "Stop and report"
+
+
 def _coder_error_tail(result):
     m = re.search(r"(Verification gate error:.*)", result, re.S)
     body = m.group(1) if m else result
@@ -2490,9 +2742,21 @@ def route_coder_result(state):
         u["rejected_rounds"] = rounds
         u["coder_sentinel"] = "CODER_REJECTED"
         if rounds > STRIKE_LIMIT:
-            u["failure_reason"] = f"the coder's plan was rejected {rounds} times"
-            u["_next"] = "end_blocked"
-            return u
+            last = tail(result, 1500)
+            resets = as_int(state.get("rejected_cap_resets"))
+            # past the ceiling Stop is recommended, so a headless run ends instead of resetting forever
+            spent = resets >= FIX_ROUND_CEILING
+            note = f"{resets}/{FIX_ROUND_CEILING} rejection budget resets used in this subtask"
+            ledger(state, u, f"coder: plan rejected {rounds} times, past the STRIKE_LIMIT budget of {STRIKE_LIMIT}; asking")
+            return raise_escalation(state, u, escalation(
+                "coder_rejected_cap", f"The coder's plan was rejected {rounds} times, past the budget of "
+                                      f"{STRIKE_LIMIT}. Plan again with your changes, or stop?",
+                [option(REJECTED_CONTINUE, not spent,
+                        f"the rejection budget starts over; your changes go to the coder; {note}"),
+                 option(REJECTED_STOP, spent)],
+                evidence=f"Rejected rounds used: {rounds} (budget STRIKE_LIMIT = {STRIKE_LIMIT})\n"
+                         f"{note}\nLast rejection (tail):\n{last}",
+                hard_trigger=True, tier3_ok=False, data={"rounds": rounds, "last_rejection": last}))
         return raise_escalation(state, u, escalation(
             "coder_rejected",
             "The coder's plan was rejected at the approval gate. What should change before it plans again?",
@@ -2710,13 +2974,21 @@ def bookkeeping_scan(state):
     base = state.get("base_sha") or ""
     hits = state.get("debt_hits") or ""
     items = []
+    failures = dict(as_dict(state.get("debt_scan_failures")))
+    scope = ("final review" if truthy(state.get("final_review"))
+             else f"subtask {as_int(state.get('task_number'))}" if as_list(state.get("subtasks")) else "task")
     if crashed:
         # The engine leaves debt_hits untouched on a crash, so it holds the initial_state
         # default (first pass) or a previous round's report; neither describes this worktree.
         if not hits.startswith("DEBT_SCAN_FAILED"):
-            u["debt_hits"] = DEBT_HITS_STALE
+            hits = u["debt_hits"] = DEBT_HITS_STALE
             ledger(state, u, "debt_scan: the node did not run this round; the previous round's report was discarded")
+    if hits.startswith("DEBT_SCAN_FAILED"):
+        failures[scope] = hits.splitlines()[0].removeprefix("DEBT_SCAN_FAILED:").strip()
+        # the reason is in debt_hits and the report; the crash text would read as a second discard here
+        ledger(state, u, f"debt_scan: scan FAILED ({scope}); the diff was not scanned and the report lists the failure")
     else:
+        failures.pop(scope, None)
         for line in hits.splitlines():
             m = re.match(r"^(\S+?:\d+)\s+--\s+(.*)$", line.strip())
             if not m:
@@ -2724,6 +2996,7 @@ def bookkeeping_scan(state):
             owner = re.search(r"\b[A-Z][A-Z0-9]+-\d{2,}\b", m.group(2))
             items.append({"where": m.group(1), "text": m.group(2).strip(), "owner": owner.group(0) if owner else ""})
     u["debt_items"] = items
+    u["debt_scan_failures"] = failures
     u["changed_files"] = changed_files_since(root, base)
     u["diff_stat"] = tail(git_out(root, "diff", "--stat", base) if base else git_out(root, "diff", "--stat", "HEAD"), 3000)
     u["head_sha"] = git_out(root, "rev-parse", "HEAD", default=state.get("head_sha", ""))
@@ -3450,7 +3723,7 @@ def pr_gate(state):
     if _review_mode(state) and truthy(state.get("ci_owner")) and truthy(state.get("flip_ready")):
         u["git_task"] = {"kind": "push_fix", "return_to": "ci_gate", "commit": True, "push": True,
                          "open_pr": False, "draft": False, "flip_ready": False,
-                         "text": f"Commit the CI fix and push the CURRENT branch (the PR head of PR #{_pr_ref(state)}). "
+                         "text": f"Commit the CI fix and push the CURRENT branch (the PR head of {_pr_label(state)}). "
                                  "Do NOT open a PR and do NOT change draft state."}
         u["_next"] = "git_ops"
         return u
@@ -3486,7 +3759,7 @@ def _publish_asks(state):
 def _review_update_text(state, pending):
     fixed = [f"- {_item_ref(p)}: {p.get('text', '')}" for p in pending if p.get("action") == "fix"]
     skipped = [f"- {_item_ref(p)}: {p.get('reason', '')}" for p in pending if p.get("action") != "fix"]
-    lines = [f"Commit the review fixes and push the CURRENT branch (the PR head of PR #{_pr_ref(state)}). "
+    lines = [f"Commit the review fixes and push the CURRENT branch (the PR head of {_pr_label(state)}). "
              "Do NOT open a PR and do NOT change draft state. Post ONE new top-level PR comment titled "
              "'## Update @ <full head SHA>' mapping each addressed item below (url) to the commit that addresses it, "
              "one line each, plus each item deliberately NOT addressed and why. "
@@ -3514,6 +3787,7 @@ def ci_gate(state):
     task = as_dict(state.get("git_task"))
     ret = task.get("return_to") or "final_report"
     if task.get("kind") == "flip_ready":
+        _confirm_pr_ready(state, u)
         if _review_mode(state) and truthy(state.get("ci_owner")):
             return _start_review_watch(state, u)
         u["_next"] = "final_report"
@@ -3522,8 +3796,8 @@ def ci_gate(state):
         u["_next"] = "pr_review_resolve"
         return u
     if task.get("kind") == "push_fix":
-        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                  "ci_failing": []})
+        _reset_ci_watch(u)
+        u["ci_rerun_ids"] = []
         u["_next"] = "ci_poll"
         return u
     if ret == "run_coder":
@@ -3557,15 +3831,25 @@ def ci_gate(state):
             ledger(state, u, f"publish: every check passed ({', '.join(n for n, _, _ in rows)})")
     owns = task.get("open_pr") and not truthy(state.get("delegated"))
     u["ci_owner"] = bool(owns)
-    if owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or ""):
-        u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                  "ci_failing": []})
-        if _review_mode(state) and not (state.get("pr_ref") or "").strip():
-            u["pr_ref"] = _pr_ref(state)
+    linked = owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or "")
+    # gh pr ready and gh pr checks run only against this saved ref, so it is always the current branch's PR
+    ref = (str(state.get("pr_ref") or "").strip() or _branch_pr_ref(state)) if linked else ""
+    if ref:
+        _reset_ci_watch(u)
+        u["ci_rerun_ids"] = []
+        u["pr_ref"] = ref
         u["_next"] = "ci_poll"
     else:
-        if task.get("open_pr") and not owns:
-            ledger(state, u, "ci: PR lifecycle owned by the parent orchestrator; left in draft")
+        if not task.get("open_pr"):
+            note = "not watched: this run opened no PR"
+        elif not owns:
+            note = "not watched: the PR lifecycle is owned by the parent orchestrator"
+        elif not linked:
+            note = "not watched: no PR link found in the publish report"
+        else:
+            note = "not watched: no PR found for the current branch"
+        u["ci_watch_note"] = note
+        ledger(state, u, f"ci: {note}" + ("; left in draft" if task.get("open_pr") and not owns else ""))
         if _review_mode(state) and truthy(state.get("delegated")) and task.get("open_pr"):
             ledger(state, u, "review-watch: not started: PR lifecycle owned by the parent orchestrator")
         u["_next"] = "final_report"
@@ -3613,21 +3897,67 @@ def _publish_checks(state):
     return rows
 
 
-def _pr_view(state):
-    """The current branch's PR as `gh pr view` reports it, or None when it cannot say."""
+def _pr_view(state, ref=""):
+    """The PR named by ref (the current branch's when ref is empty) as `gh pr view` reports it, or None."""
     root = state.get("git_root") or state.get("project_dir") or "."
     cmd = os.environ.get("SISYPHUS_GH_PR_VIEW_CMD")
     try:
         if cmd:
             # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
-            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_PR_REF": ref})
         else:
-            p = subprocess.run(["gh", "pr", "view", "--json", "url,isDraft,headRefName,body"],
+            p = subprocess.run(["gh", "pr", "view", *([ref] if ref else []), "--json", "number,url,isDraft,headRefName,body"],
                                cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
         doc = json.loads(p.stdout) if p.returncode == 0 else None
         return doc if isinstance(doc, dict) else None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _pr_ready(state):
+    """The return code of one `gh pr ready` on the run's PR, or None when the call could not run."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    ref = str(state.get("pr_ref") or "").strip()
+    cmd = os.environ.get("SISYPHUS_GH_PR_READY_CMD")
+    try:
+        if cmd:
+            # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
+            p = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS,
+                               env={**os.environ, "SISYPHUS_PR_REF": ref})
+        else:
+            p = subprocess.run(["gh", "pr", "ready", *([ref] if ref else [])], cwd=root, capture_output=True,
+                               text=True, timeout=GH_CALL_SECS)
+        return p.returncode
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _confirm_pr_ready(state, u):
+    """Confirm the flip only when `gh pr ready` exits 0 and a re-read of the same PR shows it is not a draft and
+    its head is the current branch."""
+    if not str(state.get("pr_ref") or "").strip():
+        confirmed, detail = False, ("gh pr ready not run: no PR ref (no PR found for the current branch when "
+                                    "the watch started)")
+    else:
+        root = state.get("git_root") or state.get("project_dir") or "."
+        branch = git_out(root, "branch", "--show-current", default="")
+        rc = _pr_ready(state)
+        pr = _pr_view(state, str(state["pr_ref"]).strip())
+        head = None if pr is None else pr.get("headRefName")
+        on_branch = bool(branch) and head == branch
+        seen = "gh pr view failed" if pr is None else f"isDraft {json.dumps(pr.get('isDraft'))}" + (
+            "" if on_branch else f", head {head!r} is not the current branch {branch!r}")
+        confirmed = rc == 0 and pr is not None and pr.get("isDraft") is False and on_branch
+        detail = ("gh pr ready did not run" if rc is None else f"gh pr ready rc {rc}") + f", then {seen}"
+    u["pr_ready_confirmed"] = confirmed
+    u["pr_ready_detail"] = detail
+    if confirmed:
+        ledger(state, u, f"ci: PR flip to ready confirmed ({detail})")
+    else:
+        watch = "; the review watch starts anyway" if _review_mode(state) and truthy(state.get("ci_owner")) else ""
+        ledger(state, u, f"ci: PR flip to ready NOT confirmed ({detail}){watch}")
+        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR flip to ready not confirmed: {detail}{watch}"]
 
 
 def _review_mode(state):
@@ -3646,7 +3976,7 @@ def _start_review_watch(state, u):
     if not as_int(state.get("pr_review_started_at")):
         u["pr_review_started_at"] = int(time.time())
     u.update({"pr_review_watch_polls": 0, "pr_review_poll_fails": 0, "pr_review_status": "pending"})
-    ledger(state, u, f"review-watch: PR #{_pr_ref(state)} watching")
+    ledger(state, u, f"review-watch: {_pr_label(state)} watching")
     u["_next"] = "pr_review_poll"
     return u
 
@@ -3659,8 +3989,9 @@ def _remote_head(state):
             # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
         else:
-            p = subprocess.run(["gh", "pr", "view", _pr_ref(state), "--json", "headRefOid", "-q", ".headRefOid"],
-                               cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
+            p = subprocess.run(["gh", "pr", "view", *([_pr_ref(state)] if _pr_ref(state) else []), "--json",
+                                "headRefOid", "-q", ".headRefOid"], cwd=root, capture_output=True, text=True,
+                               timeout=GH_CALL_SECS)
         return p.stdout.strip() if p.returncode == 0 else ""
     except Exception:  # noqa: BLE001
         return ""
@@ -3670,16 +4001,16 @@ def pr_review_resolve(state):
     u = {}
     note_script_error(state, u, "ci_gate")
     started = time.time()
-    pr = _pr_ref(state)
+    pr = _pr_label(state)
     root = state.get("git_root") or state.get("project_dir") or "."
     head = git_out(root, "rev-parse", "HEAD", default="")
     remote = _remote_head(state)
     if not head or remote != head:
-        ledger(state, u, f"review-watch: PR #{pr} push not confirmed (remote {remote or 'unreadable'}, "
+        ledger(state, u, f"review-watch: {pr} push not confirmed (remote {remote or 'unreadable'}, "
                          f"local {head or 'unreadable'})")
         return raise_escalation(state, u, escalation(
             "pr_review_push_unconfirmed",
-            f"PR #{pr}: the review fix push is not confirmed (remote head {remote or 'unreadable'}, local HEAD "
+            f"{pr}: the review fix push is not confirmed (remote head {remote or 'unreadable'}, local HEAD "
             f"{head or 'unreadable'}), so no review thread was resolved. How to proceed?",
             [option("Retry the push check"), option("Stop watching and report", recommended=True)],
             hard_trigger=True))
@@ -3707,11 +4038,11 @@ def pr_review_resolve(state):
     follow_ups = [f"Review thread {t}: reply failed" for t in reply_failed] + [
         f"Review thread {t}: resolve failed" for t in resolve_failed]
     if left:
-        ledger(state, u, f"review-watch: PR #{pr} {len(left)} thread(s) left unresolved (deadline)")
+        ledger(state, u, f"review-watch: {pr} {len(left)} thread(s) left unresolved (deadline)")
         follow_ups.append(f"Review threads left unresolved at the resolve deadline: {', '.join(left)}")
     if follow_ups:
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + follow_ups
-    line = (f"review-watch: PR #{pr} fix round {as_int(state.get('pr_review_rounds'))} pushed @ {head}; "
+    line = (f"review-watch: {pr} fix round {as_int(state.get('pr_review_rounds'))} pushed @ {head}; "
             f"{resolved} thread(s) resolved, {replied} no-change thread(s) replied")
     if reply_failed:
         line += f"; {len(reply_failed)} reply failed: {', '.join(reply_failed)}"
@@ -3720,8 +4051,8 @@ def pr_review_resolve(state):
     ledger(state, u, line)
     u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + pending
     u["pr_review_pending"] = []
-    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-              "ci_failing": []})
+    _reset_ci_watch(u)
+    u["ci_rerun_ids"] = []
     u["_next"] = "ci_poll"
     return u
 
@@ -3729,7 +4060,7 @@ def pr_review_resolve(state):
 def pr_review_reply(state):
     u = {}
     started = time.time()
-    pr = _pr_ref(state)
+    pr = _pr_label(state)
     replied, failed, left = 0, [], []
     for p in [p for p in as_list(state.get("pr_review_reply_pending")) if isinstance(p, dict)]:
         tid = str(p.get("id") or "")
@@ -3739,13 +4070,13 @@ def pr_review_reply(state):
             replied += 1
         else:
             failed.append(tid)
-    line = f"review-watch: PR #{pr} {replied} no-change thread(s) replied"
+    line = f"review-watch: {pr} {replied} no-change thread(s) replied"
     if failed:
         line += f"; {len(failed)} reply failed: {', '.join(failed)}"
     ledger(state, u, line)
     follow_ups = [f"Review thread {t}: reply failed" for t in failed]
     if left:
-        ledger(state, u, f"review-watch: PR #{pr} {len(left)} no-change thread(s) left without a reply (deadline)")
+        ledger(state, u, f"review-watch: {pr} {len(left)} no-change thread(s) left without a reply (deadline)")
         follow_ups.append(f"Review threads left without a reply at the reply deadline: {', '.join(left)}")
     if follow_ups:
         u["follow_ups"] = list(as_list(state.get("follow_ups"))) + follow_ups
@@ -3792,31 +4123,86 @@ def _resolve_thread(state, thread_id):
         return False
 
 
-def _pr_ref(state):
-    if ref := str(state.get("pr_ref") or "").strip():
-        return ref
-    rep = state.get("git_report") or ""
-    if m := re.search(r"https://github\.com/[^\s)]+/pull/(\d+)", rep):
+def _branch_pr_ref(state):
+    """The current branch's PR number per gh pr view, else the first pull URL in the publish report whose PR has
+    the current branch as its head, else an empty string. A bare #N in the report is never a ref."""
+    pr = _pr_view(state) or {}
+    if m := re.search(r"/pull/(\d+)", str(pr.get("url") or "")):
         return m.group(1)
-    if m := re.search(r"#(\d+)", rep):
-        return m.group(1)
+    number = pr.get("number")
+    if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+        return str(number)
+    root = state.get("git_root") or state.get("project_dir") or "."
+    branch = git_out(root, "branch", "--show-current", default="")
+    for ref in re.findall(r"https://github\.com/[^\s)]+/pull/(\d+)", state.get("git_report") or ""):
+        if branch and (_pr_view(state, ref) or {}).get("headRefName") == branch:
+            return ref
     return ""
 
 
+def _pr_ref(state):
+    return str(state.get("pr_ref") or "").strip()
+
+
+def _pr_label(state):
+    return f"PR #{_pr_ref(state)}" if _pr_ref(state) else "PR (current branch)"
+
+
+CI_KEEP_WAITING = "Keep waiting (re-run the watch)"
+CI_RERUN_CANCELLED = "Re-run the cancelled checks and watch again"
+CI_TREAT_GREEN = "Treat as green (state reason; the non-pass checks are named in the evidence)"
+CI_NO_CI = "Finish without CI (no checks configured; recorded)"
+CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
+
+
+def _reset_ci_watch(u):
+    u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": [],
+              "ci_green_by": ""})
+
+
+def _ci_poll_budget(state):
+    """The ci_poll visit budget: POLL_VISIT_BUDGET or the one a keep-waiting answer raised, lowered to
+    REVIEW_CI_POLL_CEILING once the review watch has started."""
+    budget = as_int(state.get("ci_poll_budget")) or POLL_VISIT_BUDGET
+    return min(budget, REVIEW_CI_POLL_CEILING) if _watch_started(state) else budget
+
+
+def _ci_poll_limit_name(state):
+    return "review-mode ceiling" if _watch_started(state) else "run-wide budget"
+
+
+def _ci_watch_fits(state):
+    """Whether a keep-waiting answer may add one more watch; the review-mode ceiling is never raised."""
+    return not _watch_started(state) and as_int(state.get("ci_polls_run")) + CI_MAX_ROUNDS < ENGINE_VISIT_CAP
+
+
+def _ci_leave_option(state):
+    return "Stop watching and report" if _watch_started(state) else "Leave the PR in draft and report"
+
+
+def _ci_finish_green(state, u, note, text):
+    if _review_mode(state) and truthy(state.get("flip_ready")):
+        ledger(state, u, f"ci: {note} -> back to the review watch")
+        return _start_review_watch(state, u)
+    u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True, "text": text}
+    u["flip_ready"] = True
+    ledger(state, u, f"ci: {note} -> flip to ready")
+    u["_next"] = "git_ops"
+    return u
+
+
 def ci_poll(state):
-    u = {}
-    if _review_mode(state):
-        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
-        if _watch_started(state) and u["ci_polls_run"] >= REVIEW_CI_POLL_CEILING:
-            u["ci_status"] = "poll_cap"
-            u["_next"] = "ci_route"
-            return u
+    u = {"ci_polls_run": as_int(state.get("ci_polls_run")) + 1}
+    if u["ci_polls_run"] >= _ci_poll_budget(state):
+        u["ci_status"] = "poll_cap"
+        u["_next"] = "ci_route"
+        return u
     polls = as_int(state.get("ci_polls"))
     started = as_int(state.get("ci_started_at")) or int(time.time())
     if polls > 0:
         time.sleep(int(os.environ.get("SISYPHUS_CI_SLEEP", CI_POLL_SLEEP)))
     u["ci_polls"] = polls + 1
-    if time.time() - started > CI_WALL_SECS:
+    if time.time() - started > CI_WALL_SECS or polls + 1 > CI_MAX_ROUNDS:
         u["ci_status"] = "timeout"
         u["_next"] = "ci_route"
         return u
@@ -3828,9 +4214,15 @@ def ci_poll(state):
             # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
         else:
-            p = subprocess.run(["gh", "pr", "checks", pr, "--json", "name,state,bucket,link"], cwd=root,
-                               capture_output=True, text=True, timeout=GH_CALL_SECS)
-        data = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+            p = subprocess.run(["gh", "pr", "checks", *([pr] if pr else []), "--json", "name,state,bucket,link"],
+                               cwd=root, capture_output=True, text=True, timeout=GH_CALL_SECS)
+        if p.returncode == 0 and p.stdout.strip():
+            data = json.loads(p.stdout)
+        elif p.returncode != 0 and "no checks reported" in f"{p.stdout}\n{p.stderr}".lower():
+            # gh exits non-zero on a PR without CI checks; that is an empty check list, not a failed read
+            data = []
+        else:
+            data = None
     except Exception:  # noqa: BLE001
         data = None
     if data is None:
@@ -3843,47 +4235,88 @@ def ci_poll(state):
             u["_next"] = "ci_poll"
         return u
     u["ci_poll_fails"] = 0
-    buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "").lower(), c.get("link", "")) for c in data]
-    failing = [(n, l) for n, b, l in buckets if b in ("fail", "failure", "cancelled")]
-    pending = [n for n, b, _ in buckets if b in ("pending", "queued", "in_progress", "")]
+    buckets = [(c.get("name", ""), (c.get("bucket") or c.get("state") or "unknown").lower(), c.get("link", ""))
+               for c in data]
+    failing = [(n, l) for n, b, l in buckets if b in CI_FAIL]
+    pending = [n for n, b, _ in buckets if b in CI_PENDING]
     u["ci_checks"] = buckets
     if failing:
         u["ci_status"] = "red"
         u["ci_failing"] = failing
         u["_next"] = "ci_route"
-    elif pending:
+    elif pending or (not buckets and time.time() - started < CI_NO_CHECKS_SECS):
+        # checks can take minutes to register on a fresh push, so an early empty list is polled again
         u["ci_status"] = "pending"
         u["_next"] = "ci_poll"
-    else:
+    elif not buckets:
+        u["ci_status"] = "no_checks"
+        u["_next"] = "ci_route"
+    elif all(b in CI_PASS for _, b, _ in buckets):
         u["ci_status"] = "green"
+        u["_next"] = "ci_route"
+    else:
+        u["ci_status"] = "inconclusive"
         u["_next"] = "ci_route"
     return u
 
 
+def _ci_unclear(state, u, status):
+    """Escalate a finished CI read that is not a pass on every check, listing every check with its bucket."""
+    checks = [(c[0], c[1], c[2]) for c in as_list(state.get("ci_checks"))]
+    non_pass = [[n, b] for n, b, _ in checks if b not in CI_PASS]
+    cancelled = [[n, link] for n, b, link in checks if b in CI_CANCELLED]
+    done = [str(r) for r in as_list(state.get("ci_rerun_ids"))]
+    rerunnable = [n for n, link in cancelled
+                  if (m := re.search(r"/actions/runs/(\d+)", link or "")) and m.group(1) not in done]
+    evidence = "\n".join(f"{n}: {b}" for n, b, _ in checks) or "(the PR reports no CI checks)"
+    leave = _ci_leave_option(state)
+    prefix = ""
+    if _watch_started(state):
+        prefix = "Review watch stopped: "
+        u["pr_review_status"] = f"ci_{status}"
+        ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_{status}")
+    if status == "no_checks":
+        question = f"{prefix}The PR still reports no CI checks {CI_NO_CHECKS_SECS} s after the watch started. How to proceed?"
+        options = [option(CI_NO_CI, recommended=True, evidence="no CI check is registered; a PR without CI must not stay in draft"),
+                   option(CI_KEEP_WAITING), option(leave)]
+    else:
+        quiet = (not cancelled and any(b in CI_PASS for _, b, _ in checks)
+                 and all(b in CI_QUIET for _, b in non_pass))
+        names = ", ".join(f"{n} ({b})" for n, b in non_pass)
+        question = f"{prefix}CI finished without a pass on every check (non-pass: {names}). How to proceed?"
+        options = [option(CI_RERUN_CANCELLED if rerunnable else CI_KEEP_WAITING, recommended=bool(rerunnable),
+                          evidence=", ".join(rerunnable)),
+                   option(CI_TREAT_GREEN, recommended=quiet,
+                          evidence="every non-pass check is skipped or neutral and at least one passed" if quiet else ""),
+                   option(leave, recommended=not rerunnable and not quiet)]
+    return raise_escalation(state, u, escalation(
+        f"ci_{status}", question, options, evidence=evidence, hard_trigger=_watch_started(state),
+        data={"non_pass": non_pass, "cancelled": cancelled}))
+
+
 def ci_route(state):
     u = {}
-    crashed = _review_mode(state) and bool(state.get("last_script_error"))
+    crashed = bool(state.get("last_script_error"))
     note_script_error(state, u, "ci_poll")
     status = state.get("ci_status") or "poll_error"
     if crashed:
+        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
+    if crashed and _review_mode(state):
         # A killed poll leaves the previous visit's status behind, so this visit counts as one failed read.
         fails = as_int(state.get("ci_poll_fails")) + 1
         u["ci_poll_fails"] = fails
-        u["ci_polls_run"] = as_int(state.get("ci_polls_run")) + 1
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} CI read failed (poll node error); retry")
+        ledger(state, u, f"review-watch: {_pr_label(state)} CI read failed (poll node error); retry")
         if fails < CI_POLL_FAILS:
             u["_next"] = "ci_poll"
             return u
         status = "poll_error"
     if status == "green":
-        if _review_mode(state) and truthy(state.get("flip_ready")):
-            ledger(state, u, "ci: green -> back to the review watch")
-            return _start_review_watch(state, u)
-        u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True,
-                         "text": "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready)."}
-        u["flip_ready"] = True
-        ledger(state, u, "ci: green -> flip to ready")
-        u["_next"] = "git_ops"
+        if state.get("ci_green_by"):
+            u["ci_green_by"] = ""
+        return _ci_finish_green(state, u, "green",
+                                "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready).")
+    elif status in ("inconclusive", "no_checks"):
+        return _ci_unclear(state, u, status)
     elif status == "red":
         root = state.get("git_root") or state.get("project_dir") or "."
         pack, fetched = [], []
@@ -3901,28 +4334,35 @@ def ci_route(state):
                 pack.append(_failed_run_log(root, run_id))
         u["ci_evidence"] = tail("\n".join(pack), 12000)
         u["_next"] = "ci_diagnose"
-    elif status == "poll_cap" and _watch_started(state):
+    elif status == "poll_cap":
         polls_run = as_int(state.get("ci_polls_run"))
-        u["pr_review_status"] = "ci_poll_cap"
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_poll_cap")
+        budget = _ci_poll_budget(state)
+        limit = _ci_poll_limit_name(state)
+        fits = _ci_watch_fits(state)
+        evidence = (f"{polls_run} CI poll(s) used this run; {limit} {budget}; engine visit cap {ENGINE_VISIT_CAP}; "
+                    f"one more watch takes up to {CI_MAX_ROUNDS} polls")
+        prefix = "CI watch stopped"
+        if _watch_started(state):
+            prefix = "Review watch stopped"
+            u["pr_review_status"] = "ci_poll_cap"
+            ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_poll_cap")
+        keep = [option(CI_CAP_KEEP_WAITING, recommended=True, evidence="another full watch still fits under the engine cap")]
+        options = (keep if fits else []) + [option(_ci_leave_option(state), recommended=not fits, evidence=evidence)]
         return raise_escalation(state, u, escalation(
-            "ci_poll_cap", f"Review watch stopped: the run's CI polls reached REVIEW_CI_POLL_CEILING "
-                           f"({REVIEW_CI_POLL_CEILING}) after {polls_run} poll(s). How to proceed?",
-            [option("Stop watching and report", recommended=True,
-                    evidence=f"{polls_run} CI poll(s) this run; the ceiling sits below the per-node visit cap")],
-            hard_trigger=True))
+            "ci_poll_cap", f"{prefix}: the run's CI polls reached the {limit} ({budget}) after {polls_run} poll(s). "
+                           "How to proceed?", options, evidence=evidence, hard_trigger=_watch_started(state)))
     elif _watch_started(state):
         u["pr_review_status"] = f"ci_{status}"
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_{status}")
+        ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_{status}")
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"Review watch stopped: CI watch ended without a verdict ({status}). Keep waiting, or stop watching?",
-            [option("Keep waiting (re-run the watch)"), option("Stop watching and report", recommended=True)],
+            [option(CI_KEEP_WAITING), option("Stop watching and report", recommended=True)],
             hard_trigger=True))
     else:
         return raise_escalation(state, u, escalation(
             "ci_exhausted", f"CI watch ended without a verdict ({status}). Keep waiting, or leave the PR in draft and report?",
-            [option("Keep waiting (re-run the watch)"), option("Leave the PR in draft and report", recommended=True,
-                                                               evidence="a draft with a named blocker beats a ready PR on red/pending")]))
+            [option(CI_KEEP_WAITING), option("Leave the PR in draft and report", recommended=True,
+                                             evidence="a draft with a named blocker beats a ready PR on red/pending")]))
     return u
 
 
@@ -3988,8 +4428,7 @@ def ci_apply(state):
                 elif not _rerun_failed(root, run_id):
                     ledger(state, u, f"flake-rerun: run {run_id} re-run call failed")
             u["ci_reruns"] = reruns
-            u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "",
-                      "ci_failing": []})
+            _reset_ci_watch(u)
             u["_next"] = "ci_poll"
             return u
     if verdict == "real":
@@ -3998,7 +4437,7 @@ def ci_apply(state):
         if strikes > STRIKE_LIMIT:
             if _watch_started(state):
                 u["pr_review_status"] = "ci_red"
-                ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_red")
+                ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_red")
                 return raise_escalation(state, u, escalation(
                     "ci_exhausted", f"Review watch stopped: CI still red after {STRIKE_LIMIT} fix rounds. How to proceed?",
                     [option("Resume with one more coder fix round"), option("Stop watching and report", recommended=True)],
@@ -4013,7 +4452,7 @@ def ci_apply(state):
     if verdict == "infra":
         if _watch_started(state):
             u["pr_review_status"] = "ci_infra"
-            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_infra")
+            ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_infra")
             return raise_escalation(state, u, escalation(
                 "ci_infra", "Review watch stopped: CI failed for an external cause (runner lost / timeout / 429 / "
                             "cancelled). Wait and re-watch, or stop watching?",
@@ -4025,7 +4464,7 @@ def ci_apply(state):
              option("Leave the PR in draft and report")]))
     if _watch_started(state):
         u["pr_review_status"] = "ci_unsure"
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} stop: ci_unsure")
+        ledger(state, u, f"review-watch: {_pr_label(state)} stop: ci_unsure")
         return raise_escalation(state, u, escalation(
             "ci_unsure", "Review watch stopped: CI diagnosis is unsure (unsure defaults up, never to a re-run). How to proceed?",
             [option("Re-run the failing checks once"), option("Resume with a coder fix round"),
@@ -4146,12 +4585,12 @@ def _author_trusted(state, u, login, association, started):
     perms = u.setdefault("pr_review_perms", dict(as_dict(state.get("pr_review_perms"))))
     if login not in perms and time.time() - started + GH_CALL_SECS > REVIEW_PERM_SECS:
         perms[login] = False
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {login} permission not read (REVIEW_PERM_SECS); "
+        ledger(state, u, f"review-watch: {_pr_label(state)} {login} permission not read (REVIEW_PERM_SECS); "
                          "untrusted")
     elif login not in perms:
         word = _read_permission(state, login)
         perms[login] = word in TRUSTED_PERMISSIONS
-        ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {login} permission {word or 'unreadable'}")
+        ledger(state, u, f"review-watch: {_pr_label(state)} {login} permission {word or 'unreadable'}")
     return perms[login]
 
 
@@ -4238,13 +4677,17 @@ def _pr_review_status(doc, items, trusted=_association_trusted):
     return "comments" if items else "pending"
 
 
-def _read_pr_review(state):
+def _read_pr_review(state, u):
     root = state.get("git_root") or state.get("project_dir") or "."
     cmd = os.environ.get("SISYPHUS_GH_REVIEWS_CMD")
     try:
         if cmd:
             # Operator-environment test seam run through the shell; it carries the same trust as the process environment.
             p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=GH_CALL_SECS)
+        elif not _pr_ref(state):
+            # the query needs a PR number, so the read is skipped and counts as a failed read
+            ledger(state, u, "review-watch: review read skipped: no PR ref")
+            return None
         else:
             p = subprocess.run(["gh", "api", "graphql", "-F", "owner={owner}", "-F", "name={repo}",
                                 "-F", f"number={_pr_ref(state)}", "-f", f"query={PR_REVIEW_QUERY}"],
@@ -4282,7 +4725,7 @@ def pr_review_poll(state):
         u["pr_review_status"] = "wall_cap"
         u["_next"] = "pr_review_route"
         return u
-    doc = _read_pr_review(state)
+    doc = _read_pr_review(state, u)
     if doc is None:
         fails = as_int(state.get("pr_review_poll_fails")) + 1
         u["pr_review_poll_fails"] = fails
@@ -4323,7 +4766,7 @@ def pr_review_poll(state):
         # Without a reviewDecision the status is worked out from the latest review per author, which an older
         # review outside the window can still change, so a truncated reviews window always stops the watch.
         if (key != "reviews" or doc.get("reviewDecision")) and _window_boundary_known(doc, key, known):
-            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {key} window boundary already seen; "
+            ledger(state, u, f"review-watch: {_pr_label(state)} {key} window boundary already seen; "
                              "older history skipped")
         else:
             truncated.append(key)
@@ -4346,13 +4789,13 @@ def pr_review_route(state):
     crashed = bool(state.get("last_script_error"))
     note_script_error(state, u, "pr_review_poll")
     status = state.get("pr_review_status") or "poll_error"
-    pr = _pr_ref(state)
+    pr = _pr_label(state)
     if crashed:
         # A killed poll leaves the previous visit's status behind, so this visit counts as one failed read.
         fails = as_int(state.get("pr_review_poll_fails")) + 1
         u["pr_review_poll_fails"] = fails
         u["pr_review_polls"] = as_int(state.get("pr_review_polls")) + 1
-        ledger(state, u, f"review-watch: PR #{pr} read failed (poll node error); retry")
+        ledger(state, u, f"review-watch: {pr} read failed (poll node error); retry")
         if fails < CI_POLL_FAILS:
             u["_next"] = "pr_review_poll"
             return u
@@ -4360,7 +4803,7 @@ def pr_review_route(state):
     items = [i for i in as_list(state.get("pr_review_items")) if isinstance(i, dict)]
     untrusted = [i for i in as_list(state.get("pr_review_untrusted")) if isinstance(i, dict)]
     if status == "approved":
-        ledger(state, u, f"review-watch: PR #{pr} approved")
+        ledger(state, u, f"review-watch: {pr} approved")
         if items or untrusted:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Left open after approval: {_item_ref(i)}: {(i.get('body') or '')[:200]}" for i in items] + [
@@ -4369,9 +4812,9 @@ def pr_review_route(state):
         u["_next"] = "final_report"
         return u
     if status in ("merged", "closed"):
-        ledger(state, u, f"review-watch: PR #{pr} {status} externally")
+        ledger(state, u, f"review-watch: {pr} {status} externally")
         return raise_escalation(state, u, escalation(
-            "pr_review_closed", f"PR #{pr} was {status} externally while the review watch ran. How to proceed?",
+            "pr_review_closed", f"{pr} was {status} externally while the review watch ran. How to proceed?",
             [option("Stop watching and report", recommended=True, evidence=f"the PR is {status}; there is nothing left to watch"),
              option("Keep watching (the PR was reopened)")], hard_trigger=True))
     if status == "comments":
@@ -4388,18 +4831,18 @@ def pr_review_route(state):
             u["_next"] = "pr_review_triage"
             return u
         u["pr_review_status"] = "round_cap"
-        ledger(state, u, f"review-watch: PR #{pr} stop: round_cap")
+        ledger(state, u, f"review-watch: {pr} stop: round_cap")
         return raise_escalation(state, u, escalation(
-            "pr_review_round_cap", f"PR #{pr} has {len(items) + len(untrusted)} new review item(s), but the review "
+            "pr_review_round_cap", f"{pr} has {len(items) + len(untrusted)} new review item(s), but the review "
                                    f"watch stops: {cap}. How to proceed?",
             [option("Stop watching and report", recommended=True, evidence=cap)],
             evidence=tail("\n\n".join(f"{_item_ref(i)}: {i.get('body', '')}" for i in items), 2500),
             hard_trigger=True))
     if status == "truncated":
         what = ", ".join(str(t) for t in as_list(state.get("pr_review_truncated"))) or "unknown"
-        ledger(state, u, f"review-watch: PR #{pr} stop: truncated ({what})")
+        ledger(state, u, f"review-watch: {pr} stop: truncated ({what})")
         return raise_escalation(state, u, escalation(
-            "pr_review_truncated", f"Review watch on PR #{pr} stopped: the review read was truncated ({what}), so "
+            "pr_review_truncated", f"Review watch on {pr} stopped: the review read was truncated ({what}), so "
                                    "review items could be missed. How to proceed?",
             [option("Stop watching and report", recommended=True,
                     evidence=f"GitHub returned fewer items than it counts for {what}")],
@@ -4413,19 +4856,19 @@ def pr_review_route(state):
     else:
         fails = as_int(u.get("pr_review_poll_fails", state.get("pr_review_poll_fails")))
         reason = f"{fails} consecutive review reads failed (limit {CI_POLL_FAILS})"
-    ledger(state, u, f"review-watch: PR #{pr} stop: {status}")
+    ledger(state, u, f"review-watch: {pr} stop: {status}")
     opts = [option("Stop watching and report", recommended=True, evidence=reason)]
     if status == "poll_error":
         opts.append(option("Retry the review watch"))
     return raise_escalation(state, u, escalation(
-        "pr_review_exhausted", f"Review watch on PR #{pr} stopped: {reason}. How to proceed?", opts,
+        "pr_review_exhausted", f"Review watch on {pr} stopped: {reason}. How to proceed?", opts,
         hard_trigger=True))
 
 
 def _untrusted_judgment(state, u, untrusted):
-    pr = _pr_ref(state)
+    pr = _pr_label(state)
     for i in untrusted:
-        ledger(state, u, f"review-watch: PR #{pr} untrusted {i.get('kind')} from {i.get('author', '')} "
+        ledger(state, u, f"review-watch: {pr} untrusted {i.get('kind')} from {i.get('author', '')} "
                          f"({i.get('association', '')}) -> owner judgment")
     u["pr_review_seen"] = _seen_with(state, untrusted)
     u["pr_review_status"] = "owner_judgment"
@@ -4453,7 +4896,7 @@ def _triaged(state, u, items, entries, field):
     for e in entries:
         item = items.get(str(e.get("id") or ""))
         if item is None:
-            ledger(state, u, f"review-watch: PR #{_pr_ref(state)} triage named unknown item {e.get('id')!r}; dropped")
+            ledger(state, u, f"review-watch: {_pr_label(state)} triage named unknown item {e.get('id')!r}; dropped")
             continue
         out.append({"id": item.get("id"), "kind": item.get("kind"), "url": item.get("url", ""),
                     "body": item.get("body", ""), field: str(e.get(field) or "")})
@@ -4471,10 +4914,10 @@ def _start_review_round(state, u, fixes, noaction):
         + [{"id": n.get("id"), "kind": n.get("kind"), "url": n.get("url", ""), "reason": n.get("reason", ""),
             "action": "skip"} for n in noaction])
     u["pr_review_queue"] = []
-    ledger(state, u, f"review-watch: PR #{_pr_ref(state)} {len(fixes)} new item(s) -> fix round {rounds}/{REVIEW_MAX_ROUNDS}")
+    ledger(state, u, f"review-watch: {_pr_label(state)} {len(fixes)} new item(s) -> fix round {rounds}/{REVIEW_MAX_ROUNDS}")
     # Each review fix round gets fresh gauntlet budgets; REVIEW_MAX_ROUNDS bounds the total.
     u.update({"review_rounds": 0, "lane_block_streak": {}, "fix_strikes": 0, "obs_rounds": 0, "debris_reruns": 0})
-    ledger(state, u, f"review-watch: PR #{_pr_ref(state)} gauntlet budgets reset for review round {rounds}")
+    ledger(state, u, f"review-watch: {_pr_label(state)} gauntlet budgets reset for review round {rounds}")
     u["external_feedback"] = list(as_list(state.get("external_feedback"))) + u["fix_items"]
     u["_next"] = "compose_fix"
     return u
@@ -4485,7 +4928,7 @@ def pr_review_apply(state):
     u = {"pr_review_fix": [], "pr_review_judgment": [], "pr_review_noaction": []}
     harvest_anomalies(state, u, "pr_review_triage")
     note_script_error(state, u, "pr_review_triage")
-    pr = _pr_ref(state)
+    pr = _pr_label(state)
     items = {str(i.get("id")): i for i in as_list(state.get("pr_review_items")) if isinstance(i, dict) and i.get("id")}
     fixes = _triaged(state, u, items, [e for e in as_list(state.get("pr_review_fix")) if isinstance(e, dict)], "text")
     judged = _triaged(state, u, items, [e for e in as_list(state.get("pr_review_judgment")) if isinstance(e, dict)],
@@ -4495,7 +4938,7 @@ def pr_review_apply(state):
     classified = {e["id"] for e in fixes + judged + noaction}
     unclassified = [i for i in items.values() if i.get("id") not in classified]
     if unclassified:
-        ledger(state, u, f"review-watch: PR #{pr} triage left {len(unclassified)} item(s) unclassified; owner judgment")
+        ledger(state, u, f"review-watch: {pr} triage left {len(unclassified)} item(s) unclassified; owner judgment")
         judged += [{"id": i.get("id"), "kind": i.get("kind"), "url": i.get("url", ""), "body": i.get("body", ""),
                     "question": f"Triage did not classify this comment; how should it be handled? {tail(i.get('body', ''), 300)}"}
                    for i in unclassified]
@@ -4511,7 +4954,7 @@ def pr_review_apply(state):
             hard_trigger=True, data={"judgment": judged, "noaction": noaction}))
     if fixes:
         return _start_review_round(state, u, fixes, noaction)
-    ledger(state, u, f"review-watch: PR #{pr} {len(noaction)} item(s) need no change")
+    ledger(state, u, f"review-watch: {pr} {len(noaction)} item(s) need no change")
     addressed = [{"id": n.get("id"), "kind": n.get("kind"), "url": n.get("url", ""), "reason": n.get("reason", ""),
                   "action": "skip"} for n in noaction]
     u["pr_review_addressed"] = list(as_list(state.get("pr_review_addressed"))) + addressed
@@ -4559,7 +5002,18 @@ def _assemble_report(state, u, pre_publish=False):
                 lines.append(f"  - round {r.get('round')} @ {r.get('head')}: {r.get('verdict', '(running)')}"
                              + (" [" + "; ".join(f"{k}: {v}" for k, v in details.items()) + "]" if details else ""))
     if g("ci_status"):
-        lines.append(f"- CI: {g('ci_status')}" + (" (flipped to ready)" if truthy(g("flip_ready", False)) else ""))
+        green_by = g("ci_green_by") if g("ci_status") == g("ci_green_by") else ""
+        ci = {"no_checks": "no checks configured; finished without CI",
+              "inconclusive": "inconclusive, treated as green by decision"}.get(green_by, g("ci_status"))
+        if truthy(g("pr_ready_confirmed", False)):
+            ci += " (flipped to ready)"
+        elif truthy(g("flip_ready", False)):
+            ci += f" (flip to ready NOT confirmed: {g('pr_ready_detail') or 'the PR was not re-read'})"
+        lines.append(f"- CI: {ci}")
+    elif pre_publish:
+        lines.append("- CI: not yet watched (set after publishing)")
+    else:
+        lines.append(f"- CI: {g('ci_watch_note') or 'not watched: no publish step ran'}")
     for c in as_list(g("publish_checks", [])):
         if isinstance(c, dict):
             lines.append(f"- publish check {c.get('check')}: {'ok' if c.get('ok') else 'FAILED'} ({c.get('detail')})")
@@ -4586,8 +5040,9 @@ def _assemble_report(state, u, pre_publish=False):
     if addressed:
         lines += ["## PR review feedback addressed"] + [
             f"- {a.get('action', '')}: {_item_ref(a)}: {a.get('text') or a.get('reason') or ''}" for a in addressed] + [""]
-    debt = as_list(g("debt_left_behind", []))
-    lines += ["Debt left behind:"] + ([f"- {d}" for d in debt] or ["- none"]) + [""]
+    debt = [f"- {d}" for d in as_list(g("debt_left_behind", []))] + [
+        f"- debt scan FAILED ({s}): {r}; the diff was not scanned" for s, r in as_dict(g("debt_scan_failures", {})).items()]
+    lines += ["Debt left behind:"] + (debt or ["- none"]) + [""]
     ex = as_list(g("debris_exemptions", []))
     lines += ["Debris exemptions:"] + ([f"- {e}" for e in ex] or ["- none"]) + [""]
     dd = as_list(g("design_decisions", []))
@@ -4595,6 +5050,7 @@ def _assemble_report(state, u, pre_publish=False):
     if g("observability_artifact"):
         lines += [g("observability_artifact"), ""]
     fus = list(as_list(g("follow_ups", []))) + list(as_list(g("deferred_findings", [])))
+    fus += [f"Re-run the debt scan for {scope}: {why}" for scope, why in as_dict(g("debt_scan_failures", {})).items()]
     if g("whetstone_note"):
         fus.append(g("whetstone_note"))
     lines += ["FOLLOW-UPS:"] + ([f"- {f}" for f in fus] or ["none"]) + [""]
