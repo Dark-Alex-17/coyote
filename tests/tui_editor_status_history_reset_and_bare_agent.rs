@@ -1,4 +1,4 @@
-//! Black-box pins for the bottom pane's follow-up edges: a `.edit`
+//! Black-box pins for more of the bottom pane's edges: a `.edit`
 //! `$EDITOR` that exits non-zero is reported on screen while
 //! a clean editor is not, and Ctrl+O reports it with the same words;
 //! clearing the composer, accepting a Ctrl+R
