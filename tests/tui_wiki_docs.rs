@@ -23,9 +23,12 @@
 //! names a key and whose action is not `Action::Nothing` becomes one
 //! (context, chord) pair, the context taken from the arm's block (see
 //! `key_context_marker`) and the chord from the pattern and the modifier
-//! terms of its guard (see `arm_chords`). A reshaped `keys.rs` that the
-//! scraper no longer understands fails loudly rather than shrinking the
-//! table. The literal scraper reads plain `"..."` strings only.
+//! terms of its guard (see `arm_chords`). Inside a keyed block every line
+//! with an `=>` must open a context, be a `KeyCode::` arm or be one of the
+//! key-less shapes `non_key_arm` names, and no other line may name a
+//! `KeyCode::`; anything else panics, so a reshaped `keys.rs` fails loudly
+//! rather than shrinking the table. The literal scraper reads plain `"..."`
+//! strings only.
 
 use std::collections::BTreeSet;
 use std::env;
@@ -388,12 +391,20 @@ fn clap_long(field: &str) -> String {
 
 /// The value the config template gives `key`, without its comment.
 fn template_value(key: &str) -> String {
-    let template = asset(&["config-template.yaml"]);
+    yaml_value(
+        "config-template.yaml",
+        &asset(&["config-template.yaml"]),
+        key,
+    )
+}
+
+/// The value a top-level `key:` line of `yaml` sets, without its comment.
+fn yaml_value(label: &str, yaml: &str, key: &str) -> String {
     let head = format!("{key}: ");
-    let line = template
+    let line = yaml
         .lines()
         .find(|line| line.starts_with(&head))
-        .unwrap_or_else(|| panic!("the config template sets {key}"));
+        .unwrap_or_else(|| panic!("{label} sets {key}"));
     line[head.len()..]
         .split(" #")
         .next()
@@ -610,7 +621,29 @@ fn arm_chords(pattern: &str, guard: &str, action: &str) -> Vec<String> {
     chords
 }
 
-/// Every (context, chord) pair `src/tui/keys.rs` binds to an action.
+/// An arm line of a keyed block that binds no named key: a wildcard that
+/// swallows the key or hands it on as typing, or the close of a multi-line
+/// modal pattern.
+fn non_key_arm(line: &str) -> bool {
+    if matches!(line, ") => match code {" | ") => {") {
+        return true;
+    }
+    let Some(rest) = line.strip_prefix('_') else {
+        return false;
+    };
+    let Some((_, action)) = rest.split_once("=>") else {
+        return false;
+    };
+    matches!(
+        action.trim(),
+        "{}" | "Action::Nothing," | "Action::ModalInput(key)," | "Action::ComposerInput(key),"
+    )
+}
+
+/// Every (context, chord) pair `src/tui/keys.rs` binds to an action. Every
+/// arm line of a keyed block is accounted for: it opens a context, is a
+/// `KeyCode::` arm, or binds no key (`non_key_arm`); any other line with an
+/// `=>` or a `KeyCode::` not at its start panics.
 fn key_bindings() -> BTreeSet<Binding> {
     let source = src(&["tui", "keys.rs"]);
     let mut bindings = BTreeSet::new();
@@ -654,6 +687,19 @@ fn key_bindings() -> BTreeSet<Binding> {
             } else {
                 head = Some(line.to_string());
             }
+            continue;
+        }
+        if context.is_some() {
+            assert!(
+                !line.contains("KeyCode::"),
+                "keys.rs names a key the scraper does not read in {context:?}: {line}; \
+                 extend key_bindings in tests/tui_wiki_docs.rs"
+            );
+            assert!(
+                !line.contains("=>") || non_key_arm(line),
+                "keys.rs has an arm the scraper does not read in {context:?}: {line}; \
+                 extend key_bindings in tests/tui_wiki_docs.rs"
+            );
         }
     }
     bindings
@@ -715,6 +761,27 @@ fn key_scraper_reads_every_context_of_the_key_map() {
 }
 
 #[test]
+fn a_wildcard_arm_with_an_action_is_not_a_key_less_arm() {
+    for line in [
+        "_ => {}",
+        "_ => Action::Nothing,",
+        "_ if !answerable => Action::Nothing,",
+        "_ => Action::ComposerInput(key),",
+        ") => match code {",
+        ") => {",
+    ] {
+        assert!(non_key_arm(line), "{line}");
+    }
+    for line in [
+        "_ if ctrl => Action::ClosePager,",
+        "Some(KeyCode::Esc) => Action::ClosePopup,",
+        "other => other,",
+    ] {
+        assert!(!non_key_arm(line), "{line}");
+    }
+}
+
+#[test]
 fn keys_table_matches_the_key_map_both_ways() {
     let bindings = key_bindings();
     assert!(!bindings.is_empty());
@@ -737,6 +804,15 @@ fn config_rows_match_the_template() {
     assert_eq!(names, ["repl", "tui"]);
     let flags = [clap_long("tui"), clap_long("repl")];
     let readme = read(repo_root().join("README.md"));
+    let example = read(repo_root().join("config.example.yaml"));
+    assert_eq!(
+        yaml_value("config.example.yaml", &example, "theme"),
+        template_value("theme"),
+        "config.example.yaml `theme` default"
+    );
+    for (label, text) in [("config.example.yaml", &example), ("README.md", &readme)] {
+        assert!(!names_light_theme(text), "{label} names light_theme");
+    }
     let mut tables = vec![("README.md".to_string(), readme)];
 
     let wiki = wiki_dir();
@@ -747,7 +823,6 @@ fn config_rows_match_the_template() {
         ));
     }
     for (label, text) in &tables {
-        assert!(!text.contains("light_theme"), "{label} names light_theme");
         for key in SETTINGS {
             let row = table_row(label, text, &format!("`{key}`"));
             assert_eq!(
@@ -779,11 +854,17 @@ fn config_rows_match_the_template() {
     for page in wiki_pages(&wiki) {
         let text = read(&page);
         assert!(
-            !text.contains("light_theme"),
+            !names_light_theme(&text),
             "{} names light_theme",
             page.display()
         );
     }
+}
+
+/// Whether `text` names the retired `light_theme` setting in any case, its
+/// `COYOTE_LIGHT_THEME` override included.
+fn names_light_theme(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("light_theme")
 }
 
 /// Every `*.md` under `wiki`, sorted by path.
@@ -914,14 +995,13 @@ fn prompt_helpers_are_described_as_they_ship() {
         .collect();
     assert_eq!(py_helpers.len(), 7, "{py_helpers:?}");
     assert_eq!(ts_helpers.len(), 7, "{ts_helpers:?}");
-    let scripts = ["functions", "scripts"];
     for (shim, var, present) in [
         ("run-tool.py", "LLM_PROMPT_UTILS_PY", true),
         ("run-tool.ts", "LLM_PROMPT_UTILS_TS", true),
         ("run-agent.py", "LLM_PROMPT_UTILS_PY", false),
         ("run-agent.ts", "LLM_PROMPT_UTILS_TS", false),
     ] {
-        let text = asset(&[scripts[0], scripts[1], shim]);
+        let text = asset(&["functions", "scripts", shim]);
         assert_eq!(text.contains(var), present, "{shim} and {var}");
     }
 
@@ -1088,11 +1168,12 @@ fn tui_page_quotes_the_code() {
     assert_eq!(const_expr(tui, "FULL_OUTPUT_LIMIT"), "4 * 1024 * 1024");
     assert_eq!(const_expr(tui, "FULL_OUTPUT_BUDGET"), "32 * 1024 * 1024");
     assert!(tui.contains("if app.config.tui_dump_on_exit {"));
-    let suspend = &tui[tui.find("Some(Command::Suspend) => {").unwrap()..];
-    assert!(
-        suspend[..120].contains("#[cfg(unix)]"),
-        "suspend is unix-only"
-    );
+    let suspend = tui
+        .lines()
+        .skip_while(|line| line.trim() != "Some(Command::Suspend) => {")
+        .nth(1)
+        .map(str::trim);
+    assert_eq!(suspend, Some("#[cfg(unix)]"), "suspend is unix-only");
     assert!(src(&["tui", "terminal.rs"]).contains("WriteConsoleW"));
     assert!(src(&["tui", "terminal.rs"]).contains("EnableMouseCapture"));
     assert!(src(&["config", "input.rs"]).contains("left the group with setsid"));
