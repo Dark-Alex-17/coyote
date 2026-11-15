@@ -2434,15 +2434,11 @@ fn answer_at_a_cold_prompt_prints_the_question_block_and_prompts_for_the_text() 
     session.send(format!(".mesh envoy answer {id}\r")).unwrap();
     wait_for(&mut session, "Your answer:");
     session.send("no\r").unwrap();
-    let (before, matched) = wait_for_match(
-        &mut session,
-        &literally(&format!("{who} over the mesh...")),
-    );
+    let (before, matched) =
+        wait_for_match(&mut session, &literally(&format!("{who} over the mesh...")));
     let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
     assert!(
-        sent.contains(&format!(
-            "Sending your answer to {who} over the mesh..."
-        )),
+        sent.contains(&format!("Sending your answer to {who} over the mesh...")),
         "the notice names the session as user / session before its hash: {sent:?}"
     );
     sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
@@ -2726,10 +2722,8 @@ fn answer_with_text_on_the_line_shows_the_block_then_sends_and_the_mesh_off_gate
     session
         .send(format!(".mesh envoy answer {bare_id} \"Yes, ship it.\"\r"))
         .unwrap();
-    let (before, matched) = wait_for_match(
-        &mut session,
-        &literally(&format!("{who} over the mesh...")),
-    );
+    let (before, matched) =
+        wait_for_match(&mut session, &literally(&format!("{who} over the mesh...")));
     let mut sent = strip_escapes(&before) + &strip_escapes(&matched);
     sent.push_str(&strip_escapes(&wait_for(&mut session, SESSION_PROMPT)));
     assert!(
