@@ -315,7 +315,9 @@ fn sighup_during_the_startup_probe_kills_the_process() {
     let pid = child_pid(&transcript);
     // The probe opens with its query and then waits two seconds for a
     // reply nobody here sends; the hang-up goes out as soon as the query
-    // is seen, before a loaded host can let the wait run out.
+    // is seen, before a loaded host can let the wait run out. The wait is
+    // crossterm's own fixed timeout inside the process, so no terminal on
+    // this side can hold it open for longer.
     pty.wait_for_raw(b"\x1b[?u\x1b[c", 0, PTY_DEADLINE).unwrap();
     // SAFETY: kill takes a pid and a signal number and touches no memory.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
@@ -332,6 +334,13 @@ fn sighup_during_the_startup_probe_kills_the_process() {
     assert!(
         !transcript.contains("no session"),
         "the footer was already up, so the hang-up missed the probe:\n{transcript}"
+    );
+    // The screen is entered only once the probe has answered, so a
+    // hang-up that landed inside it leaves no alternate screen and no
+    // footer behind.
+    assert!(
+        find(pty.raw(), ENTER_ALT, 0).is_none(),
+        "the alternate screen was entered, so the hang-up missed the probe:\n{transcript}"
     );
 }
 
