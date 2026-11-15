@@ -470,7 +470,7 @@ impl InquirePrompter {
         }
         let mut answer = select
             .without_filtering()
-            .with_help_message("↑↓ to move, enter to select") // debris-exempt: inquire help text reused verbatim
+            .with_help_message("↑↓ to move, enter to select") // debris-exempt: the select help text the REPL already showed, verbatim
             .prompt()?;
         if !req.closed && answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
             answer = Text::new("Custom response:").prompt()?;
@@ -888,7 +888,7 @@ mod tests {
         assert!(styled.contains(".prompt()"), "{styled}");
         for needle in [
             ".without_filtering()",
-            "\"↑↓ to move, enter to select\"", // debris-exempt: inquire help text reused verbatim
+            "\"↑↓ to move, enter to select\"", // debris-exempt: the select help text the REPL already showed, verbatim
             "\"Custom response:\"",
         ] {
             assert!(!bare.contains(needle), "{needle} in:\n{bare}");
