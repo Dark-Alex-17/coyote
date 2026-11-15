@@ -368,9 +368,11 @@ Local-run recipe / usage suites: <from the plan — enables the probe lane; omit
 ```
 
 `debris_exclude` is the repo-relative directory holding the run's own planning files (the plan
-repo or `plans/` directory the run works from, when it lies inside the repo under review) as a
-JSON array string such as `["plans"]`, or `""` when there is none or it lies outside that repo;
-every review lane reads those files as bookkeeping, not scope drift, and the debris lint skips them.
+repo or `plans/` directory the run works from, relative to `git rev-parse --show-toplevel` of the
+repo under review) as a JSON array string such as `["plans"]`, or `""` when there is none, it is
+the repo top itself, or it lies outside that repo; every review lane reads those files as
+bookkeeping, not scope drift, and the debris lint skips them. The `adversary` fallback spawn
+below passes the same value.
 
 Verification commands go in `--variables` (a JSON-array string), never in the prompt: the prompt
 also carries pasted plan text from the repo under review, and whatever is declared here is
@@ -415,6 +417,8 @@ with a lane table, blockers, attention items, and every lane's full report.
   killed, its module unresolvable, wrote a malformed verdict, or the diff spec itself unusable);
   re-run the gauntlet once only if the cause looks transient, otherwise fix the `Diff:` line or
   the install first, then escalate. This is an infrastructure fault, not a code finding.
+  A `debris_exclude` the lint cannot use (absolute, holding `..` or a glob, `.`, or malformed
+  JSON) faults the same way: check and fix the value you passed before anything else.
   NEVER route it through the findings-handling rules. NEVER claim done while it stands.
   Order of operations: for `debris`, that single conditional re-run (or the `Diff:`/install
   fix) comes FIRST and counts as the "Retry the review again" option; only if the line still
@@ -498,7 +502,7 @@ DIFF: run get_diff (or --base <ref>), or: <paste diff>
 
 PLAN — acceptance criteria to check against:
 <paste the task/step spec + acceptance criteria VERBATIM — not a summary>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
 
