@@ -761,6 +761,16 @@ mod network {
         let card = status_round_trip(&slot_a, &slot_b).await;
         assert_eq!(card.person_name.as_deref(), Some("Beatrice"));
         assert_eq!(card.session.as_deref(), Some("temp"));
+        // B's grant in the round trip asks A for its card in the background, and that ask
+        // reaches A as a contact. It lands now: one still in flight once B revokes A would
+        // reach A later, lift A's stop as a contact does, and cost B a second request.
+        for _ in 0..60 {
+            if status_requests(b_rt) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
         let people = a_rt.trust().people(&[]);
         assert_eq!(
             people.person(&b_identity).map(|alias| alias.text.as_str()),
