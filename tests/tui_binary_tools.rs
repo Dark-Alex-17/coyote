@@ -1132,9 +1132,16 @@ fn esc_on_the_first_of_two_mcp_conflicts_in_the_plain_repl_keeps_both_local_with
     let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
+    pty.resize(60, 140).unwrap();
     pty.read_for(Duration::from_millis(300));
     let install_at = pty.raw().len();
-    pty.send(format!(".install {}\r", repo.display()).as_bytes())
+    // The line editor repaints the prompt once per typed key, so the
+    // absolute temp path alone would eat most of the deadline; the binary
+    // runs in `dir`, where the relative path names the same repository.
+    let relative = repo
+        .strip_prefix(&dir)
+        .expect("the bundle repository lives under the test dir");
+    pty.send(format!(".install ./{}\r", relative.display()).as_bytes())
         .unwrap();
     pty.wait_for_after("Conflict on MCP server", install_at, PTY_DEADLINE)
         .expect("`.install` did not ask about the first MCP conflict");
