@@ -2554,6 +2554,12 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         use std::process::Stdio;
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        /// Seconds the `timeout` hang guards in these bodies allow. A hang is
+        /// unbounded, so the guard only has to outlast a loaded host's bash
+        /// start-up; a value near the expected run time turns load into false
+        /// failures.
+        const HANG_GUARD_SECS: u64 = 60;
+
         fn is_request_line(line: &str) -> bool {
             line.trim_start().as_bytes().starts_with(MARKER)
         }
@@ -3649,10 +3655,13 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             // channel and no tty they must still not emit a protocol request;
             // `range` falls through to its current value on EOF and `editor`
             // returns an empty buffer. `timeout` is only a hang guard.
-            let body = "export EDITOR=true; \
-                        r=\"$(timeout 10 bash -c 'source \"$PROMPT_UTILS\"; range \"How many?\" 1 3 5' 2>/dev/null)\"; echo \"range=[$r] rc=$?\"; \
-                        e=\"$(timeout 10 bash -c 'source \"$PROMPT_UTILS\"; editor \"Notes?\"' 2>/dev/null)\"; echo \"editor=[$e] rc=$?\"";
-            let run = run_helper(&dir, Some(&[json!(true)]), body, true);
+            let body = format!(
+                "export EDITOR=true; \
+                 r=\"$(timeout {guard} bash -c 'source \"$PROMPT_UTILS\"; range \"How many?\" 1 3 5' 2>/dev/null)\"; echo \"range=[$r] rc=$?\"; \
+                 e=\"$(timeout {guard} bash -c 'source \"$PROMPT_UTILS\"; editor \"Notes?\"' 2>/dev/null)\"; echo \"editor=[$e] rc=$?\"",
+                guard = HANG_GUARD_SECS,
+            );
+            let run = run_helper(&dir, Some(&[json!(true)]), &body, true);
             assert!(
                 run.request_lines().is_empty(),
                 "editor/range must never use the prompt channel: {}",
@@ -3687,10 +3696,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let dead = dead_reply_path();
             let body = format!(
                 "{}; \
-                 COYOTE_PROMPT_REPLY={dead} timeout 10 bash -c '{}'; echo \"outer rc=$?\"; \
-                 COYOTE_PROMPT_REPLY={dead} timeout 10 bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
+                 COYOTE_PROMPT_REPLY={dead} timeout {guard} bash -c '{}'; echo \"outer rc=$?\"; \
+                 COYOTE_PROMPT_REPLY={dead} timeout {guard} bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
                 capture("confirm \"Warm up?\""),
                 "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; rc=$?; echo \"v=[$v] rc=$rc\"; exit 0",
+                guard = HANG_GUARD_SECS,
             );
             let started = std::time::Instant::now();
             let run = run_helper(
@@ -3699,8 +3709,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 &body,
                 false,
             );
+            // Strictly below the guard, so a helper that blocks until
+            // `timeout` kills it still fails here.
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(9),
+                started.elapsed() < std::time::Duration::from_secs(HANG_GUARD_SECS / 2),
                 "the helper must not block on an unopenable reply path: {:?}",
                 started.elapsed()
             );
@@ -3749,10 +3761,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let inner =
                 "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; echo \"{tag} v=[$v] rc=$?\"";
             let body = format!(
-                "env -u {reply} -u {out} timeout 10 bash -c '{unset}' 2>/dev/null; echo \"unset outer=$?\"; \
-                 {reply}=/dev/fd/9 env -u {out} timeout 10 bash -c '{fd9}' 2>/dev/null; echo \"fd9 outer=$?\"",
+                "env -u {reply} -u {out} timeout {guard} bash -c '{unset}' 2>/dev/null; echo \"unset outer=$?\"; \
+                 {reply}=/dev/fd/9 env -u {out} timeout {guard} bash -c '{fd9}' 2>/dev/null; echo \"fd9 outer=$?\"",
                 reply = REPLY_ENV,
                 out = OUT_FD_ENV,
+                guard = HANG_GUARD_SECS,
                 unset = inner.replace("{tag}", "unset"),
                 fd9 = inner.replace("{tag}", "fd9"),
             );

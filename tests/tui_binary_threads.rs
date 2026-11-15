@@ -917,10 +917,23 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
     );
     let bodies = scene._kid.bodies();
     let last_body = bodies.last().unwrap();
-    assert!(
-        last_body.contains("yes") || last_body.contains("true"),
-        "the answer the kid got back is not a yes: {last_body}"
-    );
+    let request: serde_json::Value = serde_json::from_str(last_body).unwrap();
+    let tool_content = request["messages"]
+        .as_array()
+        .and_then(|messages| messages.iter().rfind(|m| m["role"] == "tool"))
+        .and_then(|message| message["content"].as_str())
+        .unwrap_or_else(|| panic!("the kid's model got no tool result: {last_body}"));
+    match serde_json::from_str::<serde_json::Value>(tool_content) {
+        Ok(answer) => assert_eq!(
+            answer,
+            serde_json::json!({"answer": "yes"}),
+            "the answer the kid got back is not a yes: {last_body}"
+        ),
+        Err(_) => assert!(
+            tool_content.contains(r#"{"answer":"yes"}"#),
+            "the answer the kid got back is not a yes: {last_body}"
+        ),
+    }
     pty.send(b"\x1b").unwrap();
     let transcript = leave(&mut pty, &scene);
     assert_eq!(exit_code(&transcript), 0, "{transcript}");

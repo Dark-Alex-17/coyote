@@ -3189,8 +3189,13 @@ mod tests {
             .block_on(f)
     }
 
-    fn submit_escalation(queue: &EscalationQueue, id: &str) {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
+    /// The receiver stands for the waiting asker; dropping it withdraws
+    /// the question from the queue.
+    fn submit_escalation(
+        queue: &EscalationQueue,
+        id: &str,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         queue.submit(EscalationRequest {
             id: id.to_string(),
             from_agent_id: "a1".into(),
@@ -3199,6 +3204,7 @@ mod tests {
             options: None,
             reply_tx: tx,
         });
+        rx
     }
 
     #[test]
@@ -3568,7 +3574,7 @@ mod tests {
         let mut ctx = ctx_with_registered_job("job_n1");
         ctx.current_depth = 1;
         let queue = ctx.ensure_root_escalation_queue();
-        submit_escalation(&queue, "esc_1");
+        let _asker = submit_escalation(&queue, "esc_1");
         ctx.notification_queue
             .push(job_notification("job_n1", "execute_command", true));
 
@@ -3589,7 +3595,7 @@ mod tests {
     fn eval_tool_calls_merges_both_channels_onto_last_result() {
         let mut ctx = ctx_with_registered_job("job_n1");
         let queue = ctx.ensure_root_escalation_queue();
-        submit_escalation(&queue, "esc_1");
+        let _asker = submit_escalation(&queue, "esc_1");
         ctx.notification_queue
             .push(job_notification("job_n1", "execute_command", false));
 
@@ -3620,7 +3626,7 @@ mod tests {
     fn eval_tool_calls_injects_escalations_into_last_result() {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         let queue = ctx.ensure_root_escalation_queue();
-        submit_escalation(&queue, "esc_1");
+        let _asker = submit_escalation(&queue, "esc_1");
 
         let calls = vec![call("unknown_tool", Some("id-1"))];
         let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();

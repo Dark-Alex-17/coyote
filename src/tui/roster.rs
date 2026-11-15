@@ -550,4 +550,24 @@ pub(super) mod tests {
         );
         assert_eq!(rows[0].detail(0, frame_time()), "Which branch?");
     }
+
+    #[test]
+    fn a_question_whose_asker_is_gone_gets_no_row() {
+        let queue = Arc::new(EscalationQueue::new());
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        queue.submit(crate::supervisor::escalation::EscalationRequest {
+            id: "esc_3a4b5c6d".to_string(),
+            from_agent_id: "agent_planner_7d8e9f0a".to_string(),
+            from_agent_name: "planner".to_string(),
+            question: "[select] Which branch?".to_string(),
+            options: None,
+            reply_tx,
+        });
+        drop(reply_rx);
+        let sources = RosterSources {
+            supervisor: None,
+            escalations: Some(queue),
+        };
+        assert_eq!(sources.rows(), vec![]);
+    }
 }

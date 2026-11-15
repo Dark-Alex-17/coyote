@@ -10959,6 +10959,30 @@ mod tests {
         assert_eq!(reply.try_recv().as_deref(), Ok("release"));
     }
 
+    /// An asker that stops waiting while its question is open in the
+    /// modal gets no answer, and the transcript says the reply was lost.
+    #[test]
+    #[serial]
+    fn answering_a_question_whose_asker_is_gone_shows_a_warning() {
+        let mut ctx = chat_ctx();
+        let queue = ctx.ensure_root_escalation_queue();
+        let reply = escalate(&queue, None);
+        let mut harness = Harness::for_ctx(&ctx);
+        harness.app.sync_from_ctx(&mut ctx);
+        harness.press(KeyCode::F(3));
+        harness.draw();
+        harness.press(KeyCode::Enter);
+        drop(reply);
+        harness.type_text("release");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Enter);
+        assert!(matches!(
+            harness.app.transcript.cells().last(),
+            Some(Cell::Notice { kind: NoticeKind::ToolWarning, text, .. })
+                if text == "The reply was not delivered: agent 'reviewer' stopped waiting on escalation 'esc_x7x'"
+        ));
+    }
+
     /// The `[kind] ` an agent's user tool puts in front of an escalated
     /// question names the modal, and the question is shown without it.
     #[test]

@@ -46,9 +46,12 @@ impl EscalationQueue {
         self.pending.lock().remove(escalation_id)
     }
 
+    /// Requests whose asker has stopped waiting are dropped here, so no
+    /// caller offers a question nobody can receive the answer to.
     pub fn pending(&self) -> Vec<PendingEscalation> {
-        self.pending
-            .lock()
+        let mut pending = self.pending.lock();
+        pending.retain(|_, r| !r.reply_tx.is_closed());
+        pending
             .values()
             .map(|r| PendingEscalation {
                 id: r.id.clone(),
@@ -79,7 +82,10 @@ impl EscalationQueue {
     }
 
     pub fn has_pending(&self) -> bool {
-        !self.pending.lock().is_empty()
+        self.pending
+            .lock()
+            .values()
+            .any(|r| !r.reply_tx.is_closed())
     }
 }
 
@@ -255,6 +261,32 @@ mod tests {
         let taken = queue.take("esc_1").unwrap();
         taken.reply_tx.send("the answer".into()).unwrap();
         assert_eq!(rx.blocking_recv().unwrap(), "the answer");
+    }
+
+    #[test]
+    fn a_request_whose_asker_is_gone_is_no_longer_pending() {
+        let queue = EscalationQueue::new();
+        let (gone, gone_rx) = make_request("esc_gone", "a", "Anyone there?");
+        queue.submit(gone);
+        let (waiting, _waiting_rx) = make_request("esc_waiting", "b", "Still here?");
+        queue.submit(waiting);
+        drop(gone_rx);
+
+        let ids: Vec<String> = queue.pending().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["esc_waiting"]);
+        assert_eq!(queue.pending_summary().len(), 1);
+        assert!(queue.take("esc_gone").is_none());
+        assert!(queue.has_pending());
+    }
+
+    #[test]
+    fn has_pending_ignores_a_request_whose_asker_is_gone() {
+        let queue = EscalationQueue::new();
+        let (req, rx) = make_request("esc_1", "a", "question");
+        queue.submit(req);
+        drop(rx);
+        assert!(!queue.has_pending());
+        assert!(queue.pending().is_empty());
     }
 
     #[test]

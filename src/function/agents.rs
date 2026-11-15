@@ -2337,7 +2337,12 @@ pub(crate) fn reply_escalation(
         Some(request) => {
             let from_agent = request.from_agent_name.clone();
             let question = request.question.clone();
-            let _ = request.reply_tx.send(reply.to_string());
+            if request.reply_tx.send(reply.to_string()).is_err() {
+                return Ok(json!({
+                    "status": "error",
+                    "message": format!("The reply was not delivered: agent '{from_agent}' stopped waiting on escalation '{escalation_id}'"),
+                }));
+            }
             hooks::fire(
                 HookEvent::EscalationAnswered,
                 ctx,
@@ -8013,6 +8018,33 @@ mod tests {
         let result =
             handle_reply_escalation(&mut ctx, &json!({"escalation_id": "x", "reply": "y"}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn replying_after_the_asker_stopped_waiting_is_an_error() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        let queue = Arc::new(EscalationQueue::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        queue.submit(EscalationRequest {
+            id: "esc_gone".into(),
+            from_agent_id: "a1".into(),
+            from_agent_name: "explore".into(),
+            question: "What do?".into(),
+            options: None,
+            reply_tx: tx,
+        });
+        ctx.escalation_queue = Some(queue.clone());
+        drop(rx);
+
+        let result = reply_escalation(&mut ctx, "esc_gone", "do X").unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "status": "error",
+                "message": "The reply was not delivered: agent 'explore' stopped waiting on escalation 'esc_gone'",
+            })
+        );
+        assert!(queue.take("esc_gone").is_none());
     }
 
     #[tokio::test]
