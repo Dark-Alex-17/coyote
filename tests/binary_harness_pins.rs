@@ -45,7 +45,8 @@ const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
     concat!("Pty::", "spawn("),
 ];
-const HARNESS_USERS: [&str; 8] = [
+const HARNESS_USERS: [&str; 9] = [
+    "editor_setting_usage.rs",
     "theme_setting_usage.rs",
     "tui_binary.rs",
     "tui_binary_exit.rs",

@@ -60,8 +60,9 @@ const KEY_CONTEXTS: [&str; 13] = [
     "Thread picker",
     "Pager",
 ];
-/// The settings the README and Getting-Started tables carry for the UI.
-const SETTINGS: [&str; 3] = ["ui", "tui_dump_on_exit", "theme"];
+/// The settings whose README and Getting-Started rows this lint checks.
+const SETTINGS: [&str; 4] = ["ui", "tui_dump_on_exit", "editor", "theme"];
+const WIKI_URL: &str = "https://github.com/Dark-Alex-17/coyote/wiki/";
 /// Words that narrate a plan or a release rather than describe the product.
 const PLANNING_WORDS: [&str; 8] = [
     "phase", "phases", "round", "rounds", "wave", "waves", "ruling", "rulings",
@@ -848,17 +849,23 @@ fn config_rows_match_the_template() {
         ] {
             assert!(theme.contains(needle), "{label} `theme` row says {needle}");
         }
+        let editor = table_row(label, text, "`editor`").join(" ");
+        let visual = editor.find("`$VISUAL`");
+        let fallback = editor.find("`$EDITOR`");
+        assert!(
+            visual.is_some() && fallback.is_some() && visual < fallback,
+            "{label} `editor` row names `$VISUAL` before `$EDITOR`: {editor}"
+        );
     }
     if let [(_, readme), (_, started)] = &tables[..] {
-        let readme_theme = table_row("README.md", readme, "`theme`")[2].replace(
-            "(https://github.com/Dark-Alex-17/coyote/wiki/Themes)",
-            "(Themes)",
-        );
-        assert_eq!(
-            readme_theme,
-            table_row("Getting-Started.md", started, "`theme`")[2],
-            "README.md and Getting-Started.md describe `theme` alike"
-        );
+        for key in SETTINGS {
+            let first = format!("`{key}`");
+            assert_eq!(
+                table_row("README.md", readme, &first)[2].replace(WIKI_URL, ""),
+                table_row("Getting-Started.md", started, &first)[2],
+                "README.md and Getting-Started.md describe `{key}` alike"
+            );
+        }
     }
 
     let Some(wiki) = wiki else { return };

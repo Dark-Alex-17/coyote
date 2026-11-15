@@ -1623,6 +1623,9 @@ clients:
             "tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
         ));
         assert!(CONFIG_TEMPLATE.contains(
+            "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
+        ));
+        assert!(CONFIG_TEMPLATE.contains(
             "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
         ));
         assert!(!CONFIG_TEMPLATE.to_ascii_lowercase().contains("light_theme"));
@@ -1665,6 +1668,9 @@ clients:
         ));
         assert!(example.contains(
             "\ntui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
+        ));
+        assert!(example.contains(
+            "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
         ));
         assert!(example.contains(
             "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
