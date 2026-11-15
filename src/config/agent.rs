@@ -3246,6 +3246,7 @@ nodes: {}
     }
 
     /// An agent whose `_instructions` tool writes `text` as its output.
+    #[cfg(unix)]
     fn agent_with_instructions_tool(name: &str, text: &str) -> Agent {
         use std::os::unix::fs::PermissionsExt;
         let bin = paths::agent_bin_dir(name);
@@ -3265,6 +3266,7 @@ nodes: {}
 
     /// On a multi-thread runtime's worker the tool runs through
     /// `block_in_place`, and its output comes back as the instructions.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn run_instructions_fn_returns_the_tool_output_on_a_multi_thread_worker() {
@@ -3286,6 +3288,7 @@ nodes: {}
 
     /// On a current-thread runtime `block_in_place` would panic, so the
     /// tool runs on the calling thread and still gives its output back.
+    #[cfg(unix)]
     #[test]
     #[serial]
     fn run_instructions_fn_returns_the_tool_output_on_a_current_thread_runtime() {
