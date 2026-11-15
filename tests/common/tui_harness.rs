@@ -1274,6 +1274,38 @@ pub fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
     strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
 }
 
+/// A full repaint at 100 columns: the height flips between 30 and 32 rows
+/// from whatever it is now, so every call is a real resize and the UI
+/// paints every cell.
+pub fn flipped_frame(pty: &mut Pty) -> String {
+    let rows = if pty.rows().unwrap() == 30 { 32 } else { 30 };
+    repainted_frame(pty, rows, 100)
+}
+
+/// The first fully repainted frame that shows `needle`, panicking with
+/// `what` after `repaints` repaints without it. The pager covers cells
+/// that may already hold the same characters, so a diff paint read
+/// straight off the pty can miss part of a string the screen does show.
+pub fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str, repaints: usize) -> String {
+    let mut frame = String::new();
+    for _ in 0..repaints {
+        frame = flipped_frame(pty);
+        if squeezed(&frame).contains(&squeezed(needle)) {
+            return frame;
+        }
+    }
+    panic!("{what}:\n{frame}");
+}
+
+/// The roster band of a repainted frame: from its legend down to the rule
+/// under it.
+pub fn roster_band(frame: &str) -> &str {
+    let legend = frame
+        .rfind("Esc = close")
+        .unwrap_or_else(|| panic!("the roster's legend is not on screen:\n{frame}"));
+    frame[legend..].split('\u{2500}').next().unwrap_or_default()
+}
+
 /// The vault refuses a password file anyone else can read; the fixture
 /// writes it with the default mode, so a case that stores a secret
 /// tightens it first.

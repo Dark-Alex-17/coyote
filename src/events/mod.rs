@@ -105,7 +105,9 @@ pub enum Event {
     },
     /// The root context settled the directory identity its child
     /// sessions live under, so an observer can find a child's files
-    /// while the turn that spawned it is still running.
+    /// while the turn that spawned it is still running. A sessionless
+    /// fork of a root sends it too, with a root equal to the root's own,
+    /// so a repeat compares equal by value, not by pointer.
     ChildSessionRootResolved {
         root: Arc<ChildSessionRoot>,
     },

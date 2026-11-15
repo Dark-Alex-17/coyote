@@ -45,6 +45,10 @@ pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
 pub const PARENT_ALIAS: &str = "parent";
 
+/// How long `agent__cancel` waits for a cancelled agent's task to join
+/// before it reports the cleanup as still under way.
+pub(crate) const CANCEL_CLEANUP_WAIT: Duration = Duration::from_secs(5);
+
 fn agent_permitted(whitelist: Option<&[String]>, target: &str) -> bool {
     match whitelist {
         None => true,
@@ -2151,14 +2155,15 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 );
             }
 
-            let cleanup = tokio::time::timeout(Duration::from_secs(5), handle.join_handle).await;
+            let cleanup = tokio::time::timeout(CANCEL_CLEANUP_WAIT, handle.join_handle).await;
 
             ctx.pending_tasks_guardrail_count = 0;
 
             let message = match cleanup {
                 Ok(_) => format!("Cancelled agent '{agent_name}' and waited for cleanup."),
                 Err(_) => format!(
-                    "Cancelled agent '{agent_name}'; cleanup did not complete within 5s. Its descendants have been signalled and will tear down asynchronously."
+                    "Cancelled agent '{agent_name}'; cleanup did not complete within {}s. Its descendants have been signalled and will tear down asynchronously.",
+                    CANCEL_CLEANUP_WAIT.as_secs()
                 ),
             };
 

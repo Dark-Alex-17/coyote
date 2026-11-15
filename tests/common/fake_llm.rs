@@ -33,8 +33,10 @@ pub enum Reply {
     },
 }
 
-/// How long an [`Reply::After`] waits for its gate.
-pub const AFTER_LIMIT: Duration = Duration::from_secs(30);
+/// How long an [`Reply::After`] waits for its gate. A case opens the gate
+/// itself, so the cap only bounds a case that never does; a loaded host
+/// can take well past half a minute to get there.
+pub const AFTER_LIMIT: Duration = Duration::from_secs(120);
 
 pub enum Chunk {
     /// A `delta.content` frame.

@@ -584,6 +584,37 @@ mod tests {
         assert_eq!(transcript.full_output_bytes, 0);
     }
 
+    /// The running count of whole-output bytes stays the sum over the
+    /// cells through a replace, a remove and a truncate.
+    #[test]
+    fn the_full_output_count_matches_the_cells_after_replace_remove_and_truncate() {
+        fn recounted(transcript: &Transcript) -> usize {
+            transcript.cells().iter().map(Cell::full_output_bytes).sum()
+        }
+        let (mut transcript, _) = transcript();
+        tool_with_output(&mut transcript, "c1", "one\n");
+        tool_with_output(&mut transcript, "c2", "second call\n");
+        tool_with_output(&mut transcript, "c3", "the third call's output\n");
+        tool_with_output(&mut transcript, "c4", "four 4\n");
+        assert_eq!(transcript.full_output_bytes, 47);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+
+        let mut swapped = tool("c9");
+        let (_, full) = swapped.output_for("c9").unwrap();
+        full.push("a much longer replacement output\n");
+        transcript.replace(1, swapped);
+        assert_eq!(transcript.full_output_bytes, 68);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+
+        transcript.remove(0);
+        assert_eq!(transcript.full_output_bytes, 64);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+
+        transcript.truncate(1);
+        assert_eq!(transcript.full_output_bytes, 33);
+        assert_eq!(transcript.full_output_bytes, recounted(&transcript));
+    }
+
     /// Ctrl+Up from nothing takes the last row that opens; Ctrl+Down the
     /// first; a bookkeeping call and a user line are skipped over.
     #[test]

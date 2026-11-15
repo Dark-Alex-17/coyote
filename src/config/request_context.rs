@@ -2039,7 +2039,10 @@ impl RequestContext {
     /// all. A sessionless root keys it on this process's stamp. A fork
     /// or child inherits its parent's handle and never resolves one itself.
     /// Resolving touches no directory: the first child file write creates it.
-    /// A root context announces the root it resolves on the event bus.
+    /// A root context announces the root it resolves on the event bus. So
+    /// does a sessionless fork of a root that had not resolved one yet: it
+    /// keys on the same process stamp, so it announces a root equal to the
+    /// one its parent would, and observers compare roots by value.
     pub(crate) fn ensure_child_session_root(&mut self) -> Option<Arc<ChildSessionRoot>> {
         if let Some(root) = &self.child_session_root {
             return Some(Arc::clone(root));

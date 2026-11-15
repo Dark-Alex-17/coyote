@@ -266,6 +266,22 @@ impl Pty {
         }
         Ok(())
     }
+
+    /// The terminal's current height in rows.
+    pub fn rows(&self) -> std::io::Result<u16> {
+        use std::os::fd::AsRawFd;
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: TIOCGWINSZ writes one winsize through a valid pointer.
+        if unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCGWINSZ as _, &mut size) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(size.ws_row)
+    }
 }
 
 /// Killing the wrapper is not enough on its own: the session leader's

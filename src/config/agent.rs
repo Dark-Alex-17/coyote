@@ -3244,4 +3244,60 @@ nodes: {}
         );
         assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
     }
+
+    /// An agent whose `_instructions` tool writes `text` as its output.
+    fn agent_with_instructions_tool(name: &str, text: &str) -> Agent {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = paths::agent_bin_dir(name);
+        std::fs::create_dir_all(&bin).unwrap();
+        let tool = bin.join(name);
+        std::fs::write(
+            &tool,
+            format!("#!/usr/bin/env bash\nprintf '%s' '{text}' > \"$LLM_OUTPUT\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Agent::test_new(AgentConfig {
+            name: name.to_string(),
+            ..AgentConfig::default()
+        })
+    }
+
+    /// On a multi-thread runtime's worker the tool runs through
+    /// `block_in_place`, and its output comes back as the instructions.
+    #[test]
+    #[serial]
+    fn run_instructions_fn_returns_the_tool_output_on_a_multi_thread_worker() {
+        let _guard = testing::TestConfigDirGuard::new("agent-instructions-mt");
+        let agent = agent_with_instructions_tool("probe-mt", "You are the mt probe x7x.");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let instructions = runtime
+            .block_on(
+                async move { tokio::spawn(async move { agent.run_instructions_fn(None) }).await },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(instructions, "You are the mt probe x7x.");
+    }
+
+    /// On a current-thread runtime `block_in_place` would panic, so the
+    /// tool runs on the calling thread and still gives its output back.
+    #[test]
+    #[serial]
+    fn run_instructions_fn_returns_the_tool_output_on_a_current_thread_runtime() {
+        let _guard = testing::TestConfigDirGuard::new("agent-instructions-ct");
+        let agent = agent_with_instructions_tool("probe-ct", "You are the ct probe x7x.");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let instructions = runtime
+            .block_on(async { agent.run_instructions_fn(None) })
+            .unwrap();
+        assert_eq!(instructions, "You are the ct probe x7x.");
+    }
 }

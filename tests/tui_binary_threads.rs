@@ -145,8 +145,8 @@ struct Scene {
     kid_started: PathBuf,
     kid_gate: PathBuf,
     log: PathBuf,
-    _boss: FakeLlm,
-    _kid: FakeLlm,
+    boss: FakeLlm,
+    kid: FakeLlm,
 }
 
 impl Scene {
@@ -228,8 +228,8 @@ fn scene(name: &str, kid_replies: impl FnOnce(&Path) -> Vec<Reply>, extra: &str)
         root_gate,
         kid_started,
         kid_gate,
-        _boss: boss,
-        _kid: kid,
+        boss,
+        kid,
     }
 }
 
@@ -279,36 +279,14 @@ fn engage_and_spawn(pty: &mut Pty, scene: &Scene) {
     pty.read_for(Duration::from_millis(800));
 }
 
-/// A full repaint: the pty's height flips between 30 and 32 rows on every
-/// call, so each call is a real resize and the UI paints every cell.
-fn frame(pty: &mut Pty) -> String {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static TALL: AtomicBool = AtomicBool::new(false);
-    let rows = if TALL.fetch_xor(true, Ordering::SeqCst) {
-        30
-    } else {
-        32
-    };
-    repainted_frame(pty, rows, 100)
-}
-
-fn frame_showing(pty: &mut Pty, needle: &str, what: &str) -> String {
-    let mut frame_text = String::new();
-    for _ in 0..6 {
-        let frame = frame(pty);
-        frame_text = frame.clone();
-        if squeezed(&frame).contains(&squeezed(needle)) {
-            return frame;
-        }
-    }
-    panic!("{what}:\n{frame_text}");
-}
+/// How many repaints [`repainted_frame_showing`] tries before it gives up.
+const REPAINTS: usize = 6;
 
 /// Repaints until `pred` holds on a frame or `within` passes.
 fn frame_until(pty: &mut Pty, within: Duration, pred: impl Fn(&str) -> bool) -> (bool, String) {
     let deadline = Instant::now() + within;
     loop {
-        let frame = frame(pty);
+        let frame = flipped_frame(pty);
         if pred(&frame) {
             return (true, frame);
         }
@@ -324,6 +302,17 @@ fn row_after<'a>(frame: &'a str, needle: &str) -> Option<&'a str> {
     let at = frame.rfind(needle)?;
     let rest = &frame[at..];
     Some(&rest[..rest.find('\n').unwrap_or(rest.len()).min(90)])
+}
+
+/// The thread picker's band of a repainted frame: from its header down to
+/// the key legend under the list, so a word elsewhere on screen does not
+/// count as a picker row's.
+fn picker_band(frame: &str) -> &str {
+    let header = frame
+        .rfind("Esc = back")
+        .unwrap_or_else(|| panic!("the picker's header is not on screen:\n{frame}"));
+    let band = &frame[header..];
+    &band[..band.find("j/k move").unwrap_or(band.len())]
 }
 
 fn leave(pty: &mut Pty, scene: &Scene) -> String {
@@ -421,7 +410,12 @@ fn f3_after_dot_agent_engage_lists_the_spawned_child_as_running() {
     engage_and_spawn(&mut pty, &scene);
 
     pty.send(b"\x1bOR").unwrap();
-    let roster = frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
+    let roster = repainted_frame_showing(
+        &mut pty,
+        "Esc = close",
+        "F3 did not open the roster",
+        REPAINTS,
+    );
     let band = roster_band(&roster);
     assert!(
         band.contains("kid") && band.contains("running"),
@@ -443,7 +437,12 @@ fn x_on_a_running_child_agent_row_cancels_it() {
     engage_and_spawn(&mut pty, &scene);
 
     pty.send(b"\x1bOR").unwrap();
-    let roster = frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
+    let roster = repainted_frame_showing(
+        &mut pty,
+        "Esc = close",
+        "F3 did not open the roster",
+        REPAINTS,
+    );
     assert!(
         roster_band(&roster).contains("kid"),
         "no kid row to cancel:\n{roster}"
@@ -466,12 +465,13 @@ fn x_on_a_running_child_agent_row_cancels_it() {
     // cancelled, not completed.
     let _ = fs::write(&scene.kid_gate, "");
     let _ = fs::write(&scene.root_gate, "");
-    wait_idle_after(&mut pty, &scene._boss, 6);
+    wait_idle_after(&mut pty, &scene.boss, 6);
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     let (said, picker) = frame_until(&mut pty, Duration::from_secs(6), |frame| {
@@ -506,18 +506,20 @@ fn on_the_first_spawning_turn_the_picker_lists_the_running_child_and_rereads_it(
     engage_and_spawn(&mut pty, &scene);
 
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"\t").unwrap();
-    let picker = frame_showing(
+    let picker = repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
+        REPAINTS,
     );
-    let kid_row = row_after(&picker, "kid").unwrap_or_else(|| {
+    let kid_row = row_after(picker_band(&picker), "kid").unwrap_or_else(|| {
         panic!(
             "the picker does not list the running kid (child files on disk: {:?}):\n{picker}",
             children_files(&scene.dir.join("cache"))
@@ -532,10 +534,11 @@ fn on_the_first_spawning_turn_the_picker_lists_the_running_child_and_rereads_it(
     pty.send(b"\r").unwrap();
     // Rounds inside the kid's tool loop show up only at its next
     // checkpoint, so the open view may still be empty here.
-    let child = frame_showing(
+    let child = repainted_frame_showing(
         &mut pty,
         "(read-only)",
         "Enter on the kid did not open its read-only view",
+        REPAINTS,
     );
     assert!(
         !squeezed(&child).contains("kiddonez4p"),
@@ -646,16 +649,18 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
     wait_idle_after(&mut pty, &boss, 5);
 
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"\t").unwrap();
-    let picker = frame_showing(
+    let picker = repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
+        REPAINTS,
     );
     assert!(
         row_after(&picker, "kid").is_some(),
@@ -674,21 +679,28 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
         .unwrap_or_else(|| panic!("no child session file: {files:?}"));
     fs::write(transcript_file, ":\n  - [unterminated {{ not yaml\n").unwrap();
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"\t").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker over a malformed child",
+        REPAINTS,
     );
     pty.send(b"\x1b[B").unwrap();
     pty.read_for(Duration::from_millis(300));
     pty.send(b"\r").unwrap();
-    let opened = frame(&mut pty);
+    let opened = repainted_frame_showing(
+        &mut pty,
+        "Cannot read this transcript",
+        "Enter on the malformed child did not show the error line",
+        REPAINTS,
+    );
     assert!(
         !squeezed(&opened).contains("kiddonem9f"),
         "the malformed child file still showed its old transcript:\n{opened}"
@@ -702,10 +714,11 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
         fs::write(file, "\u{0}\u{1}: [ {{\n").unwrap();
     }
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     pty.read_for(Duration::from_millis(600));
@@ -782,19 +795,21 @@ fn on_a_later_turn_the_picker_lists_a_running_child_and_rereads_it() {
     pty.read_for(Duration::from_millis(800));
 
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"\t").unwrap();
-    let picker = frame_showing(
+    let picker = repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
+        REPAINTS,
     );
     assert!(
-        squeezed(&picker).contains("running"),
+        squeezed(picker_band(&picker)).contains("running"),
         "the picker does not list the second kid as running on a later turn:\n{picker}"
     );
     // Open the second kid's thread: try each row under the root thread.
@@ -805,7 +820,7 @@ fn on_a_later_turn_the_picker_lists_a_running_child_and_rereads_it() {
             pty.read_for(Duration::from_millis(200));
         }
         pty.send(b"\r").unwrap();
-        let view = frame(&mut pty);
+        let view = flipped_frame(&mut pty);
         // The running kid's view: read-only, and not the first kid's
         // transcript (its prompt is `o1n`). Rounds inside its tool loop
         // show up only at its next checkpoint, so it may still be empty.
@@ -869,7 +884,7 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
     pty.send(b"go boss\r").unwrap();
     wait_for_file(&mut pty, &scene.root_started, "the root's mark tool");
     let deadline = Instant::now() + PTY_DEADLINE;
-    while scene._kid.served() < 1 && Instant::now() < deadline {
+    while scene.kid.served() < 1 && Instant::now() < deadline {
         pty.read_for(Duration::from_millis(200));
     }
     pty.read_for(Duration::from_millis(1500));
@@ -889,8 +904,7 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
     for _ in 0..3 {
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(1500));
-        last = frame(&mut pty);
-        eprintln!("after Enter:\n{last}");
+        last = flipped_frame(&mut pty);
         if squeezed(&last).contains("e5q") && !last.contains("Esc = close") {
             // A modal for the question: confirm with y then Enter.
             pty.read_for(HOTKEY_GAP);
@@ -908,14 +922,14 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
         "Enter did not open the question to answer:\n{last}"
     );
     let deadline = Instant::now() + Duration::from_secs(15);
-    while scene._kid.served() < 2 && Instant::now() < deadline {
+    while scene.kid.served() < 2 && Instant::now() < deadline {
         pty.read_for(Duration::from_millis(200));
     }
     assert!(
-        scene._kid.served() >= 2,
+        scene.kid.served() >= 2,
         "the kid never got an answer back to ask its model again"
     );
-    let bodies = scene._kid.bodies();
+    let bodies = scene.kid.bodies();
     let last_body = bodies.last().unwrap();
     let request: serde_json::Value = serde_json::from_str(last_body).unwrap();
     let tool_content = request["messages"]
@@ -959,10 +973,11 @@ fn sigterm_with_the_pager_open_prints_the_transcript() {
     wait_for_squeezed(&mut pty, "pager exit reply w6d", "the reply");
     pty.read_for(Duration::from_millis(800));
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     let pid = child_pid(&boot);
     // SAFETY: kill takes a pid and a signal number and touches no memory.
@@ -997,10 +1012,11 @@ fn shrinking_the_terminal_with_the_pager_open_keeps_the_ui_up() {
     wait_for_squeezed(&mut pty, "t0y", "the reply");
     pty.read_for(Duration::from_millis(800));
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     for (rows, cols) in [(3, 10), (1, 1), (5, 20), (2, 80), (40, 4)] {
         pty.resize(rows, cols).unwrap();
@@ -1010,7 +1026,12 @@ fn shrinking_the_terminal_with_the_pager_open_keeps_the_ui_up() {
             pty.read_for(Duration::from_millis(100));
         }
     }
-    let frame = frame_showing(&mut pty, "Thread: root thread", "the pager did not survive");
+    let frame = repainted_frame_showing(
+        &mut pty,
+        "Thread: root thread",
+        "the pager did not survive",
+        REPAINTS,
+    );
     pty.send(b"q").unwrap();
     pty.read_for(Duration::from_millis(400));
     pty.send(b"\x04").unwrap();
@@ -1018,15 +1039,6 @@ fn shrinking_the_terminal_with_the_pager_open_keeps_the_ui_up() {
     assert!(!transcript.contains("panicked"), "{transcript}\n{frame}");
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
-}
-
-/// The roster band of a repainted frame: from its legend down to the rule
-/// under it.
-fn roster_band(frame: &str) -> &str {
-    let legend = frame
-        .rfind("Esc = close")
-        .unwrap_or_else(|| panic!("the roster's legend is not on screen:\n{frame}"));
-    frame[legend..].split('\u{2500}').next().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,14 +1105,20 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
     );
 
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
 
     pty.send(b"G").unwrap();
-    let end = frame_showing(&mut pty, "pq-120", "G did not show the last output line");
+    let end = repainted_frame_showing(
+        &mut pty,
+        "pq-120",
+        "G did not show the last output line",
+        REPAINTS,
+    );
     assert!(
         !end.contains("pq-001"),
         "G left the first line on screen:\n{end}"
@@ -1108,7 +1126,12 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
 
     pty.send(b"\x1b[5~").unwrap();
     pty.read_for(Duration::from_millis(300));
-    let up = frame_showing(&mut pty, "j/k scroll", "the pager went away on PgUp");
+    let up = repainted_frame_showing(
+        &mut pty,
+        "j/k scroll",
+        "the pager went away on PgUp",
+        REPAINTS,
+    );
     assert!(
         !up.contains("pq-120"),
         "PgUp did not move off the end:\n{up}"
@@ -1120,10 +1143,15 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
 
     pty.send(b"\x1b[6~").unwrap();
     pty.read_for(Duration::from_millis(300));
-    frame_showing(&mut pty, "pq-120", "PgDn did not come back to the end");
+    repainted_frame_showing(
+        &mut pty,
+        "pq-120",
+        "PgDn did not come back to the end",
+        REPAINTS,
+    );
 
     pty.send(b"g").unwrap();
-    let top = frame_showing(&mut pty, "pq-001", "g did not go to the top");
+    let top = repainted_frame_showing(&mut pty, "pq-001", "g did not go to the top", REPAINTS);
     assert!(
         !top.contains("pq-120"),
         "g left the last line on screen:\n{top}"
@@ -1133,7 +1161,12 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
         pty.send(b"j").unwrap();
         pty.read_for(Duration::from_millis(60));
     }
-    let down = frame_showing(&mut pty, "pq-030", "j scrolled away the whole output");
+    let down = repainted_frame_showing(
+        &mut pty,
+        "pq-030",
+        "j scrolled away the whole output",
+        REPAINTS,
+    );
     assert!(
         !down.contains("pq-001"),
         "twelve j presses did not scroll the first output line off:\n{down}"
@@ -1142,15 +1175,21 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
         pty.send(b"k").unwrap();
         pty.read_for(Duration::from_millis(60));
     }
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "pq-001",
         "k did not scroll back to the first line",
+        REPAINTS,
     );
 
     pty.send(b"q").unwrap();
     pty.read_for(Duration::from_millis(400));
-    let back = frame_showing(&mut pty, "no session", "q did not close the pager");
+    let back = repainted_frame_showing(
+        &mut pty,
+        "no session",
+        "q did not close the pager",
+        REPAINTS,
+    );
     assert!(!squeezed(&back).contains("Thread:rootthread"), "{back}");
     pty.send(b"after scroll m4t").unwrap();
     wait_for_squeezed(
@@ -1195,10 +1234,11 @@ fn crlf_line_endings_show_in_the_pager_as_whole_lines() {
         "fixture done c6r",
     );
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"G").unwrap();
     pty.read_for(Duration::from_millis(800));
@@ -1270,21 +1310,28 @@ fn an_output_over_the_cap_pages_with_a_visible_note() {
         "fixture done h9u",
     );
     pty.send(b"\x14").unwrap();
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
+        REPAINTS,
     );
     pty.send(b"G").unwrap();
     pty.read_for(Duration::from_millis(800));
-    frame_showing(
+    repainted_frame_showing(
         &mut pty,
         "huge-last-line-b1g",
         "G did not reach the output's end",
+        REPAINTS,
     );
     pty.send(b"g").unwrap();
     pty.read_for(Duration::from_millis(800));
-    let top = frame_showing(&mut pty, "fixture_huge({})", "g did not reach the top");
+    let top = repainted_frame_showing(
+        &mut pty,
+        "fixture_huge({})",
+        "g did not reach the top",
+        REPAINTS,
+    );
     assert!(
         top.contains("bytes not kept"),
         "no visible note at the top that the output was cut:\n{top}"
@@ -1297,10 +1344,11 @@ fn an_output_over_the_cap_pages_with_a_visible_note() {
     pty.read_for(Duration::from_millis(300));
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(1500));
-    let found = frame_showing(
+    let found = repainted_frame_showing(
         &mut pty,
         "huge-last-line-b1g",
         "find did not reach the last line of a capped output",
+        REPAINTS,
     );
     assert!(!found.contains("No match"), "{found}");
     pty.send(b"q").unwrap();

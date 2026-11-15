@@ -52,9 +52,9 @@ impl LineCache {
 pub(super) struct FullOutput {
     text: String,
     dropped: usize,
-    /// A `\r` that ended the last push, held until the next push shows
-    /// whether it began a `\r\n`.
-    pending_cr: bool,
+    /// The run of `\r` that ended the last push, held until the next push
+    /// shows whether a `\n` follows it.
+    pending_crs: usize,
     wrapped: Option<WrappedOutput>,
 }
 
@@ -75,36 +75,38 @@ struct WrappedOutput {
 }
 
 impl FullOutput {
-    /// Appends `text` with each `\r\n` made `\n`, even one split across
-    /// two pushes, returning how many more bytes are kept now (fewer when
-    /// the cap cut the oldest away).
+    /// Appends `text` with each run of `\r` before a `\n` dropped, even a
+    /// run split across pushes, returning how many more bytes are kept now
+    /// (fewer when the cap cut the oldest away).
     pub(super) fn push(&mut self, text: &str) -> isize {
         if text.is_empty() {
             return 0;
         }
-        let mut chunk = String::with_capacity(text.len() + 1);
-        if std::mem::take(&mut self.pending_cr) && !text.starts_with('\n') {
-            chunk.push('\r');
-        }
-        let body = match text.strip_suffix('\r') {
-            Some(head) => {
-                self.pending_cr = true;
-                head
+        let mut crs = std::mem::take(&mut self.pending_crs);
+        let mut chunk = String::with_capacity(crs + text.len());
+        for c in text.chars() {
+            match c {
+                '\r' => crs += 1,
+                '\n' => {
+                    crs = 0;
+                    chunk.push('\n');
+                }
+                _ => {
+                    chunk.extend(std::iter::repeat_n('\r', crs));
+                    crs = 0;
+                    chunk.push(c);
+                }
             }
-            None => text,
-        };
-        chunk.push_str(&body.replace("\r\n", "\n"));
+        }
+        self.pending_crs = crs;
         self.append(&chunk)
     }
 
-    /// Keeps a `\r` still held back by `push` as it is, for output that
-    /// has ended.
+    /// Keeps the `\r`s still held back by `push` as they are, for output
+    /// that has ended.
     pub(super) fn settle(&mut self) -> isize {
-        if std::mem::take(&mut self.pending_cr) {
-            self.append("\r")
-        } else {
-            0
-        }
+        let crs = std::mem::take(&mut self.pending_crs);
+        self.append(&"\r".repeat(crs))
     }
 
     fn append(&mut self, text: &str) -> isize {
@@ -256,7 +258,7 @@ impl Clone for FullOutput {
         Self {
             text: self.text.clone(),
             dropped: self.dropped,
-            pending_cr: self.pending_cr,
+            pending_crs: self.pending_crs,
             wrapped: None,
         }
     }
@@ -266,7 +268,7 @@ impl PartialEq for FullOutput {
     fn eq(&self, other: &Self) -> bool {
         self.text == other.text
             && self.dropped == other.dropped
-            && self.pending_cr == other.pending_cr
+            && self.pending_crs == other.pending_crs
     }
 }
 
@@ -1381,6 +1383,32 @@ mod tests {
         overwritten.push("50%\r");
         overwritten.push("99%\n");
         assert_eq!(overwritten.text(), "50%\r99%\n");
+    }
+
+    /// Any run of `\r` before a `\n` folds to the `\n`, also when the run
+    /// is spread over several pushes; a run before other text is kept.
+    #[test]
+    fn the_full_output_folds_a_run_of_cr_before_lf_across_pushes() {
+        let mut full = FullOutput::default();
+        full.push("one\r\r\ntwo\r\r\r\n");
+        assert_eq!(full.text(), "one\ntwo\n");
+
+        let mut split = FullOutput::default();
+        assert_eq!(split.push("one\r"), 3);
+        assert_eq!(split.push("\r"), 0);
+        split.push("\r\ntwo\n");
+        assert_eq!(split.text(), "one\ntwo\n");
+        assert_eq!(split.settle(), 0);
+
+        let mut kept = FullOutput::default();
+        kept.push("a\r");
+        kept.push("\rb\n");
+        assert_eq!(kept.text(), "a\r\rb\n");
+
+        let mut settled = FullOutput::default();
+        settled.push("50%\r\r");
+        assert_eq!(settled.settle(), 2);
+        assert_eq!(settled.text(), "50%\r\r");
     }
 
     /// The whole output's lines are laid out once per width and change;

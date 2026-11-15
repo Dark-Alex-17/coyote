@@ -2566,7 +2566,17 @@ pub(crate) async fn run_llm_function_off_worker(
         )
     })
     .await
-    .unwrap_or_else(|err| Err(anyhow!("tool task panicked: {err}")))
+    .unwrap_or_else(|err| Err(tool_task_failure(err)))
+}
+
+fn tool_task_failure(err: tokio::task::JoinError) -> anyhow::Error {
+    if err.is_panic() {
+        anyhow!("tool task panicked: {err}")
+    } else if err.is_cancelled() {
+        anyhow!("tool task was cancelled")
+    } else {
+        anyhow!("tool task failed: {err}")
+    }
 }
 
 pub fn run_llm_function(
@@ -6535,5 +6545,28 @@ mod tests {
                 .contains("Unexpected call")
         );
         assert!(captures[0].payload.is_none());
+    }
+
+    /// A tool task that ends without a result is named for how it ended:
+    /// a panic keeps its message, a cancel is not called a panic.
+    #[test]
+    fn a_tool_task_that_did_not_finish_says_whether_it_panicked_or_was_cancelled() {
+        run_async(async {
+            let cancelled = tokio::spawn(std::future::pending::<()>());
+            cancelled.abort();
+            let err = cancelled.await.unwrap_err();
+            assert_eq!(
+                tool_task_failure(err).to_string(),
+                "tool task was cancelled"
+            );
+
+            let panicked = tokio::spawn(async { panic!("tool boom x7x") });
+            let err = panicked.await.unwrap_err();
+            let message = tool_task_failure(err).to_string();
+            assert!(
+                message.starts_with("tool task panicked: ") && message.contains("tool boom x7x"),
+                "{message}"
+            );
+        });
     }
 }

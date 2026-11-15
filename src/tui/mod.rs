@@ -32,6 +32,7 @@ mod transcript;
 use crate::config::child_sessions::ChildSessionRoot;
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, Origin, SubscriptionId};
+use crate::function::agents::CANCEL_CLEANUP_WAIT;
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, input_default_text};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::supervisor::notification::NotificationQueue;
@@ -247,7 +248,9 @@ const HOTKEY_IDLE: Duration = Duration::from_secs(1);
 const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
 /// How long the exit work waits for the roster's and the pager's control
 /// tasks before it takes the context; those still running are aborted.
-const CONTROL_TASK_WAIT: Duration = Duration::from_secs(2);
+/// A roster cancel of an agent waits up to `CANCEL_CLEANUP_WAIT` for the
+/// agent to join, so this outlasts it rather than abort that wait.
+const CONTROL_TASK_WAIT: Duration = CANCEL_CLEANUP_WAIT.saturating_add(Duration::from_secs(1));
 /// How long the UI waits on the exit work. The work itself waits
 /// `CONTROL_TASK_WAIT` on control tasks and `EXIT_CANCEL_WAIT` on
 /// background tasks before it saves the session and runs the finished
@@ -2546,11 +2549,15 @@ impl App {
                 }
             }
             UiMsg::ChildSessionRootResolved(root) => {
+                // By value: a sessionless fork resolves its own Arc of the
+                // same process-stamp root the App may already hold.
+                let changed = self.child_root.as_deref() != Some(&*root);
                 self.child_root = Some(root);
-                if self
-                    .pager
-                    .as_ref()
-                    .is_some_and(|pager| pager.mode() == PagerMode::Picker)
+                if changed
+                    && self
+                        .pager
+                        .as_ref()
+                        .is_some_and(|pager| pager.mode() == PagerMode::Picker)
                 {
                     self.open_thread_picker();
                 }
@@ -3133,10 +3140,11 @@ impl App {
 
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
-    /// that was just drawn, and so does an open roster for its next read.
+    /// that was just drawn, and so does an open roster for its next read
+    /// unless the pager covers it.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
-        if self.turn.is_some() || matches!(self.view, View::Roster(_)) {
+        if self.turn.is_some() || (self.pager.is_none() && matches!(self.view, View::Roster(_))) {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }
@@ -6699,6 +6707,22 @@ mod tests {
         );
 
         harness.app.end_turn(false, &TurnOutcome::default());
+        harness.render();
+        harness.app.frame_drawn();
+        assert_eq!(harness.app.frames.due_at(), None);
+    }
+
+    /// An open roster asks for a read every tick, but not while the pager
+    /// covers it and nothing of it is drawn.
+    #[test]
+    fn the_roster_ticks_only_while_no_pager_covers_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.press(KeyCode::F(3));
+        harness.render();
+        harness.app.frame_drawn();
+        assert!(harness.app.frames.due_at().is_some(), "no roster tick");
+
+        harness.app.pager = Some(Pager::root());
         harness.render();
         harness.app.frame_drawn();
         assert_eq!(harness.app.frames.due_at(), None);
