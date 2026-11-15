@@ -147,6 +147,9 @@ struct Scene {
     log: PathBuf,
     boss: FakeLlm,
     kid: FakeLlm,
+    /// Last because fields drop in declaration order, after `Drop` opens
+    /// the gates, so the dir outlives every file and handle in it.
+    _dir_guard: TempDirGuard,
 }
 
 impl Scene {
@@ -223,6 +226,7 @@ fn scene(name: &str, kid_replies: impl FnOnce(&Path) -> Vec<Reply>, extra: &str)
     let _ = fs::remove_file(&log);
     Scene {
         log,
+        _dir_guard: TempDirGuard(dir.clone()),
         dir,
         root_started,
         root_gate,
@@ -278,9 +282,6 @@ fn engage_and_spawn(pty: &mut Pty, scene: &Scene) {
     wait_for_file(pty, &scene.root_started, "the root's mark tool");
     pty.read_for(Duration::from_millis(800));
 }
-
-/// How many repaints [`repainted_frame_showing`] tries before it gives up.
-const REPAINTS: usize = 6;
 
 /// Repaints until `pred` holds on a frame or `within` passes.
 fn frame_until(pty: &mut Pty, within: Duration, pred: impl Fn(&str) -> bool) -> (bool, String) {
@@ -364,7 +365,6 @@ fn children_files(dir: &Path) -> Vec<PathBuf> {
 #[serial]
 fn the_ui_keeps_drawing_while_a_child_agent_runs_a_tool() {
     let scene = scene("thr-live", kid_in_a_blocking_tool, "");
-    let _guard = TempDirGuard(scene.dir.clone());
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     engage_and_spawn(&mut pty, &scene);
     wait_for_file(
@@ -405,17 +405,11 @@ fn the_ui_keeps_drawing_while_a_child_agent_runs_a_tool() {
 #[serial]
 fn f3_after_dot_agent_engage_lists_the_spawned_child_as_running() {
     let scene = scene("thr-roster", kid_mark_then_held, "");
-    let _guard = TempDirGuard(scene.dir.clone());
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     engage_and_spawn(&mut pty, &scene);
 
     pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(
-        &mut pty,
-        "Esc = close",
-        "F3 did not open the roster",
-        REPAINTS,
-    );
+    let roster = repainted_frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
     let band = roster_band(&roster);
     assert!(
         band.contains("kid") && band.contains("running"),
@@ -432,17 +426,11 @@ fn f3_after_dot_agent_engage_lists_the_spawned_child_as_running() {
 #[serial]
 fn x_on_a_running_child_agent_row_cancels_it() {
     let scene = scene("thr-cancel", kid_mark_then_held, "");
-    let _guard = TempDirGuard(scene.dir.clone());
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     engage_and_spawn(&mut pty, &scene);
 
     pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(
-        &mut pty,
-        "Esc = close",
-        "F3 did not open the roster",
-        REPAINTS,
-    );
+    let roster = repainted_frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
     assert!(
         roster_band(&roster).contains("kid"),
         "no kid row to cancel:\n{roster}"
@@ -471,7 +459,6 @@ fn x_on_a_running_child_agent_row_cancels_it() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     let (said, picker) = frame_until(&mut pty, Duration::from_secs(6), |frame| {
@@ -501,7 +488,6 @@ fn x_on_a_running_child_agent_row_cancels_it() {
 #[serial]
 fn on_the_first_spawning_turn_the_picker_lists_the_running_child_and_rereads_it() {
     let scene = scene("thr-picker", kid_mark_then_held, "");
-    let _guard = TempDirGuard(scene.dir.clone());
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     engage_and_spawn(&mut pty, &scene);
 
@@ -510,14 +496,12 @@ fn on_the_first_spawning_turn_the_picker_lists_the_running_child_and_rereads_it(
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     let picker = repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
-        REPAINTS,
     );
     let kid_row = row_after(picker_band(&picker), "kid").unwrap_or_else(|| {
         panic!(
@@ -538,7 +522,6 @@ fn on_the_first_spawning_turn_the_picker_lists_the_running_child_and_rereads_it(
         &mut pty,
         "(read-only)",
         "Enter on the kid did not open its read-only view",
-        REPAINTS,
     );
     assert!(
         !squeezed(&child).contains("kiddonez4p"),
@@ -653,14 +636,12 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     let picker = repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
-        REPAINTS,
     );
     assert!(
         row_after(&picker, "kid").is_some(),
@@ -683,14 +664,12 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker over a malformed child",
-        REPAINTS,
     );
     pty.send(b"\x1b[B").unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -699,7 +678,6 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
         &mut pty,
         "Cannot read this transcript",
         "Enter on the malformed child did not show the error line",
-        REPAINTS,
     );
     assert!(
         !squeezed(&opened).contains("kiddonem9f"),
@@ -718,7 +696,6 @@ fn a_malformed_child_session_file_degrades_without_a_panic() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     pty.read_for(Duration::from_millis(600));
@@ -799,14 +776,12 @@ fn on_a_later_turn_the_picker_lists_a_running_child_and_rereads_it() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"\t").unwrap();
     let picker = repainted_frame_showing(
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
-        REPAINTS,
     );
     assert!(
         squeezed(picker_band(&picker)).contains("running"),
@@ -876,7 +851,6 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
         },
         "",
     );
-    let _guard = TempDirGuard(scene.dir.clone());
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b".agent boss\r").unwrap();
@@ -958,39 +932,21 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
 // ---------------------------------------------------------------------------
 
 /// SIGTERM while the pager is open still leaves through the same path:
-/// the terminal is restored and the committed transcript is printed on
-/// the normal screen.
+/// exit 0, the terminal restored and the committed transcript printed
+/// once on the normal screen, prompt before reply.
 #[test]
 #[serial]
 fn sigterm_with_the_pager_open_prints_the_transcript() {
-    let dir = fresh_config_dir("thr-sigterm-pager");
-    let _guard = TempDirGuard(dir.clone());
-    let fake = FakeLlm::start(vec![Reply::Text("pager exit reply w6d".to_string())]);
-    write_fake_llm_config(&dir, &fake);
-    let mut pty = spawn_tui(&dir, &[]);
-    let boot = pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.send(b"pager exit prompt v3k\r").unwrap();
-    wait_for_squeezed(&mut pty, "pager exit reply w6d", "the reply");
-    pty.read_for(Duration::from_millis(800));
-    pty.send(b"\x14").unwrap();
-    repainted_frame_showing(
-        &mut pty,
-        "Thread: root thread",
-        "Ctrl+T did not open the pager",
-        REPAINTS,
-    );
-    let pid = child_pid(&boot);
-    // SAFETY: kill takes a pid and a signal number and touches no memory.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_tty_restored(&transcript);
-    let between = strip_ansi(&String::from_utf8_lossy(&raw_between_leave_and_report(
-        &pty,
-    )));
-    assert!(
-        squeezed(&between).contains("pagerexitpromptv3k")
-            && squeezed(&between).contains("pagerexitreplyw6d"),
-        "SIGTERM with the pager open did not print the transcript: {between:?}"
+    leaving_prints_the_transcript(
+        "thr-sigterm-pager",
+        |pty, pid| {
+            pty.send(b"\x14").unwrap();
+            repainted_frame_showing(pty, "Thread: root thread", "Ctrl+T did not open the pager");
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+        },
+        "pager exit prompt v3k",
+        "pager exit reply w6d",
     );
 }
 
@@ -1016,7 +972,6 @@ fn shrinking_the_terminal_with_the_pager_open_keeps_the_ui_up() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     for (rows, cols) in [(3, 10), (1, 1), (5, 20), (2, 80), (40, 4)] {
         pty.resize(rows, cols).unwrap();
@@ -1026,12 +981,8 @@ fn shrinking_the_terminal_with_the_pager_open_keeps_the_ui_up() {
             pty.read_for(Duration::from_millis(100));
         }
     }
-    let frame = repainted_frame_showing(
-        &mut pty,
-        "Thread: root thread",
-        "the pager did not survive",
-        REPAINTS,
-    );
+    let frame =
+        repainted_frame_showing(&mut pty, "Thread: root thread", "the pager did not survive");
     pty.send(b"q").unwrap();
     pty.read_for(Duration::from_millis(400));
     pty.send(b"\x04").unwrap();
@@ -1109,16 +1060,10 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
 
     pty.send(b"G").unwrap();
-    let end = repainted_frame_showing(
-        &mut pty,
-        "pq-120",
-        "G did not show the last output line",
-        REPAINTS,
-    );
+    let end = repainted_frame_showing(&mut pty, "pq-120", "G did not show the last output line");
     assert!(
         !end.contains("pq-001"),
         "G left the first line on screen:\n{end}"
@@ -1126,12 +1071,7 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
 
     pty.send(b"\x1b[5~").unwrap();
     pty.read_for(Duration::from_millis(300));
-    let up = repainted_frame_showing(
-        &mut pty,
-        "j/k scroll",
-        "the pager went away on PgUp",
-        REPAINTS,
-    );
+    let up = repainted_frame_showing(&mut pty, "j/k scroll", "the pager went away on PgUp");
     assert!(
         !up.contains("pq-120"),
         "PgUp did not move off the end:\n{up}"
@@ -1143,15 +1083,10 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
 
     pty.send(b"\x1b[6~").unwrap();
     pty.read_for(Duration::from_millis(300));
-    repainted_frame_showing(
-        &mut pty,
-        "pq-120",
-        "PgDn did not come back to the end",
-        REPAINTS,
-    );
+    repainted_frame_showing(&mut pty, "pq-120", "PgDn did not come back to the end");
 
     pty.send(b"g").unwrap();
-    let top = repainted_frame_showing(&mut pty, "pq-001", "g did not go to the top", REPAINTS);
+    let top = repainted_frame_showing(&mut pty, "pq-001", "g did not go to the top");
     assert!(
         !top.contains("pq-120"),
         "g left the last line on screen:\n{top}"
@@ -1161,12 +1096,7 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
         pty.send(b"j").unwrap();
         pty.read_for(Duration::from_millis(60));
     }
-    let down = repainted_frame_showing(
-        &mut pty,
-        "pq-030",
-        "j scrolled away the whole output",
-        REPAINTS,
-    );
+    let down = repainted_frame_showing(&mut pty, "pq-030", "j scrolled away the whole output");
     assert!(
         !down.contains("pq-001"),
         "twelve j presses did not scroll the first output line off:\n{down}"
@@ -1179,17 +1109,11 @@ fn the_pager_scroll_keys_move_through_a_long_output() {
         &mut pty,
         "pq-001",
         "k did not scroll back to the first line",
-        REPAINTS,
     );
 
     pty.send(b"q").unwrap();
     pty.read_for(Duration::from_millis(400));
-    let back = repainted_frame_showing(
-        &mut pty,
-        "no session",
-        "q did not close the pager",
-        REPAINTS,
-    );
+    let back = repainted_frame_showing(&mut pty, "no session", "q did not close the pager");
     assert!(!squeezed(&back).contains("Thread:rootthread"), "{back}");
     pty.send(b"after scroll m4t").unwrap();
     wait_for_squeezed(
@@ -1238,7 +1162,6 @@ fn crlf_line_endings_show_in_the_pager_as_whole_lines() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"G").unwrap();
     pty.read_for(Duration::from_millis(800));
@@ -1314,7 +1237,6 @@ fn an_output_over_the_cap_pages_with_a_visible_note() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"G").unwrap();
     pty.read_for(Duration::from_millis(800));
@@ -1322,16 +1244,10 @@ fn an_output_over_the_cap_pages_with_a_visible_note() {
         &mut pty,
         "huge-last-line-b1g",
         "G did not reach the output's end",
-        REPAINTS,
     );
     pty.send(b"g").unwrap();
     pty.read_for(Duration::from_millis(800));
-    let top = repainted_frame_showing(
-        &mut pty,
-        "fixture_huge({})",
-        "g did not reach the top",
-        REPAINTS,
-    );
+    let top = repainted_frame_showing(&mut pty, "fixture_huge({})", "g did not reach the top");
     assert!(
         top.contains("bytes not kept"),
         "no visible note at the top that the output was cut:\n{top}"
@@ -1348,7 +1264,6 @@ fn an_output_over_the_cap_pages_with_a_visible_note() {
         &mut pty,
         "huge-last-line-b1g",
         "find did not reach the last line of a capped output",
-        REPAINTS,
     );
     assert!(!found.contains("No match"), "{found}");
     pty.send(b"q").unwrap();
@@ -1387,7 +1302,6 @@ fn a_cancelled_askers_question_leaves_the_roster() {
         },
         "",
     );
-    let _guard = TempDirGuard(scene.dir.clone());
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.send(b".agent boss\r").unwrap();
@@ -1465,7 +1379,6 @@ fn cr_runs_before_lf_show_as_consecutive_lines_in_the_pager() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"G").unwrap();
     pty.read_for(Duration::from_millis(800));

@@ -2088,23 +2088,16 @@ fn ctrl_t_pages_a_tools_whole_output_and_q_closes_the_pager() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"g").unwrap();
     repainted_frame_showing(
         &mut pty,
         "pg-01",
         "the pager did not show the first line of the tool's output",
-        REPAINTS,
     );
 
     pty.send(b"q").unwrap();
-    let frame = repainted_frame_showing(
-        &mut pty,
-        "no session",
-        "q did not give the screen back",
-        REPAINTS,
-    );
+    let frame = repainted_frame_showing(&mut pty, "no session", "q did not give the screen back");
     assert!(
         !squeezed(&frame).contains("Thread:rootthread"),
         "q left the pager on the screen:\n{frame}"
@@ -2114,7 +2107,6 @@ fn ctrl_t_pages_a_tools_whole_output_and_q_closes_the_pager() {
         &mut pty,
         "still here",
         "keys did not reach the composer after the pager closed",
-        REPAINTS,
     );
     pty.send(b"\x03").unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -2123,9 +2115,6 @@ fn ctrl_t_pages_a_tools_whole_output_and_q_closes_the_pager() {
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
 }
-
-/// How many repaints [`repainted_frame_showing`] tries before it gives up.
-const REPAINTS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // The pager's find and thread picker, and the roster over a background
@@ -2161,10 +2150,9 @@ fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
         &mut pty,
         "Thread: root thread",
         "Ctrl+T did not open the pager",
-        REPAINTS,
     );
     pty.send(b"g").unwrap();
-    let top = repainted_frame_showing(&mut pty, "pg-01", "g did not go to the top", REPAINTS);
+    let top = repainted_frame_showing(&mut pty, "pg-01", "g did not go to the top");
     assert!(
         !top.contains("pg-37"),
         "pg-37 already on the top page:\n{top}"
@@ -2172,12 +2160,7 @@ fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
     pty.send(b"/pg-37").unwrap();
     pty.read_for(Duration::from_millis(300));
     pty.send(b"\r").unwrap();
-    let found = repainted_frame_showing(
-        &mut pty,
-        "pg-37",
-        "find did not bring pg-37 on screen",
-        REPAINTS,
-    );
+    let found = repainted_frame_showing(&mut pty, "pg-37", "find did not bring pg-37 on screen");
     // The repaint is the screen's rows in order with the escapes gone:
     // the find field closed on Enter, so the last row is the key legend
     // again and a `pg-37` ahead of it is a row of the text.
@@ -2198,7 +2181,6 @@ fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
         &mut pty,
         "Threads  Enter = open  Esc = back",
         "Tab did not open the picker",
-        REPAINTS,
     );
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(400));
@@ -2206,7 +2188,6 @@ fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
         &mut pty,
         "Thread: root thread",
         "Esc did not go back to the pager",
-        REPAINTS,
     );
     assert!(
         !squeezed(&back).contains(&squeezed("Threads  Enter = open  Esc = back")),
@@ -2214,12 +2195,7 @@ fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
     );
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(400));
-    let frame = repainted_frame_showing(
-        &mut pty,
-        "no session",
-        "Esc did not close the pager",
-        REPAINTS,
-    );
+    let frame = repainted_frame_showing(&mut pty, "no session", "Esc did not close the pager");
     assert!(
         !squeezed(&frame).contains("Thread:rootthread"),
         "the pager is still up after Esc:\n{frame}\npicker was:\n{picker}"
@@ -2330,12 +2306,7 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
     assert!(alive(pid), "the job died with the interrupted turn");
 
     pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(
-        &mut pty,
-        "fixture_sleep",
-        "F3 did not list the job",
-        REPAINTS,
-    );
+    let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "F3 did not list the job");
     let band = roster_band(&roster);
     assert!(
         band.contains("fixture_sleep") && band.contains("running"),
@@ -2353,8 +2324,7 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
     );
     // The repaint is the screen's rows in order with the escapes gone:
     // the transcript's job row, then the roster band under its legend.
-    let after =
-        repainted_frame_showing(&mut pty, "Cancelled job_", "x reported no cancel", REPAINTS);
+    let after = repainted_frame_showing(&mut pty, "Cancelled job_", "x reported no cancel");
     let at = after
         .find("job fixture_sleep")
         .unwrap_or_else(|| panic!("the transcript lost the job's row:\n{after}"));
@@ -2417,8 +2387,7 @@ fn ctrl_t_and_every_pager_key_on_an_empty_transcript_keep_the_ui_up() {
         pty.send(b"\x1b").unwrap();
         pty.read_for(Duration::from_millis(400));
     }
-    let frame =
-        repainted_frame_showing(&mut pty, "no session", "the UI did not come back", REPAINTS);
+    let frame = repainted_frame_showing(&mut pty, "no session", "the UI did not come back");
     assert!(
         !squeezed(&frame).contains("Thread:rootthread"),
         "Esc left the pager up:\n{frame}"
@@ -2454,7 +2423,6 @@ fn f3_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
         &mut pty,
         "(no tasks and no questions)",
         "F3 did not show the empty roster",
-        REPAINTS,
     );
     pty.send(b"x").unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -2464,7 +2432,6 @@ fn f3_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
         &mut pty,
         "(no tasks and no questions)",
         "x or o closed the empty roster or opened something",
-        REPAINTS,
     );
     assert!(
         !squeezed(&still).contains("Thread:"),

@@ -199,7 +199,8 @@ impl RosterState {
         }
     }
 
-    /// With no focus, moving down picks the first row and up the last.
+    /// With no focus, moving down picks the first row and up the last. A
+    /// move on an empty roster lands nowhere, so a lost focus stays lost.
     pub(super) fn move_highlight(&mut self, delta: i32) {
         let index = match self.highlight() {
             Some(index) => step_highlight(index, delta, self.rows.len()),
@@ -207,7 +208,9 @@ impl RosterState {
             None => 0,
         };
         self.focus = self.rows.get(index).map(|row| row.id().to_string());
-        self.focus_lost = false;
+        if self.focus.is_some() {
+            self.focus_lost = false;
+        }
     }
 
     fn highlight(&self) -> Option<usize> {
@@ -472,6 +475,25 @@ pub(super) mod tests {
             state.focused().map(RosterRow::id),
             Some("agent_planner_0f1e2d3c")
         );
+    }
+
+    /// A move while the roster is empty picks nothing, so the row that
+    /// arrives next is not focused for the user.
+    #[test]
+    fn a_move_on_an_empty_roster_keeps_a_lost_focus_lost() {
+        let mut state = mixed();
+        state.refresh(Vec::new());
+        assert!(state.focus_lost);
+        state.move_highlight(1);
+        state.move_highlight(-1);
+        assert!(state.focus_lost);
+        state.refresh(vec![task(
+            "agent_planner_0f1e2d3c",
+            TaskKind::Agent,
+            "planner",
+            TaskRowStatus::Running,
+        )]);
+        assert!(state.focused().is_none());
     }
 
     #[test]

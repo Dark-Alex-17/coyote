@@ -46,7 +46,7 @@ pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 5;
 
 const JOB_RESULT_TAIL_CAP_CHARS: usize = 50_000;
 
-const JOB_KILL_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const JOB_KILL_GRACE: Duration = Duration::from_secs(5);
 
 const JOB_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
 

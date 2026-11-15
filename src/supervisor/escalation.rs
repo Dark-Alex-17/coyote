@@ -1,4 +1,5 @@
 use fmt::{Debug, Formatter};
+use log::debug;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fmt;
@@ -49,17 +50,20 @@ impl EscalationQueue {
     /// Withdraws every question asked by one of `agent_ids`, for askers
     /// that are being cancelled and will never read an answer.
     pub fn remove_for_agents(&self, agent_ids: &[&str]) {
-        self.pending
-            .lock()
-            .retain(|_, r| !agent_ids.contains(&r.from_agent_id.as_str()));
+        self.pending.lock().retain(|_, r| {
+            let keep = !agent_ids.contains(&r.from_agent_id.as_str());
+            if !keep {
+                debug!(
+                    "Withdrew escalation '{}' of cancelled agent '{}'",
+                    r.id, r.from_agent_id
+                );
+            }
+            keep
+        });
     }
 
-    /// Requests whose asker has stopped waiting are dropped here, so no
-    /// caller offers a question nobody can receive the answer to.
     pub fn pending(&self) -> Vec<PendingEscalation> {
-        let mut pending = self.pending.lock();
-        pending.retain(|_, r| !r.reply_tx.is_closed());
-        pending
+        self.prune_closed()
             .values()
             .map(|r| PendingEscalation {
                 id: r.id.clone(),
@@ -90,10 +94,25 @@ impl EscalationQueue {
     }
 
     pub fn has_pending(&self) -> bool {
-        self.pending
-            .lock()
-            .values()
-            .any(|r| !r.reply_tx.is_closed())
+        !self.prune_closed().is_empty()
+    }
+
+    /// Drops the requests whose asker has stopped waiting, so no caller
+    /// offers a question nobody can receive the answer to, and hands back
+    /// the locked map of those left.
+    fn prune_closed(&self) -> parking_lot::MutexGuard<'_, HashMap<String, EscalationRequest>> {
+        let mut pending = self.pending.lock();
+        pending.retain(|_, r| {
+            let open = !r.reply_tx.is_closed();
+            if !open {
+                debug!(
+                    "Dropped escalation '{}': agent '{}' stopped waiting",
+                    r.id, r.from_agent_id
+                );
+            }
+            open
+        });
+        pending
     }
 }
 
@@ -304,13 +323,13 @@ mod tests {
     }
 
     #[test]
-    fn has_pending_ignores_a_request_whose_asker_is_gone() {
+    fn has_pending_drops_a_request_whose_asker_is_gone() {
         let queue = EscalationQueue::new();
         let (req, rx) = make_request("esc_1", "a", "question");
         queue.submit(req);
         drop(rx);
         assert!(!queue.has_pending());
-        assert!(queue.pending().is_empty());
+        assert!(queue.pending.lock().is_empty());
     }
 
     #[test]

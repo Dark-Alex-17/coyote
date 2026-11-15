@@ -24,7 +24,7 @@ pub enum Reply {
     /// at the screen between two deltas. A non-streaming request gets the
     /// text chunks joined into one message.
     Streamed(Vec<Chunk>),
-    /// `reply`, answered only once `gate` exists (thirty seconds at most),
+    /// `reply`, answered only once `gate` exists (at most [`AFTER_LIMIT`]),
     /// in whichever form the request asks for: the hold for a client whose
     /// requests do not stream, such as a spawned child agent.
     After {

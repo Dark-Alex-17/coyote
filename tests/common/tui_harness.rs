@@ -1282,13 +1282,16 @@ pub fn flipped_frame(pty: &mut Pty) -> String {
     repainted_frame(pty, rows, 100)
 }
 
+/// How many repaints [`repainted_frame_showing`] tries before it gives up.
+pub const REPAINTS: usize = 6;
+
 /// The first fully repainted frame that shows `needle`, panicking with
-/// `what` after `repaints` repaints without it. The pager covers cells
+/// `what` after [`REPAINTS`] repaints without it. The pager covers cells
 /// that may already hold the same characters, so a diff paint read
 /// straight off the pty can miss part of a string the screen does show.
-pub fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str, repaints: usize) -> String {
+pub fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str) -> String {
     let mut frame = String::new();
-    for _ in 0..repaints {
+    for _ in 0..REPAINTS {
         frame = flipped_frame(pty);
         if squeezed(&frame).contains(&squeezed(needle)) {
             return frame;

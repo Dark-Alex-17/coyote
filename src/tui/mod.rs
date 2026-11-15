@@ -33,6 +33,7 @@ use crate::config::child_sessions::ChildSessionRoot;
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, Origin, SubscriptionId};
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
+use crate::function::jobs::JOB_KILL_GRACE;
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, input_default_text};
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::supervisor::notification::NotificationQueue;
@@ -249,8 +250,20 @@ const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
 /// How long the exit work waits for the roster's and the pager's control
 /// tasks before it takes the context; those still running are aborted.
 /// A roster cancel of an agent waits up to `CANCEL_CLEANUP_WAIT` for the
-/// agent to join, so this outlasts it rather than abort that wait.
-const CONTROL_TASK_WAIT: Duration = CANCEL_CLEANUP_WAIT.saturating_add(Duration::from_secs(1));
+/// agent to join and one of a job sits through up to two `JOB_KILL_GRACE`
+/// joins, so this outlasts the longer rather than abort that wait.
+const CONTROL_TASK_WAIT: Duration = longer(CANCEL_CLEANUP_WAIT, JOB_KILL_GRACE.saturating_mul(2))
+    .saturating_add(Duration::from_secs(1));
+const _: () = assert!(
+    CONTROL_TASK_WAIT.as_nanos() > CANCEL_CLEANUP_WAIT.as_nanos()
+        && CONTROL_TASK_WAIT.as_nanos() > JOB_KILL_GRACE.saturating_mul(2).as_nanos()
+);
+
+/// `Ord::max` for a const context.
+const fn longer(a: Duration, b: Duration) -> Duration {
+    if a.as_nanos() >= b.as_nanos() { a } else { b }
+}
+
 /// How long the UI waits on the exit work. The work itself waits
 /// `CONTROL_TASK_WAIT` on control tasks and `EXIT_CANCEL_WAIT` on
 /// background tasks before it saves the session and runs the finished
@@ -1040,21 +1053,26 @@ fn spawn_control_request(
             let mut ctx = cancel_context(&control, child_root);
             tasks.spawn(async move {
                 let args = serde_json::json!({ "id": id });
-                let result = match kind {
-                    TaskKind::Job => {
-                        crate::function::jobs::handle_job_tool(&mut ctx, "job__cancel", &args).await
-                    }
-                    TaskKind::Agent => {
-                        crate::function::agents::handle_agent_tool(&mut ctx, "agent__cancel", &args)
+                let result = catch_cancel(async {
+                    match kind {
+                        TaskKind::Job => {
+                            crate::function::jobs::handle_job_tool(&mut ctx, "job__cancel", &args)
+                                .await
+                        }
+                        TaskKind::Agent => {
+                            crate::function::agents::handle_agent_tool(
+                                &mut ctx,
+                                "agent__cancel",
+                                &args,
+                            )
                             .await
+                        }
                     }
-                };
+                })
+                .await;
                 // A closed inbox means the UI is gone; nobody is left to
                 // tell.
-                let _ = tx.send(UiMsg::TaskCancelled {
-                    id,
-                    result: result.map_err(|err| format!("{err:#}")),
-                });
+                let _ = tx.send(UiMsg::TaskCancelled { id, result });
             });
         }
         ControlRequest::LoadChild {
@@ -1082,6 +1100,23 @@ fn catch_child_load(
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)) {
         Ok(result) => result.map_err(|err| format!("{err:#}")),
         Err(_) => Err("child load panicked".to_string()),
+    }
+}
+
+/// Runs a roster cancel, a panic inside it reported as the error the UI
+/// shows rather than lost with the task.
+async fn catch_cancel(cancel: impl Future<Output = Result<Value>>) -> Result<Value, String> {
+    use futures_util::FutureExt;
+    match std::panic::AssertUnwindSafe(cancel).catch_unwind().await {
+        Ok(result) => result.map_err(|err| format!("{err:#}")),
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("no message");
+            Err(format!("cancel task panicked: {reason}"))
+        }
     }
 }
 
@@ -10905,6 +10940,24 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_panicking_cancel_is_reported_as_a_failed_cancel() {
+        let result = catch_cancel(async { panic!("the cancel broke c4p") }).await;
+        assert_eq!(
+            result,
+            Err("cancel task panicked: the cancel broke c4p".to_string())
+        );
+        assert_eq!(
+            cancel_report("j", &result),
+            (
+                NoticeKind::ToolWarning,
+                "Cancel of j failed: cancel task panicked: the cancel broke c4p".to_string()
+            )
+        );
+        let done = serde_json::json!({"status": "ok"});
+        assert_eq!(catch_cancel(async { Ok(done.clone()) }).await, Ok(done));
+    }
+
     fn escalate(
         queue: &crate::supervisor::escalation::EscalationQueue,
         options: Option<Vec<String>>,
@@ -11218,6 +11271,44 @@ mod tests {
         let frame = harness.draw();
         assert!(frame.contains("reviewer  reviewer-x7x  running"), "{frame}");
         assert!(!frame.contains("No child sessions yet"), "{frame}");
+    }
+
+    /// A root equal by value to the one the picker listed from, as a
+    /// sessionless fork resolves in an Arc of its own, leaves the open
+    /// picker as it is: no fresh listing and the highlight kept.
+    #[test]
+    #[serial]
+    fn an_equal_root_leaves_the_open_picker_and_its_highlight_alone() {
+        run_async(async {
+            let _guard = TestConfigDirGuard::new("tui-pager-picker-equal-root");
+            let root = ChildSessionRoot::Proc { pid: 1, start: 13 };
+            save_running_child(&root, "reviewer-e3e");
+            write_child(&root, "reviewer-e3e", &child_yaml("kid wrote e3e"));
+            let mut ctx = chat_ctx();
+            ctx.child_session_root = Some(Arc::new(root.clone()));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            press_ctrl(&mut harness, 't');
+            harness.press(KeyCode::Tab);
+            harness.press(KeyCode::Down);
+            save_running_child(&root, "reviewer-n9n");
+
+            harness
+                .app
+                .handle_msg(UiMsg::ChildSessionRootResolved(Arc::new(root)));
+            let frame = harness.draw();
+            assert!(frame.contains("reviewer-e3e"), "{frame}");
+            assert!(!frame.contains("reviewer-n9n"), "{frame}");
+            harness.press(KeyCode::Enter);
+            let requests = harness.app.take_control_requests();
+            assert!(
+                matches!(
+                    requests.as_slice(),
+                    [ControlRequest::LoadChild { session_id, .. }] if session_id == "reviewer-e3e"
+                ),
+                "{requests:?}"
+            );
+        });
     }
 
     /// Ctrl+T, Tab, Down, Enter opens a child's thread from the picker,
