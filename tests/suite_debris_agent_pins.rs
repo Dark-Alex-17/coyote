@@ -83,6 +83,8 @@ fn sisyphus_prompt_pins_debris_rules() {
             "the lint's `debris-exempt` token",
             "under a `Debt left behind:` heading",
             "a `Debris exemptions:` heading",
+            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}"#,
+            "`debris_exclude` is the repo-relative directory holding the run's own planning files",
         ],
     );
     assert!(
@@ -107,6 +109,8 @@ fn architect_prompt_pins_debris_rules() {
             "paste the Sisyphus `HYGIENE:` list VERBATIM",
             "if Sisyphus reported a `Debt left behind:` list",
             "report's `Debris exemptions:` list",
+            r#""build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans rel>\"]"}"#,
+            "`debris_exclude` takes the same `<plans rel>` the run-closing hygiene pass computes",
         ],
     );
     assert_anchors(

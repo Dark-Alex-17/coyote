@@ -363,9 +363,14 @@ Settled lanes: <on re-review rounds ONLY: bare lane names, comma-separated, e.g.
 immediately-prior round was green (code-review PASS with 0 criticals, adversary CONFORMS, security
 PASS, probe PASS), NEVER a lane that reported findings; omit on the first round (ignored unless `Re-review delta:` is also given)>
 Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
---variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}"}
+--variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]", "build_lock": "{{build_lock}}", "debris_exclude": "[\"<plans dir>\"]"}
 <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
 ```
+
+`debris_exclude` is the repo-relative directory holding the run's own planning files (the plan
+repo or `plans/` directory the run works from, when it lies inside the repo under review) as a
+JSON array string such as `["plans"]`, or `""` when there is none or it lies outside that repo;
+every review lane reads those files as bookkeeping, not scope drift, and the debris lint skips them.
 
 Verification commands go in `--variables` (a JSON-array string), never in the prompt: the prompt
 also carries pasted plan text from the repo under review, and whatever is declared here is
