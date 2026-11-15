@@ -35,7 +35,7 @@ from _lib import (  # noqa: E402
     REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_POLL_SLEEP, REVIEW_UPDATE_BUDGET, REVIEW_WALL_SECS, SHA_RE, SIBLING_HINT,
     SISYPHUS_RUN_RE, STACK_LINKING, STORE_LABEL, STORE_TOOL_PREFIX, STRIKE_LIMIT, TAIL_CHARS, TASKSTORE, TASK_ID_RE,
     TEST_FILE_RE, VERIFY_CMD_SECS, VERIFY_SET_SECS, WAVE_CAP,
-    append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, emit,
+    append_artifact, as_dict, as_int, as_list, choice_label, commit_planning, context_pack, core_tool, criterion_commands, emit,
     ensure_run_dir, escalation, frontmatter, git, git_out, harvest_anomalies, harvest_anomaly_lines, heal_state,
     is_micro, is_parallel, is_single, ledger, load_state, load_tasks, log_event, looks_executable,
     headless_recommended, match_option, mode, new_run_id, new_task, note_script_error, now_iso, option, plan_section, review_fault,
@@ -1834,6 +1834,18 @@ def verify_gate(state):
         arr = json.loads(cmds)
         arr.append(state["hygiene_lint_cmd"])
         cmds = json.dumps(arr)
+    elif scope != "hygiene":
+        try:
+            arr = json.loads(cmds)
+        except json.JSONDecodeError:
+            arr = None
+        if isinstance(arr, list):
+            declared = {c.strip() for c in arr if isinstance(c, str)}
+            source = crit if scope == "batch" else plan_section(body, r"Acceptance criteria")
+            extra = [c for c in criterion_commands(source, code) if c not in declared]
+            if extra:
+                cmds = json.dumps(arr + extra)
+                ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs: {'; '.join(extra)}")
     u["verification_commands_json"] = cmds
     u["debris_exclude"] = state.get("debris_exclude") or _planning_exclude(state, code)
     rl.append({"round": n, "head": head, "scope": scope, "started": now_iso()})

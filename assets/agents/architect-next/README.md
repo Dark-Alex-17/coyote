@@ -116,14 +116,15 @@ the frozen budgets row records. The gates' per-call `gh` and seam timeouts, betw
 180 seconds in staging, are all `GH_CALL_SECS` now, as the gh command seams row records.
 
 Toolchain census (the gates must stay project-agnostic; verification commands come
-from the brief, never from a hard-coded toolchain):
+from the brief, plus the read-only command lines a task's acceptance criteria quote in
+backticks, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:712:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
+scripts/_lib.py:714:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
 scripts/gates.py:51:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:4304:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:4313:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:4315:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:4324:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
@@ -133,10 +134,10 @@ scripts/smoke_test.py:1889:   ... "acceptance_criteria": ["`...`"], ...   (a com
 scripts/smoke_test.py:2550:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:712` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:714` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:51` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:4304` and `:4313` are an English verb in prompt prose, and
+lockfile names), `gates.py:4315` and `:4324` are an English verb in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`

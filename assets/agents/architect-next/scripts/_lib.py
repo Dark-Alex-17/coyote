@@ -19,6 +19,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -717,6 +719,46 @@ EXECUTABLE_RE = re.compile(
 def looks_executable(criterion):
     """Micro mode: a criterion must name a command (backticked or a known runner)."""
     return bool(EXECUTABLE_RE.search(criterion or ""))
+
+
+GIT_READ_ONLY = ("diff", "status", "log", "show", "rev-parse", "ls-files", "merge-base", "cat-file", "grep")
+SHELL_META_RE = re.compile(r"[;|&$<>(){}`*?\n]")
+ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
+
+
+def criterion_commands(criteria_text, cwd, cap=8):
+    """The backticked spans of acceptance criteria that are runnable command lines, deduplicated, at most cap.
+
+    A span counts when it has two or more tokens, no shell metacharacters, and a program (after leading NAME=value
+    assignments) found on PATH or, when it holds a slash, executable under cwd. A git span counts only for a
+    read-only subcommand and a gh span never does, so a criterion can never push or mutate the repository.
+    """
+    out = []
+    for span in re.findall(r"`([^`]+)`", criteria_text or ""):
+        span = span.strip()
+        if span in out or SHELL_META_RE.search(span):
+            continue
+        try:
+            toks = shlex.split(span)
+        except ValueError:
+            continue
+        args = toks[next((i for i, t in enumerate(toks) if not ENV_ASSIGN_RE.match(t)), len(toks)):]
+        if len(toks) < 2 or not args or any(t.startswith("--output") for t in args):
+            continue
+        prog = args[0]
+        if "/" in prog:
+            path = os.path.join(cwd or "", prog)
+            if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+                continue
+        elif not shutil.which(prog):
+            continue
+        name = os.path.basename(prog)
+        if name == "gh" or (name == "git" and (len(args) < 2 or args[1] not in GIT_READ_ONLY)):
+            continue
+        out.append(span)
+        if len(out) >= cap:
+            break
+    return out
 
 
 # ---------------------------------------------------------------- task store

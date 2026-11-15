@@ -3040,10 +3040,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4304, 4313],
+        vec![51, 4315, 4324],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4304, 4313] {
+    for line in [4315, 4324] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -3491,18 +3491,28 @@ fn gate_json(gate: &str, state: &serde_json::Value, scratch: &TempDirGuard) -> s
     parse_json_stdout(gate, &out)
 }
 
-/// Runs one of the review gauntlet's own scripts on `state`, exactly as the
-/// engine invokes them (no path adjustments; bytecode writing is turned off
-/// so the shared module it imports leaves no cache under `assets/`, and
-/// `HOME`/`TMPDIR` point at the scratch dir), so the test reads the composed
-/// prompt with the real consumer.
+/// Runs one of the review gauntlet's own scripts on `state`, so the test
+/// reads the composed prompt with the real consumer.
 fn gauntlet_script(
     script: &str,
     state: &serde_json::Value,
     scratch: &TempDirGuard,
 ) -> serde_json::Value {
+    agent_script("review-gauntlet", script, state, scratch)
+}
+
+/// Runs one of sibling agent `agent`'s own scripts on `state`, exactly as the
+/// engine invokes them (no path adjustments; bytecode writing is turned off
+/// so the shared module it imports leaves no cache under `assets/`, and
+/// `HOME`/`TMPDIR` point at the scratch dir).
+fn agent_script(
+    agent: &str,
+    script: &str,
+    state: &serde_json::Value,
+    scratch: &TempDirGuard,
+) -> serde_json::Value {
     let python = python3().expect("callers skip without python3");
-    let path = agents_dir().join("review-gauntlet/scripts").join(script);
+    let path = agents_dir().join(agent).join("scripts").join(script);
     let mut cmd = Command::new(python);
     scrub_agent_vars(&mut cmd);
     without_git_repo_vars(&mut cmd);
@@ -4395,6 +4405,153 @@ fn only_dirt_outside_the_in_repo_planning_store_suppresses_the_re_review_lines()
     assert!(
         lines.is_empty() && settled.is_empty(),
         "code dirt beside planning-store dirt: {lines:?} {settled:?}"
+    );
+}
+
+/// A criterion that names a command is run and recorded, not left to the
+/// reviewer's reading: `verify_gate` declares the read-only `git diff` spans
+/// of the task's criteria as verification commands, the adversary's own
+/// `run_checks.py` runs them against the diff base and its `verdict.py`
+/// raises no run complaint while the two files are untouched, then a
+/// blocking regression once one of them changes in the working tree.
+#[test]
+fn criterion_commands_are_run_as_recorded_verification_runs() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("criterion-commands");
+    let repo = scratch.0.join("project");
+    let sql = repo.join("schema/sql");
+    fs::create_dir_all(&sql).unwrap();
+    let git = |args: &[&str]| -> String {
+        let mut cmd = Command::new("git");
+        without_git_repo_vars(&mut cmd);
+        cmd.args([
+            "-c",
+            "user.name=probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(&repo)
+        .env("HOME", scratch.0.join("home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        let out = output_with_timeout(&mut cmd, GATE_LIMIT, "git");
+        assert!(out.status.success(), "git {args:?}\n{}", transcript(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    git(&["init", "-q"]);
+    fs::write(sql.join("0001_base.sql"), "CREATE TABLE base (id INT);\n").unwrap();
+    fs::write(sql.join("0002_more.sql"), "CREATE TABLE more (id INT);\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    let base = git(&["rev-parse", "HEAD"]);
+    fs::write(
+        sql.join("0003_alpha.sql"),
+        "CREATE TABLE alpha_records (id INT);\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "alpha"]);
+
+    let pair = "schema/sql/0001_base.sql schema/sql/0002_more.sql";
+    let byte_identical = format!("git diff --exit-code -- {pair}");
+    let no_change = format!("git diff --exit-code {pair}");
+    let quiet = format!("git diff --quiet -- {pair}");
+    let task_dir = scratch.0.join("plans/tasks/TASK-100-schema");
+    fs::create_dir_all(&task_dir).unwrap();
+    fs::write(
+        task_dir.join("index.md"),
+        format!(
+            "---\ntitle: schema\nstatus: in-progress\n---\n\n# schema\n\n## Acceptance criteria\n\n\
+             - `git status --short` passes, and the table list includes `alpha_records`.\n\
+             - 0001 and 0002 are byte-identical: `{byte_identical}`.\n\
+             - `{no_change}` shows no change.\n\
+             - `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{quiet}`).\n\
+             - A missing row is reported as `errors.Is(err, x)`.\n"
+        ),
+    )
+    .unwrap();
+    let mut state = verify_state(&repo, &base, json!({}), &scratch);
+    state["tasks"][0]["dir"] = json!(task_dir);
+    let composed = gate_json("verify_gate", &state, &scratch);
+    let declared = composed["verification_commands_json"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no verification_commands_json in {composed}"))
+        .to_string();
+    let commands: Vec<String> = serde_json::from_str(&declared).unwrap();
+    assert_eq!(
+        commands,
+        [
+            "true",
+            "git status --short",
+            &byte_identical,
+            &no_change,
+            &quiet
+        ],
+        "{composed}"
+    );
+
+    let review = || -> (serde_json::Value, String) {
+        let checks = agent_script(
+            "adversary",
+            "run_checks.py",
+            &json!({"project_dir": repo, "verification_commands": declared, "diff_base": base}),
+            &scratch,
+        );
+        let run = checks["exec_results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("exec_results must be a record list: {checks}"))
+            .iter()
+            .find(|r| r["cmd"].as_str() == Some(byte_identical.as_str()))
+            .unwrap_or_else(|| panic!("no recorded run of `{byte_identical}`: {checks}"))
+            .clone();
+        let verdict = agent_script(
+            "adversary",
+            "verdict.py",
+            &json!({
+                "pipeline_faults": [],
+                "crit_verdicts": [{"id": "c1", "text": "the files are byte-identical", "status": "MET",
+                                   "evidence": "recorded run", "complaint": "", "no_test_reason": ""}],
+                "extra_complaints": [],
+                "format_rulings": [],
+                "observations": "",
+                "exec_results": checks["exec_results"],
+                "verification_commands": declared,
+            }),
+            &scratch,
+        );
+        let report = verdict["adv_report"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no adv_report in {verdict}"))
+            .to_string();
+        (run, report)
+    };
+
+    let (run, report) = review();
+    assert_eq!(run["exit"], 0, "{run}");
+    assert!(
+        report.starts_with("ADVERSARIAL_REVIEW: CONFORMS")
+            && !report.contains("Verification run `"),
+        "{report}"
+    );
+
+    fs::write(
+        sql.join("0001_base.sql"),
+        "CREATE TABLE base (id INT, extra INT);\n",
+    )
+    .unwrap();
+    let (run, report) = review();
+    assert_eq!(run["exit"], 1, "{run}");
+    assert_eq!(run["baseline"]["status"], "regression", "{run}");
+    assert!(
+        report.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
+            && report.contains(&format!("Verification run `{byte_identical}`"))
+            && report.contains("baseline on the diff base: regression"),
+        "{report}"
     );
 }
 

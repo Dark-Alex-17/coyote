@@ -5164,6 +5164,53 @@ for _k, _v in _ci_saved.items():
     else:
         os.environ[_k] = _v
 
+# ---------------------------------------------------------------- criterion commands declared as verification runs
+CC_DIR = os.path.join(TMP, "criterion-commands")
+write(os.path.join(CC_DIR, "bin", "check.sh"), "#!/bin/sh\nexit 0\n", exe=True)
+cc = _lib.criterion_commands("- `git push origin x` pushes, `gh pr view` shows it, `CREATE TABLE x` runs, `true && true` holds\n"
+                             "- `git status --short` is clean, `git status --short` again, `FOO=1 true x` and `bin/check.sh run` pass,"
+                             " `./missing.sh run` and `alpha_records` are not commands", CC_DIR)
+check("criterion_commands: mutating git, gh, an unresolvable program and shell metacharacters dropped; read-only git, "
+      "env assignments and an executable under cwd kept once each, in order",
+      cc == ["git status --short", "FOO=1 true x", "bin/check.sh run"], cc)
+cc_many = " ".join(f"`true a{i}`" for i in range(12))
+check("criterion_commands: at most 8 by default and the cap honoured, the first ones kept",
+      _lib.criterion_commands(cc_many, CC_DIR) == [f"true a{i}" for i in range(8)]
+      and _lib.criterion_commands(cc_many, CC_DIR, cap=3) == ["true a0", "true a1", "true a2"])
+check("criterion_commands: a read-only git span that writes a file through --output is dropped",
+      _lib.criterion_commands("- `git diff --output=x.patch` and `git diff --exit-code -- a` pass\n", CC_DIR) == ["git diff --exit-code -- a"])
+CC_SQL = "schema/sql/0001_base.sql schema/sql/0002_more.sql"
+CC_DIFFS = [f"git diff --exit-code -- {CC_SQL}", f"git diff --exit-code {CC_SQL}", f"git diff --quiet -- {CC_SQL}"]
+CC_DECLARED = ["true", "git status --short"]
+write(os.path.join(CC_DIR, "TASK-900-schema", "index.md"),
+      "---\ntitle: schema\nstatus: in-progress\nbatch: B9\n---\n\n# schema\n\n## Acceptance criteria\n\n"
+      "- `git status --short` passes, and the table list includes `alpha_records`.\n"
+      f"- 0001 and 0002 are byte-identical: `{CC_DIFFS[0]}`.\n"
+      f"- `{CC_DIFFS[1]}` shows no change.\n"
+      f"- `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{CC_DIFFS[2]}`).\n"
+      "- A missing row is reported as `errors.Is(err, x)`.\n")
+
+
+def cc_verify(**over):
+    task = {"id": "TASK-900", "dir": os.path.join(CC_DIR, "TASK-900-schema"), "base_sha": CODE_BASE, "batch": "B9"}
+    return gates.verify_gate(base_state(**{"tasks": [task], "current_task": "TASK-900", "verify_scope": "task",
+                                           "verification_commands": json.dumps(CC_DECLARED), **over}))
+
+
+cc_runs = {k: cc_verify(**over) for k, over in {"task": {}, "micro": {"task_granularity": "micro"},
+                                                "batch": {"verify_scope": "batch", "current_batch": "B9"}}.items()}
+cc_bad = {k: json.loads(u["verification_commands_json"]) for k, u in cc_runs.items() if json.loads(u["verification_commands_json"]) != CC_DECLARED + CC_DIFFS}
+check("verify_gate: the git diff commands the criteria name are declared once each after the declared ones (task, micro, batch)",
+      not cc_bad and all(sum(f"declared 3 criterion command(s) as verification runs: {'; '.join(CC_DIFFS)}" in d for d in u["decisions"]) == 1
+                         for u in cc_runs.values()), cc_bad or [u["decisions"] for u in cc_runs.values()])
+u = cc_verify(verify_scope="hygiene", hygiene_criteria="x", hygiene_lint_cmd="true lint")
+check("verify_gate: hygiene scope declares only the run-wide lint, no criterion command",
+      json.loads(u["verification_commands_json"]) == CC_DECLARED + ["true lint"], u["verification_commands_json"])
+guarded("verify_gate: a malformed declaration is passed on unchanged and a non-string item does not crash the gate",
+        lambda: ((cc_verify(verification_commands='["unterminated')["verification_commands_json"] == '["unterminated'
+                  and json.loads(cc_verify(verification_commands=[1, "true"])["verification_commands_json"]) == [1, "true", "git status --short"] + CC_DIFFS),
+                 "declaration mangled"))
+
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")
 u = gates.wave_claim(base_state(plan_path=PROMOTED, tasks=tasks_with(), wave_ids=[T1, T3], run_branch="feat/PLAN-widgets", parallel_tasks="1",
