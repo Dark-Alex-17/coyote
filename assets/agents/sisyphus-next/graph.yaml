@@ -2126,7 +2126,7 @@ nodes:
     id: ci_poll
     type: script
     description: >-
-      Bounded self-loop over gh pr checks (pr-watch poll precedent; wall clock B15): CI_MAX_ROUNDS
+      Bounded self-loop over gh pr checks (pr-watch poll precedent; elapsed-time limit B15): CI_MAX_ROUNDS
       visits per watch, POLL_VISIT_BUDGET visits per run, and an empty check list reads no_checks
       only after CI_NO_CHECKS_SECS of the watch.
     script: scripts/ci_poll.py
