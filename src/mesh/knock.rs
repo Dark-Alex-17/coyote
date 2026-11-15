@@ -209,7 +209,7 @@ pub(crate) enum KnockFallback {
 
 /// The sentence every unanswered request report ends with: what a request to be trusted
 /// can and cannot do.
-pub(crate) const KNOCK_IS_NOT_FIRST_CONTACT: &str = "A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides.";
+pub(crate) const KNOCK_IS_NOT_FIRST_CONTACT: &str = "A request to be trusted is heard only by a session whose user already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KnockOutcome {
@@ -252,7 +252,7 @@ impl fmt::Display for KnockError {
             ),
             Self::NotRunning => write!(
                 f,
-                "The mesh node has been stopped; run `.mesh on` to start it again"
+                "This session left the mesh; run `.mesh on` to join again"
             ),
             Self::Direct(err) => write!(
                 f,
@@ -378,7 +378,7 @@ mod knock_error_quoting_tests {
         let slash = shown_as(&direct, CommandPrefix::Slash);
         assert_eq!(
             slash,
-            "Error: The request to be trusted could not be sent: The mesh link failed: no route to .vault. Try again in a minute; `/mesh people list` shows when the peer was last heard"
+            "Error: The request to be trusted could not be sent: The mesh link failed: no route to .vault. Try again in a minute; `/mesh people list` shows when that session was last heard"
         );
         assert!(slash.contains("no route to .vault"), "{slash}");
         assert!(slash.contains("`/mesh people list`"), "{slash}");
@@ -1267,7 +1267,7 @@ mod tests {
         );
         assert_eq!(
             KnockError::Direct(RequestError::Decode("short frame".into())).to_string(),
-            "The request to be trusted could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
+            "The request to be trusted could not be sent: Malformed mesh request frame: short frame. That session answered in a form this Coyote could not read; it may run a different Coyote"
         );
         assert_eq!(
             KnockError::Propagation {
@@ -1275,7 +1275,7 @@ mod tests {
                 err: PropagationError::TransferFailed,
             }
             .to_string(),
-            "The session is unreachable and the request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when the peer was last heard"
+            "The session is unreachable and the request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when that session was last heard"
         );
         assert_eq!(
             KnockError::Propagation {

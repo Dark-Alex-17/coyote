@@ -1,6 +1,6 @@
 use crate::config::mesh_config::{MeshBrief, MeshInterface, mesh_settings_rows};
 use crate::config::{CommandPrefix, MeshConfig, RequestContext, live_prefix, paths};
-use crate::function::mesh::{open_message_correlation, trust_label};
+use crate::function::mesh::{is_cursor_shaped, open_message_correlation, trust_label};
 use crate::mesh::access::{
     ACCESS_MAX_PATHS, AccessError, AccessOutcome, AccessRefusal, AccessRequestOutcome, GrantKind,
     ValidAccess, validate_access,
@@ -13,7 +13,8 @@ use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf}
 use crate::mesh::events::TrustHookObserver;
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, GONE_COPY_TAIL,
-    NotSharedReason, grant_expires_at, not_shared_reason, not_shared_sentence, spent_attachment,
+    NotSharedReason, SharesPage, grant_expires_at, not_shared_reason, not_shared_sentence,
+    spent_attachment,
 };
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -204,13 +205,13 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "messaging",
         "broadcast",
         ".mesh messaging broadcast [--yes] \"text\"",
-        "Send a bulletin to every trusted peer with a known path",
+        "Send a bulletin to every trusted session with a known path",
     ),
     (
         "messaging",
         "inbox",
         ".mesh messaging inbox [clear [--yes] | --purge-files [--yes|--dry-run]]",
-        "Show the messages peers sent this session, the new ones marked; `clear` empties the list",
+        "Show the messages other sessions sent this one, the new ones marked; `clear` empties the list",
     ),
     (
         "messaging",
@@ -234,25 +235,25 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "envoy",
         "brief",
         ".mesh envoy brief [note \"text\"|note clear|auto|manual|off]",
-        "Show the brief your envoy answers peers with, or set its note or mode",
+        "Show the brief your envoy answers other sessions with, or set its note or mode",
     ),
     (
         "envoy",
         "memory",
         ".mesh envoy memory forget <user|all> [thread] [--yes|--dry-run]",
-        "Forget what the envoy remembers of a peer's threads: one user, one of their threads, or everything",
+        "Forget what the envoy remembers of a user's threads: one user, one of their threads, or everything",
     ),
     (
         "envoy",
         "questions",
         ".mesh envoy questions",
-        "List the questions peers escalated to you",
+        "List the questions other sessions escalated to you",
     ),
     (
         "envoy",
         "answer",
         ".mesh envoy answer <id> [\"text\"] [--attach <path> [--force]]",
-        "Answer a question a peer escalated to you",
+        "Answer a question another session escalated to you",
     ),
     (
         "envoy",
@@ -263,20 +264,20 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "files",
         "list",
-        ".mesh files list [--peer <who>] [--effective [--all]]",
-        "List the share rules and the file each came from, or the files a peer can fetch",
+        ".mesh files list [<session> [--prefix <path>] [--next <cursor>]] [--peer <who>] [--effective [--all]]",
+        "List your share rules and the file each came from, the files a user or session may fetch from you, or the files a session shares with you",
     ),
     (
         "files",
         "allow",
         ".mesh files allow docs/** [--peer <who>] [--force] [--global|--workspace] [--yes|--dry-run]",
-        "Share files matching a pattern with every trusted peer, or with one peer",
+        "Share files matching a pattern with every trusted session, or with one user or session",
     ),
     (
         "files",
         "deny",
         ".mesh files deny \"src/vault/*\" [--global|--workspace] [--yes|--dry-run]",
-        "Never share files matching a pattern, whatever `files allow` says; a share rule, not a peer refusal (that is `access block`)",
+        "Never share files matching a pattern, whatever `files allow` says; a share rule, not a refusal of a session (that is `access block`)",
     ),
     (
         "files",
@@ -288,31 +289,31 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         "files",
         "requests",
         ".mesh files requests",
-        "List the access requests peers sent",
+        "List the access requests other sessions sent",
     ),
     (
         "files",
         "grant",
         ".mesh files grant <id> [--standing [--global|--workspace]] [--for 30m|2h|1d]",
-        "Grant a peer's access request: once for a while, or standing in the share list",
+        "Grant a session's access request: once for a while, or standing in the share list",
     ),
     (
         "files",
         "refuse",
         ".mesh files refuse <id>",
-        "Refuse a peer's access request",
+        "Refuse a session's access request",
     ),
     (
         "files",
         "request",
         ".mesh files request <session> <path>... [--reason \"text\"] [--yes]",
-        "Ask a trusted peer's human for access to files it does not share yet",
+        "Ask a trusted session's user for access to files it does not share yet",
     ),
     (
         "files",
         "fetch",
         ".mesh files fetch <session> <path> [--if-sha256 <hex>]",
-        "Fetch one file a trusted peer shares into your session's staging inbox",
+        "Fetch one file a trusted session shares into your session's staging inbox",
     ),
     (
         "config",
@@ -329,10 +330,11 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
-const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the key is replaced only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
+const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the key is replaced only while no session on this config dir is on the mesh, then `.mesh on` announces the new one.";
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every session you trust that has a known path right now. Sessions you have not trusted receive nothing.";
 const MESSAGE_REFUSAL_TAIL: &str = "Nothing is sent to a session you do not trust.";
 const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a session you do not trust.";
+const LIST_REFUSAL_TAIL: &str = "No listing is asked of a session you do not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from sessions you trust.";
 const KNOCK_REFUSAL_TAIL: &str = "No request to be trusted is sent to a session you blocked or to a user you blocked; `.mesh access unblock session <who>` or `.mesh access trust session <who>` lifts the one, `.mesh access unblock user <who>` the other.";
 const UNHEARD_KNOCK_REFUSAL_TAIL: &str = "No request to be trusted is sent to a session you blocked, and the mesh is not asked about one you have not heard; `.mesh access unblock session <who>` lifts the block.";
@@ -424,7 +426,7 @@ pub(crate) async fn run(
         ("envoy", "questions") => pending(ctx, PendingList::Escalated),
         ("envoy", "answer") => answer(ctx, AnswerRoute::Inbound, rest).await,
         ("envoy", "dismiss") => dismiss(ctx, rest).await,
-        ("files", "list") => shares(ctx, rest),
+        ("files", "list") => files_list(ctx, &abort_signal, rest).await,
         ("files", "allow") => allow(ctx, rest),
         ("files", "deny") => deny(ctx, rest),
         ("files", "unshare") => unshare(ctx, rest),
@@ -800,7 +802,7 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
     Ok(())
 }
 
-const NODE_OFF_LINE: &str = "node: off - .mesh on joins";
+const NODE_OFF_LINE: &str = "mesh: off - .mesh on joins";
 
 fn show_config(ctx: &RequestContext) {
     let node = ctx.app.mesh.get();
@@ -1110,7 +1112,7 @@ fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 .mesh
                 .set_objective_override(Some(objective.to_string()));
             out_text(&ctx.render_hints(&format!(
-                "Objective set to \"{objective}\" for this session; peers that ask see it in your status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
+                "Objective set to \"{objective}\" for this session; sessions that ask see it in your status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
             )));
         }
         StatusArg::Clear => {
@@ -1146,22 +1148,30 @@ async fn peer_status(
     else {
         return Ok(());
     };
+    let who = runtime.who_at(&destination).to_string();
     let route = match route_to(&runtime, &destination, abort_signal).await {
         Ok(route) => route,
-        Err(Unrouted::NoAnswer) => bail!(
-            "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
-            unreachable_head(&destination),
-            left_mesh_hint(Some(&peer), SystemTime::now())
-        ),
+        Err(Unrouted::NoAnswer) => {
+            let text = format!(
+                "{}{} A status request is answered live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
+                unreachable_head(&destination),
+                left_mesh_hint(Some(&peer), SystemTime::now())
+            );
+            return Err(session_led_or_plain(text, &who, &destination));
+        }
         Err(Unrouted::Interrupted) => {
             out_text("Status request interrupted.");
             return Ok(());
         }
     };
-    out_text(&format!(
-        "Asking {} for its status card; Ctrl-C cancels...",
-        short(&destination)
-    ));
+    out_text(
+        &NoticeText::from_template(
+            "Asking {who}{hash} for its status card; Ctrl-C cancels...",
+            &[("hash", &hash_after(&who, &destination))],
+            &[("who", who.as_str())],
+        )
+        .render(live_prefix()),
+    );
     result_follows();
     let card = tokio::select! {
         outcome = runtime.request_status(route) => outcome.map_err(quoted_status_failure)?,
@@ -1185,7 +1195,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
                     brief.render_for_human()
                 ),
                 None if mode == MeshBrief::Off => format!(
-                    "brief mode: {mode}\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on."
+                    "brief mode: {mode}\nNo brief is assembled in off mode: your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on."
                 ),
                 None => format!(
                     "brief mode: {mode}\nNo brief is assembled yet: it is built at the first turn boundary after the mesh is on."
@@ -1198,7 +1208,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
             // Under off the bare verb shows no sections, so the next command is the mode
             // that will carry the note, not `.mesh envoy brief`.
             let line = if ctx.app.config.mesh.brief != MeshBrief::Off {
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from."
+                "Note set; your envoy includes it the next time it answers another session (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from."
             } else {
                 "Note set, but brief mode is off, so your envoy does not include it until `.mesh envoy brief auto` or `.mesh envoy brief manual`; then it goes with the card (and, in auto mode, the digest)."
             };
@@ -1207,7 +1217,7 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         BriefArg::NoteClear => {
             ctx.app.mesh.set_user_brief(None);
             out_text(&ctx.render_hints(
-                "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one.",
+                "Note cleared; your envoy answers other sessions without it from now on. `.mesh envoy brief note \"text\"` sets a new one.",
             ));
         }
         BriefArg::Mode(mode) => {
@@ -1230,13 +1240,13 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
 fn brief_mode_line(mode: MeshBrief) -> &'static str {
     match mode {
         MeshBrief::Auto => {
-            "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections."
+            "Brief mode is auto for this session: your envoy answers other sessions from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections."
         }
         MeshBrief::Manual => {
-            "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections."
+            "Brief mode is manual for this session: your envoy answers other sessions from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections."
         }
         MeshBrief::Off => {
-            "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on."
+            "Brief mode is off for this session: no brief is assembled, so your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on."
         }
     }
 }
@@ -1486,7 +1496,7 @@ fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<(
         return Ok(());
     }
     let question = format!(
-        "Remove {count} ({size}) staged under {}? They are the peers' copies; this cannot be undone.",
+        "Remove {count} ({size}) staged under {}? They are copies other sessions sent; this cannot be undone.",
         inbox_root.display()
     );
     if !confirm_or_flag(&question, "--yes", yes)? {
@@ -1649,6 +1659,9 @@ fn pending(ctx: &RequestContext, list: PendingList) -> Result<()> {
 enum Answering {
     Peer(String),
     OwnQuestion(Box<Correlation>),
+    /// A message this session sent whose reply already closed it: the follow-up goes as
+    /// a new message into its thread, to the session that replied.
+    ClosedThread(SentThread),
 }
 
 /// `envoy answer` (`wanted` Inbound) takes the questions peers escalated and
@@ -1692,7 +1705,7 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 .mesh
                 .who(&record.peer_identity, &record.peer_destination);
             (
-                QuestionRow::inbound(&record, name.clone(), now),
+                Some(QuestionRow::inbound(&record, name.clone(), now)),
                 Answering::Peer(record.peer_destination),
                 name,
             )
@@ -1706,17 +1719,28 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 &correlation.record.peer_destination,
             );
             (
-                QuestionRow::outbound(&correlation.record, name.clone()),
+                Some(QuestionRow::outbound(&correlation.record, name.clone())),
                 Answering::OwnQuestion(Box::new(correlation)),
                 name,
             )
         }
+        (_, None, None) if wanted == AnswerRoute::Outbound => match closed_sent_thread(ctx, id) {
+            Some(sent) => {
+                let name = ctx.app.mesh.who(&sent.identity, &sent.destination);
+                (None, Answering::ClosedThread(sent), name)
+            }
+            None => {
+                return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id)));
+            }
+        },
         _ => return Err(asked_elsewhere(ctx, id, now).unwrap_or_else(|| no_open_question(id))),
     };
     let attachment = prepared_attachment(ctx, attach, &runtime)?;
-    out_path_text(
-        &render_question_block(&row, now, terminal_width(), !*NO_COLOR).render(live_prefix()),
-    );
+    if let Some(row) = &row {
+        out_path_text(
+            &render_question_block(row, now, terminal_width(), !*NO_COLOR).render(live_prefix()),
+        );
+    }
     let text = match given {
         Some(text) => text.to_string(),
         None => match prompt_answer_text(wanted, id)? {
@@ -1767,8 +1791,111 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                     .render(live_prefix()),
             );
         }
+        Answering::ClosedThread(sent) => {
+            let destination = &sent.destination;
+            out_path_text(&follow_up_notice(&who, destination).render(live_prefix()));
+            if let Some(attachment) = &attachment {
+                out_path_text(&attaching_notice(attachment, destination));
+            }
+            result_follows();
+            let out = OutboundPeer::with_parts(
+                PeerKind::Message,
+                &text,
+                None,
+                None,
+                None,
+                parts_of(attachment),
+                &runtime.part_limits(),
+            )?
+            .with_thread(Some(sent.thread.clone()))?;
+            open_message_correlation(
+                &ctx.app.mesh,
+                destination,
+                &sent.identity,
+                &out,
+                SystemTime::now(),
+            );
+            let outcome = match runtime.send_peer_lending_reference(destination, &out).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    ctx.app.mesh.correlations().abandon(&out.id);
+                    return Err(quoted_send_failure(err, &who));
+                }
+            };
+            ctx.app.mesh.remember_sent_thread(&sent.thread);
+            out_path_text(
+                &thread_follow_up_line(
+                    &outcome,
+                    destination,
+                    &who,
+                    &sent.thread,
+                    SystemTime::now(),
+                )
+                .render(live_prefix()),
+            );
+        }
     }
     Ok(())
+}
+
+/// A message this session sent whose reply closed it, as a follow-up continues it: the
+/// thread it opened and the session that replied in it.
+struct SentThread {
+    thread: String,
+    destination: String,
+    identity: String,
+}
+
+/// The thread `id` names when this session sent it and a reply already closed it: `id`
+/// is the message's own id (a root message's thread), or the id of the reply, and the
+/// newest reply in that thread still in the inbox says which session to send to. `None`
+/// for a thread another session sent, one a peer started, or one whose replies the
+/// inbox no longer holds.
+fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<SentThread> {
+    let sent = ctx.app.mesh.sent_threads()?;
+    let reply = ctx.app.mesh.peer_inbox().newest(|message| {
+        !message.source_destination.is_empty()
+            && [
+                Some(message.message_id.as_str()),
+                message.in_reply_to.as_deref(),
+                Some(message.thread()),
+            ]
+            .contains(&Some(id))
+            && sent.was_sent(message.thread())
+    })?;
+    Some(SentThread {
+        thread: reply.thread().to_string(),
+        destination: reply.source_destination,
+        identity: reply.source_identity,
+    })
+}
+
+/// The line a follow-up on a message whose reply already closed it ends with: the new
+/// message went into that message's thread, where its reply lands too; when the session
+/// had gone, the propagation node holds it, as `own_reply_sent_line` says.
+fn thread_follow_up_line(
+    outcome: &SendOutcome,
+    destination: &str,
+    name: &str,
+    thread: &str,
+    now: SystemTime,
+) -> NoticeText {
+    let line = NoticeText::from_template(
+        "Sent {sent} to {name} ({destination}) in thread {thread} (via {via}); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
+        &[
+            ("sent", short(&outcome.id)),
+            ("destination", short(destination)),
+            ("via", via_text(outcome.via)),
+        ],
+        &[("name", name), ("thread", short(thread))],
+    );
+    match outcome.departed {
+        Some(departed) => line.frame(" ").peer(name).frame(format!(
+            "{}{HELD_REPLY_FOR_DEPARTED}. {SEE_WHEN_IT_IS_BACK}",
+            departed.status(now)
+        )),
+        None => line,
+    }
 }
 
 /// `reply_sent_line` for a follow-up on this node's own question, saying, when the peer
@@ -2199,7 +2326,7 @@ fn asked_by_this_node(id: &str) -> anyhow::Error {
     QuotingError::wrap(
         NoticeText::default()
             .peer(id)
-            .frame(" is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."),
+            .frame(" is a question you asked, not one escalated to you; it closes when that session replies or its timeout passes. `.mesh messaging sent` shows it until then."),
     )
 }
 
@@ -2218,7 +2345,7 @@ fn escalated_not_asked(id: &str) -> anyhow::Error {
     QuotingError::wrap(
         NoticeText::default()
             .peer(id)
-            .frame(" is a question a peer escalated to you, not one you asked; answer it with `.mesh envoy answer ")
+            .frame(" is a question another session escalated to you, not one you asked; answer it with `.mesh envoy answer ")
             .peer(id)
             .frame(" \"<text>\"`."),
     )
@@ -2435,17 +2562,30 @@ fn session_led(
     destination: &str,
 ) -> Option<anyhow::Error> {
     let tail = text.strip_prefix(lead)?;
-    let dest8 = short(destination);
-    let hash = if who.ends_with(&format!("/ {dest8}")) {
-        String::new()
-    } else {
-        format!(" ({dest8})")
-    };
+    let hash = hash_after(who, destination);
     Some(QuotingError::wrap(
         NoticeText::from(word)
             .peer(who)
             .frame(format!("{hash}{tail}")),
     ))
+}
+
+/// What follows a session's `<user> / <session>` name: its short hash in parentheses,
+/// unless the name already ends on it, as a session with no name of its own does.
+fn hash_after(who: &str, destination: &str) -> String {
+    let dest8 = short(destination);
+    if who.ends_with(&format!("/ {dest8}")) {
+        String::new()
+    } else {
+        format!(" ({dest8})")
+    }
+}
+
+/// A refusal that opens on `Session <hash>`, opened on the session's `<user> / <session>`
+/// name instead, as `session_led` writes it; `text` as it stands when it opens otherwise.
+fn session_led_or_plain(text: String, who: &str, destination: &str) -> anyhow::Error {
+    let lead = format!("Session {destination}");
+    session_led(&text, &lead, "", who, destination).unwrap_or_else(|| anyhow!(text))
 }
 
 /// An access request failure as the REPL shows it: a peer-side refusal quoted as
@@ -3343,11 +3483,14 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     }
     let route = match route_to(&runtime, &destination, abort_signal).await {
         Ok(route) => route,
-        Err(Unrouted::NoAnswer) => bail!(
-            "{}{} Try again in a minute; nothing was queued for it, because a request to be trusted can be held on a propagation node only after the session's announce has been heard. `.mesh people list` shows when it was last heard.",
-            unreachable_head(&destination),
-            left_mesh_hint(Some(&peer), SystemTime::now())
-        ),
+        Err(Unrouted::NoAnswer) => {
+            let text = format!(
+                "{}{} Try again in a minute; nothing was queued for it, because a request to be trusted can be held on a propagation node only after the session's announce has been heard. `.mesh people list` shows when it was last heard.",
+                unreachable_head(&destination),
+                left_mesh_hint(Some(&peer), SystemTime::now())
+            );
+            return Err(session_led_or_plain(text, &name, &destination));
+        }
         Err(Unrouted::Interrupted) => {
             out_path_text(&NoticeText::from("Request interrupted.").render(live_prefix()));
             return Ok(());
@@ -3392,7 +3535,7 @@ fn knock_confirmation(name: &str, destination: &str, trust: &str, intro: &str) -
             short(destination)
         ))
         .then(intro_label)
-        .frame("; if the session is unreachable the request is held on a propagation node. Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides.")
+        .frame("; if the session is unreachable the request is held on a propagation node. Only a session whose user already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides.")
 }
 
 /// The line `.mesh access ask` ends with for a request that was delivered somewhere. A
@@ -3403,7 +3546,7 @@ fn knock_report(who: &str, outcome: &KnockOutcome) -> NoticeText {
         KnockOutcome {
             via: KnockVia::Direct,
             ..
-        } => " directly; its owner decides whether to trust you.".to_string(),
+        } => " directly; its user decides whether to trust you.".to_string(),
         KnockOutcome {
             via: KnockVia::StoreAndForward,
             fallback: Some(KnockFallback::Unanswered),
@@ -3481,7 +3624,7 @@ async fn request(
     let valid = match validate_access(&id, args.paths, reason) {
         Ok(valid) => valid,
         Err("a path is not a wire path") => bail!(
-            "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh files list --effective --all prints it."
+            "The access request was not sent: a path is not a wire path. Spell each path relative to that session's share root, /-separated, as mesh__list shows it or that session's own .mesh files list --effective --all prints it."
         ),
         Err(rule) => bail!(AccessError::Invalid(rule).to_string()),
     };
@@ -3511,11 +3654,15 @@ async fn send_request(
     // path asked for) once.
     let route = match route_to(runtime, destination, abort_signal).await {
         Ok(route) => route,
-        Err(Unrouted::NoAnswer) => bail!(
-            "{}{} Try again in a minute; nothing was sent. `.mesh people list` shows when it was last heard.",
-            unreachable_head(destination),
-            left_mesh_hint(runtime.peers().get(destination).as_ref(), SystemTime::now())
-        ),
+        Err(Unrouted::NoAnswer) => {
+            let text = format!(
+                "{}{} Try again in a minute; nothing was sent. `.mesh people list` shows when it was last heard.",
+                unreachable_head(destination),
+                left_mesh_hint(runtime.peers().get(destination).as_ref(), SystemTime::now())
+            );
+            let who = runtime.who_at(destination).to_string();
+            return Err(session_led_or_plain(text, &who, destination));
+        }
         Err(Unrouted::Interrupted) => {
             out_path_text(
                 &NoticeText::from("Request interrupted; nothing was sent.").render(live_prefix()),
@@ -3812,7 +3959,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
 /// file name there and not a command.
 fn invalid_path_refusal(peer: &str, shown: &str, rule: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh files list --peer {peer}` or mesh__list shows it.",
+        "`{shown}` is not a path the mesh carries (rule `{rule}`); pass the path exactly as `.mesh files list {peer}` or mesh__list shows it.",
         &[("rule", rule), ("peer", peer)],
         &[("shown", shown)],
     ))
@@ -3858,7 +4005,7 @@ mod fetch_path_refusal_tests {
         let mut cases = vec![
             (
                 invalid_path_refusal(peer, path, "dot_segment"),
-                "`.vault/key` is not a path the mesh carries (rule `dot_segment`); pass the path exactly as `.mesh files list --peer 1a2b3c4d` or mesh__list shows it.".to_string(),
+                "`.vault/key` is not a path the mesh carries (rule `dot_segment`); pass the path exactly as `.mesh files list 1a2b3c4d` or mesh__list shows it.".to_string(),
             ),
             (
                 too_large_refusal(named, path, 1024),
@@ -4357,7 +4504,7 @@ fn render_sync(report: &FetchReport) -> String {
     }
     if report.wanted > 0 && report.received == 0 {
         let mut line = format!(
-            "Propagation node {node} lists {} for you and {} were asked for, but none were served; run .mesh messaging sync again or check that node's logs.",
+            "Propagation node {node} lists {} for you and {} were asked for, but none were served; run .mesh messaging sync again or check its logs.",
             plural(report.listed, "message", "messages"),
             report.wanted
         );
@@ -4493,7 +4640,7 @@ mod sync_ask_line_tests {
         };
         assert_eq!(
             render_sync(&none_served),
-            "Propagation node deadbeef lists 3 messages for you and 2 were asked for, but none were served; run .mesh messaging sync again or check that node's logs. 1 left on the node for another session."
+            "Propagation node deadbeef lists 3 messages for you and 2 were asked for, but none were served; run .mesh messaging sync again or check its logs. 1 left on the node for another session."
         );
     }
 }
@@ -5102,7 +5249,7 @@ fn forget(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             lines.push(format!("  the block on {user}"));
         }
         if forgotten.names {
-            lines.push("  the names of this person and their sessions".to_string());
+            lines.push("  the names of this user and their sessions".to_string());
         }
         if knocks > 0 {
             lines.push(format!(
@@ -5457,7 +5604,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     identity::PREDECESSORS_FILE
                 ),
                 "  your session id is unchanged, so the session announces a new address under the new key".to_string(),
-                "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
+                "  rotation is refused while any session on this config dir is on the mesh: each one holds mesh/identity.key.lock".to_string(),
                 "  every user who trusted you or your sessions now sees a stranger and must run .mesh access trust again after verifying the new hash out of band".to_string(),
             ];
             let text = NoticeText::default()
@@ -5481,7 +5628,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 trust.rotate_self_trust(&old, new, SystemTime::now())
             });
             let mut text = format!(
-                "Rotated your mesh key: {} -> {new}.\nPredecessors recorded: {}. Run .mesh on to announce the new key; peers must re-trust it.",
+                "Rotated your mesh key: {} -> {new}.\nPredecessors recorded: {}. Run .mesh on to announce the new key; other users must trust it again.",
                 rotation.old_fingerprint, rotation.predecessors
             );
             if let Ok(own_trust) = &moved {
@@ -5606,7 +5753,7 @@ fn rotated_self_trust_text(new: &str, own_trust: SelfTrustRotation) -> String {
     }
 }
 
-/// `.mesh files allow <pattern>`: an allow rule for every trusted peer or for one. `--force`
+/// `.mesh files allow <pattern>`: an allow rule for every trusted session or for one. `--force`
 /// adds the override that lifts the built-in deny for one exact file, which only the
 /// global file may carry.
 fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -5641,12 +5788,12 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     } = args;
     if force && peer.is_some() {
         bail!(
-            "`--force` lifts the built-in deny for every peer whose allow names `{pattern}`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted peer with a matching allow will see the file)."
+            "`--force` lifts the built-in deny for every user or session whose allow names `{pattern}`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted session with a matching allow will see the file)."
         );
     }
     if let Some(destination) = canonical_hash(&pattern) {
         bail!(
-            "`.mesh files allow` takes a file pattern, not a peer; to trust the session {} run `.mesh access trust session {destination}`, or scope a share to it with `--peer {destination}`.",
+            "`.mesh files allow` takes a file pattern, not a session; to trust the session {} run `.mesh access trust session {destination}`, or scope a share to it with `--peer {destination}`.",
             short(&destination)
         );
     }
@@ -5839,7 +5986,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     } = args;
     if let Some(destination) = canonical_hash(&pattern) {
         bail!(
-            "`.mesh files deny` takes a file pattern, not a peer; to refuse the session {} run `.mesh access block session {destination}`.",
+            "`.mesh files deny` takes a file pattern, not a session; to refuse the session {} run `.mesh access block session {destination}`.",
             short(&destination)
         );
     }
@@ -5863,7 +6010,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     refuse_symlink(&target.path)?;
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     let already = format!(
-        "`{pattern}` is already denied to every peer in {}; nothing was changed.",
+        "`{pattern}` is already denied to every session in {}; nothing was changed.",
         target.path.display()
     );
     if layer_holds(
@@ -5877,7 +6024,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     }
     out_path_text(&format!(
-        "{} write to {}: deny `{pattern}` to every peer.",
+        "{} write to {}: deny `{pattern}` to every session.",
         intent_verb(dry_run),
         target.written_to()
     ));
@@ -5887,7 +6034,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     if matches.broad {
         let question = format!(
-            "Deny {} files matching `{pattern}` to every peer?",
+            "Deny {} files matching `{pattern}` to every session?",
             matches.words
         );
         if !confirm_or_flag(&question, "--yes", yes)? {
@@ -5906,7 +6053,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .map_err(quoted_share_write)?;
     if applied.changed {
         out_path_text(&format!(
-            "Denied `{pattern}` to every peer; written to {}.",
+            "Denied `{pattern}` to every session; written to {}.",
             target.written_to()
         ));
     } else {
@@ -6019,11 +6166,11 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         for (layer, held) in &targets {
             for holder in held {
                 let scope = match &holder.peer {
-                    None if holder.kind == "allow" => " (every trusted peer)".to_string(),
+                    None if holder.kind == "allow" => " (every trusted session)".to_string(),
                     None => String::new(),
-                    Some(hash) if is_canonical_peer(hash) => format!(" (peer {})", short(hash)),
+                    Some(hash) if is_canonical_peer(hash) => format!(" (only {})", short(hash)),
                     Some(text) => {
-                        format!(" (scoped to no peer: `{}`)", shown_pattern(text))
+                        format!(" (scoped to no user or session: `{}`)", shown_pattern(text))
                     }
                 };
                 out_path_text(&format!("  {}{scope} in {}", holder.kind, path_of(*layer)));
@@ -6092,16 +6239,174 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// they resolve to under the root with the verdict a fetch of each would get. Inspection
 /// only, so it works while the mesh is off and never prints a file's contents. `--all`
 /// widens `--effective` to every file under the root, whether an allow names it or not.
-fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+/// `.mesh files list`: bare or with `--peer` / `--effective`, your own share rules and
+/// what they share; with a session, the files that session shares with you, asked live.
+async fn files_list(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    rest: Option<&str>,
+) -> Result<()> {
     let args = parse_mutation_args(
         rest.unwrap_or(""),
         "files",
         "list",
-        &["--peer", "--effective", "--all"],
+        &["--peer", "--effective", "--all", "--prefix", "--next"],
     )?;
-    if let Some(token) = args.positional.first() {
-        return Err(unexpected(token, "files", "list"));
+    let Some(token) = args.positional.first() else {
+        if args.prefix.is_some() || args.next.is_some() {
+            bail!(
+                "`--prefix` and `--next` narrow what a session shares with you: run `.mesh files list <session> --prefix <path>`. Nothing was listed."
+            );
+        }
+        return shares(ctx, &args);
+    };
+    if args.peer.is_some() || args.effective || args.all {
+        bail!(
+            "`.mesh files list <session>` asks that session which files it shares with you; `--peer`, `--effective` and `--all` read your own share rules, so run them without the session, as in `.mesh files list --effective --peer <who>`. Nothing was listed."
+        );
     }
+    list_remote(
+        ctx,
+        abort_signal,
+        token,
+        args.prefix.as_deref(),
+        args.next.as_deref(),
+    )
+    .await
+}
+
+/// `.mesh files list <session> [--prefix <path>] [--next <cursor>]`: one page of the files
+/// a trusted session shares with you, as mesh__list reads it. The paths are that
+/// session's own text, quoted as they stand; nothing is fetched.
+async fn list_remote(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    token: &str,
+    prefix: Option<&str>,
+    cursor: Option<&str>,
+) -> Result<()> {
+    let destination = destination_hash(ctx, token)?;
+    let runtime = live(ctx)?;
+    let Some(record) =
+        peer_for_contact(&runtime, &destination, LIST_REFUSAL_TAIL, abort_signal).await?
+    else {
+        return Ok(());
+    };
+    let peer = short(&destination);
+    let who = runtime.who_at(&destination).to_string();
+    let named = format!("{who}{}", hash_after(&who, &destination));
+    let route = match route_to(&runtime, &destination, abort_signal).await {
+        Ok(route) => route,
+        Err(Unrouted::NoAnswer) => {
+            let text = format!(
+                "{}{} A listing runs live or not at all, so nothing was queued; try again in a minute. `.mesh people list` shows when it was last heard.",
+                unreachable_head(&destination),
+                left_mesh_hint(Some(&record), SystemTime::now())
+            );
+            return Err(session_led_or_plain(text, &who, &destination));
+        }
+        Err(Unrouted::Interrupted) => {
+            out_text("Listing interrupted; nothing was listed.");
+            return Ok(());
+        }
+    };
+    out_path_text(
+        &NoticeText::from_template(
+            "Asking {named} which files it shares with you; Ctrl-C cancels...",
+            &[],
+            &[("named", &named)],
+        )
+        .render(live_prefix()),
+    );
+    result_follows();
+    let outcome = tokio::select! {
+        outcome = runtime.list_shares(route, prefix, cursor) => outcome,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text("Listing interrupted; nothing was listed.");
+            return Ok(());
+        }
+    };
+    let page = match outcome {
+        Ok(page) => page,
+        Err(FileFetchError::NotServed) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "{named} does not share files: it may run an older Coyote or have sharing off. Nothing was listed.",
+                &[],
+                &[("named", &named)],
+            )));
+        }
+        Err(
+            err @ (FileFetchError::Malformed(_)
+            | FileFetchError::Oversize { .. }
+            | FileFetchError::Corrupt
+            | FileFetchError::UnknownStatus),
+        ) => {
+            return Err(QuotingError::wrap(NoticeText::from_template(
+                "{named} did not list its files: {err}. Try `.mesh files list {peer}` again; if it repeats, that session may run a different Coyote.",
+                &[("peer", peer), ("err", &err.to_string())],
+                &[("named", &named)],
+            )));
+        }
+        Err(err) => return Err(quoted_fetch_failure(err, &who)),
+    };
+    out_path_text(&listed_page(&page, &named, peer, prefix).render(live_prefix()));
+    Ok(())
+}
+
+/// One page of a session's listing as the REPL shows it: a line per file, its path quoted
+/// as the session sent it, then what to run next.
+fn listed_page(page: &SharesPage, named: &str, peer: &str, prefix: Option<&str>) -> NoticeText {
+    let under = prefix.map(shown_pattern);
+    if page.entries.is_empty() && page.next.is_none() {
+        let mut text = NoticeText::default()
+            .peer(named)
+            .frame(" shares nothing with you");
+        if let Some(under) = &under {
+            text = text.frame(" under `").peer(under.as_str()).frame("`");
+        }
+        return text.frame(format!(
+            ". `.mesh files request {peer} <path>` asks its user for a path it does not share."
+        ));
+    }
+    let mut text = NoticeText::default()
+        .peer(named)
+        .frame(format!(" shares {} file(s) with you", page.entries.len()));
+    if let Some(under) = &under {
+        text = text.frame(" under `").peer(under.as_str()).frame("`");
+    }
+    text = text.frame(" on this page:");
+    for entry in &page.entries {
+        text = text
+            .frame("\n  `")
+            .peer(shown_pattern(&entry.path))
+            .frame(format!(
+                "` . {} bytes . sha256 {}",
+                entry.size,
+                hex_lower(&entry.sha256)
+            ));
+    }
+    let narrowed = prefix
+        .map(|prefix| format!(" --prefix {}", shown_pattern(prefix)))
+        .unwrap_or_default();
+    match &page.next {
+        Some(next) if is_cursor_shaped(next) => {
+            text = text.frame(format!(
+                "\nMore files: `.mesh files list {peer}{narrowed} --next {next}` lists the next page."
+            ));
+        }
+        Some(_) => {
+            text = text.frame(
+                "\nMore files remain, but the page marker that session sent is not one this Coyote passes on; narrow the listing with `--prefix <path>`.",
+            );
+        }
+        None => {}
+    }
+    text.frame(format!(
+        "\n`.mesh files fetch {peer} <path>` fetches one into your session's staging inbox."
+    ))
+}
+
+fn shares(ctx: &RequestContext, args: &MutationArgs) -> Result<()> {
     if args.all && !args.effective {
         bail!("`--all` works with `--effective`: run `.mesh files list --effective --all`.");
     }
@@ -6641,10 +6946,10 @@ fn render_share_rules(
                         return None;
                     }
                     let note = match &peer {
-                        None => "every trusted peer".to_string(),
-                        Some(hash) if is_canonical_peer(hash) => format!("peer {}", short(hash)),
+                        None => "every trusted session".to_string(),
+                        Some(hash) if is_canonical_peer(hash) => format!("only {}", short(hash)),
                         Some(text) => format!(
-                            "scoped to no peer (`{}` is not a peer hash)",
+                            "scoped to no user or session (`{}` is not a user or session hash)",
                             shown_pattern(text)
                         ),
                     };
@@ -6672,7 +6977,7 @@ fn render_share_rules(
     if rows.is_empty() {
         if let Some(hash) = scoped_to {
             return format!(
-                "No share rule applies to peer {}; {}",
+                "No share rule applies to user or session {}; {}",
                 short(hash),
                 prefix.render_hints("`.mesh files list` lists every rule.")
             );
@@ -6681,13 +6986,14 @@ fn render_share_rules(
             "No share rules in {} or {}. {}",
             locations.global.display(),
             locations.workspace.display(),
-            prefix
-                .render_hints("`.mesh files allow docs/**` shares docs/ with every trusted peer.")
+            prefix.render_hints(
+                "`.mesh files allow docs/**` shares docs/ with every trusted session."
+            )
         );
     }
     let presence = |path: &Path| if path.exists() { "" } else { " (absent)" };
     let for_peer = scoped_to
-        .map(|hash| format!(" for peer {}", short(hash)))
+        .map(|hash| format!(" for user or session {}", short(hash)))
         .unwrap_or_default();
     let mut table = mesh_table(&["kind", "pattern", "layer", "note"]);
     table.add_rows(rows);
@@ -6752,7 +7058,7 @@ fn render_effective_shares(
     lines.push(table.to_string());
     if resolved.capped && !all {
         lines.push(format!(
-            "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
+            "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see what one user or session can fetch."
         ));
     }
     if all && resolved.capped {
@@ -7218,8 +7524,8 @@ fn intent_verb(dry_run: bool) -> &'static str {
 
 fn share_audience(peer: Option<&str>) -> String {
     match peer {
-        None => "every trusted peer".to_string(),
-        Some(peer) => format!("peer {}", short(peer)),
+        None => "every trusted session".to_string(),
+        Some(peer) => format!("user or session {}", short(peer)),
     }
 }
 
@@ -9262,6 +9568,8 @@ struct MutationArgs {
     purge_files: bool,
     all: bool,
     silent: bool,
+    prefix: Option<String>,
+    next: Option<String>,
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
@@ -9311,6 +9619,8 @@ fn parse_mutation_args(
             "--purge-files" => args.purge_files = true,
             "--all" => args.all = true,
             "--silent" => args.silent = true,
+            "--prefix" => args.prefix = Some(value()?),
+            "--next" => args.next = Some(value()?),
             _ => return Err(unexpected(&token, group, verb)),
         }
     }
@@ -9627,7 +9937,7 @@ fn result_follows() {
 
 fn dropped_warning(dropped: usize) -> String {
     format!(
-        "WARNING: {dropped} peer message(s) were dropped before you read them because the inbox was full."
+        "WARNING: {dropped} message(s) were dropped before you read them because the inbox was full."
     )
 }
 
@@ -10004,7 +10314,7 @@ fn render_help() -> String {
 const MESH_CONCEPTS: [(&str, &str); 5] = [
     (
         "user",
-        "A person or an installation on the mesh; one user can run several sessions. You are `you`.",
+        "Someone, or one installation, on the mesh; one user can run several sessions. You are `you`.",
     ),
     (
         "session",
@@ -10108,7 +10418,7 @@ fn group_concepts(group: &str) -> Vec<(String, String)> {
             ),
             (
                 "sync counts",
-                "listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the node: for another of your sessions.",
+                "listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the propagation node: for another of your sessions.",
             ),
         ],
         "envoy" => &[
@@ -10268,7 +10578,7 @@ mod help_output_tests {
                 ".mesh config | Show your mesh settings and replace your mesh key",
                 "What the words mean:",
                 "word | meaning",
-                "user | A person or an installation on the mesh; one user can run several sessions. You are `you`.",
+                "user | Someone, or one installation, on the mesh; one user can run several sessions. You are `you`.",
                 "session | One running Coyote session of a user; you reach a user through their sessions.",
                 "envoy | The agent that answers other sessions for yours from your brief, so they do not interrupt you.",
                 "trust | Only sessions you trust can message you, ask your envoy or fetch the files you share; `.mesh access` manages it.",
@@ -10291,7 +10601,7 @@ mod help_output_tests {
                 "`.mesh people <command> --help` shows a command's usage.",
                 "What the words mean:",
                 "word | meaning",
-                "user | A person or an installation, which can run several sessions.",
+                "user | Someone, or one installation, which can run several sessions.",
                 "session | One running session of a user; each row of `.mesh people list` is one.",
                 "you | Your own sessions on this config dir, by session name when it runs on this computer, (ended) once it has stopped.",
                 "names | A user or session shows the name you gave it, else the one it advertised (its own text), else its short hash.",
@@ -10303,7 +10613,7 @@ mod help_output_tests {
                 "stale | Silent for 2+ hourly heartbeats; dropped after about 3 h.",
                 "superseded | This user moved to the session named.",
                 "left | The session said it was leaving the mesh, until it announces again or is heard over a link.",
-                "no route | You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.",
+                "no route | You have no path to it (a relay that restarted has none until the session announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.",
                 "hashes | <user hash> / <session hash>, shortened; `.mesh people info <who>` shows them whole.",
                 "addressing | Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh people name <user>/<session> \"name\"` one of their sessions.",
                 "Under the hood: a user is a Reticulum identity (one key pair; its hash is the user hash) and a session is a destination, the address one running instance announces (its hash is the session hash). A name is shown in place of a hash and never sent to identify anyone.",
@@ -10354,8 +10664,8 @@ mod help_output_tests {
                 "messaging: Send to people's sessions, read your inbox and follow up on what you asked",
                 "command | what it does",
                 ".mesh messaging send | Send your own text to one session, bypassing the model",
-                ".mesh messaging broadcast | Send a bulletin to every trusted peer with a known path",
-                ".mesh messaging inbox | Show the messages peers sent this session, the new ones marked; `clear` empties the list",
+                ".mesh messaging broadcast | Send a bulletin to every trusted session with a known path",
+                ".mesh messaging inbox | Show the messages other sessions sent this one, the new ones marked; `clear` empties the list",
                 ".mesh messaging sync | Fetch now the messages a propagation node holds for this session",
                 ".mesh messaging sent | List what your sessions sent and asked: open messages and questions, open or answered",
                 ".mesh messaging follow-up | Follow up on a message you sent or a question you asked",
@@ -10370,7 +10680,7 @@ mod help_output_tests {
                 "answered, awaiting the model | The answer arrived; the model picks it up with mesh__collect.",
                 "bulletin | One text sent to every trusted session at once with `.mesh messaging broadcast`.",
                 "propagation node | Where messages wait while a session is away; `.mesh messaging sync` fetches them now.",
-                "sync counts | listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the node: for another of your sessions.",
+                "sync counts | listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the propagation node: for another of your sessions.",
                 "Under the hood: messages travel over Reticulum as LXMF, addressed to the destination a session announces. A propagation node is an LXMF store-and-forward node; your session identifies itself to the nearest one heard when it joins and on a timer, and `.mesh messaging sync` asks it now.",
             ]
         );
@@ -10383,10 +10693,10 @@ mod help_output_tests {
             [
                 "envoy: Shape what your envoy tells other sessions and handle what it escalates to you",
                 "command | what it does",
-                ".mesh envoy brief | Show the brief your envoy answers peers with, or set its note or mode",
-                ".mesh envoy memory | Forget what the envoy remembers of a peer's threads: one user, one of their threads, or everything",
-                ".mesh envoy questions | List the questions peers escalated to you",
-                ".mesh envoy answer | Answer a question a peer escalated to you",
+                ".mesh envoy brief | Show the brief your envoy answers other sessions with, or set its note or mode",
+                ".mesh envoy memory | Forget what the envoy remembers of a user's threads: one user, one of their threads, or everything",
+                ".mesh envoy questions | List the questions other sessions escalated to you",
+                ".mesh envoy answer | Answer a question another session escalated to you",
                 ".mesh envoy dismiss | Dismiss an escalated question: the asker hears that you declined, or nothing with --silent",
                 "`.mesh envoy <command> --help` shows a command's usage.",
                 "What the words mean:",
@@ -10409,15 +10719,15 @@ mod help_output_tests {
             [
                 "files: Share files, decide requests for them and fetch other sessions' files",
                 "command | what it does",
-                ".mesh files list | List the share rules and the file each came from, or the files a peer can fetch",
-                ".mesh files allow | Share files matching a pattern with every trusted peer, or with one peer",
-                ".mesh files deny | Never share files matching a pattern, whatever `files allow` says; a share rule, not a peer refusal (that is `access block`)",
+                ".mesh files list | List your share rules and the file each came from, the files a user or session may fetch from you, or the files a session shares with you",
+                ".mesh files allow | Share files matching a pattern with every trusted session, or with one user or session",
+                ".mesh files deny | Never share files matching a pattern, whatever `files allow` says; a share rule, not a refusal of a session (that is `access block`)",
                 ".mesh files unshare | Remove the allow or deny share rule that holds a pattern",
-                ".mesh files requests | List the access requests peers sent",
-                ".mesh files grant | Grant a peer's access request: once for a while, or standing in the share list",
-                ".mesh files refuse | Refuse a peer's access request",
-                ".mesh files request | Ask a trusted peer's human for access to files it does not share yet",
-                ".mesh files fetch | Fetch one file a trusted peer shares into your session's staging inbox",
+                ".mesh files requests | List the access requests other sessions sent",
+                ".mesh files grant | Grant a session's access request: once for a while, or standing in the share list",
+                ".mesh files refuse | Refuse a session's access request",
+                ".mesh files request | Ask a trusted session's user for access to files it does not share yet",
+                ".mesh files fetch | Fetch one file a trusted session shares into your session's staging inbox",
                 "`.mesh files <command> --help` shows a command's usage.",
                 "What the words mean:",
                 "word | meaning",
@@ -10479,7 +10789,7 @@ mod help_output_tests {
     fn verb_help_is_the_usage_and_a_few_plain_sentences() {
         assert_eq!(
             render_verb_help("envoy", "brief"),
-            "Usage: .mesh envoy brief [note \"text\"|note clear|auto|manual|off]\n  Show the brief your envoy answers peers with, or set its note or mode\n  The brief is what your envoy may tell other sessions about this one: the objective, the status card and your note. Peers asking \"what are you working on?\" get answers from it without interrupting you; set it to share more or less."
+            "Usage: .mesh envoy brief [note \"text\"|note clear|auto|manual|off]\n  Show the brief your envoy answers other sessions with, or set its note or mode\n  The brief is what your envoy may tell other sessions about this one: the objective, the status card and your note. Sessions asking \"what are you working on?\" get answers from it without interrupting you; set it to share more or less."
         );
         assert_eq!(
             render_verb_help("messaging", "send"),
@@ -10845,6 +11155,70 @@ mod tests {
         );
     }
 
+    const USER_MODEL_WORDS: [&str; 4] = ["peer", "owner", "person", "node"];
+
+    /// `line: word in literal` for each literal of `source` a user reads that names
+    /// someone on the mesh other than as a user or a session. `propagation node` is the
+    /// one named term kept, as the messaging help explains it (with its config keys),
+    /// `--peer` is a flag, and a bare lowercase word is a key, never prose.
+    fn user_model_word_hits(source: &str) -> Vec<String> {
+        shown_literals(source)
+            .into_iter()
+            .filter(|(_, literal)| !literal.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .filter_map(|(line, literal)| {
+                let prose = prose_of(&literal)
+                    .replace("propagation node", "")
+                    .replace("propagation_node", "")
+                    .replace("--peer", "");
+                USER_MODEL_WORDS
+                    .iter()
+                    .find(|word| prose.contains(*word))
+                    .map(|word| format!("{line}: {word:?} in {literal:?}"))
+            })
+            .collect()
+    }
+
+    /// Every help and result line speaks of users, sessions and envoys: no literal a
+    /// user reads in this file, or in the request and fetch errors it prints, says peer,
+    /// owner, person or node outside a group's "Under the hood" paragraph.
+    #[test]
+    fn no_shown_literal_says_peer_owner_person_or_node() {
+        let fixture = r##"
+fn shown() {
+    debug!("the peer is quiet");
+    out_text("the propagation node holds it; `--peer <who>` narrows it");
+    let row = NoticeText::from_template("to {peer}", &[("peer", d)], &[]);
+    out_text("every trusted peer");
+    bail!("its owner decides");
+}
+const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
+"##;
+        assert_eq!(
+            user_model_word_hits(fixture),
+            [
+                "6: \"peer\" in \"every trusted peer\"",
+                "7: \"owner\" in \"its owner decides\"",
+            ],
+            "the scan misreads its fixture"
+        );
+
+        for (path, source) in [
+            ("src/repl/mesh.rs", include_str!("mesh.rs")),
+            (
+                "src/mesh/request/error.rs",
+                include_str!("../mesh/request/error.rs"),
+            ),
+            ("src/mesh/fetch.rs", include_str!("../mesh/fetch.rs")),
+        ] {
+            let hits = user_model_word_hits(source);
+            assert!(
+                hits.is_empty(),
+                "{path} prints peer, owner, person or node where a user reads it:\n{}",
+                hits.join("\n")
+            );
+        }
+    }
+
     #[test]
     fn a_join_prints_one_line_naming_you_and_the_help() {
         let destination = "ab".repeat(16);
@@ -11047,7 +11421,7 @@ fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
             "The text goes to the session you asked, in the same thread; without text you are asked for it."
         }
         ("envoy", "brief") => {
-            "The brief is what your envoy may tell other sessions about this one: the objective, the status card and your note. Peers asking \"what are you working on?\" get answers from it without interrupting you; set it to share more or less."
+            "The brief is what your envoy may tell other sessions about this one: the objective, the status card and your note. Sessions asking \"what are you working on?\" get answers from it without interrupting you; set it to share more or less."
         }
         ("envoy", "memory") => {
             "Your envoy remembers its threads with each user so a follow-up makes sense; this erases that memory and nothing else."
@@ -11159,18 +11533,18 @@ fn reach_line(interfaces: &[ReachFact]) -> String {
         .collect();
     let all_loopback = relays.iter().all(|endpoint| loopback_endpoint(endpoint));
     match (public, relays.as_slice()) {
-        (true, []) => "world-visible via a community node (public interface)".to_string(),
+        (true, []) => "world-visible via a public community interface".to_string(),
         (true, _) => {
-            "world-visible via a community node (public interface), plus the configured relay and the peers it reaches".to_string()
+            "world-visible via a public community interface, plus the configured relay and the sessions it reaches".to_string()
         }
         (false, []) => "this link-local segment only".to_string(),
         (false, relays) if all_loopback => format!(
             "via rnsd at {} - rnstatus shows what it reaches",
             relays.join(", ")
         ),
-        (false, [relay]) => format!("the configured relay {relay} and the peers it reaches"),
+        (false, [relay]) => format!("the configured relay {relay} and the sessions it reaches"),
         (false, relays) => format!(
-            "the configured relays {} and the peers they reach",
+            "the configured relays {} and the sessions they reach",
             relays.join(", ")
         ),
     }
@@ -11196,14 +11570,14 @@ fn trust_refusal(
 
 fn audience(interface: &MeshInterface) -> &'static str {
     match interface {
-        MeshInterface::Lan => "every node on this LAN",
-        MeshInterface::Private { .. } => "the nodes joined to that relay",
-        MeshInterface::Local { .. } => "every node reachable through this host's rnsd",
+        MeshInterface::Lan => "everyone on this LAN",
+        MeshInterface::Private { .. } => "everyone joined to that relay",
+        MeshInterface::Local { .. } => "everyone reachable through this host's rnsd",
         MeshInterface::Public { .. } => "anyone on the internet who reaches that relay",
     }
 }
 
-/// How many paths the share files already hand every trusted peer, for the `.mesh on`
+/// How many paths the share files already hand every trusted session, for the `.mesh on`
 /// preview: the peer-less entries only, after the built-in and user denies, so a
 /// peer-scoped allow is not counted and neither is a file a deny holds back. Counted up
 /// to `LIST_PAGE_SIZE`, with the read-only case hint in place of the probe, since nothing
@@ -11248,7 +11622,7 @@ fn render_on_preview(
         "  announce: your session's address and protocol version, repeated while the mesh is on"
             .to_string()
     } else {
-        "  announce: nothing until you contact a peer (announce: false)".to_string()
+        "  announce: nothing until you contact a session (announce: false)".to_string()
     });
     lines.push(match (config.announce, config.propagation_sync_interval_secs) {
         (false, _) => "  propagation sync: off (announce: false); .mesh messaging sync runs one".to_string(),
@@ -11270,17 +11644,17 @@ fn render_on_preview(
         None => "  display name: none".to_string(),
     });
     lines.push(
-        "  status card: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
+        "  status card: this session's objective, state, repo and todo, served to trusted sessions on request".to_string(),
     );
     lines.push(match config.brief {
         MeshBrief::Auto => {
-            "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such".to_string()
+            "  brief: what your envoy answers trusted sessions from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such".to_string()
         }
         MeshBrief::Manual => {
-            "  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such".to_string()
+            "  brief: what your envoy answers trusted sessions from (the card, your note and the todo list); it is never sent as such".to_string()
         }
         MeshBrief::Off => {
-            "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on".to_string()
+            "  brief: none (brief mode is off): your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on".to_string()
         }
     });
     if let Some(shared) = shared.filter(|shared| shared.files > 0) {
@@ -11294,7 +11668,7 @@ fn render_on_preview(
             MatchCount { files, .. } => files.to_string(),
         };
         lines.push(format!(
-            "  files: {n} path(s) are shared with trusted peers (`.mesh files list`)"
+            "  files: {n} path(s) are shared with trusted sessions (`.mesh files list`)"
         ));
     }
     if fresh {
@@ -11324,7 +11698,7 @@ fn on_question(config: &MeshConfig) -> String {
         )
     } else {
         format!(
-            "Join the mesh on {} interface(s), visible to the nodes there?",
+            "Join the mesh on {} interface(s), visible to everyone there?",
             config.interfaces.len()
         )
     }
@@ -11343,7 +11717,7 @@ fn cwd_warning(cwd: &Path, home: Option<&Path>) -> Option<String> {
     });
     if is_home || cwd.parent().is_none() {
         Some(format!(
-            "Warning: this session's working directory is {}. A peer's question is answered by the envoy with read-only tools confined to it, so every file under it that the name deny-list does not cover is one question away from a peer. Start Coyote from a project directory before joining the mesh.",
+            "Warning: this session's working directory is {}. Another session's question is answered by the envoy with read-only tools confined to it, so every file under it that the name deny-list does not cover is one question away from another session. Start Coyote from a project directory before joining the mesh.",
             cwd.display()
         ))
     } else {
@@ -11396,10 +11770,10 @@ fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
                     )
                 }
                 InterfaceState::Unreachable { reason, .. } if status.kind == "lan" => format!(
-                    "WARNING: lan is unreachable ({reason}); peers on this link-local segment are out of reach."
+                    "WARNING: lan is unreachable ({reason}); sessions on this link-local segment are out of reach."
                 ),
                 InterfaceState::Unreachable { reason, .. } => format!(
-                    "WARNING: {label} is unreachable ({reason}); peers behind that relay are out of reach."
+                    "WARNING: {label} is unreachable ({reason}); sessions behind that relay are out of reach."
                 ),
                 InterfaceState::Connecting {
                     dial_failure:
@@ -11786,7 +12160,7 @@ mod peers_route_tests {
         assert_eq!(cells[1][5], "", "{text}");
         assert!(
             people_meaning("no route").contains(
-                "You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again."
+                "You have no path to it (a relay that restarted has none until the session announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again."
             ),
             "{text}"
         );
@@ -12029,7 +12403,7 @@ mod peers_you_tests {
         );
         let no_route = people_meaning("no route");
         assert!(
-            no_route.contains("You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again."),
+            no_route.contains("You have no path to it (a relay that restarted has none until the session announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again."),
             "{no_route}"
         );
     }
@@ -12062,7 +12436,7 @@ fn row_state(peer: &PeerRecord, successor: Option<&PeerRecord>, now: SystemTime)
 /// which only says how long the row has been silent, and yields to `superseded`, which
 /// says where the identity went. A relay that restarted holds no path to a peer until that
 /// peer announces again, so the marker does not claim the peer has left.
-const NO_ROUTE_STATE: &str = "(no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce)";
+const NO_ROUTE_STATE: &str = "(no route: no path, its link failed or its session ended; a restarted relay has none until the session announces; it may have left; run .mesh people list after its next announce)";
 
 /// The `state` of a heard row whose instance said it was leaving the mesh, `left_at` by
 /// this node's clock. It outranks `no route` and `stale`, being the peer's own word, and
@@ -12123,7 +12497,7 @@ fn people_concepts() -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = [
         (
             "user",
-            "A person or an installation, which can run several sessions.".to_string(),
+            "Someone, or one installation, which can run several sessions.".to_string(),
         ),
         (
             "session",
@@ -12169,7 +12543,7 @@ fn people_concepts() -> Vec<(String, String)> {
             ),
             (
                 "no route",
-                "You have no path to it (a relay that restarted has none until the peer announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.".to_string(),
+                "You have no path to it (a relay that restarted has none until the session announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.".to_string(),
             ),
             (
                 "hashes",
@@ -12343,7 +12717,7 @@ fn render_knocks(
         }
         lines.push(NoticeText::default().peer(table.to_string()));
         lines.push(NoticeText::from(format!(
-            "{}. Names and intros are peer-supplied text; .mesh access trust session <who> trusts one.",
+            "{}. Names and intros are those sessions' own text; .mesh access trust session <who> trusts one.",
             plural(records.len(), "request", "requests")
         )));
     }
@@ -12613,7 +12987,7 @@ fn render_peer_detail(
                 .into(),
         ),
     }
-    lines.push("Names and intros are peer-supplied text.".into());
+    lines.push("Names and intros are those sessions' own text.".into());
     joined_text(lines, "\n")
 }
 
@@ -12856,7 +13230,7 @@ struct QuestionRow {
     /// `timeout_at` is the collect wait, not the question's life).
     expires_in: Option<Duration>,
     /// When the peer of a question still waiting on it said it was leaving the mesh,
-    /// rendered as `peer left <age>` beside the state. Only an outbound row carries it.
+    /// rendered as `session left <age>` beside the state. Only an outbound row carries it.
     peer_left: Option<SystemTime>,
     /// Which verb its footer names: `messaging follow-up` for a question this node asked,
     /// `envoy answer` for the rest.
@@ -13237,7 +13611,7 @@ fn shown_id_len(id: &str, ids: &[String]) -> usize {
 
 /// One numbered entry of `.mesh envoy questions`, `.mesh messaging sent` and `.mesh files requests`. The first line is
 /// `-> <name> (<dest8>) <age> . <state> . id <id>` for a question this node asked, with
-/// ` . peer left <age>` after the state while its peer has said it left, and
+/// ` . session left <age>` after the state while its peer has said it left, and
 /// `<name> (<dest8>) asked <age> . expires in <span> . id <id>` for a peer's question or
 /// access request, the id cut to `id_len` characters; the quoted question, the envoy's
 /// framing and the extra rows follow, word-wrapped at `width` and indented under the
@@ -13263,7 +13637,7 @@ fn pending_entry(
     let head = if outbound {
         let left = row
             .peer_left
-            .map(|at| format!(" . peer left {}", age_text(now, at)))
+            .map(|at| format!(" . session left {}", age_text(now, at)))
             .unwrap_or_default();
         NoticeText::from(format!("{marker}-> "))
             .then(peer)
@@ -13307,7 +13681,7 @@ fn pending_entry(
 /// this node's own hints follow the prefix.
 fn render_broadcast(outcome: &BroadcastOutcome, who: impl Fn(&str) -> String) -> NoticeText {
     if outcome.recipients.is_empty() {
-        return "No trusted peer has a known path right now; nothing was sent. `.mesh people list` lists the sessions you have heard.".into();
+        return "No trusted session has a known path right now; nothing was sent. `.mesh people list` lists the sessions you have heard.".into();
     }
     let mut report = NoticeText::default();
     for recipient in &outcome.recipients {
@@ -13576,7 +13950,7 @@ mod tests {
         };
         assert_eq!(
             report(&direct),
-            "Asked Ida / abcd1234 to trust you directly; its owner decides whether to trust you."
+            "Asked Ida / abcd1234 to trust you directly; its user decides whether to trust you."
         );
 
         let unanswered = KnockOutcome {
@@ -13585,7 +13959,7 @@ mod tests {
         };
         assert_eq!(
             report(&unanswered),
-            "Asked Ida / abcd1234 to trust you; no answer over the link, so a propagation node holds the request until the session fetches it. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides."
+            "Asked Ida / abcd1234 to trust you; no answer over the link, so a propagation node holds the request until the session fetches it. A request to be trusted is heard only by a session whose user already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides."
         );
         assert!(!report(&unanswered).contains("unreachable"));
 
@@ -13745,7 +14119,7 @@ mod tests {
             assert_eq!(line.render(CommandPrefix::Slash), expected);
         }
 
-        /// An open question whose peer said it left reads `peer left <age>` beside its
+        /// An open question whose peer said it left reads `session left <age>` beside its
         /// state in `.mesh messaging sent`; a row without the mark reads as before.
         #[test]
         fn an_open_question_to_a_peer_that_left_says_so_in_pending() {
@@ -13769,7 +14143,7 @@ mod tests {
                 render_pending_lists(std::slice::from_ref(&row), &[], &[], now, 120, false);
             assert!(
                 pending.plain().contains(
-                    "  1. -> bob (fedcba98) 2d ago . open . peer left 1h ago . id 01234567"
+                    "  1. -> bob (fedcba98) 2d ago . open . session left 1h ago . id 01234567"
                 ),
                 "{pending}"
             );
@@ -13782,7 +14156,7 @@ mod tests {
             let pending =
                 render_pending_lists(std::slice::from_ref(&row), &[], &[], now, 120, false);
             assert!(
-                !pending.plain().contains("peer left"),
+                !pending.plain().contains("session left"),
                 "an answered question waits on no one: {pending}"
             );
         }
@@ -13894,7 +14268,7 @@ mod tests {
         .to_string();
         assert_eq!(
             unanswered,
-            "Asked Ida / abcd1234 to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
+            "Asked Ida / abcd1234 to trust you; no answer. A request to be trusted is heard only by a session whose user already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
         );
         assert!(!unanswered.contains("unreachable"));
     }
@@ -14133,7 +14507,7 @@ mod tests {
         const FORGET: &str =
             "Erase everything you know about them, blocks included; they become a stranger";
         const UNBLOCK: &str = "Lift a block; it grants nothing";
-        const DENY: &str = "Never share files matching a pattern, whatever `files allow` says; a share rule, not a peer refusal (that is `access block`)";
+        const DENY: &str = "Never share files matching a pattern, whatever `files allow` says; a share rule, not a refusal of a session (that is `access block`)";
 
         let verb_description = |group: &str, verb: &str| -> &str {
             COMMANDS
@@ -14693,12 +15067,12 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("lan: every node on this LAN"), "{text}");
+        assert!(text.contains("lan: everyone on this LAN"), "{text}");
         assert!(text.contains("world-visible"), "{text}");
         assert!(text.contains("anyone on the internet"), "{text}");
         assert!(
             text.contains(
-                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such\n"
+                "\n  status card: this session's objective, state, repo and todo, served to trusted sessions on request\n  brief: what your envoy answers trusted sessions from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such\n"
             ),
             "{text}"
         );
@@ -14757,7 +15131,7 @@ mod tests {
         let text = render_on_preview(&manual, "work", false, None);
         assert!(
             text.contains(
-                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such\n"
+                "\n  status card: this session's objective, state, repo and todo, served to trusted sessions on request\n  brief: what your envoy answers trusted sessions from (the card, your note and the todo list); it is never sent as such\n"
             ),
             "{text}"
         );
@@ -14770,7 +15144,7 @@ mod tests {
         let text = render_on_preview(&off, "work", false, None);
         assert!(
             text.contains(
-                "\n  status card: this session's objective, state, repo and todo, served to trusted peers on request\n  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on\n"
+                "\n  status card: this session's objective, state, repo and todo, served to trusted sessions on request\n  brief: none (brief mode is off): your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on\n"
             ),
             "{text}"
         );
@@ -14786,10 +15160,7 @@ mod tests {
         assert_eq!(lan_only, "this link-local segment only");
 
         let public = reach_line(&reach_facts_of_config(&public_config()));
-        assert_eq!(
-            public,
-            "world-visible via a community node (public interface)"
-        );
+        assert_eq!(public, "world-visible via a public community interface");
 
         let mut both = public_config();
         both.interfaces.push(MeshInterface::Private {
@@ -14799,7 +15170,7 @@ mod tests {
         let both = reach_line(&reach_facts_of_config(&both));
         assert_eq!(
             both,
-            "world-visible via a community node (public interface), plus the configured relay and the peers it reaches"
+            "world-visible via a public community interface, plus the configured relay and the sessions it reaches"
         );
     }
 
@@ -14828,7 +15199,7 @@ mod tests {
         }
         assert_eq!(
             reach_line(&reach_facts_of_config(&relay("relay.internal"))),
-            "the configured relay relay.internal:4242 and the peers it reaches"
+            "the configured relay relay.internal:4242 and the sessions it reaches"
         );
 
         let status = |endpoint: &str| InterfaceStatus {
@@ -14846,7 +15217,7 @@ mod tests {
                 status("127.0.0.1:4242"),
                 status("relay.internal:4242"),
             ])),
-            "the configured relays 127.0.0.1:4242, relay.internal:4242 and the peers they reach"
+            "the configured relays 127.0.0.1:4242, relay.internal:4242 and the sessions they reach"
         );
         assert_eq!(
             reach_line(&reach_facts_of_states(&[
@@ -15024,8 +15395,8 @@ mod tests {
         assert_eq!(
             interface_warnings(&states),
             vec![
-                "WARNING: lan is unreachable (address in use); peers on this link-local segment are out of reach.".to_string(),
-                "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
+                "WARNING: lan is unreachable (address in use); sessions on this link-local segment are out of reach.".to_string(),
+                "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); sessions behind that relay are out of reach.".to_string(),
                 "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: nothing is listening at 127.0.0.1:37428; start the local rnsd (`rnsd`), and `.mesh config show` shows when it connects".to_string(),
                 "WARNING: local rnsd at 127.0.0.1:37428 is not reachable yet: rnsd did not answer; the transport keeps redialing it, and `.mesh config show` shows when it connects".to_string(),
@@ -15301,7 +15672,7 @@ mod tests {
             super::render_peers(&rows, &snapshot_namer(), now, CommandPrefix::Dot).plain(),
             PEERS_SNAPSHOT.replace(
                 "{row separator}",
-                &row_separator(&[12, 16, 11, 6, 11, 177, 21])
+                &row_separator(&[12, 16, 11, 6, 11, 180, 21])
             )
         );
     }
@@ -15349,21 +15720,21 @@ mod tests {
         Namer::new(People::new(&entries, &[]), Some(&"8b9c0d1e".repeat(4)), own)
     }
 
-    const PEERS_SNAPSHOT: &str = r#"┌────────────┬────────────────┬───────────┬──────┬───────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────┐
-│ user       ┆ session        ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                           ┆ hashes              │
-╞════════════╪════════════════╪═══════════╪══════╪═══════════╪═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╪═════════════════════╡
-│ you        ┆ test-session-2 ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                                                                                 ┆ 8b9c0d1e / 2c3d4e5f │
+    const PEERS_SNAPSHOT: &str = r#"┌────────────┬────────────────┬───────────┬──────┬───────────┬────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────────────┐
+│ user       ┆ session        ┆ trust     ┆ hops ┆ last seen ┆ state                                                                                                                                                                              ┆ hashes              │
+╞════════════╪════════════════╪═══════════╪══════╪═══════════╪════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╪═════════════════════╡
+│ you        ┆ test-session-2 ┆ trusted   ┆    1 ┆ 3s ago    ┆                                                                                                                                                                                    ┆ 8b9c0d1e / 2c3d4e5f │
 {row separator}
-│ you        ┆ temp (ended)   ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) ┆ 8b9c0d1e / 6a7b8c9d │
+│ you        ┆ temp (ended)   ┆ trusted   ┆    1 ┆ 5m ago    ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the session announces; it may have left; run .mesh people list after its next announce) ┆ 8b9c0d1e / 6a7b8c9d │
 {row separator}
-│ Bob        ┆ 7c8d9e0f       ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the peer announces; it may have left; run .mesh people list after its next announce) ┆ 4a5b6c7d / 7c8d9e0f │
+│ Bob        ┆ 7c8d9e0f       ┆ trusted   ┆    1 ┆ 40s ago   ┆ (no route: no path, its link failed or its session ended; a restarted relay has none until the session announces; it may have left; run .mesh people list after its next announce) ┆ 4a5b6c7d / 7c8d9e0f │
 {row separator}
-│ Bob        ┆ 3b4c5d6e       ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same user announced a new session)                                                                                                                     ┆ 4a5b6c7d / 3b4c5d6e │
+│ Bob        ┆ 3b4c5d6e       ┆ trusted   ┆    1 ┆ 2h ago    ┆ (superseded by 7c8d9e0f: same user announced a new session)                                                                                                                        ┆ 4a5b6c7d / 3b4c5d6e │
 {row separator}
-│ Coworker A ┆ review         ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                                                                                 ┆ 9f8e7d6c / 1a2b3c4d │
+│ Coworker A ┆ review         ┆ trusted   ┆    1 ┆ 12s ago   ┆                                                                                                                                                                                    ┆ 9f8e7d6c / 1a2b3c4d │
 {row separator}
-│ 0c1d2e3f   ┆ 5e6f7a8b       ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                ┆ 0c1d2e3f / 5e6f7a8b │
-└────────────┴────────────────┴───────────┴──────┴───────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────┘
+│ 0c1d2e3f   ┆ 5e6f7a8b       ┆ untrusted ┆    2 ┆ 2h ago    ┆ (stale: no announce for 2 heartbeats; forgotten after about 3 h)                                                                                                                   ┆ 0c1d2e3f / 5e6f7a8b │
+└────────────┴────────────────┴───────────┴──────┴───────────┴────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────────────┘
 1a2b3c4d key changed: announced under the key of user 2b3c4d5e 5m ago; the grant stays with user 9f8e7d6c. If they changed their key, verify out of band, then .mesh access trust session 6d7e8f9a6d7e8f9a6d7e8f9a6d7e8f9a; otherwise .mesh access block user 2b3c4d5e2b3c4d5e2b3c4d5e2b3c4d5e; .mesh access revoke session 1a2b3c4d1a2b3c4d1a2b3c4d1a2b3c4d stops serving the old key
 4 users and 6 sessions.
 `.mesh people help` says what the columns, states and names mean."#;
@@ -15402,7 +15773,7 @@ mod tests {
 ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┤
 │ 9a8b7c6d / 1e2f3a4b ┆ carol ┆ 12m ago ┆ (no intro)     ┆ 9a8b7c6d ┆ 1e2f3a4b │
 └─────────────────────┴───────┴─────────┴────────────────┴──────────┴──────────┘
-2 requests. Names and intros are peer-supplied text; .mesh access trust session <who> trusts one.
+2 requests. Names and intros are those sessions' own text; .mesh access trust session <who> trusts one.
 2 request(s) from 0c1d2e3f dropped in the last 10 min (rate limit; next accepted in 6m); their earlier requests are listed above, .mesh access trust session 5e6f7a8b5e6f7a8b5e6f7a8b5e6f7a8b on one of them trusts it"#;
 
     /// Share rules and files under a temp config dir and share root; the rendered text
@@ -15489,9 +15860,9 @@ mod tests {
 ┌──────────┬─────────────────────┬────────┬───────────────────────────────────────┐
 │ kind     ┆ pattern             ┆ layer  ┆ note                                  │
 ╞══════════╪═════════════════════╪════════╪═══════════════════════════════════════╡
-│ allow    ┆ docs/**             ┆ global ┆ every trusted peer                    │
+│ allow    ┆ docs/**             ┆ global ┆ every trusted session                 │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ allow    ┆ src/lib.rs          ┆ global ┆ peer 1a2b3c4d                         │
+│ allow    ┆ src/lib.rs          ┆ global ┆ only 1a2b3c4d                         │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
 │ deny     ┆ src/vault/*         ┆ global ┆                                       │
 ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
@@ -15516,7 +15887,7 @@ mod tests {
         let text = render_effective_shares(
             &fx.set(),
             &peer,
-            "every trusted peer",
+            "every trusted session",
             &fx.root,
             Some(false),
             false,
@@ -15525,7 +15896,7 @@ mod tests {
         assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_SNAPSHOT);
     }
 
-    const EFFECTIVE_SHARES_SNAPSHOT: &str = r#"Files every trusted peer can fetch from <root>:
+    const EFFECTIVE_SHARES_SNAPSHOT: &str = r#"Files every trusted session can fetch from <root>:
 ┌─────────────────────┬───────────────┐
 │ path                ┆ verdict       │
 ╞═════════════════════╪═══════════════╡
@@ -15543,7 +15914,7 @@ mod tests {
             render_effective_shares(
                 &fx.set(),
                 &PeerRef::unscoped(),
-                "every trusted peer",
+                "every trusted session",
                 &fx.root,
                 Some(false),
                 true,
@@ -15564,7 +15935,7 @@ mod tests {
             assert_eq!(fx.placeholders(&text), EFFECTIVE_SHARES_ALL_SNAPSHOT);
         }
 
-        const EFFECTIVE_SHARES_ALL_SNAPSHOT: &str = r#"Every file under <root> and what it is to every trusted peer:
+        const EFFECTIVE_SHARES_ALL_SNAPSHOT: &str = r#"Every file under <root> and what it is to every trusted session:
 ┌─────────────┬───────────────┐
 │ path        ┆ verdict       │
 ╞═════════════╪═══════════════╡
@@ -16435,7 +16806,7 @@ mod tests {
         assert_eq!(
             table_footer(&text),
             [
-                "2 requests. Names and intros are peer-supplied text; .mesh access trust session <who> trusts one."
+                "2 requests. Names and intros are those sessions' own text; .mesh access trust session <who> trusts one."
             ],
             "{text}"
         );
@@ -16501,7 +16872,7 @@ mod tests {
         assert_eq!(footer.len(), 4, "{text}");
         assert_eq!(
             footer[0],
-            "2 requests. Names and intros are peer-supplied text; .mesh access trust session <who> trusts one.",
+            "2 requests. Names and intros are those sessions' own text; .mesh access trust session <who> trusts one.",
             "{text}"
         );
         assert_eq!(
@@ -16684,7 +17055,7 @@ mod tests {
             assert_eq!(
                 dot,
                 format!(
-                    "session hash: {destination}\nuser hash: {}\nname: .session\ntrust: untrusted (seen only in its request to be trusted)\nasked to be trusted: {age}, intro: .mesh access trust x\nNames and intros are peer-supplied text.",
+                    "session hash: {destination}\nuser hash: {}\nname: .session\ntrust: untrusted (seen only in its request to be trusted)\nasked to be trusted: {age}, intro: .mesh access trust x\nNames and intros are those sessions' own text.",
                     "ef".repeat(16)
                 )
             );
@@ -18353,8 +18724,8 @@ mod tests {
                 ),
                 (
                     asked_by_this_node(".vault"),
-                    ".vault is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
-                    ".vault is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `/mesh messaging sent` shows it until then.",
+                    ".vault is a question you asked, not one escalated to you; it closes when that session replies or its timeout passes. `.mesh messaging sent` shows it until then.",
+                    ".vault is a question you asked, not one escalated to you; it closes when that session replies or its timeout passes. `/mesh messaging sent` shows it until then.",
                 ),
                 (
                     access_not_a_question(".vault"),
@@ -18454,12 +18825,12 @@ mod tests {
             assert_eq!(
                 knock_confirmation(".session", DESTINATION, "known", ".mesh access trust x")
                     .render(CommandPrefix::Dot),
-                "This asks .session (1a2b3c4d, trust: known) to trust this session of yours, with intro \".mesh access trust x\"; if the session is unreachable the request is held on a propagation node. Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides."
+                "This asks .session (1a2b3c4d, trust: known) to trust this session of yours, with intro \".mesh access trust x\"; if the session is unreachable the request is held on a propagation node. Only a session whose user already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides."
             );
             assert_eq!(
                 knock_confirmation(&name_label(None), DESTINATION, "known", "")
                     .render(CommandPrefix::Dot),
-                "This asks (no name) (1a2b3c4d, trust: known) to trust this session of yours, without an intro; if the session is unreachable the request is held on a propagation node. Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides."
+                "This asks (no name) (1a2b3c4d, trust: known) to trust this session of yours, without an intro; if the session is unreachable the request is held on a propagation node. Only a session whose user already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides."
             );
         }
 
@@ -18472,7 +18843,7 @@ mod tests {
             assert_eq!(
                 knock_confirmation(".session", DESTINATION, "known", ".mesh access trust x")
                     .render(CommandPrefix::Slash),
-                "This asks .session (1a2b3c4d, trust: known) to trust this session of yours, with intro \".mesh access trust x\"; if the session is unreachable the request is held on a propagation node. Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `/mesh access trust` on both sides."
+                "This asks .session (1a2b3c4d, trust: known) to trust this session of yours, with intro \".mesh access trust x\"; if the session is unreachable the request is held on a propagation node. Only a session whose user already knows you hears it (they trusted you, or another session of yours, before); for first contact use `/mesh access trust` on both sides."
             );
         }
     }
@@ -18872,7 +19243,7 @@ mod tests {
         assert!(
             render_broadcast(&nobody, ann)
                 .plain()
-                .starts_with("No trusted peer has a known path")
+                .starts_with("No trusted session has a known path")
         );
 
         let outcome = BroadcastOutcome {
@@ -19028,7 +19399,7 @@ mod tests {
         ] {
             assert!(text.contains(marker), "{marker}: {text}");
         }
-        assert!(dropped_warning(3).starts_with("WARNING: 3 peer message(s)"));
+        assert!(dropped_warning(3).starts_with("WARNING: 3 message(s)"));
     }
 
     #[test]
@@ -19111,7 +19482,7 @@ mod tests {
         assert_eq!(
             table_footer(&text),
             [
-                "1 request. Names and intros are peer-supplied text; .mesh access trust session <who> trusts one."
+                "1 request. Names and intros are those sessions' own text; .mesh access trust session <who> trusts one."
             ],
             "{text}"
         );
@@ -19298,7 +19669,7 @@ mod tests {
                     run_async(run(&mut ctx, &format!("{sigil}mesh off"))).unwrap();
 
                     let out = stdout_of_capture();
-                    assert_eq!(out[0], format!("node: off - {mesh} on joins"), "{prefix}");
+                    assert_eq!(out[0], format!("mesh: off - {mesh} on joins"), "{prefix}");
                     assert_eq!(
                         out.last().unwrap(),
                         &format!(
@@ -19407,11 +19778,11 @@ mod tests {
 
                 let infos: Vec<String> = stdout_of_capture()
                     .into_iter()
-                    .filter(|line| line.starts_with("node: off"))
+                    .filter(|line| line.starts_with("mesh: off"))
                     .collect();
                 assert_eq!(
                     infos,
-                    ["node: off - .mesh on joins", "node: off - /mesh on joins"]
+                    ["mesh: off - .mesh on joins", "mesh: off - /mesh on joins"]
                 );
                 for mesh in [".mesh", "/mesh"] {
                     assert_eq!(
@@ -19488,7 +19859,7 @@ mod tests {
             run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
-            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert_eq!(lines[0], "mesh: off - .mesh on joins", "{out}");
             assert!(
                 lines[1].starts_with('┌'),
                 "the table follows the node-off line at once: {out}"
@@ -19525,7 +19896,7 @@ mod tests {
             run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
-            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert_eq!(lines[0], "mesh: off - .mesh on joins", "{out}");
             assert!(lines[1].starts_with('┌'), "{out}");
             for present in ["enabled", "reach", "interfaces[0]"] {
                 assert!(has_info_row(&out, present), "no {present} row: {out}");
@@ -19564,10 +19935,10 @@ mod tests {
             run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
-            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert_eq!(lines[0], "mesh: off - .mesh on joins", "{out}");
             assert_eq!(
                 info_row(&out, "reach"),
-                "the configured relay relay.example:4242 and the peers it reaches",
+                "the configured relay relay.example:4242 and the sessions it reaches",
                 "{out}"
             );
             assert_eq!(
@@ -19589,10 +19960,10 @@ mod tests {
             run_async(run(&mut ctx, ".mesh config show")).unwrap();
             let lines = stdout_lines();
             let out = lines.join("\n");
-            assert_eq!(lines[0], "node: off - .mesh on joins", "{out}");
+            assert_eq!(lines[0], "mesh: off - .mesh on joins", "{out}");
             assert_eq!(
                 info_row(&out, "reach"),
-                "world-visible via a community node (public interface), plus the configured relay and the peers it reaches",
+                "world-visible via a public community interface, plus the configured relay and the sessions it reaches",
                 "the public interface decides, the lan is ignored and the relay is appended: {out}"
             );
             assert_eq!(info_row(&out, "interfaces[0]"), "lan", "{out}");
@@ -19836,7 +20207,7 @@ mod tests {
             };
             assert_eq!(
                 render_sync(&none_served),
-                "Propagation node deadbeef lists 7 messages for you and 3 were asked for, but none were served; run .mesh messaging sync again or check that node's logs."
+                "Propagation node deadbeef lists 7 messages for you and 3 were asked for, but none were served; run .mesh messaging sync again or check its logs."
             );
             let full_page_none_served = FetchReport {
                 listed: 100,
@@ -19845,8 +20216,7 @@ mod tests {
                 ..report.clone()
             };
             assert!(
-                render_sync(&full_page_none_served)
-                    .ends_with("check that node's logs. More may be held.")
+                render_sync(&full_page_none_served).ends_with("check its logs. More may be held.")
             );
             let all_known = FetchReport {
                 wanted: 0,
@@ -19960,15 +20330,15 @@ mod tests {
             for (word, expected) in [
                 (
                     "auto",
-                    "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.",
+                    "Brief mode is auto for this session: your envoy answers other sessions from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.",
                 ),
                 (
                     "manual",
-                    "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.",
+                    "Brief mode is manual for this session: your envoy answers other sessions from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.",
                 ),
                 (
                     "off",
-                    "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on.",
+                    "Brief mode is off for this session: no brief is assembled, so your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on.",
                 ),
             ] {
                 let out =
@@ -19998,7 +20368,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh status \"ship the widget\"")).unwrap();
             assert_eq!(
                 out,
-                "Objective set to \"ship the widget\" for this session; peers that ask see it in your status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
+                "Objective set to \"ship the widget\" for this session; sessions that ask see it in your status card; unless brief mode is off, your envoy also answers from it. `.mesh status clear` removes it."
             );
         }
 
@@ -20024,7 +20394,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh envoy brief")).unwrap();
             assert_eq!(
                 out,
-                "brief mode: off\nNo brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on."
+                "brief mode: off\nNo brief is assembled in off mode: your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on."
             );
         }
 
@@ -20488,7 +20858,7 @@ mod tests {
             let warned = stderr_lines();
             assert_eq!(warned.len(), 1, "{warned:?}");
             assert!(
-                warned[0].contains("1 peer message(s) were dropped"),
+                warned[0].contains("1 message(s) were dropped"),
                 "{warned:?}"
             );
         }
@@ -20730,7 +21100,7 @@ mod tests {
             assert_eq!(
                 stderr_lines(),
                 [
-                    "WARNING: 1 peer message(s) were dropped before you read them because the inbox was full."
+                    "WARNING: 1 message(s) were dropped before you read them because the inbox was full."
                 ]
             );
 
@@ -21305,7 +21675,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 out,
-                "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from."
+                "Note set; your envoy includes it the next time it answers another session (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from."
             );
             assert_eq!(
                 ctx.app.mesh.user_brief().as_deref().map(String::as_str),
@@ -21335,7 +21705,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh envoy brief note clear")).unwrap();
             assert_eq!(
                 out,
-                "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one."
+                "Note cleared; your envoy answers other sessions without it from now on. `.mesh envoy brief note \"text\"` sets a new one."
             );
             assert!(ctx.app.mesh.user_brief().is_none());
 
@@ -21363,10 +21733,10 @@ mod tests {
             };
             let mut ctx = ctx_with(mesh, true);
             ctx.session = Some(Session::default());
-            const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
-            const AUTO_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such";
-            const MANUAL_ROW: &str = "  brief: what your envoy answers trusted peers from (the card, your note and the todo list); it is never sent as such";
-            const OFF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on";
+            const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted sessions on request";
+            const AUTO_ROW: &str = "  brief: what your envoy answers trusted sessions from (the card, the session digest in auto mode, your note and the todo list); it is never sent as such";
+            const MANUAL_ROW: &str = "  brief: what your envoy answers trusted sessions from (the card, your note and the todo list); it is never sent as such";
+            const OFF_ROW: &str = "  brief: none (brief mode is off): your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on";
 
             for (mode, row) in [("manual", MANUAL_ROW), ("off", OFF_ROW), ("auto", AUTO_ROW)] {
                 run_async(run(&mut ctx, &format!(".mesh envoy brief {mode}"))).unwrap();
@@ -21527,7 +21897,7 @@ mod tests {
             let out = run_async(out_of(&mut ctx, ".mesh envoy brief   note    clear  ")).unwrap();
             assert_eq!(
                 out,
-                "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one."
+                "Note cleared; your envoy answers other sessions without it from now on. `.mesh envoy brief note \"text\"` sets a new one."
             );
             assert!(ctx.app.mesh.user_brief().is_none());
 
@@ -21603,7 +21973,7 @@ mod tests {
                 assert!(out.contains("(0 recorded so far)"), "{line}: {out}");
                 assert!(out.contains("sees a stranger"), "{line}: {out}");
                 assert!(
-                    out.contains("refused while any session's node on this config dir is running"),
+                    out.contains("refused while any session on this config dir is on the mesh"),
                     "{line}: {out}"
                 );
                 assert!(out.contains("mesh/identity.key.lock"), "{line}: {out}");
@@ -21750,7 +22120,7 @@ mod tests {
             );
             assert!(out.contains("Predecessors recorded: 1."), "{out}");
             assert!(out.contains(".mesh on"), "{out}");
-            assert!(out.contains("peers must re-trust it"), "{out}");
+            assert!(out.contains("other users must trust it again"), "{out}");
         }
 
         #[cfg(unix)]
@@ -26228,7 +26598,7 @@ mod tests {
                         warnings[0]
                     );
                     assert!(
-                        warnings[0].ends_with("); peers behind that relay are out of reach."),
+                        warnings[0].ends_with("); sessions behind that relay are out of reach."),
                         "{}",
                         warnings[0]
                     );
@@ -27003,7 +27373,7 @@ mod tests {
 
                     // Off: the settings rows, one per configured interface, nothing else.
                     let off = out_of(&mut ctx, ".mesh config show").await.unwrap();
-                    assert!(off.starts_with("node: off - .mesh on joins\n"), "{off}");
+                    assert!(off.starts_with("mesh: off - .mesh on joins\n"), "{off}");
                     assert_eq!(heads(&off).len(), 2, "{off}");
                     assert_eq!(rows_of(&off), settings, "{off}");
                     assert!(!off.contains("connected"), "{off}");
@@ -27059,7 +27429,7 @@ mod tests {
                     // Off again: the settings rows are back, the node's rows are gone.
                     let off_again = out_of(&mut ctx, ".mesh config show").await.unwrap();
                     assert!(
-                        off_again.starts_with("node: off - .mesh on joins\n"),
+                        off_again.starts_with("mesh: off - .mesh on joins\n"),
                         "{off_again}"
                     );
                     assert!(!has_info_row(&off_again, "joined"), "{off_again}");
@@ -28396,7 +28766,7 @@ mod tests {
                     assert_eq!(
                         err,
                         format!(
-                            "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({a_instance}). Its user can run .mesh access trust session {a_instance} (or .mesh access unblock session {a_instance} if they blocked this session). (You do trust them.) A status request is answered live or not at all; nothing queues it for later.",
+                            "\"{i8} / {d8}\" refused the request: it has not trusted this session ({a_instance}). Its user can run .mesh access trust session {a_instance} (or .mesh access unblock session {a_instance} if they blocked this session). (You do trust them.) A status request is answered live or not at all; nothing queues it for later.",
                             d8 = short(&b_hex),
                             i8 = short(&pair.responder.desc.identity.address_hash.to_hex_string())
                         )
@@ -28405,7 +28775,7 @@ mod tests {
                     let asking = index_of(
                         &out,
                         &format!(
-                            "Asking {} for its status card; Ctrl-C cancels...",
+                            " / {} for its status card; Ctrl-C cancels...",
                             short(&b_hex)
                         ),
                     );
@@ -28827,27 +29197,24 @@ mod tests {
                         "the trust store holds the whole destination"
                     );
 
-                    // Contact verbs: the gate passes and the path lookup names the whole
-                    // destination, which is what would have gone on the wire; a fetch
-                    // leads its refusal with the session's name instead.
+                    // Contact verbs: the gate passes and the path lookup runs for the whole
+                    // destination, which is what would have gone on the wire; each refusal
+                    // leads with the session's name, as a fetch's does.
                     for line in [
                         format!(".mesh access ask {dest8} --yes"),
                         format!(".mesh people status {dest8}"),
+                        format!(".mesh files fetch {dest8} docs/a.md"),
+                        format!(".mesh files list {dest8}"),
                     ] {
                         let err = run(&mut ctx, &line).await.unwrap_err().to_string();
                         assert!(
-                            err.starts_with(&format!("Session {destination} could not be reached")),
+                            err.starts_with(&format!(
+                                "Tia / {dest8} could not be reached: you asked the network for a route to it"
+                            )),
                             "{line}: {err}"
                         );
+                        assert!(!err.contains(&destination), "{line}: {err}");
                     }
-                    let fetch = format!(".mesh files fetch {dest8} docs/a.md");
-                    let err = run(&mut ctx, &fetch).await.unwrap_err().to_string();
-                    assert!(
-                        err.starts_with(&format!(
-                            "Tia / {dest8} could not be reached: you asked the network for a route to it"
-                        )),
-                        "{fetch}: {err}"
-                    );
                     let out = out_of(&mut ctx, &format!(".mesh messaging send {dest8} \"hi\""))
                         .await
                         .unwrap();
@@ -29440,7 +29807,7 @@ mod tests {
                     assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
                     assert!(
                         out[notice].ends_with(
-                            "; if the session is unreachable the request is held on a propagation node. Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides."
+                            "; if the session is unreachable the request is held on a propagation node. Only a session whose user already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides."
                         ),
                         "the preview says up front what a request to be trusted can do: {}",
                         out[notice]
@@ -31730,6 +32097,76 @@ mod tests {
                 });
             }
 
+            /// A trust change another session on this config dir makes reaches this one
+            /// through the shared trust list: this session's next read of the list lifts
+            /// its card-fetch stop for the user and session the change named, in memory and
+            /// in the card-refusals file, so the background fetch may ask again.
+            #[test]
+            #[serial]
+            fn a_trust_change_a_sibling_session_makes_lifts_this_sessions_card_stops() {
+                use crate::mesh::card_refusals::card_refusals_path;
+                use crate::mesh::test_support::mesh_paths;
+                use crate::mesh::trust::{TrustOptions, TrustStore};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-sibling-trust-cadence");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-sibling-trust-cadence").await;
+                    let ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let (dest, id) = heard_unnamed_peer(&started.runtime, "Tia", now);
+                    let (blocked_dest, blocked_id) =
+                        heard_unnamed_peer(&started.runtime, "Bo", now);
+                    let cadence = started.runtime.card_cadence();
+                    for destination in [&dest, &blocked_dest] {
+                        assert!(cadence.admit(destination, CardTrigger::OwnerGranted, false));
+                        cadence.note_heard(destination);
+                        cadence.refused(destination);
+                    }
+                    let refusals = card_refusals_path(
+                        started.runtime.cache_dir(),
+                        &started.runtime.current_instance_id(),
+                    );
+                    let on_disk = || std::fs::read_to_string(&refusals).unwrap_or_default();
+                    assert!(on_disk().contains(&dest) && on_disk().contains(&blocked_dest));
+                    let trust = started.runtime.trust();
+                    trust.authorize(&id, &dest);
+                    let sibling = TrustStore::open(&mesh_paths(&started.tmp).config_dir).unwrap();
+
+                    sibling
+                        .trust_destination(
+                            ctx.app.mesh.as_ref(),
+                            &dest,
+                            TrustOptions::default(),
+                            now,
+                        )
+                        .unwrap();
+                    trust.authorize(&id, &dest);
+                    wait_until("the sibling's grant to lift the stop", || {
+                        !cadence.is_refused(&dest)
+                    })
+                    .await;
+                    assert!(!on_disk().contains(&dest), "{}", on_disk());
+                    assert!(
+                        cadence.is_refused(&blocked_dest),
+                        "a session the change does not name keeps its stop"
+                    );
+
+                    sibling
+                        .block_identity(ctx.app.mesh.as_ref(), &blocked_id, None, now)
+                        .unwrap();
+                    trust.authorize(&id, &dest);
+                    wait_until("the sibling's block to lift the stop", || {
+                        !cadence.is_refused(&blocked_dest)
+                    })
+                    .await;
+                    assert!(!on_disk().contains(&blocked_dest), "{}", on_disk());
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// Revoking keeps the user known and the name the owner gave a session, so both
             /// are something to forget: the dry run lists the record and the names, the
             /// confirmed run erases them, and only then is the user a stranger.
@@ -31768,7 +32205,7 @@ mod tests {
                         },
                         "revoking the session leaves its user known"
                     );
-                    let names = "  the names of this person and their sessions";
+                    let names = "  the names of this user and their sessions";
 
                     let out = out_of(
                         &mut ctx,
@@ -32316,7 +32753,7 @@ mod tests {
                     let out = out_of(&mut ctx, ".mesh access requests").await.unwrap();
 
                     assert!(
-                        out.contains("3 requests. Names and intros are peer-supplied text; .mesh access trust session <who> trusts one."),
+                        out.contains("3 requests. Names and intros are those sessions' own text; .mesh access trust session <who> trusts one."),
                         "{out}"
                     );
                     let drop_line = out
@@ -34129,7 +34566,7 @@ mod tests {
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
 
                     let deny_teaching = format!(
-                        "`.mesh files deny` takes a file pattern, not a peer; to refuse the session {} run `.mesh access block session {dest}`.",
+                        "`.mesh files deny` takes a file pattern, not a session; to refuse the session {} run `.mesh access block session {dest}`.",
                         short(&dest)
                     );
                     for (expected, line) in [
@@ -36585,7 +37022,7 @@ mod tests {
                     let landed = index_of(
                         &out,
                         &format!(
-                            "Asked Tia / {} to trust you directly; its owner decides whether to trust you.",
+                            "Asked Tia / {} to trust you directly; its user decides whether to trust you.",
                             short(&peer)
                         ),
                     );
@@ -36663,7 +37100,7 @@ mod tests {
                     assert!(!out.contains(&route_request_line(&peer)), "{out}");
                     assert!(
                         out.contains(&format!(
-                            "Asked Tia / {} to trust you directly; its owner decides whether to trust you.",
+                            "Asked Tia / {} to trust you directly; its user decides whether to trust you.",
                             short(&peer)
                         )),
                         "{out}"
@@ -36749,7 +37186,7 @@ mod tests {
                         .lines()
                         .find(|line| line.contains("-> ") && line.contains(short(&peer)))
                         .unwrap_or_else(|| panic!("no row for the open question: {pending}"));
-                    assert!(row.contains(" . open . peer left "), "{row}");
+                    assert!(row.contains(" . open . session left "), "{row}");
                     let listed = handle_mesh_tool(&mut ctx, "mesh__peers", &serde_json::json!({}))
                         .await
                         .unwrap();
@@ -37076,14 +37513,14 @@ mod tests {
                         .lines()
                         .find(|line| line.contains("-> ") && line.contains(short(&peer)))
                         .unwrap_or_else(|| panic!("no row for the open question: {pending}"));
-                    assert!(row.contains(" . peer left "), "{row}");
+                    assert!(row.contains(" . session left "), "{row}");
 
                     announce_until(&stub, "the announce to lift the left mark", || {
                         runtime.peers().get(&peer).unwrap().left_at.is_none()
                     })
                     .await;
                     let pending = pending_out(&mut ctx, ".").await.unwrap();
-                    assert!(!pending.contains("peer left"), "{pending}");
+                    assert!(!pending.contains("session left"), "{pending}");
                     let result = handle_mesh_tool(
                         &mut ctx,
                         "mesh__send",
@@ -37313,7 +37750,7 @@ mod tests {
                     let landed = index_of(
                         &out,
                         &format!(
-                            "Asked {who} to trust you directly; its owner decides whether to trust you."
+                            "Asked {who} to trust you directly; its user decides whether to trust you."
                         ),
                     );
                     assert!(asked < knocking && knocking < landed, "{out:?}");
@@ -37380,7 +37817,7 @@ mod tests {
                     assert!(row.contains(" trusted "), "{row}");
 
                     let refusal = format!(
-                        "\"Tia / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                        "\"Tia / {d8}\" refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     let before = stdout_lines().len();
                     let err = run(
@@ -37456,8 +37893,7 @@ mod tests {
                             .who(started.runtime.identity_at(&peer).as_deref(), &peer)
                             .to_string();
                         let no_answer = format!(
-                            "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
-                            short(&peer)
+                            "no answer from \"{who}\": most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
                         );
 
                         let err = run(
@@ -37551,10 +37987,7 @@ mod tests {
                     let out = stdout_lines()[before..].to_vec();
                     let asking = index_of(
                         &out,
-                        &format!(
-                            "Asking {} for its status card; Ctrl-C cancels...",
-                            short(&peer)
-                        ),
+                        &format!(" / {} for its status card; Ctrl-C cancels...", short(&peer)),
                     );
                     assert_eq!(
                         out[asking..],
@@ -37639,7 +38072,7 @@ mod tests {
                         "{out}"
                     );
                     let expected = format!(
-                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                        "  Cee / {cee_d8} ({cee_d8}): \"Cee / {cee_d8}\" refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
                     );
                     assert!(lines.contains(&expected.as_str()), "{out}");
                     assert!(
@@ -38255,7 +38688,7 @@ mod tests {
                             .unwrap();
                         assert!(
                             card.contains(&format!(
-                                "Asking {} for its status card; Ctrl-C cancels...",
+                                " / {} for its status card; Ctrl-C cancels...",
                                 short(&to_a)
                             )),
                             "{card}"
@@ -38319,7 +38752,7 @@ mod tests {
                         assert!(out.contains(&fx.waiting_line()), "{out}");
                         assert!(
                             out.contains(&format!(
-                                "Asked {} / {} to trust you directly; its owner decides whether to trust you.",
+                                "Asked {} / {} to trust you directly; its user decides whether to trust you.",
                                 short(&identity_of_a),
                                 short(&to_a)
                             )),
@@ -39979,11 +40412,11 @@ mod tests {
                                     fx.root.path.display()
                                 ),
                                 format!(
-                                    "Will write to {}: allow `docs/**` for every trusted peer.",
+                                    "Will write to {}: allow `docs/**` for every trusted session.",
                                     fx.global()
                                 ),
                                 format!(
-                                    "Allowed `docs/**` for every trusted peer; written to {}.",
+                                    "Allowed `docs/**` for every trusted session; written to {}.",
                                     fx.global()
                                 ),
                             ],
@@ -40015,14 +40448,14 @@ mod tests {
                             .unwrap();
                         assert!(
                             out.contains(&format!(
-                                "Will write to {} (created): allow `docs/**` for every trusted peer.",
+                                "Will write to {} (created): allow `docs/**` for every trusted session.",
                                 fx.workspace()
                             )),
                             "{out}"
                         );
                         assert!(
                             out.contains(&format!(
-                                "Allowed `docs/**` for every trusted peer; written to {} (created).",
+                                "Allowed `docs/**` for every trusted session; written to {} (created).",
                                 fx.workspace()
                             )),
                             "{out}"
@@ -40035,7 +40468,7 @@ mod tests {
                             .unwrap();
                         assert!(
                             out.contains(&format!(
-                                "Allowed `notes/**` for every trusted peer; written to {}.",
+                                "Allowed `notes/**` for every trusted session; written to {}.",
                                 fx.workspace()
                             )),
                             "{out}"
@@ -40076,7 +40509,7 @@ mod tests {
 
                         assert!(
                             out.contains(&format!(
-                                "Allowed `notes/**` for every trusted peer; written to {}.",
+                                "Allowed `notes/**` for every trusted session; written to {}.",
                                 fx.global()
                             )),
                             "{out}"
@@ -40151,7 +40584,7 @@ mod tests {
                         let non_tty = prompt_script::install_non_interactive();
                         let err = refusal(&mut fx.ctx, ".mesh files allow **").await;
                         assert!(
-                            err.contains("Share 3 files matching `**` with every trusted peer?"),
+                            err.contains("Share 3 files matching `**` with every trusted session?"),
                             "{err}"
                         );
                         assert!(err.contains("--yes"), "{err}");
@@ -40235,7 +40668,7 @@ mod tests {
 
                         assert!(
                             out.contains(&format!(
-                                "Will write to {}: allow `.env` for every trusted peer, and an override lifting the built-in deny for it.",
+                                "Will write to {}: allow `.env` for every trusted session, and an override lifting the built-in deny for it.",
                                 fx.global()
                             )),
                             "{out}"
@@ -40284,7 +40717,7 @@ mod tests {
                         assert_eq!(
                             out.lines().next().unwrap(),
                             format!(
-                                "Files every trusted peer can fetch from {}:",
+                                "Files every trusted session can fetch from {}:",
                                 fx.root.path.display()
                             ),
                             "{out}"
@@ -41061,7 +41494,7 @@ mod tests {
                             .unwrap();
                         assert!(
                             out.ends_with(&format!(
-                                "Allowed `docs/**` for every trusted peer; written to {}.",
+                                "Allowed `docs/**` for every trusted session; written to {}.",
                                 fx.global()
                             )),
                             "{out}"
@@ -41119,7 +41552,7 @@ mod tests {
                         .unwrap();
                         assert!(
                             out.contains(&format!(
-                                "Allowed `docs/**` for peer {}; written to",
+                                "Allowed `docs/**` for user or session {}; written to",
                                 short(&peer)
                             )),
                             "{out}"
@@ -41152,7 +41585,7 @@ mod tests {
 
                         assert!(
                             out.ends_with(&format!(
-                                "`docs/**` is already allowed for every trusted peer in {}; nothing was changed.",
+                                "`docs/**` is already allowed for every trusted session in {}; nothing was changed.",
                                 fx.global()
                             )),
                             "{out}"
@@ -41188,7 +41621,7 @@ mod tests {
 
                     assert_eq!(
                         err,
-                        "`--force` lifts the built-in deny for every peer whose allow names `.env`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted peer with a matching allow will see the file)."
+                        "`--force` lifts the built-in deny for every user or session whose allow names `.env`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted session with a matching allow will see the file)."
                     );
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                     assert!(!locations.global.exists());
@@ -41262,7 +41695,7 @@ mod tests {
                         assert_eq!(
                             err,
                             format!(
-                                "`.mesh files allow` takes a file pattern, not a peer; to trust the session {} run `.mesh access trust session {dest}`, or scope a share to it with `--peer {dest}`.",
+                                "`.mesh files allow` takes a file pattern, not a session; to trust the session {} run `.mesh access trust session {dest}`, or scope a share to it with `--peer {dest}`.",
                                 short(dest)
                             )
                         );
@@ -41290,7 +41723,7 @@ mod tests {
                         assert_eq!(
                             err,
                             format!(
-                                "`.mesh files deny` takes a file pattern, not a peer; to refuse the session {} run `.mesh access block session {dest}`.",
+                                "`.mesh files deny` takes a file pattern, not a session; to refuse the session {} run `.mesh access block session {dest}`.",
                                 short(dest)
                             )
                         );
@@ -41317,14 +41750,14 @@ mod tests {
                             .unwrap();
                         assert!(
                             out.contains(&format!(
-                                "Will write to {}: deny `src/vault/*` to every peer.",
+                                "Will write to {}: deny `src/vault/*` to every session.",
                                 fx.global()
                             )),
                             "{out}"
                         );
                         assert!(
                             out.ends_with(&format!(
-                                "Denied `src/vault/*` to every peer; written to {}.",
+                                "Denied `src/vault/*` to every session; written to {}.",
                                 fx.global()
                             )),
                             "{out}"
@@ -41340,14 +41773,14 @@ mod tests {
 
                         let accepted = prompt_script::install(&[true]);
                         let out = out_of(&mut fx.ctx, ".mesh files deny **").await.unwrap();
-                        assert!(out.contains("Denied `**` to every peer"), "{out}");
+                        assert!(out.contains("Denied `**` to every session"), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         let out = out_of(&mut fx.ctx, ".mesh files deny ** --yes")
                             .await
                             .unwrap();
                         assert!(
                             out.ends_with(&format!(
-                                "`**` is already denied to every peer in {}; nothing was changed.",
+                                "`**` is already denied to every session in {}; nothing was changed.",
                                 fx.global()
                             )),
                             "{out}"
@@ -41451,7 +41884,7 @@ mod tests {
                             let out = out_of(&mut fx.ctx, "/mesh files list").await.unwrap();
                             assert!(
                                 out.ends_with(
-                                    "`/mesh files allow docs/**` shares docs/ with every trusted peer."
+                                    "`/mesh files allow docs/**` shares docs/ with every trusted session."
                                 ),
                                 "{out}"
                             );
@@ -41471,7 +41904,7 @@ mod tests {
                             assert_eq!(
                                 scoped,
                                 format!(
-                                    "No share rule applies to peer {}; `/mesh files list` lists every rule.",
+                                    "No share rule applies to user or session {}; `/mesh files list` lists every rule.",
                                     short(&hash)
                                 )
                             );
@@ -41568,14 +42001,14 @@ mod tests {
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
                             lines.contains(
-                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                &format!("  allow (every trusted session) in {}", fx.global())
                                     .as_str()
                             ),
                             "{out}"
                         );
                         assert!(
                             lines.contains(
-                                &format!("  allow (every trusted peer) in {}", fx.workspace())
+                                &format!("  allow (every trusted session) in {}", fx.workspace())
                                     .as_str()
                             ),
                             "{out}"
@@ -41638,14 +42071,14 @@ mod tests {
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
                             lines.contains(
-                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                &format!("  allow (every trusted session) in {}", fx.global())
                                     .as_str()
                             ),
                             "{out}"
                         );
                         assert!(
                             lines.contains(
-                                &format!("  allow (peer {}) in {}", short(&peer), fx.global())
+                                &format!("  allow (only {}) in {}", short(&peer), fx.global())
                                     .as_str()
                             ),
                             "{out}"
@@ -41653,7 +42086,7 @@ mod tests {
                         assert!(
                             lines.contains(
                                 &format!(
-                                    "  allow (scoped to no peer: `nobody`) in {}",
+                                    "  allow (scoped to no user or session: `nobody`) in {}",
                                     fx.global()
                                 )
                                 .as_str()
@@ -41928,7 +42361,7 @@ mod tests {
 
                         assert!(
                             out.ends_with(&format!(
-                                "Allowed `**` for every trusted peer; written to {}.",
+                                "Allowed `**` for every trusted session; written to {}.",
                                 fx.global()
                             )),
                             "{out}"
@@ -41974,7 +42407,7 @@ mod tests {
                         );
                         assert!(
                             out.ends_with(&format!(
-                                "Allowed `**` for every trusted peer; written to {}.",
+                                "Allowed `**` for every trusted session; written to {}.",
                                 fx.global()
                             )),
                             "{out}"
@@ -42068,18 +42501,18 @@ mod tests {
                         assert_eq!(
                             table_rows(&out),
                             [
-                                ["allow", "docs/**", "global", "every trusted peer"],
+                                ["allow", "docs/**", "global", "every trusted session"],
                                 [
                                     "allow",
                                     "src/**",
                                     "global",
-                                    format!("peer {}", short(&peer)).as_str()
+                                    format!("only {}", short(&peer)).as_str()
                                 ],
                                 [
                                     "allow",
                                     "etc/**",
                                     "global",
-                                    "scoped to no peer (`nobody` is not a peer hash)"
+                                    "scoped to no user or session (`nobody` is not a user or session hash)"
                                 ],
                                 ["deny", "secrets/**", "global", ""],
                                 [
@@ -42088,7 +42521,7 @@ mod tests {
                                     "global",
                                     "lifts the built-in deny for this file"
                                 ],
-                                ["allow", "notes/**", "workspace", "every trusted peer"],
+                                ["allow", "notes/**", "workspace", "every trusted session"],
                                 [
                                     "override",
                                     "k.pem",
@@ -42113,7 +42546,7 @@ mod tests {
                             out.lines()
                                 .next()
                                 .unwrap()
-                                .ends_with(&format!(" for peer {}:", short(&other))),
+                                .ends_with(&format!(" for user or session {}:", short(&other))),
                             "{out}"
                         );
                         assert!(out.contains("docs/**"), "{out}");
@@ -42134,10 +42567,7 @@ mod tests {
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files list docs/**").await,
-                            format!(
-                                "Unexpected 'docs/**'. {}",
-                                render_verb_help("files", "list")
-                            )
+                            "'docs/**' names no user you know: no user is called 'docs' and no user's hash starts with it. `.mesh people list` lists the users and sessions you can name, and `.mesh people name <user> \"name\"` names one; a hash needs 8 or more characters."
                         );
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
@@ -42177,7 +42607,7 @@ mod tests {
                         assert_eq!(
                             out.lines().next().unwrap(),
                             format!(
-                                "Files every trusted peer can fetch from {}:",
+                                "Files every trusted session can fetch from {}:",
                                 fx.root.path.display()
                             ),
                             "{out}"
@@ -42202,7 +42632,10 @@ mod tests {
                         .await
                         .unwrap();
                         assert!(
-                            out.starts_with(&format!("Files peer {} can fetch from", short(&peer))),
+                            out.starts_with(&format!(
+                                "Files user or session {} can fetch from",
+                                short(&peer)
+                            )),
                             "{out}"
                         );
                         assert!(!out.contains(&peer), "{out}");
@@ -42237,7 +42670,7 @@ mod tests {
                         assert_eq!(
                             out.lines().next().unwrap(),
                             format!(
-                                "Files every trusted peer can fetch from {}:",
+                                "Files every trusted session can fetch from {}:",
                                 fx.root.path.display()
                             ),
                             "{out}"
@@ -42301,7 +42734,7 @@ mod tests {
                         assert_eq!(
                             out.lines().next().unwrap(),
                             format!(
-                                "Files every trusted peer can fetch from {}:",
+                                "Files every trusted session can fetch from {}:",
                                 fx.root.path.display()
                             ),
                             "{out}"
@@ -42329,7 +42762,7 @@ mod tests {
                         assert_eq!(
                             footer,
                             [format!(
-                                "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
+                                "listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see what one user or session can fetch."
                             )],
                             "the cap is one plain line under the table: {footer:?}"
                         );
@@ -42374,7 +42807,7 @@ mod tests {
                             assert_eq!(
                                 out.lines().next().unwrap(),
                                 format!(
-                                    "Every file under {} and what it is to every trusted peer:",
+                                    "Every file under {} and what it is to every trusted session:",
                                     fx.root.path.display()
                                 ),
                                 "{out}"
@@ -42536,7 +42969,7 @@ mod tests {
                         ),
                         (
                             ".mesh files allow 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
-                            "takes a file pattern, not a peer",
+                            "takes a file pattern, not a session",
                         ),
                         (
                             ".mesh files allow x --peer bob",
@@ -42582,7 +43015,7 @@ mod tests {
                     assert_eq!(
                         stdout_lines().join("\n"),
                         format!(
-                            "No share rule applies to peer {}; `.mesh files list` lists every rule.",
+                            "No share rule applies to user or session {}; `.mesh files list` lists every rule.",
                             short(&peer)
                         )
                     );
@@ -42625,7 +43058,7 @@ mod tests {
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 1 path(s) are shared with trusted peers (`.mesh files list`)",
+                        "  files: 1 path(s) are shared with trusted sessions (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -42655,7 +43088,7 @@ mod tests {
                         }))
                         .as_deref(),
                         Some(
-                            "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)"
+                            "  files: 3 path(s) are shared with trusted sessions (`.mesh files list`)"
                         )
                     );
                     assert_eq!(
@@ -42666,7 +43099,7 @@ mod tests {
                         }))
                         .as_deref(),
                         Some(
-                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh files list`)"
+                            "  files: 1000 or more path(s) are shared with trusted sessions (`.mesh files list`)"
                         )
                     );
                     assert_eq!(
@@ -42677,7 +43110,7 @@ mod tests {
                         }))
                         .as_deref(),
                         Some(
-                            "  files: at least 7 path(s) are shared with trusted peers (`.mesh files list`)"
+                            "  files: at least 7 path(s) are shared with trusted sessions (`.mesh files list`)"
                         ),
                         "a walk cut short names a floor, not a count"
                     );
@@ -42689,7 +43122,7 @@ mod tests {
                         }))
                         .as_deref(),
                         Some(
-                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh files list`)"
+                            "  files: 1000 or more path(s) are shared with trusted sessions (`.mesh files list`)"
                         ),
                         "the cap wins when both hold"
                     );
@@ -42725,7 +43158,7 @@ mod tests {
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 2 path(s) are shared with trusted peers (`.mesh files list`)",
+                        "  files: 2 path(s) are shared with trusted sessions (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -42872,7 +43305,7 @@ mod tests {
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
                             lines.contains(
-                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                &format!("  allow (every trusted session) in {}", fx.global())
                                     .as_str()
                             ),
                             "{out}"
@@ -43172,12 +43605,12 @@ mod tests {
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 2 path(s) are shared with trusted peers (`.mesh files list`)",
+                        "  files: 2 path(s) are shared with trusted sessions (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                     assert_eq!(
                         out.iter()
-                            .filter(|line| line.contains("shared with trusted peers"))
+                            .filter(|line| line.contains("shared with trusted sessions"))
                             .count(),
                         1,
                         "{out:?}"
@@ -43193,7 +43626,7 @@ mod tests {
                     let out = stdout_lines()[before..].to_vec();
                     assert!(
                         !out.iter()
-                            .any(|line| line.contains("shared with trusted peers")),
+                            .any(|line| line.contains("shared with trusted sessions")),
                         "{out:?}"
                     );
                     assert!(
@@ -43304,7 +43737,7 @@ mod tests {
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 1000 or more path(s) are shared with trusted peers (`.mesh files list`)",
+                        "  files: 1000 or more path(s) are shared with trusted sessions (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -43342,7 +43775,7 @@ mod tests {
                     let out = stdout_lines();
                     let files = index_of(
                         &out,
-                        "  files: 1 path(s) are shared with trusted peers (`.mesh files list`)",
+                        "  files: 1 path(s) are shared with trusted sessions (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
@@ -43503,7 +43936,7 @@ mod tests {
                     let out = stdout_lines();
                     assert!(
                         !out.iter()
-                            .any(|line| line.contains("shared with trusted peers")),
+                            .any(|line| line.contains("shared with trusted sessions")),
                         "{out:?}"
                     );
                     assert!(
@@ -43647,7 +44080,7 @@ mod tests {
 
                         assert!(
                             out.ends_with(&format!(
-                                "Allowed `docs/**` for every trusted peer; written to {} (created).",
+                                "Allowed `docs/**` for every trusted session; written to {} (created).",
                                 fx.workspace()
                             )),
                             "{out}"
@@ -43687,7 +44120,7 @@ mod tests {
                             .unwrap();
                         assert!(
                             out.ends_with(&format!(
-                                "Denied `src/**` to every peer; written to {}.",
+                                "Denied `src/**` to every session; written to {}.",
                                 fx.workspace()
                             )),
                             "a bare deny lands in the workspace file once it exists: {out}"
@@ -43766,7 +44199,7 @@ mod tests {
                     let out = stdout_lines().join("\n");
                     assert!(
                         out.lines().any(|line| line
-                            == "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)"),
+                            == "  files: 3 path(s) are shared with trusted sessions (`.mesh files list`)"),
                         "{out}"
                     );
                     assert_eq!(prompt_script::prompts_asked(), 1);
@@ -43815,7 +44248,7 @@ mod tests {
                         assert_eq!(
                             out.lines().last().unwrap(),
                             &format!(
-                                "`**` is already allowed for every trusted peer in {}; nothing was changed.",
+                                "`**` is already allowed for every trusted session in {}; nothing was changed.",
                                 fx.global()
                             ),
                             "{out}"
@@ -43830,7 +44263,7 @@ mod tests {
                         assert_eq!(
                             out.lines().last().unwrap(),
                             &format!(
-                                "`**/*.rs` is already denied to every peer in {}; nothing was changed.",
+                                "`**/*.rs` is already denied to every session in {}; nothing was changed.",
                                 fx.global()
                             )
                         );
@@ -43865,7 +44298,7 @@ mod tests {
                         assert_eq!(
                             out.lines().last().unwrap(),
                             &format!(
-                                "`.env` is already allowed for every trusted peer in {}; nothing was changed.",
+                                "`.env` is already allowed for every trusted session in {}; nothing was changed.",
                                 fx.global()
                             ),
                             "a held allow+override pair is a no-op"
@@ -43928,14 +44361,14 @@ mod tests {
 
                         assert!(
                             out.contains(&format!(
-                                "Will write to {}: deny `**` to every peer.",
+                                "Will write to {}: deny `**` to every session.",
                                 fx.global()
                             )),
                             "{out}"
                         );
                         assert!(
                             out.ends_with(&format!(
-                                "Denied `**` to every peer; written to {}.",
+                                "Denied `**` to every session; written to {}.",
                                 fx.global()
                             )),
                             "{out}"
@@ -43982,7 +44415,7 @@ mod tests {
                         );
                         let last = out.lines().last().unwrap_or_default();
                         assert!(
-                            last.starts_with("Allowed `**` for every trusted peer; written to ")
+                            last.starts_with("Allowed `**` for every trusted session; written to ")
                                 && last.contains(&fx.workspace()),
                             "{out}"
                         );
@@ -44195,7 +44628,7 @@ mod tests {
                         [
                             "The share root's case folding could not be read; patterns were matched case-sensitively.",
                             format!(
-                                "Files every trusted peer can fetch from {}:",
+                                "Files every trusted session can fetch from {}:",
                                 root.path.display()
                             )
                             .as_str(),
@@ -44325,7 +44758,7 @@ mod tests {
                     assert_eq!(
                         out.lines().next().unwrap(),
                         format!(
-                            "Files every trusted peer can fetch from {}:",
+                            "Files every trusted session can fetch from {}:",
                             root.path.display()
                         ),
                         "{out}"
@@ -44347,7 +44780,7 @@ mod tests {
                     let out = stdout_lines()[before..].to_vec();
                     let files = index_of(
                         &out,
-                        "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)",
+                        "  files: 3 path(s) are shared with trusted sessions (`.mesh files list`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
@@ -44488,14 +44921,14 @@ mod tests {
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
                             lines.contains(
-                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                &format!("  allow (every trusted session) in {}", fx.global())
                                     .as_str()
                             ),
                             "{out}"
                         );
                         assert!(
                             lines.contains(
-                                &format!("  allow (peer {}) in {}", short(&peer), fx.workspace())
+                                &format!("  allow (only {}) in {}", short(&peer), fx.workspace())
                                     .as_str()
                             ),
                             "{out}"
@@ -44626,7 +45059,7 @@ mod tests {
                         assert_eq!(
                             out.lines().next().unwrap(),
                             format!(
-                                "Files every trusted peer can fetch from {}:",
+                                "Files every trusted session can fetch from {}:",
                                 fx.root.path.display()
                             ),
                             "{out}"
@@ -44737,7 +45170,7 @@ mod tests {
                 }
 
                 /// A `peer:` field is repo-derived text: a non-hash peer carrying an
-                /// escape is shown as "scoped to no peer" with the escape stripped, both in
+                /// escape is shown as "scoped to no user or session" with the escape stripped, both in
                 /// the `files list` row and in the holder row `files unshare` prints before asking.
                 #[test]
                 #[serial]
@@ -44758,9 +45191,9 @@ mod tests {
 
                         let out = out_of(&mut fx.ctx, ".mesh files list").await.unwrap();
                         assert!(!out.contains('\u{1b}'), "shares: raw escape in: {out:?}");
-                        assert!(out.contains("scoped to no peer"), "{out}");
+                        assert!(out.contains("scoped to no user or session"), "{out}");
                         assert!(
-                            out.contains("(`nobody` is not a peer hash)"),
+                            out.contains("(`nobody` is not a user or session hash)"),
                             "the text survives, cleaned: {out}"
                         );
 
@@ -44774,7 +45207,7 @@ mod tests {
                         );
                         assert!(
                             printed.contains(&format!(
-                                "  allow (scoped to no peer: `nobody`) in {}",
+                                "  allow (scoped to no user or session: `nobody`) in {}",
                                 fx.global()
                             )),
                             "{printed}"
@@ -44958,7 +45391,7 @@ mod tests {
                             .unwrap_or_else(|| panic!("no files clause in: {preview}"));
                         assert_eq!(
                             clause,
-                            "  files: 3 path(s) are shared with trusted peers (`.mesh files list`)"
+                            "  files: 3 path(s) are shared with trusted sessions (`.mesh files list`)"
                         );
                         fx.stop().await;
                     });
@@ -47014,11 +47447,11 @@ mod tests {
                                     fx.root.path.display()
                                 ),
                                 format!(
-                                    "Will write to {}: allow `src/x.rs` for every trusted peer.",
+                                    "Will write to {}: allow `src/x.rs` for every trusted session.",
                                     fx.global()
                                 ),
                                 format!(
-                                    "Allowed `src/x.rs` for every trusted peer; written to {}.",
+                                    "Allowed `src/x.rs` for every trusted session; written to {}.",
                                     fx.global()
                                 ),
                             ],
@@ -47057,7 +47490,7 @@ mod tests {
                             .unwrap();
                         assert!(
                             out.contains(&format!(
-                                "Allowed `etc/e.cfg` for every trusted peer; written to {} (created).",
+                                "Allowed `etc/e.cfg` for every trusted session; written to {} (created).",
                                 fx.workspace()
                             )),
                             "{out}"
@@ -47177,7 +47610,7 @@ mod tests {
                     let files = index_of(
                         &out,
                         &format!(
-                            "  files: {LIST_PAGE_SIZE} path(s) are shared with trusted peers (`.mesh files list`)"
+                            "  files: {LIST_PAGE_SIZE} path(s) are shared with trusted sessions (`.mesh files list`)"
                         ),
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
@@ -47197,7 +47630,7 @@ mod tests {
                     let files = index_of(
                         &out[before..],
                         &format!(
-                            "  files: {} path(s) are shared with trusted peers (`.mesh files list`)",
+                            "  files: {} path(s) are shared with trusted sessions (`.mesh files list`)",
                             LIST_PAGE_SIZE - 1
                         ),
                     );
@@ -47344,7 +47777,7 @@ mod tests {
                             let seventeen: Vec<String> =
                                 (0..=ACCESS_MAX_PATHS).map(|n| format!("p{n}.md")).collect();
                             let long_reason = "x".repeat(ACCESS_REASON_MAX_CHARS + 1);
-                            let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh files list --effective --all prints it.";
+                            let not_a_wire_path = "The access request was not sent: a path is not a wire path. Spell each path relative to that session's share root, /-separated, as mesh__list shows it or that session's own .mesh files list --effective --all prints it.";
                             for (line, expected) in [
                                 (
                                     format!(
@@ -49691,7 +50124,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh files grant 320b8f7b").await,
                             format!(
-                                "{SECOND} is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
+                                "{SECOND} is a question you asked, not one escalated to you; it closes when that session replies or its timeout passes. `.mesh messaging sent` shows it until then."
                             )
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
@@ -49736,7 +50169,7 @@ mod tests {
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh messaging follow-up q-1 \"x\"").await,
-                            "q-1 is a question a peer escalated to you, not one you asked; answer it with `.mesh envoy answer q-1 \"<text>\"`."
+                            "q-1 is a question another session escalated to you, not one you asked; answer it with `.mesh envoy answer q-1 \"<text>\"`."
                         );
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert_eq!(fx.pending_ids(), ["q-1"]);
@@ -49975,7 +50408,7 @@ mod tests {
                         for line in [".mesh envoy dismiss q1", ".mesh envoy dismiss q1 --silent"] {
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
-                                "q1 is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then.",
+                                "q1 is a question you asked, not one escalated to you; it closes when that session replies or its timeout passes. `.mesh messaging sent` shows it until then.",
                                 "{line}"
                             );
                         }
@@ -52648,6 +53081,143 @@ mod tests {
                     });
                 }
 
+                /// A message this session sent stays one it can follow up after the reply
+                /// closed it: `.mesh messaging follow-up` with the message's id, or the
+                /// reply's, sends a new message into its thread to the session that
+                /// replied, opening a correlation of its own so the next reply lands there
+                /// too. A thread a peer started is no message of this session's, so it is
+                /// refused and nothing is sent.
+                #[test]
+                #[serial]
+                fn messaging_follow_up_continues_a_sent_messages_thread_after_its_reply_closed_it()
+                {
+                    use crate::mesh::message::RawPeerMessage;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-closed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-closed").await;
+                        let to = fx.stub.destination_hex();
+                        let from_stub = |id: &str, in_reply_to: Option<&str>, thread: &str| {
+                            PeerMessage::new(RawPeerMessage {
+                                source_identity: fx.stub.identity_hex(),
+                                source_destination: fx.stub.destination_hex(),
+                                destination: fx.started.runtime.current_destination_hash(),
+                                title: None,
+                                content: "done".to_string(),
+                                fields: None,
+                                timestamp: 1_790_000_000.0,
+                                message_id: id.to_string(),
+                                in_reply_to: in_reply_to.map(str::to_string),
+                                kind: if in_reply_to.is_some() {
+                                    PeerKind::Reply
+                                } else {
+                                    PeerKind::Message
+                                },
+                                via: PeerVia::Direct,
+                                thread: Some(thread.to_string()),
+                                disposition: in_reply_to.map(|_| Disposition::Answered),
+                                retry_after: None,
+                                parts: Vec::new(),
+                                dropped_parts: 0,
+                            })
+                        };
+                        out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging send {to} --yes \"can you review it?\""),
+                        )
+                        .await
+                        .unwrap();
+                        let id = fx.stub.seen()[0].id.clone();
+                        let reply = "7e".repeat(16);
+                        fx.ctx
+                            .app
+                            .mesh
+                            .deliver_peer(from_stub(&reply, Some(&id), &id));
+                        assert!(
+                            !fx.ctx.app.mesh.correlations().is_open(&id),
+                            "the reply closed the message"
+                        );
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging follow-up {id} \"and the tests too\""),
+                        )
+                        .await
+                        .unwrap();
+
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "the follow-up went out: {seen:?}");
+                        assert_eq!(seen[1].kind, PeerKind::Message);
+                        assert_eq!(seen[1].in_reply_to, None);
+                        assert_eq!(seen[1].thread.as_deref(), Some(id.as_str()));
+                        assert_eq!(seen[1].content, "and the tests too");
+                        let follow_up = seen[1].id.clone();
+                        let opened = fx
+                            .ctx
+                            .app
+                            .mesh
+                            .correlations()
+                            .get(&follow_up)
+                            .expect("the follow-up opens a correlation under its own id");
+                        assert_eq!(opened.record.kind, CorrelationKind::Message);
+                        assert_eq!(opened.record.thread, id);
+                        assert_eq!(opened.record.peer_destination, to);
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Sending your follow-up to {} ({}) over the mesh...",
+                                    fx.who(),
+                                    fx.dest()
+                                )
+                                .as_str(),
+                                "",
+                                format!(
+                                    "Sent {} to {} ({}) in thread {} (via direct); its reply lands in that thread, and `.mesh messaging inbox` shows it.",
+                                    short(&follow_up),
+                                    fx.who(),
+                                    fx.dest(),
+                                    short(&id)
+                                )
+                                .as_str(),
+                            ],
+                            "{out}"
+                        );
+
+                        out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging follow-up {reply} \"one more\""),
+                        )
+                        .await
+                        .unwrap();
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 3, "by the reply's id too: {seen:?}");
+                        assert_eq!(seen[2].thread.as_deref(), Some(id.as_str()));
+
+                        let theirs = "9a".repeat(16);
+                        fx.ctx
+                            .app
+                            .mesh
+                            .deliver_peer(from_stub(&theirs, None, &theirs));
+                        assert_eq!(
+                            refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh messaging follow-up {theirs} \"hm\"")
+                            )
+                            .await,
+                            format!(
+                                "No open question has id {theirs}. `.mesh envoy questions` and `.mesh messaging sent` list the ones you know about."
+                            )
+                        );
+                        assert_eq!(fx.stub.seen().len(), 3, "nothing was sent");
+
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn a_messaging_send_the_peer_refuses_abandons_its_correlation() {
@@ -54811,6 +55381,119 @@ mod tests {
                         .map(|(_, v)| v)
                 }
 
+                /// `.mesh files list <session>` asks a trusted session for the files it
+                /// shares with you, as mesh__list does: the progress line, then a line per
+                /// file with its path quoted as the session sent it, its size and sha256,
+                /// the command for the next page and the fetch command. A session that
+                /// shares nothing says so and names the request verb, and `--effective`
+                /// beside a session is refused before anything is asked.
+                #[test]
+                #[serial]
+                fn files_list_of_a_session_reads_its_page_and_says_what_to_run_next() {
+                    use crate::mesh::test_support::LIST_PATH;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-files-list-session");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-files-list-session", false).await;
+                        fx.stub.serve(LIST_PATH, fx.script.clone());
+                        let bytes = b"# a\n";
+                        let page = |entries: Vec<Value>, next: Value| {
+                            Value::Map(vec![
+                                (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
+                                (Value::from("entries"), Value::Array(entries)),
+                                (Value::from("next"), next),
+                            ])
+                        };
+                        let entry = Value::Map(vec![
+                            (Value::from("path"), Value::from("docs/a.md")),
+                            (Value::from("size"), Value::from(bytes.len() as u64)),
+                            (
+                                Value::from("sha256"),
+                                Value::Binary(Sha256::digest(bytes).to_vec()),
+                            ),
+                            (Value::from("mtime"), Value::F64(1_700_000_000.0)),
+                        ]);
+                        fx.script
+                            .replies
+                            .lock()
+                            .push_back(page(vec![entry], Value::from("page-2")));
+                        let to = fx.stub.destination_hex();
+                        let who = fx.started.runtime.who_at(&to).to_string();
+                        let named = format!("{who}{}", hash_after(&who, &to));
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh files list {to} --prefix docs/"),
+                        )
+                        .await
+                        .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Asking {} which files it shares with you; Ctrl-C cancels...",
+                                    named
+                                ),
+                                String::new(),
+                                format!(
+                                    "{} shares 1 file(s) with you under `docs/` on this page:",
+                                    named
+                                ),
+                                format!(
+                                    "  `docs/a.md` . 4 bytes . sha256 {}",
+                                    hex_lower(&Sha256::digest(bytes))
+                                ),
+                                format!(
+                                    "More files: `.mesh files list {} --prefix docs/ --next page-2` lists the next page.",
+                                    fx.dest()
+                                ),
+                                format!(
+                                    "`.mesh files fetch {} <path>` fetches one into your session's staging inbox.",
+                                    fx.dest()
+                                ),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(
+                            field(&fx.heard()[0], "prefix").and_then(Value::as_str),
+                            Some("docs/")
+                        );
+
+                        fx.script
+                            .replies
+                            .lock()
+                            .push_back(page(Vec::new(), Value::Nil));
+                        let out = out_of(&mut fx.ctx, &format!(".mesh files list {to}"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out.lines().last(),
+                            Some(
+                                format!(
+                                    "{} shares nothing with you. `.mesh files request {} <path>` asks its user for a path it does not share.",
+                                    named,
+                                    fx.dest()
+                                )
+                                .as_str()
+                            ),
+                            "{out}"
+                        );
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &format!(".mesh files list {to} --effective"))
+                                .await,
+                            "`.mesh files list <session>` asks that session which files it shares with you; `--peer`, `--effective` and `--all` read your own share rules, so run them without the session, as in `.mesh files list --effective --peer <who>`. Nothing was listed."
+                        );
+                        assert_eq!(fx.heard().len(), 2, "the refusal asked nothing");
+
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn fetch_stages_the_peers_bytes_under_the_inbox_and_says_where_they_landed() {
@@ -55143,7 +55826,7 @@ mod tests {
                             refusal(&mut fx.ctx, &format!(".mesh files fetch {dest} {escaped}"))
                                 .await,
                             format!(
-                                "`docs/redalert.md` is not a path the mesh carries (rule `control`); pass the path exactly as `.mesh files list --peer {}` or mesh__list shows it.",
+                                "`docs/redalert.md` is not a path the mesh carries (rule `control`); pass the path exactly as `.mesh files list {}` or mesh__list shows it.",
                                 fx.dest()
                             )
                         );
@@ -55718,7 +56401,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "`../x` is not a path the mesh carries (rule `segment`); pass the path exactly as `.mesh files list --peer {}` or mesh__list shows it.",
+                                "`../x` is not a path the mesh carries (rule `segment`); pass the path exactly as `.mesh files list {}` or mesh__list shows it.",
                                 fx.dest()
                             )
                         );
@@ -55881,7 +56564,7 @@ mod tests {
                         assert_eq!(
                             corrupt,
                             format!(
-                                "{named} did not deliver `docs/a.md`: the peer's bytes do not match the hash it sent. {retry}"
+                                "{named} did not deliver `docs/a.md`: that session's bytes do not match the hash it sent. {retry}"
                             ),
                             "the mesh__fetch fact for a corrupt body: {corrupt}"
                         );
@@ -55892,7 +56575,7 @@ mod tests {
                         assert_eq!(
                             unknown,
                             format!(
-                                "{named} did not deliver `docs/a.md`: peer sent an unknown status. {retry}"
+                                "{named} did not deliver `docs/a.md`: that session sent an unknown status. {retry}"
                             )
                         );
 
@@ -55902,7 +56585,7 @@ mod tests {
                         assert_eq!(
                             malformed,
                             format!(
-                                "{named} did not deliver `docs/a.md`: the peer's reply could not be read: `bytes`. {retry}"
+                                "{named} did not deliver `docs/a.md`: that session's reply could not be read: `bytes`. {retry}"
                             )
                         );
 
@@ -56072,7 +56755,7 @@ mod tests {
 
                 fn confirm_question(root: &Path) -> String {
                     format!(
-                        "Remove 3 files (12 bytes) staged under {}? They are the peers' copies; this cannot be undone.",
+                        "Remove 3 files (12 bytes) staged under {}? They are copies other sessions sent; this cannot be undone.",
                         root.display()
                     )
                 }

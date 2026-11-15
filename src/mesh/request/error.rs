@@ -116,7 +116,7 @@ impl fmt::Display for RequestError {
             } => {
                 write!(
                     f,
-                    "No mesh link to the peer came up within {:.1}s",
+                    "No mesh link to that session came up within {:.1}s",
                     after.as_secs_f64()
                 )?;
                 // Every caller ends this message with its own full stop.
@@ -133,17 +133,17 @@ impl fmt::Display for RequestError {
             ),
             Self::IdentifyTimeout { after, .. } => write!(
                 f,
-                "Your session could not prove who it is to the peer within {:.1}s",
+                "Your session could not prove who it is to that session within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::ResponseIncomplete { after, .. } => write!(
                 f,
-                "The peer started to answer, but the answer had not finished arriving within {:.1}s",
+                "That session started to answer, but the answer had not finished arriving within {:.1}s",
                 after.as_secs_f64()
             ),
             Self::RequestIncomplete { after, .. } => write!(
                 f,
-                "The request was too large for one packet, and its upload to the peer had not finished within {:.1}s, so the peer never had all of it to answer",
+                "The request was too large for one packet, and its upload to that session had not finished within {:.1}s, so it never had all of it to answer",
                 after.as_secs_f64()
             ),
             Self::LinkFailed(reason) | Self::LinkNotOpened(reason) => {
@@ -156,11 +156,11 @@ impl fmt::Display for RequestError {
             ),
             Self::ResponseOversize { max } => write!(
                 f,
-                "The peer's answer is larger than the {max}-byte limit for this request"
+                "That session's answer is larger than the {max}-byte limit for this request"
             ),
             Self::Decode(reason) => write!(f, "Malformed mesh request frame: {reason}"),
             Self::Send(reason) => write!(f, "The mesh transport could not send: {reason}"),
-            Self::Refused(code) => write!(f, "The mesh peer refused the request: {code}"),
+            Self::Refused(code) => write!(f, "That session refused the request: {code}"),
             Self::UnsupportedVersion { found, min, max } => write!(
                 f,
                 "Protocol version {} is outside the supported range {min}..={max}",
@@ -168,9 +168,12 @@ impl fmt::Display for RequestError {
             ),
             Self::NotRunning => write!(
                 f,
-                "The mesh node has been stopped; run `.mesh on` to start it again"
+                "This session left the mesh; run `.mesh on` to join again"
             ),
-            Self::Shutdown => write!(f, "The mesh node stopped while the request was pending"),
+            Self::Shutdown => write!(
+                f,
+                "This session left the mesh while the request was pending"
+            ),
         }
     }
 }
@@ -245,16 +248,16 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         | RequestError::LinkFailed(_)
         | RequestError::LinkNotOpened(_)
         | RequestError::LinkClosed => {
-            "Try again in a minute; `.mesh people list` shows when the peer was last heard"
+            "Try again in a minute; `.mesh people list` shows when that session was last heard"
         }
         RequestError::Oversize { .. } => {
             "Shorten the message or send fewer parts so the frame fits the limit, then send it again"
         }
         RequestError::ResponseOversize { .. } => {
-            "The peer sent more than this request allows; if it repeats, the peer may run a different Coyote"
+            "That session sent more than this request allows; if it repeats, it may run a different Coyote"
         }
         RequestError::Decode(_) => {
-            "The peer answered in a form this Coyote could not read; it may run a different Coyote"
+            "That session answered in a form this Coyote could not read; it may run a different Coyote"
         }
         RequestError::Send(_) => "Try again; if it repeats, report it",
         RequestError::Refused(code) => refusal_remedy(*code),
@@ -276,12 +279,12 @@ pub(crate) fn refusal_remedy(code: RefusalCode) -> &'static str {
         RefusalCode::Throttled => "Wait a minute and try again",
         RefusalCode::Timeout => "Try again in a minute",
         RefusalCode::NoIdentity | RefusalCode::NoAccess => {
-            "The peer has not trusted this session; nothing on your side lifts that"
+            "That session has not trusted this one; nothing on your side lifts that"
         }
         RefusalCode::InvalidKey | RefusalCode::InvalidData | RefusalCode::InvalidStamp => {
-            "The peer could not read what was sent, so sending it again meets the same answer; report it"
+            "That session could not read what was sent, so sending it again meets the same answer; report it"
         }
-        RefusalCode::NotFound => "The peer has nothing under that name; check it and try again",
+        RefusalCode::NotFound => "That session has nothing under that name; check it and try again",
     }
 }
 
@@ -345,20 +348,35 @@ impl RemoteRefusal {
     /// that saw your key change, filed none, and the wire does not say which it was.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on your side unblocks it: ask the person at {} to run .mesh access trust session {}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
+            "Nothing on your side unblocks it: ask the user of {} to run .mesh access trust session {}; unless they blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
             self.named_peer(),
             self.own_destination
         )
     }
 
-    /// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, or the short
-    /// hash alone when no name was given.
     fn named_peer(&self) -> String {
-        let dest8 = short(&self.destination);
-        match &self.display_name {
-            Some(name) => format!("\"{}\" ({dest8})", name.replace('"', "'")),
-            None => dest8.to_string(),
+        named_peer(&self.destination, self.display_name.as_deref())
+    }
+}
+
+/// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, without the
+/// hash when the name already ends on it (a session with no name of its own reads
+/// `<user> / <dest8>`), or the short hash alone when no name was given.
+fn named_peer(destination: &str, display_name: Option<&str>) -> String {
+    let dest8 = short(destination);
+    match display_name {
+        Some(name) => {
+            let quoted = format!("\"{}\"", name.replace('"', "'"));
+            let ends_on_hash = name
+                .to_ascii_lowercase()
+                .ends_with(&format!("/ {}", dest8.to_ascii_lowercase()));
+            if ends_on_hash {
+                quoted
+            } else {
+                format!("{quoted} ({dest8})")
+            }
         }
+        None => dest8.to_string(),
     }
 }
 
@@ -379,11 +397,7 @@ impl Serialize for RemoteRefusal {
 /// which are this node's own.
 impl fmt::Display for RemoteRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let dest8 = short(&self.destination);
-        match &self.display_name {
-            Some(name) => write!(f, "\"{}\" ({dest8})", name.replace('"', "'"))?,
-            None => f.write_str(dest8)?,
-        }
+        f.write_str(&self.named_peer())?;
         write!(
             f,
             " refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)",
@@ -440,21 +454,15 @@ impl NoAnswer {
         name_quoted(&self.to_string(), self.display_name.as_deref())
     }
 
-    /// The peer as the sentences name it: `"<user> / <session>" (<dest8>)`, or the short
-    /// hash alone when no name was given.
     fn named_peer(&self) -> String {
-        let dest8 = short(&self.destination);
-        match &self.display_name {
-            Some(name) => format!("\"{}\" ({dest8})", name.replace('"', "'")),
-            None => dest8.to_string(),
-        }
+        named_peer(&self.destination, self.display_name.as_deref())
     }
 
     /// What the model can still do about it, for a tool result's `next_action`. A peer
     /// that stays silent filed no knock, so unlike a refusal nothing reached its owner.
     pub(crate) fn next_action(&self) -> String {
         format!(
-            "Nothing on your side lifts it: ask the person at {} to run .mesh access trust session {} (or .mesh access unblock session {} if they blocked this session); the peer did not answer, so nothing reached them.",
+            "Nothing on your side lifts it: ask the user of {} to run .mesh access trust session {} (or .mesh access unblock session {} if they blocked this session); that session did not answer, so nothing reached them.",
             self.named_peer(),
             self.own_destination,
             self.own_destination
@@ -519,7 +527,7 @@ mod no_answer_tests {
 
         assert_eq!(
             err.to_string(),
-            "No mesh link to the peer came up within 10.0s"
+            "No mesh link to that session came up within 10.0s"
         );
         assert_eq!(
             request_remedy(&err),
@@ -539,7 +547,7 @@ mod no_answer_tests {
 
         assert_eq!(
             format!("{err}. {}.", request_remedy(&err)),
-            "No mesh link to the peer came up within 10.0s. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; `.mesh people list` shows when the peer was last heard."
+            "No mesh link to that session came up within 10.0s. It may have left the mesh; a session that crashes or loses its network says nothing. Try again in a minute; `.mesh people list` shows when that session was last heard."
         );
     }
 
@@ -580,7 +588,7 @@ mod no_answer_tests {
             assert!(!text.contains("trust"), "{text}");
             assert_eq!(
                 request_remedy(&err),
-                "Try again in a minute; `.mesh people list` shows when the peer was last heard"
+                "Try again in a minute; `.mesh people list` shows when that session was last heard"
             );
         }
         assert!(!RequestError::Timeout { path, after }.is_retryable_wait());

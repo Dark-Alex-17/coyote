@@ -764,8 +764,8 @@ fn renamed_verbs_answer_at_a_cold_prompt_and_the_retired_spellings_are_refused()
     const REPLY_REFUSED: &str = "Unknown .mesh command 'reply'. Type `.mesh help` for the list.";
     const SEND_USAGE: &str =
         ".mesh messaging send <session> [--yes] \"text\" [--attach <path> [--force]]";
-    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from.";
-    const NOTE_CLEARED: &str = "Note cleared; your envoy answers peers without it from now on. `.mesh envoy brief note \"text\"` sets a new one.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers another session (with the card and, in auto mode, the digest). Run `.mesh envoy brief` to see what your envoy answers from.";
+    const NOTE_CLEARED: &str = "Note cleared; your envoy answers other sessions without it from now on. `.mesh envoy brief note \"text\"` sets a new one.";
     fn retired(word: &str) -> String {
         format!(
             ".mesh envoy brief has no '{word}' argument. Set the note with `.mesh envoy brief note \"text\"` and remove it with `.mesh envoy brief note clear`."
@@ -915,7 +915,7 @@ fn the_inbox_reads_and_clears_at_a_cold_prompt_and_the_help_says_where_replies_l
     );
     assert!(help.contains(INBOX_USAGE), "{help}");
     assert!(
-        help.contains("Show the messages peers sent this session, the new ones marked"),
+        help.contains("Show the messages other sessions sent this one, the new ones marked"),
         "{help}"
     );
     assert!(help.contains("mesh__check_inbox"), "{help}");
@@ -3140,7 +3140,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     let shares = command_text(
         &mut session,
         ".mesh files list",
-        "every trusted peer",
+        "every trusted session",
         SESSION_PROMPT,
     );
     let table = boxed_table(".mesh files list", &shares);
@@ -3153,8 +3153,13 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     assert_eq!(
         table.body(),
         [
-            ["allow", "docs/**", "global", "every trusted peer"],
-            ["allow", "vendor/.git/HEAD", "global", "every trusted peer",],
+            ["allow", "docs/**", "global", "every trusted session"],
+            [
+                "allow",
+                "vendor/.git/HEAD",
+                "global",
+                "every trusted session",
+            ],
             ["deny", "docs/secret.md", "global", ""],
         ],
         "{shares}"
@@ -3192,7 +3197,7 @@ fn mesh_listings_at_a_cold_prompt_are_one_bordered_table_each_and_a_progress_lin
     let lines = transcript_lines(&effective);
     let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
     assert!(
-        lines[top - 1].starts_with("Files every trusted peer can fetch from "),
+        lines[top - 1].starts_with("Files every trusted session can fetch from "),
         "{:?}",
         lines[top - 1]
     );
@@ -3276,7 +3281,7 @@ fn a_narrow_terminal_wraps_the_mesh_info_table_within_its_width_while_the_node_i
     let lines = transcript_lines(&info);
     let off_line = lines
         .iter()
-        .position(|line| *line == "node: off - .mesh on joins")
+        .position(|line| *line == "mesh: off - .mesh on joins")
         .unwrap_or_else(|| panic!("no node-off line: {info}"));
     let top = lines.iter().position(|line| line.starts_with('┌')).unwrap();
     assert!(
@@ -4039,7 +4044,7 @@ fn seconds_of(text: &str) -> Option<u64> {
 /// node reads `<n>s ago (next in 1h)`; a fresh identity with nothing marked shows no
 /// `earlier user hashes` and no `key changes` row, and no `node` or `selection` row either,
 /// the node facts running in the fixed order from `user hash` to `propagation_nodes`. After a
-/// typed `.mesh off --yes` the same command prints the `node: off - .mesh on joins` line
+/// typed `.mesh off --yes` the same command prints the `mesh: off - .mesh on joins` line
 /// before a table that keeps the configured `interfaces[0]` row, ends on `reach` keyed on the
 /// config (the loopback relay reads as the local rnsd), and holds no node fact.
 #[test]
@@ -4119,7 +4124,7 @@ fn an_announcing_node_reads_its_start_announce_with_the_first_tick_a_period_away
     let lines = transcript_lines(&info_off);
     let off_line = lines
         .iter()
-        .position(|line| *line == "node: off - .mesh on joins")
+        .position(|line| *line == "mesh: off - .mesh on joins")
         .unwrap_or_else(|| panic!("no node-off line: {info_off}"));
     let top = lines
         .iter()
@@ -4651,11 +4656,11 @@ fn dismiss_at_a_cold_prompt_refuses_tells_or_stays_silent_and_pending_sweeps_the
 /// the status card and the brief on two rows of their own.
 #[test]
 fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
-    const AUTO: &str = "Brief mode is auto for this session: your envoy answers peers from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.";
-    const MANUAL: &str = "Brief mode is manual for this session: your envoy answers peers from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.";
-    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on.";
+    const AUTO: &str = "Brief mode is auto for this session: your envoy answers other sessions from the status card, the session digest, your note and the todo list (the digest is model-written, so it spends tokens). config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.";
+    const MANUAL: &str = "Brief mode is manual for this session: your envoy answers other sessions from the status card, your note and the todo list; no model spend. config.yaml is not changed; the change applies at the next turn boundary. Run .mesh envoy brief to see the sections.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. .mesh envoy brief auto or .mesh envoy brief manual turns the brief back on.";
     const NOTE_LABEL: &str = "your note (none; .mesh envoy brief note \"text\" sets it)";
-    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on.";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. .mesh envoy brief auto or .mesh envoy brief manual turns it back on.";
 
     let relay = SilentRelay::start();
     let probe = Probe::new("brief-modes-cold", false, &[relay.port]);
@@ -4737,8 +4742,8 @@ fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
     // to trusted peers, and the brief row follows the mode just set (off here, so it
     // says no brief is assembled and names the commands that turn it on); the old
     // single `status card and brief` row is gone.
-    const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted peers on request";
-    const BRIEF_ROW: &str = "  brief: none (brief mode is off): your envoy answers peers with nothing about this session behind it; peers that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on";
+    const CARD_ROW: &str = "  status card: this session's objective, state, repo and todo, served to trusted sessions on request";
+    const BRIEF_ROW: &str = "  brief: none (brief mode is off): your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card; .mesh envoy brief auto or .mesh envoy brief manual turns it on";
     let prompt = session_prompt("work");
     session.send(".session work\r").expect("enter a session");
     let entered = strip_escapes(&wait_for(&mut session, &prompt));
@@ -4773,9 +4778,9 @@ fn brief_modes_and_the_bare_brief_before_a_turn_answer_at_a_cold_prompt() {
 /// of them keeps a `.mesh` the user cannot type.
 #[test]
 fn brief_confirmations_under_slash_name_their_next_command_with_the_slash_sigil() {
-    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers a peer (with the card and, in auto mode, the digest). Run `/mesh envoy brief` to see what your envoy answers from.";
-    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh envoy brief auto or /mesh envoy brief manual turns the brief back on.";
-    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers peers with nothing about this session behind it; peers that ask still get the status card. /mesh envoy brief auto or /mesh envoy brief manual turns it back on.";
+    const NOTE_SET: &str = "Note set; your envoy includes it the next time it answers another session (with the card and, in auto mode, the digest). Run `/mesh envoy brief` to see what your envoy answers from.";
+    const OFF: &str = "Brief mode is off for this session: no brief is assembled, so your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. config.yaml is not changed; the change applies at the next turn boundary. /mesh envoy brief auto or /mesh envoy brief manual turns the brief back on.";
+    const OFF_BARE: &str = "No brief is assembled in off mode: your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card. /mesh envoy brief auto or /mesh envoy brief manual turns it back on.";
     const MANUAL_TAIL: &str = "Run /mesh envoy brief to see the sections.";
     const RETIRED: &str = "/mesh envoy brief has no 'set' argument. Set the note with `/mesh envoy brief note \"text\"` and remove it with `/mesh envoy brief note clear`.";
 
@@ -4909,7 +4914,7 @@ fn a_local_only_node_is_refused_until_rnsd_listens_then_joins_through_it() {
     // Node off: the config row names the entry by its endpoint and `reach` is keyed on it.
     let info = command_text(&mut session, ".mesh config show", "└", SESSION_PROMPT);
     assert!(
-        info.contains("node: off - .mesh on joins"),
+        info.contains("mesh: off - .mesh on joins"),
         "the node-off line precedes the settings table: {info}"
     );
     let table = boxed_table(".mesh config show (node off)", &info);

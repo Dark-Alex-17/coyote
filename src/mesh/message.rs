@@ -1450,7 +1450,7 @@ impl fmt::Display for SendError {
             Self::Unheard { destination, miss } => write!(f, "{}", miss.refusal(destination)),
             Self::NotRunning => write!(
                 f,
-                "The mesh node has been stopped; run `.mesh on` to start it again"
+                "This session left the mesh; run `.mesh on` to join again"
             ),
             Self::ContentTooLong { chars, max } => write!(
                 f,
@@ -1555,7 +1555,7 @@ fn fields_remedy(reason: &str) -> String {
 /// failure, so those two rows serve only a caller that wraps without the remap.
 pub(crate) fn propagation_remedy(err: &PropagationError) -> &'static str {
     const RETRY: &str =
-        "Try again in a minute; `.mesh people list` shows when the peer was last heard";
+        "Try again in a minute; `.mesh people list` shows when that session was last heard";
     const ANOTHER_NODE: &str =
         "Try again when another propagation node is heard; `.mesh people list` lists them";
     match err {
@@ -3187,6 +3187,20 @@ impl PeerInbox {
         state.entries.push_back((seq, envelope));
     }
 
+    /// The newest peer message still held that `wanted` picks, whatever either reader has
+    /// read or the human cleared; neither reader's mark moves.
+    pub(crate) fn newest(&self, wanted: impl Fn(&PeerMessage) -> bool) -> Option<PeerMessage> {
+        let state = self.state.lock();
+        state
+            .entries
+            .iter()
+            .rev()
+            .find_map(|(_, envelope)| match &envelope.payload {
+                EnvelopePayload::Peer(message) if wanted(message) => Some((**message).clone()),
+                _ => None,
+            })
+    }
+
     /// The human's view: every entry it has not cleared, oldest first, each marked new
     /// when the human had not been shown it, and how many it never saw were dropped.
     /// The human's mark moves to the newest entry; the model's is left alone.
@@ -3429,8 +3443,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the sessions you have heard.",
-                short(&to)
+                "no answer from \"{who}\": most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the message for it; `.mesh people list` lists the sessions you have heard.",
             )
         );
         assert_eq!(err.class(), "no_answer");
@@ -3940,7 +3953,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{text:?} does not start with {head:?}"))
                 .to_string()
         };
-        let retry = "Try again in a minute; `.mesh people list` shows when the peer was last heard";
+        let retry =
+            "Try again in a minute; `.mesh people list` shows when that session was last heard";
         assert_eq!(stored(PropagationError::TransferFailed), retry);
         assert_eq!(stored(PropagationError::VerdictLost { skipped: 3 }), retry);
         assert_eq!(
@@ -4019,7 +4033,7 @@ mod tests {
         );
         assert_eq!(
             SendError::Direct(RequestError::Decode("short frame".into())).to_string(),
-            "The message could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
+            "The message could not be sent: Malformed mesh request frame: short frame. That session answered in a form this Coyote could not read; it may run a different Coyote"
         );
         assert_eq!(
             SendError::Direct(RequestError::Send("no interface".into())).to_string(),
@@ -4027,11 +4041,11 @@ mod tests {
         );
         assert_eq!(
             SendError::Refused(RefusalCode::NotFound).to_string(),
-            "The peer refused the message: not found (0xfd). The peer has nothing under that name; check it and try again"
+            "The peer refused the message: not found (0xfd). That session has nothing under that name; check it and try again"
         );
         assert_eq!(
             SendError::Refused(RefusalCode::InvalidData).to_string(),
-            "The peer refused the message: invalid data (0xf4). The peer could not read what was sent, so sending it again meets the same answer; report it"
+            "The peer refused the message: invalid data (0xf4). That session could not read what was sent, so sending it again meets the same answer; report it"
         );
 
         let cleaned_under_cap = format!(

@@ -13,7 +13,7 @@ use crate::mesh::announce::{
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::card_cadence::{
-    CadenceTrustObserver, CardCadence, CardTrigger, drive_card_cadence,
+    CadenceTrustObserver, CardCadence, CardStopsOnSiblingTrust, CardTrigger, drive_card_cadence,
 };
 use crate::mesh::card_refusals::card_refusals_path;
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
@@ -1128,6 +1128,10 @@ impl MeshRuntime {
         runtime
             .trust()
             .attach_envoy_memory(Arc::downgrade(&runtime) as Weak<dyn EnvoyMemorySink>);
+        runtime
+            .trust()
+            .attach_sibling_trust(Arc::new(CardStopsOnSiblingTrust(Arc::downgrade(&runtime))));
+        runtime.trust().attach_instance_registry(&runtime.cache_dir);
         if config.envoy_memory.enabled {
             let swept = Arc::downgrade(&runtime);
             runtime.register_task(tokio::spawn(sweep_envoy_memory(
@@ -2191,7 +2195,7 @@ impl MeshRuntime {
             .lock()
             .await
             .clone()
-            .context("The mesh node has been stopped; run `.mesh on` to start it again")
+            .context("This session left the mesh; run `.mesh on` to join again")
     }
 
     async fn send_announce(

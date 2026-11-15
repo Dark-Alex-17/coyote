@@ -145,6 +145,11 @@ impl SentThreads {
             .any(|other| other == thread)
     }
 
+    /// Whether this instance sent or opened `thread`, as opposed to only receiving it.
+    pub(crate) fn was_sent(&self, thread: &str) -> bool {
+        self.held.lock().sent.iter().any(|other| other == thread)
+    }
+
     /// Records `thread` as one this instance sent or opened, moving it out of the
     /// received list if a peer named it first.
     pub(crate) fn record_sent(&self, thread: &str) -> Result<()> {

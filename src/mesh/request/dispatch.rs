@@ -624,7 +624,7 @@ mod tests {
 
     /// `/list` and `/fetch` are paths this node knows by name alongside the first three:
     /// each is named in the log, and a `no_provider` refusal naming any of them decodes
-    /// to the typed error the client maps to "peer does not share files", while a path
+    /// to the typed error the client maps to "that session does not share files", while a path
     /// outside the list is logged by hash and refused as a dispatch error.
     #[test]
     fn every_known_path_is_named_and_its_no_provider_refusal_round_trips() {

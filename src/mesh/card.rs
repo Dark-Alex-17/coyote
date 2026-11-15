@@ -612,6 +612,20 @@ pub(crate) enum StatusError {
     UnsupportedVersion { found: u64, supported: u64 },
 }
 
+impl StatusError {
+    /// The sentence as a log line carries it, as `SendError::log_text` writes it: a
+    /// refusal or a silence names the session by its short hash alone.
+    pub(crate) fn log_text(&self) -> String {
+        match self {
+            Self::NotTrustedByPeer(refusal) => {
+                Self::NotTrustedByPeer(refusal.clone().named(None)).to_string()
+            }
+            Self::NoAnswer(no_answer) => Self::NoAnswer(no_answer.clone().named(None)).to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for StatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -792,8 +806,6 @@ mod no_answer_tests {
     #[cfg(unix)]
     use super::*;
     #[cfg(unix)]
-    use crate::mesh::request::short;
-    #[cfg(unix)]
     use crate::mesh::test_support::beside_a_stub_that_does_not_know_it;
 
     /// The link came up and the peer said nothing to `/status`: the error names the
@@ -829,8 +841,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). A status request is answered live or not at all; nothing queues it for later.",
-                short(&to)
+                "no answer from \"{who}\": most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). A status request is answered live or not at all; nothing queues it for later.",
             )
         );
         assert!(slot.stop().await.unwrap());
@@ -2341,7 +2352,7 @@ mod tests {
         .to_string();
         assert_eq!(
             unopened,
-            "The mesh link failed: no known path to destination abababab. Try again in a minute; `.mesh people list` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later."
+            "The mesh link failed: no known path to destination abababab. Try again in a minute; `.mesh people list` shows when that session was last heard. A status request is answered live or not at all; nothing queues it for later."
         );
         let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
         assert!(malformed.contains("status card"), "{malformed}");

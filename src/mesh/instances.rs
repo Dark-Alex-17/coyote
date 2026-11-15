@@ -88,6 +88,24 @@ pub(crate) struct Sessions {
     pub gone: HashMap<String, InstanceRow>,
 }
 
+/// The name each of your sessions on this cache dir runs under, by the destination it
+/// serves: a running session's over a gone one's.
+pub(crate) fn session_names(cache_dir: &Path) -> HashMap<String, String> {
+    let sessions = by_destination(cache_dir);
+    let mut names: HashMap<String, String> = sessions
+        .gone
+        .into_iter()
+        .map(|(destination, row)| (destination, row.session))
+        .collect();
+    names.extend(
+        sessions
+            .running
+            .into_iter()
+            .map(|(destination, row)| (destination, row.session)),
+    );
+    names
+}
+
 /// The rows whose node still runs, by the destination each serves. A tombstone is never
 /// among them, so no name resolves to a session that has gone.
 pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {

@@ -924,7 +924,7 @@ mod request_bad_path_tests {
     /// the Commands page quotes it word for word. The code side is checked on every run.
     #[test]
     fn the_commands_page_quotes_the_request_bad_path_remedy() {
-        let sentence = "The access request was not sent: a path is not a wire path. Spell each path relative to the peer's share root, /-separated, as mesh__list shows it or the peer's own .mesh files list --effective --all prints it.";
+        let sentence = "The access request was not sent: a path is not a wire path. Spell each path relative to that session's share root, /-separated, as mesh__list shows it or that session's own .mesh files list --effective --all prints it.";
         let source = read(repo_root().join("src/repl/mesh.rs"));
         assert!(
             source.contains(&format!("\"{sentence}\"")),
@@ -5326,11 +5326,17 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
         !sync.contains("{}"),
         "the sync progress line is static: {sync:?}"
     );
-    for (what, line) in [
-        ("status", &status),
-        ("knock", &knock),
-        ("declining_notice", &declining),
-    ] {
+    assert!(
+        status.starts_with("Asking {who}{hash} for its status card"),
+        "the status progress line names the session as user / session, its short hash after it unless the name ends on it: {status:?}"
+    );
+    let status_span = format!(
+        "`{}`",
+        status
+            .replace("{who}", "<user> / <session>")
+            .replace("{hash}", " (<dest8>)")
+    );
+    for (what, line) in [("knock", &knock), ("declining_notice", &declining)] {
         assert_eq!(
             line.matches("{}").count(),
             1,
@@ -5424,7 +5430,7 @@ fn the_commands_page_states_the_blank_line_convention_and_its_progress_samples_f
             "Mesh-Commands.md",
             commands_samples,
             vec![
-                span(&status),
+                status_span,
                 span(&sync),
                 format!("`{}`", knock.replace("{}", "<who>")),
                 request_span.clone(),
@@ -5949,7 +5955,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
         .next()
         .expect("KNOCK_IS_NOT_FIRST_CONTACT is a string literal");
     assert!(first_contact.starts_with(
-        "A request to be trusted is heard only by a session whose owner already knows you"
+        "A request to be trusted is heard only by a session whose user already knows you"
     ));
     let stored_tail = "; no answer over the link, so a propagation node holds the request until the session fetches it. {KNOCK_IS_NOT_FIRST_CONTACT}";
     let stored = format!(
@@ -5959,7 +5965,7 @@ fn the_knock_pages_say_a_knock_is_not_first_contact_and_quote_the_reports() {
     let unanswered_template = "Asked {who} to trust you; no answer. {KNOCK_IS_NOT_FIRST_CONTACT} No propagation node is known yet to hold the request for it.";
     let unanswered = unanswered_template.replace("{KNOCK_IS_NOT_FIRST_CONTACT}", &first_contact);
     let unreachable = "The session is unreachable and no propagation node is known yet to hold the request for it. Run `.mesh people list` to see which sessions you have heard from.";
-    let preview_tail = "Only a session whose owner already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides.";
+    let preview_tail = "Only a session whose user already knows you hears it (they trusted you, or another session of yours, before); for first contact use `.mesh access trust` on both sides.";
     assert!(
         repl.contains(&format!("\"{stored_tail}\"")),
         "src/repl/mesh.rs no longer prints the stored-after-silence report this test quotes"
@@ -6044,6 +6050,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
     );
     let cause = cause_template.replace("{}", &timeout.to_string());
     let head = format!("Session <hash> {cause}");
+    let named_head = format!("<user> / <session> (<dest8>) {cause}");
     let route_line_template = string_literals(&fn_body("src/repl/mesh.rs", "route_request_line"))
         .into_iter()
         .next()
@@ -6108,7 +6115,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         display,
         &[
             "Self::LinkActivationTimeout {",
-            "No mesh link to the peer came up within",
+            "No mesh link to that session came up within",
             "left_mesh_hint_when(*recently_seen)",
             "Self::LocalTimeout",
         ],
@@ -6122,7 +6129,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         "### `.mesh status`",
     ));
     assert!(
-        status.contains(&format!("{head} {status_tail}")),
+        status.contains(&format!("{named_head} {status_tail}")),
         "Mesh-Commands.md's `.mesh status` entry does not quote the path-request refusal"
     );
     assert!(
@@ -6131,8 +6138,8 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         "Mesh-Commands.md's `.mesh status` entry does not say the refusals add {hint:?} after `cannot reach.`"
     );
     let link_timeout_line = format!(
-        "No mesh link to the peer came up within {link_timeout}.0s. {hint} {}.",
-        "Try again in a minute; `.mesh people list` shows when the peer was last heard. A status request is answered live or not at all; nothing queues it for later"
+        "No mesh link to that session came up within {link_timeout}.0s. {hint} {}.",
+        "Try again in a minute; `.mesh people list` shows when that session was last heard. A status request is answered live or not at all; nothing queues it for later"
     );
     assert!(
         status.contains(&link_timeout_line),
@@ -6170,7 +6177,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         "### `.mesh access ask`",
     ));
     assert!(
-        knock.contains(&format!("{head} {knock_tail}")),
+        knock.contains(&format!("{named_head} {knock_tail}")),
         "Mesh-Commands.md's `.mesh access ask` entry does not quote the path-request refusal"
     );
     assert!(
@@ -6201,7 +6208,7 @@ fn the_mesh_pages_tell_the_restart_story_as_a_path_request_with_the_timeout_the_
         "## A two-machine walkthrough on Windows",
     ));
     for needle in [
-        format!("{head} {status_tail}"),
+        format!("{named_head} {status_tail}"),
         "the request goes through without waiting for W1's next heartbeat".to_string(),
         route_line.clone(),
         "With W1 alone off, W2's own `rnsd` still answers the path request from its table"
@@ -6750,7 +6757,7 @@ fn the_mesh_page_sets_the_card_beside_the_brief_and_explains_the_digest() {
     assert!(
         off_row.contains("no brief is assembled")
             && off_row.contains("nothing about the session behind it")
-            && off_row.contains("peers that ask still get the card"),
+            && off_row.contains("sessions that ask still get the card"),
         "the `off` row does not say no brief is assembled, the envoy has nothing behind it and the card still goes to peers that ask:\n{off_row}"
     );
 }
@@ -6781,7 +6788,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         let body = &line[opening.len()..];
         if *mode == "off" {
             assert!(
-                body.starts_with("no brief is assembled, so your envoy answers peers with nothing about this session behind it; peers that ask still get the status card."),
+                body.starts_with("no brief is assembled, so your envoy answers other sessions with nothing about this session behind it; sessions that ask still get the status card."),
                 "{line:?}"
             );
             assert!(
@@ -6790,7 +6797,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
             );
         } else {
             assert!(
-                body.starts_with("your envoy answers peers from "),
+                body.starts_with("your envoy answers other sessions from "),
                 "{line:?}"
             );
         }
@@ -6816,7 +6823,7 @@ fn the_commands_page_quotes_the_brief_mode_lines_the_objective_line_and_the_prev
         "the off-mode sentence names both commands that turn the brief back on: {off_bare:?}"
     );
     assert!(
-        off_bare.contains("peers that ask still get the status card")
+        off_bare.contains("sessions that ask still get the status card")
             && !off_bare.contains("served"),
         "the off-mode sentence keeps the card apart from the brief and never says served: {off_bare:?}"
     );
@@ -7257,8 +7264,8 @@ fn the_commands_page_shows_the_inbox_block_shape_and_no_mesh_page_quotes_the_old
         ),
         (
             &dropped,
-            "WARNING: {dropped} peer message(s) were dropped before you read them because the inbox was full.",
-            "`WARNING: N peer message(s) were dropped before you read them because the inbox was full.`",
+            "WARNING: {dropped} message(s) were dropped before you read them because the inbox was full.",
+            "`WARNING: N message(s) were dropped before you read them because the inbox was full.`",
         ),
     ] {
         assert!(
@@ -7458,7 +7465,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
     for needle in [
         "{marker}-> ",
         " {age} . {}{left} . id ",
-        " . peer left {}",
+        " . session left {}",
         " {} {age}{expires} . id ",
         " . expires in {}",
         "  {number}. ",
@@ -7675,7 +7682,7 @@ fn the_commands_page_shows_the_pending_block_shape_and_the_answer_prompt() {
         "`<user8> / <dest8> (<dest8>)`".to_string(),
         "`<user> / <session> (<dest8>) asked <age> . expires in <span> . id <id8>`".to_string(),
         "`-> <user> / <session> (<dest8>) <age> . <state> . id <id8>`".to_string(),
-        "`. peer left <age>`".to_string(),
+        "`. session left <age>`".to_string(),
         "`[mesh:reply] <user> / <session> is back; your question from <age> is still open; .mesh messaging sent lists it`"
             .to_string(),
         "`your <n> questions, the oldest from <age>, are still open; .mesh messaging sent lists them`"
@@ -8052,7 +8059,7 @@ fn the_commands_page_documents_dismiss_and_the_pending_expiry() {
         .expect("asked_by_this_node words this node's own question with one literal");
     assert_eq!(
         own,
-        " is a question you asked, not one escalated to you; it closes when the peer replies or its timeout passes. `.mesh messaging sent` shows it until then."
+        " is a question you asked, not one escalated to you; it closes when that session replies or its timeout passes. `.mesh messaging sent` shows it until then."
     );
     assert_in_source_order(
         "asked_by_this_node",
@@ -9810,6 +9817,25 @@ fn the_trust_model_glossary_names_the_four_standings_in_order() {
     }
 }
 
+/// The free `named_peer` in `src/mesh/request/error.rs` names a session
+/// `"<user> / <session>" (<dest8>)`, the short hash left out when the name already ends on
+/// it, so a session with no name of its own never reads its hash twice.
+fn assert_named_peer_quotes_the_name_before_the_hash_once() {
+    let error = read(repo_root().join("src/mesh/request/error.rs"));
+    let body = error
+        .split_once("\nfn named_peer(destination: &str, display_name: Option<&str>) -> String {")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body.to_string())
+        .expect("src/mesh/request/error.rs declares the free fn named_peer");
+    let literals = string_literals(&body);
+    for wanted in ["\"{}\"", "/ {}", "{quoted} ({dest8})"] {
+        assert!(
+            literals.iter().any(|literal| literal == wanted),
+            "named_peer no longer formats {wanted:?}: {literals:?}"
+        );
+    }
+}
+
 /// Every page that quotes what a peer's `NoAccess` prints carries each static piece of
 /// the `RemoteRefusal` Display in `src/mesh/request/error.rs`: the `.mesh status`,
 /// `.mesh messaging send` and `.mesh access ask` sections of the Commands page, the requests section of
@@ -9830,9 +9856,10 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
         .unwrap();
     let literals = string_literals(display);
     assert!(
-        literals.iter().any(|literal| literal == "\"{}\" ({dest8})"),
-        "RemoteRefusal's Display no longer opens with the peer's name in quotes before its short hash: {literals:?}"
+        display.contains("f.write_str(&self.named_peer())?;"),
+        "RemoteRefusal's Display no longer opens with the session named by named_peer: {display}"
     );
+    assert_named_peer_quotes_the_name_before_the_hash_once();
     let literal = literals
         .iter()
         .find(|literal| literal.starts_with(" refused the request: "))
@@ -9852,7 +9879,7 @@ fn the_pages_quote_a_peers_refusal_as_the_code_prints_it_with_the_side_that_has_
     let action_fragments = format_fragments(&next_action[0]);
     assert!(
         action_fragments.iter().any(|piece| piece.contains(
-            "unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted"
+            "unless they blocked this session or saw your key change, the request already reached them as a request to be trusted"
         )),
         "next_action no longer says a default-closed refusal filed the request as a request to be trusted, or no longer hedges that for a block or a key change: {next_action:?}"
     );
@@ -10560,12 +10587,7 @@ fn the_pages_quote_the_no_answer_and_throttled_lines_as_the_code_words_them() {
             .is_some_and(|literal| literal.starts_with(head)),
         "NoAnswer no longer opens {head:?}: {no_answer:?}"
     );
-    let named = string_literals(&method_body("src/mesh/request/error.rs", "named_peer"));
-    assert_eq!(
-        named.first().map(String::as_str),
-        Some("\"{}\" ({dest8})"),
-        "named_peer no longer quotes the name before the short hash: {named:?}"
-    );
+    assert_named_peer_quotes_the_name_before_the_hash_once();
     let quoted_head = head
         .replace("{}", "\"<user> / <session>\" (<dest8>)")
         .replace("{own}", "<hash>");
@@ -10682,4 +10704,60 @@ fn the_trust_model_keeps_protocol_words_under_the_hood() {
         }
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// Every tool that names a session refuses a name or a short prefix as the wrong
+/// argument, `not_a_session_hash`, before its trust gate, and a message another session
+/// sent has its own collect kind; Mesh.md says both and no longer says every miss is
+/// `not_trusted`.
+#[test]
+fn the_mesh_page_names_the_short_hash_refusal_and_the_sibling_message_kind() {
+    for (handler, call) in [
+        (
+            "handle_send",
+            "not_a_session_hash(\"to\", to, \"Nothing was sent.\")",
+        ),
+        (
+            "handle_ask",
+            "not_a_session_hash(\"to\", to, \"Nothing was asked.\")",
+        ),
+        (
+            "handle_list",
+            "not_a_session_hash(\"peer\", peer, \"Nothing was listed.\")",
+        ),
+        (
+            "handle_fetch",
+            "not_a_session_hash(\"peer\", peer, \"Nothing was fetched.\")",
+        ),
+        (
+            "handle_request_access",
+            "not_a_session_hash(\"peer\", peer, \"Nothing was requested.\")",
+        ),
+    ] {
+        assert!(
+            fn_body("src/function/mesh.rs", handler).contains(call),
+            "{handler} no longer refuses a short hash with {call:?}"
+        );
+    }
+    let collect = fn_body("src/function/mesh.rs", "asked_by_another_session");
+    assert!(
+        collect.contains("\"kind\": \"sent_by_another_session\""),
+        "mesh__collect's sibling-message kind moved:\n{collect}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join("Mesh.md")));
+    for needle in [
+        "a `to` or `peer` that is a name or a short prefix is refused with `kind: not_a_session_hash`, asking for the full session hash, and nothing is sent, listed, fetched or requested",
+        "a full hash the trust list rules out is `not_trusted`, whichever rule ruled it out",
+        "one of these kinds: `not_a_session_hash`, `unknown_thread`, `not_trusted`",
+        "one this session sent returns `status: message` with the `thread` its reply lands in",
+        "one another of your sessions sent is refused with `kind: sent_by_another_session` and the `thread` its reply lands in, in that session's inbox",
+        "written for that session's user",
+    ] {
+        assert!(page.contains(needle), "Mesh.md does not say {needle:?}");
+    }
+    for gone in ["every miss is the same `not_trusted` error", "peer's human"] {
+        assert!(!page.contains(gone), "Mesh.md still says {gone:?}");
+    }
 }

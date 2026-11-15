@@ -1918,6 +1918,77 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// The same, driven by a second request's own deadline: while an active request holds
+    /// the link, a second `open_link` to the same session whose deadline runs out before
+    /// it can read the link fails on that deadline alone. The link stays open, the request
+    /// in flight on it still gets its answer, and the next request is handed the same link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_requests_deadline_running_out_never_closes_the_link_an_active_request_holds()
+    {
+        let (stall, release) = ReleasableStall::new();
+        let (responder, requester, desc) = pair(stall.clone()).await;
+        let mut events = requester.transport.out_link_events();
+        let link = open_link(&requester.transport, &desc, "/slow", link_deadline())
+            .await
+            .unwrap();
+        let link_id = *link.lock().await.id();
+        let in_flight = {
+            let transport = requester.transport.clone();
+            let link = link.clone();
+            let data = requester.envelope(Value::Nil).into_value();
+            tokio::spawn(async move {
+                request_on_link(&transport, &link, "/slow", data, TRANSFER_REQUEST_TIMEOUT).await
+            })
+        };
+        wait_until("the responder to hold the active request", || {
+            stall.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let second_deadline = Duration::from_millis(300);
+        let second = {
+            let held = link.lock().await;
+            let second = timeout(
+                INTEROP_TIMEOUT,
+                open_link(
+                    &requester.transport,
+                    &desc,
+                    "/echo",
+                    Deadline::after(second_deadline),
+                ),
+            )
+            .await
+            .expect("the second request ends on its own deadline");
+            drop(held);
+            second
+        };
+        let err = second.err().expect("the second request's deadline ran out");
+        assert!(
+            matches!(err, RequestError::LinkActivationTimeout { after, .. } if after == second_deadline),
+            "{err:?}"
+        );
+
+        release.send(true).unwrap();
+        let reply = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, Value::from("released"));
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !(event.id == link_id && matches!(event.event, LinkEvent::Closed)),
+                "the active link must stay open"
+            );
+        }
+        let next = open_link(&requester.transport, &desc, "/echo", link_deadline())
+            .await
+            .unwrap();
+        assert_eq!(*next.lock().await.id(), link_id);
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     /// The handler sees the peer's identity only once the peer has proven it on the link;
     /// before that the request reaches it anonymous.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8134,7 +8205,7 @@ pub(crate) mod network {
         assert_eq!(
             err.to_string(),
             format!(
-                "Asked {who} to trust you; no answer. A request to be trusted is heard only by a session whose owner already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
+                "Asked {who} to trust you; no answer. A request to be trusted is heard only by a session whose user already knows you (they trusted you, or another session of yours, before); for first contact, exchange session hashes and run `.mesh access trust session <who>` on both sides. No propagation node is known yet to hold the request for it."
             )
         );
         assert_eq!(pair.responder.adapter.admitted_count(), 0);
@@ -8418,7 +8489,7 @@ pub(crate) mod network {
         );
         assert_eq!(
             err.to_string(),
-            "The request to be trusted could not be sent: The mesh peer refused the request: throttled (0xf6). Wait a minute and try again"
+            "The request to be trusted could not be sent: That session refused the request: throttled (0xf6). Wait a minute and try again"
         );
         assert!(!err.to_string().contains(".mesh people list"), "{err}");
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(KNOCK_PATH));
@@ -9466,12 +9537,11 @@ pub(crate) mod network {
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"{}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
+                "\"{}\" refused the request: it has not trusted this session ({a_instance}).",
                 unnamed_who(
                     &pair.responder.desc.identity.address_hash.to_hex_string(),
                     &b_instance
-                ),
-                short(&b_instance)
+                )
             )),
             "{text}"
         );
@@ -9539,8 +9609,7 @@ pub(crate) mod network {
             let text = err.to_string();
             assert!(
                 text.starts_with(&format!(
-                    "\"{b_who}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
-                    short(&b_instance)
+                    "\"{b_who}\" refused the request: it has not trusted this session ({a_instance})."
                 )),
                 "{text}"
             );
@@ -11876,12 +11945,11 @@ pub(crate) mod network {
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"{}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
+                "\"{}\" refused the request: it has not trusted this session ({a_instance}).",
                 unnamed_who(
                     &pair.responder.desc.identity.address_hash.to_hex_string(),
                     &b_instance
-                ),
-                short(&b_instance)
+                )
             )),
             "{text}"
         );
@@ -12964,7 +13032,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::NotServed), "{err:?}");
-        assert_eq!(err.to_string(), "peer does not share files");
+        assert_eq!(err.to_string(), "that session does not share files");
 
         pair.recorder_b
             .queue(Script::Reply(Reply::Value(wire_map(vec![
@@ -12977,7 +13045,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::UnknownStatus), "{err:?}");
-        assert_eq!(err.to_string(), "peer sent an unknown status");
+        assert_eq!(err.to_string(), "that session sent an unknown status");
 
         pair.recorder_b
             .queue(Script::Reply(Reply::Value(ok_body([0; 32]))));
@@ -13327,7 +13395,7 @@ pub(crate) mod network {
             .await
             .unwrap_err();
         assert!(matches!(err, FetchError::NotServed), "{err:?}");
-        assert_eq!(err.to_string(), "peer does not share files");
+        assert_eq!(err.to_string(), "that session does not share files");
 
         for refusal in [
             DispatchError::UnknownPath {
@@ -13345,7 +13413,7 @@ pub(crate) mod network {
                 .await
                 .unwrap_err();
             assert!(matches!(err, FetchError::NotServed), "{err:?}");
-            assert_eq!(err.to_string(), "peer does not share files");
+            assert_eq!(err.to_string(), "that session does not share files");
         }
         assert_eq!(
             pair.node_a.last_listing(&b_hex),
@@ -14334,12 +14402,11 @@ pub(crate) mod network {
         let text = err.to_string();
         assert!(
             text.starts_with(&format!(
-                "\"{}\" ({}) refused the request: it has not trusted this session ({a_instance}).",
+                "\"{}\" refused the request: it has not trusted this session ({a_instance}).",
                 unnamed_who(
                     &pair.responder.desc.identity.address_hash.to_hex_string(),
                     &b_instance
-                ),
-                short(&b_instance)
+                )
             )),
             "{text}"
         );

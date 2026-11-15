@@ -387,7 +387,7 @@ impl fmt::Display for AccessError {
         match self {
             Self::NotRunning => write!(
                 f,
-                "The mesh node has been stopped; run `.mesh on` to start it again"
+                "This session left the mesh; run `.mesh on` to join again"
             ),
             Self::Untrusted => write!(
                 f,
@@ -426,7 +426,7 @@ impl fmt::Display for AccessError {
             ),
             Self::UnknownStatus => write!(
                 f,
-                "The peer sent an unknown status in its answer to the access request; it may be running a newer Coyote"
+                "The that session sent an unknown status in its answer to the access request; it may be running a newer Coyote"
             ),
             Self::Malformed(why) => write!(
                 f,
@@ -460,6 +460,20 @@ impl fmt::Display for AccessError {
                 "The peer is unreachable and the access request could not be stored: {err}. {}",
                 propagation_remedy(err)
             ),
+        }
+    }
+}
+
+impl AccessError {
+    /// The sentence as a log line carries it, as `SendError::log_text` writes it: a
+    /// refusal or a silence names the session by its short hash alone.
+    pub(crate) fn log_text(&self) -> String {
+        match self {
+            Self::NotTrustedByPeer(refusal) => {
+                Self::NotTrustedByPeer(refusal.clone().named(None)).to_string()
+            }
+            Self::NoAnswer(no_answer) => Self::NoAnswer(no_answer.clone().named(None)).to_string(),
+            other => other.to_string(),
         }
     }
 }
@@ -1846,8 +1860,7 @@ mod no_answer_tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the sessions you have heard.",
-                short(&to)
+                "no answer from \"{who}\": most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). Nothing was queued, because no propagation node is known yet to hold the access request for it; `.mesh people list` lists the sessions you have heard.",
             )
         );
         assert!(slot.stop().await.unwrap());
@@ -6036,7 +6049,7 @@ mod tests {
         assert!(
             AccessError::UnknownStatus
                 .to_string()
-                .contains("peer sent an unknown status")
+                .contains("that session sent an unknown status")
         );
         assert_eq!(
             AccessError::IncompatibleVersion {
@@ -6113,15 +6126,15 @@ mod tests {
         );
         assert_eq!(
             AccessError::Direct(RequestError::Decode("short frame".to_string())).to_string(),
-            "The access request could not be sent: Malformed mesh request frame: short frame. The peer answered in a form this Coyote could not read; it may run a different Coyote"
+            "The access request could not be sent: Malformed mesh request frame: short frame. That session answered in a form this Coyote could not read; it may run a different Coyote"
         );
         assert_eq!(
             AccessError::Refused(RefusalCode::NotFound).to_string(),
-            "The peer refused the access request: not found (0xfd). The peer has nothing under that name; check it and try again"
+            "The peer refused the access request: not found (0xfd). That session has nothing under that name; check it and try again"
         );
         assert_eq!(
             AccessError::Propagation(PropagationError::TransferFailed).to_string(),
-            "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when the peer was last heard"
+            "The peer is unreachable and the access request could not be stored: The transfer to the propagation node did not complete. Try again in a minute; `.mesh people list` shows when that session was last heard"
         );
     }
 

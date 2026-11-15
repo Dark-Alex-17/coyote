@@ -6,7 +6,9 @@ use crate::mesh::card_refusals::{load_card_refusals, save_card_refusals};
 use crate::mesh::message::Route;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{RequestOptions, short};
-use crate::mesh::trust::{Decision, TrustGranted, TrustObserver, TrustRevoked};
+use crate::mesh::trust::{
+    Decision, SiblingTrustSink, TrustChanges, TrustGranted, TrustObserver, TrustRevoked,
+};
 
 use anyhow::Result;
 use log::debug;
@@ -294,6 +296,31 @@ impl TrustObserver for CadenceTrustObserver {
     }
 }
 
+/// Lifts this session's card-fetch stops, in memory and on disk, for every user and
+/// session another session on this config dir changed the trust of, as the shared trust
+/// list's reload reports it: their grant, revoke, forget, block or unblock is a trust
+/// change like one made here. Run on the async runtime when there is one, since the
+/// store reports from inside whatever read reloaded it.
+pub(crate) struct CardStopsOnSiblingTrust(pub(crate) Weak<MeshRuntime>);
+
+impl SiblingTrustSink for CardStopsOnSiblingTrust {
+    fn trust_changed_elsewhere(&self, changes: &TrustChanges) {
+        let runtime = self.0.clone();
+        let changes = changes.clone();
+        let lift = move || {
+            if let Some(runtime) = runtime.upgrade() {
+                runtime.lift_card_stops(&changes);
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { lift() });
+            }
+            Err(_) => lift(),
+        }
+    }
+}
+
 /// Turns each grant into a background card fetch of every session it covers that the
 /// peer table holds: the one destination of a destination grant, every session of the
 /// identity for an identity grant.
@@ -362,6 +389,29 @@ impl MeshRuntime {
                 self.card_cadence().forget(&row.destination_hash);
             }
         }
+    }
+
+    /// Lifts the card-fetch stop of every session `changes` names and of every session
+    /// of a user it names that the peer table holds.
+    pub(crate) fn lift_card_stops(&self, changes: &TrustChanges) {
+        let cadence = self.card_cadence();
+        for destination in &changes.destinations {
+            cadence.lift(destination);
+        }
+        for row in self.peers().snapshot() {
+            if changes
+                .identities
+                .iter()
+                .any(|identity| identity.eq_ignore_ascii_case(&row.identity_hash))
+            {
+                cadence.lift(&row.destination_hash);
+            }
+        }
+        debug!(
+            "Mesh background status card: another session changed the trust of {} user(s) and {} session(s); their stops are lifted",
+            changes.identities.len(),
+            changes.destinations.len()
+        );
     }
 
     /// Asks the session at `destination` for its card in the background when the cadence

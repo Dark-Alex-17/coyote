@@ -2832,7 +2832,7 @@ fn an_unknown_status_is_a_client_error_with_the_pinned_wording() -> Result<(), S
     same(
         "wording",
         FetchError::UnknownStatus.to_string(),
-        "peer sent an unknown status".to_string(),
+        "that session sent an unknown status".to_string(),
     )
 }
 

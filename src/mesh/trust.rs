@@ -74,6 +74,7 @@
 use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyMemorySink, RememberedOf};
 use crate::mesh::idle::{IdleNotify, Origin};
+use crate::mesh::instances;
 use crate::mesh::knock::KnockSurface;
 use crate::mesh::lock::acquire_mesh_lock;
 use crate::mesh::node::MeshSlot;
@@ -981,6 +982,89 @@ struct Reloaded {
     /// Identities the other process forgot or blocked, whose envoy memory this process
     /// sweeps too.
     revoked: Vec<String>,
+    /// Every grant, revoke, forget, block or unblock the other process made.
+    changed: TrustChanges,
+}
+
+/// The users and sessions whose standing in the trust list a reload found changed: a
+/// grant, a revoke, a forget, a block or an unblock another process made. A session's
+/// record names its user too, so a change to it lists both.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct TrustChanges {
+    pub identities: Vec<String>,
+    pub destinations: Vec<String>,
+}
+
+impl TrustChanges {
+    fn is_empty(&self) -> bool {
+        self.identities.is_empty() && self.destinations.is_empty()
+    }
+
+    /// What changed between `before` and `after`, judged on what decides access alone:
+    /// which users and sessions hold a grant (and whether a user's covers every
+    /// session), which session a record is bound to, and which are blocked. A record's
+    /// seen time or note moving is no change.
+    fn between(before: &TrustFile, after: &TrustFile) -> Self {
+        fn moved<'a, V, K: PartialEq>(
+            before: &'a BTreeMap<String, V>,
+            after: &'a BTreeMap<String, V>,
+            key: impl Fn(&V) -> K,
+        ) -> impl Iterator<Item = &'a String> {
+            let gone_or_changed = before.iter().filter(move |(hash, entry)| {
+                after
+                    .get(*hash)
+                    .is_none_or(|other| key(other) != key(entry))
+            });
+            let added = after.keys().filter(move |hash| !before.contains_key(*hash));
+            gone_or_changed.map(|(hash, _)| hash).chain(added)
+        }
+        let mut identities: BTreeSet<String> = BTreeSet::new();
+        let mut destinations: BTreeSet<String> = BTreeSet::new();
+        identities.extend(
+            moved(&before.identities, &after.identities, |entry| {
+                entry.all_destinations
+            })
+            .cloned(),
+        );
+        identities.extend(
+            moved(
+                &before.blocked_identities,
+                &after.blocked_identities,
+                |_| (),
+            )
+            .cloned(),
+        );
+        for hash in moved(&before.destinations, &after.destinations, |entry| {
+            entry.identity.to_ascii_lowercase()
+        }) {
+            destinations.insert(hash.clone());
+            for file in [before, after] {
+                if let Some(entry) = file.destinations.get(hash) {
+                    identities.insert(entry.identity.to_ascii_lowercase());
+                }
+            }
+        }
+        destinations.extend(
+            moved(
+                &before.denied_destinations,
+                &after.denied_destinations,
+                |_| (),
+            )
+            .cloned(),
+        );
+        Self {
+            identities: identities.into_iter().collect(),
+            destinations: destinations.into_iter().collect(),
+        }
+    }
+}
+
+/// Told, with the trust store's state lock released, which users and sessions another
+/// process on this config dir changed the standing of, as a reload of the shared trust
+/// list found them. Any read of the store can reload it, so the sink must not wait on
+/// a lock a caller of the store may hold.
+pub(crate) trait SiblingTrustSink: Send + Sync {
+    fn trust_changed_elsewhere(&self, changes: &TrustChanges);
 }
 
 /// The state mutex taken for one read, after `reload_if_changed`. Dropping it releases
@@ -1016,6 +1100,9 @@ impl Drop for Loaded<'_> {
         drop(self.state.take());
         for identity in &self.reloaded.revoked {
             self.store.forget_envoy_memory(identity);
+        }
+        if !self.reloaded.changed.is_empty() {
+            self.store.tell_sibling_trust(&self.reloaded.changed);
         }
     }
 }
@@ -1106,6 +1193,12 @@ pub(crate) struct TrustStore {
     /// Where a revoked identity's remembered conversations go, held weakly for the same
     /// reason.
     envoy_memory: Mutex<Option<Weak<dyn EnvoyMemorySink>>>,
+    /// Who hears the trust changes another process made; it holds the runtime weakly
+    /// itself, so it is held here outright.
+    sibling_trust: Mutex<Option<Arc<dyn SiblingTrustSink>>>,
+    /// The cache dir whose instance registry names your own sessions in the lines this
+    /// store writes, once a node attached it.
+    instance_registry: Mutex<Option<PathBuf>>,
     collision_protection: AtomicBool,
     #[cfg(test)]
     stats: AtomicUsize,
@@ -1156,6 +1249,8 @@ impl TrustStore {
             surface: Mutex::new(None),
             presence: Mutex::new(None),
             envoy_memory: Mutex::new(None),
+            sibling_trust: Mutex::new(None),
+            instance_registry: Mutex::new(None),
             collision_protection: AtomicBool::new(false),
             #[cfg(test)]
             stats: AtomicUsize::new(0),
@@ -1256,12 +1351,12 @@ impl TrustStore {
             Ok(file) => {
                 state.last_text = Some(text);
                 state.last_reload_failure = None;
-                let revoked = state.take_over(file);
+                let (revoked, changed) = state.take_over(file);
                 debug!(
                     "Mesh trust list reloaded: another process wrote '{}'",
                     self.path.display()
                 );
-                Reloaded { revoked }
+                Reloaded { revoked, changed }
             }
             Err(err) => {
                 state.last_text = Some(text);
@@ -1286,12 +1381,12 @@ impl TrustStore {
         state.on_disk = None;
         state.last_text = None;
         state.last_reload_failure = None;
-        let revoked = state.take_over(TrustFile::default());
+        let (revoked, changed) = state.take_over(TrustFile::default());
         warn!(
             "Mesh trust list '{}' disappeared; nobody is trusted until the next grant writes it afresh",
             self.path.display()
         );
-        Reloaded { revoked }
+        Reloaded { revoked, changed }
     }
 
     /// Warns once per distinct refusal; the same one again is a debug line. The refusal
@@ -1340,6 +1435,26 @@ impl TrustStore {
     /// forget the identity's conversations.
     pub(crate) fn attach_envoy_memory(&self, sink: Weak<dyn EnvoyMemorySink>) {
         *self.envoy_memory.lock() = Some(sink);
+    }
+
+    /// Installs who hears the grants, revokes, forgets, blocks and unblocks another
+    /// process on this config dir made, as a reload finds them.
+    pub(crate) fn attach_sibling_trust(&self, sink: Arc<dyn SiblingTrustSink>) {
+        *self.sibling_trust.lock() = Some(sink);
+    }
+
+    /// Called with the state lock released, as `forget_envoy_memory` is.
+    fn tell_sibling_trust(&self, changes: &TrustChanges) {
+        let Some(sink) = self.sibling_trust.lock().clone() else {
+            return;
+        };
+        sink.trust_changed_elsewhere(changes);
+    }
+
+    /// Installs the cache dir whose instance registry names your own sessions in the
+    /// key-change lines, as every other line names them.
+    pub(crate) fn attach_instance_registry(&self, cache_dir: &Path) {
+        *self.instance_registry.lock() = Some(cache_dir.to_path_buf());
     }
 
     /// Called with the state lock released: the memory store takes its own locks and
@@ -3075,8 +3190,9 @@ impl State {
     /// withdrawn reads as the untrust it is. Returns the forgotten identities for the
     /// envoy sweep the caller runs with the lock released. `seen` is kept for every
     /// record still standing.
-    fn take_over(&mut self, file: TrustFile) -> Vec<String> {
+    fn take_over(&mut self, file: TrustFile) -> (Vec<String>, TrustChanges) {
         let before = std::mem::replace(&mut self.file, file);
+        let changed = TrustChanges::between(&before, &self.file);
         for hash in self.file.destinations.keys() {
             self.session_destinations.remove(hash);
         }
@@ -3115,7 +3231,7 @@ impl State {
                 self.forget_presence_memos_naming(identity);
             }
         }
-        revoked.into_iter().collect()
+        (revoked.into_iter().collect(), changed)
     }
 
     fn effective_last_seen(&self, destination_hash: &str, entry: &DestinationEntry) -> SystemTime {
@@ -3550,13 +3666,18 @@ fn namer_of(file: &TrustFile, own_identity: Option<&str>) -> Namer {
 impl TrustStore {
     /// The namer the key-change lines name users and sessions with: your own aliases
     /// and hashes only, since nothing in those lines may come from the peer, with `you`
-    /// for this node's own identity when it is known.
+    /// for this node's own identity when it is known and the names your own sessions on
+    /// this config dir run under, once a node attached the instance registry.
     fn owner_namer(&self) -> Namer {
         let own_identity = self.inner.lock().own_identity.clone();
+        let registry = self.instance_registry.lock().clone();
+        let own_sessions = registry
+            .map(|cache_dir| instances::session_names(&cache_dir))
+            .unwrap_or_default();
         Namer::new(
             self.owner_people(&[]),
             own_identity.as_deref(),
-            HashMap::new(),
+            own_sessions,
         )
     }
 }
@@ -7587,6 +7708,88 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(10))
             .unwrap();
+    }
+
+    #[derive(Default)]
+    struct RecordingSiblingTrust(Mutex<Vec<TrustChanges>>);
+
+    impl SiblingTrustSink for RecordingSiblingTrust {
+        fn trust_changed_elsewhere(&self, changes: &TrustChanges) {
+            self.0.lock().push(changes.clone());
+        }
+    }
+
+    impl RecordingSiblingTrust {
+        fn take(&self) -> Vec<TrustChanges> {
+            std::mem::take(&mut *self.0.lock())
+        }
+    }
+
+    fn changes(identities: &[&str], destinations: &[&str]) -> TrustChanges {
+        TrustChanges {
+            identities: identities.iter().map(|hash| hash.to_string()).collect(),
+            destinations: destinations.iter().map(|hash| hash.to_string()).collect(),
+        }
+    }
+
+    /// Two handles on one config dir, as two sessions hold them: every grant, revoke,
+    /// forget, block and unblock one makes is told to the other's sibling sink once,
+    /// naming the users and sessions it changed, when the other's next read reloads the
+    /// list. A change the other makes itself, and a read that finds nothing new, tell it
+    /// nothing.
+    #[test]
+    fn a_trust_change_made_in_one_process_is_told_to_the_others_sibling_sink() {
+        let fx = Fixture::new("trust-shared-sibling-changes");
+        let (other, _, _) = second_process(&fx);
+        let sink = Arc::new(RecordingSiblingTrust::default());
+        other.attach_sibling_trust(sink.clone());
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        let user = fake_hash(0xaa);
+        let id = peer.identity_hash.as_str();
+        let dest = peer.destination_hash.as_str();
+        let read = |other: &TrustStore| {
+            other.authorize(&peer.identity_hash, &peer.destination_hash);
+        };
+        read(&other);
+        sink.take();
+
+        fx.trust_destination(&peer, t(3_000));
+        read(&other);
+        assert_eq!(sink.take(), [changes(&[id], &[dest])], "a session grant");
+        read(&other);
+        assert!(sink.take().is_empty(), "nothing new, nothing told");
+
+        fx.trust_identity(&user, t(3_000));
+        read(&other);
+        assert_eq!(sink.take(), [changes(&[&user], &[])], "a user grant");
+
+        fx.store.untrust_identity(&fx.mesh, &user, false).unwrap();
+        read(&other);
+        assert_eq!(sink.take(), [changes(&[&user], &[])], "a user revoke");
+
+        fx.store
+            .block_identity(&fx.mesh, &user, None, t(4_000))
+            .unwrap();
+        read(&other);
+        assert_eq!(sink.take(), [changes(&[&user], &[])], "a block");
+
+        fx.store.unblock_identity(&fx.mesh, &user, false).unwrap();
+        read(&other);
+        assert_eq!(sink.take(), [changes(&[&user], &[])], "an unblock");
+
+        fx.store.forget_identity(&fx.mesh, id, false).unwrap();
+        read(&other);
+        assert_eq!(sink.take(), [changes(&[id], &[dest])], "a forget");
+
+        other
+            .trust_destination(&fx.mesh, dest, TrustOptions::default(), t(5_000))
+            .unwrap();
+        read(&other);
+        assert!(
+            sink.take().is_empty(),
+            "a change this process made itself is no sibling's"
+        );
     }
 
     #[test]
@@ -12771,6 +12974,54 @@ mod tests {
             &parse_hash(&peer.identity_hash).unwrap(),
         )
         .to_hex_string()
+    }
+
+    /// A key-change line about one of your own sessions names it as every other line
+    /// does, `you / <the name it runs under>`, read from the instance registry a node
+    /// attached, never by its short hashes.
+    #[test]
+    fn a_key_change_line_names_your_own_session_as_you_and_the_name_it_runs_under() {
+        let fx = Fixture::new("trust-key-change-own-session");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let own = announced("alpha");
+        fx.announce(&own, t(2_000));
+        fx.store.set_own_identity(&own.identity_hash).unwrap();
+        fx.trust_destination(&own, t(3_000));
+        let cache = TempDir::new("trust-key-change-own-session-cache");
+        instances::register(
+            &cache.path,
+            "instance-review",
+            instances::InstanceRow::started_now(
+                own.destination_hash.clone(),
+                "review".to_string(),
+                None,
+            ),
+        );
+        fx.store.attach_instance_registry(&cache.path);
+        let presenter = announced("alpha");
+        fx.announce(&presenter, t(4_000));
+
+        fx.store.note_key_change(
+            &presenter.identity_hash,
+            &own.name_hash,
+            KeyChangeOutcome::Refused,
+            t(4_500),
+        );
+
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(
+            texts[0].starts_with(&format!(
+                "error: session you / review ({}) is bound to the key of user {} but was presented under the key of user {}",
+                short(&own.destination_hash),
+                own.identity_hash,
+                presenter.identity_hash
+            )),
+            "{}",
+            texts[0]
+        );
     }
 
     /// The own-line dedupe is per refused presenter: two identities trusted for all

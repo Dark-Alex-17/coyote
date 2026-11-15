@@ -5,7 +5,7 @@ mod announce;
 pub(crate) mod brief;
 pub(crate) mod card;
 pub(crate) mod card_cadence;
-mod card_refusals;
+pub(crate) mod card_refusals;
 #[cfg(test)]
 pub(crate) mod conformance;
 pub(crate) mod envoy;
@@ -3380,15 +3380,52 @@ mod tests {
         use crate::mesh::message::SendError;
         use crate::mesh::request::{NoAnswer, RemoteRefusal};
 
+        use crate::mesh::access::AccessError;
+        use crate::mesh::card::StatusError;
+        use crate::mesh::fetch::FetchError;
+
         let peer = "ab".repeat(16);
         let own = "cd".repeat(16);
         let name = "Alice / laptop";
-        for err in [
-            SendError::NotTrustedByPeer(RemoteRefusal::new(&peer, Some(name), own.clone())),
-            SendError::NoAnswer(NoAnswer::new(&peer, own.clone()).named(Some(name))),
-        ] {
-            assert!(err.to_string().contains(name), "{err}");
-            let logged = redact_hashes(&err.log_text());
+        let refusal = RemoteRefusal::new(&peer, Some(name), own.clone());
+        let silence = NoAnswer::new(&peer, own.clone()).named(Some(name));
+        let told_and_logged: Vec<(String, String)> = vec![
+            {
+                let err = SendError::NotTrustedByPeer(refusal.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = SendError::NoAnswer(silence.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = AccessError::NotTrustedByPeer(refusal.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = AccessError::NoAnswer(silence.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = FetchError::NotTrustedByPeer(refusal.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = FetchError::NoAnswer(silence.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = StatusError::NotTrustedByPeer(refusal.clone());
+                (err.to_string(), err.log_text())
+            },
+            {
+                let err = StatusError::NoAnswer(silence.clone());
+                (err.to_string(), err.log_text())
+            },
+        ];
+        for (told, logged) in told_and_logged {
+            assert!(told.contains(name), "{told}");
+            let logged = redact_hashes(&logged);
             assert!(
                 !logged.contains("Alice") && !logged.contains("laptop"),
                 "{logged}"

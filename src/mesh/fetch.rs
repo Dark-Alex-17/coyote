@@ -969,15 +969,29 @@ impl fmt::Display for FetchError {
             Self::Transport(err) => write!(f, "{err}"),
             Self::NotTrustedByPeer(refusal) => write!(f, "{refusal}"),
             Self::NoAnswer(no_answer) => write!(f, "{no_answer}"),
-            Self::NotServed => write!(f, "peer does not share files"),
-            Self::Malformed(key) => write!(f, "the peer's reply could not be read: `{key}`"),
+            Self::NotServed => write!(f, "that session does not share files"),
+            Self::Malformed(key) => write!(f, "that session's reply could not be read: `{key}`"),
             Self::Oversize { len } => write!(
                 f,
-                "the peer sent {len} bytes, above the {MAX_FETCH_FILE_BYTES}-byte limit; discarded"
+                "that session sent {len} bytes, above the {MAX_FETCH_FILE_BYTES}-byte limit; discarded"
             ),
-            Self::Corrupt => write!(f, "the peer's bytes do not match the hash it sent"),
-            Self::UnknownStatus => write!(f, "peer sent an unknown status"),
+            Self::Corrupt => write!(f, "that session's bytes do not match the hash it sent"),
+            Self::UnknownStatus => write!(f, "that session sent an unknown status"),
             Self::Stage(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl FetchError {
+    /// The sentence as a log line carries it, as `SendError::log_text` writes it: a
+    /// refusal or a silence names the session by its short hash alone.
+    pub(crate) fn log_text(&self) -> String {
+        match self {
+            Self::NotTrustedByPeer(refusal) => {
+                Self::NotTrustedByPeer(refusal.clone().named(None)).to_string()
+            }
+            Self::NoAnswer(no_answer) => Self::NoAnswer(no_answer.clone().named(None)).to_string(),
+            other => other.to_string(),
         }
     }
 }
@@ -1330,7 +1344,7 @@ impl PeerMemory {
 /// The debug line for a `granted` decision whose `expires` this node cannot read, after
 /// the request id; shared with the reply path in `access`.
 pub(crate) const UNREADABLE_GRANT_EXPIRY_DEBUG: &str =
-    "was granted until an expiry this node cannot read; the grant is not remembered";
+    "was granted until an expiry this Coyote cannot read; the grant is not remembered";
 
 /// The end of the grant a decision reply's `{"access": {"status", "expires"?}}` data
 /// part carries: `Some(None)` for a standing grant, which names no `expires`. One
@@ -1815,8 +1829,7 @@ mod no_answer_tests {
         assert_eq!(
             silent.to_string(),
             format!(
-                "no answer from \"{who}\" ({}): most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
-                short(&to)
+                "no answer from \"{who}\": most likely it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session).",
             )
         );
 
@@ -1840,7 +1853,7 @@ mod no_answer_tests {
         );
         assert_eq!(
             never_linked.to_string(),
-            "No mesh link to the peer came up within 2.0s. Try again in a minute; `.mesh people list` shows when the peer was last heard."
+            "No mesh link to that session came up within 2.0s. Try again in a minute; `.mesh people list` shows when that session was last heard."
         );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;

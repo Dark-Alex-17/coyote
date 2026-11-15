@@ -460,7 +460,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                         JsonSchema {
                             type_value: Some("string".to_string()),
                             description: Some(format!(
-                                "Why you need them, for the peer's human to read (at most {ACCESS_REASON_MAX_CHARS} characters)"
+                                "Why you need them, for that session's user to read (at most {ACCESS_REASON_MAX_CHARS} characters)"
                             )),
                             ..Default::default()
                         },
@@ -1159,6 +1159,11 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                     peers[index]["reachable"] = json!(true);
                 }
                 Err(err) => {
+                    debug!(
+                        "Mesh tool peers: the status card of {} was not read: {}",
+                        short(&records[index].destination_hash),
+                        redact_hashes(&err.log_text())
+                    );
                     peers[index]["status_error"] = json!(err.to_string());
                     match &err {
                         StatusError::NotTrustedByPeer(refusal) => {
@@ -1189,7 +1194,7 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
     let message = required_str(args, "message")?;
 
     let Some(destination) = canonical_hash(to) else {
-        return Ok(not_a_session_hash(to));
+        return Ok(not_a_session_hash("to", to, "Nothing was sent."));
     };
     let out = match outbound_from_args(PeerKind::Message, message, args)
         .and_then(|out| refuse_unseen_thread(slot, &out).map(|()| out))
@@ -1247,20 +1252,26 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
             Ok(result)
         }
         Err(err) => {
+            debug!(
+                "Mesh tool send to {} failed: {}",
+                short(&destination),
+                redact_hashes(&err.log_text())
+            );
             slot.correlations().abandon(&out.id);
             Ok(named_send_error(&err, &naming, identity.as_deref()))
         }
     }
 }
 
-/// A `to` that is not a full session hash names no session the send could check trust
-/// for, so it is refused as the wrong argument rather than as an untrusted session.
-fn not_a_session_hash(to: &str) -> Value {
+/// A `to` or `peer` that is not a full session hash names no session the call could
+/// check trust for, so it is refused as the wrong argument rather than as an untrusted
+/// session; `nothing` says what did not happen.
+fn not_a_session_hash(field: &str, value: &str, nothing: &str) -> Value {
     json!({
         "status": "error",
         "kind": "not_a_session_hash",
         "message": format!(
-            "'{to}' is not a full session hash; `to` takes the session's full session hash, its `destination` in mesh__peers, never a name or an 8-character prefix. Nothing was sent."
+            "'{value}' is not a full session hash; `{field}` takes the session's full session hash, its `destination` in mesh__peers, never a name or an 8-character prefix. {nothing}"
         ),
     })
 }
@@ -1326,6 +1337,9 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
     let timeout = collect_timeout(args)?;
     let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
 
+    if canonical_hash(to).is_none() {
+        return Ok(not_a_session_hash("to", to, "Nothing was asked."));
+    }
     let slot = &ctx.app.mesh;
     let out = match outbound_from_args(PeerKind::Ask, message, args)
         .and_then(|out| refuse_unseen_thread(slot, &out).map(|()| out))
@@ -1513,7 +1527,7 @@ async fn wait_for_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Va
             "status": "escalated",
             "id": id,
             "next_action": collect_next_action(id),
-            "message": "The peer's human has been asked; the question stays open. Collect again later.",
+            "message": "That session's user has been asked; the question stays open. Collect again later.",
         }),
         WaitOutcome::Unknown => asked_by_another_session(ctx, id).unwrap_or_else(|| {
             json!({
@@ -1547,7 +1561,7 @@ fn asked_by_another_session(ctx: &RequestContext, id: &str) -> Option<Value> {
         };
         return Some(json!({
             "status": "error",
-            "kind": "asked_by_another_session",
+            "kind": "sent_by_another_session",
             "id": id,
             "thread": thread,
             "message": format!(
@@ -1816,11 +1830,21 @@ async fn handle_list(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let peer = required_str(args, "peer")?;
     let prefix = optional_str(args, "prefix");
     let cursor = optional_str(args, "cursor");
+    if canonical_hash(peer).is_none() {
+        return Ok(not_a_session_hash("peer", peer, "Nothing was listed."));
+    }
     let (record, route) = match trusted_destination(runtime, peer).await {
         Ok(trusted) => trusted,
         Err(refusal) => return Ok(refusal),
     };
     let outcome = runtime.list_shares(route, prefix, cursor).await;
+    if let Err(err) = &outcome {
+        debug!(
+            "Mesh tool list of {} failed: {}",
+            short(&record.destination_hash),
+            redact_hashes(&err.log_text())
+        );
+    }
     let mut result = list_result(&record.destination_hash, prefix, outcome);
     Naming::of_runtime(runtime).name(
         &mut result,
@@ -1837,6 +1861,9 @@ async fn handle_fetch(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         None => None,
         Some(hex) => Some(parse_sha256(hex)?),
     };
+    if canonical_hash(peer).is_none() {
+        return Ok(not_a_session_hash("peer", peer, "Nothing was fetched."));
+    }
     let (destination, record) = match trusted_peer(runtime, peer).await {
         Ok(trusted) => trusted,
         Err(refusal) => return Ok(refusal),
@@ -1861,6 +1888,13 @@ async fn handle_fetch(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     };
     let outcome = runtime.fetch_file(route, path, if_sha256).await;
     let peer = &record.destination_hash;
+    if let Err(err) = &outcome {
+        debug!(
+            "Mesh tool fetch from {} failed: {}",
+            short(peer),
+            redact_hashes(&err.log_text())
+        );
+    }
     let reason = match outcome {
         Ok(Fetched::NotShared) => not_shared_reason(
             runtime.memory(),
@@ -1889,7 +1923,17 @@ async fn handle_request_access(slot: &MeshSlot, args: &Value) -> Result<Value> {
                 .collect::<Option<Vec<String>>>()
         })
         .ok_or_else(|| anyhow!("'paths' must be an array of path strings"))?;
+    if canonical_hash(peer).is_none() {
+        return Ok(not_a_session_hash("peer", peer, "Nothing was requested."));
+    }
     let outcome = slot.request_access(peer, &paths, reason, None).await;
+    if let Err(err) = &outcome {
+        debug!(
+            "Mesh tool access request to {} failed: {}",
+            short(peer),
+            redact_hashes(&err.log_text())
+        );
+    }
     let departed = outcome.as_ref().ok().and_then(|outcome| outcome.departed);
     let lead = outcome.as_ref().err().and_then(access_error_lead);
     let mut result = access_result(outcome);
@@ -2046,7 +2090,7 @@ fn list_result(
 
 /// The cursor is the peer's own text and goes into a `next_action` the model will
 /// repeat, so only the unreserved URI alphabet passes.
-fn is_cursor_shaped(cursor: &str) -> bool {
+pub(crate) fn is_cursor_shaped(cursor: &str) -> bool {
     (1..=64).contains(&cursor.len())
         && cursor
             .bytes()
@@ -2147,7 +2191,7 @@ async fn fetch_result(
             "peer": peer,
             "path": path,
             "limit": limit,
-            "message": format!("The peer serves files of at most {limit} bytes and this one is larger. Ask the peer's human for a smaller copy, or for the file another way."),
+            "message": format!("That session serves files of at most {limit} bytes and this one is larger. Ask its user for a smaller copy, or for the file another way."),
         }),
         Err(err) => fetch_error(&err, FetchVerb::Fetch),
     }
@@ -2310,7 +2354,7 @@ fn access_result(outcome: Result<AccessRequestOutcome, AccessError>) -> Value {
         AccessOutcome::Pending => {
             result["next_action"] = json!(collect_next_action(&outcome.id));
             result["message"] = json!(format!(
-                "The peer's human has not decided yet. The decision arrives as a system_notifications entry; collect it with mesh__collect --id {}.",
+                "That session's user has not decided yet. The decision arrives as a system_notifications entry; collect it with mesh__collect --id {}.",
                 outcome.id
             ));
         }
@@ -4365,11 +4409,9 @@ mod tests {
         assert_eq!(escalated["status"], "escalated", "{escalated}");
         assert_eq!(escalated["id"], "q1");
         assert_eq!(escalated["next_action"], "mesh__collect --id q1");
-        assert!(
-            escalated["message"]
-                .as_str()
-                .unwrap()
-                .contains("human has been asked"),
+        assert_eq!(
+            escalated["message"],
+            "That session's user has been asked; the question stays open. Collect again later.",
             "{escalated}"
         );
         assert!(slot.correlations().is_open("q1"), "the question waits on");
@@ -5446,12 +5488,9 @@ mod tests {
         let too_large = fetched(Ok(Fetched::TooLarge { limit: 4096 })).await;
         assert_eq!(too_large["status"], "too_large");
         assert_eq!(too_large["limit"], 4096);
-        let message = too_large["message"].as_str().unwrap();
-        assert!(
-            message.ends_with(
-                " Ask the peer's human for a smaller copy, or for the file another way."
-            ),
-            "{message}"
+        assert_eq!(
+            too_large["message"],
+            "That session serves files of at most 4096 bytes and this one is larger. Ask its user for a smaller copy, or for the file another way."
         );
 
         let not_modified = fetched(Ok(Fetched::NotModified { sha256: [0xcd; 32] })).await;
@@ -5463,7 +5502,7 @@ mod tests {
         assert_eq!(not_served["kind"], "not_served");
         let message = not_served["message"].as_str().unwrap();
         assert!(
-            message.starts_with("peer does not share files"),
+            message.starts_with("that session does not share files"),
             "{message}"
         );
         assert!(message.contains("mesh__request_access"), "{message}");
@@ -5472,22 +5511,22 @@ mod tests {
             (
                 FileFetchError::UnknownStatus,
                 "unknown_status",
-                "peer sent an unknown status",
+                "that session sent an unknown status",
             ),
             (
                 FileFetchError::Corrupt,
                 "corrupt",
-                "the peer's bytes do not match the hash it sent",
+                "that session's bytes do not match the hash it sent",
             ),
             (
                 FileFetchError::Malformed("size"),
                 "malformed",
-                "the peer's reply could not be read: `size`",
+                "that session's reply could not be read: `size`",
             ),
             (
                 FileFetchError::Oversize { len: 9 },
                 "oversize",
-                "the peer sent 9 bytes, above the 4194304-byte limit; discarded",
+                "that session sent 9 bytes, above the 4194304-byte limit; discarded",
             ),
         ] {
             let result = fetched(Err(err)).await;
@@ -5701,14 +5740,14 @@ mod tests {
         assert_eq!(unknown["kind"], "unknown_status", "{unknown}");
         assert_eq!(
             unknown["message"],
-            "The peer did not list its shares: peer sent an unknown status. Call mesh__list again; if it repeats, the peer may run a different Coyote.",
+            "The peer did not list its shares: that session sent an unknown status. Call mesh__list again; if it repeats, the peer may run a different Coyote.",
             "{unknown}"
         );
         let malformed = list_result(&peer, None, Err(FileFetchError::Malformed("entries")));
         assert_eq!(malformed["kind"], "malformed", "{malformed}");
         assert_eq!(
             malformed["message"],
-            "The peer did not list its shares: the peer's reply could not be read: `entries`. Call mesh__list again; if it repeats, the peer may run a different Coyote.",
+            "The peer did not list its shares: that session's reply could not be read: `entries`. Call mesh__list again; if it repeats, the peer may run a different Coyote.",
             "{malformed}"
         );
     }
@@ -5761,11 +5800,9 @@ mod tests {
         assert_eq!(pending["id"], "req-1");
         assert_eq!(pending["via"], "direct");
         assert_eq!(pending["next_action"], "mesh__collect --id req-1");
-        assert!(
-            pending["message"]
-                .as_str()
-                .unwrap()
-                .contains("mesh__collect --id req-1")
+        assert_eq!(
+            pending["message"],
+            "That session's user has not decided yet. The decision arrives as a system_notifications entry; collect it with mesh__collect --id req-1."
         );
         assert!(pending.get("expires").is_none());
         assert!(pending.get("reason").is_none());
@@ -5814,7 +5851,7 @@ mod tests {
         let refusal =
             RemoteRefusal::new(&hex_lower(&[0xbb; 16]), Some("Bea"), hex_lower(&[0xaa; 16]));
         let expected_action = format!(
-            "Nothing on your side unblocks it: ask the person at \"Bea\" (bbbbbbbb) to run .mesh access trust session {}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
+            "Nothing on your side unblocks it: ask the user of \"Bea\" (bbbbbbbb) to run .mesh access trust session {}; unless they blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side).",
             "aa".repeat(16)
         );
         let sent = send_error(&SendError::NotTrustedByPeer(refusal.clone()));
@@ -7698,7 +7735,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("no status_error: {row}"));
             assert!(
                 error.starts_with("no answer from \"")
-                    && error.contains(&format!("\" ({}): ", short(&to))),
+                    && error.contains(&format!("/ {}\": ", short(&to))),
                 "{error}"
             );
             assert!(
@@ -8428,7 +8465,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            assert_eq!(collected["kind"], "asked_by_another_session", "{collected}");
+            assert_eq!(collected["kind"], "sent_by_another_session", "{collected}");
             assert_eq!(collected["thread"], "t-sibling", "{collected}");
             assert_eq!(
                 collected["message"],
@@ -8464,6 +8501,64 @@ mod tests {
             let message = refused["message"].as_str().unwrap();
             assert!(message.contains("full session hash"), "{refused}");
             assert!(!message.contains("not trusted"), "{refused}");
+            assert!(ctx.app.mesh.correlations().list().is_empty());
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+        }
+
+        /// Every tool that names a session takes its full hash: ask, list, fetch and
+        /// request_access answer a short `to` or `peer` as mesh__send does, asking for the
+        /// full session hash, never as an untrusted session, and open nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn every_tool_asks_a_short_hash_for_the_full_session_hash() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-short-hash-everywhere");
+            let started = started_runtime("mesh-tool-short-hash-everywhere").await;
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+            for (tool, field, args, nothing) in [
+                (
+                    "ask",
+                    "to",
+                    json!({"to": "abababab", "message": "hi"}),
+                    "Nothing was asked.",
+                ),
+                (
+                    "list",
+                    "peer",
+                    json!({"peer": "abababab"}),
+                    "Nothing was listed.",
+                ),
+                (
+                    "fetch",
+                    "peer",
+                    json!({"peer": "abababab", "path": "docs/a.md"}),
+                    "Nothing was fetched.",
+                ),
+                (
+                    "request_access",
+                    "peer",
+                    json!({"peer": "abababab", "paths": ["docs/a.md"], "reason": "to read it"}),
+                    "Nothing was requested.",
+                ),
+            ] {
+                let refused =
+                    handle_mesh_tool(&mut ctx, &format!("{MESH_FUNCTION_PREFIX}{tool}"), &args)
+                        .await
+                        .unwrap();
+
+                assert_eq!(refused["status"], "error", "{tool}: {refused}");
+                assert_eq!(refused["kind"], "not_a_session_hash", "{tool}: {refused}");
+                assert_eq!(
+                    refused["message"],
+                    format!(
+                        "'abababab' is not a full session hash; `{field}` takes the session's full session hash, its `destination` in mesh__peers, never a name or an 8-character prefix. {nothing}"
+                    ),
+                    "{tool}: {refused}"
+                );
+            }
             assert!(ctx.app.mesh.correlations().list().is_empty());
 
             assert!(ctx.app.mesh.stop().await.unwrap());
@@ -9541,6 +9636,70 @@ mod tests {
                 live.stub.stop().await;
             }
 
+            /// Sessions `a` and `c` of one identity on one cache dir: a message `c` sent,
+            /// read from `c`'s own pending file, is reported to `a`'s collect as a message
+            /// `c` sent, with its own kind and the thread its reply lands in, never as a
+            /// question another session asked.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn collecting_a_message_a_running_sibling_sent_names_it_and_its_thread() {
+                use crate::config::Session;
+                use crate::mesh::test_support::{mesh_paths, private_config};
+                use crate::mesh::{MeshRuntime, NodeOptions};
+
+                let mut live = trusted_stub("mesh-tool-collect-running-sibling").await;
+                let mut session = Session::default();
+                session.set_name("c".to_string());
+                let c = MeshRuntime::start(
+                    &private_config(live.stub.port()),
+                    true,
+                    &mut session,
+                    mesh_paths(&live.started.tmp),
+                    NodeOptions::default(),
+                )
+                .await
+                .unwrap();
+                let mut c_ctx = plain_ctx();
+                c_ctx.app.mesh.install(c.clone()).unwrap();
+                live.stub.trust_identity(c.fingerprint());
+                live.stub.wait_to_be_filed(&c.peers(), &live.to).await;
+
+                let sent = handle_mesh_tool(
+                    &mut c_ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}send"),
+                    &json!({"to": live.to, "message": "fyi"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(sent["status"], "sent", "{sent}");
+                let id = sent["id"].as_str().unwrap().to_string();
+                let thread = sent["thread"].as_str().unwrap().to_string();
+                assert!(c_ctx.app.mesh.correlations().is_open(&id));
+
+                let collected = handle_mesh_tool(
+                    &mut live.ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}collect"),
+                    &json!({"id": id, "timeout_secs": 1}),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(collected["status"], "error", "{collected}");
+                assert_eq!(collected["kind"], "sent_by_another_session", "{collected}");
+                assert_eq!(collected["thread"], thread.as_str(), "{collected}");
+                assert_eq!(
+                    collected["message"],
+                    format!(
+                        "'{id}' is a message sent by your session 'c', not this one, so it has nothing to collect; its reply lands in that session's inbox in thread {thread}. Nothing needs to be done here."
+                    ),
+                    "{collected}"
+                );
+
+                assert!(c_ctx.app.mesh.stop().await.unwrap());
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
             /// A resumed session keeps its instance, so after a stop and a start under the
             /// same session it continues the thread its earlier question opened.
             #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9738,6 +9897,60 @@ mod tests {
                 assert_eq!(refused["kind"], "unknown_thread", "{refused}");
                 assert_eq!(held_threads(&live), vec![thread]);
                 assert_eq!(live.stub.seen().len(), 2, "{:?}", live.stub.seen());
+
+                assert!(live.ctx.app.mesh.stop().await.unwrap());
+                live.stub.stop().await;
+            }
+
+            /// A message sent into a thread this session sent, without `in_reply_to`, opens
+            /// a correlation under its own id, in that thread and to that session, so its
+            /// reply lands in the thread as the root's did; the root's stays as it was.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+            #[serial]
+            async fn a_threaded_send_opens_a_correlation_under_its_own_id() {
+                let mut live = trusted_stub("mesh-tool-thread-send-correlation").await;
+                let to = live.to.clone();
+                let root = send_in(&mut live, json!({"to": to, "message": "hello"})).await;
+                assert_eq!(root["status"], "sent", "{root}");
+                let thread = root["thread"].as_str().unwrap().to_string();
+
+                let threaded = send_in(
+                    &mut live,
+                    json!({"to": to, "message": "and also", "thread": thread}),
+                )
+                .await;
+
+                assert_eq!(threaded["status"], "sent", "{threaded}");
+                assert_eq!(threaded["thread"], thread.as_str(), "{threaded}");
+                let id = threaded["id"].as_str().unwrap().to_string();
+                assert_ne!(id, thread);
+                let opened = live
+                    .ctx
+                    .app
+                    .mesh
+                    .correlations()
+                    .get(&id)
+                    .expect("the threaded message opens a correlation under its own id");
+                assert_eq!(opened.record.kind, CorrelationKind::Message);
+                assert_eq!(opened.record.thread, thread);
+                assert_eq!(opened.record.peer_destination, to);
+                assert_eq!(
+                    live.ctx.app.mesh.correlations().thread_of(&id).as_deref(),
+                    Some(thread.as_str())
+                );
+                let mut open: Vec<String> = live
+                    .ctx
+                    .app
+                    .mesh
+                    .correlations()
+                    .list()
+                    .into_iter()
+                    .map(|correlation| correlation.record.id)
+                    .collect();
+                open.sort();
+                let mut expected = vec![thread.clone(), id.clone()];
+                expected.sort();
+                assert_eq!(open, expected, "one correlation per message sent");
 
                 assert!(live.ctx.app.mesh.stop().await.unwrap());
                 live.stub.stop().await;
@@ -9982,6 +10195,88 @@ mod tests {
             live.stub.stop().await;
         }
 
+        /// A refusal each tool tells the model by the session's name is logged by its short
+        /// hash alone: the debug line send, list, fetch, request_access and a status card
+        /// of mesh__peers write carry the refusal sentence and never the names the user
+        /// gave that user and session.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn every_tool_logs_a_named_refusal_without_the_name() {
+            use crate::testing::{debug_snapshot, install_log_collector};
+
+            install_log_collector();
+            let mut live = trusted_stub("mesh-tool-refusal-log-name").await;
+            let runtime = live.started.runtime.clone();
+            let to = live.to.clone();
+            let d8 = short(&to).to_string();
+            let identity = live.stub.identity_hex();
+            live.stub.know_identity(runtime.fingerprint());
+            runtime
+                .trust()
+                .set_person_alias(&identity, Some("Zelda"), &[])
+                .unwrap();
+            runtime
+                .trust()
+                .set_session_alias(&identity, &to, Some("hyrule"), &[])
+                .unwrap();
+            let mine = |line: &String| {
+                line.starts_with("Mesh tool ")
+                    && line.contains(&format!("{d8} refused the request"))
+            };
+            let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+
+            let calls = [
+                ("send", json!({"to": to, "message": "hello"})),
+                ("fetch", json!({"peer": to, "path": SHARED_PATH})),
+                ("list", json!({"peer": to, "prefix": "docs/"})),
+                (
+                    "request_access",
+                    json!({"peer": to, "paths": ["docs/plan.md"], "reason": "to read the plan"}),
+                ),
+                ("peers", json!({"with_status": true})),
+            ];
+            for (tool, args) in calls {
+                let result = handle_mesh_tool(
+                    &mut live.ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}{tool}"),
+                    &args,
+                )
+                .await
+                .unwrap();
+                assert!(
+                    result.to_string().contains("Zelda / hyrule"),
+                    "{tool} tells the model the name: {result}"
+                );
+            }
+
+            let logged: Vec<String> = debug_snapshot()
+                .into_iter()
+                .filter(|line| mine(line))
+                .skip(before)
+                .collect();
+            for lead in [
+                format!("Mesh tool send to {d8} failed: "),
+                format!("Mesh tool fetch from {d8} failed: "),
+                format!("Mesh tool list of {d8} failed: "),
+                format!("Mesh tool access request to {d8} failed: "),
+                format!("Mesh tool peers: the status card of {d8} was not read: "),
+            ] {
+                assert!(
+                    logged.iter().any(|line| line.starts_with(&lead)),
+                    "no line opens {lead:?}: {logged:#?}"
+                );
+            }
+            for line in &logged {
+                assert!(
+                    !line.contains("Zelda") && !line.contains("hyrule"),
+                    "a log line names the session: {line}"
+                );
+            }
+
+            assert!(live.ctx.app.mesh.stop().await.unwrap());
+            live.stub.stop().await;
+        }
+
         /// A peer whose own gate knows this node's identity but has not trusted the
         /// instance asking answers `NoAccess` on the wire. Every tool that asks it says in
         /// `message` which side has to act, in the one wording: the peer by its announced
@@ -10003,10 +10298,10 @@ mod tests {
 
             let i8 = short(&live.stub.identity_hex()).to_string();
             let refusal = format!(
-                "\"{i8} / {d8}\" ({d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                "\"{i8} / {d8}\" refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
             );
             let next_action = format!(
-                "Nothing on your side unblocks it: ask the person at \"{i8} / {d8}\" ({d8}) to run .mesh access trust session {own}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
+                "Nothing on your side unblocks it: ask the user of \"{i8} / {d8}\" to run .mesh access trust session {own}; unless they blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
             );
 
             let calls = [
@@ -10100,7 +10395,7 @@ mod tests {
             assert!(!message.contains("Evil"), "{message:?}");
             assert!(
                 message.contains(&format!(
-                    "\" ({d8}) refused the request: it has not trusted this session ({own})."
+                    "/ {d8}\" refused the request: it has not trusted this session ({own})."
                 )),
                 "{message:?}"
             );
@@ -10173,10 +10468,10 @@ mod tests {
             let cee_d8 = short(&cee.destination_hex()).to_string();
             let cee_i8 = short(&cee.identity_hex()).to_string();
             let refusal = format!(
-                "\"{cee_i8} / {cee_d8}\" ({cee_d8}) refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
+                "\"{cee_i8} / {cee_d8}\" refused the request: it has not trusted this session ({own}). Its user can run .mesh access trust session {own} (or .mesh access unblock session {own} if they blocked this session). (You do trust them.)"
             );
             let next_action = format!(
-                "Nothing on your side unblocks it: ask the person at \"{cee_i8} / {cee_d8}\" ({cee_d8}) to run .mesh access trust session {own}; unless that peer blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
+                "Nothing on your side unblocks it: ask the user of \"{cee_i8} / {cee_d8}\" to run .mesh access trust session {own}; unless they blocked this session or saw your key change, the request already reached them as a request to be trusted (.mesh access requests on their side)."
             );
 
             let result = handle_mesh_tool(
@@ -10265,7 +10560,7 @@ mod tests {
                 not_served["message"]
                     .as_str()
                     .unwrap()
-                    .starts_with("peer does not share files"),
+                    .starts_with("that session does not share files"),
                 "{not_served}"
             );
 
@@ -12523,7 +12818,7 @@ mod tests {
         /// The cursor from `next` pages; an empty or whitespace cursor is page 1 (nil on
         /// the wire); a shaped-but-unknown cursor is sent and the peer starts over; a
         /// cursor over the 64-byte wire cap is refused by the peer and the model sees a
-        /// typed `transport` error, never "peer does not share files", never a panic. The
+        /// typed `transport` error, never "that session does not share files", never a panic. The
         /// whole exchange is one `mesh__list` call.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
