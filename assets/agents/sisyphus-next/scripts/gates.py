@@ -810,6 +810,12 @@ def record_subtasks(state):
         # next_subtask rejects a list holding a duplicate, so one is never sealed
         ledger(state, u, f"subtasks: dropped {len(subtasks) - len(unique)} exact duplicate subtask(s) before sealing")
         subtasks = unique
+    if not subtasks and not str(state.get("plan_shaped_reason") or "").strip() and not truthy(state.get("top_level")):
+        u["failure_reason"] = ("plan_subtasks returned an empty subtask list and no plan-shaped reason; nothing was "
+                               "planned or started")
+        ledger(state, u, f"subtasks: {u['failure_reason']}")
+        u["_next"] = "end_blocked"
+        return u
     if not subtasks or len(subtasks) > SUBTASK_MAX:
         why = state.get("plan_shaped_reason") or f"{len(subtasks)} subtasks (bound: {SUBTASK_MAX})"
         if truthy(state.get("top_level")):
@@ -817,6 +823,7 @@ def record_subtasks(state):
             ledger(state, u, f"subtasks: {len(subtasks)} planned, bound {SUBTASK_MAX}: {_one_line(why)}; asking")
             return _sizing_verdict(state, u, why, planned=[s.get("title") or s.get("outcome") or "" for s in subtasks])
         u["redirect_reason"] = f"Plan-shaped by A11: {why}. This wants an architect run."
+        ledger(state, u, f"subtasks: {len(subtasks)} planned, bound {SUBTASK_MAX}: {_one_line(why)}; redirected")
         u["_next"] = "end_redirect"
         return u
     lines = ["# In-run subtasks (A11)", ""]

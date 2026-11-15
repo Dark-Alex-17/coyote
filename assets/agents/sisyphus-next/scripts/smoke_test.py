@@ -253,6 +253,11 @@ u = gates.record_subtasks(base_state(subtasks=subs))
 check("record_subtasks: up to SUBTASK_MAX recorded", u["_next"] == "next_subtask" and os.path.exists(os.path.join(base_state()["run_dir"], "tasklog.md")))
 u = gates.record_subtasks(base_state(subtasks=subs + [{"title": "s7", "outcome": "o", "acceptance_criteria": []}], top_level=False))
 check("record_subtasks: B2 more than SUBTASK_MAX in a delegated run -> end_redirect (plan-shaped)", u["_next"] == "end_redirect")
+check("record_subtasks: a redirect is ledgered with its reason", any("redirected" in d for d in u.get("decisions", [])))
+u = gates.record_subtasks(base_state(subtasks=[], top_level=False))
+check("record_subtasks: an empty list with no plan-shaped reason in a delegated run -> end_blocked with the reason, ledgered",
+      u["_next"] == "end_blocked" and "empty subtask list" in u.get("failure_reason", "") and "redirect_reason" not in u
+      and any("empty subtask list" in d for d in u.get("decisions", [])), u)
 u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="cross-PR", top_level=False))
 check("record_subtasks: empty in a delegated run -> end_redirect with reason", u["_next"] == "end_redirect" and "cross-PR" in u["redirect_reason"])
 u = gates.record_subtasks(base_state(subtasks=[], plan_shaped_reason="needs cross-PR sequencing", top_level=True))
