@@ -170,6 +170,8 @@ initial_state:
   clarify_extensions: 0
   needs_oracle: false
   oracle_question: ''
+  assess_needs_oracle: false
+  assess_oracle_question: ''
   architecture_scale: false
   has_spec: false
   spec_text: ''
@@ -220,6 +222,7 @@ initial_state:
   oracle_consulted: false
   oracle_result: ''
   architecture_proposal: ''
+  proposal_confirmed: false
   # --- escalation ladder ---
   escalation: {}
   ask_question: ''
@@ -249,24 +252,32 @@ initial_state:
   discussion_message: ''
   settled_answer: ''
   autonomous_digest: []
+  autonomous_kinds: []
   decisions: []
   # --- implementation ---
   coder_brief: {}
   coder_prompt: ''
   expected_files: []
   scope_breach: ''
+  scope_confirmed: false
   fix_instructions: ''
+  fix_source: ''
+  fix_note: ''
+  fix_items: []
   fix_round: 0
   coder_result: ''
   coder_sentinel: ''
   fix_strikes: 0
   rejected_rounds: 0
+  rejected_cap_resets: 0
   strikeout_rounds: 0
+  strikeout_stash: ''
   diagnosis: ''
   last_coder_error: ''
   design_block: ''
   design_asks: []
   design_ask_rounds: 0
+  design_ask_pending_done: false
   oracle_retries: 0
   design_decisions: []
   inbox_instructions: ''
@@ -279,6 +290,7 @@ initial_state:
     grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'
   debt_items: []
   debt_left_behind: []
+  debt_scan_failures: {}
   debt_rounds: 0
   diff_stat: ''
   changed_files: []
@@ -320,16 +332,24 @@ initial_state:
   publish_retries: 0
   publish_checks: []
   ci_owner: false
+  ci_watch_note: ''
   ci_polls: 0
   ci_poll_fails: 0
   ci_status: ''
+  ci_checks: []
+  ci_failing: []
+  ci_green_by: ''
   ci_started_at: 0
   ci_evidence: ''
   ci_diagnosis: ''
   ci_reruns: {}
+  ci_rerun_ids: []
   ci_fix_strikes: 0
   flip_ready: false
+  pr_ready_confirmed: false
+  pr_ready_detail: ''
   ci_polls_run: 0
+  ci_poll_budget: 0
   pr_ref: ''
   pr_review_status: ''
   pr_review_rounds: 0

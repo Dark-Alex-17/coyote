@@ -4290,6 +4290,39 @@ check("caps: initial_state seeds apply_reasks next to reask_rounds, and the audi
 check("caps: initial_state seeds clarify_extensions and sizing_extensions next to their round counters",
       re.search(r"(?m)^  clarify_rounds: 0\n  clarify_extensions: 0$", _initial) is not None
       and re.search(r"(?m)^  sizing_rounds: 0\n  sizing_extensions: 0$", _initial) is not None)
+
+
+def _written_and_read_back(src, graph):
+    """State keys gates.py writes into its update dict `u` and reads back through state.get, state[...], the
+    report's g(...) or a {{key}} template in graph.yaml."""
+    written, read = set(), set(re.findall(r"\{\{(\w+)\}\}", graph))
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "u" and isinstance(node.value, ast.Dict):
+                    written.update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+                elif isinstance(t, ast.Subscript) and getattr(t.value, "id", "") == "u" and isinstance(t.slice, ast.Constant):
+                    written.add(t.slice.value)
+        elif isinstance(node, ast.Call):
+            first = node.args[0] if node.args else None
+            owner = getattr(node.func, "value", None)
+            if (getattr(node.func, "attr", "") == "update" and getattr(owner, "id", "") == "u"
+                    and isinstance(first, ast.Dict)):
+                written.update(k.value for k in first.keys if isinstance(k, ast.Constant))
+            elif isinstance(first, ast.Constant) and (
+                    (getattr(node.func, "attr", "") == "get" and getattr(owner, "id", "") == "state")
+                    or getattr(node.func, "id", "") == "g"):
+                read.add(first.value)
+        elif (isinstance(node, ast.Subscript) and getattr(node.value, "id", "") == "state"
+              and isinstance(node.slice, ast.Constant) and isinstance(node.ctx, ast.Load)):
+            read.add(node.slice.value)
+    return {k for k in written & read if isinstance(k, str) and not k.startswith("_")}
+
+
+_read_back = _written_and_read_back(open(os.path.join(HERE, "gates.py"), encoding="utf-8").read(), _graph_text)
+_unseeded = sorted(_read_back - set(re.findall(r"(?m)^  (\w+):", _initial)) - set(_vars))
+check("initial_state: every state key the gates write and read back is seeded (variables aside)",
+      len(_read_back) > 50 and not _unseeded, _unseeded)
 check("caps: the final whole-task review resets oracle_retries",
       gates._start_final_review(base_state(subtasks=subs, oracle_retries=RERUN_ONCE), {}, len(subs))
       .get("oracle_retries") == 0)

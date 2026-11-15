@@ -3384,6 +3384,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "apply_reasks",
     "ci_fix_strikes",
+    "ci_poll_budget",
     "ci_poll_fails",
     "ci_polls",
     "ci_polls_run",
@@ -3406,6 +3407,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "pr_review_watch_polls",
     "publish_retries",
     "reask_rounds",
+    "rejected_cap_resets",
     "rejected_rounds",
     "review_rounds",
     "sizing_extensions",
