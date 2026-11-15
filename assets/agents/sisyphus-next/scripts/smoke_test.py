@@ -1327,6 +1327,69 @@ finally:
     shutil.rmtree(os.path.join(REPO, "plans"))
     if os.path.exists(os.path.join(REPO, "untracked.txt")):
         os.remove(os.path.join(REPO, "untracked.txt"))
+
+# ---------------------------------------------------------------- criterion commands declared as verification runs
+CC_DIR = os.path.join(TMP, "criterion-commands")
+
+
+def cc_exe(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(path, 0o755)
+
+
+cc_exe(os.path.join(CC_DIR, "tools", "check"))
+cc_exe(os.path.join(TMP, "outside", "tool"))
+
+
+def cc_row(name, text, want, declared=("true",)):
+    got = _lib.criterion_commands(text, CC_DIR, list(declared))[0]
+    check(name, got == want, got)
+
+
+cc_row("criterion_commands: `rm -rf x` passes -> dropped, rm is not a declared program", "- `rm -rf x` passes\n", [])
+cc_row("criterion_commands: `sh -c 'x'` passes -> dropped for its quotes even with sh declared",
+       "- `sh -c 'x'` passes\n", [], declared=("true", "sh run.sh"))
+cc_row("criterion_commands: `git grep -Oecho -e a` passes -> dropped, grep is not read-only and -O runs a program",
+       "- `git grep -Oecho -e a` passes\n", [])
+cc_row("criterion_commands: `git diff -Oecho` and `git log --ext-diff` pass -> dropped for the unsafe argument",
+       "- `git diff -Oecho --exit-code` and `git log --ext-diff -p` pass\n", [])
+cc_row("criterion_commands: `git push origin x` passes -> dropped even when a declared command is git",
+       "- `git push origin x` passes\n", [], declared=("git diff --check",))
+cc_row("criterion_commands: `../outside/tool run` passes -> dropped, the executable is outside cwd",
+       "- `../outside/tool run` passes\n", [])
+cc_row("criterion_commands: `./tools/check run` passes -> kept, an executable inside cwd",
+       "- `./tools/check run` passes\n", ["./tools/check run"])
+cc_row("criterion_commands: a declared program passes -> kept; a bare program or a missing path is not",
+       "- `true x` passes, `true` alone passes, `./missing.sh run` passes\n", ["true x"])
+cc_row("criterion_commands: a NAME=value prefix is dropped, on git and on a declared program alike",
+       "- `GIT_EXTERNAL_DIFF=rm git diff --exit-code -- f` and `PATH=. true x` and `LD_PRELOAD=x.so true y` pass\n", [])
+cc_row("criterion_commands: `git status --short` is clean -> dropped, its exit does not decide the criterion",
+       "- `git status --short` is clean\n", [])
+cc_row("criterion_commands: `true --bad` exits 2 -> dropped, the criterion expects a failing exit",
+       "- `true --bad` exits 2\n", [])
+cc_row("criterion_commands: a line stating both a pass and a failure -> dropped", "- `true x` passes, `true y` fails\n", [])
+cc_row("criterion_commands: a read-only git span that writes a file through --output is dropped",
+       "- `git diff --output=x.patch` and `git diff --exit-code -- a` pass\n", ["git diff --exit-code -- a"])
+cc_many = "".join(f"- `true a{i}` passes\n" for i in range(12)) + "- `true a0` passes\n"
+check("criterion_commands: at most 8 by default and the cap honoured, the first ones kept and the rest counted once each",
+      (_lib.criterion_commands(cc_many, CC_DIR, ["true"]), _lib.criterion_commands(cc_many, CC_DIR, ["true"], cap=3))
+      == (([f"true a{i}" for i in range(8)], 4), (["true a0", "true a1", "true a2"], 9)))
+CC_DIFF = f"git diff --exit-code {BASE} -- f"
+CC_SUBS = [{"title": "one", "outcome": "o1", "acceptance_criteria": [f"`{CC_DIFF}` passes"]},
+           {"title": "two", "outcome": "o2", "acceptance_criteria": ["AC2"]}]
+u = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, subtask_changed_files=["f"],
+                                           verification_commands='["true x"]'))
+check("build_gauntlet: a subtask criterion's exit-code git diff is declared after the brief's commands and ledgered",
+      json.loads(u["review_verification_commands"]) == ["true x", CC_DIFF]
+      and f"verify: declared 1 criterion command(s) as verification runs: {CC_DIFF}" in u["decisions"], u)
+u = gates.build_gauntlet_prompt(base_state(spec_text="AC1: hello endpoint", verification_commands='["true x"]'))
+check("build_gauntlet: no command in the criteria -> review_verification_commands is verification_commands",
+      u["review_verification_commands"] == '["true x"]' and not any(d.startswith("verify:") for d in u["decisions"]), u)
+u = gates.build_gauntlet_prompt(base_state(spec_text=f"- `{CC_DIFF}` passes", verification_commands="run the suite"))
+check("build_gauntlet: a verification_commands that is not a JSON list passes through unchanged",
+      u["review_verification_commands"] == "run the suite" and not any(d.startswith("verify:") for d in u["decisions"]), u)
 passed = ("GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | PASS, 0 critical |\n"
           "| adversary | GREEN | CONFORMS |\n| security | GREEN (attention) | PASS (attention items) |\n| probe | SKIPPED | not selected |\n"
           "| debris | GREEN | clean |\n\n## Human attention required\n- check X\n")

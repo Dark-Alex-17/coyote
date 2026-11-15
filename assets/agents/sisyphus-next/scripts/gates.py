@@ -30,7 +30,7 @@ from _lib import (  # noqa: E402
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
-    set_frontmatter,
+    set_frontmatter, criterion_commands,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
     note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot, split_option_reply,
@@ -3281,6 +3281,21 @@ def build_gauntlet_prompt(state):
             if amended:
                 spec += ("\n\nSubtask criteria the user amended during the run (settled rulings; the parent criteria "
                          "above are unchanged):\n" + "\n".join(f"- {a}" for a in amended))
+    cmds = state.get("verification_commands")
+    cmds = "[]" if cmds is None else cmds
+    try:
+        arr = json.loads(cmds)
+    except (TypeError, json.JSONDecodeError):
+        arr = None
+    if isinstance(arr, list):
+        declared = [c.strip() for c in arr if isinstance(c, str)]
+        kept, capped = criterion_commands(spec, root, declared)
+        extra = [c for c in kept if c not in declared]
+        if extra:
+            cmds = json.dumps(arr + extra)
+            over = f" ({capped} more dropped by the cap)" if capped else ""
+            ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
+    u["review_verification_commands"] = cmds
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if dropped or as_list(state.get("publish_criteria")) or _publish_asks(state)["commit"]:

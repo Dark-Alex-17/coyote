@@ -177,6 +177,7 @@ initial_state:
   security_posture: 'standard'
   posture_reason: ''
   verification_commands: '[]'
+  review_verification_commands: '[]'
   local_run_recipe: ''
   git_actions: {}
   publish_criteria: []
@@ -1829,7 +1830,7 @@ nodes:
     prompt: |
       {{gauntlet_prompt}}
     inputs:
-      verification_commands: '{{verification_commands}}'
+      verification_commands: '{{review_verification_commands}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'

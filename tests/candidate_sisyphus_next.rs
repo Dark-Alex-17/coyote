@@ -3064,6 +3064,90 @@ fn blocked_after_findings_prior_report_yields_no_settled_lanes_line() {
     );
 }
 
+/// The text of `_lib.py` from `GIT_READ_ONLY = ` through the return of
+/// `criterion_commands`.
+fn criterion_commands_block(agent: &str) -> String {
+    let lib = fs::read_to_string(agents_dir().join(agent).join("scripts/_lib.py")).unwrap();
+    let start = lib
+        .find("\nGIT_READ_ONLY = ")
+        .unwrap_or_else(|| panic!("no GIT_READ_ONLY in {agent}'s _lib.py"))
+        + 1;
+    let def = start
+        + lib[start..]
+            .find("\ndef criterion_commands(")
+            .unwrap_or_else(|| {
+                panic!("no criterion_commands after GIT_READ_ONLY in {agent}'s _lib.py")
+            });
+    let ret = "\n    return out, dropped\n";
+    let end = def
+        + lib[def..]
+            .find(ret)
+            .unwrap_or_else(|| panic!("no return in {agent}'s criterion_commands"))
+        + ret.len();
+    lib[start..end].to_string()
+}
+
+/// The guard that decides which criterion spans may run is architect-next's,
+/// copied as is, so the two candidates cannot drift apart on what they run.
+#[test]
+fn criterion_commands_block_is_identical_to_architect_nexts() {
+    let ours = criterion_commands_block(CANDIDATE);
+    assert!(
+        ours.contains("\ndef _command_args(span):\n")
+            && ours.contains("\ndef _in_tree_executable(prog, cwd):\n"),
+        "{ours}"
+    );
+    assert_eq!(
+        ours,
+        criterion_commands_block("architect-next"),
+        "sisyphus-next's criterion_commands block differs from architect-next's (left: ours)"
+    );
+}
+
+/// A review round declares the exit-code command a criterion quotes as one
+/// more verification run after the brief's own, and ledgers it; the `git
+/// status` span, whose exit does not decide its criterion, stays out.
+#[test]
+fn criterion_commands_are_declared_as_review_verification_runs() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("criterion-commands");
+    let (repo, first, second) = two_commit_repo(&scratch);
+    let diff = format!("git diff --exit-code {first} -- README.md");
+    let state = json!({
+        "project_dir": repo,
+        "git_root": repo,
+        "base_sha": first,
+        "head_sha": second,
+        "run_dir": scratch.0.join("runs").join("x"),
+        "decisions": [],
+        "anomalies": [],
+        "anomalies_log": [],
+        "spec_text": format!("- `git status --short` is clean.\n- The README is unchanged: `{diff}` passes.\n"),
+        "quality_rigor": "production",
+        "round_heads": [],
+        "verification_commands": "[\"true\"]",
+    });
+    let composed = gate_json("build_gauntlet_prompt", &state, &scratch);
+    let declared = composed["review_verification_commands"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no review_verification_commands in {composed}"));
+    let commands: Vec<String> = serde_json::from_str(declared).unwrap();
+    assert_eq!(commands, ["true", diff.as_str()], "{composed}");
+    assert!(
+        composed.get("verification_commands").is_none(),
+        "the brief's own list is left as it was: {composed}"
+    );
+    let line = format!("verify: declared 1 criterion command(s) as verification runs: {diff}");
+    assert!(
+        composed["decisions"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|l| l.as_str() == Some(line.as_str()))),
+        "{composed}"
+    );
+}
+
 /// Feeds `report` to `gates._parse_gauntlet` in a fresh interpreter and
 /// returns the verdict, incomplete list, lane statuses, lane details and
 /// blockers, and the attention text.
