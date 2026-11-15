@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
@@ -716,7 +717,7 @@ impl InboundStore {
                 Some(expired)
             }
             Some(pos) if records[pos].peer_destination != record.peer_destination => bail!(
-                "An open question with id {} belongs to another peer; refusing to store it.",
+                "An open question with id {} belongs to another session; refusing to store it.",
                 record.id
             ),
             Some(pos) if records[pos].kind != record.kind => bail!(
@@ -1026,7 +1027,7 @@ pub(crate) enum Answered {
 
 #[derive(Default)]
 struct CorrelationState {
-    store: Option<PendingStore>,
+    store: Option<Arc<PendingStore>>,
     entries: HashMap<String, Correlation>,
 }
 
@@ -1038,10 +1039,14 @@ type WaitHook = Box<dyn FnOnce(&Correlations) + Send>;
 /// blocking thread first, so the file write never sits on the server's request loop. The
 /// file is a few lines and the write is the only way the question survives the process. A
 /// store write that fails is logged and the in-memory state still moves on, so a full
-/// disk never loses a reply that has already arrived.
+/// disk never loses a reply that has already arrived. The write may wait on a file lock
+/// another process holds, so it runs with `state` let go and readers never wait on it.
 #[derive(Default)]
 pub(crate) struct Correlations {
     state: Mutex<CorrelationState>,
+    /// Held across each change and its store write, taken before `state`, so the writes
+    /// reach the disk in the order the changes were made.
+    store_order: Mutex<()>,
     /// Signalled on every change to an entry, so `wait` re-reads rather than polls.
     changed: Notify,
     /// Runs once inside `wait`, between its state read and its await: the one place a
@@ -1072,6 +1077,7 @@ impl Correlations {
     /// nothing when the file could not be read: the node then serves with no questions
     /// pending and a late reply lands as an ordinary message.
     pub(crate) fn adopt(&self, store: PendingStore, pending: Vec<PendingRecord>) {
+        let _order = self.store_order.lock();
         let mut state = self.state.lock();
         state.entries = pending
             .into_iter()
@@ -1080,7 +1086,7 @@ impl Correlations {
                 (record.id.clone(), Correlation { record, reply })
             })
             .collect();
-        state.store = Some(store);
+        state.store = Some(Arc::new(store));
         drop(state);
         self.changed.notify_waiters();
     }
@@ -1088,6 +1094,7 @@ impl Correlations {
     /// Forgets the store and every question with it, for a node that has stopped: the
     /// records stay on disk for the next install of that instance to reopen.
     pub(crate) fn detach_store(&self) {
+        let _order = self.store_order.lock();
         let mut state = self.state.lock();
         state.store = None;
         state.entries.clear();
@@ -1098,10 +1105,12 @@ impl Correlations {
     /// Files a correlation. The record is written to the store first so a failure there
     /// leaves nothing waiting in memory for a reply the next process would not know.
     pub(crate) fn open(&self, record: PendingRecord) -> Result<()> {
-        let mut state = self.state.lock();
-        if let Some(store) = &state.store {
+        let _order = self.store_order.lock();
+        let store = self.state.lock().store.clone();
+        if let Some(store) = store {
             store.upsert(record.clone(), SystemTime::now())?;
         }
+        let mut state = self.state.lock();
         state.entries.insert(
             record.id.clone(),
             Correlation {
@@ -1148,6 +1157,7 @@ impl Correlations {
     /// answered, or a second `Escalated` reply to one already escalated does not match:
     /// it is an ordinary message.
     pub(crate) fn answer(&self, in_reply_to: &str, reply: PeerMessage) -> Option<Answered> {
+        let _order = self.store_order.lock();
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
         let entry = entries.get_mut(in_reply_to)?;
@@ -1190,27 +1200,33 @@ impl Correlations {
             entry.reply = Some(reply);
             Answered::Collectable
         };
-        if answered == Answered::ClosedMessage {
+        let kept = (answered != Answered::ClosedMessage).then(|| entry.record.clone());
+        if kept.is_none() {
             entries.remove(in_reply_to);
-            if let Some(store) = store
-                && let Err(err) = store.remove(in_reply_to)
-            {
-                warn!(
-                    "Mesh message {in_reply_to} was replied to but could not be removed from disk: {}",
-                    redact_hashes(&format!("{err:#}"))
-                );
-            }
-        } else if let Some(store) = store
-            && let Err(err) = store.upsert(entry.record.clone(), SystemTime::now())
-        {
-            warn!(
-                "Mesh {} {in_reply_to} was answered but the answer could not be recorded on disk: {}",
-                entry.record.kind.noun(),
-                redact_hashes(&format!("{err:#}"))
-            );
         }
+        let store = store.clone();
         drop(state);
         self.changed.notify_waiters();
+        match (store, kept) {
+            (None, _) => {}
+            (Some(store), None) => {
+                if let Err(err) = store.remove(in_reply_to) {
+                    warn!(
+                        "Mesh message {in_reply_to} was replied to but could not be removed from disk: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                }
+            }
+            (Some(store), Some(record)) => {
+                let noun = record.kind.noun();
+                if let Err(err) = store.upsert(record, SystemTime::now()) {
+                    warn!(
+                        "Mesh {noun} {in_reply_to} was answered but the answer could not be recorded on disk: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                }
+            }
+        }
         Some(answered)
     }
 
@@ -1252,10 +1268,14 @@ impl Correlations {
     /// Removes an answered question and returns its reply; `None` leaves an unanswered
     /// question in place.
     pub(crate) fn take_answer(&self, id: &str) -> Option<PeerMessage> {
+        let _order = self.store_order.lock();
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
         let reply = entries.get(id)?.reply.as_ref()?.clone();
         entries.remove(id);
+        let store = store.clone();
+        drop(state);
+        self.changed.notify_waiters();
         if let Some(store) = store
             && let Err(err) = store.remove(id)
         {
@@ -1264,8 +1284,6 @@ impl Correlations {
                 redact_hashes(&format!("{err:#}"))
             );
         }
-        drop(state);
-        self.changed.notify_waiters();
         Some(reply)
     }
 
@@ -1273,6 +1291,7 @@ impl Correlations {
     /// waits on a reply that was never asked for. `true` when such a record with `id` was
     /// there to remove; an answered one stays for `take_answer`.
     pub(crate) fn abandon(&self, id: &str) -> bool {
+        let _order = self.store_order.lock();
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
         let Some(kind) = entries
@@ -1283,6 +1302,9 @@ impl Correlations {
             return false;
         };
         entries.remove(id);
+        let store = store.clone();
+        drop(state);
+        self.changed.notify_waiters();
         if let Some(store) = store
             && let Err(err) = store.remove(id)
         {
@@ -1292,8 +1314,6 @@ impl Correlations {
                 redact_hashes(&format!("{err:#}"))
             );
         }
-        drop(state);
-        self.changed.notify_waiters();
         true
     }
 
@@ -1437,6 +1457,75 @@ mod tests {
             retry_after: None,
             parts: Vec::new(),
             dropped_parts: 0,
+        }
+    }
+
+    /// A store write waits on the file lock another process may hold, and none of it
+    /// waits under the correlations' own lock: while each kind of write is stuck on the
+    /// file lock, a reader on another thread still gets its answer at once, and the
+    /// write lands once the lock is let go.
+    #[test]
+    fn a_store_write_stuck_on_the_file_lock_keeps_no_reader_waiting() {
+        type Step = fn(&Correlations);
+        let tmp = TempDir::new("pending-store-write-unlocked");
+        fn open_q1(correlations: &Correlations) {
+            correlations
+                .open(record("q1", SystemTime::now(), PendingState::Open))
+                .unwrap();
+        }
+        let open: Step = open_q1;
+        let answered: Step = |correlations| {
+            open_q1(correlations);
+            assert!(correlations.answer("q1", reply_to("q1")).is_some());
+        };
+        let cases: [(&str, Step, Step); 4] = [
+            ("open", |_| {}, open),
+            ("answer", open, |correlations| {
+                assert!(correlations.answer("q1", reply_to("q1")).is_some());
+            }),
+            ("take_answer", answered, |correlations| {
+                assert!(correlations.take_answer("q1").is_some());
+            }),
+            ("abandon", open, |correlations| {
+                assert!(correlations.abandon("q1"));
+            }),
+        ];
+        for (write, setup, step) in cases {
+            let store = PendingStore::new(&tmp.path, write);
+            let lock_path = store.path().with_added_extension("lock");
+            let correlations = Arc::new(Correlations::new());
+            correlations.attach_store(store, SystemTime::now()).unwrap();
+            setup(&correlations);
+            fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            held.lock().unwrap();
+
+            let writer = std::thread::spawn({
+                let correlations = Arc::clone(&correlations);
+                move || step(&correlations)
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            let (read, answered) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn({
+                let correlations = Arc::clone(&correlations);
+                move || {
+                    let _ = correlations.get("q1");
+                    let _ = correlations.is_open("q1");
+                    read.send(()).unwrap();
+                }
+            });
+            let read_at_once = answered.recv_timeout(Duration::from_secs(5)).is_ok();
+            held.unlock().unwrap();
+            writer.join().unwrap();
+            reader.join().unwrap();
+
+            assert!(read_at_once, "a reader waited on the stuck `{write}`");
         }
     }
 
@@ -2651,7 +2740,7 @@ mod tests {
         let mut other_peer = inbound("shared", t(1_001));
         other_peer.peer_destination = hex_lower(&[0xee; 16]);
         let err = store.upsert(other_peer, t(1_001)).unwrap_err().to_string();
-        assert!(err.contains("belongs to another peer"), "{err}");
+        assert!(err.contains("belongs to another session"), "{err}");
         assert_eq!(store.get("shared").unwrap(), Some(first.clone()));
 
         let mut same_peer = inbound("shared", t(1_002));

@@ -87,7 +87,7 @@ impl AnnounceAppData {
         }
         if let Some(c) = name.chars().find(|c| is_control_or_invisible(*c)) {
             bail!(
-                "mesh.display_name contains a control or invisible formatting character (U+{:04X}); remove it in config.yaml so peers can read the name",
+                "mesh.display_name contains a control or invisible formatting character (U+{:04X}); remove it in config.yaml so other users can read the name",
                 u32::from(c)
             );
         }

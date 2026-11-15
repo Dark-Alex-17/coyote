@@ -172,7 +172,7 @@ impl PropagationNode {
             }
         };
         let propagation_enabled = slots.get(2).and_then(rmpv::Value::as_bool).ok_or_else(|| {
-            PropagationNodeError::InvalidAnnounce("node state is not a boolean".to_string())
+            PropagationNodeError::InvalidAnnounce("propagation is not a boolean".to_string())
         })?;
         let per_transfer_limit_kb =
             slots.get(3).and_then(rmpv::Value::as_u64).ok_or_else(|| {
@@ -233,11 +233,11 @@ impl fmt::Display for PropagationError {
             Self::StampExhausted => write!(f, "No propagation stamp could be found"),
             Self::StampCostAboveCeiling { cost, max } => write!(
                 f,
-                "The propagation node demands stamp cost {cost}, above the {max} this node will mine"
+                "The propagation node demands stamp cost {cost}, above the {max} this session will mine"
             ),
             Self::Oversize { len, max } => write!(
                 f,
-                "The propagation envelope is {len} bytes, above the node's {max}-byte limit"
+                "The propagation envelope is {len} bytes, above the propagation node's {max}-byte limit"
             ),
             Self::Encode(reason) => write!(f, "The message could not be packed: {reason}"),
             Self::Link(RequestError::Timeout { after, .. }) => write!(
@@ -2263,14 +2263,14 @@ mod tests {
                 ),
                 (
                     PropagationError::StampCostAboveCeiling { cost: 30, max: 26 },
-                    "The propagation node demands stamp cost 30, above the 26 this node will mine",
+                    "The propagation node demands stamp cost 30, above the 26 this session will mine",
                 ),
                 (
                     PropagationError::Oversize {
                         len: 2048,
                         max: 1000,
                     },
-                    "The propagation envelope is 2048 bytes, above the node's 1000-byte limit",
+                    "The propagation envelope is 2048 bytes, above the propagation node's 1000-byte limit",
                 ),
                 (
                     PropagationError::Encode("bad fields".to_string()),

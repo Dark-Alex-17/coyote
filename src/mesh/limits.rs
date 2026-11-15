@@ -95,22 +95,22 @@ impl RefusalReason {
     pub(crate) fn peer_text(self) -> &'static str {
         match self {
             RefusalReason::RateLimited => {
-                "This node has taken as many messages from you as it accepts in an hour; try again when the hour is up."
+                "This session has taken as many messages from you as it accepts in an hour; try again when the hour is up."
             }
             RefusalReason::EnvoyBusy => {
-                "This node's envoy is busy; try again in a couple of minutes."
+                "This session's envoy is busy; try again in a couple of minutes."
             }
-            RefusalReason::EnvoyStopping => "No answer: this node is shutting down.",
+            RefusalReason::EnvoyStopping => "No answer: this session is shutting down.",
             RefusalReason::PeerConcurrency => {
-                "This node is not taking another message from you until the current one finishes."
+                "This session is not taking another message from you until the current one finishes."
             }
             RefusalReason::TokenCeiling => {
-                "This node has spent as many model tokens on you as it allows in an hour; try again when the hour is up."
+                "This session has spent as many model tokens on you as it allows in an hour; try again when the hour is up."
             }
             RefusalReason::CostCeiling => {
-                "This node has spent as much on you as it allows in an hour; try again when the hour is up."
+                "This session has spent as much on you as it allows in an hour; try again when the hour is up."
             }
-            RefusalReason::LoopGuard => "This node does not answer replies.",
+            RefusalReason::LoopGuard => "This session does not answer replies.",
         }
     }
 
@@ -618,7 +618,7 @@ mod tests {
         }
         assert_eq!(
             RefusalReason::PeerConcurrency.peer_text(),
-            "This node is not taking another message from you until the current one finishes."
+            "This session is not taking another message from you until the current one finishes."
         );
     }
 

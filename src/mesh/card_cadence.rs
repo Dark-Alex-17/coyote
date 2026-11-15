@@ -2,7 +2,7 @@
 //! card advertises stay current without anyone running `.mesh people status`.
 
 use crate::mesh::card::{STATUS_MAX_CONCURRENCY, StatusError};
-use crate::mesh::card_refusals::{load_card_refusals, save_card_refusals};
+use crate::mesh::card_refusals::{CardRefusals, load_card_refusals, save_card_refusals};
 use crate::mesh::message::Route;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::request::{RequestOptions, short};
@@ -12,7 +12,7 @@ use crate::mesh::trust::{
 
 use anyhow::Result;
 use log::debug;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -56,12 +56,19 @@ pub(crate) struct CardCadence {
     /// The file the refusals are written to on every change; `None` keeps them in
     /// memory only.
     refusals: Option<PathBuf>,
+    /// Taken before `state` is let go and held through the write of the refusals, so
+    /// the writes reach the disk in the order the changes were made while none of them
+    /// holds `state`.
+    write_lock: Mutex<()>,
     /// The node's one `STATUS_MAX_CONCURRENCY` cap, shared by the background fetches and
     /// a `mesh__peers` listing with its cards.
     permits: Arc<Semaphore>,
     /// Added to the clock, so a test can let hours pass at once.
     #[cfg(test)]
     skew: Mutex<Duration>,
+    /// Whether `state` could be locked as each refusals write began.
+    #[cfg(test)]
+    state_free_at_save: Mutex<Vec<bool>>,
 }
 
 #[derive(Default)]
@@ -74,8 +81,9 @@ struct CadenceState {
     /// Destinations whose last answer was a refusal or no answer at all, which is how a
     /// session that does not trust this one yet often looks; not asked in the background
     /// again until the trust on either side changes or the owner asks by hand. Kept
-    /// across runs in the instance's card-refusal list, so a restart does not ask again.
-    refused: HashSet<String>,
+    /// across runs in the instance's card-refusal list, so a restart does not ask again,
+    /// and capped there, the oldest going first.
+    refused: CardRefusals,
     /// When a contact last skipped the interval of each destination, so it skips it once
     /// per interval at most.
     contact_skipped: HashMap<String, Instant>,
@@ -90,9 +98,12 @@ impl Default for CardCadence {
         Self {
             state: Mutex::default(),
             refusals: None,
+            write_lock: Mutex::new(()),
             permits: Arc::new(Semaphore::new(STATUS_MAX_CONCURRENCY)),
             #[cfg(test)]
             skew: Mutex::default(),
+            #[cfg(test)]
+            state_free_at_save: Mutex::default(),
         }
     }
 }
@@ -149,24 +160,40 @@ impl CardCadence {
     pub(crate) fn admit(&self, destination: &str, trigger: CardTrigger, served: bool) -> bool {
         let now = self.now();
         let mut state = self.state.lock();
-        match trigger {
+        let lifted = match trigger {
             CardTrigger::Heard => {
                 if !state.heard.insert(destination.to_string()) {
                     return false;
                 }
+                false
             }
-            CardTrigger::Granted | CardTrigger::OwnerGranted => {
-                self.clear_stop(&mut state, destination);
-            }
+            CardTrigger::Granted | CardTrigger::OwnerGranted => state.refused.remove(destination),
             CardTrigger::Contacted => {
                 state.contacted.insert(destination.to_string(), now);
                 let skipped_lately = Self::skipped_lately(&state, destination, now);
-                if self.clear_stop(&mut state, destination) && !skipped_lately {
+                let lifted = state.refused.remove(destination);
+                if lifted && !skipped_lately {
                     state.last_asked.remove(destination);
                     state.contact_skipped.insert(destination.to_string(), now);
                 }
+                lifted
             }
+        };
+        let admitted = Self::admits(&mut state, destination, trigger, served, now);
+        if lifted {
+            self.save_refusals(state);
         }
+        admitted
+    }
+
+    /// The rest of `admit`, once any stop the trigger lifts is gone.
+    fn admits(
+        state: &mut CadenceState,
+        destination: &str,
+        trigger: CardTrigger,
+        served: bool,
+        now: Instant,
+    ) -> bool {
         let asks_unserved = matches!(trigger, CardTrigger::OwnerGranted | CardTrigger::Contacted);
         if (!served && !asks_unserved) || state.refused.contains(destination) {
             return false;
@@ -210,7 +237,7 @@ impl CardCadence {
             return true;
         }
         if state.refused.insert(destination.to_string()) {
-            self.save_refusals(&state);
+            self.save_refusals(state);
         }
         false
     }
@@ -220,7 +247,9 @@ impl CardCadence {
     /// later revoke) or the owner asked for its card by hand.
     pub(crate) fn lift(&self, destination: &str) {
         let mut state = self.state.lock();
-        self.clear_stop(&mut state, destination);
+        if state.refused.remove(destination) {
+            self.save_refusals(state);
+        }
     }
 
     /// The owner forgot the session's user: the session starts out as one never asked,
@@ -231,25 +260,49 @@ impl CardCadence {
         state.last_asked.remove(destination);
         state.contact_skipped.remove(destination);
         state.contacted.remove(destination);
-        self.clear_stop(&mut state, destination);
-    }
-
-    /// Lifts the stop `destination` is under, writing the refusals when it changed;
-    /// returns whether there was a stop to lift.
-    fn clear_stop(&self, state: &mut CadenceState, destination: &str) -> bool {
-        let refused = state.refused.remove(destination);
-        if refused {
+        if state.refused.remove(destination) {
             self.save_refusals(state);
         }
-        refused
     }
 
-    /// Written under the state lock, so the writes reach the disk in the order the
-    /// changes were made.
-    fn save_refusals(&self, state: &CadenceState) {
-        if let Some(path) = &self.refusals {
-            save_card_refusals(path, &state.refused);
+    /// Drops the stops of the sessions `known` says are gone, as from the peer table,
+    /// and writes the refusals when any went.
+    pub(crate) fn prune_refusals(&self, known: impl Fn(&str) -> bool) {
+        let held = self.state.lock().refused.to_vec();
+        let gone: HashSet<String> = held
+            .into_iter()
+            .filter(|destination| !known(destination))
+            .collect();
+        if gone.is_empty() {
+            return;
         }
+        let mut state = self.state.lock();
+        if state
+            .refused
+            .retain(|destination| !gone.contains(destination))
+        {
+            debug!(
+                "Dropped the mesh card-fetch stops of {} sessions gone from the peer table",
+                gone.len()
+            );
+            self.save_refusals(state);
+        }
+    }
+
+    /// Writes the refusals as `state` holds them: snapshotted under `state`, with
+    /// `write_lock` taken before `state` is let go and the write made after.
+    fn save_refusals(&self, state: MutexGuard<'_, CadenceState>) {
+        let Some(path) = &self.refusals else {
+            return;
+        };
+        let refused = state.refused.to_vec();
+        let _write = self.write_lock.lock();
+        drop(state);
+        #[cfg(test)]
+        self.state_free_at_save
+            .lock()
+            .push(self.state.try_lock().is_some());
+        save_card_refusals(path, &refused);
     }
 
     /// The session served this node a card or a message: it has been heard in this run,
@@ -690,9 +743,71 @@ mod tests {
             assert!(!CardCadence::persisted(path.clone()).unwrap().is_refused(D));
         }
     }
+
+    /// The refusals are written once the cadence's state is let go, so a slow disk
+    /// holds up no admission; each change still reaches the file.
+    #[test]
+    fn the_refusals_are_written_with_the_cadence_unlocked() {
+        let tmp = crate::mesh::test_support::TempDir::new("card-cadence-save-unlocked");
+        let path = crate::mesh::card_refusals::card_refusals_path(&tmp.path, "instance");
+        let cadence = CardCadence::persisted(path.clone()).unwrap();
+        cadence.refused(D);
+        assert!(CardCadence::persisted(path.clone()).unwrap().is_refused(D));
+        cadence.admit(D, CardTrigger::Granted, true);
+        assert!(!CardCadence::persisted(path.clone()).unwrap().is_refused(D));
+
+        assert_eq!(*cadence.state_free_at_save.lock(), [true, true]);
+    }
+
+    /// The stops of sessions no longer known are dropped, on disk too, and the others
+    /// kept; a prune that drops nothing writes nothing.
+    #[test]
+    fn the_stops_of_sessions_no_longer_known_are_pruned() {
+        let tmp = crate::mesh::test_support::TempDir::new("card-cadence-prune");
+        let path = crate::mesh::card_refusals::card_refusals_path(&tmp.path, "instance");
+        let cadence = CardCadence::persisted(path.clone()).unwrap();
+        let kept = "e".repeat(32);
+        cadence.refused(D);
+        cadence.refused(&kept);
+
+        cadence.prune_refusals(|destination| destination == kept);
+
+        assert!(!cadence.is_refused(D));
+        assert!(cadence.is_refused(&kept));
+        assert_eq!(load_card_refusals(&path).unwrap().to_vec(), [kept.as_str()]);
+        let writes = cadence.state_free_at_save.lock().len();
+        cadence.prune_refusals(|_| true);
+        assert_eq!(cadence.state_free_at_save.lock().len(), writes);
+    }
+
+    /// The stops are capped as the sent threads are: past the cap the oldest goes
+    /// first, and a session stopped again moves to the newest end.
+    #[test]
+    fn the_stops_are_capped_dropping_the_oldest_first() {
+        use crate::mesh::card_refusals::CARD_REFUSALS_MAX_ENTRIES;
+
+        let cadence = CardCadence::default();
+        let destination = |index: usize| format!("{index:032x}");
+        for index in 0..CARD_REFUSALS_MAX_ENTRIES {
+            cadence.refused(&destination(index));
+        }
+        cadence.lift(&destination(0));
+        cadence.refused(&destination(0));
+        cadence.refused(&destination(CARD_REFUSALS_MAX_ENTRIES));
+
+        assert!(
+            cadence.is_refused(&destination(0)),
+            "stopped again, so newest"
+        );
+        assert!(!cadence.is_refused(&destination(1)), "the oldest went");
+        for index in 2..=CARD_REFUSALS_MAX_ENTRIES {
+            assert!(cadence.is_refused(&destination(index)), "{index}");
+        }
+    }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
+#[cfg(unix)]
 mod network {
     use super::*;
     use crate::mesh::message::{PeerKind, PeerMessage, PeerSurface, PeerVia, RawPeerMessage};

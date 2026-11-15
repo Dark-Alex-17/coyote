@@ -57,7 +57,7 @@ pub(crate) const WHO_MAX_CHARS: usize = 2 * NAME_MAX_CHARS + 3;
 /// A run of this many hex digits or more reads as a hash prefix, which an address takes.
 const HASH_LIKE_MIN_CHARS: usize = 8;
 
-pub(crate) const NAME_TAKEN: &str = "Another person or session already has that name (names are compared ignoring case); nothing was changed. `.mesh people list` shows the names in use; pick another.";
+pub(crate) const NAME_TAKEN: &str = "Another user or session already has that name (names are compared ignoring case); nothing was changed. `.mesh people list` shows the names in use; pick another.";
 
 /// One person's names, keyed in the trust list by their identity hash.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,7 +148,7 @@ impl NameRule {
                 format!("A name is at most {NAME_MAX_CHARS} characters")
             }
             Self::Slash => {
-                "A name cannot contain `/`, which separates a person from a session".to_string()
+                "A name cannot contain `/`, which separates a user from a session".to_string()
             }
             Self::Reserved => "`you` and `unnamed` are reserved and cannot be a name".to_string(),
             Self::HashLike => format!(

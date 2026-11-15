@@ -228,6 +228,9 @@ pub(crate) struct PeerTable {
     /// The rows whose `served_instances` held this node's id when it started, cleared
     /// from the rows so a mark on disk speaks for one run only.
     served_previous_run: Mutex<BTreeSet<String>>,
+    /// Runs as each write of a changed table begins.
+    #[cfg(test)]
+    persist_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 impl PeerTable {
@@ -244,7 +247,7 @@ impl PeerTable {
             Ok(bytes) => match parse_peer_file(&bytes) {
                 Ok(records) => records,
                 Err(PeerFileParse::Version(found)) => bail!(version_refusal(
-                    "peer table",
+                    "table of heard sessions",
                     &path,
                     None,
                     found,
@@ -278,7 +281,14 @@ impl PeerTable {
             link_failed: Mutex::new(BTreeSet::new()),
             own_instance: Mutex::new(None),
             served_previous_run: Mutex::new(BTreeSet::new()),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_persist_hook(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self.persist_hook.lock() = Some(Box::new(hook));
     }
 
     /// Makes `instance_id` the node `mark_served` marks for, and takes its marks off the
@@ -485,6 +495,10 @@ impl PeerTable {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(hook) = &*self.persist_hook.lock() {
+            hook();
+        }
         self.persist()
             .inspect_err(|_| self.dirty.store(true, Ordering::Release))
     }
@@ -499,13 +513,13 @@ impl PeerTable {
     fn persist(&self) -> Result<()> {
         let _held = acquire_mesh_lock(
             &self.path.with_added_extension("lock"),
-            "mesh peer table",
+            "mesh table of heard sessions",
             EXCLUSIVE_LOCK_WAIT,
         )?;
         let on_disk = match fs::read(&self.path).map(|bytes| parse_peer_file(&bytes)) {
             Ok(Ok(records)) => records,
             Ok(Err(PeerFileParse::Version(found))) => bail!(version_refusal(
-                "peer table",
+                "table of heard sessions",
                 &self.path,
                 None,
                 found,
@@ -542,8 +556,8 @@ impl PeerTable {
             version: PEER_TABLE_VERSION,
             peers,
         };
-        let json =
-            serde_json::to_vec_pretty(&file).context("Failed to serialize the mesh peer table")?;
+        let json = serde_json::to_vec_pretty(&file)
+            .context("Failed to serialize the mesh table of heard sessions")?;
         write_atomically(&self.path, &json)
     }
 }
@@ -564,7 +578,7 @@ fn parse_peer_file(bytes: &[u8]) -> Result<Vec<PeerRecord>, PeerFileParse> {
     }
     let file: PeerTableFile = serde_json::from_slice(bytes).map_err(|err| {
         PeerFileParse::Corrupt(format!(
-            "is not a version-{PEER_TABLE_VERSION} peer table: {err}"
+            "is not a version-{PEER_TABLE_VERSION} table of heard sessions: {err}"
         ))
     })?;
     Ok(file.peers)
@@ -1583,7 +1597,7 @@ mod tests {
     #[test]
     fn load_sets_aside_a_current_table_with_an_unknown_field() {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let cause = format!("is not a version-{PEER_TABLE_VERSION} peer table");
+        let cause = format!("is not a version-{PEER_TABLE_VERSION} table of heard sessions");
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["peers"][0]["later"] = serde_json::json!(true);
         assert_corrupt_file_is_set_aside(

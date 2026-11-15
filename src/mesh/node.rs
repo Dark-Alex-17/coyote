@@ -857,6 +857,7 @@ impl MeshRuntime {
         let sent_threads = SentThreads::open(&paths.cache_dir, &instance_id)?;
         let card_cadence =
             CardCadence::persisted(card_refusals_path(&paths.cache_dir, &instance_id))?;
+        card_cadence.prune_refusals(|destination| peers.get(destination).is_some());
         let envoy_memory =
             EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
         if let Some(store) = &envoy_memory {
@@ -980,7 +981,7 @@ impl MeshRuntime {
             Err(err) => {
                 abandon_start(transport, joined, Some(&request_handler)).await;
                 return Err(err.context(format!(
-                    "The mesh node's destination could not be registered within {}s",
+                    "The mesh session's destination could not be registered within {}s",
                     SHUTDOWN_GRACE.as_secs()
                 )));
             }
@@ -1002,7 +1003,7 @@ impl MeshRuntime {
                 Err(_) => {
                     abandon_start(transport, joined, Some(&request_handler)).await;
                     bail!(
-                        "The mesh node's first announce for destination {} was not sent within {}s",
+                        "The mesh session's first announce for destination {} was not sent within {}s",
                         hash.to_hex_string(),
                         SHUTDOWN_GRACE.as_secs()
                     );
@@ -1112,7 +1113,7 @@ impl MeshRuntime {
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(sweep_peers(
-            runtime.peers.clone(),
+            Arc::downgrade(&runtime),
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(persist_tables_periodically(
@@ -2148,7 +2149,7 @@ impl MeshRuntime {
             .await
             .map_err(|_| {
                 anyhow!(
-                    "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the node",
+                    "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the mesh",
                     state.hash.to_hex_string(),
                     REKEY_GRACE.as_secs()
                 )
@@ -2184,7 +2185,7 @@ impl MeshRuntime {
         .await
         .map_err(|_| {
             anyhow!(
-                "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the node",
+                "The mesh transport did not send the announce for destination {} within {}s; run `.mesh off` and then `.mesh on` to restart the mesh",
                 state.hash.to_hex_string(),
                 REKEY_GRACE.as_secs()
             )
@@ -2234,7 +2235,7 @@ impl MeshRuntime {
         let mut state = self.destination.lock().await;
         if rekey.original_instance_id.as_deref() != Some(state.instance_id.as_str()) {
             bail!(
-                "The mesh node is serving instance {} rather than the forked session's instance {}, so the fork cannot take over its destination. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
+                "The mesh session is serving instance {} rather than the forked session's instance {}, so the fork cannot take over its destination. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
                 state.instance_id,
                 rekey.original_instance_id.as_deref().unwrap_or("(none)")
             );
@@ -2254,7 +2255,7 @@ impl MeshRuntime {
         .await
         .with_context(|| {
             format!(
-                "The fork's destination could not be registered within {}s, so the node still serves destination {}. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
+                "The fork's destination could not be registered within {}s, so the session still serves destination {}. Run `.mesh off` and then `.mesh on` in the fork to join the mesh with the fork's own destination.",
                 REKEY_GRACE.as_secs(),
                 state.hash.to_hex_string(),
             )
@@ -2354,6 +2355,11 @@ impl MeshRuntime {
         instances::unregister(&self.cache_dir, &state.instance_id);
         state.lock = None;
         *self.identity_lock.lock() = None;
+        let instance_id = state.instance_id.clone();
+        let destination_hex = state.hash.to_hex_string();
+        // The peer table's write may wait on another process's file lock; nothing past
+        // this point needs the destination.
+        drop(state);
         if let Err(err) = self.peers.persist_if_dirty() {
             warn!(
                 "Failed to persist the mesh peer table on stop: {}",
@@ -2363,10 +2369,9 @@ impl MeshRuntime {
         self.propagation_nodes
             .persist_if_dirty_or_warn(PersistTrigger::Stop);
         debug!(
-            "Stopped mesh node {} (instance {}, destination {})",
+            "Stopped mesh node {} (instance {instance_id}, destination {})",
             short(&self.fingerprint),
-            state.instance_id,
-            short(&state.hash.to_hex_string())
+            short(&destination_hex)
         );
         Ok(())
     }
@@ -2435,7 +2440,7 @@ async fn register_destination(
             if released {
                 "it was deregistered again"
             } else {
-                "it could not be deregistered either, so the node serves it without announce data"
+                "it could not be deregistered either, so the session serves it without announce data"
             }
         );
     }
@@ -2712,7 +2717,7 @@ async fn join_local(
 ) -> Joined {
     let not_reachable = |reason: &str| {
         format!(
-            "Local rnsd at {endpoint} (type: local) is not reachable: {reason}. The node cannot join the mesh until rnsd's shared instance answers there; start rnsd or fix mesh.interfaces."
+            "Local rnsd at {endpoint} (type: local) is not reachable: {reason}. This session cannot join the mesh until rnsd's shared instance answers there; start rnsd or fix mesh.interfaces."
         )
     };
     let not_reached = |reason: String| Joined::NotReached {
@@ -2888,7 +2893,7 @@ async fn join_tcp(
         }
     };
     let message = format!(
-        "Mesh relay {endpoint} (type: {kind}) is unreachable: {reason}. The node cannot join the mesh until that relay is reachable; fix mesh.interfaces or the relay."
+        "Mesh relay {endpoint} (type: {kind}) is unreachable: {reason}. This session cannot join the mesh until that relay is reachable; fix mesh.interfaces or the relay."
     );
     Joined::Pending {
         iface: JoinedInterface::Tcp {
@@ -3500,7 +3505,7 @@ fn log_aged_out_peers(aged_out: &[String]) {
     }
 }
 
-async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
+async fn sweep_peers(runtime: Weak<MeshRuntime>, cancel: CancellationToken) {
     let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
     // The first tick of an interval fires immediately; the table was already swept on load.
     ticks.tick().await;
@@ -3508,10 +3513,18 @@ async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
         tokio::select! {
             () = cancel.cancelled() => break,
             _ = ticks.tick() => {
-                log_aged_out_peers(&peers.sweep(SystemTime::now()));
+                let Some(runtime) = runtime.upgrade() else { break };
+                sweep_peers_once(&runtime.peers, &runtime.card_cadence, SystemTime::now());
             }
         }
     }
+}
+
+/// One heartbeat's sweep of the peer table, then of the card-fetch stops of the sessions
+/// no longer in it, so the refusals list keeps no session the table forgot.
+fn sweep_peers_once(peers: &PeerTable, cadence: &CardCadence, now: SystemTime) {
+    log_aged_out_peers(&peers.sweep(now));
+    cadence.prune_refusals(|destination| peers.get(destination).is_some());
 }
 
 /// An edge of one TCP client the watcher tells the user about.
@@ -3916,13 +3929,13 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
     match greeting {
         ReconnectGreeting::Announced => format!("{label} reconnected; announced"),
         ReconnectGreeting::PastCap => format!(
-            "{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+            "{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
         ),
         ReconnectGreeting::Failed(_) => format!(
-            "{label} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log)."
+            "{label} reconnected, but announcing over it failed; the next heartbeat will announce this session (details in the log)."
         ),
         ReconnectGreeting::NodeDoesNotAnnounce => format!(
-            "{label} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
+            "{label} reconnected; this session does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
         ),
     }
 }
@@ -4154,11 +4167,22 @@ async fn persist_tables_periodically(
         tokio::select! {
             () = cancel.cancelled() => break,
             _ = ticks.tick() => {
-                if let Err(err) = peers.persist_if_dirty() {
-                    warn!(
+                // The write waits up to the file lock's bound on another process.
+                let persisted = tokio::task::spawn_blocking({
+                    let peers = Arc::clone(&peers);
+                    move || peers.persist_if_dirty()
+                })
+                .await;
+                match persisted {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => warn!(
                         "Failed to persist the mesh peer table: {}",
                         redact_hashes(&format!("{err:#}"))
-                    );
+                    ),
+                    Err(err) => warn!(
+                        "Mesh peer table write did not finish: {}",
+                        redact_hashes(&err.to_string())
+                    ),
                 }
                 propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Timer);
             }
@@ -4628,7 +4652,7 @@ impl MeshSlot {
             .serving()
             .rebind_grants(&rekey.fork_instance_id, SystemTime::now())
             .context(
-                "The fork's grant store could not be opened, so the node still serves the original instance",
+                "The fork's grant store could not be opened, so the session still serves the original instance",
             );
         let rebound = grants_rebound.and_then(|displaced_grants| {
             match runtime.rebind_sent_threads(&rekey.fork_instance_id) {
@@ -4636,7 +4660,7 @@ impl MeshSlot {
                 Err(err) => {
                     runtime.serving().restore_grants(displaced_grants);
                     Err(err.context(
-                        "The fork's sent-threads list could not be opened, so the node still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again.",
+                        "The fork's sent-threads list could not be opened, so the session still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again.",
                     ))
                 }
             }
@@ -6535,7 +6559,7 @@ fn fold_lines(
     let mut lines = fold_report_lines(who, &notice.reports);
     if notice.surface {
         lines.push(NoticeText::default().peer(who).frame(format!(
-            ": {}; further {} refusals from this peer are folded for the hour",
+            ": {}; further {} refusals from this session are folded for the hour",
             refusal_phrase(reason, path),
             reason.as_str()
         )));
@@ -6567,7 +6591,7 @@ fn refusal_phrase(reason: RefusalReason, path: RefusalPath) -> &'static str {
     use RefusalPath::{Filed, Link};
     match (reason, path) {
         (RefusalReason::RateLimited, Filed(PeerVia::StoreAndForward)) => {
-            "over the hourly message limit; arrived store-and-forward, the peer is told once an hour"
+            "over the hourly message limit; arrived store-and-forward, the sender is told once an hour"
         }
         (RefusalReason::RateLimited, Link) => "over the hourly message limit, refused on its link",
         (RefusalReason::RateLimited, Filed(PeerVia::Direct)) => {
@@ -8411,7 +8435,7 @@ mod tests {
         assert_eq!(
             pushed[1].text.plain(),
             format!(
-                "{id8} / {dest8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this peer are folded for the hour"
+                "{id8} / {dest8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this session are folded for the hour"
             )
         );
         for note in pushed.iter() {
@@ -8539,7 +8563,7 @@ mod tests {
             [
                 "39 more rate_limited refusals from alice were folded in the last hour",
                 "1 more token_ceiling refusal from alice was folded in the last hour",
-                "alice: already has a message with the envoy, filed in the inbox; further peer_concurrency refusals from this peer are folded for the hour",
+                "alice: already has a message with the envoy, filed in the inbox; further peer_concurrency refusals from this session are folded for the hour",
             ]
         );
         assert!(
@@ -8567,7 +8591,7 @@ mod tests {
                 let became = match (reason, path) {
                     (_, RefusalPath::Link) => "refused on its link",
                     (RefusalReason::RateLimited, RefusalPath::Filed(PeerVia::StoreAndForward)) => {
-                        "arrived store-and-forward, the peer is told once an hour"
+                        "arrived store-and-forward, the sender is told once an hour"
                     }
                     (_, RefusalPath::Filed(_)) => "filed in the inbox",
                 };
@@ -8588,7 +8612,7 @@ mod tests {
                 &first
             ),
             [
-                "alice: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+                "alice: over the hourly message limit, refused on its link; further rate_limited refusals from this session are folded for the hour"
             ]
         );
         assert_eq!(
@@ -8599,7 +8623,7 @@ mod tests {
                 &first
             ),
             [
-                "alice: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+                "alice: over the hourly message limit; arrived store-and-forward, the sender is told once an hour; further rate_limited refusals from this session are folded for the hour"
             ]
         );
         assert_eq!(
@@ -8610,7 +8634,7 @@ mod tests {
                 &first
             ),
             [
-                "alice: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
+                "alice: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this session are folded for the hour"
             ]
         );
     }
@@ -8775,7 +8799,7 @@ mod tests {
         assert_eq!(
             pushed[0].text.plain(),
             format!(
-                "{a8} / {a_dest8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+                "{a8} / {a_dest8}: over the hourly message limit, refused on its link; further rate_limited refusals from this session are folded for the hour"
             )
         );
         assert_eq!(pushed[0].origin, Origin::Peer(a8.to_string()));
@@ -9174,17 +9198,17 @@ mod tests {
             texts,
             [
                 format!(
-                    "{} / {}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    "{} / {}: over the hourly message limit; arrived store-and-forward, the sender is told once an hour; further rate_limited refusals from this session are folded for the hour",
                     short(&a),
                     short(&a_instance)
                 ),
                 format!(
-                    "{} / {}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour",
+                    "{} / {}: over the hourly message limit, refused on its link; further rate_limited refusals from this session are folded for the hour",
                     short(&b),
                     short(&b_instance)
                 ),
                 format!(
-                    "{} / {}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    "{} / {}: over the hourly message limit; arrived store-and-forward, the sender is told once an hour; further rate_limited refusals from this session are folded for the hour",
                     short(&c),
                     short(&c_instance)
                 ),
@@ -12231,6 +12255,102 @@ mod tests {
         );
     }
 
+    /// Files `destination` in `peers` from an announce heard at `at`.
+    fn heard_at(peers: &PeerTable, destination: &str, at: SystemTime) {
+        let app_data = AnnounceAppData {
+            version: 1,
+            display_name: Some("Bea".to_string()),
+        }
+        .encode()
+        .unwrap();
+        record_announce(
+            peers,
+            AnnouncedDestination::without_key(destination, "identity", "name"),
+            &app_data,
+            1,
+            at,
+        );
+    }
+
+    /// The heartbeat sweep drops the card-fetch stops of the sessions it ages out of the
+    /// peer table, and keeps those of the sessions still in it.
+    #[test]
+    fn the_heartbeat_sweep_drops_the_card_stops_of_the_sessions_it_ages_out() {
+        let tmp = TempDir::new("node-sweep-card-stops");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let (aged, fresh) = ("a1".repeat(16), "a2".repeat(16));
+        heard_at(&peers, &aged, now);
+        heard_at(&peers, &fresh, now + PEER_TTL / 2);
+        let cadence = CardCadence::default();
+        cadence.refused(&aged);
+        cadence.refused(&fresh);
+
+        sweep_peers_once(&peers, &cadence, now + PEER_TTL);
+
+        assert!(peers.get(&aged).is_none(), "the sweep aged it out");
+        assert!(!cadence.is_refused(&aged));
+        assert!(cadence.is_refused(&fresh));
+    }
+
+    /// The periodic write of the peer table may wait on a lock another process holds,
+    /// so it runs on a blocking thread, never on the thread driving the node's tasks.
+    #[tokio::test(start_paused = true)]
+    async fn the_periodic_peer_table_write_runs_off_the_runtime_thread() {
+        let tmp = TempDir::new("node-persist-off-runtime");
+        let now = SystemTime::now();
+        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), now).unwrap());
+        let propagation_nodes = Arc::new(
+            PropagationNodeTable::load(tmp.path.join(PROPAGATION_NODE_TABLE_FILE), now).unwrap(),
+        );
+        let written_on = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        peers.set_persist_hook({
+            let written_on = Arc::clone(&written_on);
+            move || written_on.lock().push(std::thread::current().id())
+        });
+        heard_at(&peers, &"a1".repeat(16), now);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(persist_tables_periodically(
+            Arc::clone(&peers),
+            propagation_nodes,
+            cancel.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_secs(PEER_PERSIST_INTERVAL_SECS + 1)).await;
+        cancel.cancel();
+        task.await.unwrap();
+
+        let written_on = written_on.lock().clone();
+        assert_eq!(written_on.len(), 1, "one write of the changed table");
+        assert_ne!(written_on[0], std::thread::current().id());
+        assert!(tmp.path.join("peers.json").exists());
+    }
+
+    /// The stop's write of the peer table may wait on a lock another process holds, so
+    /// it runs with the destination let go.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stops_peer_table_write_holds_no_destination_lock() {
+        let started = started_runtime("node-stop-persist-unlocked").await;
+        let runtime = Arc::clone(&started.runtime);
+        let free = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        runtime.peers().set_persist_hook({
+            let runtime = Arc::downgrade(&runtime);
+            let free = Arc::clone(&free);
+            move || {
+                if let Some(runtime) = runtime.upgrade() {
+                    free.lock().push(runtime.destination.try_lock().is_ok());
+                }
+            }
+        });
+        heard_at(&runtime.peers(), &"a1".repeat(16), SystemTime::now());
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+
+        assert_eq!(*free.lock(), [true]);
+    }
+
     #[test]
     fn record_announce_and_sweep_log_peer_lifecycle() {
         install_log_collector();
@@ -15031,7 +15151,7 @@ mod tests {
             .strip_prefix(&format!(
                 "Local rnsd at {endpoint} (type: local) is not reachable: "
             ))
-            .and_then(|rest| rest.split_once(". The node cannot join"))
+            .and_then(|rest| rest.split_once(". This session cannot join"))
             .map(|(reason, _)| reason)
             .unwrap_or_else(|| panic!("{err}"));
         assert!(names_nothing_listening(reason, &endpoint), "{err}");
@@ -15711,7 +15831,7 @@ mod tests {
             .strip_prefix(&format!(
                 "Local rnsd at {endpoint} (type: local) is not reachable: "
             ))
-            .and_then(|rest| rest.split_once(". The node cannot join"))
+            .and_then(|rest| rest.split_once(". This session cannot join"))
             .map(|(reason, _)| reason)
             .unwrap_or_else(|| panic!("{err}"));
         assert!(names_nothing_listening(reason, &endpoint), "{err}");
@@ -17599,7 +17719,7 @@ mod tests {
 
         relay = TransportRelay::start_on(port).await;
         let past_cap = format!(
-            "{label} reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+            "{label} reconnected again (more than 4 times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
         );
         wait_for_mesh_line(&a.notifier, &past_cap).await;
         wait_for_mesh_line(&b.notifier, &past_cap).await;
@@ -17923,7 +18043,7 @@ mod tests {
             wait_for_mesh_line(
                 &notifier,
                 &format!(
-                    "{} reconnected; this node does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote.",
+                    "{} reconnected; this session does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote.",
                     private_label(port)
                 ),
             )
@@ -17949,7 +18069,7 @@ mod tests {
             wait_for_mesh_line(
                 &a.notifier,
                 &format!(
-                    "{} reconnected, but announcing over it failed; the next heartbeat will announce this node (details in the log).",
+                    "{} reconnected, but announcing over it failed; the next heartbeat will announce this session (details in the log).",
                     private_label(port)
                 ),
             )
@@ -18014,7 +18134,7 @@ mod tests {
             );
             assert_eq!(
                 reconnect_line(label, &ReconnectGreeting::PastCap),
-                "private 127.0.0.1:4242 reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
+                "private 127.0.0.1:4242 reconnected again (more than 4 times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now"
             );
         }
 
@@ -22229,7 +22349,7 @@ mod tests {
 
         assert!(
             chain.contains(
-                "The fork's sent-threads list could not be opened, so the node still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again."
+                "The fork's sent-threads list could not be opened, so the session still serves the original instance and its grants. Move the fork's sent-threads file named below aside, then fork again."
             ),
             "{chain}"
         );

@@ -114,20 +114,20 @@ const TRUST_FILE_HEADER: &str = "\
 # Coyote's mesh trust list. .mesh access trust, revoke, block, unblock and forget edit\n\
 # it; a hand edit is read on the next look.\n\
 # version: the file format.\n\
-# identities: the identities this node knows. all_destinations: true trusts every instance\n\
+# identities: the identities this session knows. all_destinations: true trusts every instance\n\
 #   of that identity; all_destinations: false only means its other instances may knock.\n\
-# destinations: the instances (one per destination) this node trusts and serves.\n\
+# destinations: the instances (one per destination) this session trusts and serves.\n\
 # denied_destinations: instances refused by .mesh access block session <session>.\n\
 # blocked_identities: identities refused outright by\n\
 #   .mesh access block user <user>.\n\
-# self_trust_seeded: true once this node's own identity got its \"this node\" grant (or was\n\
+# self_trust_seeded: true once your own identity got its own grant (or was\n\
 #   blocked), so it is never granted again; .mesh access revoke user takes the\n\
 #   grant back.\n\
 # people: display names by identity, never read for trust: alias is the name you gave,\n\
 #   advertised the one their status card gave, and sessions holds both per destination.\n\
 # Every entry has added_at and note; identities and destinations also have last_seen_at,\n\
 #   a destination names its identity, key_changed on a destination records the other\n\
-#   identity its name was heard under, and label marks this node's own grant.\n";
+#   identity its name was heard under, and label marks the grant your own identity holds.\n";
 /// The trust list is the human's own decisions, so a refusal says what starting fresh costs.
 const TRUST_FILE_REMEDY: Remedy =
     Remedy::UserFile("is the trust list, and a fresh one trusts nobody");
@@ -3992,14 +3992,14 @@ fn verified_identity(record: &PeerRecord) -> Result<AddressHash> {
     let destination = &record.destination_hash;
     if record.name_hash.is_empty() {
         bail!(
-            "Peer {destination} was recorded before its name hash was kept, so its identity cannot be verified yet. Wait for its next announce and try again."
+            "Session {destination} was recorded before its name hash was kept, so its identity cannot be verified yet. Wait for its next announce and try again."
         );
     }
     verify_binding(
         destination,
         &record.identity_hash,
         &record.name_hash,
-        "the peer table",
+        "the table of heard sessions",
     )
 }
 

@@ -1283,7 +1283,7 @@ mod tests {
                 err: PropagationError::Oversize { len: 9, max: 8 },
             }
             .to_string(),
-            "The session did not answer the request over the link, and the request could not be stored either: The propagation envelope is 9 bytes, above the node's 8-byte limit. The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
+            "The session did not answer the request over the link, and the request could not be stored either: The propagation envelope is 9 bytes, above the propagation node's 8-byte limit. The limit is the propagation node's; shorten the message or send fewer parts so the envelope fits, then send it again"
         );
     }
 

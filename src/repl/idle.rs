@@ -1664,7 +1664,7 @@ mod tests {
         wait_until("the others summary line", || {
             sink.lines()
                 .iter()
-                .any(|line| line.contains(" other peers)"))
+                .any(|line| line.contains(" other sessions)"))
         })
         .await;
         // Give the tick a chance to emit anything beyond the cap before counting.
@@ -1682,7 +1682,7 @@ mod tests {
         assert_eq!(
             summaries
                 .iter()
-                .filter(|line| line.contains(" other peers)"))
+                .filter(|line| line.contains(" other sessions)"))
                 .count(),
             1,
             "exactly one closing line for the peers past the named cap: {summaries:?}"

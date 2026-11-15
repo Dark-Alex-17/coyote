@@ -86,7 +86,7 @@ impl IdentityLock {
         match file.try_lock() {
             Ok(()) => Self::hold(&path, file),
             Err(TryLockError::WouldBlock) => bail!(
-                "A mesh node on this config dir is running in a Coyote process{}; the identity is rotated only while no session's node on this config dir is running. Run `.mesh off` in every Coyote session that shares this config dir (the holder may be another process), then rotate again.",
+                "A mesh session on this config dir is running in a Coyote process{}; the identity is rotated only while no session on this config dir is on the mesh. Run `.mesh off` in every Coyote session that shares this config dir (the holder may be another process), then rotate again.",
                 holder_suffix(read_holder_pid(&mut file))
             ),
             Err(TryLockError::Error(err)) => Err(err).with_context(|| {
@@ -148,7 +148,7 @@ pub(crate) fn current_identity(path: &Path) -> Result<PrivateIdentity> {
     refuse_symlink(path)?;
     if fs::symlink_metadata(path).is_err() {
         bail!(
-            "No mesh identity at '{}': `.mesh on` mints one the first time the node starts.",
+            "No mesh identity at '{}': `.mesh on` mints one the first time the mesh starts.",
             path.display()
         );
     }
@@ -438,7 +438,7 @@ fn load_identity(path: &Path) -> Result<PrivateIdentity> {
     let bytes = read_owner_only_key(path)?;
     if bytes.len() != PRIVATE_KEY_LENGTH {
         bail!(
-            "Mesh identity file '{}' is corrupt: expected {PRIVATE_KEY_LENGTH} bytes, found {}. Move the file aside to mint a new identity; any trust other peers hold for the old identity is lost.",
+            "Mesh identity file '{}' is corrupt: expected {PRIVATE_KEY_LENGTH} bytes, found {}. Move the file aside to mint a new identity; any trust other users hold for the old identity is lost.",
             path.display(),
             bytes.len()
         );
@@ -472,7 +472,7 @@ fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
                 Err(query_err) => {
                     let advice = owner_only_advice(path, true)?;
                     return Err(query_err).context(format!(
-                        "Mesh identity file '{}' refused even to report its permissions, a right its owner always holds, so another user owns it. {advice}",
+                        "Mesh identity file '{}' refused even to report its permissions, a right the account that owns a file always holds, so another user owns it. {advice}",
                         path.display()
                     ));
                 }
@@ -543,12 +543,12 @@ fn owner_only_advice(path: &Path, owner_is_wrong: bool) -> Result<String> {
         .context("Failed to look up the current user's SID")?;
     let remedy = render_remedy(path, &owner_only_remedy(path, &sid, owner_is_wrong));
     let elevation = if owner_is_wrong {
-        " The `takeown` step must be run from an elevated (Administrator) prompt: taking ownership of a file another user owns needs SeTakeOwnershipPrivilege."
+        " The `takeown` step must be run from an elevated (Administrator) prompt: taking over a file another user owns needs SeTakeOwnershipPrivilege."
     } else {
         ""
     };
     Ok(format!(
-        "A private key whose permissions cannot be vouched for must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.{elevation}"
+        "A private key whose permissions cannot be vouched for must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other users hold for the old identity is lost.{elevation}"
     ))
 }
 
@@ -700,7 +700,7 @@ pub(crate) fn write_owner_only_file(
     #[cfg(not(any(unix, windows)))]
     {
         bail!(
-            "Mesh is not supported on this platform: the mesh identity must be stored in an owner-only file, and Coyote can create one only on Unix and Windows. Run the mesh from a Unix or Windows host."
+            "Mesh is not supported on this platform: the mesh identity must be stored in a file only your account can read, and Coyote can create one only on Unix and Windows. Run the mesh from a Unix or Windows host."
         )
     }
 }

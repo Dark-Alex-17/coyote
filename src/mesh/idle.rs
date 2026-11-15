@@ -252,7 +252,7 @@ impl Coalescer {
         if other_events > 0 {
             lines.push(Notification::new(
                 Source::Mesh,
-                format!("({other_events} more from {other_peers} other peers)"),
+                format!("({other_events} more from {other_peers} other sessions)"),
             ));
         }
         self.delivered.clear();
@@ -852,7 +852,7 @@ mod tests {
         assert!(other_peers <= IDLE_COALESCE_MAX_OTHER_PEERS);
         assert_eq!(
             lines[IDLE_COALESCE_MAX_PEERS],
-            format!("[mesh] ({other_events} more from {other_peers} other peers)")
+            format!("[mesh] ({other_events} more from {other_peers} other sessions)")
         );
         assert!(coalescer.is_empty());
     }
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(
             lines[IDLE_COALESCE_MAX_PEERS],
             format!(
-                "[mesh] ({other_events} more from {IDLE_COALESCE_MAX_OTHER_PEERS}+ other peers)"
+                "[mesh] ({other_events} more from {IDLE_COALESCE_MAX_OTHER_PEERS}+ other sessions)"
             )
         );
         assert!(coalescer.is_empty());
@@ -1354,7 +1354,7 @@ mod tests {
             .expect("the first silence is said");
         assert_eq!(
             line,
-            "sync from 5e1e07ce failed: Propagation node 5e1e07ce did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced"
+            "sync from 5e1e07ce failed: Propagation node 5e1e07ce did not answer the request for its message list within 60 s, so it may be down, busy or out of reach on this path (a propagation node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced"
         );
         assert_eq!(logged(&node), 1);
 

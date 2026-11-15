@@ -154,7 +154,7 @@ impl GrantStore {
             );
         }
         let Some(peer) = canonical_hash(peer_destination) else {
-            bail!("A grant names its peer by a 32-hex destination hash; refusing to store it.");
+            bail!("A grant names its session by a 32-hex destination hash; refusing to store it.");
         };
         if paths.is_empty() || paths.len() > GRANT_MAX_PATHS {
             bail!(

@@ -1852,11 +1852,14 @@ struct SentThread {
     identity: String,
 }
 
-/// The thread `id` names when this session sent it and a reply already closed it: `id`
-/// is the message's own id (a root message's thread), or the id of the reply, and the
-/// newest reply in that thread still in the inbox says which session to send to. `None`
-/// for a thread another session sent, one a peer started, or one whose replies the
-/// inbox no longer holds.
+/// The thread `id` names when this session sent it and a reply already closed it, and
+/// the session a follow-up goes to. `id` is the thread itself, which is the id of the
+/// message that opened it, or the id of a message the inbox holds in that thread, or the
+/// id that message replied to. The session is the recipient kept for the thread when the
+/// message went out. A thread sent before recipients were kept falls back to the one
+/// session that replied in it, which is then kept as its recipient; with no reply in the
+/// inbox or replies from several sessions it is refused. `None` for a thread another
+/// session sent, or one a session on the other side started.
 fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<Result<SentThread>> {
     let sent = ctx.app.mesh.sent_threads()?;
     let thread = if sent.was_sent(id) {
@@ -1873,33 +1876,60 @@ fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<Result<SentThrea
             .thread()
             .to_string()
     };
-    Some(match sent.recipient(&thread) {
-        Some(recipient) => Ok(SentThread {
+    if let Some(recipient) = sent.recipient(&thread) {
+        return Some(Ok(SentThread {
             thread: recipient.thread,
             destination: recipient.destination,
             identity: recipient.identity,
-        }),
-        None => Err(QuotingError::wrap(
-            NoticeText::default()
-                .frame("Message ")
-                .peer(short(&thread))
-                .frame(" was sent before this session kept where each message went, so a follow-up has no session to go to; `.mesh messaging send <session> \"text\"` starts a new conversation."),
-        )),
+        }));
+    }
+    let mut repliers: Vec<(String, String)> = Vec::new();
+    ctx.app.mesh.peer_inbox().newest(|message| {
+        if message.kind == PeerKind::Reply
+            && !message.source_destination.is_empty()
+            && message.thread() == thread
+            && !repliers.iter().any(|(destination, _)| {
+                destination.eq_ignore_ascii_case(&message.source_destination)
+            })
+        {
+            repliers.push((
+                message.source_destination.clone(),
+                message.source_identity.clone(),
+            ));
+        }
+        false
+    });
+    let before = NoticeText::default()
+        .frame("Message ")
+        .peer(short(&thread))
+        .frame(" was sent before this session kept where each message went, and ");
+    Some(match repliers.as_slice() {
+        [(destination, identity)] => {
+            sent.record_recipient(&thread, destination, identity);
+            Ok(SentThread {
+                thread,
+                destination: destination.clone(),
+                identity: identity.clone(),
+            })
+        }
+        [] => Err(QuotingError::wrap(before.frame(
+            "no reply in its thread is in the inbox to say which session to follow up with. `.mesh messaging inbox` shows what came back; `.mesh messaging send <session> \"text\"` starts a new conversation.",
+        ))),
+        several => Err(QuotingError::wrap(before.frame(format!(
+            "{} sessions replied in its thread, so a follow-up has no one session to go to. `.mesh messaging inbox` shows who answered; `.mesh messaging send <session> \"text\"` starts a new conversation with the one you mean.",
+            several.len()
+        )))),
     })
 }
 
 /// The ids `messaging follow-up` takes for a message this session sent whose reply
-/// already closed it: each sent thread whose recipient is on record, and the ids of the
-/// replies the inbox holds in those threads.
+/// already closed it: each sent thread, and the ids of the messages the inbox holds in
+/// those threads.
 fn closed_follow_up_ids(ctx: &RequestContext) -> Vec<String> {
     let Some(sent) = ctx.app.mesh.sent_threads() else {
         return Vec::new();
     };
-    let mut ids: Vec<String> = sent
-        .sent()
-        .into_iter()
-        .filter(|thread| sent.recipient(thread).is_some())
-        .collect();
+    let mut ids = sent.sent();
     ctx.app.mesh.peer_inbox().newest(|message| {
         if !message.source_destination.is_empty() && sent.was_sent(message.thread()) {
             ids.push(message.message_id.clone());
@@ -6328,6 +6358,13 @@ async fn files_list(
         }
         return shares(ctx, &args);
     };
+    if token.contains(GLOB_METACHARACTERS) {
+        return Err(QuotingError::wrap(
+            NoticeText::default().frame("'").peer(token.as_str()).frame(
+                "' is a file pattern, not a session. `.mesh files list` shows what you share; `.mesh files list <session> --prefix <path>` narrows what a session shares with you. Nothing was listed.",
+            ),
+        ));
+    }
     if args.peer.is_some() || args.effective || args.all {
         bail!(
             "`.mesh files list <session>` asks that session which files it shares with you; `--peer`, `--effective` and `--all` read your own share rules, so run them without the session, as in `.mesh files list --effective --peer <who>`. Nothing was listed."
@@ -11058,8 +11095,8 @@ mod help_output_tests {
 
     /// The string literals of `source` a user can read, as `(line, text)`: every literal
     /// outside the `#[cfg(test)]` items, the log macros, the `*_UNDER_THE_HOOD` and
-    /// `group_under_the_hood` paragraphs, and the keys a `NoticeText::from_template` call
-    /// names its placeholders by.
+    /// `group_under_the_hood` paragraphs, the `SELF_TRUST_LABEL` a trust file stores, and
+    /// the keys a `NoticeText::from_template` call names its placeholders by.
     fn shown_literals(source: &str) -> Vec<(usize, String)> {
         let tokens = tokens(source);
         let punct = |at: usize, wanted: char| matches!(tokens.get(at), Some((_, Token::Punct(c))) if *c == wanted);
@@ -11115,7 +11152,9 @@ mod help_output_tests {
                 at = closing(at + 2);
                 continue;
             }
-            if word(at) == "const" && word(at + 1).ends_with("_UNDER_THE_HOOD") {
+            if word(at) == "const"
+                && (word(at + 1).ends_with("_UNDER_THE_HOOD") || word(at + 1) == "SELF_TRUST_LABEL")
+            {
                 at = next_of(at, &[';']) + 1;
                 continue;
             }
@@ -11145,12 +11184,19 @@ mod help_output_tests {
     /// a name; the `rotate-identity` verb, which keeps its name; and the key's file name,
     /// `mesh/identity.key`.
     fn prose_of(literal: &str) -> String {
+        without_placeholders(
+            &["rotate-identity", "mesh/identity.key"]
+                .iter()
+                .fold(literal.to_ascii_lowercase(), |text, token| {
+                    text.replace(token, "")
+                }),
+        )
+    }
+
+    /// `text` without its format placeholders, such as `{identity}` or `{PREFIX}`.
+    fn without_placeholders(text: &str) -> String {
         let mut prose = String::new();
-        let mut rest = ["rotate-identity", "mesh/identity.key"]
-            .iter()
-            .fold(literal.to_ascii_lowercase(), |text, token| {
-                text.replace(token, "")
-            });
+        let mut rest = text.to_string();
         while let Some(open) = rest.find('{') {
             prose.push_str(&rest[..open]);
             let after = &rest[open + 1..];
@@ -11240,22 +11286,34 @@ mod tests {
     /// `line: word in literal` for each literal of `source` a user reads that names
     /// someone on the mesh other than as a user or a session. `propagation node` is the
     /// one named term kept, as the messaging help explains it (with its config keys),
-    /// `--peer` is a flag, and a bare lowercase word, key or path is never prose. The
-    /// match ignores case, so a sentence that opens on one of the words is caught too.
+    /// `--peer` is a flag, `not_trusted_by_peer` is an outcome a tool returns, `peer` in
+    /// backticks is the key a tool argument or result names a session by,
+    /// `SeTakeOwnershipPrivilege` is the Windows privilege `takeown` needs, and a bare
+    /// lowercase word, key or path, or an all-caps identifier such as an environment
+    /// variable name, alone or built around placeholders, is never prose. The match
+    /// ignores case, so a sentence that opens on one of the words is caught too.
     fn user_model_word_hits(source: &str) -> Vec<String> {
         shown_literals(source)
             .into_iter()
             .filter(|(_, literal)| {
-                !literal
+                let bare = without_placeholders(literal);
+                let lowercase = bare
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_./-".contains(c))
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_./-".contains(c));
+                let all_caps = bare
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                !lowercase && !all_caps
             })
             .filter_map(|(line, literal)| {
                 let prose = prose_of(&literal)
                     .replace("mesh__peers", "")
                     .replace("propagation node", "")
                     .replace("propagation_node", "")
-                    .replace("--peer", "");
+                    .replace("--peer", "")
+                    .replace("not_trusted_by_peer", "")
+                    .replace("`peer`", "")
+                    .replace("setakeownershipprivilege", "");
                 USER_MODEL_WORDS
                     .iter()
                     .find(|word| prose.contains(*word))
@@ -11264,8 +11322,80 @@ mod tests {
             .collect()
     }
 
-    /// Every help and result line speaks of users, sessions and envoys: no literal a
-    /// user reads in this file, or in the request and fetch errors it prints, says peer,
+    /// The names `#[cfg(test)]` declares as `mod name;` in `source`: the files of those
+    /// modules hold no text a user reads.
+    fn test_only_modules(source: &str) -> Vec<String> {
+        let tokens = tokens(source);
+        let punct = |at: usize, wanted: char| matches!(tokens.get(at), Some((_, Token::Punct(c))) if *c == wanted);
+        let word = |at: usize| match tokens.get(at) {
+            Some((_, Token::Word(word))) => word.as_str(),
+            _ => "",
+        };
+        let mut names = Vec::new();
+        for at in 0..tokens.len() {
+            let cfg_test = punct(at, '#')
+                && punct(at + 1, '[')
+                && word(at + 2) == "cfg"
+                && punct(at + 3, '(')
+                && word(at + 4) == "test"
+                && punct(at + 5, ')')
+                && punct(at + 6, ']');
+            if !cfg_test {
+                continue;
+            }
+            let mut item = at + 7;
+            if word(item) == "pub" {
+                item += 1;
+                if punct(item, '(') {
+                    item += 3;
+                }
+            }
+            if word(item) == "mod" && punct(item + 2, ';') {
+                names.push(word(item + 1).to_string());
+            }
+        }
+        names
+    }
+
+    /// Every `.rs` file under `dir` that the build compiles outside tests, as
+    /// `(path, source)`, sorted by path. A module `dir/mod.rs` declares under
+    /// `#[cfg(test)]` is left out with everything under it.
+    fn non_test_sources(dir: &std::path::Path) -> Vec<(String, String)> {
+        let test_only = std::fs::read_to_string(dir.join("mod.rs"))
+            .map(|parent| test_only_modules(&parent))
+            .unwrap_or_default();
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()))
+            .map(|entry| entry.expect("a directory entry reads").path())
+            .collect();
+        entries.sort();
+        let mut sources = Vec::new();
+        for path in entries {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if test_only.iter().any(|name| name == stem) {
+                continue;
+            }
+            if path.is_dir() {
+                sources.extend(non_test_sources(&path));
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                let shown = path
+                    .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                sources.push((shown, source));
+            }
+        }
+        sources
+    }
+
+    /// Every help, result and tool line speaks of users, sessions and envoys: no literal
+    /// a user or a model reads in this file, in src/mesh, or in the mesh tools says peer,
     /// owner, person or node outside a group's "Under the hood" paragraph.
     #[test]
     fn no_shown_literal_says_peer_owner_person_or_node() {
@@ -11277,8 +11407,16 @@ fn shown() {
     out_text("every trusted peer");
     bail!("its owner decides");
     out_text("Peer said no; see scope.peer/1");
+    out_text("Returns not_trusted_by_peer when `peer` has not trusted you");
+    out_text("Lists `peers` you trust");
+    let name = format!("{PREFIX}peers");
+    let env = "COYOTE_MESH_PEER_DESTINATION";
+    out_text("Set COYOTE_MESH_PEER_NAME to name the peer");
+    out_text("taking over a file needs SeTakeOwnershipPrivilege");
 }
 const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
+pub(crate) const SELF_TRUST_LABEL: &str = "this node";
+const OTHER_LABEL: &str = "this node";
 "##;
         assert_eq!(
             user_model_word_hits(fixture),
@@ -11286,28 +11424,66 @@ const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
                 "6: \"peer\" in \"every trusted peer\"",
                 "7: \"owner\" in \"its owner decides\"",
                 "8: \"peer\" in \"Peer said no; see scope.peer/1\"",
+                "10: \"peer\" in \"Lists `peers` you trust\"",
+                "13: \"peer\" in \"Set COYOTE_MESH_PEER_NAME to name the peer\"",
+                "18: \"node\" in \"this node\"",
             ],
             "the scan misreads its fixture"
         );
-
-        for (path, source) in [
-            ("src/repl/mesh.rs", include_str!("mesh.rs")),
-            (
-                "src/mesh/request/error.rs",
-                include_str!("../mesh/request/error.rs"),
+        assert_eq!(
+            test_only_modules(
+                "#[cfg(test)]\npub(crate) mod conformance;\nmod fetch;\n#[cfg(test)]\nmod fuzz;\n#[cfg(test)]\nmod tests {}\n"
             ),
-            ("src/mesh/fetch.rs", include_str!("../mesh/fetch.rs")),
-            ("src/mesh/message.rs", include_str!("../mesh/message.rs")),
-            ("src/mesh/card.rs", include_str!("../mesh/card.rs")),
-            ("src/mesh/access.rs", include_str!("../mesh/access.rs")),
+            ["conformance", "fuzz"],
+            "the scan misreads which modules are test-only"
+        );
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mesh_sources = non_test_sources(&root.join("src/mesh"));
+        for kept in [
+            "request/error.rs",
+            "fetch.rs",
+            "message.rs",
+            "card.rs",
+            "access.rs",
+            "knock.rs",
+            "idle.rs",
         ] {
-            let hits = user_model_word_hits(source);
             assert!(
-                hits.is_empty(),
-                "{path} prints peer, owner, person or node where a user reads it:\n{}",
-                hits.join("\n")
+                mesh_sources.iter().any(|(path, _)| path.ends_with(kept)),
+                "the scan skipped src/mesh/{kept}"
             );
         }
+        assert!(
+            !mesh_sources
+                .iter()
+                .any(|(path, _)| path.contains("conformance") || path.ends_with("pins.rs")),
+            "the scan read a test-only module"
+        );
+        let sources = [
+            (
+                "src/repl/mesh.rs".to_string(),
+                include_str!("mesh.rs").to_string(),
+            ),
+            (
+                "src/function/mesh.rs".to_string(),
+                include_str!("../function/mesh.rs").to_string(),
+            ),
+        ]
+        .into_iter()
+        .chain(mesh_sources);
+        let hits: Vec<String> = sources
+            .flat_map(|(path, source)| {
+                user_model_word_hits(&source)
+                    .into_iter()
+                    .map(move |hit| format!("{path}:{hit}"))
+            })
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "these print peer, owner, person or node where a user reads it:\n{}",
+            hits.join("\n")
+        );
     }
 
     #[test]
@@ -22811,7 +22987,7 @@ mod tests {
                 if let Err(err) = runtime.trust().set_person_alias(&identity, Some(name), &[]) {
                     assert!(
                         err.to_string()
-                            .starts_with("Another person or session already has that name"),
+                            .starts_with("Another user or session already has that name"),
                         "{err}"
                     );
                 }
@@ -42912,10 +43088,14 @@ mod tests {
                             .unwrap();
                         assert!(out.contains("src/**"), "{out}");
 
-                        assert_eq!(
-                            refusal(&mut fx.ctx, ".mesh files list docs/**").await,
-                            "'docs/**' names no user you know: no user is called 'docs' and no user's hash starts with it. `.mesh people list` lists the users and sessions you can name, and `.mesh people name <user> \"name\"` names one; a hash needs 8 or more characters."
-                        );
+                        for pattern in ["docs/**", "*.rs", "docs/*.md"] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, &format!(".mesh files list {pattern}")).await,
+                                format!(
+                                    "'{pattern}' is a file pattern, not a session. `.mesh files list` shows what you share; `.mesh files list <session> --prefix <path>` narrows what a session shares with you. Nothing was listed."
+                                )
+                            );
+                        }
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });
@@ -50148,6 +50328,44 @@ mod tests {
                 }
             }
 
+            /// Listing rows carry a live age: `--all` rows end in `asked Ns ago`, and a
+            /// question or message this session sent reads `-> <who> <age> . <state>`.
+            /// The wall clock may tick between filing and listing, or between two
+            /// listings, so each age is checked for shape and pinned to zero before the
+            /// rows are compared.
+            fn with_ages_zeroed(out: &str) -> Vec<String> {
+                let sent_row = |line: &str| {
+                    line.trim_start()
+                        .split_once(". -> ")
+                        .is_some_and(|(number, _)| number.parse::<usize>().is_ok())
+                };
+                out.lines()
+                    .map(|line| match line.rsplit_once(" . asked ") {
+                        Some((head, age)) => {
+                            let secs = age
+                                .strip_suffix("s ago")
+                                .unwrap_or_else(|| panic!("not an age: {line}"));
+                            secs.parse::<u64>()
+                                .unwrap_or_else(|_| panic!("not an age: {line}"));
+                            format!("{head} . asked 0s ago")
+                        }
+                        None if sent_row(line) => {
+                            let (head, rest) = line
+                                .split_once(" ago . ")
+                                .unwrap_or_else(|| panic!("not an age: {line}"));
+                            let (who, age) = head
+                                .rsplit_once(' ')
+                                .unwrap_or_else(|| panic!("not an age: {line}"));
+                            age.strip_suffix(['s', 'm', 'h', 'd'])
+                                .and_then(|count| count.parse::<u64>().ok())
+                                .unwrap_or_else(|| panic!("not an age: {line}"));
+                            format!("{who} 0s ago . {rest}")
+                        }
+                        None => line.to_string(),
+                    })
+                    .collect()
+            }
+
             /// The verbs that take a pending id act on the whole id a prefix names, and
             /// a prefix two ids share sends nothing.
             mod id_prefix_tests {
@@ -50543,8 +50761,10 @@ mod tests {
                         std::fs::write(store.path(), "not a record\n").unwrap();
 
                         assert_eq!(
-                            out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap(),
-                            before
+                            with_ages_zeroed(
+                                &out_of(&mut fx.ctx, ".mesh messaging sent").await.unwrap()
+                            ),
+                            with_ages_zeroed(&before)
                         );
                         for path in ["envoy questions", "files requests"] {
                             assert!(
@@ -50555,31 +50775,52 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// The listings the test above compares are read a moment apart, so
+                /// the clock may tick between them; rendered a second apart, they still
+                /// compare equal once their ages are zeroed.
+                #[test]
+                fn sent_listings_a_clock_tick_apart_compare_equal_once_their_ages_are_zeroed() {
+                    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord};
+
+                    let now = SystemTime::now();
+                    let record = PendingRecord {
+                        version: PENDING_RECORD_VERSION,
+                        id: SECOND.to_string(),
+                        peer_destination: "fe".repeat(16),
+                        peer_identity: "fd".repeat(16),
+                        thread: SECOND.to_string(),
+                        question: "still there?".to_string(),
+                        sent_at: rfc3339_utc(now),
+                        timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                        state: PendingState::Open,
+                        reply: None,
+                        kind: CorrelationKind::Ask,
+                    };
+                    let row = QuestionRow::outbound(&record, "bob".to_string());
+                    let listing = |at: SystemTime| {
+                        render_pending(
+                            PendingList::Asked,
+                            std::slice::from_ref(&row),
+                            &[],
+                            &[],
+                            at,
+                            120,
+                            false,
+                        )
+                        .plain()
+                    };
+                    let (before, after) = (listing(now), listing(now + Duration::from_secs(1)));
+
+                    assert_ne!(before, after, "a second later the age reads otherwise");
+                    assert_eq!(with_ages_zeroed(&before), with_ages_zeroed(&after));
+                }
             }
 
             mod dismiss_verb {
                 use super::*;
                 use crate::mesh::HUMAN_DECLINED;
                 use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord};
-
-                /// The `--all` list rows end in a live `asked Ns ago`; the wall clock may
-                /// tick between filing and listing, so the seconds are checked for shape
-                /// and pinned to zero before the rows are compared.
-                fn with_ages_zeroed(out: &str) -> Vec<String> {
-                    out.lines()
-                        .map(|line| match line.rsplit_once(" . asked ") {
-                            Some((head, age)) => {
-                                let secs = age
-                                    .strip_suffix("s ago")
-                                    .unwrap_or_else(|| panic!("not an age: {line}"));
-                                secs.parse::<u64>()
-                                    .unwrap_or_else(|_| panic!("not an age: {line}"));
-                                format!("{head} . asked 0s ago")
-                            }
-                            None => line.to_string(),
-                        })
-                        .collect()
-                }
 
                 /// Files a question this node asked of the stub, as `mesh__ask` would.
                 fn ask_stub(fx: &PeerFixture, id: &str) {
@@ -53597,6 +53838,185 @@ mod tests {
                         assert_eq!(seen[1].thread.as_deref(), Some(id.as_str()));
                         assert_eq!(seen[1].content, "and the tests too");
 
+                        fx.stop().await;
+                    });
+                }
+
+                /// A reply in `thread` to `asked`, a message this session sent there
+                /// with no recipient kept, from `destination` and `identity`. The
+                /// message's correlation is opened first, as the send would have, so
+                /// the reply lands in the inbox as a reply in that thread.
+                fn reply_in_thread(
+                    fx: &PeerFixture,
+                    id: &str,
+                    asked: &str,
+                    thread: &str,
+                    destination: String,
+                    identity: String,
+                ) -> PeerMessage {
+                    let now = SystemTime::now();
+                    fx.ctx
+                        .app
+                        .mesh
+                        .correlations()
+                        .open(crate::mesh::pending::PendingRecord {
+                            version: crate::mesh::pending::PENDING_RECORD_VERSION,
+                            id: asked.to_string(),
+                            peer_destination: destination.clone(),
+                            peer_identity: identity.clone(),
+                            thread: thread.to_string(),
+                            question: "and the docs?".to_string(),
+                            sent_at: crate::mesh::rfc3339_utc(now),
+                            timeout_at: crate::mesh::rfc3339_utc(
+                                now + std::time::Duration::from_secs(600),
+                            ),
+                            state: crate::mesh::pending::PendingState::Open,
+                            reply: None,
+                            kind: crate::mesh::pending::CorrelationKind::Message,
+                        })
+                        .unwrap();
+                    PeerMessage::new(crate::mesh::message::RawPeerMessage {
+                        source_identity: identity,
+                        source_destination: destination,
+                        destination: fx.started.runtime.current_destination_hash(),
+                        title: None,
+                        content: "done".to_string(),
+                        fields: None,
+                        timestamp: 1_790_000_000.0,
+                        message_id: id.to_string(),
+                        in_reply_to: Some(asked.to_string()),
+                        kind: PeerKind::Reply,
+                        via: PeerVia::Direct,
+                        thread: Some(thread.to_string()),
+                        disposition: Some(Disposition::Answered),
+                        retry_after: None,
+                        parts: Vec::new(),
+                        dropped_parts: 0,
+                    })
+                }
+
+                /// A thread sent before this session kept where each message went has
+                /// no recipient on record; when exactly one session replied in it, a
+                /// follow-up by the thread's short id goes to that session, which is
+                /// then kept as the thread's recipient.
+                #[test]
+                #[serial]
+                fn messaging_follow_up_on_a_thread_sent_before_recipients_were_kept_goes_to_its_one_replier()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-legacy-one");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-legacy-one").await;
+                        let thread = "4d".repeat(16);
+                        fx.ctx.app.mesh.remember_sent_thread(&thread);
+                        let reply = reply_in_thread(
+                            &fx,
+                            &"7e".repeat(16),
+                            &thread,
+                            &thread,
+                            fx.stub.destination_hex(),
+                            fx.stub.identity_hex(),
+                        );
+                        fx.ctx.app.mesh.deliver_peer(reply);
+
+                        let result = out_of(
+                            &mut fx.ctx,
+                            &format!(
+                                ".mesh messaging follow-up {} \"and the tests too\"",
+                                short(&thread)
+                            ),
+                        )
+                        .await;
+
+                        let seen = fx.stub.seen();
+                        assert!(result.is_ok(), "{result:?}");
+                        assert_eq!(seen.len(), 1, "the follow-up went out: {seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Message);
+                        assert_eq!(seen[0].in_reply_to, None);
+                        assert_eq!(seen[0].thread.as_deref(), Some(thread.as_str()));
+                        assert_eq!(seen[0].content, "and the tests too");
+                        let recipient = fx
+                            .ctx
+                            .app
+                            .mesh
+                            .sent_threads()
+                            .unwrap()
+                            .recipient(&thread)
+                            .expect("the one replier is kept as the thread's recipient");
+                        assert_eq!(recipient.destination, fx.stub.destination_hex());
+                        assert_eq!(recipient.identity, fx.stub.identity_hex());
+                        fx.stop().await;
+                    });
+                }
+
+                /// With no reply in such a thread, or replies from more than one
+                /// session, nothing says where a follow-up should go: it is refused,
+                /// naming what to run instead, and nothing is sent or recorded.
+                #[test]
+                #[serial]
+                fn messaging_follow_up_on_a_thread_sent_before_recipients_were_kept_refuses_without_one_replier()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-legacy-none");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-legacy-none").await;
+                        let thread = "4d".repeat(16);
+                        fx.ctx.app.mesh.remember_sent_thread(&thread);
+
+                        assert_eq!(
+                            refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh messaging follow-up {thread} \"x\"")
+                            )
+                            .await,
+                            format!(
+                                "Message {} was sent before this session kept where each message went, and no reply in its thread is in the inbox to say which session to follow up with. `.mesh messaging inbox` shows what came back; `.mesh messaging send <session> \"text\"` starts a new conversation.",
+                                short(&thread)
+                            )
+                        );
+
+                        for (id, asked, destination, identity) in [
+                            (
+                                "7e",
+                                thread.clone(),
+                                fx.stub.destination_hex(),
+                                fx.stub.identity_hex(),
+                            ),
+                            ("6b", "3f".repeat(16), "5a".repeat(16), "5c".repeat(16)),
+                        ] {
+                            let reply = reply_in_thread(
+                                &fx,
+                                &id.repeat(16),
+                                &asked,
+                                &thread,
+                                destination,
+                                identity,
+                            );
+                            fx.ctx.app.mesh.deliver_peer(reply);
+                        }
+                        assert_eq!(
+                            refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh messaging follow-up {} \"x\"", short(&thread))
+                            )
+                            .await,
+                            format!(
+                                "Message {} was sent before this session kept where each message went, and 2 sessions replied in its thread, so a follow-up has no one session to go to. `.mesh messaging inbox` shows who answered; `.mesh messaging send <session> \"text\"` starts a new conversation with the one you mean.",
+                                short(&thread)
+                            )
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(
+                            fx.ctx
+                                .app
+                                .mesh
+                                .sent_threads()
+                                .unwrap()
+                                .recipient(&thread)
+                                .is_none()
+                        );
                         fx.stop().await;
                     });
                 }

@@ -7635,8 +7635,9 @@ impl RequestContext {
     /// Completions for the share verbs, `rest` being everything after the verb with the
     /// token being typed last. After `--peer` the destination records and the trusted
     /// identities, which is what the verbs resolve a peer from;
-    /// otherwise the data rows the verb takes, once, before its positional is given, then
-    /// the flags not yet used, each of `--global`/`--workspace`, `--yes`/`--dry-run` and
+    /// otherwise the data rows the verb takes, once, before its positional is given (for
+    /// `list`, the sessions it can ask, until a flag that reads your own rules is typed),
+    /// then the flags not yet used, each of `--global`/`--workspace`, `--yes`/`--dry-run` and
     /// `--peer`/`--force` dropping once its partner is present, and `--force` once the
     /// positional is a glob, since an override names one exact file.
     fn mesh_completion_share_verb(
@@ -7670,6 +7671,14 @@ impl RequestContext {
                 self.mesh_completion_share_paths(typed)
             }
             "unshare" if positional.is_none() => self.mesh_completion_share_patterns(),
+            "list"
+                if positional.is_none()
+                    && !["--peer", "--effective", "--all"]
+                        .iter()
+                        .any(|flag| prior.contains(flag)) =>
+            {
+                self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard)
+            }
             _ => Vec::new(),
         };
         let flags: &[&str] = match verb {
@@ -39549,6 +39558,7 @@ mod tests {
             ),
             (&["access", "unblock", "session", ""], vec![eve], false),
             (&["files", "fetch", ""], vec![bea], false),
+            (&["files", "list", ""], vec![bea], false),
             (&["files", "allow", "x", "--peer", ""], vec![bea], true),
             (&["files", "list", "--peer", ""], vec![bea], true),
         ] {
@@ -40829,7 +40839,11 @@ mod tests {
 
         assert_eq!(
             completion_values(&fixture.complete(&["files", "list", ""])),
-            ["--peer ", "--effective"]
+            [
+                fixture.trusted_destination.as_str(),
+                "--peer ",
+                "--effective"
+            ]
         );
         assert_eq!(
             completion_values(&fixture.complete(&["files", "list", "--effective", ""])),

@@ -1916,8 +1916,8 @@ mod tests {
         let inside = |user: &str| {
             let begin = peer_fence_begin(&message.source_destination);
             let end = peer_fence_end(&message.source_destination);
-            assert!(begin.contains(" from peer abababab begins "), "{begin}");
-            assert_eq!(end, "=== Untrusted content from peer abababab ends ===");
+            assert!(begin.contains(" from session abababab begins "), "{begin}");
+            assert_eq!(end, "=== Untrusted content from session abababab ends ===");
             assert!(user.starts_with(&begin), "{user}");
             assert!(user.ends_with(&end), "{user}");
             user[begin.len()..user.len() - end.len()].to_string()
@@ -4157,7 +4157,7 @@ mod tests {
         assert!(
             texts.iter().any(|text| {
                 text.contains("envoy failed: could not file the escalated question")
-                    && text.contains("belongs to another peer")
+                    && text.contains("belongs to another session")
             }),
             "{texts:?}"
         );
@@ -4398,7 +4398,7 @@ mod tests {
         assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
         assert_eq!(
             idle.count(
-                "the envoy is stopping, filed in the inbox; further envoy_stopping refusals from this peer are folded for the hour"
+                "the envoy is stopping, filed in the inbox; further envoy_stopping refusals from this session are folded for the hour"
             ),
             1,
             "{:?}",
@@ -4597,7 +4597,7 @@ mod tests {
         let a_dest8 = short(&a_destination);
         assert_eq!(
             idle.count(&format!(
-                "{a8} / {a_dest8}: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
+                "{a8} / {a_dest8}: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this session are folded for the hour"
             )),
             1,
             "{:?}",
@@ -4633,7 +4633,7 @@ mod tests {
         );
         assert_eq!(
             idle.count(&format!(
-                "{a8} / {a_dest8}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+                "{a8} / {a_dest8}: over the hourly message limit; arrived store-and-forward, the sender is told once an hour; further rate_limited refusals from this session are folded for the hour"
             )),
             1,
             "{:?}",
@@ -6247,7 +6247,7 @@ mod tests {
         );
         assert_eq!(
             idle.count(&format!(
-                "{} / {}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                "{} / {}: over the hourly message limit; arrived store-and-forward, the sender is told once an hour; further rate_limited refusals from this session are folded for the hour",
                 short(&identity),
                 short(&to)
             )),

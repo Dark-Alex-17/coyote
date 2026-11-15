@@ -1031,7 +1031,7 @@ fn the_mesh_page_says_how_tool_results_name_users_and_sessions() {
     let guidance = const_str("src/function/mesh.rs", "NAMES_GUIDANCE");
     for needle in [
         "`user` and `session` are your own words for it",
-        "only inside that peer's fenced `advertised_names` block",
+        "only inside that session's fenced `advertised_names` block",
         "Arguments always take the full session hash, never a name.",
     ] {
         assert!(
@@ -1256,9 +1256,9 @@ fn the_mesh_page_quotes_both_fence_forms_and_says_one_fence_per_peer_message_and
         long_end,
         "=== Untrusted content from <destination> ends ==="
     );
-    // The long label is `peer <destination>`; the pages quote it with the label filled in.
-    let long_begin = long_begin.replace("from <destination>", "from peer <destination>");
-    let long_end = long_end.replace("from <destination>", "from peer <destination>");
+    // The long label is `session <destination>`; the pages quote it with the label filled in.
+    let long_begin = long_begin.replace("from <destination>", "from session <destination>");
+    let long_end = long_end.replace("from <destination>", "from session <destination>");
     let card_value = fn_body("src/function/mesh.rs", "card_value");
     for label in ["objective: ", "about: ", "repo: ", "todo goal: "] {
         assert!(
@@ -1279,7 +1279,7 @@ fn the_mesh_page_quotes_both_fence_forms_and_says_one_fence_per_peer_message_and
     );
     let fetch_result = fn_body("src/function/mesh.rs", "fetch_result");
     assert!(
-        fetch_result.contains("wrap(&format!(\"peer {peer}\")"),
+        fetch_result.contains("wrap(&format!(\"session {peer}\")"),
         "fetch_result does not fence a fetched file's text in the long form:\n{fetch_result}"
     );
 
@@ -1356,7 +1356,7 @@ fn the_mesh_page_quotes_both_fence_forms_and_says_one_fence_per_peer_message_and
 
 /// The Mesh page says the envoy's long-form fence fills `<destination>` with the first 8
 /// hex characters of the peer's destination. The envoy's label function spells exactly
-/// that (`peer {}` over `short(destination)`), so the sentence is read against the code
+/// that (`session {}` over `short(destination)`), so the sentence is read against the code
 /// on every run and the page is held to it when the wiki is present.
 #[test]
 fn the_mesh_page_says_the_envoy_fence_names_the_peer_by_its_eight_hex_prefix_as_the_code_does() {
@@ -1367,8 +1367,8 @@ fn the_mesh_page_says_the_envoy_fence_names_the_peer_by_its_eight_hex_prefix_as_
     );
     assert_eq!(
         string_literals(&label),
-        vec!["peer {}".to_string()],
-        "the envoy's fence label is not `peer <d8>`:\n{label}"
+        vec!["session {}".to_string()],
+        "the envoy's fence label is not `session <d8>`:\n{label}"
     );
     let fence = fn_body("src/mesh/envoy.rs", "fence_peer_text");
     assert!(
@@ -4142,7 +4142,7 @@ fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemo
 fn the_relay_restart_idle_lines_are_quoted_on_the_wiki() {
     let Some(wiki) = wiki_dir() else { return };
     let announced = "[mesh] <label> reconnected; announced";
-    let past_cap = "[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now";
+    let past_cap = "[mesh] <label> reconnected again (more than 4 times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now";
     let gotchas = flat(&section(
         "Mesh-Deployment.md",
         &read(wiki.join("Mesh-Deployment.md")),
@@ -4313,7 +4313,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an
     let node = read(repo_root().join("src/mesh/node.rs"));
     for format in [
         "\"{label} reconnected; announced\"",
-        "\"{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now\"",
+        "\"{label} reconnected again (more than {RECONNECT_GREETINGS_PER_HOUR} times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now\"",
     ] {
         assert!(
             node.contains(format),
@@ -4336,7 +4336,7 @@ fn the_relay_restart_idle_lines_are_the_nodes_own_wording_and_the_cap_is_four_an
     );
 
     let Some(wiki) = wiki_dir() else { return };
-    let past_cap = "`[mesh] <label> reconnected again (more than 4 times this hour), so this node waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`";
+    let past_cap = "`[mesh] <label> reconnected again (more than 4 times this hour), so this session waits for its next heartbeat, within about an hour, to announce; .mesh off then .mesh on announces now`";
     for page in ["Mesh.md", "Mesh-Commands.md", "Mesh-Deployment.md"] {
         let text = flat(&read(wiki.join(page)));
         assert!(
@@ -4380,8 +4380,8 @@ fn mesh_sync_documents_a_propagation_node_that_does_not_answer_the_list_request(
         "the page says `60 s` of the fetch request timeout; reword it and this pin with it"
     );
     let lines = [
-        "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced",
-        "The link to propagation node {node} closed before it answered the request for its message list, so the node stopped answering or the way to it broke; .mesh messaging sync tries again, and .mesh config show shows when it last announced",
+        "Propagation node {node} did not answer the request for its message list within {}, so it may be down, busy or out of reach on this path (a propagation node that does not allow this identity refuses it rather than staying silent); .mesh messaging sync tries again, and .mesh config show shows when it last announced",
+        "The link to propagation node {node} closed before it answered the request for its message list, so the propagation node stopped answering or the way to it broke; .mesh messaging sync tries again, and .mesh config show shows when it last announced",
     ];
     for line in lines {
         assert!(
@@ -4447,12 +4447,16 @@ mod first_contact_wiki_pins {
         [waiting, unanswered, not_coyote]
     }
 
-    /// The two reconnect idle lines for a failed announce and for a node that does not
+    /// The two reconnect idle lines for a failed announce and for a session that does not
     /// announce, as `reconnect_line` builds them, with the `[mesh]` prefix the idle line
     /// is printed under.
     fn unannounced_reconnect_lines() -> [String; 2] {
         let body = fn_body("src/mesh/node.rs", "reconnect_line");
-        ["announcing over it failed", "this node does not announce"].map(|needle| {
+        [
+            "announcing over it failed",
+            "this session does not announce",
+        ]
+        .map(|needle| {
             literal_with("src/mesh/node.rs reconnect_line", &body, needle)
                 .replace("{label}", "[mesh] <label>")
         })

@@ -105,13 +105,18 @@ impl Held {
 /// The instance lock keeps the file to one process while a node serves that instance.
 /// A change is made and serialized under `held`, and `write_lock` is taken before
 /// `held` is let go, so a single fsync'd write blocks no reader and the snapshots reach
-/// the disk in the order they were taken.
+/// the disk in the order they were taken. The recipients file is written the same way,
+/// under `recipients` and `recipients_write_lock`.
 pub(crate) struct SentThreads {
     path: PathBuf,
     held: Mutex<Held>,
     write_lock: Mutex<()>,
     recipients_path: PathBuf,
     recipients: Mutex<VecDeque<SentRecipient>>,
+    recipients_write_lock: Mutex<()>,
+    /// Whether `recipients` could be locked as each recipients write began.
+    #[cfg(test)]
+    recipients_free_at_write: Mutex<Vec<bool>>,
 }
 
 impl SentThreads {
@@ -157,6 +162,9 @@ impl SentThreads {
             write_lock: Mutex::new(()),
             recipients_path,
             recipients: Mutex::new(recipients),
+            recipients_write_lock: Mutex::new(()),
+            #[cfg(test)]
+            recipients_free_at_write: Mutex::default(),
         })
     }
 
@@ -219,9 +227,16 @@ impl SentThreads {
             version: SENT_RECIPIENTS_VERSION,
             recipients: recipients.iter().cloned().collect(),
         };
-        let written = serde_json::to_vec(&file)
-            .context("Failed to serialize the mesh sent-recipients list")
-            .and_then(|json| write_atomically_owner_only(&self.recipients_path, &json));
+        let json =
+            serde_json::to_vec(&file).context("Failed to serialize the mesh sent-recipients list");
+        let _write = self.recipients_write_lock.lock();
+        drop(recipients);
+        #[cfg(test)]
+        self.recipients_free_at_write
+            .lock()
+            .push(self.recipients.try_lock().is_some());
+        let written =
+            json.and_then(|json| write_atomically_owner_only(&self.recipients_path, &json));
         if let Err(err) = written {
             warn!(
                 "Mesh sent-recipients list '{}' could not be written ({}); a follow-up on this thread works until the node stops",
@@ -458,6 +473,32 @@ mod tests {
 
     fn written(path: &Path) -> SentThreadsFile {
         serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    /// The recipients file is written once the list is let go, so a slow disk keeps
+    /// no follow-up lookup waiting; the write still lands, oldest first.
+    #[test]
+    fn a_recipient_is_written_with_the_recipient_list_unlocked() {
+        let tmp = TempDir::new("sent-threads-recipient-unlocked");
+        let threads = store(&tmp);
+        let (first, second) = ("a1".repeat(16), "a2".repeat(16));
+        threads.record_recipient(&first, &"d1".repeat(16), &"e1".repeat(16));
+        threads.record_recipient(&second, &"d2".repeat(16), &"e2".repeat(16));
+
+        assert_eq!(*threads.recipients_free_at_write.lock(), [true, true]);
+        let reopened = store(&tmp);
+        assert_eq!(
+            reopened
+                .recipient(&first)
+                .map(|recipient| recipient.destination),
+            Some("d1".repeat(16))
+        );
+        assert_eq!(
+            reopened
+                .recipient(&second)
+                .map(|recipient| recipient.destination),
+            Some("d2".repeat(16))
+        );
     }
 
     #[test]
