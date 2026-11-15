@@ -1948,18 +1948,18 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
             (
                 "strikeout-whole-reply",
                 "a = \"abort\" if stop else _answered(state, {\"round\": [\"apply\", \"one more\", \
-                 \"round\"], \"accept\": [\"accept\"]},",
+                 \"round\"], \"accept\": [\"accept\"],",
                 "a = _answered(state, {\"abort\": [\"abort\"], \"round\": [\"apply\", \"one more\", \
-                 \"round\"], \"accept\": [\"accept\"]},",
+                 \"round\"], \"accept\": [\"accept\"],",
                 "apply_answer: strikeout / lane_stuck replies that mention abort are no abort; the \
                  whole reply or the option is",
             ),
             (
                 "owner-judgment-whole-reply",
                 "a = \"stop\" if stop else _answered(state, {\"skip\": [\"skip\"], \"fix\": [\"fix\", \
-                 \"address\"]}, \"stop\")",
+                 \"address\"], \"stop\": [\"stop\"]})",
                 "a = _answered(state, {\"stop\": [\"stop\"], \"skip\": [\"skip\"], \"fix\": [\"fix\", \
-                 \"address\"]}, \"stop\")",
+                 \"address\"]})",
                 "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is a fix \
                  round, never a stop",
             ),
@@ -2022,14 +2022,17 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "choice-empty-recommended",
-                "        if not text and options and picker and not esc.get(\"hard_trigger\"):\n",
+                "        if not text and options and picker and not esc.get(\"hard_trigger\") \
+                 and not _is_stop_text(options[0].get(\"text\")):\n",
                 "        if False:\n",
                 "choice: an empty picker reply after the re-asks takes the recommended option, ledgered",
             ),
             (
                 "hard-trigger-no-auto-pick",
-                "        if not text and options and picker and not esc.get(\"hard_trigger\"):\n",
-                "        if not text and options and picker:\n",
+                "        if not text and options and picker and not esc.get(\"hard_trigger\") \
+                 and not _is_stop_text(options[0].get(\"text\")):\n",
+                "        if not text and options and picker and \
+                 not _is_stop_text(options[0].get(\"text\")):\n",
                 "sizing: an empty reply after the re-asks never picks the hard-trigger recommendation -> \
                  end_redirect, no file",
             ),
@@ -2039,7 +2042,7 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "    return next((o.get(\"text\") for o in options if o.get(\"text\", \"\").lower() in \
                  reply.lower()), None) or _exact_option(m.group(1) if m else reply, options)\n",
                 "sizing: only an exact option counts - a negated reply naming the architect picks none \
-                 -> end_redirect, nothing written",
+                 -> asked again, then end_redirect, nothing written",
             ),
             (
                 "architect-top-level",
