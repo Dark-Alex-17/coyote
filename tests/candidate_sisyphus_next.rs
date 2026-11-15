@@ -931,6 +931,63 @@ print(json.dumps([gates._discussion_message(d, True), gates._discussion_message(
     assert_no_bytecode_under_candidate();
 }
 
+/// Intake hands the review lanes the configured `plans_dir`, relative to the
+/// git top level, as `debris_exclude`: a custom dir and one below a project
+/// subdirectory are named as such, a preset value is kept, and a missing dir
+/// or one outside the repository yields "".
+#[test]
+fn intake_debris_exclude_follows_the_configured_plans_dir() {
+    let Some(python) = python3() else { return };
+    let scratch = scratch_dir("planning-exclude");
+    let repo = scratch.0.join("repo");
+    for dir in ["docs/planning", "svc/plans"] {
+        fs::create_dir_all(repo.join(dir)).unwrap();
+    }
+    let outside = scratch.0.join("elsewhere");
+    fs::create_dir_all(&outside).unwrap();
+    let mut init = Command::new("git");
+    without_git_repo_vars(&mut init);
+    let init = init.arg("init").arg("-q").arg(&repo).output().unwrap();
+    assert!(init.status.success(), "{}", transcript(&init));
+    let probe = r#"
+import json, sys
+sys.path.insert(0, "scripts")
+import gates
+repo, outside = sys.argv[1], sys.argv[2]
+svc = repo + "/svc"
+print(json.dumps([
+    gates._planning_exclude({"plans_dir": "docs/planning"}, repo, repo),
+    gates._planning_exclude({}, svc, repo),
+    gates._planning_exclude({"debris_exclude": '["kept"]', "plans_dir": "docs/planning"}, repo, repo),
+    gates._planning_exclude({}, repo, repo),
+    gates._planning_exclude({"plans_dir": outside}, repo, repo),
+]))
+"#;
+    let output = battery(&python, &scratch)
+        .args(["-B", "-c", probe])
+        .arg(&repo)
+        .arg(&outside)
+        .output()
+        .unwrap();
+    let report = transcript(&output);
+    assert!(output.status.success(), "{report}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let values: Vec<String> =
+        serde_json::from_str(stdout.lines().last().unwrap_or_default()).expect(&report);
+    assert_eq!(
+        values,
+        [
+            r#"["docs/planning"]"#,
+            r#"["svc/plans"]"#,
+            r#"["kept"]"#,
+            "",
+            ""
+        ],
+        "{report}"
+    );
+    assert_no_bytecode_under_candidate();
+}
+
 /// Lists every regular file under `root` as a path relative to it, sorted.
 fn files_under(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
