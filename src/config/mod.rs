@@ -1620,7 +1620,7 @@ clients:
             "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl"
         ));
         assert!(CONFIG_TEMPLATE.contains(
-            "tui_dump_on_exit: true           # Print the committed transcript on the normal screen when the full-screen UI leaves"
+            "tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
         ));
     }
 
@@ -1660,7 +1660,7 @@ clients:
             "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl"
         ));
         assert!(example.contains(
-            "\ntui_dump_on_exit: true           # Print the committed transcript on the normal screen when the full-screen UI leaves"
+            "\ntui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
         ));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
