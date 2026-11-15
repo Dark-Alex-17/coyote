@@ -1603,11 +1603,15 @@ check("apply: ci_inconclusive re-run cancelled -> the cancelled run re-run and l
 _sleeps = []
 _real_sleep = gates.time.sleep
 gates.time.sleep = _sleeps.append
-set_checks(("build", "pass", ""), ("lint", "cancel", _cancel_link))
-_u2 = gates.ci_poll(base_state(**{**u, "git_report": "pull/5"}))
-gates.time.sleep = _real_sleep
+try:
+    set_checks(("build", "pass", ""), ("lint", "cancel", _cancel_link))
+    _u2 = gates.ci_poll(base_state(**{**u, "git_report": "pull/5"}))
+finally:
+    gates.time.sleep = _real_sleep
+# time.sleep is patched process-wide, so only the poll's own sleep (SISYPHUS_CI_SLEEP) is counted
+_poll_sleep = int(os.environ.get("SISYPHUS_CI_SLEEP", gates.CI_POLL_SLEEP))
 check("ci_poll: the first re-poll after a re-run answer sleeps before reading the checks",
-      len(_sleeps) == 1 and _u2.get("ci_polls") == 2, (_sleeps, _u2))
+      _sleeps.count(_poll_sleep) == 1 and _u2.get("ci_polls") == 2, (_sleeps, _u2))
 _esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=_u2.get("ci_checks", []),
                                  ci_rerun_ids=u.get("ci_rerun_ids"))).get("escalation", {})
 check("ci_route: a cancelled run already re-run this run -> re-run not offered, leaving the PR in draft recommended",
