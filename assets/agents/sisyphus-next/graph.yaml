@@ -1470,7 +1470,7 @@ nodes:
     type: script
     description: The continuation switch on the escalation kind (design doc 2.3).
     script: scripts/apply_answer.py
-    # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each
+    # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each, or flips the PR with two
     timeout: 300
     fallback: end_failure
 
@@ -2064,18 +2064,14 @@ nodes:
 
       Rules that always apply:
       - Commit messages reference the task id when the brief names one.
-      - Draft-first PRs: open every PR as a DRAFT (gh pr create --draft). Flip it
-        (gh pr ready) ONLY when the task block says flip_ready - that means the
-        verification loop is complete AND CI checks are green. Never flip a
-        ready PR back to draft.
+      - Draft-first PRs: open every PR as a DRAFT (gh pr create --draft). Never
+        run gh pr ready and never change a PR's draft state: the gates flip the
+        PR to ready themselves once CI is green.
       - The PR DESCRIPTION is a stable document (what, how to verify, the digest
         sections given below). Every review round's evidence is a NEW comment
         titled "## Review round N @ <full head SHA>"; every later push is a NEW
         top-level comment "## Update @ <full head SHA>" mapping each addressed
         finding to its commit. NEVER rewrite the description as a changelog.
-      - When an orchestrator owns the PR lifecycle (e.g. the architect's single
-        run PR), the flip is NOT yours - leave draft state alone unless the PR
-        is one you authored.
       - Parallel batch member: never touch the shared branch; commit and push
         ONLY your own task branch; no merging, no branch switching - integration
         belongs to the parent. Leave the worktree removable:
@@ -2119,7 +2115,7 @@ nodes:
       Check the publish step's git and PR state (one git_ops retry, then follow-ups, never a stop); watch checks
       only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
     script: scripts/ci_gate.py
-    # 2 x GH_CALL_SECS + 30: the flip confirmation runs gh pr ready and then gh pr view
+    # 2 x GH_CALL_SECS + 30: the publish check and the watch start each read the PR with gh pr view
     timeout: 210
     fallback: final_report
 
@@ -2139,11 +2135,11 @@ nodes:
     id: ci_route
     type: script
     description: >-
-      green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack;
+      green -> gh pr ready, confirmed by a re-read; red -> diagnose; exhausted -> escalate with the evidence pack;
       inconclusive or no_checks -> escalate with every check and its bucket; poll_cap -> escalate
       with the polls used against the poll budget.
     script: scripts/ci_route.py
-    # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin
+    # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin; the green flip makes two gh calls
     timeout: 300
     fallback: final_report
 

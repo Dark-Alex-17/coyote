@@ -2459,15 +2459,12 @@ def apply_answer(state):
             if status == "no_checks":
                 ledger(state, u, f"ci: finished without CI at the user's say-so ({reason}); no CI checks reported")
                 note = "CI never ran: the PR reports no CI checks; finished without CI"
-                text = "The PR reports no CI checks and the user chose to finish without CI: flip the PR to ready."
             else:
                 ledger(state, u, f"ci: inconclusive treated as green at the user's say-so ({reason}); non-pass checks: {non_pass}")
                 note = f"CI treated as green with non-pass checks: {non_pass}"
-                text = (f"Not every CI check passed ({non_pass}) and the user chose to treat CI as green: "
-                        "flip the PR to ready.")
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"{note} (reason: {reason})"]
             u["ci_green_by"] = status
-            _ci_finish_green(state, u, f"{status} accepted", text)
+            _ci_finish_green(state, u, f"{status} accepted")
         elif _watch_started(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review watch stopped with CI {status} on the ready PR: {non_pass}"]
@@ -3805,12 +3802,6 @@ def ci_gate(state):
         u["anomalies"] = []
     task = as_dict(state.get("git_task"))
     ret = task.get("return_to") or "final_report"
-    if task.get("kind") == "flip_ready":
-        _confirm_pr_ready(state, u)
-        if _review_mode(state) and truthy(state.get("ci_owner")):
-            return _start_review_watch(state, u)
-        u["_next"] = "final_report"
-        return u
     if task.get("kind") == "review_update":
         u["_next"] = "pr_review_resolve"
         return u
@@ -3976,7 +3967,8 @@ def _confirm_pr_ready(state, u):
     else:
         watch = "; the review watch starts anyway" if _review_mode(state) and truthy(state.get("ci_owner")) else ""
         ledger(state, u, f"ci: PR flip to ready NOT confirmed ({detail}){watch}")
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR flip to ready not confirmed: {detail}{watch}"]
+        u["follow_ups"] = list(as_list(u.get("follow_ups", state.get("follow_ups")))) + [
+            f"PR flip to ready not confirmed: {detail}{watch}"]
 
 
 def _review_mode(state):
@@ -4199,14 +4191,16 @@ def _ci_leave_option(state):
     return "Stop watching and report" if _watch_started(state) else "Leave the PR in draft and report"
 
 
-def _ci_finish_green(state, u, note, text):
+def _ci_finish_green(state, u, note):
     if _review_mode(state) and truthy(state.get("flip_ready")):
         ledger(state, u, f"ci: {note} -> back to the review watch")
         return _start_review_watch(state, u)
-    u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True, "text": text}
     u["flip_ready"] = True
     ledger(state, u, f"ci: {note} -> flip to ready")
-    u["_next"] = "git_ops"
+    _confirm_pr_ready(state, u)
+    if _review_mode(state) and truthy(state.get("ci_owner")):
+        return _start_review_watch(state, u)
+    u["_next"] = "final_report"
     return u
 
 
@@ -4332,8 +4326,7 @@ def ci_route(state):
     if status == "green":
         if state.get("ci_green_by"):
             u["ci_green_by"] = ""
-        return _ci_finish_green(state, u, "green",
-                                "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready).")
+        return _ci_finish_green(state, u, "green")
     elif status in ("inconclusive", "no_checks"):
         return _ci_unclear(state, u, status)
     elif status == "red":
