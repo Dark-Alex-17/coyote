@@ -229,9 +229,9 @@ class World:
             base = task.get("pr_base") or "main"
             git(self.code, "fetch", "-q", "origin")
             if git(self.code, "rev-parse", "--verify", "--quiet", f"refs/heads/{task.get('branch')}", check_=False) == "":
-                git(self.code, "checkout", "-q", "-b", task.get("branch"), f"origin/{base}" if git(self.code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", check_=False) else base)
+                git(self.code, "checkout", "-q", "-b", task.get("branch"), "--end-of-options", f"origin/{base}" if git(self.code, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{base}", check_=False) else base)
             else:
-                git(self.code, "checkout", "-q", task.get("branch"))
+                git(self.code, "checkout", "-q", "--end-of-options", task.get("branch"))
         fname = (task.get("files") or [f"work/{task_id}.txt"])[0]
         path = os.path.join(cwd, fname)
         os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -2521,14 +2521,22 @@ check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u[
 _none_dir = os.path.join(TMP, "no-open-escalation")
 write(os.path.join(_none_dir, "state.json"), json.dumps({"phase": "wave"}))
 _none = gates.apply_answer(base_state(escalation={}, last_answer="go on", run_dir=_none_dir))
-_none_bare = gates.apply_answer(base_state(escalation={"kind": ""}, last_answer="go on", run_dir=os.path.join(TMP, "no-snapshot-here")))
-check("apply_answer: no open escalation -> resume_route from the saved phase, ledgered; with no snapshot the phase is left alone",
+_none_bare = gates.apply_answer(base_state(escalation={"kind": ""}, last_answer="go on", resume_phase="task TASK-001 verify r1",
+                                           run_dir=os.path.join(TMP, "no-snapshot-here")))
+check("apply_answer: no open escalation -> resume_route from the saved phase, ledgered",
       _none["_next"] == "resume_route" and _none.get("resume_phase") == "wave" and "failure_reason" not in _none
-      and any("no open escalation" in d for d in _none["decisions"])
-      and _none_bare["_next"] == "resume_route" and "resume_phase" not in _none_bare, (_none, _none_bare))
+      and any("no open escalation" in d for d in _none["decisions"]), _none)
+check("apply_answer: no open escalation and no snapshot -> a stale resume_phase is cleared, resume_route",
+      _none_bare["_next"] == "resume_route" and _none_bare.get("resume_phase") == "", _none_bare)
+_none_abort = gates.apply_answer(base_state(escalation={}, last_answer="abort", run_dir=_none_dir))
+check("apply_answer: abort with no open escalation -> end_aborted, ledgered",
+      _none_abort["_next"] == "end_aborted" and "aborted" in _none_abort.get("failure_reason", "")
+      and any("no open escalation" in d for d in _none_abort["decisions"]), _none_abort)
+_none_stop = gates.apply_answer(base_state(escalation={}, last_answer="Stop", run_dir=_none_dir))
+check("apply_answer: stop with no open escalation -> end_blocked", _none_stop["_next"] == "end_blocked", _none_stop)
 check("resume_route: copes with the state an answer with no open escalation leaves",
       gates.resume_route({**base_state(run_dir=_none_dir), **_none})["_next"] == "select_tasks"
-      and gates.resume_route({**base_state(resume_phase="", sealed=False), **_none_bare})["_next"] == "reseal_gate")
+      and gates.resume_route({**base_state(resume_phase="task TASK-001 verify r1", sealed=False), **_none_bare})["_next"] == "reseal_gate")
 _unknown = AA("no_such_kind", "go on")
 check("apply_answer: a non-empty unknown escalation kind still stops -> end_failure",
       _unknown["_next"] == "end_failure" and "no_such_kind" in _unknown.get("failure_reason", ""), _unknown)
@@ -5066,6 +5074,45 @@ argv_delete = recorded_git_argv(lambda: cleanup_task(wt_x, "argv-marked", integr
 check("git argv: an end-of-options marker precedes the task branch at the integration merge and the cleanup branch delete",
       marker_before(argv_merge, "merge", "argv-marked") and marker_before(argv_delete, "branch", "argv-marked") and not local("argv-marked"),
       ([c for c in argv_merge if c[:1] == ["merge"]], [c for c in argv_delete if c[:1] == ["branch"]]))
+REF_NAMES = {"branch", "run_branch", "base", "base_branch", "top"}
+
+
+def names_ref(node):
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and n.id in REF_NAMES:
+            return True
+        if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id in ("task", "t")
+                and isinstance(n.slice, ast.Constant) and n.slice.value == "branch"):
+            return True
+        if isinstance(n, ast.JoinedStr) and any(isinstance(v, ast.Constant) and str(v.value).endswith("origin/") for v in n.values):
+            return True
+    return False
+
+
+def unmarked_ref_calls(tree):
+    """git/git_out calls in tree that pass a ref-bearing positional with no "--end-of-options" before it. A value right
+    after -b or --branch is the option's own argument (validated by check-ref-format), and a "--opt=..." f-string
+    carries its value inside the option, so neither can be read as an option."""
+    out = []
+    for call in ast.walk(tree):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in ("git", "git_out")):
+            continue
+        argv = call.args[1:]
+        for i, a in enumerate(argv):
+            if not names_ref(a) or (i and isinstance(argv[i - 1], ast.Constant) and argv[i - 1].value in ("-b", "--branch")):
+                continue
+            if isinstance(a, ast.JoinedStr) and isinstance(a.values[0], ast.Constant) and str(a.values[0].value).startswith("-"):
+                continue
+            if not any(isinstance(b, ast.Constant) and b.value == "--end-of-options" for b in argv[:i]):
+                out.append(f"{call.lineno}: {ast.unparse(call)}")
+    return out
+
+
+_unmarked = unmarked_ref_calls(GATES_AST)
+_planted = unmarked_ref_calls(ast.parse("git(code, 'merge', '--no-ff', task['branch'])\ngit(code, 'branch', '-D', '--end-of-options', branch)\n"
+                                        "git_out(code, 'rev-parse', f'origin/{x}')\ngit(code, 'worktree', 'add', wt, '-b', branch, base)\n"))
+check("git argv: every git/git_out call in gates.py that passes a branch or base name puts --end-of-options before it",
+      not _unmarked and len(_planted) == 3, _unmarked or _planted)
 wt_x, sha_x = task_branch("int-checkout")
 gates.task_by_id(ts_i, T1).update({"worktree": wt_x, "branch": "int-checkout"})
 head0 = git(CODE, "rev-parse", "HEAD")
@@ -5239,32 +5286,63 @@ for _k, _v in _ci_saved.items():
 # ---------------------------------------------------------------- criterion commands declared as verification runs
 CC_DIR = os.path.join(TMP, "criterion-commands")
 write(os.path.join(CC_DIR, "bin", "check.sh"), "#!/bin/sh\nexit 0\n", exe=True)
-cc = _lib.criterion_commands("- `git push origin x` pushes, `gh pr view` shows it, `CREATE TABLE x` runs, `true && true` holds\n"
-                             "- `git status --short` is clean, `git status --short` again, `FOO=1 true x` and `bin/check.sh run` pass,"
-                             " `./missing.sh run` and `alpha_records` are not commands", CC_DIR)
-check("criterion_commands: mutating git, gh, an unresolvable program and shell metacharacters dropped; read-only git, "
-      "env assignments and an executable under cwd kept once each, in order",
-      cc == ["git status --short", "FOO=1 true x", "bin/check.sh run"], cc)
-cc_many = " ".join(f"`true a{i}`" for i in range(12))
-check("criterion_commands: at most 8 by default and the cap honoured, the first ones kept",
-      _lib.criterion_commands(cc_many, CC_DIR) == [f"true a{i}" for i in range(8)]
-      and _lib.criterion_commands(cc_many, CC_DIR, cap=3) == ["true a0", "true a1", "true a2"])
-check("criterion_commands: a read-only git span that writes a file through --output is dropped",
-      _lib.criterion_commands("- `git diff --output=x.patch` and `git diff --exit-code -- a` pass\n", CC_DIR) == ["git diff --exit-code -- a"])
+write(os.path.join(CC_DIR, "tools", "check"), "#!/bin/sh\nexit 0\n", exe=True)
+write(os.path.join(TMP, "outside", "tool"), "#!/bin/sh\nexit 0\n", exe=True)
+
+
+def cc_row(name, text, want, declared=("true",)):
+    def run():
+        got = _lib.criterion_commands(text, CC_DIR, list(declared))[0]
+        return got == want, got
+    guarded(name, run)
+
+
+cc_row("criterion_commands: `rm -rf x` passes -> dropped, rm is not a declared program", "- `rm -rf x` passes\n", [])
+cc_row("criterion_commands: `sh -c 'x'` passes -> dropped for its quotes even with sh declared",
+       "- `sh -c 'x'` passes\n", [], declared=("true", "sh run.sh"))
+cc_row("criterion_commands: `git grep -Oecho -e a` passes -> dropped, grep is not read-only and -O runs a program",
+       "- `git grep -Oecho -e a` passes\n", [])
+cc_row("criterion_commands: `git diff -Oecho` and `git log --ext-diff` pass -> dropped for the unsafe argument",
+       "- `git diff -Oecho --exit-code` and `git log --ext-diff -p` pass\n", [])
+cc_row("criterion_commands: `git push origin x` passes -> dropped even when a declared command is git",
+       "- `git push origin x` passes\n", [], declared=("git diff --check",))
+cc_row("criterion_commands: `../outside/tool run` passes -> dropped, the executable is outside cwd",
+       "- `../outside/tool run` passes\n", [])
+cc_row("criterion_commands: `./tools/check run` passes -> kept, an executable inside cwd",
+       "- `./tools/check run` passes\n", ["./tools/check run"])
+cc_row("criterion_commands: a declared program passes -> kept; a bare program or a missing path is not",
+       "- `true x` passes, `true` alone passes, `./missing.sh run` passes\n", ["true x"])
+cc_row("criterion_commands: a NAME=value prefix is dropped, on git and on a declared program alike",
+       "- `GIT_EXTERNAL_DIFF=rm git diff --exit-code -- f` and `PATH=. true x` and `LD_PRELOAD=x.so true y` pass\n", [])
+cc_row("criterion_commands: `git status --short` is clean -> dropped, its exit does not decide the criterion",
+       "- `git status --short` is clean\n", [])
+cc_row("criterion_commands: `true --bad` exits 2 -> dropped, the criterion expects a failing exit",
+       "- `true --bad` exits 2\n", [])
+cc_row("criterion_commands: a line stating both a pass and a failure -> dropped", "- `true x` passes, `true y` fails\n", [])
+cc_row("criterion_commands: `CREATE TABLE x` and `true && true` pass -> dropped, not a declared program and a metacharacter",
+       "- `CREATE TABLE x` and `true && true` pass\n", [])
 CC_SQL = "schema/sql/0001_base.sql schema/sql/0002_more.sql"
 CC_DIFFS = [f"git diff --exit-code -- {CC_SQL}", f"git diff --exit-code {CC_SQL}", f"git diff --quiet -- {CC_SQL}"]
-CC_DECLARED = ["true", "git status --short"]
+CC_CRITERIA = ("- `git status --short` is clean, and the table list includes `alpha_records`.\n"
+               f"- 0001 and 0002 are byte-identical: `{CC_DIFFS[0]}`.\n"
+               f"- `{CC_DIFFS[1]}` shows no change.\n"
+               f"- `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{CC_DIFFS[2]}`).\n"
+               "- A missing row is reported as `errors.Is(err, x)`.\n")
+cc_row("criterion_commands: the three git diff exit-code forms are kept with no pass word on their lines, once each",
+       CC_CRITERIA + f"- again `{CC_DIFFS[0]}`\n", CC_DIFFS)
+cc_many = "".join(f"- `true a{i}` passes\n" for i in range(12)) + "- `true a0` passes\n"
+guarded("criterion_commands: at most 8 by default and the cap honoured, the first ones kept and the rest counted once each",
+        lambda: ((_lib.criterion_commands(cc_many, CC_DIR, ["true"]), _lib.criterion_commands(cc_many, CC_DIR, ["true"], cap=3))
+                 == (([f"true a{i}" for i in range(8)], 4), (["true a0", "true a1", "true a2"], 9)), "cap misapplied"))
+cc_row("criterion_commands: a read-only git span that writes a file through --output is dropped",
+       "- `git diff --output=x.patch` and `git diff --exit-code -- a` pass\n", ["git diff --exit-code -- a"])
+CC_DECLARED = ["true"]
 write(os.path.join(CC_DIR, "TASK-900-schema", "index.md"),
-      "---\ntitle: schema\nstatus: in-progress\nbatch: B9\n---\n\n# schema\n\n## Acceptance criteria\n\n"
-      "- `git status --short` passes, and the table list includes `alpha_records`.\n"
-      f"- 0001 and 0002 are byte-identical: `{CC_DIFFS[0]}`.\n"
-      f"- `{CC_DIFFS[1]}` shows no change.\n"
-      f"- `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{CC_DIFFS[2]}`).\n"
-      "- A missing row is reported as `errors.Is(err, x)`.\n")
+      "---\ntitle: schema\nstatus: in-progress\nbatch: B9\n---\n\n# schema\n\n## Acceptance criteria\n\n" + CC_CRITERIA)
 
 
-def cc_verify(**over):
-    task = {"id": "TASK-900", "dir": os.path.join(CC_DIR, "TASK-900-schema"), "base_sha": CODE_BASE, "batch": "B9"}
+def cc_verify(task_dir=os.path.join(CC_DIR, "TASK-900-schema"), **over):
+    task = {"id": "TASK-900", "dir": task_dir, "base_sha": CODE_BASE, "batch": "B9"}
     return gates.verify_gate(base_state(**{"tasks": [task], "current_task": "TASK-900", "verify_scope": "task",
                                            "verification_commands": json.dumps(CC_DECLARED), **over}))
 
@@ -5280,8 +5358,22 @@ check("verify_gate: hygiene scope declares only the run-wide lint, no criterion 
       json.loads(u["verification_commands_json"]) == CC_DECLARED + ["true lint"], u["verification_commands_json"])
 guarded("verify_gate: a malformed declaration is passed on unchanged and a non-string item does not crash the gate",
         lambda: ((cc_verify(verification_commands='["unterminated')["verification_commands_json"] == '["unterminated'
-                  and json.loads(cc_verify(verification_commands=[1, "true"])["verification_commands_json"]) == [1, "true", "git status --short"] + CC_DIFFS),
+                  and json.loads(cc_verify(verification_commands=[1, "true"])["verification_commands_json"]) == [1, "true"] + CC_DIFFS),
                  "declaration mangled"))
+CC_WT = os.path.join(TMP, "criterion-commands-worktree")
+write(os.path.join(CC_WT, "wt-only", "check"), "#!/bin/sh\nexit 0\n", exe=True)
+write(os.path.join(CC_DIR, "TASK-900-wave", "index.md"),
+      "---\ntitle: wave\nstatus: in-progress\n---\n\n# wave\n\n## Acceptance criteria\n\n- `./wt-only/check run` passes\n")
+cc_wave = {k: json.loads(cc_verify(task_dir=os.path.join(CC_DIR, "TASK-900-wave"), **over)["verification_commands_json"])
+           for k, over in {"wave": {"delegate_project_dir": CC_WT}, "main": {}}.items()}
+check("verify_gate: on the wave path an executable only the task worktree holds is declared; against the main checkout it is not",
+      cc_wave == {"wave": CC_DECLARED + ["./wt-only/check run"], "main": CC_DECLARED}, cc_wave)
+write(os.path.join(CC_DIR, "TASK-900-many", "index.md"),
+      "---\ntitle: many\nstatus: in-progress\n---\n\n# many\n\n## Acceptance criteria\n\n" + cc_many)
+u = cc_verify(task_dir=os.path.join(CC_DIR, "TASK-900-many"))
+check("verify_gate: the ledger line says how many criterion commands the cap dropped",
+      any("declared 8 criterion command(s) as verification runs (4 more dropped by the cap): true a0;" in d for d in u["decisions"]),
+      u["decisions"])
 
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")

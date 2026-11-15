@@ -1853,12 +1853,14 @@ def verify_gate(state):
         except json.JSONDecodeError:
             arr = None
         if isinstance(arr, list):
-            declared = {c.strip() for c in arr if isinstance(c, str)}
+            declared = [c.strip() for c in arr if isinstance(c, str)]
             source = crit if scope == "batch" else plan_section(body, r"Acceptance criteria")
-            extra = [c for c in criterion_commands(source, code) if c not in declared]
+            kept, dropped = criterion_commands(source, state.get("delegate_project_dir") or code, declared)
+            extra = [c for c in kept if c not in declared]
             if extra:
                 cmds = json.dumps(arr + extra)
-                ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs: {'; '.join(extra)}")
+                over = f" ({dropped} more dropped by the cap)" if dropped else ""
+                ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
     u["verification_commands_json"] = cmds
     u["debris_exclude"] = state.get("debris_exclude") or _planning_exclude(state, code)
     rl.append({"round": n, "head": head, "scope": scope, "started": now_iso()})
@@ -3682,11 +3684,18 @@ def apply_answer(state):
     stop = _whole_reply_stop(answer, options)
 
     if not kind:
-        # nothing is open to answer, so the run goes on from its last saved phase rather than failing
-        if phase := read_snapshot(state.get("run_dir")).get("phase"):
-            u["resume_phase"] = str(phase)
-        ledger(state, u, "apply_answer: no open escalation to apply the answer to -> resume_route")
-        u["_next"] = "resume_route"
+        if abort:
+            u["failure_reason"] = f"aborted at the user's request (no open escalation): {answer}"
+            u["_next"] = "end_aborted"
+        elif stop:
+            u["failure_reason"] = "stopped at the user's request with no open escalation"
+            u["_next"] = "end_blocked"
+        else:
+            # nothing is open to answer, so the run goes on from its last saved phase rather than failing; with no
+            # snapshot a stale resume_phase is cleared so resume_route falls back to the state flags
+            u["resume_phase"] = str(read_snapshot(state.get("run_dir")).get("phase") or "")
+            u["_next"] = "resume_route"
+        ledger(state, u, f"apply_answer: no open escalation to apply the answer to -> {u['_next']}")
         return u
     if kind == "draft_confirm":
         # matched before the generic abort check: an edit such as "do not abort, add a flag" must not abort

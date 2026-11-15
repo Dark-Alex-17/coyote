@@ -20,7 +20,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import time
@@ -721,44 +720,69 @@ def looks_executable(criterion):
     return bool(EXECUTABLE_RE.search(criterion or ""))
 
 
-GIT_READ_ONLY = ("diff", "status", "log", "show", "rev-parse", "ls-files", "merge-base", "cat-file", "grep")
-SHELL_META_RE = re.compile(r"[;|&$<>(){}`*?\n]")
+GIT_READ_ONLY = ("diff", "status", "log", "show", "rev-parse", "ls-files", "merge-base", "cat-file")
+GIT_UNSAFE_ARGS = ("-O", "--open-files-in-pager", "--ext-diff", "--textconv", "--output")
+SHELL_META_RE = re.compile(r"[;|&$<>(){}`*?\n'\"~!]")
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_]\w*=")
+CRITERION_PASS_RE = re.compile(r"\b(pass(es|ing)?|succeed(s|ed)?|green|exits?\s+(with\s+)?(code\s+|status\s+)?0)\b", re.I)
+CRITERION_FAIL_RE = re.compile(r"\b(fail(s|ed)?|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9]|non-?zero|rejected|refuse[sd]?)\b", re.I)
+EXIT_CODE_FLAGS = ("--exit-code", "--quiet")
 
 
-def criterion_commands(criteria_text, cwd, cap=8):
-    """The backticked spans of acceptance criteria that are runnable command lines, deduplicated, at most cap.
+def _command_args(span):
+    try:
+        toks = shlex.split(span)
+    except ValueError:
+        return []
+    return toks[next((i for i, t in enumerate(toks) if not ENV_ASSIGN_RE.match(t)), len(toks)):]
 
-    A span counts when it has two or more tokens, no shell metacharacters, and a program (after leading NAME=value
-    assignments) found on PATH or, when it holds a slash, executable under cwd. A git span counts only for a
-    read-only subcommand and a gh span never does, so a criterion can never push or mutate the repository.
+
+def _in_tree_executable(prog, cwd):
+    if not cwd:
+        return False
+    root = os.path.realpath(cwd)
+    path = os.path.realpath(os.path.join(root, prog))
+    return os.path.commonpath([root, path]) == root and os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def criterion_commands(criteria_text, cwd, declared, cap=8):
+    """(kept, dropped): the backticked spans of acceptance criteria whose exit status is the criterion's verdict.
+
+    A span counts when it has a program and at least one argument, no leading NAME=value assignment, no shell
+    metacharacters, quotes, ~ or !, and a program that is either the program of a declared verification command,
+    a path holding a slash that resolves to an executable file inside cwd, or git with a read-only subcommand
+    (diff, status, log, show, rev-parse, ls-files, merge-base, cat-file) and no -O, --open-files-in-pager,
+    --ext-diff, --textconv or --output argument. Any git span must meet the git rule, even when git is declared.
+    The span must also carry --exit-code or --quiet, or sit on a criterion line that states a passing exit and no
+    failing one, because a span whose exit does not decide the criterion would report a false green or red.
+    Assignments are refused because the span runs through a shell, where GIT_EXTERNAL_DIFF, GIT_CONFIG_*, PATH or
+    LD_PRELOAD would turn an allowed program into an arbitrary one.
+    kept is deduplicated and at most cap long; dropped counts the eligible spans the cap left out.
     """
-    out = []
-    for span in re.findall(r"`([^`]+)`", criteria_text or ""):
-        span = span.strip()
-        if span in out or SHELL_META_RE.search(span):
-            continue
-        try:
-            toks = shlex.split(span)
-        except ValueError:
-            continue
-        args = toks[next((i for i, t in enumerate(toks) if not ENV_ASSIGN_RE.match(t)), len(toks)):]
-        if len(toks) < 2 or not args or any(t.startswith("--output") for t in args):
-            continue
-        prog = args[0]
-        if "/" in prog:
-            path = os.path.join(cwd or "", prog)
-            if not (os.path.isfile(path) and os.access(path, os.X_OK)):
+    programs = {a[0] for a in map(_command_args, declared or []) if a}
+    out, seen, dropped = [], set(), 0
+    for line in (criteria_text or "").splitlines():
+        prose = re.sub(r"`[^`]*`", " ", line)
+        line_passes = bool(CRITERION_PASS_RE.search(prose)) and not CRITERION_FAIL_RE.search(prose)
+        for span in re.findall(r"`([^`]+)`", line):
+            span = span.strip()
+            if span in seen or SHELL_META_RE.search(span):
                 continue
-        elif not shutil.which(prog):
-            continue
-        name = os.path.basename(prog)
-        if name == "gh" or (name == "git" and (len(args) < 2 or args[1] not in GIT_READ_ONLY)):
-            continue
-        out.append(span)
-        if len(out) >= cap:
-            break
-    return out
+            args = _command_args(span)
+            if ENV_ASSIGN_RE.match(span) or len(args) < 2 or not (line_passes or any(a in EXIT_CODE_FLAGS for a in args)):
+                continue
+            prog = args[0]
+            if prog == "git":
+                if args[1] not in GIT_READ_ONLY or any(a.startswith(GIT_UNSAFE_ARGS) for a in args):
+                    continue
+            elif prog not in programs and not ("/" in prog and _in_tree_executable(prog, cwd)):
+                continue
+            seen.add(span)
+            if len(out) >= cap:
+                dropped += 1
+                continue
+            out.append(span)
+    return out, dropped
 
 
 # ---------------------------------------------------------------- task store

@@ -116,28 +116,30 @@ the frozen budgets row records. The gates' per-call `gh` and seam timeouts, betw
 180 seconds in staging, are all `GH_CALL_SECS` now, as the gh command seams row records.
 
 Toolchain census (the gates must stay project-agnostic; verification commands come
-from the brief, plus the read-only command lines a task's acceptance criteria quote in
-backticks, never from a hard-coded toolchain):
+from the brief, plus the command lines a task's acceptance criteria quote in backticks
+when the criterion's verdict is their exit status and they run a program of a declared
+verification command, an executable inside the project, or read-only git with no leading
+environment assignment, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:714:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
+scripts/_lib.py:713:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
 scripts/gates.py:51:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:4350:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:4359:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:4359:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:4368:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
 scripts/smoke_test.py:173:`make run`
 scripts/smoke_test.py:1431:u = gates.verify_gate(base_state(..., local_run_recipe="make run"))
 scripts/smoke_test.py:1889:   ... "acceptance_criteria": ["`...`"], ...   (a command-shaped criterion fixture, elided here)
-scripts/smoke_test.py:2567:u = AA("probe_gap", "Supply the recipe: make run", ...)
+scripts/smoke_test.py:2575:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:714` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:713` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:51` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:4350` and `:4359` are an English verb in prompt prose, and
+lockfile names), `gates.py:4359` and `:4368` are an English verb in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -529,6 +531,13 @@ different `yq` (or none) is on `PATH`, and fail instead when `ARCHITECT_NEXT_REQ
 set to a non-empty value. The sweep that
 keeps every bundled agent from naming this candidate lives in
 `tests/candidate_sisyphus_next.rs` and covers both candidate names.
+
+The gates need git 2.30 or newer: every branch or base name they pass to git follows an
+`--end-of-options` marker, and `git rev-parse` accepts that marker from 2.30. Three kinds of
+site carry a branch without the marker: `check-ref-format --branch`, whose operand is the
+name being validated; the value right after `-b`, which that check has already validated;
+and the `--force-with-lease=<branch>:<sha>` option value, which git never reads as an option
+of its own.
 
 Measured 2026-11-02 after the adjustments above, from a fresh scratch dir: audit
 `PROBLEMS: none`; smoke `848/848 checks passed` (audit, smoke and matrix re-measured 2026-11-06

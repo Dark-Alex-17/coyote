@@ -640,6 +640,27 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
     );
 }
 
+/// The criterion commands `verify_gate` keeps never reach the review's
+/// declaration once the append is removed from a scratch copy, and the
+/// verify_gate row turns red. One battery run, so it stays apart from the
+/// longer list above.
+#[test]
+fn verify_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    let Some(yq) = mikefarah_yq() else { return };
+    run_smoke_sabotages(
+        &python,
+        &yq,
+        &[(
+            "criterion-commands-declared",
+            "                cmds = json.dumps(arr + extra)\n",
+            "                pass\n",
+            "verify_gate: the git diff commands the criteria name are declared once each after the \
+             declared ones (task, micro, batch)",
+        )],
+    );
+}
+
 /// The rest of the intake guards, each removed from a scratch copy, turn
 /// their smoke row red: the re-check that a seed is still ready before it is
 /// consumed, the consumption at the step after a successful orientation, the
@@ -3040,10 +3061,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4350, 4359],
+        vec![51, 4359, 4368],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4350, 4359] {
+    for line in [4359, 4368] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4245,10 +4266,9 @@ fn gauntlet_adversary_complaints_become_the_fix_items() {
 /// review gauntlet is written.
 #[test]
 fn adversary_complaints_copy_matches_the_review_gauntlet_reader() {
-    use std::io::Write;
     let Some(python) = python3() else { return };
     let scratch = scratch_dir("complaints-pin");
-    let cases: [(&str, serde_json::Value); 8] = [
+    let cases: [(&str, serde_json::Value); 11] = [
         (
             "ADVERSARIAL_REVIEW: DIVERGES\n1. not under a complaints line\n",
             json!([]),
@@ -4278,8 +4298,16 @@ fn adversary_complaints_copy_matches_the_review_gauntlet_reader() {
             "Complaints:\n1. field a\u{2028}field b\rfield c\n2. two\u{b}more\n",
             json!(["field a field b field c", "two more"]),
         ),
+        ("  Complaints:\n1. one\n2. two\n", json!(["one", "two"])),
+        ("Complaints:\n  1. one\n  2. two\n", json!([])),
+        (
+            "Complaints:\n1. first\n\nVerification runs:\n- r\n\nComplaints:\n1. second\n",
+            json!(["first"]),
+        ),
     ];
     let reports: Vec<&str> = cases.iter().map(|(report, _)| *report).collect();
+    let fixtures = scratch.0.join("complaints-fixtures.json");
+    fs::write(&fixtures, json!(reports).to_string()).unwrap();
     let verdict_gate = agents_dir().join("review-gauntlet/scripts/verdict_gate.py");
     let mut cmd = battery(&python, &scratch);
     cmd.current_dir(candidate_dir().join("scripts"))
@@ -4289,8 +4317,8 @@ fn adversary_complaints_copy_matches_the_review_gauntlet_reader() {
         .arg(
             "import contextlib, io, json, sys\n\
              import gates\n\
-             reports = json.loads(sys.stdin.read())\n\
              path = sys.argv[1]\n\
+             reports = json.load(open(sys.argv[2], encoding=\"utf-8\"))\n\
              saved = list(sys.path)\n\
              ns = {\"__name__\": \"verdict_gate_pin\", \"__file__\": path}\n\
              with contextlib.redirect_stdout(io.StringIO()):\n    \
@@ -4299,17 +4327,8 @@ fn adversary_complaints_copy_matches_the_review_gauntlet_reader() {
              print(json.dumps([[gates._adversary_complaints(r), ns[\"adversary_complaints\"](r)] for r in reports]))\n",
         )
         .arg(&verdict_gate)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(json!(reports).to_string().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
+        .arg(&fixtures);
+    let out = output_with_timeout(&mut cmd, GATE_LIMIT, "adversary_complaints pin");
     assert_no_bytecode_under_candidate();
     let pairs = parse_json_stdout("adversary_complaints pin", &out);
     for ((report, expected), pair) in cases.iter().zip(pairs.as_array().unwrap()) {
@@ -4491,11 +4510,14 @@ fn only_dirt_outside_the_in_repo_planning_store_suppresses_the_re_review_lines()
 }
 
 /// A criterion that names a command is run and recorded, not left to the
-/// reviewer's reading: `verify_gate` declares the read-only `git diff` spans
-/// of the task's criteria as verification commands, the adversary's own
-/// `run_checks.py` runs them against the diff base and its `verdict.py`
-/// raises no run complaint while the two files are untouched, then a
-/// blocking regression once one of them changes in the working tree.
+/// reviewer's reading. With only the brief's declaration the adversary's
+/// `run_checks.py` never runs the diff, and a PARTIAL verdict on that
+/// criterion diverges. `verify_gate` declares the exit-code `git diff` spans
+/// of the task's criteria (not the `git status` one, whose exit does not
+/// decide its criterion) as verification commands; `run_checks.py` runs them
+/// against the diff base and `verdict.py` lists the diff as a passing run
+/// while the two files are untouched, then raises a blocking regression once
+/// one of them changes in the working tree.
 #[test]
 fn criterion_commands_are_run_as_recorded_verification_runs() {
     if python3().is_none() || which::which("git").is_err() {
@@ -4540,7 +4562,7 @@ fn criterion_commands_are_run_as_recorded_verification_runs() {
     git(&["commit", "-q", "-m", "alpha"]);
 
     let pair = "schema/sql/0001_base.sql schema/sql/0002_more.sql";
-    let byte_identical = format!("git diff --exit-code -- {pair}");
+    let diff_vs_index = format!("git diff --exit-code -- {pair}");
     let no_change = format!("git diff --exit-code {pair}");
     let quiet = format!("git diff --quiet -- {pair}");
     let task_dir = scratch.0.join("plans/tasks/TASK-100-schema");
@@ -4549,8 +4571,8 @@ fn criterion_commands_are_run_as_recorded_verification_runs() {
         task_dir.join("index.md"),
         format!(
             "---\ntitle: schema\nstatus: in-progress\n---\n\n# schema\n\n## Acceptance criteria\n\n\
-             - `git status --short` passes, and the table list includes `alpha_records`.\n\
-             - 0001 and 0002 are byte-identical: `{byte_identical}`.\n\
+             - `git status --short` is clean, and the table list includes `alpha_records`.\n\
+             - 0001 and 0002 are byte-identical: `{diff_vs_index}`.\n\
              - `{no_change}` shows no change.\n\
              - `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{quiet}`).\n\
              - A missing row is reported as `errors.Is(err, x)`.\n"
@@ -4567,17 +4589,11 @@ fn criterion_commands_are_run_as_recorded_verification_runs() {
     let commands: Vec<String> = serde_json::from_str(&declared).unwrap();
     assert_eq!(
         commands,
-        [
-            "true",
-            "git status --short",
-            &byte_identical,
-            &no_change,
-            &quiet
-        ],
+        ["true", &diff_vs_index, &no_change, &quiet],
         "{composed}"
     );
 
-    let review = || -> (serde_json::Value, String) {
+    let review = |declared: &str, status: &str| -> (Option<serde_json::Value>, String) {
         let checks = agent_script(
             "adversary",
             "run_checks.py",
@@ -4588,16 +4604,17 @@ fn criterion_commands_are_run_as_recorded_verification_runs() {
             .as_array()
             .unwrap_or_else(|| panic!("exec_results must be a record list: {checks}"))
             .iter()
-            .find(|r| r["cmd"].as_str() == Some(byte_identical.as_str()))
-            .unwrap_or_else(|| panic!("no recorded run of `{byte_identical}`: {checks}"))
-            .clone();
+            .find(|r| r["cmd"].as_str() == Some(diff_vs_index.as_str()))
+            .cloned();
         let verdict = agent_script(
             "adversary",
             "verdict.py",
             &json!({
                 "pipeline_faults": [],
-                "crit_verdicts": [{"id": "c1", "text": "the files are byte-identical", "status": "MET",
-                                   "evidence": "recorded run", "complaint": "", "no_test_reason": ""}],
+                "crit_verdicts": [{"id": "c1", "text": "the files are byte-identical", "status": status,
+                                   "evidence": "recorded run",
+                                   "complaint": if status == "MET" { "" } else { "no recorded run of the diff" },
+                                   "no_test_reason": ""}],
                 "extra_complaints": [],
                 "format_rulings": [],
                 "observations": "",
@@ -4613,11 +4630,31 @@ fn criterion_commands_are_run_as_recorded_verification_runs() {
         (run, report)
     };
 
-    let (run, report) = review();
+    let (run, report) = review(&json!(["true"]).to_string(), "PARTIAL");
+    assert!(
+        run.is_none(),
+        "the original declaration recorded the diff: {run:?}"
+    );
+    assert!(
+        report.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+        "{report}"
+    );
+
+    let (run, report) = review(&declared, "MET");
+    let run = run.unwrap_or_else(|| panic!("no recorded run of `{diff_vs_index}`"));
     assert_eq!(run["exit"], 0, "{run}");
     assert!(
         report.starts_with("ADVERSARIAL_REVIEW: CONFORMS")
             && !report.contains("Verification run `"),
+        "{report}"
+    );
+    let runs = report
+        .split_once("Verification runs:")
+        .unwrap_or_else(|| panic!("no Verification runs section: {report}"))
+        .1;
+    assert!(
+        runs.lines()
+            .any(|l| l.starts_with(&format!("- [PASS] `{diff_vs_index}`"))),
         "{report}"
     );
 
@@ -4626,12 +4663,13 @@ fn criterion_commands_are_run_as_recorded_verification_runs() {
         "CREATE TABLE base (id INT, extra INT);\n",
     )
     .unwrap();
-    let (run, report) = review();
+    let (run, report) = review(&declared, "MET");
+    let run = run.unwrap_or_else(|| panic!("no recorded run of `{diff_vs_index}`"));
     assert_eq!(run["exit"], 1, "{run}");
     assert_eq!(run["baseline"]["status"], "regression", "{run}");
     assert!(
         report.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
-            && report.contains(&format!("Verification run `{byte_identical}`"))
+            && report.contains(&format!("Verification run `{diff_vs_index}`"))
             && report.contains("baseline on the diff base: regression"),
         "{report}"
     );
