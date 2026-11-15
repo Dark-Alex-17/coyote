@@ -27799,6 +27799,15 @@ mod tests {
                             kind: CorrelationKind::Ask,
                         })
                         .unwrap();
+                    started
+                        .runtime
+                        .trust()
+                        .set_person_alias(&asked_identity, Some("Ann"), &[])
+                        .unwrap();
+                    assert!(
+                        ctx.app.mesh.who_at(&asked_peer).starts_with("unnamed / "),
+                        "the session is in no table, so naming it by destination alone loses its user"
+                    );
                     let before = stdout_lines().len();
 
                     run(&mut ctx, ".mesh messaging follow-up q1 \"and then?\"")
@@ -27806,18 +27815,88 @@ mod tests {
                         .unwrap_err();
 
                     let out = stdout_lines()[before..].to_vec();
-                    let who = ctx.app.mesh.who(&asked_identity, &asked_peer);
                     assert!(
-                        out.contains(&format!(
-                            "Sending your follow-up to {who} ({}) over the mesh...",
-                            short(&asked_peer)
-                        )),
+                        out.contains(
+                            &"Sending your follow-up to Ann / abababab (abababab) over the mesh..."
+                                .to_string()
+                        ),
                         "{out:?}"
                     );
                     assert!(
                         !out.iter().any(|line| line.contains("Sending your answer")),
                         "{out:?}"
                     );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh files grant` and `.mesh files refuse` name the session by the user the
+            /// request was filed under, as the follow-up does, never by its destination
+            /// alone: the requester is in no table, so only the record's user names it.
+            /// The send then fails fast at the trust check.
+            #[test]
+            #[serial]
+            fn grant_and_refuse_name_the_session_by_the_user_the_request_was_filed_under() {
+                use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundRecord};
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-grant-refuse-names");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-grant-refuse-names").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let peer = "ab".repeat(16);
+                    let identity = "cd".repeat(16);
+                    let root = TempDir::new("repl-mesh-grant-refuse-names-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    started
+                        .runtime
+                        .trust()
+                        .set_person_alias(&identity, Some("Ann"), &[])
+                        .unwrap();
+                    for id in ["a-1", "a-2"] {
+                        ctx.app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: id.to_string(),
+                                    peer_destination: peer.clone(),
+                                    peer_identity: identity.clone(),
+                                    thread: id.to_string(),
+                                    question: String::new(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Access,
+                                    paths: vec!["docs/a.md".to_string()],
+                                    reason: "need it".to_string(),
+                                    session_thread: String::new(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                    }
+
+                    for line in [".mesh files grant a-1", ".mesh files refuse a-2"] {
+                        let before = stdout_lines().len();
+                        let _ = run(&mut ctx, line).await;
+                        let out = stdout_lines()[before..].to_vec();
+                        assert!(
+                            out.contains(
+                                &"Sending your answer to Ann / abababab (abababab) over the mesh..."
+                                    .to_string()
+                            ),
+                            "{line}: {out:?}"
+                        );
+                    }
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
