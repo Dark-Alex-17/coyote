@@ -20,7 +20,8 @@ frame scheduler that folds every redraw request between two draws into one,
 a streaming reply split into a stable part rendered once per width and a
 live tail, a prompt modal that takes the composer's place, and a capture of
 command output that never waits on a lingering child. The code is Coyote's
-own; only the design was followed.
+own; only the design was followed. The Apache License 2.0 text is preserved
+in the [LICENSE-APACHE](./LICENSE-APACHE) file.
 
 ## AIChat
 

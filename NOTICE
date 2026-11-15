@@ -28,5 +28,6 @@ distributed under the Apache License, Version 2.0
 scheduler, the stable/tail split for a streaming reply, the bottom-pane modal
 that replaces the composer, and the detached drain of captured output. No
 Codex source files are copied; the shapes were reimplemented for Coyote.
+The Apache License 2.0 text is provided in the LICENSE-APACHE file.
 
 See CREDITS.md for additional background and attribution.
