@@ -1616,6 +1616,15 @@ check("ci budget: ENGINE_VISIT_CAP equals graph.yaml settings.max_loop_iteration
       _lib.ENGINE_VISIT_CAP == _graph_cap, (_lib.ENGINE_VISIT_CAP, _graph_cap))
 check("ci budget: POLL_VISIT_BUDGET, plus the one watch a keep-waiting answer grants, stays below max_loop_iterations",
       _lib.POLL_VISIT_BUDGET < _lib.POLL_VISIT_BUDGET + _lib.CI_MAX_ROUNDS < _graph_cap, (_lib.POLL_VISIT_BUDGET, _graph_cap))
+_graph_text = open(os.path.join(HERE, "..", "graph.yaml")).read()
+_node_timeouts = {}
+for _node in ("ci_gate", "apply_answer"):
+    _m = re.search(rf"(?ms)^  {_node}:\n    id: {_node}\n(?:(?!\n\n).)*?^    timeout: (\d+)$", _graph_text)
+    _node_timeouts[_node] = int(_m.group(1)) if _m else None
+check("ci budget: ci_gate's timeout covers 2 x GH_CALL_SECS + 30 (gh pr ready, then gh pr view)",
+      (_node_timeouts["ci_gate"] or 0) >= 2 * _lib.GH_CALL_SECS + 30, _node_timeouts)
+check("ci budget: apply_answer's timeout covers CI_LOG_RUNS_MAX x GH_CALL_SECS + 30 (one gh re-run call per cancelled run)",
+      (_node_timeouts["apply_answer"] or 0) >= _lib.CI_LOG_RUNS_MAX * _lib.GH_CALL_SECS + 30, _node_timeouts)
 
 # ---------------------------------------------------------------- final report
 u = gates.final_report(base_state(coder_result=done, coder_sentinel="CODER_COMPLETE", gauntlet_verdict="PASS", round_heads=[{"round": 1, "head": "h", "verdict": "PASS"}],
@@ -3118,6 +3127,14 @@ check("subtasks: a re-entry whose state has no task_number derives it from subta
       _st.get("task_number") == 2 and u.get("task_number") == 3 and u["_next"] != "end_blocked"
       and "failure_reason" not in u and any("derived 2 from subtask_index" in d for d in _st["decisions"]),
       (_st.get("task_number"), u))
+_rid = "20990101T000000-cafef010"
+_lib.snapshot({"run_dir": gates.run_dir_for(_rid), "base_sha": BASE, "subtasks": SUBS7, "subtask_index": 2,
+               "task_number": 2, "final_review": False, "debt_scan_failures": {"subtask 2": "diff spec unreadable"}},
+              {}, "review_gate")
+_st = gates.intake({"initial_prompt": f"continue\nSisyphus run id: {_rid}", "project_dir": REPO})
+check("subtasks: a re-entry from a snapshot-written state.json keeps task_number and debt_scan_failures",
+      _st.get("task_number") == 2 and _st.get("debt_scan_failures") == {"subtask 2": "diff spec unreadable"}
+      and not any("derived" in d for d in _st["decisions"]), (_st.get("task_number"), _st.get("debt_scan_failures")))
 
 # a plan amendment made during a subtask amends that subtask's criterion
 am = base_state(project_dir=SUB_REPO, git_root=SUB_REPO, subtasks=SUBS7, subtask_index=2, spec_text=PARENT_AC, round_heads=[], gauntlet_lanes={},

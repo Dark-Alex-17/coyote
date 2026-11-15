@@ -1466,6 +1466,8 @@ nodes:
     type: script
     description: The continuation switch on the escalation kind (design doc 2.3).
     script: scripts/apply_answer.py
+    # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each
+    timeout: 300
     fallback: end_failure
 
   # =====================================================================
@@ -2110,8 +2112,8 @@ nodes:
       Check the publish step's git and PR state (one git_ops retry, then follow-ups, never a stop); watch checks
       only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
     script: scripts/ci_gate.py
-    # one GH_CALL_SECS read (90) for the PR check, a few local git calls and a margin
-    timeout: 150
+    # 2 x GH_CALL_SECS + 30: the flip confirmation runs gh pr ready and then gh pr view
+    timeout: 210
     fallback: final_report
 
   ci_poll:

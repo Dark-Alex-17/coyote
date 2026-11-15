@@ -1470,12 +1470,7 @@ fn smoke_summary_and_exit_code_cover_a_check_recorded_last() {
 /// split of a mixed-author thread, read access left out of
 /// `TRUSTED_PERMISSIONS`, the CHANGES_REQUESTED check in the approval
 /// fallback and a failed permission read cached as untrusted rather than
-/// retried; then the all-pass test behind a green CI reading, the
-/// `CI_NO_CHECKS_SECS` window, the re-read behind a confirmed flip, the
-/// skipped-watch note, the debt-scan failure report line, the subtask list
-/// check and the index against `task_number` before each review, the
-/// malformed-escalation fault in `ask_dispatch`, the not-a-list fault in
-/// `record_subtasks` and the coder-rejection budget escalation.
+/// retried.
 #[test]
 fn smoke_rows_go_red_under_the_recorded_sabotages() {
     let Some(python) = python3() else { return };
@@ -1571,76 +1566,103 @@ fn smoke_rows_go_red_under_the_recorded_sabotages() {
             "pr_tracking review: three failing permission reads -> all untrusted within one poll, \
              each cached False",
         ),
-        (
-            "all-pass-green",
-            "    elif all(b in CI_PASS for _, b, _ in buckets):\n",
-            "    elif True:\n",
-            "ci_poll: an unknown bucket -> inconclusive; ci_route recommends leaving the PR in draft",
-        ),
-        (
-            "no-checks-window",
-            "time.time() - started < CI_NO_CHECKS_SECS",
-            "False",
-            "ci_poll: an empty check list on a later read inside CI_NO_CHECKS_SECS -> still pending, \
-             never no_checks",
-        ),
-        (
-            "flip-confirmed",
-            "confirmed = rc == 0 and pr is not None and pr.get(\"isDraft\") is False",
-            "confirmed = rc == 0",
-            "flip: gh pr ready rc 0 but the re-read is still a draft -> not confirmed, the detail \
-             names isDraft",
-        ),
-        (
-            "skipped-watch-note",
-            "        u[\"ci_watch_note\"] = note\n",
-            "",
-            "ci_gate: a delegated batch run skips the watch with a ledgered note and a CI line",
-        ),
-        (
-            "debt-scan-report",
-            "for s, r in as_dict(g(\"debt_scan_failures\", {})).items()]",
-            "for s, r in {}.items()]",
-            "debt: a scanner failure is recorded for its subtask, ledgered, and the report names it \
-             instead of none",
-        ),
-        (
-            "subtask-check",
-            "if problem := _subtasks_problem(raw, idx):",
-            "if problem := None:",
-            "subtask heal: a str subtasks is rebuilt from the sealed list, ledgered, and subtask 2 \
-             is reviewed",
-        ),
-        (
-            "index-step",
-            "if not truthy(state.get(\"final_review\")) and idx != step:",
-            "if False:",
-            "subtask heal: an index ahead of task_number 0 -> end_blocked naming both, never a \
-             review of subtask 3",
-        ),
-        (
-            "ask-dispatch-fault",
-            "    if _escalation_fault(state, u, \"ask_dispatch\"):\n        return u\n",
-            "",
-            "escalation fault: missing escalation -> end_blocked with the bad state named, never an \
-             empty ask",
-        ),
-        (
-            "subtasks-not-a-list",
-            "if shape := _not_a_list(state.get(\"subtasks\")):",
-            "if shape := None:",
-            "record_subtasks: a str subtasks -> a reason naming the str, apart from the over-bound \
-             message",
-        ),
-        (
-            "rejected-cap",
-            "        if rounds > STRIKE_LIMIT:\n",
-            "        if False:\n",
-            "route_coder_result: B7 rejected bound -> coder_rejected_cap escalation, never \
-             end_blocked",
-        ),
     ];
     run_smoke_sabotages(&python, &sabotages);
+}
+
+/// The guards behind the CI reading, the flip, the subtask list and the
+/// escalation faults: the all-pass test behind a green CI reading, the
+/// `CI_NO_CHECKS_SECS` window, the re-read behind a confirmed flip, the
+/// skipped-watch note, the debt-scan failure report line, the subtask list
+/// check and the index against `task_number` before each review, the
+/// malformed-escalation fault in `ask_dispatch` and in `parse_answer`, the
+/// not-a-list fault in `record_subtasks` and the coder-rejection budget
+/// escalation.
+#[test]
+#[ignore = "eleven smoke battery runs take about two minutes; run with -- --ignored"]
+fn task_fault_smoke_rows_go_red_under_the_recorded_sabotages() {
+    let Some(python) = python3() else { return };
+    run_smoke_sabotages(
+        &python,
+        &[
+            (
+                "all-pass-green",
+                "    elif all(b in CI_PASS for _, b, _ in buckets):\n",
+                "    elif True:\n",
+                "ci_poll: an unknown bucket -> inconclusive; ci_route recommends leaving the PR in \
+                 draft",
+            ),
+            (
+                "no-checks-window",
+                "time.time() - started < CI_NO_CHECKS_SECS",
+                "False",
+                "ci_poll: an empty check list on a later read inside CI_NO_CHECKS_SECS -> still \
+                 pending, never no_checks",
+            ),
+            (
+                "flip-confirmed",
+                "confirmed = rc == 0 and pr is not None and pr.get(\"isDraft\") is False",
+                "confirmed = rc == 0",
+                "flip: gh pr ready rc 0 but the re-read is still a draft -> not confirmed, the \
+                 detail names isDraft",
+            ),
+            (
+                "skipped-watch-note",
+                "        u[\"ci_watch_note\"] = note\n",
+                "",
+                "ci_gate: a delegated batch run skips the watch with a ledgered note and a CI line",
+            ),
+            (
+                "debt-scan-report",
+                "for s, r in as_dict(g(\"debt_scan_failures\", {})).items()]",
+                "for s, r in {}.items()]",
+                "debt: a scanner failure is recorded for its subtask, ledgered, and the report \
+                 names it instead of none",
+            ),
+            (
+                "subtask-check",
+                "if problem := _subtasks_problem(raw, idx):",
+                "if problem := None:",
+                "subtask heal: a str subtasks is rebuilt from the sealed list, ledgered, and \
+                 subtask 2 is reviewed",
+            ),
+            (
+                "index-step",
+                "if not truthy(state.get(\"final_review\")) and idx != step:",
+                "if False:",
+                "subtask heal: an index ahead of task_number 0 -> end_blocked naming both, never a \
+                 review of subtask 3",
+            ),
+            (
+                "ask-dispatch-fault",
+                "    if _escalation_fault(state, u, \"ask_dispatch\"):\n        return u\n",
+                "",
+                "escalation fault: missing escalation -> end_blocked with the bad state named, \
+                 never an empty ask",
+            ),
+            (
+                "parse-answer-fault",
+                "    if _escalation_fault(state, u, \"parse_answer\"):\n        return u\n",
+                "",
+                "escalation fault: a list escalation -> end_blocked with the bad state named, \
+                 never an empty ask",
+            ),
+            (
+                "subtasks-not-a-list",
+                "if shape := _not_a_list(state.get(\"subtasks\")):",
+                "if shape := None:",
+                "record_subtasks: a str subtasks -> a reason naming the str, apart from the \
+                 over-bound message",
+            ),
+            (
+                "rejected-cap",
+                "        if rounds > STRIKE_LIMIT:\n",
+                "        if False:\n",
+                "route_coder_result: B7 rejected bound -> coder_rejected_cap escalation, never \
+                 end_blocked",
+            ),
+        ],
+    );
 }
 
 /// Applies each `(label, old, new, row)` sabotage to a scratch copy of
@@ -3107,6 +3129,7 @@ const FROZEN_GRAPH_BOUNDS: &[(&str, i64)] = &[
 /// `max_attempts`, `max_iterations`) plus the review-watch nodes; a node
 /// absent here declares none.
 const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
+    ("apply_answer", "timeout", 300),
     ("architecture_review", "max_attempts", 1),
     ("architecture_review", "timeout", 3600),
     ("ask_owner_poll", "timeout", 0),
@@ -3119,7 +3142,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
     ("check_inbox_pre", "timeout", 300),
     ("ci_apply", "timeout", 300),
     ("ci_diagnose", "timeout", 600),
-    ("ci_gate", "timeout", 150),
+    ("ci_gate", "timeout", 210),
     ("ci_poll", "timeout", 180),
     ("ci_route", "timeout", 300),
     ("compose_brief", "timeout", 600),

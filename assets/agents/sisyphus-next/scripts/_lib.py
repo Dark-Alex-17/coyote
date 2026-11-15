@@ -263,10 +263,10 @@ def read_artifact(run_dir, name):
 
 STATE_KEYS = (
     "run_id", "base_sha", "head_sha", "git_root", "project_dir", "delegated", "top_level",
-    "parallel_mode", "intent", "sizing", "subtasks", "subtask_index", "current_task",
+    "parallel_mode", "intent", "sizing", "subtasks", "subtask_index", "task_number", "final_review", "current_task",
     "fix_strikes", "fix_round", "review_rounds", "round_heads", "gauntlet_verdict",
     "gauntlet_lanes", "rejected_findings", "deferred_findings", "skipped_reviews",
-    "debt_left_behind", "debris_exemptions", "design_decisions", "autonomous_digest",
+    "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions", "autonomous_digest",
     "decisions", "follow_ups", "parked", "escalation", "coder_result", "git_report",
     "ci_status", "anomalies_log",
 )
