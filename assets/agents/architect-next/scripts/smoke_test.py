@@ -2512,9 +2512,34 @@ u = AA("amend_cap", "Allow one more amendment cycle", amend_cycles=AMEND_CYCLES_
 check("apply_answer: amend_cap allow on an escalation with no source -> one more cycle of every source and the ceiling, then gate1",
       u["_next"] == "gate1_build" and u["amend_cycles"] == AMEND_CYCLES_MAX - 1
       and u["amend_counts"] == {"design": _lib.AMEND_DESIGN_MAX - 1}, u)
-check("apply_answer: gate1_stuck stop -> end_blocked", AA("gate1_stuck", "Stop and report")["_next"] == "end_blocked")
+_g1_stop = AA("gate1_stuck", "Stop and report", esc=gates.gate1_route(base_state(
+    gate1_result=leaky, leak_fingerprints=[gates._leak_fingerprint(leaky)[0]]))["escalation"])
+check("apply_answer: gate1_stuck stop -> end_blocked, no continue counted",
+      _g1_stop["_next"] == "end_blocked" and "cap_continues" not in _g1_stop, _g1_stop)
 u = AA("gate1_stuck", "infra goes in infra/; DB is pg")
 check("apply_answer: gate1_stuck answers -> amend_plan (fingerprints reset)", u["_next"] == "amend_plan" and u["leak_fingerprints"] == [])
+_none_dir = os.path.join(TMP, "no-open-escalation")
+write(os.path.join(_none_dir, "state.json"), json.dumps({"phase": "wave"}))
+_none = gates.apply_answer(base_state(escalation={}, last_answer="go on", run_dir=_none_dir))
+_none_bare = gates.apply_answer(base_state(escalation={"kind": ""}, last_answer="go on", resume_phase="task TASK-001 verify r1",
+                                           run_dir=os.path.join(TMP, "no-snapshot-here")))
+check("apply_answer: no open escalation -> resume_route from the saved phase, ledgered",
+      _none["_next"] == "resume_route" and _none.get("resume_phase") == "wave" and "failure_reason" not in _none
+      and any("no open escalation" in d for d in _none["decisions"]), _none)
+check("apply_answer: no open escalation and no snapshot -> a stale resume_phase is cleared, resume_route",
+      _none_bare["_next"] == "resume_route" and _none_bare.get("resume_phase") == "", _none_bare)
+_none_abort = gates.apply_answer(base_state(escalation={}, last_answer="abort", run_dir=_none_dir))
+check("apply_answer: abort with no open escalation -> end_aborted, ledgered",
+      _none_abort["_next"] == "end_aborted" and "aborted" in _none_abort.get("failure_reason", "")
+      and any("no open escalation" in d for d in _none_abort["decisions"]), _none_abort)
+_none_stop = gates.apply_answer(base_state(escalation={}, last_answer="Stop", run_dir=_none_dir))
+check("apply_answer: stop with no open escalation -> end_blocked", _none_stop["_next"] == "end_blocked", _none_stop)
+check("resume_route: copes with the state an answer with no open escalation leaves",
+      gates.resume_route({**base_state(run_dir=_none_dir), **_none})["_next"] == "select_tasks"
+      and gates.resume_route({**base_state(resume_phase="task TASK-001 verify r1", sealed=False), **_none_bare})["_next"] == "reseal_gate")
+_unknown = AA("no_such_kind", "go on")
+check("apply_answer: a non-empty unknown escalation kind still stops -> end_failure",
+      _unknown["_next"] == "end_failure" and "no_such_kind" in _unknown.get("failure_reason", ""), _unknown)
 check("apply_answer: gate2_stuck stop -> end_blocked", AA("gate2_stuck", "Stop and report")["_next"] == "end_blocked")
 check("apply_answer: gate2_stuck override -> reseal_return (recorded)", AA("gate2_stuck", "Override: promote the plan as reviewed (recorded)")["_next"] == "reseal_return")
 u = AA("gate_fault", "Retry the gatekeeper", esc=escalation("gate_fault", "q", data={"gate": "gate1"}), gate_fault_retries=0)
@@ -2787,6 +2812,30 @@ check("gate2_stuck: continue recommended until STRIKE_LIMIT continues past the c
       and _cap_offer(g2_spent.get("escalation")) == ("Another fix round (state reason)", [])
       and _lib.as_dict(g2_one.get("cap_continues")).get("gate2_stuck") == 1,
       (_cap_offer(g2_spent.get("escalation")), g2_one.get("cap_continues")))
+G1_STUCK = "PLAN_GATE: LEAKY\n- Which queue carries the retries?\n- Who owns the retry budget?"
+G1_FP = gates._leak_fingerprint(G1_STUCK)[0]
+E_G1_STUCK = gates.gate1_route(base_state(gate1_result=G1_STUCK, leak_fingerprints=[G1_FP]))["escalation"]
+g1_spent = gates.gate1_route(base_state(gate1_result=G1_STUCK, leak_fingerprints=[G1_FP], cap_continues={"gate1_stuck": STRIKE_LIMIT}))
+check("gate1_stuck: another revise-and-re-seal round recommended first; answering and stopping stay, unrecommended; nothing recommended once the cap is spent",
+      _cap_offer(E_G1_STUCK) == (gates.GATE1_ANOTHER_ROUND, [gates.GATE1_ANOTHER_ROUND])
+      and [o["text"] for o in E_G1_STUCK["options"]][1:] == ["I will answer: (type the answers)", "Stop and report"]
+      and _cap_offer(g1_spent.get("escalation")) == (gates.GATE1_ANOTHER_ROUND, [])
+      and gates.CAP_SPENT_NOTE in g1_spent["escalation"]["question"] and gates.CAP_SPENT_NOTE not in E_G1_STUCK["question"],
+      (E_G1_STUCK["options"], g1_spent.get("escalation")))
+g1_why = "the plan now names the queue in the Context pack"
+g1_one = AA("gate1_stuck", gates.GATE1_ANOTHER_ROUND, esc=E_G1_STUCK, last_answer_text=f"1 - {g1_why}", gate1_result=G1_STUCK,
+            leak_fingerprints=[G1_FP, G1_FP], amend_counts={"gate1": _lib.AMEND_GATE1_MAX}, amend_cycles=AMEND_CYCLES_MAX, cap_continues={})
+check("apply_answer: gate1_stuck another round -> answer_leaks with the reason ledgered and carried, one continue counted, the same-questions check kept",
+      g1_one["_next"] == "answer_leaks" and g1_one.get("leak_owner_reason") == g1_why
+      and any(g1_why in d for d in g1_one["decisions"]) and "leak_fingerprints" not in g1_one
+      and _lib.as_dict(g1_one.get("cap_continues")).get("gate1_stuck") == 1
+      and g1_one["amend_counts"]["gate1"] == _lib.AMEND_GATE1_MAX - 1 and g1_one["amend_cycles"] == AMEND_CYCLES_MAX - 1, g1_one)
+g1_amend = gates.leak_route(base_state(leak_owner_reason=g1_why, leak_answers=[{"question": "Which queue?", "answer": "the retry queue"}],
+                                       leak_unanswerable=[], choice_kind="", choice_queue=[]))
+check("leak_route: the owner's reason for another round reaches amend_plan with the leak answers, then is cleared",
+      g1_amend["_next"] == "amend_plan" and g1_amend["leak_owner_reason"] == ""
+      and any(g1_why in a for a in g1_amend["pending_amendments"]) and any("the retry queue" in a for a in g1_amend["pending_amendments"]),
+      g1_amend)
 
 
 def _headless_past_ceiling():
@@ -4994,6 +5043,76 @@ gates.task_by_id(ts_i, T1).update({"status": "in-progress", "worktree": wt_x, "b
 u = gates.integration_test(base_state(plan_path=PROMOTED, tasks=ts_i, integration_task=T1, run_branch=RB, task_rounds={}, verification_commands='["true"]'))
 check("integration_test: a green merge records the merged branch head as integrated_sha",
       u["_next"] == "harvest_report" and u["task_rounds"][T1].get("integrated_sha") == sha_x, u.get("task_rounds"))
+
+
+def recorded_git_argv(run):
+    """The git argv every gates.git call makes while `run` runs, the real git still doing the work."""
+    calls, real = [], gates.git
+
+    def recording(cwd, *args, **kw):
+        calls.append(list(args))
+        return real(cwd, *args, **kw)
+    gates.git = recording
+    try:
+        run()
+    finally:
+        gates.git = real
+    return calls
+
+
+def marker_before(calls, verb, branch):
+    hits = [c for c in calls if c[:1] == [verb] and branch in c]
+    return bool(hits) and all("--end-of-options" in c and c.index("--end-of-options") < c.index(branch) for c in hits)
+
+
+wt_x, sha_x = task_branch("argv-marked")
+ts_m = copy.deepcopy(TS_W)
+gates.task_by_id(ts_m, T1).update({"status": "in-progress", "worktree": wt_x, "branch": "argv-marked"})
+argv_merge = recorded_git_argv(lambda: gates.integration_test(base_state(
+    plan_path=PROMOTED, tasks=ts_m, integration_task=T1, run_branch=RB, task_rounds={}, verification_commands='["true"]')))
+argv_delete = recorded_git_argv(lambda: cleanup_task(wt_x, "argv-marked", integrated_sha=sha_x))
+check("git argv: an end-of-options marker precedes the task branch at the integration merge and the cleanup branch delete",
+      marker_before(argv_merge, "merge", "argv-marked") and marker_before(argv_delete, "branch", "argv-marked") and not local("argv-marked"),
+      ([c for c in argv_merge if c[:1] == ["merge"]], [c for c in argv_delete if c[:1] == ["branch"]]))
+REF_NAMES = {"branch", "run_branch", "base", "base_branch", "top"}
+
+
+def names_ref(node):
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and n.id in REF_NAMES:
+            return True
+        if (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id in ("task", "t")
+                and isinstance(n.slice, ast.Constant) and n.slice.value == "branch"):
+            return True
+        if isinstance(n, ast.JoinedStr) and any(isinstance(v, ast.Constant) and str(v.value).endswith("origin/") for v in n.values):
+            return True
+    return False
+
+
+def unmarked_ref_calls(tree):
+    """git/git_out calls in tree that pass a ref-bearing positional with no "--end-of-options" before it. A value right
+    after -b or --branch is the option's own argument (validated by check-ref-format), and a "--opt=..." f-string
+    carries its value inside the option, so neither can be read as an option."""
+    out = []
+    for call in ast.walk(tree):
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in ("git", "git_out")):
+            continue
+        argv = call.args[1:]
+        for i, a in enumerate(argv):
+            if not names_ref(a) or (i and isinstance(argv[i - 1], ast.Constant) and argv[i - 1].value in ("-b", "--branch")):
+                continue
+            if isinstance(a, ast.JoinedStr) and isinstance(a.values[0], ast.Constant) and str(a.values[0].value).startswith("-"):
+                continue
+            if not any(isinstance(b, ast.Constant) and b.value == "--end-of-options" for b in argv[:i]):
+                out.append(f"{call.lineno}: {ast.unparse(call)}")
+    return out
+
+
+_unmarked = unmarked_ref_calls(GATES_AST)
+_planted = unmarked_ref_calls(ast.parse("git(code, 'merge', '--no-ff', task['branch'])\ngit(code, 'branch', '-D', '--end-of-options', branch)\n"
+                                        "git_out(code, 'rev-parse', f'origin/{x}')\ngit(code, 'worktree', 'add', wt, '-b', branch, base)\n"))
+check("git argv: every git/git_out call in gates.py that passes a branch or base name puts --end-of-options before it",
+      not _unmarked and len(_planted) == 3, _unmarked or _planted)
 wt_x, sha_x = task_branch("int-checkout")
 gates.task_by_id(ts_i, T1).update({"worktree": wt_x, "branch": "int-checkout"})
 head0 = git(CODE, "rev-parse", "HEAD")
@@ -5163,6 +5282,98 @@ for _k, _v in _ci_saved.items():
         os.environ.pop(_k, None)
     else:
         os.environ[_k] = _v
+
+# ---------------------------------------------------------------- criterion commands declared as verification runs
+CC_DIR = os.path.join(TMP, "criterion-commands")
+write(os.path.join(CC_DIR, "bin", "check.sh"), "#!/bin/sh\nexit 0\n", exe=True)
+write(os.path.join(CC_DIR, "tools", "check"), "#!/bin/sh\nexit 0\n", exe=True)
+write(os.path.join(TMP, "outside", "tool"), "#!/bin/sh\nexit 0\n", exe=True)
+
+
+def cc_row(name, text, want, declared=("true",)):
+    def run():
+        got = _lib.criterion_commands(text, CC_DIR, list(declared))[0]
+        return got == want, got
+    guarded(name, run)
+
+
+cc_row("criterion_commands: `rm -rf x` passes -> dropped, rm is not a declared program", "- `rm -rf x` passes\n", [])
+cc_row("criterion_commands: `sh -c 'x'` passes -> dropped for its quotes even with sh declared",
+       "- `sh -c 'x'` passes\n", [], declared=("true", "sh run.sh"))
+cc_row("criterion_commands: `git grep -Oecho -e a` passes -> dropped, grep is not read-only and -O runs a program",
+       "- `git grep -Oecho -e a` passes\n", [])
+cc_row("criterion_commands: `git diff -Oecho` and `git log --ext-diff` pass -> dropped for the unsafe argument",
+       "- `git diff -Oecho --exit-code` and `git log --ext-diff -p` pass\n", [])
+cc_row("criterion_commands: `git push origin x` passes -> dropped even when a declared command is git",
+       "- `git push origin x` passes\n", [], declared=("git diff --check",))
+cc_row("criterion_commands: `../outside/tool run` passes -> dropped, the executable is outside cwd",
+       "- `../outside/tool run` passes\n", [])
+cc_row("criterion_commands: `./tools/check run` passes -> kept, an executable inside cwd",
+       "- `./tools/check run` passes\n", ["./tools/check run"])
+cc_row("criterion_commands: a declared program passes -> kept; a bare program or a missing path is not",
+       "- `true x` passes, `true` alone passes, `./missing.sh run` passes\n", ["true x"])
+cc_row("criterion_commands: a NAME=value prefix is dropped, on git and on a declared program alike",
+       "- `GIT_EXTERNAL_DIFF=rm git diff --exit-code -- f` and `PATH=. true x` and `LD_PRELOAD=x.so true y` pass\n", [])
+cc_row("criterion_commands: `git status --short` is clean -> dropped, its exit does not decide the criterion",
+       "- `git status --short` is clean\n", [])
+cc_row("criterion_commands: `true --bad` exits 2 -> dropped, the criterion expects a failing exit",
+       "- `true --bad` exits 2\n", [])
+cc_row("criterion_commands: a line stating both a pass and a failure -> dropped", "- `true x` passes, `true y` fails\n", [])
+cc_row("criterion_commands: `CREATE TABLE x` and `true && true` pass -> dropped, not a declared program and a metacharacter",
+       "- `CREATE TABLE x` and `true && true` pass\n", [])
+CC_SQL = "schema/sql/0001_base.sql schema/sql/0002_more.sql"
+CC_DIFFS = [f"git diff --exit-code -- {CC_SQL}", f"git diff --exit-code {CC_SQL}", f"git diff --quiet -- {CC_SQL}"]
+CC_CRITERIA = ("- `git status --short` is clean, and the table list includes `alpha_records`.\n"
+               f"- 0001 and 0002 are byte-identical: `{CC_DIFFS[0]}`.\n"
+               f"- `{CC_DIFFS[1]}` shows no change.\n"
+               f"- `schema/sql/0001_base.sql` and `schema/sql/0002_more.sql` are unchanged (`{CC_DIFFS[2]}`).\n"
+               "- A missing row is reported as `errors.Is(err, x)`.\n")
+cc_row("criterion_commands: the three git diff exit-code forms are kept with no pass word on their lines, once each",
+       CC_CRITERIA + f"- again `{CC_DIFFS[0]}`\n", CC_DIFFS)
+cc_many = "".join(f"- `true a{i}` passes\n" for i in range(12)) + "- `true a0` passes\n"
+guarded("criterion_commands: at most 8 by default and the cap honoured, the first ones kept and the rest counted once each",
+        lambda: ((_lib.criterion_commands(cc_many, CC_DIR, ["true"]), _lib.criterion_commands(cc_many, CC_DIR, ["true"], cap=3))
+                 == (([f"true a{i}" for i in range(8)], 4), (["true a0", "true a1", "true a2"], 9)), "cap misapplied"))
+cc_row("criterion_commands: a read-only git span that writes a file through --output is dropped",
+       "- `git diff --output=x.patch` and `git diff --exit-code -- a` pass\n", ["git diff --exit-code -- a"])
+CC_DECLARED = ["true"]
+write(os.path.join(CC_DIR, "TASK-900-schema", "index.md"),
+      "---\ntitle: schema\nstatus: in-progress\nbatch: B9\n---\n\n# schema\n\n## Acceptance criteria\n\n" + CC_CRITERIA)
+
+
+def cc_verify(task_dir=os.path.join(CC_DIR, "TASK-900-schema"), **over):
+    task = {"id": "TASK-900", "dir": task_dir, "base_sha": CODE_BASE, "batch": "B9"}
+    return gates.verify_gate(base_state(**{"tasks": [task], "current_task": "TASK-900", "verify_scope": "task",
+                                           "verification_commands": json.dumps(CC_DECLARED), **over}))
+
+
+cc_runs = {k: cc_verify(**over) for k, over in {"task": {}, "micro": {"task_granularity": "micro"},
+                                                "batch": {"verify_scope": "batch", "current_batch": "B9"}}.items()}
+cc_bad = {k: json.loads(u["verification_commands_json"]) for k, u in cc_runs.items() if json.loads(u["verification_commands_json"]) != CC_DECLARED + CC_DIFFS}
+check("verify_gate: the git diff commands the criteria name are declared once each after the declared ones (task, micro, batch)",
+      not cc_bad and all(sum(f"declared 3 criterion command(s) as verification runs: {'; '.join(CC_DIFFS)}" in d for d in u["decisions"]) == 1
+                         for u in cc_runs.values()), cc_bad or [u["decisions"] for u in cc_runs.values()])
+u = cc_verify(verify_scope="hygiene", hygiene_criteria="x", hygiene_lint_cmd="true lint")
+check("verify_gate: hygiene scope declares only the run-wide lint, no criterion command",
+      json.loads(u["verification_commands_json"]) == CC_DECLARED + ["true lint"], u["verification_commands_json"])
+guarded("verify_gate: a malformed declaration is passed on unchanged and a non-string item does not crash the gate",
+        lambda: ((cc_verify(verification_commands='["unterminated')["verification_commands_json"] == '["unterminated'
+                  and json.loads(cc_verify(verification_commands=[1, "true"])["verification_commands_json"]) == [1, "true"] + CC_DIFFS),
+                 "declaration mangled"))
+CC_WT = os.path.join(TMP, "criterion-commands-worktree")
+write(os.path.join(CC_WT, "wt-only", "check"), "#!/bin/sh\nexit 0\n", exe=True)
+write(os.path.join(CC_DIR, "TASK-900-wave", "index.md"),
+      "---\ntitle: wave\nstatus: in-progress\n---\n\n# wave\n\n## Acceptance criteria\n\n- `./wt-only/check run` passes\n")
+cc_wave = {k: json.loads(cc_verify(task_dir=os.path.join(CC_DIR, "TASK-900-wave"), **over)["verification_commands_json"])
+           for k, over in {"wave": {"delegate_project_dir": CC_WT}, "main": {}}.items()}
+check("verify_gate: on the wave path an executable only the task worktree holds is declared; against the main checkout it is not",
+      cc_wave == {"wave": CC_DECLARED + ["./wt-only/check run"], "main": CC_DECLARED}, cc_wave)
+write(os.path.join(CC_DIR, "TASK-900-many", "index.md"),
+      "---\ntitle: many\nstatus: in-progress\n---\n\n# many\n\n## Acceptance criteria\n\n" + cc_many)
+u = cc_verify(task_dir=os.path.join(CC_DIR, "TASK-900-many"))
+check("verify_gate: the ledger line says how many criterion commands the cap dropped",
+      any("declared 8 criterion command(s) as verification runs (4 more dropped by the cap): true a0;" in d for d in u["decisions"]),
+      u["decisions"])
 
 # ---------------------------------------------------------------- micro wave delegate inputs (last: claiming a wave moves task state)
 git(CODE, "checkout", "-q", "feat/PLAN-widgets")

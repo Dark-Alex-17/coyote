@@ -242,6 +242,7 @@ initial_state:
   leak_answers: []
   leak_unanswerable: []
   leak_pending_answers: []
+  leak_owner_reason: ''
   gate2_prompt: ''
   gate2_result: ''
   gate2_verdict: ''
@@ -1237,6 +1238,9 @@ nodes:
 
       ## Question lines (parsed)
       {{leak_questions}}
+
+      ## Owner's reason for this round (empty unless the owner asked for another round)
+      {{leak_owner_reason}}
 
       ## Plan
       {{plan_path}}
