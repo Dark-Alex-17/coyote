@@ -1048,12 +1048,52 @@ fn the_mesh_page_says_how_tool_results_name_users_and_sessions() {
     let page = flat(&read(wiki.join("Mesh.md")));
     for needle in [
         "Every result that answers about a session names it beside its hashes, as `user` and `session`, in your own words only",
-        "the result carries it in `advertised_names`, fenced as that peer's data",
+        "the result carries it in `advertised_names`, fenced as that session's data (`advertised user: ...` and `advertised session: ...` lines)",
         "The tools still take the full session hash, never a name.",
         "opens on `<user> / <session> (session hash <hash>)`",
     ] {
         assert!(page.contains(needle), "Mesh.md does not say {needle:?}");
     }
+}
+
+/// A card names the session and user it advertises as `advertised session:` and
+/// `advertised user:`, never as the bare `session` and `user` a row names a session by
+/// in your own words; `.mesh status` and the tools spell the lines the same way, and the
+/// Commands page shows the card in that shape.
+#[test]
+fn a_card_labels_its_advertised_names_apart_from_the_row_s_own_names() {
+    for (path, name) in [
+        ("src/mesh/card.rs", "render_for_human"),
+        ("src/function/mesh.rs", "card_value"),
+    ] {
+        let body = fn_body(path, name);
+        for label in ["\"advertised session: ", "\"advertised user: "] {
+            assert!(body.contains(label), "{name} lacks {label:?}:\n{body}");
+        }
+        for bare in ["\"session: ", "\"user: "] {
+            assert!(!body.contains(bare), "{name} still heads a line {bare:?}");
+        }
+    }
+    let Some(wiki) = wiki_dir() else { return };
+    let status = section(
+        "Mesh-Commands.md",
+        &read(wiki.join("Mesh-Commands.md")),
+        "### `.mesh status`",
+    );
+    assert!(
+        status.contains("\nadvertised session: mesh-docs\nadvertised user: Alice\n"),
+        "the `.mesh status` card does not show the advertised lines:\n{status}"
+    );
+    assert!(
+        flat(&status).contains(
+            "`advertised session` is there while `mesh.share_session_name` is on (the default) and `advertised user` only when `mesh.person_name` is set"
+        ),
+        "the `.mesh status` section does not say when each advertised line is there:\n{status}"
+    );
+    assert!(
+        !status.contains("\nsession: ") && !status.contains("\nuser: "),
+        "the `.mesh status` card still shows a bare session or user line:\n{status}"
+    );
 }
 
 /// `mesh__peers` reports `trust` by one of the five `TRUST_LABELS` words, and the Mesh
@@ -1260,7 +1300,14 @@ fn the_mesh_page_quotes_both_fence_forms_and_says_one_fence_per_peer_message_and
     let long_begin = long_begin.replace("from <destination>", "from session <destination>");
     let long_end = long_end.replace("from <destination>", "from session <destination>");
     let card_value = fn_body("src/function/mesh.rs", "card_value");
-    for label in ["objective: ", "about: ", "repo: ", "todo goal: "] {
+    for label in [
+        "advertised session: ",
+        "advertised user: ",
+        "objective: ",
+        "about: ",
+        "repo: ",
+        "todo goal: ",
+    ] {
         assert!(
             card_value.contains(&format!("\"{label}")),
             "card_value does not head a card field with {label:?}:\n{card_value}"
@@ -1309,6 +1356,8 @@ fn the_mesh_page_quotes_both_fence_forms_and_says_one_fence_per_peer_message_and
         "wears the same pair with `your session` in place of `session <d8>`",
         "The inline `text` of a file fetched with `mesh__fetch` keeps the long form",
         "a marker of either form",
+        "`advertised session: ...`",
+        "`advertised user: ...`",
         "`objective: ...`",
         "`about: ...`",
         "`repo: <name> @ <branch>`",

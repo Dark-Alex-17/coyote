@@ -336,10 +336,10 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
         card.display_name.as_deref().unwrap_or("(none)")
     )];
     if let Some(session) = &card.session {
-        lines.push(format!("session: {session}"));
+        lines.push(format!("advertised session: {session}"));
     }
     if let Some(person_name) = &card.person_name {
-        lines.push(format!("user: {person_name}"));
+        lines.push(format!("advertised user: {person_name}"));
     }
     lines.push(format!(
         "objective: {}",
@@ -2219,6 +2219,25 @@ mod tests {
         assert!(!text.contains("since:"), "{text}");
         assert!(!text.contains("repo:"), "{text}");
         assert!(text.contains("served: 0s ago"), "{text}");
+    }
+
+    /// The session and user a card advertises read as advertised, never as the bare
+    /// `session` and `user` your own names for a session go by.
+    #[test]
+    fn human_rendering_labels_the_advertised_session_and_user() {
+        let mut card = build_card(None, None, None, None, None, &[], now());
+        card.session = Some("review".to_string());
+        card.person_name = Some("Bea".to_string());
+        let text = render_for_human(&card, now());
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.contains(&"advertised session: review"), "{text}");
+        assert!(lines.contains(&"advertised user: Bea"), "{text}");
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("session:") || line.starts_with("user:")),
+            "{text}"
+        );
     }
 
     #[test]

@@ -948,10 +948,10 @@ impl Naming {
         };
         let mut advertised = Vec::new();
         if shown.user != local.user {
-            advertised.push(format!("user: {}", shown.user));
+            advertised.push(format!("advertised user: {}", shown.user));
         }
         if shown.session != local.session {
-            advertised.push(format!("session: {}", shown.session));
+            advertised.push(format!("advertised session: {}", shown.session));
         }
         fields.insert("user".into(), json!(local.user));
         fields.insert("session".into(), json!(local.session));
@@ -1000,10 +1000,12 @@ fn named_send_error(err: &SendError, naming: &Naming, identity: Option<&str>) ->
 /// `todo.goal`) reaches the model as one fenced `text` block under the peer's short
 /// marker, one labelled line per field the card carries, or null when it carries none;
 /// the display name, `caps` and the numbers are identifiers and stay bare. A whole short
-/// marker fits inside a display name or a cap, but a bare identifier is a JSON string
-/// value and never opens a line in the serialised result, so it cannot close the fence or
-/// open another; the tests pin that with a same-peer marker in each. The two advertised
-/// names never get a bare key of their own: `session` on a row is always one of your own.
+/// marker fits inside a display name, and most of one inside a cap, but a bare
+/// identifier is a JSON string value and never opens a line in the serialised result, so
+/// it cannot close the fence or open another; the tests pin that with a same-peer marker
+/// in each. The two advertised names never get a bare key of their own and read
+/// `advertised session:` and `advertised user:` inside the block: `session` and `user`
+/// on a row are always your own words.
 fn card_value(card: &StatusCard, destination: &str) -> Value {
     let state_name = match card.state.code {
         STATE_UNKNOWN => "unknown",
@@ -1013,10 +1015,10 @@ fn card_value(card: &StatusCard, destination: &str) -> Value {
     };
     let mut lines = Vec::new();
     if let Some(session) = &card.session {
-        lines.push(format!("session: {session}"));
+        lines.push(format!("advertised session: {session}"));
     }
     if let Some(person_name) = &card.person_name {
-        lines.push(format!("user: {person_name}"));
+        lines.push(format!("advertised user: {person_name}"));
     }
     if let Some(objective) = &card.objective {
         lines.push(format!("objective: {objective}"));
@@ -2528,7 +2530,10 @@ mod naming_tests {
         assert_eq!(value["session"], "abababab", "{value}");
         assert_eq!(
             value["advertised_names"],
-            wrap_short("abababab", "user: Bea\nsession: review"),
+            wrap_short(
+                "abababab",
+                "advertised user: Bea\nadvertised session: review"
+            ),
             "{value}"
         );
 
@@ -2538,7 +2543,7 @@ mod naming_tests {
         assert_eq!(value["user"], "Coworker A", "{value}");
         assert_eq!(
             value["advertised_names"],
-            wrap_short("abababab", "session: review"),
+            wrap_short("abababab", "advertised session: review"),
             "{value}"
         );
 
@@ -2569,8 +2574,8 @@ mod naming_tests {
             lines,
             [
                 begin.as_str(),
-                &format!("user: {end}"),
-                &format!("session: {begin}"),
+                &format!("advertised user: {end}"),
+                &format!("advertised session: {begin}"),
                 end.as_str()
             ],
             "{fenced}"
@@ -2631,7 +2636,7 @@ mod naming_tests {
             assert_eq!(result["session"], "abababab", "{result}");
             assert_eq!(
                 result["advertised_names"],
-                wrap_short("abababab", "session: review"),
+                wrap_short("abababab", "advertised session: review"),
                 "{result}"
             );
         }
@@ -3746,7 +3751,7 @@ mod tests {
             wrap_short(
                 d8,
                 &format!(
-                    "session: widgets-review\nuser: {injected}\nobjective: {injected}\nabout: reviews Rust\nrepo: widgets @ main\ntodo goal: finish"
+                    "advertised session: widgets-review\nadvertised user: {injected}\nobjective: {injected}\nabout: reviews Rust\nrepo: widgets @ main\ntodo goal: finish"
                 )
             ),
             "{value}"
@@ -7511,7 +7516,7 @@ mod tests {
             assert_eq!(result["session"], d8, "{what}: {result}");
             assert_eq!(
                 result["advertised_names"],
-                wrap_short(d8, "session: review"),
+                wrap_short(d8, "advertised session: review"),
                 "{what}: {result}"
             );
             let mut bare = result.clone();
