@@ -5,9 +5,7 @@ use super::skill::SKILL_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
-use crate::config::{
-    McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
-};
+use crate::config::{McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled};
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::{
@@ -193,6 +191,7 @@ pub struct JobEnvSnapshot {
     cmd_name: String,
     display_name: String,
     cmd_args: Vec<String>,
+    bin_dirs: Vec<PathBuf>,
     envs: HashMap<String, String>,
     output_file: PathBuf,
     timeout_secs: u64,
@@ -1210,30 +1209,29 @@ fn build_env_snapshot(
     arguments: &Value,
 ) -> Result<JobEnvSnapshot> {
     let agent = ctx.agent.as_ref();
-    let (cmd_name, mut cmd_args, mut envs) = match agent {
+    let (cmd_name, mut cmd_args, mut envs, agent_script) = match agent {
         Some(agent) => match agent.functions().find(tool) {
             Some(declaration) if declaration.agent => (
-                format!("{}-{tool}", agent.name()),
+                agent.name().to_string(),
                 vec![tool.to_string()],
                 agent.variable_envs(),
+                true,
             ),
-            Some(_) => (tool.to_string(), vec![], agent.variable_envs()),
-            None => (tool.to_string(), vec![], HashMap::new()),
+            Some(_) => (tool.to_string(), vec![], agent.variable_envs(), false),
+            None => (tool.to_string(), vec![], HashMap::new(), false),
         },
-        None => (tool.to_string(), vec![], HashMap::new()),
+        None => (tool.to_string(), vec![], HashMap::new(), false),
     };
 
-    let mut bin_dirs: Vec<PathBuf> = vec![];
-    if let Some(agent) = agent {
-        let dir = paths::agent_bin_dir(agent.name());
-        if dir.exists() {
-            bin_dirs.push(dir);
-        }
-        if graph::agent_has_graph(agent.name()) {
-            envs.insert("AUTO_CONFIRM".into(), "true".into());
-        }
-    } else {
-        bin_dirs.push(paths::functions_bin_dir());
+    let tool_agent = agent.map(|agent| super::ToolAgent {
+        name: agent.name().to_string(),
+        script: agent_script,
+    });
+    let bin_dirs = super::tool_bin_dirs(tool_agent.as_ref());
+    if let Some(agent) = agent
+        && graph::agent_has_graph(agent.name())
+    {
+        envs.insert("AUTO_CONFIRM".into(), "true".into());
     }
     let current_path = env::var("PATH").context("No PATH environment variable")?;
     let prepend_path = bin_dirs
@@ -1275,6 +1273,7 @@ fn build_env_snapshot(
         cmd_name,
         display_name: tool.to_string(),
         cmd_args,
+        bin_dirs,
         envs,
         output_file,
         timeout_secs,
@@ -1354,9 +1353,14 @@ async fn run_process_job(
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    let mut child = command.spawn().map_err(|err| {
+        super::spawn_error(
+            &snapshot.display_name,
+            &snapshot.cmd_name,
+            &snapshot.bin_dirs,
+            &err,
+        )
+    })?;
     debug!(
         "Spawned job process '{}' pid {:?}",
         snapshot.display_name,
@@ -1618,6 +1622,76 @@ mod tests {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn env_snapshot_path_reaches_skill_granted_global_tool_inside_agent() {
+        let _guard = crate::testing::TestConfigDirGuard::new("job-skill-granted-tool");
+        let _functions_env =
+            crate::testing::EnvVarGuard::unset(super::super::get_env_name("functions_dir"));
+        let agent_name = "job-skill-granted-agent";
+        fs::create_dir_all(crate::config::paths::agent_bin_dir(agent_name)).unwrap();
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        }));
+
+        let snapshot = build_env_snapshot(&ctx, "grantedglob", &json!({})).unwrap();
+
+        let path = &snapshot.envs["PATH"];
+        let functions_bin = crate::config::paths::functions_bin_dir()
+            .display()
+            .to_string();
+        assert!(
+            path.split(PATH_SEP).any(|dir| dir == functions_bin),
+            "a global tool run inside an agent needs the global functions bin on PATH: {path}"
+        );
+        assert_eq!(
+            path.split(PATH_SEP).next(),
+            Some(
+                crate::config::paths::agent_bin_dir(agent_name)
+                    .display()
+                    .to_string()
+                    .as_str()
+            ),
+            "the agent's own bin dir keeps precedence: {path}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_snapshot_runs_agent_script_tool_as_agent_binary() {
+        let _guard = crate::testing::TestConfigDirGuard::new("job-agent-script-tool");
+        let agent_name = "job-script-agent";
+        let mut agent = crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        });
+        agent
+            .functions_mut()
+            .append_declaration(FunctionDeclaration {
+                name: "scripted".into(),
+                description: String::new(),
+                parameters: Default::default(),
+                agent: true,
+            });
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(agent);
+
+        let snapshot = build_env_snapshot(&ctx, "scripted", &json!({})).unwrap();
+
+        assert_eq!(snapshot.cmd_name, agent_name);
+        assert_eq!(snapshot.cmd_args[0], "scripted");
+        let functions_bin = crate::config::paths::functions_bin_dir()
+            .display()
+            .to_string();
+        let path = &snapshot.envs["PATH"];
+        assert!(
+            !path.split(PATH_SEP).any(|dir| dir == functions_bin),
+            "{path}"
+        );
+    }
+
     fn ctx_with_job_supervisor(max_jobs: usize) -> RequestContext {
         let mut ctx = plain_ctx();
         ctx.supervisor = Some(Arc::new(RwLock::new(
@@ -1673,6 +1747,7 @@ mod tests {
             cmd_name: cmd.to_string(),
             display_name: cmd.to_string(),
             cmd_args: args.iter().map(|s| s.to_string()).collect(),
+            bin_dirs: vec![],
             envs,
             output_file,
             timeout_secs,

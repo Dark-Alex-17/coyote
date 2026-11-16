@@ -5,7 +5,7 @@ use crate::{
     client::Model,
     config::memory,
     function::{
-        FunctionDeclaration, Functions,
+        FunctionDeclaration, Functions, ToolAgent,
         jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX},
         run_llm_function,
     },
@@ -913,7 +913,10 @@ impl Agent {
             self.name().to_string(),
             vec!["_instructions".into(), "{}".into()],
             self.variable_envs(),
-            Some(self.name().to_string()),
+            Some(ToolAgent {
+                name: self.name().to_string(),
+                script: true,
+            }),
             tool_timeout,
             false,
             None,
