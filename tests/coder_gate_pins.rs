@@ -1277,10 +1277,10 @@ fn coder_graph_runs_the_baseline_once_before_implement() {
     );
 }
 
-/// Only gate_approval (by its routes), and route_complexity and
-/// parse_approval (by the `_next` they print) lead into baseline_tests, and
-/// baseline_tests declares no `next` or `routes` of its own: it runs once,
-/// before implement.
+/// Only gate_approval (by its routes), and route_complexity, parse_approval
+/// and analyze_fault (by the `_next` they print) lead into baseline_tests,
+/// and baseline_tests declares no `next` or `routes` of its own: it runs
+/// once, before implement.
 #[test]
 fn only_the_approval_side_routes_into_the_baseline() {
     let graph = graph();
@@ -1312,11 +1312,130 @@ fn only_the_approval_side_routes_into_the_baseline() {
         }
     }
     scripts.sort_unstable();
-    assert_eq!(scripts, ["parse_approval.sh", "route_complexity.sh"]);
+    assert_eq!(
+        scripts,
+        [
+            "analyze_fault.sh",
+            "parse_approval.sh",
+            "route_complexity.sh"
+        ]
+    );
 
     let node = &graph["nodes"]["baseline_tests"];
     assert!(node["next"].is_null(), "baseline_tests declares a next");
     assert!(node["routes"].is_null(), "baseline_tests declares routes");
+}
+
+/// analyze_request reads the repository through read-only tools its agent
+/// declares; it can never write.
+#[test]
+fn analyze_request_gets_exactly_the_read_tools() {
+    let graph = graph();
+    let node = &graph["nodes"]["analyze_request"];
+    let mut tools: Vec<&str> = node["tools"]
+        .as_sequence()
+        .expect("analyze_request lists its tools")
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    tools.sort_unstable();
+    let read_tools = ["ast_grep", "fs_cat", "fs_glob", "fs_grep", "fs_ls"];
+    assert_eq!(tools, read_tools, "analyze_request tools");
+    let global_tools: Vec<&str> = graph["global_tools"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    for tool in read_tools {
+        let script = format!("{tool}.sh");
+        assert!(
+            global_tools.contains(&script.as_str()),
+            "global_tools lacks {script}"
+        );
+    }
+}
+
+/// Lower bounds on the coder llm budgets. Raising one is fine; going below
+/// a floor brings back runs that end on the cap before the node concludes.
+#[test]
+fn coder_llm_budgets_stay_at_or_above_their_floors() {
+    let graph = graph();
+    for (name, turns, seconds) in [
+        ("analyze_request", 60, 1200),
+        ("implement", 200, 1800),
+        ("self_review", 40, 1200),
+    ] {
+        let node = &graph["nodes"][name];
+        assert!(
+            node["max_iterations"].as_u64().is_some_and(|n| n >= turns),
+            "{name} max_iterations {:?} is below {turns}",
+            node["max_iterations"]
+        );
+        assert!(
+            node["timeout"].as_u64().is_some_and(|t| t >= seconds),
+            "{name} timeout {:?} is below {seconds}",
+            node["timeout"]
+        );
+    }
+}
+
+/// A dead analyze_request or implement continues through its fault script
+/// rather than ending the run, and a crash of either fault script fails
+/// closed.
+#[test]
+fn analyze_and_implement_faults_continue_through_their_fault_scripts() {
+    let graph = graph();
+    let nodes = &graph["nodes"];
+    for (llm, fault) in [
+        ("analyze_request", "analyze_fault"),
+        ("implement", "implement_fault"),
+    ] {
+        assert_eq!(nodes[llm]["fallback"].as_str(), Some(fault), "{llm}");
+        let node = &nodes[fault];
+        assert_eq!(node["type"].as_str(), Some("script"), "{fault}");
+        assert_eq!(
+            node["script"].as_str(),
+            Some(format!("scripts/{fault}.sh").as_str()),
+            "{fault}"
+        );
+        assert_eq!(node["fallback"].as_str(), Some("end_failure"), "{fault}");
+    }
+}
+
+/// Every coder llm node sets its own turn budget and timeout instead of the
+/// engine defaults.
+#[test]
+fn every_coder_llm_node_declares_its_budget() {
+    let graph = graph();
+    for (name, node) in graph["nodes"].as_mapping().unwrap() {
+        if node["type"].as_str() != Some("llm") {
+            continue;
+        }
+        for key in ["max_iterations", "timeout"] {
+            assert!(
+                node[key].as_u64().is_some(),
+                "coder llm node {name:?} relies on the engine default {key}"
+            );
+        }
+    }
+}
+
+/// implement is entered once, then once per fix attempt (fix_loop_gate and
+/// implement_fault spend the same budget) and once per review loop. That
+/// worst case must stay below the engine's per-node visit cap.
+#[test]
+fn implement_worst_case_visits_stay_below_the_loop_cap() {
+    let graph = graph();
+    let state = &graph["initial_state"];
+    let fix = state["max_fix_attempts"].as_u64().unwrap();
+    let review = state["max_review_attempts"].as_u64().unwrap();
+    let cap = graph["settings"]["max_loop_iterations"].as_u64().unwrap();
+    assert!(
+        1 + fix + review < cap,
+        "implement may run {} times, not below max_loop_iterations {cap}",
+        1 + fix + review
+    );
 }
 
 /// With no report the `Tests:` line is followed by the `Review:` line; a
