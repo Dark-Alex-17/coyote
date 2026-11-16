@@ -6169,9 +6169,10 @@ impl MeshSlot {
         });
     }
 
-    /// Matches a reply to the question or message of ours it answers; a reply that named
-    /// no thread inherits the correlation's, on the filed answer and the delivered copy
-    /// alike, but only once `answer` has taken it. A reply that answers nothing is
+    /// Matches a reply to the question or message of ours it answers; the reply takes the
+    /// correlation's thread, whether it named none or another, on the filed answer and
+    /// the delivered copy alike, but only once `answer` has taken it. A reply that
+    /// answers nothing is
     /// downgraded to a message, since to this node it is one, and sheds the thread,
     /// disposition and retry hint a reply earns and a message cannot carry; `Some` says
     /// what the match did. An escalated reply matches without closing the question, so
@@ -6182,9 +6183,24 @@ impl MeshSlot {
         }
         let answered = match message.in_reply_to.as_deref() {
             Some(id) => {
+                // A reply's thread is the thread of the message it answers, whatever the
+                // reply names: a claimed thread would let a reply to one message pass for
+                // a reply in any thread this session sent.
                 let mut reply = message.clone();
-                if reply.thread.is_none() {
-                    reply.thread = self.correlations.thread_of(id);
+                if let Some(opened) = self.correlations.thread_of(id) {
+                    if reply
+                        .thread
+                        .as_deref()
+                        .is_some_and(|claimed| claimed != opened)
+                    {
+                        debug!(
+                            "Mesh reply {} from {} names thread {} but answers {id}, sent in {opened}; filing it in {opened}",
+                            reply.message_id,
+                            short(&reply.source_identity),
+                            reply.thread.as_deref().unwrap_or_default()
+                        );
+                    }
+                    reply.thread = Some(opened);
                 }
                 let thread = reply.thread.clone();
                 let answered = self.correlations.answer(id, reply);
@@ -20536,6 +20552,7 @@ mod tests {
             30,
             SystemTime::now(),
             "cd".repeat(16),
+            &|| false,
         );
 
         assert!(remembered_record(&other, "old").exists());
@@ -20552,7 +20569,6 @@ mod tests {
         let starting_id = "ab".repeat(16);
         let starting = plant_year_old_store(&paths, &starting_id);
         let held = InstanceLock::acquire(&paths.cache_dir, &starting_id).unwrap();
-            &|| false,
         let sweep = || {
             prune_unused_envoy_stores(
                 &paths.cache_dir,
@@ -20560,6 +20576,7 @@ mod tests {
                 30,
                 SystemTime::now(),
                 "cd".repeat(16),
+                &|| false,
             )
             .unused
             .unwrap()
@@ -20576,7 +20593,6 @@ mod tests {
     /// The real sweep future under a paused clock: a store that crosses the days unused
     /// after the join sweep goes on the next daily sweep, not before.
     #[tokio::test(start_paused = true)]
-                &|| false,
     async fn the_unused_store_sweep_removes_a_store_on_the_first_daily_sweep_after_it_crosses() {
         let tmp = TempDir::new("node-envoy-store-sweep-daily");
         let paths = mesh_paths(&tmp);

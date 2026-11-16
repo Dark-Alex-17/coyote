@@ -53885,6 +53885,20 @@ mod tests {
                     destination: String,
                     identity: String,
                 ) -> PeerMessage {
+                    reply_claiming(fx, id, asked, thread, thread, destination, identity)
+                }
+
+                /// `reply_in_thread` to `asked`, sent in `sent_in`, by a reply that
+                /// names `claimed` as its thread.
+                fn reply_claiming(
+                    fx: &PeerFixture,
+                    id: &str,
+                    asked: &str,
+                    sent_in: &str,
+                    claimed: &str,
+                    destination: String,
+                    identity: String,
+                ) -> PeerMessage {
                     let now = SystemTime::now();
                     fx.ctx
                         .app
@@ -53895,7 +53909,7 @@ mod tests {
                             id: asked.to_string(),
                             peer_destination: destination.clone(),
                             peer_identity: identity.clone(),
-                            thread: thread.to_string(),
+                            thread: sent_in.to_string(),
                             question: "and the docs?".to_string(),
                             sent_at: crate::mesh::rfc3339_utc(now),
                             timeout_at: crate::mesh::rfc3339_utc(
@@ -53918,7 +53932,7 @@ mod tests {
                         in_reply_to: Some(asked.to_string()),
                         kind: PeerKind::Reply,
                         via: PeerVia::Direct,
-                        thread: Some(thread.to_string()),
+                        thread: Some(claimed.to_string()),
                         disposition: Some(Disposition::Answered),
                         retry_after: None,
                         parts: Vec::new(),
@@ -54088,6 +54102,68 @@ mod tests {
                             .await,
                             format!(
                                 "Message {} was sent before this session kept where each message went, and 2 sessions replied in its thread, so a follow-up has no one session to go to. `.mesh messaging inbox` shows who answered; `.mesh messaging send <session> \"text\"` starts a new conversation with the one you mean.",
+                                short(&thread)
+                            )
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(
+                            fx.ctx
+                                .app
+                                .mesh
+                                .sent_threads()
+                                .unwrap()
+                                .recipient(&thread)
+                                .is_none()
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// A reply's own word for its thread is never what puts it there: a
+                /// reply to a message this session sent in another thread that claims
+                /// the old thread is filed in the thread of the message it answers, so
+                /// a follow-up on the old thread still has no replier to go to.
+                #[test]
+                #[serial]
+                fn messaging_follow_up_on_an_old_thread_ignores_a_reply_that_only_claims_it() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-legacy-claimed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-legacy-claimed").await;
+                        let thread = "4d".repeat(16);
+                        let other = "3f".repeat(16);
+                        fx.ctx.app.mesh.remember_sent_thread(&thread);
+                        fx.ctx.app.mesh.remember_sent_thread(&other);
+                        let id = "7e".repeat(16);
+                        let reply = reply_claiming(
+                            &fx,
+                            &id,
+                            &"2a".repeat(16),
+                            &other,
+                            &thread,
+                            fx.stub.destination_hex(),
+                            fx.stub.identity_hex(),
+                        );
+                        fx.ctx.app.mesh.deliver_peer(reply);
+                        let filed = fx
+                            .ctx
+                            .app
+                            .mesh
+                            .peer_inbox()
+                            .newest(|message| message.message_id == id)
+                            .expect("the reply is in the inbox");
+                        assert_eq!(filed.kind, PeerKind::Reply);
+                        assert_eq!(filed.thread(), other, "filed in the thread it answers");
+
+                        assert_eq!(
+                            refusal(
+                                &mut fx.ctx,
+                                &format!(".mesh messaging follow-up {thread} \"x\"")
+                            )
+                            .await,
+                            format!(
+                                "Message {} was sent before this session kept where each message went, and no reply in its thread is in the inbox to say which session to follow up with. `.mesh messaging inbox` shows what came back; `.mesh messaging send <session> \"text\"` starts a new conversation.",
                                 short(&thread)
                             )
                         );

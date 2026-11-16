@@ -2975,6 +2975,10 @@ mod tests {
     }
 
     fn open_correlation(slot: &MeshSlot, id: &str, kind: CorrelationKind) {
+        open_correlation_in(slot, id, id, kind);
+    }
+
+    fn open_correlation_in(slot: &MeshSlot, id: &str, thread: &str, kind: CorrelationKind) {
         let now = SystemTime::now();
         slot.correlations()
             .open(PendingRecord {
@@ -2982,7 +2986,7 @@ mod tests {
                 id: id.to_string(),
                 peer_destination: hex_lower(&[0xab; 16]),
                 peer_identity: hex_lower(&[0xcd; 16]),
-                thread: id.to_string(),
+                thread: thread.to_string(),
                 question: "what now?".into(),
                 sent_at: rfc3339_utc(now),
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
@@ -6928,18 +6932,19 @@ mod tests {
     }
 
     /// The collect surface carries two bare copies of a peer-chosen `thread` (the
-    /// result's own `thread` and the reply's) next to the reply's `message_id`; each may
-    /// be a whole short marker of the reply's own fence and each arrives bare, as the id
-    /// it is, never opening a line in the serialised result, while the same marker as a
-    /// content line is quoted inside the fence. So the result keeps exactly one
-    /// line-leading begin and one line-leading end marker: the real pair.
+    /// result's own `thread` and the reply's, a thread a peer opened that the question
+    /// continued) next to the reply's `message_id`; each may be a whole short marker of
+    /// the reply's own fence and each arrives bare, as the id it is, never opening a line
+    /// in the serialised result, while the same marker as a content line is quoted
+    /// inside the fence. So the result keeps exactly one line-leading begin and one
+    /// line-leading end marker: the real pair.
     #[tokio::test]
     async fn collected_reply_leaves_marker_shaped_ids_bare_and_never_line_leading() {
         let ctx = mesh_ctx();
-        open_question(&ctx.app.mesh, "q-ids");
         let d8 = "abababab";
         let short_begin = short_begin_line(d8);
         let short_end = short_end_line(d8);
+        open_correlation_in(&ctx.app.mesh, "q-ids", &short_end, CorrelationKind::Ask);
         let mut raw = raw_message(PeerKind::Reply, &short_begin, Some("q-ids"));
         raw.thread = Some(short_end.clone());
         raw.content = short_end.clone();
