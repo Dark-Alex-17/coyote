@@ -35,8 +35,10 @@ pub const DEFAULT_ENVOY_MEMORY_TTL_HOURS: u64 = 168;
 pub const DEFAULT_LOCAL_RNSD_PORT: u16 = 37428;
 /// The rnsd instance whose abstract socket a `local` entry dials when it names none.
 pub const DEFAULT_LOCAL_RNSD_INSTANCE: &str = "default";
-/// Width of the label column in the `mesh:` section of `.info`.
-const MESH_INFO_LABEL_WIDTH: usize = 32;
+/// Width of the label column in the `mesh:` section of `.info`: the longest key,
+/// `envoy_memory.prune_unused_after_days`, and the two spaces after it, so every value
+/// starts in one column.
+const MESH_INFO_LABEL_WIDTH: usize = 38;
 
 pub(crate) const MESH_DIGEST_PROMPT: &str = r#"The session above may be shared with a trusted collaborator's Coyote instance. Write a digest of it that lets that collaborator understand what is happening here without reading the transcript.
 
@@ -2003,7 +2005,7 @@ mod tests {
     fn render_mesh_info_marks_a_zero_cost_ceiling_as_off() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
-            info.contains("  peer_max_cost_usd_per_hour      0 (off)\n"),
+            info.contains("  peer_max_cost_usd_per_hour            0 (off)\n"),
             "{info}"
         );
         let priced = MeshConfig {
@@ -2012,7 +2014,7 @@ mod tests {
         };
         let info = render_mesh_info(&priced);
         assert!(
-            info.contains("  peer_max_cost_usd_per_hour      1.5\n"),
+            info.contains("  peer_max_cost_usd_per_hour            1.5\n"),
             "{info}"
         );
     }
@@ -2021,15 +2023,15 @@ mod tests {
     fn render_mesh_info_marks_a_zero_peer_budget_as_unlimited() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
-            info.contains("  peer_max_concurrent             1\n"),
+            info.contains("  peer_max_concurrent                   1\n"),
             "{info}"
         );
         assert!(
-            info.contains("  peer_max_messages_per_hour      60\n"),
+            info.contains("  peer_max_messages_per_hour            60\n"),
             "{info}"
         );
         assert!(
-            info.contains("  peer_max_tokens_per_hour        100000\n"),
+            info.contains("  peer_max_tokens_per_hour              100000\n"),
             "{info}"
         );
         let unlimited = MeshConfig {
@@ -2053,7 +2055,7 @@ mod tests {
     fn render_mesh_info_marks_a_zero_sync_interval_as_manual() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
-            info.contains("  propagation_sync_interval_secs  300\n"),
+            info.contains("  propagation_sync_interval_secs        300\n"),
             "{info}"
         );
         let manual = MeshConfig {
@@ -2062,7 +2064,7 @@ mod tests {
         };
         let info = render_mesh_info(&manual);
         assert!(
-            info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
+            info.contains("  propagation_sync_interval_secs        0 (manual)\n"),
             "{info}"
         );
     }
@@ -2071,11 +2073,11 @@ mod tests {
     fn render_mesh_info_shows_unset_timers_as_null_and_set_ones_in_seconds() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
-            info.contains("  request_timeout_secs            null\n"),
+            info.contains("  request_timeout_secs                  null\n"),
             "{info}"
         );
         assert!(
-            info.contains("  link_timeout_secs               null\n"),
+            info.contains("  link_timeout_secs                     null\n"),
             "{info}"
         );
         let raised = MeshConfig {
@@ -2085,11 +2087,11 @@ mod tests {
         };
         let info = render_mesh_info(&raised);
         assert!(
-            info.contains("  request_timeout_secs            90\n"),
+            info.contains("  request_timeout_secs                  90\n"),
             "{info}"
         );
         assert!(
-            info.contains("  link_timeout_secs               45\n"),
+            info.contains("  link_timeout_secs                     45\n"),
             "{info}"
         );
     }
@@ -2102,7 +2104,7 @@ mod tests {
         };
         let info = render_mesh_info(&quiet);
         assert!(
-            info.contains("  propagation_sync_interval_secs  300 (off: announce is false)\n"),
+            info.contains("  propagation_sync_interval_secs        300 (off: announce is false)\n"),
             "{info}"
         );
         let manual_and_quiet = MeshConfig {
@@ -2112,7 +2114,7 @@ mod tests {
         };
         let info = render_mesh_info(&manual_and_quiet);
         assert!(
-            info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
+            info.contains("  propagation_sync_interval_secs        0 (manual)\n"),
             "{info}"
         );
     }
@@ -2135,61 +2137,88 @@ mod tests {
         };
         let info = render_mesh_info(&mesh);
         assert!(
-            info.contains("  interfaces[0]                   private relay.example.com:4242\n"),
-            "{info}"
-        );
-        assert!(
             info.contains(
-                "  interfaces[1]                   public node.example.com:4242 (world-visible)\n"
+                "  interfaces[0]                         private relay.example.com:4242\n"
             ),
             "{info}"
         );
         assert!(
-            info.contains("  enabled                         false\n"),
+            info.contains(
+                "  interfaces[1]                         public node.example.com:4242 (world-visible)\n"
+            ),
             "{info}"
         );
         assert!(
-            info.contains("  display_name                    null\n"),
+            info.contains("  enabled                               false\n"),
             "{info}"
         );
         assert!(
-            info.contains("  about                           null\n"),
+            info.contains("  display_name                          null\n"),
             "{info}"
         );
         assert!(
-            info.contains("  share_session_name              true\n"),
+            info.contains("  about                                 null\n"),
             "{info}"
         );
         assert!(
-            info.contains("  person_name                     null\n"),
+            info.contains("  share_session_name                    true\n"),
             "{info}"
         );
         assert!(
-            info.contains("  brief                           manual\n"),
+            info.contains("  person_name                           null\n"),
             "{info}"
         );
         assert!(
-            info.contains("  peer_max_tokens_per_hour        100000\n"),
+            info.contains("  brief                                 manual\n"),
             "{info}"
         );
         assert!(
-            info.contains("  fetch.inline_max_bytes          65536\n"),
+            info.contains("  peer_max_tokens_per_hour              100000\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  fetch.inline_max_bytes                65536\n"),
             "{info}"
         );
         assert!(
             info.ends_with(concat!(
-                "  fetch.max_bytes                 4194304\n",
-                "  fetch.inbox_dir                 null\n",
-                "  envoy_memory.enabled            false\n",
-                "  envoy_memory.max_sessions       256\n",
-                "  envoy_memory.max_per_identity   16\n",
-                "  envoy_memory.max_turns          40\n",
-                "  envoy_memory.max_bytes          65536\n",
-                "  envoy_memory.ttl_hours          168\n",
+                "  fetch.max_bytes                       4194304\n",
+                "  fetch.inbox_dir                       null\n",
+                "  envoy_memory.enabled                  false\n",
+                "  envoy_memory.max_sessions             256\n",
+                "  envoy_memory.max_per_identity         16\n",
+                "  envoy_memory.max_turns                40\n",
+                "  envoy_memory.max_bytes                65536\n",
+                "  envoy_memory.ttl_hours                168\n",
                 "  envoy_memory.prune_unused_after_days  null\n",
             )),
             "{info}"
         );
+    }
+
+    /// Every row of the `mesh:` section starts its value in one column, the one the
+    /// longest key leaves two spaces after, so the longest key's row lines up too.
+    #[test]
+    fn render_mesh_info_starts_every_value_in_the_same_column() {
+        let mesh = MeshConfig {
+            interfaces: vec![MeshInterface::Lan],
+            ..Default::default()
+        };
+        let longest = mesh_settings_rows(&mesh, true)
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap();
+        assert_eq!(longest, "envoy_memory.prune_unused_after_days".len());
+        let info = render_mesh_info(&mesh);
+        for line in info.lines() {
+            let name_end = 2 + line[2..].find(' ').unwrap_or(line.len() - 2);
+            let value_at = name_end
+                + line[name_end..]
+                    .find(|c: char| c != ' ')
+                    .unwrap_or_else(|| panic!("no value on {line:?}"));
+            assert_eq!(value_at, 2 + longest + 2, "{line:?} in\n{info}");
+        }
     }
 
     #[test]
@@ -2231,12 +2260,12 @@ mod tests {
         let info = render_mesh_info(&mesh);
 
         assert!(
-            info.contains("  fetch.inbox_dir                 /srv/inbox\n"),
+            info.contains("  fetch.inbox_dir                       /srv/inbox\n"),
             "{info}"
         );
         assert!(
             info.ends_with(concat!(
-                "  envoy_memory.ttl_hours          168\n",
+                "  envoy_memory.ttl_hours                168\n",
                 "  envoy_memory.prune_unused_after_days  null\n",
             )),
             "{info}"
@@ -2252,20 +2281,20 @@ mod tests {
         };
         let info = render_mesh_info(&mesh);
         assert!(
-            info.contains("  digest_prompt                   custom\n"),
+            info.contains("  digest_prompt                         custom\n"),
             "{info}"
         );
         assert!(!info.contains(secret), "{info}");
         assert!(
             render_mesh_info(&MeshConfig::default())
-                .contains("  digest_prompt                   default\n")
+                .contains("  digest_prompt                         default\n")
         );
         let blank = MeshConfig {
             digest_prompt: Some("  \n".into()),
             ..Default::default()
         };
         assert!(
-            render_mesh_info(&blank).contains("  digest_prompt                   default\n"),
+            render_mesh_info(&blank).contains("  digest_prompt                         default\n"),
             "{}",
             render_mesh_info(&blank)
         );
