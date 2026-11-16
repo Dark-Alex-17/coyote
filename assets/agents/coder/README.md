@@ -13,7 +13,7 @@ implement-fix loop enforced as graph edges rather than prose.
 ```mermaid
 flowchart TD
     resolve_paths{"resolve_paths<br/>script"} --> analyze_request
-    analyze_request["analyze_request<br/>llm + output_schema"] --> route_complexity
+    analyze_request["analyze_request<br/>llm + read tools + output_schema"] --> route_complexity
     analyze_request -. "planning died" .-> analyze_fault
     analyze_fault{"analyze_fault<br/>script"}
     analyze_fault -->|"empty plan, complexity 7"| gate_approval

@@ -475,7 +475,7 @@ nodes:
   implement_fault:
     id: implement_fault
     type: script
-    description: "Reached when implement dies (iteration cap, API failure). Under the fix budget it spends one fix attempt and loops back to implement with fix_instructions quoting the error and pointing at the edits already on disk; at the budget it sets gate_error and ends the run. Never routes to verify_build, so a pass that wrote nothing cannot end as CODER_COMPLETE. A crash of this script fails the run closed."
+    description: "Reached when implement dies (iteration cap, API failure). Under the fix budget it spends one fix attempt and loops back to implement with fix_instructions quoting the error, pointing at the edits already on disk and keeping the fix_instructions the dead pass was working on; at the budget it sets gate_error and ends the run. Never routes to verify_build, so a pass that wrote nothing cannot end as CODER_COMPLETE. A crash of this script fails the run closed."
     script: scripts/implement_fault.sh
     timeout: 5
     fallback: end_failure

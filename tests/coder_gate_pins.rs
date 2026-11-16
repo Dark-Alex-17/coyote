@@ -1327,40 +1327,55 @@ fn only_the_approval_side_routes_into_the_baseline() {
 }
 
 /// analyze_request reads the repository through read-only tools its agent
-/// declares, and has room to conclude; it can never write.
+/// declares; it can never write.
 #[test]
-fn analyze_request_gets_read_tools_and_a_budget_to_conclude() {
+fn analyze_request_gets_exactly_the_read_tools() {
     let graph = graph();
     let node = &graph["nodes"]["analyze_request"];
-    assert!(
-        node["max_iterations"].as_u64().is_some_and(|n| n >= 60),
-        "analyze_request max_iterations: {:?}",
-        node["max_iterations"]
-    );
-    let tools: Vec<&str> = node["tools"]
+    let mut tools: Vec<&str> = node["tools"]
         .as_sequence()
         .expect("analyze_request lists its tools")
         .iter()
         .map(|t| t.as_str().unwrap())
         .collect();
+    tools.sort_unstable();
+    let read_tools = ["ast_grep", "fs_cat", "fs_glob", "fs_grep", "fs_ls"];
+    assert_eq!(tools, read_tools, "analyze_request tools");
     let global_tools: Vec<&str> = graph["global_tools"]
         .as_sequence()
         .unwrap()
         .iter()
         .map(|t| t.as_str().unwrap())
         .collect();
-    for tool in ["ast_grep", "fs_cat", "fs_ls", "fs_grep", "fs_glob"] {
-        assert!(tools.contains(&tool), "analyze_request lacks {tool}");
+    for tool in read_tools {
         let script = format!("{tool}.sh");
         assert!(
             global_tools.contains(&script.as_str()),
             "global_tools lacks {script}"
         );
     }
-    for tool in ["fs_write", "fs_patch", "execute_command"] {
+}
+
+/// Lower bounds on the coder llm budgets. Raising one is fine; going below
+/// a floor brings back runs that end on the cap before the node concludes.
+#[test]
+fn coder_llm_budgets_stay_at_or_above_their_floors() {
+    let graph = graph();
+    for (name, turns, seconds) in [
+        ("analyze_request", 60, 1200),
+        ("implement", 200, 1800),
+        ("self_review", 40, 1200),
+    ] {
+        let node = &graph["nodes"][name];
         assert!(
-            !tools.contains(&tool),
-            "analyze_request only plans, yet offers {tool}"
+            node["max_iterations"].as_u64().is_some_and(|n| n >= turns),
+            "{name} max_iterations {:?} is below {turns}",
+            node["max_iterations"]
+        );
+        assert!(
+            node["timeout"].as_u64().is_some_and(|t| t >= seconds),
+            "{name} timeout {:?} is below {seconds}",
+            node["timeout"]
         );
     }
 }
@@ -1388,19 +1403,21 @@ fn analyze_and_implement_faults_continue_through_their_fault_scripts() {
     }
 }
 
-/// Every coder llm node sets its own turn budget instead of the engine
-/// default.
+/// Every coder llm node sets its own turn budget and timeout instead of the
+/// engine defaults.
 #[test]
-fn every_coder_llm_node_declares_max_iterations() {
+fn every_coder_llm_node_declares_its_budget() {
     let graph = graph();
     for (name, node) in graph["nodes"].as_mapping().unwrap() {
         if node["type"].as_str() != Some("llm") {
             continue;
         }
-        assert!(
-            node["max_iterations"].as_u64().is_some(),
-            "coder llm node {name:?} relies on the engine default max_iterations"
-        );
+        for key in ["max_iterations", "timeout"] {
+            assert!(
+                node[key].as_u64().is_some(),
+                "coder llm node {name:?} relies on the engine default {key}"
+            );
+        }
     }
 }
 

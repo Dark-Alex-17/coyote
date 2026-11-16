@@ -14,9 +14,11 @@ fi
 # on with an empty plan so implement explores the request itself, and the
 # fault stays visible in plan_summary, which every end node renders.
 # Interactive runs go to the human checkpoint; headless runs skip it the way
-# route_complexity does.
+# route_complexity does. The quoted error goes on one line and is capped, so a
+# multi-line provider error cannot start a line that reads as a report field.
 empty_plan='
-  ((.last_node_output // "") | tostring | if . == "" then "no error recorded in state" else . end) as $err
+  ((.last_node_output // "") | tostring | gsub("\\s*\\n\\s*"; " ") | .[0:400]
+    | if . == "" then "no error recorded in state" else . end) as $err
   | {
       "plan_summary": ("Planning ended without a plan (" + $err + "); the implementer plans from the request itself."),
       "files_to_modify": [],
