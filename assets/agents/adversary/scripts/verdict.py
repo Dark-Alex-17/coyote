@@ -11,6 +11,11 @@ reported in their own section. A command the runner's deadline skipped is
 reported as not run and does not block by itself: the criterion checks judge
 the criteria it covers. An ENVIRONMENT runner-error marker blocks when
 commands were declared, since the declared commands never ran.
+An INSPECTED verdict whose no_test_reason starts with "ENVIRONMENT:" (an
+execution criterion judged from the diff because no recorded run covered
+it) counts as met only when at least one recorded run is green (exit 0, not
+skipped); otherwise it is PARTIAL with a complaint naming the command to
+declare, so nothing executed never conforms.
 Holistic complaints block unless they carry `blocking: false`, or are scope
 drift whose every location path lies under the configured `debris_exclude`
 dirs (the run's own planning files); both are reported as non-blocking. A
@@ -46,6 +51,8 @@ MAX_SECTION_TEXT_CHARS = 100
 DIED_MARKER = "criterion check DIED (pipeline fault)"
 DIED_EVIDENCE_PREFIX = "PIPELINE-FAULT: criterion "
 RULED_MARKER = "(ruled by holistic: output format failed)"
+ENVIRONMENT_PREFIX = "ENVIRONMENT:"
+DECLARE_RE = re.compile(r"^declare\s+(.+?)\s+via the verification_commands variable", re.S)
 PLANNING_DRIFT_NOTE = "not blocking: scope drift confined to the run's planning files"
 SCOPE_DRIFT_KIND_RE = re.compile(r"scope drift|out-of-scope", re.I)
 BARE_LINE_REF_RE = re.compile(r":\d+(?:[-:]\d+)*")
@@ -192,6 +199,38 @@ def unverified_faults(verdicts):
         for v in verdicts
         if v.get("status") == "UNVERIFIED" and not died(v)
     ]
+
+
+def green_run(exec_results):
+    return isinstance(exec_results, list) and any(
+        isinstance(r, dict) and not r.get("skipped") and r.get("exit") == 0
+        for r in exec_results
+    )
+
+
+def declared_command(reason):
+    rest = reason[len(ENVIRONMENT_PREFIX) :].strip()
+    m = DECLARE_RE.match(rest)
+    return (m.group(1) if m else rest).strip()
+
+
+def demote_unexecuted(verdicts, exec_results):
+    """PARTIAL for each ENVIRONMENT-INSPECTED verdict when no recorded run is green."""
+    if green_run(exec_results):
+        return verdicts
+    out = []
+    for v in verdicts:
+        reason = str_field(v, "no_test_reason")
+        if v.get("status") != "INSPECTED" or died(v) or not reason.startswith(ENVIRONMENT_PREFIX):
+            out.append(v)
+            continue
+        complaint = (
+            "judged from the diff only and nothing was executed (no recorded "
+            f"verification run is green); declare {declared_command(reason)} via the "
+            "verification_commands variable so it runs"
+        )
+        out.append(dict(v, status="PARTIAL", complaint=complaint))
+    return out
 
 
 def load_state():
@@ -426,6 +465,7 @@ def main():
     state = load_state()
     verdicts = [v for v in (state.get("crit_verdicts") or []) if isinstance(v, dict)]
     verdicts = apply_format_rulings(verdicts, state.get("format_rulings"))
+    verdicts = demote_unexecuted(verdicts, state.get("exec_results"))
     holistic = [c for c in (state.get("extra_complaints") or []) if isinstance(c, dict)]
     excludes = configured_excludes(state)
     outside = outside_names(state, excludes) if excludes else set()
