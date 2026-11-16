@@ -6640,8 +6640,8 @@ mod tests {
 
     /// Recording a graph run is the caller's job: the dispatcher hands the
     /// record back and never touches the session itself, and exactly three
-    /// callers store it: the REPL `.run` arm and the one-shot graph arm in
-    /// main.rs, on the engaged session, and the child runner, on the
+    /// callers store it: the REPL turn and the one-shot graph turn, both in
+    /// the turn driver, on the engaged session, and the child runner, on the
     /// child's own session.
     #[test]
     fn only_the_repl_turn_the_one_shot_arm_and_the_child_runner_record_a_graph_run() {
@@ -6664,11 +6664,15 @@ mod tests {
 
         let repl = include_str!("../repl/mod.rs").replace("\r\n", "\n");
         let repl = &repl[..repl.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        assert_eq!(repl.matches("record_graph_run(").count(), 1);
+        assert_eq!(repl.matches("record_graph_run(").count(), 0);
 
         let main = include_str!("../main.rs").replace("\r\n", "\n");
         let main = &main[..main.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        assert_eq!(main.matches("record_graph_run(").count(), 1);
+        assert_eq!(main.matches("record_graph_run(").count(), 0);
+
+        let driver = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let driver = &driver[..driver.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(driver.matches("record_graph_run(").count(), 2);
     }
 
     #[test]

@@ -129,21 +129,17 @@ impl TurnDriver<'_> {
             {
                 routed = true;
                 ctx.before_chat_completion(&input)?;
-                let turn =
-                    match run_graph_turn(ctx, &input, abort_signal.clone(), forced, self.runner)
-                        .await
-                    {
-                        Ok(turn) => turn,
-                        Err(err) => {
-                            if abort_signal.aborted_ctrlc() {
-                                emit_turn_notice(
-                                    ctx,
-                                    turn_interrupt_notice(ctx, &abort_signal).await,
-                                );
-                            }
-                            return Err(err);
+                let graph_turn =
+                    run_graph_turn(ctx, &input, abort_signal.clone(), forced, self.runner).await;
+                let turn = match graph_turn {
+                    Ok(turn) => turn,
+                    Err(err) => {
+                        if abort_signal.aborted_ctrlc() {
+                            emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
                         }
-                    };
+                        return Err(err);
+                    }
+                };
                 match turn {
                     GraphTurn::Run { output, last_run } => {
                         emit_assistant_text(ui.as_ref(), app.as_ref(), &output)?;

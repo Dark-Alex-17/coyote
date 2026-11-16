@@ -10265,8 +10265,7 @@ mod tests {
     fn every_other_stdin_reader_checks_the_tui_flag() {
         let spinner = include_str!("../utils/spinner.rs");
         assert!(
-            fn_body(spinner, "pub async fn abortable_run_with_spinner_rx")
-                .contains("crate::tui::active()")
+            fn_body(spinner, "\nasync fn run_with_spinner_rx<").contains("crate::tui::active()")
         );
         let utils = include_str!("../utils/mod.rs");
         assert!(fn_body(utils, "pub fn drain_stale_tty_input").contains("crate::tui::active()"));

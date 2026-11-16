@@ -10469,36 +10469,36 @@ local_hello() {\n\
     /// Every way a Ctrl-C ends the turn (the interrupted arm, an aborted
     /// request, an aborted graph turn, an aborted RAG lookup) prints through
     /// the one notice helper that branches on the session, so the sessionless
-    /// notices reach the same stderr channel as the two-stage one, and the
+    /// notices reach the same notice channel as the two-stage one, and the
     /// idle-prompt second press keeps its hint.
     #[test]
     fn every_interrupt_path_prints_through_one_notice_channel() {
-        let source = include_str!("mod.rs").replace("\r\n", "\n");
-        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
-        let notice = "print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);";
-        let arm = format!("        if interrupted {{\n            {notice}\n        }} else {{\n");
+        let source = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\n").unwrap()];
+        let notice = "emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);";
+        let arm = format!(
+            "            if interrupted {{\n                {notice}\n            }} else {{\n"
+        );
         assert_eq!(production.matches(&arm).count(), 1);
-        let rag = "            let embeddings = input.use_embeddings(abort_signal.clone());\n            interruptible_step(ctx, &abort_signal, embeddings).await?;\n";
+        let rag = "                let embeddings = input.use_embeddings(abort_signal.clone());\n                interruptible_step(ctx, &abort_signal, embeddings).await?;\n";
         assert_eq!(production.matches(rag).count(), 1);
         assert_eq!(production.matches(".use_embeddings(").count(), 1);
         let step = &production[production.find("async fn interruptible_step<").unwrap()..];
         let step = &step[..step.find("\n}\n").unwrap()];
         assert!(
-            step.contains(
-                "print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);"
-            ),
+            step.contains("emit_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);"),
             "{step}"
         );
         let graph = format!(
-            "                Err(err) => {{\n                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    return Err(err);\n                }}\n            }};\n            match turn {{\n"
+            "                    Err(err) => {{\n                        if abort_signal.aborted_ctrlc() {{\n                            {notice}\n                        }}\n                        return Err(err);\n                    }}\n                }};\n                match turn {{\n"
         );
         assert_eq!(production.matches(&graph).count(), 1);
         let aborted = format!(
-            "                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n                    return Err(err);\n"
+            "                        if abort_signal.aborted_ctrlc() {{\n                            {notice}\n                        }}\n                        ctx.on_chat_completion_error(app.as_ref(), &input);\n                        return Err(err);\n"
         );
         assert_eq!(production.matches(&aborted).count(), 1);
         assert_eq!(production.matches(notice).count(), 3);
-        assert_eq!(production.matches("print_turn_notice(").count(), 6);
+        assert_eq!(production.matches("emit_turn_notice(").count(), 6);
         let helper = &production[production.find("async fn turn_interrupt_notice(").unwrap()..];
         let helper = &helper[..helper.find("\n}\n").unwrap()];
         assert!(
@@ -10513,9 +10513,10 @@ local_hello() {\n\
                 .count(),
             1
         );
-        let printer = &production[production.find("fn print_turn_notice(").unwrap()..];
+        let printer = &production[production.find("fn emit_turn_notice(").unwrap()..];
         let printer = &printer[..printer.find("\n}\n").unwrap()];
-        assert!(printer.contains("eprintln!("), "{printer}");
+        assert!(printer.contains("emit_notice("), "{printer}");
+        assert!(printer.contains("NoticeKind::Interrupted"), "{printer}");
         assert_eq!(
             CANCELLED_TASKS_HINT,
             "Cancelled the background task(s) left running by the interrupted turn."
@@ -11284,7 +11285,11 @@ local_hello() {\n\
         let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
         assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
         assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
-        assert_eq!(production.matches(&format!("{call};")).count(), 6);
+        // The sessionless interrupt's wait lives with the turn loop.
+        assert_eq!(production.matches(&format!("{call};")).count(), 5);
+        let driver = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let driver = &driver[..driver.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(driver.matches(&format!("{call};")).count(), 1);
 
         let finished = production.find("top_level_agent_finished(").unwrap();
         let before_finished = &production[..finished];
