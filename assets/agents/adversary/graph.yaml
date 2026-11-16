@@ -230,12 +230,15 @@ nodes:
         admits no test that could prove it (documentation, an absence such as
         "does not touch Y", a deletion, no new dependencies, a process or log
         entry, performance), for a static claim about what a file declares or
-        contains (a signature, a query's text, a config value), where the
-        cited source is the proof; the claim is about the text, never about
-        what running or evaluating it produces; and for an execution
-        criterion no recorded run covers (see below). A behavioral criterion
-        still needs a test that proves it. Evidence MUST cite file:line, and
-        `no_test_reason` says in one line why no test applies.
+        contains, including a declarative artefact whose language fixes the
+        result from its text alone (a query's filter and ordering, a schema
+        constraint, a signature, a config value), where the cited text is the
+        proof, and for an execution criterion no recorded run covers (see
+        below). A claim whose result depends on runtime data, imperative code
+        paths or anything the text does not fix still needs a proving test.
+        A behavioral criterion still needs a test that proves it. Evidence
+        MUST cite file:line, and `no_test_reason` says in one line why no test
+        applies.
       - `PARTIAL` — partially satisfied, or satisfied but unproven (missing/weak
         test), or you could not establish it either way (say why — doubt lands
         here, never in MET).
