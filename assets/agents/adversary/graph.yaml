@@ -229,9 +229,11 @@ nodes:
         admits no test that could prove it (documentation, an absence such as
         "does not touch Y", a deletion, no new dependencies, a process or log
         entry, performance), for a static claim about what a file declares or
-        contains (a signature, a query's text, a config value) where the cited
-        source itself is the proof, and for an execution criterion no recorded
-        run covers (see below). A behavioral criterion still needs a test that
+        contains, including a declarative artefact (a query, a schema, a
+        signature, a config value) whose text itself states the promised
+        result, where the cited source is the proof, and for an execution
+        criterion no recorded run covers (see below). A behavioral criterion
+        still needs a test that
         proves it. Evidence MUST cite file:line, and `no_test_reason` says in
         one line why no test applies.
       - `PARTIAL` — partially satisfied, or satisfied but unproven (missing/weak
@@ -284,9 +286,9 @@ nodes:
         of it) is judged on the diff and the working tree. When they show it
         satisfied, return INSPECTED with `no_test_reason` beginning
         `ENVIRONMENT: declare <command> via the verification_commands variable`,
-        naming the exact command the caller should declare (structured input,
-        e.g. "cargo test --all"); otherwise PARTIAL, UNMET or DIVERGED with the
-        complaint. Commands are never declared in the prompt.
+        naming the exact command the caller should declare (structured input);
+        otherwise PARTIAL, UNMET or DIVERGED with the complaint. Commands are
+        never declared in the prompt.
       - a SKIPPED record (the runner's total deadline expired before that
         command ran) => at best PARTIAL for the criteria it covers: unproven
         at the criterion level.
@@ -305,7 +307,9 @@ nodes:
       {"id": "<the criterion's id, echoed>",
        "status": "MET" | "INSPECTED" | "PARTIAL" | "UNMET" | "DIVERGED",
        "evidence": "<for MET: the satisfying change file:line AND the proving test
-      file:line, quoted decisively; for INSPECTED: the inspected file:line; otherwise
+      file:line, quoted decisively, or, for an execution criterion, the recorded
+      run (command + exit 0); or, for a repository-state criterion, the
+      repository-fact line that establishes it; for INSPECTED: the inspected file:line; otherwise
       the closest relevant citations or empty>",
        "complaint": "<required unless MET or INSPECTED: what the diff does/omits
       (file:line) and what would make it conform; empty string otherwise>",
@@ -421,10 +425,9 @@ nodes:
       its check produced no valid verdict after re-asks; its evidence is the
       check's raw output. Rule on each UNVERIFIED criterion, and ONLY those,
       from that raw output and the diff: one entry with its id, a status
-      (MET, INSPECTED, PARTIAL, UNMET or DIVERGED, under the same bar as the
-      criterion checks: MET needs a proving test, INSPECTED only where no test
-      could prove it or no recorded run covers it), evidence, complaint, and
-      no_test_reason. Rulings for
+      (MET, INSPECTED, PARTIAL, UNMET or DIVERGED, under the same rules as the
+      criterion checks, including the execution-criteria and repository-facts
+      rules), evidence, complaint, and no_test_reason. Rulings for
       any other criterion are ignored. A ruling is held to the criterion
       contract: MET needs evidence, INSPECTED needs a file:line citation in
       its evidence and a no_test_reason, and any other status a complaint.
@@ -447,6 +450,9 @@ nodes:
 
       Repository facts (recorded by the deterministic facts stage):
       {{git_facts}}
+
+      Verification runs (recorded by the deterministic run_checks stage):
+      {{exec_results}}
     tools:
       - fs_read
       - fs_cat

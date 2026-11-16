@@ -1078,27 +1078,29 @@ fn diff_facts_records_the_commits_between_the_diff_base_and_head() {
 fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() {
     let graph: serde_yaml::Value =
         serde_yaml::from_str(&fs::read_to_string(asset("adversary/graph.yaml")).unwrap()).unwrap();
-    for node in ["check_criterion", "holistic"] {
-        let prompt = graph["nodes"][node]["prompt"]
+    let collapsed = |node: &str, field: &str| {
+        let text = graph["nodes"][node][field]
             .as_str()
-            .unwrap_or_else(|| panic!("{node}: prompt"));
-        assert!(
-            prompt.contains(
-                "Repository facts (recorded by the deterministic facts stage):\n{{git_facts}}"
-            ),
-            "{node}: {prompt}"
-        );
+            .unwrap_or_else(|| panic!("{node}: {field}"));
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    for node in ["check_criterion", "holistic"] {
+        let prompt = collapsed(node, "prompt");
+        for rendered in [
+            "Repository facts (recorded by the deterministic facts stage): {{git_facts}}",
+            "Verification runs (recorded by the deterministic run_checks stage): {{exec_results}}",
+        ] {
+            assert!(prompt.contains(rendered), "{node}: {prompt}");
+        }
     }
     assert_eq!(
         graph["initial_state"]["git_facts"],
         serde_yaml::Value::from("")
     );
 
-    let instructions = graph["nodes"]["check_criterion"]["instructions"]
-        .as_str()
-        .unwrap();
+    let instructions = collapsed("check_criterion", "instructions");
     let uncovered = instructions
-        .split("\n- ")
+        .split(" - ")
         .find(|bullet| bullet.contains("\"none declared\""))
         .unwrap_or_else(|| panic!("no bullet for the none-declared case: {instructions}"));
     assert!(!uncovered.contains("at best PARTIAL"), "{uncovered}");
@@ -1109,18 +1111,26 @@ fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() 
             ),
         "{uncovered}"
     );
+    for sentence in [
+        "INSPECTED never overrides a covering red run: it stays UNMET.",
+        "A behavioral criterion still needs a test that proves it.",
+        "a static claim about what a file declares or contains, including a declarative artefact",
+        "Recorded repository facts",
+        "that they establish is MET",
+        "or, for an execution criterion, the recorded run (command + exit 0); or, for a \
+         repository-state criterion, the repository-fact line that establishes it",
+    ] {
+        assert!(
+            instructions.contains(sentence),
+            "{sentence:?} in {instructions}"
+        );
+    }
     assert!(
-        instructions.contains("INSPECTED never overrides a covering red run: it stays UNMET."),
-        "{instructions}"
-    );
-    assert!(
-        instructions.contains("a static claim about what a file declares or\n  contains"),
-        "{instructions}"
-    );
-    assert!(
-        instructions.contains("Recorded repository facts")
-            && instructions.contains("that they establish is MET"),
-        "{instructions}"
+        collapsed("holistic", "instructions").contains(
+            "under the same rules as the criterion checks, including the execution-criteria \
+             and repository-facts rules"
+        ),
+        "holistic format_rulings bar"
     );
 }
 
@@ -1174,4 +1184,131 @@ fn an_uncovered_execution_criterion_judged_satisfied_is_inspected_not_partial() 
     let text = report(&dir.0, "diverges", &state);
     assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
     assert!(text.contains("orders by name, not by price"), "{text}");
+}
+
+#[test]
+fn uncovered_execution_criteria_conform_without_declared_commands_but_not_past_a_runner_error() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("uncovered-markers");
+    let inspected = json!({"id": "c1", "text": "does c1", "status": "INSPECTED",
+        "evidence": "py/notify/backoff.py:34 doubles the delay up to the cap", "complaint": "",
+        "no_test_reason": "ENVIRONMENT: declare make test via the verification_commands variable"});
+    let mut state = verdict_state(json!([inspected, met("c2")]));
+    state["exec_results"] = json!(
+        "none declared \u{2014} the caller supplied no verification_commands; execution criteria \
+         (build/test/lint) cannot be independently confirmed. Declare the exact commands via the \
+         verification_commands variable to get recorded runs."
+    );
+    let text = report(&dir.0, "none-declared", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+
+    state["exec_results"] = json!(
+        "ENVIRONMENT: verification runner error: boom \u{2014} the declared commands could not be \
+         executed; execution criteria are unproven (no recorded run covers them; the verdict \
+         blocks CONFORMS when commands were declared)"
+    );
+    state["verification_commands"] = json!(["make test"]);
+    let text = report(&dir.0, "runner-error", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+}
+
+#[test]
+fn a_repository_fact_git_cannot_produce_is_a_note_and_leaves_the_diff_alone() {
+    if missing(&["python3", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("git-facts-unavailable");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("f.txt"), "main\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "main"]);
+    git(&repo, &["branch", "-M", "main"]);
+    git(&repo, &["checkout", "-q", "--orphan", "unrelated"]);
+    git(&repo, &["rm", "-rfq", "."]);
+    fs::write(repo.join("o.txt"), "orphan\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "orphan"]);
+    let orphan = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "main"]);
+
+    let out = script(
+        &dir.0,
+        "diff_facts.py",
+        "unrelated-base",
+        &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "unrelated"}),
+        &[],
+    );
+    assert!(out.get("_next").is_none(), "{out}");
+    assert!(out.get("pipeline_faults").is_none(), "{out}");
+    assert_eq!(out["diff_base"], orphan, "{out}");
+    let facts = out["git_facts"].as_str().unwrap();
+    assert!(
+        facts
+            .lines()
+            .any(|l| l.starts_with("merge-base of diff_base and HEAD: unavailable (")),
+        "{facts}"
+    );
+    assert_eq!(out["changed_files"], json!(["f.txt"]), "{out}");
+    let expected = git(
+        &repo,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "unrelated",
+            "--",
+        ],
+    );
+    assert!(
+        expected.contains("+main") && expected.contains("-orphan"),
+        "{expected}"
+    );
+    assert_eq!(out["diff_text"].as_str().unwrap().trim(), expected, "{out}");
+}
+
+#[test]
+fn a_long_commit_subject_is_cut_in_the_repository_facts() {
+    if missing(&["python3", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("git-facts-long-subject");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("f.txt"), "1\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "main"]);
+    git(&repo, &["branch", "-M", "main"]);
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "-b", "review"]);
+    let subject = "s".repeat(400);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", &subject]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let out = script(
+        &dir.0,
+        "diff_facts.py",
+        "long-subject",
+        &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "main...HEAD"}),
+        &[],
+    );
+    let facts = out["git_facts"].as_str().unwrap();
+    let full = format!("{head} {main} (HEAD -> review) {subject}");
+    let cut = format!(
+        "{} (truncated to 300 chars of {})",
+        &full[..300],
+        full.len()
+    );
+    assert!(
+        facts.lines().any(|l| l == cut),
+        "missing {cut:?} in:\n{facts}"
+    );
 }
