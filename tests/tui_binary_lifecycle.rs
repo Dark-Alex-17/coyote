@@ -335,9 +335,9 @@ fn sighup_during_the_startup_probe_kills_the_process() {
         !transcript.contains("no session"),
         "the footer was already up, so the hang-up missed the probe:\n{transcript}"
     );
-    // The screen is entered only once the probe has answered, so a
-    // hang-up that landed inside it leaves no alternate screen and no
-    // footer behind.
+    // The screen is entered only once the probe has answered or timed
+    // out, so a hang-up that landed inside it leaves no alternate screen
+    // and no footer behind.
     assert!(
         find(pty.raw(), ENTER_ALT, 0).is_none(),
         "the alternate screen was entered, so the hang-up missed the probe:\n{transcript}"

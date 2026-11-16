@@ -53,4 +53,5 @@ Coyote as a whole is licensed under the GNU Affero General Public License
 v3.0 only (AGPL-3.0-only); see [LICENSE](./LICENSE). Substantial portions
 derived from AIChat remain under the MIT License (Copyright (c) sigoden),
 preserved in [LICENSE-MIT](./LICENSE-MIT). See [NOTICE](./NOTICE) for the
-combined-licensing summary.
+combined-licensing summary. The Apache License 2.0 text for the Codex CLI
+design attribution is preserved in [LICENSE-APACHE](./LICENSE-APACHE).

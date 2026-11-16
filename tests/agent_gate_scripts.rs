@@ -1656,8 +1656,8 @@ fn graphs_seed_and_render_the_gate_crash_keys() {
 }
 
 // ---------------------------------------------------------------------------
-// Usage-probe tests (spec-first, derived from the acceptance criteria before
-// reading the implementation). They cover the patterns the matrix above left
+// Usage tests written against the scripts' documented contract rather than
+// their implementation. They cover the patterns the matrix above left
 // out: boundary sizes, errexit/pipefail safety, the crash-before-budget
 // ordering, the second-crash default text, stage selection after the old
 // "no failure detected" else-branch was removed, the lint-fail arm, multibyte

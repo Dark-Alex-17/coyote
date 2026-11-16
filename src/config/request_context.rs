@@ -25153,7 +25153,7 @@ mod tests {
     /// Every gauntlet lane that runs a graph-backed agent must outlive that
     /// graph's own timeout so the child's own graph timeout, not the lane
     /// timeout, is the binding bound; the child's internal retry envelope is
-    /// deliberately not derived here (follow-up). And because agent-node
+    /// not part of this bound. And because agent-node
     /// retries each get a fresh per-attempt budget (src/graph/agent.rs
     /// retry_transient/bounded_attempt), the gauntlet itself must outlive
     /// `max_attempts × timeout` for every lane, with headroom for the
