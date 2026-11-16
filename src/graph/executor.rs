@@ -2415,6 +2415,7 @@ nodes:
     /// the distinct routes prove one branch's metadata never leaks into a
     /// sibling's events.
     #[tokio::test]
+    #[serial]
     async fn parallel_super_step_branches_fire_per_node_metadata() {
         if !cmd_available("bash") {
             eprintln!("skipping: bash not available");
