@@ -1692,6 +1692,73 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn job_runs_skill_granted_global_tool_inside_agent_and_names_a_missing_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("job-runs-granted-tool");
+        let _functions_env =
+            crate::testing::EnvVarGuard::unset(super::super::get_env_name("functions_dir"));
+        let functions_bin = crate::config::paths::functions_bin_dir();
+        fs::create_dir_all(&functions_bin).unwrap();
+        let tool = functions_bin.join("jobglob");
+        fs::write(
+            &tool,
+            "#!/usr/bin/env bash\nprintf globbed >> \"$LLM_OUTPUT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let agent_name = "job-granted-agent";
+        fs::create_dir_all(crate::config::paths::agent_bin_dir(agent_name)).unwrap();
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        }));
+        let new_state = || {
+            Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }))
+        };
+
+        run_async(async {
+            // A freshly written script can still be open for writing in a
+            // forked child elsewhere in the process, making exec fail with
+            // ETXTBSY.
+            let mut attempts = 0;
+            let result = loop {
+                let snapshot = build_env_snapshot(&ctx, "jobglob", &json!({})).unwrap();
+                let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+                match run_process_job(snapshot, new_state(), output_buf).await {
+                    Err(err) if err.to_string().contains("Text file busy") && attempts < 10 => {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    result => break result.unwrap(),
+                }
+            };
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.output, json!({"output": "globbed"}));
+
+            let snapshot =
+                build_env_snapshot(&ctx, "jobmissing", &json!({"pattern": "*.rs"})).unwrap();
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let Err(err) = run_process_job(snapshot, new_state(), output_buf).await else {
+                panic!("a missing job tool must fail to spawn");
+            };
+            let err = err.to_string();
+            assert!(
+                err.starts_with("Unable to run jobmissing: no 'jobmissing' executable in ["),
+                "{err}"
+            );
+            assert!(err.contains(&functions_bin.display().to_string()), "{err}");
+            assert!(!err.contains("pattern"), "{err}");
+        });
+    }
+
     fn ctx_with_job_supervisor(max_jobs: usize) -> RequestContext {
         let mut ctx = plain_ctx();
         ctx.supervisor = Some(Arc::new(RwLock::new(
