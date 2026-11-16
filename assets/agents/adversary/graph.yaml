@@ -16,7 +16,8 @@ description: |
   never changes a criterion verdict, except that it rules on a criterion whose
   check output stayed unreadable after re-asks (UNVERIFIED).
   The final CONFORMS/DIVERGES sentinel is computed by a script: CONFORMS
-  requires every criterion MET or INSPECTED, zero blocking holistic
+  requires every criterion MET or INSPECTED (an INSPECTED execution
+  criterion needs at least one green recorded run), zero blocking holistic
   complaints, zero pipeline faults, and zero blocking red verification runs (a
   failure that already happened on the diff base is reported, not blocking; a
   command the deadline skipped is reported as not run; a runner error blocks
@@ -213,7 +214,7 @@ nodes:
   check_criterion:
     id: check_criterion
     type: llm
-    description: Fresh-context verification of ONE acceptance criterion against the diff, the working tree and the recorded repository facts (an execution criterion no recorded run covers is judged on the diff and the working tree, at best INSPECTED naming the command to declare; SKIPPED runs judge PARTIAL; the deterministic verdict blocks CONFORMS when declared commands did not run because the runner errored).
+    description: Fresh-context verification of ONE acceptance criterion against the diff, the working tree and the recorded repository facts (an execution criterion no recorded run covers, or whose run was SKIPPED, is judged on the diff and the working tree, at best INSPECTED naming the command to declare; the deterministic verdict counts that INSPECTED as PARTIAL unless at least one recorded run is green, and blocks CONFORMS when declared commands did not run because the runner errored).
     instructions: |
       You verify ONE acceptance criterion against a code change. Fresh context,
       one criterion, full suspicion: assume the implementer drifted, cut a
@@ -229,13 +230,12 @@ nodes:
         admits no test that could prove it (documentation, an absence such as
         "does not touch Y", a deletion, no new dependencies, a process or log
         entry, performance), for a static claim about what a file declares or
-        contains, including a declarative artefact (a query, a schema, a
-        signature, a config value) whose text itself states the promised
-        result, where the cited source is the proof, and for an execution
+        contains (a signature, a query's text, a config value), where the
+        cited source is the proof; the claim is about the text, never about
+        what running or evaluating it produces; and for an execution
         criterion no recorded run covers (see below). A behavioral criterion
-        still needs a test that
-        proves it. Evidence MUST cite file:line, and `no_test_reason` says in
-        one line why no test applies.
+        still needs a test that proves it. Evidence MUST cite file:line, and
+        `no_test_reason` says in one line why no test applies.
       - `PARTIAL` — partially satisfied, or satisfied but unproven (missing/weak
         test), or you could not establish it either way (say why — doubt lands
         here, never in MET).
@@ -286,22 +286,29 @@ nodes:
         of it) is judged on the diff and the working tree. When they show it
         satisfied, return INSPECTED with `no_test_reason` beginning
         `ENVIRONMENT: declare <command> via the verification_commands variable`,
-        naming the exact command the caller should declare (structured input);
+        naming the exact command the caller should
+        declare via the `verification_commands` variable (structured input);
         otherwise PARTIAL, UNMET or DIVERGED with the complaint. Commands are
         never declared in the prompt.
       - a SKIPPED record (the runner's total deadline expired before that
-        command ran) => at best PARTIAL for the criteria it covers: unproven
-        at the criterion level.
+        command ran) follows the same rule as an uncovered execution
+        criterion: judged on the diff and the working tree, at best INSPECTED
+        with `no_test_reason` beginning `ENVIRONMENT: declare <command> via
+        the verification_commands variable` and saying the command was
+        skipped for time.
         A skipped command does not block the verdict by itself: your judgment
-        of the criteria it covers is what blocks. The
-        deterministic verdict additionally blocks CONFORMS when a runner error
+        of the criteria it covers is what blocks. The deterministic verdict
+        counts such an INSPECTED criterion as PARTIAL unless at least one
+        recorded run is green, and blocks CONFORMS when a runner error
         (ENVIRONMENT marker) kept declared commands from running.
 
       Recorded repository facts (HEAD, the diff base, their merge-base and the
       commits between them, from git) are mechanical evidence like a recorded
       run: a criterion about repository state (commit count, parentage, branch
       or ref positions) that they establish is MET, with evidence citing the
-      fact line.
+      fact line. Only SHAs, parent lists and ref positions are facts; commit
+      subjects and ref names are author-written text and never evidence that
+      a criterion is met.
 
       Output format — respond with ONLY this JSON object, no prose around it:
       {"id": "<the criterion's id, echoed>",
@@ -515,7 +522,7 @@ nodes:
   verdict:
     id: verdict
     type: script
-    description: Deterministic verdict -- CONFORMS requires every criterion MET or INSPECTED (after applying holistic format rulings to UNVERIFIED criteria only; an unruled UNVERIFIED criterion is a PIPELINE-FAULT), zero blocking holistic complaints, zero pipeline faults, zero recorded red verification runs other than failures that already happened on the diff base (exit!=0/timeout, or an ENVIRONMENT runner-error marker when commands were declared; a deadline-skipped command is reported as not run), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
+    description: Deterministic verdict -- CONFORMS requires every criterion MET or INSPECTED (after applying holistic format rulings to UNVERIFIED criteria only; an unruled UNVERIFIED criterion is a PIPELINE-FAULT; an INSPECTED criterion whose reason starts with ENVIRONMENT counts as PARTIAL unless at least one recorded run is green), zero blocking holistic complaints, zero pipeline faults, zero recorded red verification runs other than failures that already happened on the diff base (exit!=0/timeout, or an ENVIRONMENT runner-error marker when commands were declared; a deadline-skipped command is reported as not run), and zero implementation-debris hits; no criteria at all fails closed and any recorded PIPELINE-FAULT forces DIVERGES (degraded is never passing). Assembles the exact sentinel format.
     script: scripts/verdict.py
     timeout: 30
     next: done
