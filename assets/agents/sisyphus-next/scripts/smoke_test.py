@@ -3470,6 +3470,35 @@ check("subtasks: a skipped read-only subtask is named in skipped_reviews for the
 check("subtasks: the tree snapshot's git calls stay under the 30 s script-node default", 2 * getattr(gates, "WORKTREE_TREE_SECS", 30) < 30)
 check("subtasks: next_subtask's tree snapshot and diff-base commit stay under its node timeout",
       5 * getattr(gates, "WORKTREE_TREE_SECS", 30) < node_timeout("next_subtask"))
+# A subtask staged an edit and the next rewrote the file to the same size in the same second: the stat data matched
+# the index entry, the private index copy got a fresh mtime that hid the racy entry, and _subtask_changes listed []
+# for the subtask's own edit. Pinned mtimes and an untrusted ctime give that stat match on every run.
+RACY = os.path.join(TMP, "racy-repo")
+os.makedirs(RACY)
+scratch_git(RACY, "init", "-q")
+scratch_git(RACY, "config", "core.trustctime", "false")
+racy_file = os.path.join(RACY, "util.txt")
+
+
+def racy_write(text, pin=None):
+    with open(racy_file, "w") as f:
+        f.write(text)
+    if pin:
+        os.utime(racy_file, (pin, pin))
+
+
+racy_write("base\n")
+scratch_git(RACY, "add", "-A")
+scratch_git(RACY, "commit", "-q", "--no-gpg-sign", "-m", "base")
+racy_head = scratch_git(RACY, "rev-parse", "HEAD")
+racy_write("one\n\n", 1700000000)
+scratch_git(RACY, "add", "-A")
+os.utime(os.path.join(RACY, ".git", "index"), (1700000000, 1700000000))
+racy_state = base_state(project_dir=RACY, git_root=RACY, subtask_tree=gates._worktree_tree(RACY), subtask_head=racy_head)
+racy_write("two\n\n", 1700000000)
+racy_changes = gates._subtask_changes(racy_state)
+check("subtasks: a same-size rewrite in the second the index was written is still the subtask's own change",
+      (racy_changes or {}).get("files") == ["util.txt"], racy_changes)
 real_tree = getattr(gates, "_worktree_tree", lambda root: "")
 gates._worktree_tree = lambda root: ""
 unk = gates.review_gate(dict(ro, subtask_changed_files=["stale.go"]))

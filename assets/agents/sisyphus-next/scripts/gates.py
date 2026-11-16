@@ -3220,7 +3220,9 @@ def _worktree_tree(root):
     os.close(fd)
     try:
         if os.path.isfile(index):
-            shutil.copyfile(index, tmp)
+            # the copy keeps the index's mtime: git re-reads an entry stamped no older than its index, and a fresh
+            # mtime would let a same-size rewrite in that second pass as unchanged on stat data alone
+            shutil.copy2(index, tmp)
         else:
             os.unlink(tmp)
         env = {**os.environ, "GIT_INDEX_FILE": tmp}
