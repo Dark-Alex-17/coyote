@@ -1143,8 +1143,9 @@ const INTERRUPT_RESEND_AFTER: Duration = Duration::from_secs(2);
 /// already turned it off the wait returns at once and the prompt marker is
 /// the only ordering. If the tool has not exited within
 /// `INTERRUPT_RESEND_AFTER`, a second interrupt lets it exit cleanly, but
-/// the first one was lost, so the call still fails with the terminal's
-/// state as it was before the resend.
+/// the first one was lost or too slow, so the call still fails with the
+/// transcript and the terminal's state as they were before the resend and
+/// the transcript after it.
 fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
     wait_for_echo_off(pty)?;
     pty.send(TYPED_BEFORE_INTERRUPT)?;
@@ -1154,11 +1155,15 @@ fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
             let before = pty.diagnostics();
             pty.send(b"\x03")?;
-            let _ = pty.wait_for("tool-exit=", PTY_DEADLINE);
+            let after = match pty.wait_for("tool-exit=", PTY_DEADLINE) {
+                Ok(transcript) => transcript,
+                Err(err) => err.to_string(),
+            };
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "no tool-exit= {INTERRUPT_RESEND_AFTER:?} after the interrupt; a second one was sent\nbefore the resend:\n{before}"
+                    "the first interrupt was lost or slow, so a second one was sent: {err}\n\
+                     before the resend:\n{before}\nafter the resend:\n{after}"
                 ),
             ))
         }
@@ -1174,7 +1179,7 @@ fn wait_for_echo_off(pty: &mut Pty) -> std::io::Result<()> {
                 std::io::ErrorKind::TimedOut,
                 format!(
                     "the terminal still echoed {PTY_DEADLINE:?} after the prompt:\n{}",
-                    pty.read_for(Duration::ZERO)
+                    pty.read_for(Duration::from_millis(200))
                 ),
             ));
         }
