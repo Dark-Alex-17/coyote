@@ -1,10 +1,85 @@
+use super::Agent;
 use super::role::{Role, RoleLike};
 use super::skill::Skill;
 use super::skill_policy::SkillPolicy;
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
+
+/// The tools an active agent provides. A skill loaded inside an agent only
+/// brings into reach the granted tools the agent already provides; it never
+/// widens the agent's `global_tools`.
+pub struct AgentToolGate<'a> {
+    agent_name: &'a str,
+    provided: HashSet<String>,
+    mapping_tools: &'a IndexMap<String, String>,
+}
+
+impl<'a> AgentToolGate<'a> {
+    pub fn new(agent: &'a Agent, mapping_tools: &'a IndexMap<String, String>) -> Self {
+        Self {
+            agent_name: agent.name(),
+            provided: agent
+                .functions()
+                .declarations()
+                .iter()
+                .map(|declaration| declaration.name.clone())
+                .collect(),
+            mapping_tools,
+        }
+    }
+
+    /// Splits a skill's granted entries into the tool names the agent
+    /// provides and the ones it does not. A `mapping_tools` alias expands to
+    /// its members and `all` to every tool the agent provides.
+    pub fn partition(&self, granted: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut allowed = vec![];
+        let mut denied = vec![];
+        for entry in granted.iter().map(|entry| entry.trim()) {
+            if entry.is_empty() {
+                continue;
+            }
+            if entry == "all" {
+                let mut provided: Vec<String> = self.provided.iter().cloned().collect();
+                provided.sort();
+                allowed.extend(provided);
+                continue;
+            }
+            let members: Vec<&str> = match self.mapping_tools.get(entry) {
+                Some(values) => values.split(',').map(str::trim).collect(),
+                None => vec![entry],
+            };
+            for tool in members.into_iter().filter(|tool| !tool.is_empty()) {
+                let bucket = if self.provided.contains(tool) {
+                    &mut allowed
+                } else {
+                    &mut denied
+                };
+                if !bucket.iter().any(|seen| seen == tool) {
+                    bucket.push(tool.to_string());
+                }
+            }
+        }
+        (allowed, denied)
+    }
+
+    /// One warning per granted tool the agent does not provide.
+    pub fn warnings(&self, skill: &Skill) -> Vec<String> {
+        let (_, denied) = self.partition(skill.enabled_tools().unwrap_or_default());
+        denied
+            .iter()
+            .map(|tool| not_enabled_warning(skill.name(), tool, self.agent_name))
+            .collect()
+    }
+}
+
+pub fn not_enabled_warning(skill: &str, tool: &str, agent: &str) -> String {
+    format!(
+        "Skill '{skill}' grants tool '{tool}', but it is not enabled for agent '{agent}' and will not be offered. \
+         To use it with this skill, add {tool} to {agent}'s global_tools in the agent definition."
+    )
+}
 
 #[derive(Clone, Default)]
 pub struct SkillRegistry {
@@ -61,7 +136,15 @@ impl SkillRegistry {
         self.loaded.retain(|_, skill| !skill.auto_unload());
     }
 
-    pub fn effective_role(&self, base: &Role, policy: &SkillPolicy) -> Role {
+    /// The base role with every loaded skill composed in. Inside an agent,
+    /// `agent_tools` keeps a skill's granted tools to the ones the agent
+    /// provides; with no agent the grants apply as written.
+    pub fn effective_role(
+        &self,
+        base: &Role,
+        policy: &SkillPolicy,
+        agent_tools: Option<&AgentToolGate>,
+    ) -> Role {
         if !policy.skills_enabled || self.loaded.is_empty() {
             return base.clone();
         }
@@ -82,7 +165,10 @@ impl SkillRegistry {
                 continue;
             }
             if let Some(skill_tools) = skill.enabled_tools() {
-                tools.extend(skill_tools.iter().cloned());
+                match agent_tools {
+                    Some(gate) => tools.extend(gate.partition(skill_tools).0),
+                    None => tools.extend(skill_tools.iter().cloned()),
+                }
             }
             if let Some(servers) = skill.enabled_mcp_servers() {
                 mcps.extend(servers.iter().cloned());
@@ -122,7 +208,7 @@ impl SkillRegistry {
             enabled: self.loaded.keys().cloned().collect(),
             compatible_enabled: self.loaded.keys().cloned().collect(),
         };
-        self.effective_role(base, &policy)
+        self.effective_role(base, &policy, None)
     }
 }
 
@@ -314,5 +400,73 @@ mod tests {
         let registry = SkillRegistry::default();
 
         assert!(!registry.is_loaded("nothing"));
+    }
+
+    fn agent_providing(tools: &[&str]) -> Agent {
+        let mut agent = Agent::test_new(super::super::AgentConfig {
+            name: "gated".into(),
+            ..Default::default()
+        });
+        for tool in tools {
+            agent
+                .functions_mut()
+                .append_declaration(crate::function::FunctionDeclaration {
+                    name: tool.to_string(),
+                    description: String::new(),
+                    parameters: Default::default(),
+                    agent: false,
+                });
+        }
+        agent
+    }
+
+    #[test]
+    fn agent_gate_expands_aliases_and_all_before_splitting() {
+        let agent = agent_providing(&["fs_read", "fs_ls"]);
+        let mapping = IndexMap::from([("fs".to_string(), "fs_read, fs_write".to_string())]);
+        let gate = AgentToolGate::new(&agent, &mapping);
+
+        let granted = ["fs", "execute_command", "fs_read"].map(String::from);
+        assert_eq!(
+            gate.partition(&granted),
+            (
+                vec!["fs_read".to_string()],
+                vec!["fs_write".to_string(), "execute_command".to_string()]
+            )
+        );
+        assert_eq!(
+            gate.partition(&["all".to_string()]),
+            (vec!["fs_ls".to_string(), "fs_read".to_string()], vec![])
+        );
+    }
+
+    #[test]
+    fn effective_role_inside_an_agent_keeps_only_the_grants_the_agent_provides() {
+        let mut registry = SkillRegistry::default();
+        registry.insert_for_test(make_skill(
+            "grants-exec",
+            "enabled_tools: fs_read, execute_command",
+            "body",
+        ));
+        let agent = agent_providing(&["fs_read"]);
+        let mapping = IndexMap::new();
+        let gate = AgentToolGate::new(&agent, &mapping);
+        let policy = SkillPolicy {
+            skills_enabled: true,
+            enabled: registry.loaded.keys().cloned().collect(),
+            compatible_enabled: registry.loaded.keys().cloned().collect(),
+        };
+
+        let effective = registry.effective_role(&Role::new("r", "p"), &policy, Some(&gate));
+
+        assert_eq!(effective.enabled_tools(), Some(vec!["fs_read".to_string()]));
+        assert_eq!(
+            gate.warnings(registry.loaded.get("grants-exec").unwrap()),
+            vec![not_enabled_warning(
+                "grants-exec",
+                "execute_command",
+                "gated"
+            )]
+        );
     }
 }

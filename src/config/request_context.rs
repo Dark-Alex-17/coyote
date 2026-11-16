@@ -10,7 +10,7 @@ use super::session::{
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
-use super::skill_registry::SkillRegistry;
+use super::skill_registry::{AgentToolGate, SkillRegistry};
 use super::todo::TodoList;
 use super::tool_scope::{
     McpPromptCompletion, McpRuntime, ToolScope, format_prompt_arguments, sanitize_display_text,
@@ -33,7 +33,7 @@ use crate::function::{
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
-    skill::SKILL_FUNCTION_PREFIX,
+    skill::{SKILL_FUNCTION_PREFIX, report_withheld_tools},
     todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
@@ -2377,8 +2377,13 @@ impl RequestContext {
             prompt_split = Some(split);
         }
 
+        let agent_tools = self
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, &app.mapping_tools));
         Ok((
-            self.skill_registry.effective_role(&role, &policy),
+            self.skill_registry
+                .effective_role(&role, &policy, agent_tools.as_ref()),
             prompt_split,
         ))
     }
@@ -6890,6 +6895,11 @@ impl RequestContext {
             bail!("Skill '{name}' requires MCP servers, which are disabled");
         }
 
+        let warnings = self
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, &self.app.config.mapping_tools).warnings(&skill))
+            .unwrap_or_default();
         self.skill_registry.insert(skill)?;
         if let Err(e) = self.refresh_tool_scope(abort_signal).await {
             if let Err(unload_err) = self.skill_registry.unload(name) {
@@ -6899,6 +6909,7 @@ impl RequestContext {
         }
 
         println!("✓ Loaded skill '{name}'.");
+        report_withheld_tools(&warnings, true);
         Ok(())
     }
 
@@ -13306,6 +13317,163 @@ mod tests {
         assert!(!names.contains(&"skill__list"));
         assert!(!names.contains(&"skill__load"));
         assert!(!names.contains(&"skill__unload"));
+    }
+
+    /// Installs global tool stubs for `fs_read` and `execute_command`, a skill
+    /// `grants-exec` granting both, and, when `agent_tools` is set, a plain
+    /// agent whose `global_tools` lists only those tools, then enters it.
+    fn skill_grant_ctx(agent_tools: Option<&[&str]>) -> (RequestContext, Option<String>) {
+        write_global_tool_stubs(&["fs_read", "execute_command"]);
+        let skill_file = paths::skill_file("grants-exec");
+        create_dir_all(skill_file.parent().unwrap()).unwrap();
+        write(
+            &skill_file,
+            "---\ndescription: D\nenabled_tools: fs_read, execute_command\n---\nUse the tools.\n",
+        )
+        .unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        let agent_name = agent_tools.map(|tools| {
+            let agent_name = unique_name("test_skill_grant_agent");
+            let agent_dir = paths::agent_data_dir(&agent_name);
+            create_dir_all(&agent_dir).unwrap();
+            let global_tools: String = tools
+                .iter()
+                .map(|tool| format!("  - {tool}.sh\n"))
+                .collect();
+            write(
+                agent_dir.join("config.yaml"),
+                format!("name: {agent_name}\ninstructions: hi\nglobal_tools:\n{global_tools}"),
+            )
+            .unwrap();
+            run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+                .unwrap();
+            agent_name
+        });
+        if agent_name.is_none() {
+            run_async(ctx.refresh_tool_scope(utils::create_abort_signal())).unwrap();
+        }
+        (ctx, agent_name)
+    }
+
+    fn offered_tool_names(ctx: &RequestContext) -> Vec<String> {
+        let role = ctx.extract_role(&ctx.app.config.clone()).unwrap();
+        ctx.select_functions(&role)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|function| function.name)
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_withholds_an_undeclared_global_tool_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_grant_ctx(Some(&["fs_read"]));
+        let agent_name = agent_name.unwrap();
+        assert!(
+            ctx.tool_scope.functions.contains("execute_command"),
+            "the global pool carries execute_command, so only the agent gate can withhold it"
+        );
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__load",
+            &json!({"name": "grants-exec"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        let warning = format!(
+            "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
+        );
+        assert_eq!(result["warnings"], json!([warning]), "{result}");
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        let offered = offered_tool_names(&ctx);
+        assert!(
+            !offered.iter().any(|name| name == "execute_command"),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_skill_load_inside_an_agent_withholds_an_undeclared_global_tool_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_grant_ctx(Some(&["fs_read"]));
+        let agent_name = agent_name.unwrap();
+
+        run_async(ctx.load_skill_repl("grants-exec", utils::create_abort_signal())).unwrap();
+
+        let warning = format!(
+            "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
+        );
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        let offered = offered_tool_names(&ctx);
+        assert_eq!(
+            (
+                offered.iter().any(|name| name == "fs_read"),
+                offered.iter().any(|name| name == "execute_command")
+            ),
+            (true, false),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_offers_a_declared_global_tool_without_warning() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_grant_ctx(Some(&["fs_read", "execute_command"]));
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__load",
+            &json!({"name": "grants-exec"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(result.get("warnings").is_none(), "{result}");
+        let offered = offered_tool_names(&ctx);
+        for tool in ["fs_read", "execute_command"] {
+            assert!(
+                offered.iter().any(|name| name == tool),
+                "{tool}: {offered:?}"
+            );
+        }
+    }
+
+    /// Outside an agent there is no `global_tools` list to hold a skill to,
+    /// so a skill's grants apply as written, as they always have.
+    #[test]
+    #[serial]
+    fn skill_load_without_an_agent_offers_every_granted_global_tool() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_grant_ctx(None);
+
+        let result = run_async(skill::handle_skill_tool(
+            &mut ctx,
+            "skill__load",
+            &json!({"name": "grants-exec"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "ok", "{result}");
+        assert!(result.get("warnings").is_none(), "{result}");
+        let offered = offered_tool_names(&ctx);
+        for tool in ["fs_read", "execute_command"] {
+            assert!(
+                offered.iter().any(|name| name == tool),
+                "{tool}: {offered:?}"
+            );
+        }
     }
 
     #[test]

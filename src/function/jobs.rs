@@ -1218,7 +1218,7 @@ fn build_env_snapshot(
                 true,
             ),
             Some(_) => (tool.to_string(), vec![], agent.variable_envs(), false),
-            None => (tool.to_string(), vec![], HashMap::new(), false),
+            None => bail!(super::undeclared_tool_error(tool, agent.name())),
         },
         None => (tool.to_string(), vec![], HashMap::new(), false),
     };
@@ -1624,37 +1624,22 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn env_snapshot_path_reaches_skill_granted_global_tool_inside_agent() {
+    fn env_snapshot_refuses_a_global_tool_the_agent_does_not_declare() {
         let _guard = crate::testing::TestConfigDirGuard::new("job-skill-granted-tool");
-        let _functions_env =
-            crate::testing::EnvVarGuard::unset(super::super::get_env_name("functions_dir"));
         let agent_name = "job-skill-granted-agent";
-        fs::create_dir_all(crate::config::paths::agent_bin_dir(agent_name)).unwrap();
         let mut ctx = plain_ctx();
         ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
             name: agent_name.into(),
             ..Default::default()
         }));
 
-        let snapshot = build_env_snapshot(&ctx, "grantedglob", &json!({})).unwrap();
+        let Err(err) = build_env_snapshot(&ctx, "grantedglob", &json!({})) else {
+            panic!("an undeclared tool must not be runnable as a job");
+        };
 
-        let path = &snapshot.envs["PATH"];
-        let functions_bin = crate::config::paths::functions_bin_dir()
-            .display()
-            .to_string();
-        assert!(
-            path.split(PATH_SEP).any(|dir| dir == functions_bin),
-            "a global tool run inside an agent needs the global functions bin on PATH: {path}"
-        );
         assert_eq!(
-            path.split(PATH_SEP).next(),
-            Some(
-                crate::config::paths::agent_bin_dir(agent_name)
-                    .display()
-                    .to_string()
-                    .as_str()
-            ),
-            "the agent's own bin dir keeps precedence: {path}"
+            err.to_string(),
+            "Tool 'grantedglob' is not enabled for agent 'job-skill-granted-agent'. To use it, add grantedglob to job-skill-granted-agent's global_tools in the agent definition."
         );
     }
 
@@ -1695,28 +1680,36 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn job_runs_skill_granted_global_tool_inside_agent_and_names_a_missing_one() {
+    fn job_runs_a_declared_global_tool_inside_an_agent_and_names_a_missing_one() {
         use std::os::unix::fs::PermissionsExt;
 
         let _guard = crate::testing::TestConfigDirGuard::new("job-runs-granted-tool");
-        let _functions_env =
-            crate::testing::EnvVarGuard::unset(super::super::get_env_name("functions_dir"));
-        let functions_bin = crate::config::paths::functions_bin_dir();
-        fs::create_dir_all(&functions_bin).unwrap();
-        let tool = functions_bin.join("jobglob");
+        let agent_name = "job-granted-agent";
+        let agent_bin = crate::config::paths::agent_bin_dir(agent_name);
+        fs::create_dir_all(&agent_bin).unwrap();
+        let tool = agent_bin.join("jobglob");
         fs::write(
             &tool,
             "#!/usr/bin/env bash\nprintf globbed >> \"$LLM_OUTPUT\"\n",
         )
         .unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-        let agent_name = "job-granted-agent";
-        fs::create_dir_all(crate::config::paths::agent_bin_dir(agent_name)).unwrap();
-        let mut ctx = plain_ctx();
-        ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
+        let mut agent = crate::config::Agent::test_new(crate::config::AgentConfig {
             name: agent_name.into(),
             ..Default::default()
-        }));
+        });
+        for name in ["jobglob", "jobmissing"] {
+            agent
+                .functions_mut()
+                .append_declaration(FunctionDeclaration {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: Default::default(),
+                    agent: false,
+                });
+        }
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(agent);
         let new_state = || {
             Arc::new(Mutex::new(JobState {
                 status: JobStatus::Running,
@@ -1751,10 +1744,12 @@ mod tests {
             };
             let err = err.to_string();
             assert!(
-                err.starts_with("Unable to run jobmissing: no 'jobmissing' executable in ["),
+                err.starts_with(&format!(
+                    "Unable to run jobmissing: no 'jobmissing' executable in [{}] or PATH",
+                    agent_bin.display()
+                )),
                 "{err}"
             );
-            assert!(err.contains(&functions_bin.display().to_string()), "{err}");
             assert!(!err.contains("pattern"), "{err}");
         });
     }
