@@ -2642,6 +2642,7 @@ picked_ = {f: _lib.match_option(f, PICK_OPTS) for f in PICK_FORMS + PICK_TWO}
 guarded("match_option: every numbered form picks option 2, a reply naming two options picks none, total on any text",
         lambda: (all(picked_[f] == "Abort the run" for f in PICK_FORMS) and all(picked_[f] is None for f in PICK_TWO)
                  and _lib.match_option("\ud800", PICK_OPTS) is None and _lib.match_option("2 - " + "x\ud800" * 500000, PICK_OPTS) == "Abort the run"
+                 and _lib.match_option("9" * 5000, PICK_OPTS) is None and _lib.match_option("2 - " + "1" * 5000, PICK_OPTS) == "Abort the run"
                  and _lib.match_option("recommended", PICK_OPTS) == "Proceed with the plan"
                  and _lib.match_option(_lib.HEADLESS_GUIDANCE, PICK_OPTS) is None, picked_))
 E_PICK = escalation("approach", "Which way?", PICK_OPTS)
@@ -2662,6 +2663,15 @@ check("consult_route: '2 (gloss)' and 'Option 2, but ...' -> option 2, the navig
 check("split_option_reply: a gloss ends at its own parenthesis, and a separator after it is dropped",
       _lib.split_option_reply("2 (as planned) and (log it)", PICK_OPTS) == ("Abort the run", "as planned and (log it)")
       and _lib.split_option_reply("2 (recommended) - keep logs", PICK_OPTS) == ("Abort the run", "keep logs"))
+VALUES_ = {"2 - only when seats < 1": "only when seats < 1", "2: a 1/3 share at most": "a 1/3 share at most",
+           "2 - keep 1.5x headroom": "keep 1.5x headroom", "2 - only when count >= 3": "only when count >= 3"}
+check("split_option_reply: a compared value, a fraction or a decimal in the note names no other option, while a note "
+      "that names another option still picks none",
+      all(_lib.split_option_reply(f, PICK_OPTS) == ("Abort the run", r) for f, r in VALUES_.items())
+      and _lib.match_option("2 - only when seats < 1", PICK_OPTS) == "Abort the run"
+      and _lib.split_option_reply("1 - no wait, 3", PICK_OPTS)[0] is None and _lib.match_option("1 - no wait, 3", PICK_OPTS) is None
+      and _lib.split_option_reply("2: then option 1", PICK_OPTS)[0] is None,
+      {f: _lib.split_option_reply(f, PICK_OPTS) for f in VALUES_})
 AMEND_CAP_NEW = [option("Allow one more amendment cycle", True), option("Stop and report")]
 E_AC = escalation("amend_cap", "q", AMEND_CAP_NEW, data={"source": "gate1", "over": ["source"]})
 neg_ = {"amend_cap don't stop": AA("amend_cap", "don't stop, allow one more", esc=E_AC, amend_counts={"gate1": 9})["_next"],

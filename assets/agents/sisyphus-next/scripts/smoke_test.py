@@ -750,6 +750,9 @@ check("answers: the reply interpreter's text is headed by its author, the naviga
 _qty = gates.consult_route(base_state(escalation=pd2, consult_result="CONSULT: ANSWER 2 \u2014 Continue; only touch 1 file"))
 check("answers: a quantity in a navigator's note that may name another option goes to the interpreter, never the owner's default",
       _qty["_next"] == "interpret_reply" and "last_answer" not in _qty)
+check("answers: a '#2' reply picks option 2, its note kept",
+      _lib.split_option_reply("#2", ROUTE3) == ("Abort the run", "")
+      and _lib.split_option_reply("#2: keep the logs", ROUTE3) == ("Abort the run", "keep the logs"))
 check("answers: an arrow compares nothing, so '1 -> 3' names two options",
       _lib.names_several_options("1 -> 3", ROUTE3) and _lib.names_several_options("1 => 3", ROUTE3)
       and not _lib.names_several_options("1 - only when n >= 3", ROUTE3))
