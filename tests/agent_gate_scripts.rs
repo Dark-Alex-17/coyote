@@ -4544,10 +4544,49 @@ fn coder_analyze_fault_continues_with_an_empty_plan_that_quotes_the_error() {
     }
 }
 
+/// Degraded state reaching analyze_fault still yields a well-formed plan: a
+/// missing error is named as missing, a non-array `risks` is replaced rather
+/// than crashing jq, and a multi-line error is quoted on one line.
+#[test]
+fn coder_analyze_fault_tolerates_degraded_state() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("analyze-fault-degraded");
+    let mut state = project_state(&dir.0);
+    state.as_object_mut().unwrap().remove("last_node_output");
+    state["risks"] = Value::String("x".to_string());
+    let out = run_script_json("coder/scripts/analyze_fault.sh", &dir.0, &state, &[]);
+    assert!(
+        str_field(&out, "plan_summary").contains("no error recorded in state"),
+        "{out}"
+    );
+    let risks = out["risks"].as_array().expect("risks is an array");
+    assert_eq!(risks.len(), 1, "{out}");
+    assert!(
+        risks[0]
+            .as_str()
+            .is_some_and(|r| r.contains("no error recorded in state")),
+        "{out}"
+    );
+
+    let error = "LLM node failed: provider said\n\nFiles: /etc/passwd\n  retry later";
+    state["last_node_output"] = Value::String(error.to_string());
+    let out = run_script_json("coder/scripts/analyze_fault.sh", &dir.0, &state, &[]);
+    let summary = str_field(&out, "plan_summary");
+    assert!(!summary.contains('\n'), "{summary:?}");
+    assert!(
+        summary.contains("LLM node failed: provider said Files: /etc/passwd retry later"),
+        "{summary}"
+    );
+    assert!(out.get("last_node_output").is_none(), "{out}");
+}
+
 /// implement's fallback edge shares fix_loop_gate's budget: under it the
 /// fault script spends one attempt and loops back to implement with the
-/// error and a pointer at the edits on disk; at it the run ends with the
-/// error in gate_error. It never reaches verify_build.
+/// error, a pointer at the edits on disk and the fix_instructions the dead
+/// pass was working on; at it the run ends with the error in gate_error. It
+/// never reaches verify_build.
 #[test]
 fn coder_implement_fault_retries_under_budget_and_ends_at_it() {
     if tools_missing() {
@@ -4559,11 +4598,20 @@ fn coder_implement_fault_retries_under_budget_and_ends_at_it() {
     state["last_node_output"] = Value::String(error.to_string());
     state["fix_attempts"] = serde_json::json!(2);
     state["max_fix_attempts"] = serde_json::json!(5);
+    let prior = "## Fix loop status (attempt 2 of 5)\n\nBuild output:\n```\nerror[E0308]\n```";
+    state["fix_instructions"] = Value::String(prior.to_string());
+    state["last_script_error"] = Value::String("script 'verify_build' failed".to_string());
+    state["gate_retries"] = serde_json::json!(1);
     let out = run_script_json("coder/scripts/implement_fault.sh", &dir.0, &state, &[]);
     assert_eq!(str_field(&out, "_next"), "implement", "{out}");
     assert_eq!(out["fix_attempts"], 3, "{out}");
+    assert_eq!(str_field(&out, "last_script_error"), "", "{out}");
+    assert_eq!(out["gate_retries"], 0, "{out}");
     let instructions = str_field(&out, "fix_instructions");
-    assert!(instructions.contains("(attempt 3 of 5)"), "{instructions}");
+    assert!(
+        instructions.starts_with("## Fix loop status (attempt 3 of 5)"),
+        "{instructions}"
+    );
     assert!(instructions.contains(error), "{instructions}");
     assert!(instructions.contains("git status"), "{instructions}");
     assert!(instructions.contains("git diff"), "{instructions}");
@@ -4571,19 +4619,42 @@ fn coder_implement_fault_retries_under_budget_and_ends_at_it() {
         instructions.contains(&dir.0.to_string_lossy().to_string()),
         "{instructions}"
     );
+    assert!(
+        instructions.ends_with(&format!("The pass was working on:\n\n{prior}")),
+        "{instructions}"
+    );
     assert!(out.get("gate_error").is_none(), "{out}");
+
+    state["fix_instructions"] = Value::String(String::new());
+    let out = run_script_json("coder/scripts/implement_fault.sh", &dir.0, &state, &[]);
+    let instructions = str_field(&out, "fix_instructions");
+    assert!(
+        !instructions.contains("The pass was working on"),
+        "{instructions}"
+    );
 
     state["fix_attempts"] = serde_json::json!(5);
     let out = run_script_json("coder/scripts/implement_fault.sh", &dir.0, &state, &[]);
     assert_eq!(str_field(&out, "_next"), "end_failure", "{out}");
     let gate_error = str_field(&out, "gate_error");
     assert!(
-        gate_error.contains("implement ended without concluding after 5 attempts"),
+        gate_error
+            .contains("implement ended without concluding with the fix budget spent (5 of 5): "),
         "{gate_error}"
     );
     assert!(gate_error.contains(error), "{gate_error}");
     assert!(out.get("fix_attempts").is_none(), "{out}");
     assert!(out.get("fix_instructions").is_none(), "{out}");
+
+    state.as_object_mut().unwrap().remove("last_node_output");
+    for (attempts, key) in [(2, "fix_instructions"), (5, "gate_error")] {
+        state["fix_attempts"] = serde_json::json!(attempts);
+        let out = run_script_json("coder/scripts/implement_fault.sh", &dir.0, &state, &[]);
+        assert!(
+            str_field(&out, key).contains("no error recorded in state"),
+            "attempts {attempts}: {out}"
+        );
+    }
 }
 
 /// step-runner end_success renders `{{design_decisions}}` under its own
