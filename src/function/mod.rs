@@ -2656,7 +2656,8 @@ pub struct ToolAgent {
 /// script and the global tools the agent declares are built into its bin dir;
 /// a global tool it reaches through the shared tool scope (one a loaded skill
 /// grants) is built only into the global functions bin, which follows the
-/// agent dir so the agent's own copies keep precedence.
+/// agent dir so the agent's own copies keep precedence and a declared global
+/// tool missing from the agent dir falls back to its global build.
 pub(crate) fn tool_bin_dirs(agent: Option<&ToolAgent>) -> Vec<PathBuf> {
     let mut dirs = vec![];
     if let Some(agent) = agent {
