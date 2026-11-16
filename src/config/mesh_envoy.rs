@@ -74,6 +74,9 @@ pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this session will not handle that request";
 /// What the peer hears when the provider refused to answer; the category stays local.
 pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
+/// The idle line's reason for a message the envoy never ran because the mesh went off
+/// first; the message itself is in the inbox.
+pub(crate) const LEFT_BEFORE_ENVOY_RAN: &str = "you left the mesh before the envoy could run";
 /// Ends the owner's line when the provider refused or failed, since another model may
 /// answer where this one would not.
 const SWITCH_MODEL_NEXT_STEP: &str =
@@ -556,7 +559,7 @@ impl EnvoyRunner {
             self.app
                 .load()
                 .mesh
-                .record_envoy_fallback(message, "you left the mesh before the envoy could run");
+                .record_envoy_fallback(message, LEFT_BEFORE_ENVOY_RAN);
             drop(reservation);
             return;
         }

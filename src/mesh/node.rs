@@ -3,7 +3,7 @@ use crate::config::mesh_config::{
     MeshInterface,
 };
 use crate::config::mesh_digest::MeshDigestHook;
-use crate::config::mesh_envoy::ENVOY_QUEUE_MAX;
+use crate::config::mesh_envoy::{ENVOY_QUEUE_MAX, LEFT_BEFORE_ENVOY_RAN};
 use crate::config::{ForkRekey, LivePrefix, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
@@ -4152,7 +4152,14 @@ async fn sweep_unused_envoy_stores(
                 let now = now();
                 let stopping = cancel.clone();
                 let swept = tokio::task::spawn_blocking(move || {
-                    prune_unused_envoy_stores(&cache_dir, &config, days, now, instance_id, &|| stopping.is_cancelled())
+                    prune_unused_envoy_stores(
+                        &cache_dir,
+                        &config,
+                        days,
+                        now,
+                        instance_id,
+                        &|| stopping.is_cancelled(),
+                    )
                 })
                 .await;
                 log_unused_envoy_stores(swept, days);
@@ -5564,10 +5571,7 @@ impl MeshSlot {
                     next.message,
                     PeerRefusal::capacity(RefusalReason::EnvoyStopping),
                 ),
-                HeldEnd::NodeOff => self.record_envoy_fallback(
-                    next.message,
-                    "you left the mesh before the envoy could run",
-                ),
+                HeldEnd::NodeOff => self.record_envoy_fallback(next.message, LEFT_BEFORE_ENVOY_RAN),
                 HeldEnd::Rekeyed => self.record_envoy_fallback(
                     next.message,
                     "the session forked before the envoy could run",
@@ -6171,12 +6175,12 @@ impl MeshSlot {
 
     /// Matches a reply to the question or message of ours it answers; the reply takes the
     /// correlation's thread, whether it named none or another, on the filed answer and
-    /// the delivered copy alike, but only once `answer` has taken it. A reply that
-    /// answers nothing is
-    /// downgraded to a message, since to this node it is one, and sheds the thread,
-    /// disposition and retry hint a reply earns and a message cannot carry; `Some` says
-    /// what the match did. An escalated reply matches without closing the question, so
-    /// a pending access request it names stays filed for the decision that follows.
+    /// the delivered copy alike, but only once `answer` has taken it. A reply that answers
+    /// nothing is downgraded to a message, since to this node it is one, and sheds the
+    /// thread, disposition and retry hint a reply earns and a message cannot carry;
+    /// `Some` says what the match did. An escalated reply matches without closing the
+    /// question, so a pending access request it names stays filed for the decision that
+    /// follows.
     fn answer_correlation(&self, message: &mut PeerMessage) -> Option<Answered> {
         if message.kind != PeerKind::Reply {
             return None;
@@ -11806,6 +11810,47 @@ mod tests {
             Some("t-root"),
             "the filed answer carries the inherited thread too"
         );
+    }
+
+    /// A reply that names another thread than the question it answers is filed in the
+    /// question's thread, on the delivered copy and the filed answer alike, whether it is
+    /// delivered or filed past the envoy.
+    #[test]
+    fn an_accepted_reply_takes_the_question_thread_whatever_thread_it_names() {
+        for filed in [false, true] {
+            let slot = MeshSlot::default();
+            slot.correlations()
+                .open(PendingRecord {
+                    thread: "t-root".to_string(),
+                    ..pending("q-1")
+                })
+                .unwrap();
+            let mut reply = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+            reply.thread = Some("t-claimed".to_string());
+
+            if filed {
+                PeerSurface::file_peer(&slot, reply);
+            } else {
+                slot.deliver_peer(reply);
+            }
+
+            let (envelopes, _) = slot.peer_inbox().drain();
+            let delivered = peer_payload(&envelopes[0]);
+            assert_eq!(delivered.kind, PeerKind::Reply, "filed: {filed}");
+            assert_eq!(
+                delivered.thread.as_deref(),
+                Some("t-root"),
+                "filed: {filed}"
+            );
+            let answer = slot
+                .correlations()
+                .get("q-1")
+                .unwrap()
+                .record
+                .reply
+                .unwrap();
+            assert_eq!(answer.thread.as_deref(), Some("t-root"), "filed: {filed}");
+        }
     }
 
     #[test]

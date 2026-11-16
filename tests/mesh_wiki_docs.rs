@@ -1096,6 +1096,39 @@ fn a_card_labels_its_advertised_names_apart_from_the_row_s_own_names() {
     );
 }
 
+/// The words a session hears when the envoy declines without saying why, runs out of
+/// time, is cut off or cannot answer are spelled in the envoy source and quoted in the
+/// Mesh page's disposition table, both in session words.
+#[test]
+fn the_mesh_page_quotes_the_envoy_fallback_replies_as_the_envoy_sends_them() {
+    let declined = const_str("src/config/mesh_envoy.rs", "DECLINED_FALLBACK_TEXT");
+    assert_eq!(declined, "this session will not handle that request");
+    let envoy = read(repo_root().join("src/config/mesh_envoy.rs"));
+    let replies = [
+        "no answer (timed out)",
+        "no answer (this session is shutting down)",
+        "this session cannot answer right now",
+    ];
+    for reply in replies {
+        assert!(
+            envoy.contains(&format!("\"{reply}\".to_string()")),
+            "src/config/mesh_envoy.rs no longer replies {reply:?}"
+        );
+    }
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    for text in std::iter::once(declined.as_str()).chain(replies) {
+        assert!(
+            page.contains(&format!("`{text}`")),
+            "Mesh.md does not quote the envoy's {text:?}"
+        );
+    }
+    assert!(
+        !page.contains("this node will not handle") && !page.contains("this node cannot answer"),
+        "Mesh.md still quotes a node-worded fallback"
+    );
+}
+
 /// `mesh__peers` reports `trust` by one of the five `TRUST_LABELS` words, and the Mesh
 /// page's peers row names each of them.
 #[test]

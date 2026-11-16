@@ -8597,8 +8597,8 @@ mod tests {
         /// An inbox entry is this node's own when this node filed it: the reply its
         /// envoy minted carries `from_self`, the peer's original it answers does not,
         /// and nor does a delivered message that merely names the node's destination as
-        /// its source. The own entry's text is fenced as `your session`, a peer's as
-        /// `peer <d8>`. The envelope otherwise keeps its keys, and the tool's
+        /// its source. The own entry's text is fenced as `your session`, another
+        /// session's as `session <d8>`. The envelope otherwise keeps its keys, and the tool's
         /// description tells the model what the key means.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]

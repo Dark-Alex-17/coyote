@@ -13,8 +13,8 @@
 //! The markers come in two forms. The long form names the source in full and spells
 //! out the warning; it frames fetched file content and the envoy's view of a peer's
 //! message. The short form names a session by the first eight hex digits of its
-//! destination and frames a whole peer card, message or reply at once in a tool
-//! result, where one fence per peer keeps the markers a small share of what the model
+//! destination and frames a whole card, message or reply of another session at once in
+//! a tool result, where one fence per session keeps the markers a small share of what the model
 //! reads; its twin for your own session's entries in that result says `your session` where
 //! the other form says `session <d8>`. All forms share one body rule: a line that could
 //! pass for a marker of any form, under any label, is quoted.
@@ -58,7 +58,7 @@ pub(crate) fn wrap_short(d8: &str, text: &str) -> String {
 }
 
 /// `wrap_short` for text your own session wrote (its envoy's answer, the human's
-/// reply), so a tool result never labels your own words as a peer's.
+/// reply), so a tool result never labels your own words as another session's.
 pub(crate) fn wrap_own(text: &str) -> String {
     fence(OWN_BEGIN_LINE, text, OWN_END_LINE)
 }

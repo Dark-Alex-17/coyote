@@ -33,7 +33,7 @@ const ALLOW_LISTED_DIRS: [&str; 3] = [
 
 /// Branch-owned files outside those directories, plus the CI workflow: the one entry that
 /// also exists on `main`, whose main-side lines carry no hit.
-const ALLOW_LISTED_FILES: [&str; 35] = [
+const ALLOW_LISTED_FILES: [&str; 36] = [
     CI_WORKFLOW,
     "LICENSE-BSD-3-Clause",
     "LICENSE-GPL-2.0",
@@ -64,6 +64,7 @@ const ALLOW_LISTED_FILES: [&str; 35] = [
     "tests/fixtures/mesh-relay-task-harness.ps1",
     "tests/installer_script.rs",
     "tests/mesh_autostart_repl.rs",
+    "tests/mesh_envoy_prune_repl.rs",
     "tests/mesh_relay_script.rs",
     "tests/mesh_relay_task.rs",
     "tests/mesh_wiki_docs.rs",
