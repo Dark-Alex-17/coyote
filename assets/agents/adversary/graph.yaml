@@ -214,7 +214,7 @@ nodes:
   check_criterion:
     id: check_criterion
     type: llm
-    description: Fresh-context verification of ONE acceptance criterion against the diff, the working tree and the recorded repository facts (an execution criterion no recorded run covers, or whose run was SKIPPED, is judged on the diff and the working tree, at best INSPECTED naming the command to declare; the deterministic verdict counts that INSPECTED as PARTIAL unless at least one recorded run is green, and blocks CONFORMS when declared commands did not run because the runner errored).
+    description: Fresh-context verification of ONE acceptance criterion against the diff, the working tree and the recorded repository facts (an execution criterion no recorded run covers, or whose run was SKIPPED, is judged on the diff and the working tree, at best INSPECTED naming the command to declare, which counts as PARTIAL unless at least one recorded run is green; the deterministic verdict blocks CONFORMS when declared commands did not run because the runner errored).
     instructions: |
       You verify ONE acceptance criterion against a code change. Fresh context,
       one criterion, full suspicion: assume the implementer drifted, cut a
@@ -299,7 +299,8 @@ nodes:
         A skipped command does not block the verdict by itself: your judgment
         of the criteria it covers is what blocks. The deterministic verdict
         counts such an INSPECTED criterion as PARTIAL unless at least one
-        recorded run is green, and blocks CONFORMS when a runner error
+        recorded run is green. The
+        deterministic verdict additionally blocks CONFORMS when a runner error
         (ENVIRONMENT marker) kept declared commands from running.
 
       Recorded repository facts (HEAD, the diff base, their merge-base and the
