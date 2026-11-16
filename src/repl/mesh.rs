@@ -11386,8 +11386,8 @@ mod tests {
                 let shown = path
                     .strip_prefix(env!("CARGO_MANIFEST_DIR"))
                     .unwrap_or(&path)
-                    .display()
-                    .to_string();
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 sources.push((shown, source));
             }
         }
