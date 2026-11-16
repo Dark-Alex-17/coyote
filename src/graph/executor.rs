@@ -1925,7 +1925,7 @@ nodes:
         );
     }
 
-    /// Usage probe (spec AC3): the key is written only when the failing
+    /// The key is written only when the failing
     /// script node HAS a `fallback`. Without one the failure must still
     /// propagate as a hard error — recording must never turn a crash into a
     /// silent continue.
@@ -1965,7 +1965,7 @@ nodes:
         assert!(chain.contains("boom"), "{chain}");
     }
 
-    /// Usage probe (spec AC3): the 8 KiB cap must land on a char boundary.
+    /// The 8 KiB cap must land on a char boundary.
     /// stderr made of 3-byte characters guarantees most candidate cut points
     /// fall inside a character; both cuts (end of head, start of tail) must
     /// land on whole characters and the recorded value must stay within one
@@ -2077,7 +2077,7 @@ nodes:
             .unwrap_or_else(|e| panic!("cannot read shipped script {}: {e}", path.display()))
     }
 
-    /// Usage probe (spec AC3 + AC5 end to end): the SHIPPED coder
+    /// End to end: the SHIPPED coder
     /// `fix_loop_gate.sh` reached over a `verify_build` fallback edge must
     /// read the engine-recorded error, re-run `verify_build` once, and on the
     /// second crash end the run as `end_failure` with the "crashed again"
@@ -2168,7 +2168,7 @@ nodes:
         );
     }
 
-    /// Usage probe (spec AC6 end to end): the SHIPPED step-runner gate does
+    /// End to end: the SHIPPED step-runner gate does
     /// the same dance with `verify_format_lint` as its retry target.
     #[tokio::test]
     async fn usage_probe_shipped_step_runner_gate_retries_format_lint_once_after_crash() {
@@ -2256,7 +2256,7 @@ nodes:
         );
     }
 
-    /// Usage probe (self_review fallback end to end): when the review node
+    /// self_review fallback end to end: when the review node
     /// dies, the engine routes to the SHIPPED `self_review_fault.sh`, which
     /// lifts the implementer's `Design: ASK -- <question>` lines out of
     /// `design_trail` (label stripped, de-duplicated), marks `review_notes`,
