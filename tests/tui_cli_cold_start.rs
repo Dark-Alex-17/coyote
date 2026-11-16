@@ -451,19 +451,26 @@ fn the_shell_flags_conflict_with_every_prompt_path_in_clap() {
     }
 }
 
-const SBX_CALL_END: &str = "<<END>>";
-const SBX_INNER_STDOUT: &str = "INNER-STDOUT";
+#[cfg(unix)]
+mod sandbox_relaunch {
+    use super::*;
 
-/// A stub `sbx` first on `PATH` that logs each call one argument per line,
-/// lists `box` and `default_name` as running sandboxes so no create runs,
-/// and on `exec -i` prints a marker instead of starting anything. Returns
-/// the `PATH` value to run under and the call log.
-fn install_stub_sbx(dir: &Path, default_name: &str) -> (std::ffi::OsString, PathBuf) {
-    let bin = dir.join("stub-bin");
-    fs::create_dir_all(&bin).unwrap();
-    let log = dir.join("stub-sbx-calls");
-    let stub = bin.join("sbx");
-    fs::write(
+    const SBX_CALL_END: &str = "<<END>>";
+    const SBX_INNER_STDOUT: &str = "INNER-STDOUT";
+
+    /// A stub `sbx` first on `PATH` that logs each call one argument per line,
+    /// lists `box` and `default_name` as running sandboxes so no create runs,
+    /// and on `exec -i` prints a marker instead of starting anything. Returns
+    /// the `PATH` value to run under and the call log.
+    pub(super) fn install_stub_sbx(
+        dir: &Path,
+        default_name: &str,
+    ) -> (std::ffi::OsString, PathBuf) {
+        let bin = dir.join("stub-bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = dir.join("stub-sbx-calls");
+        let stub = bin.join("sbx");
+        fs::write(
         &stub,
         format!(
             "#!/bin/sh\n\
@@ -477,108 +484,121 @@ fn install_stub_sbx(dir: &Path, default_name: &str) -> (std::ffi::OsString, Path
         ),
     )
     .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        [bin, fixture_bin]
-            .into_iter()
-            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    (path, log)
-}
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
+        let path = env::join_paths(
+            [bin, fixture_bin]
+                .into_iter()
+                .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+        )
+        .unwrap();
+        (path, log)
+    }
 
-fn sbx_calls(log: &Path) -> Vec<Vec<String>> {
-    let text = fs::read_to_string(log).unwrap_or_default();
-    let mut calls = Vec::new();
-    let mut current = Vec::new();
-    for line in text.lines() {
-        if line == SBX_CALL_END {
-            calls.push(std::mem::take(&mut current));
-        } else {
-            current.push(line.to_string());
+    pub(super) fn sbx_calls(log: &Path) -> Vec<Vec<String>> {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        let mut calls = Vec::new();
+        let mut current = Vec::new();
+        for line in text.lines() {
+            if line == SBX_CALL_END {
+                calls.push(std::mem::take(&mut current));
+            } else {
+                current.push(line.to_string());
+            }
+        }
+        calls
+    }
+
+    /// The sandbox flags are split off before the parser and everything else
+    /// is forwarded, so a shell flag next to `--sandbox` (named or not, with
+    /// or without `--fresh`, in either order) relaunches into the sandbox and
+    /// the inner Coyote gets the shell flag alone: `--sandbox`,
+    /// `--sandbox-name` and `--fresh` never reach it.
+    #[test]
+    #[serial]
+    fn the_shell_flags_are_forwarded_into_the_sandbox_relaunch() {
+        let dir = fresh_config_dir("shell-flag-sandbox-forward");
+        let _guard = TempDirGuard(dir.clone());
+        write_dry_run_config(&dir);
+        let default_name = dir.file_name().unwrap().to_str().unwrap().to_string();
+
+        let cases: [(&[&str], &str, &str); 8] = [
+            (&["--sandbox", "--tui"], &default_name, "--tui"),
+            (&["--sandbox", "--repl"], &default_name, "--repl"),
+            (
+                &["--sandbox", "--sandbox-name", "box", "--tui"],
+                "box",
+                "--tui",
+            ),
+            (
+                &["--sandbox", "--sandbox-name", "box", "--repl"],
+                "box",
+                "--repl",
+            ),
+            (&["--sandbox", "--fresh", "--tui"], &default_name, "--tui"),
+            (&["--sandbox", "--fresh", "--repl"], &default_name, "--repl"),
+            (&["--tui", "--sandbox"], &default_name, "--tui"),
+            (&["--repl", "--sandbox"], &default_name, "--repl"),
+        ];
+        let (path, log) = install_stub_sbx(&dir, &default_name);
+        let path = path.to_str().unwrap().to_string();
+        for (args, name, shell_flag) in cases {
+            let _ = fs::remove_file(&log);
+            let out = run_piped(&dir, &[("PATH", &path)], args);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+            let all = format!("{stdout}\n{stderr}");
+            let execs: Vec<Vec<String>> = sbx_calls(&log)
+                .into_iter()
+                .filter(|c| c.len() > 1 && c[0] == "exec" && c[1] == "-i")
+                .collect();
+            assert_eq!(
+                execs.len(),
+                1,
+                "{args:?} did not relaunch into the sandbox exactly once: {execs:?}\n{all}"
+            );
+            let exec = &execs[0];
+            let coyote = exec
+                .iter()
+                .position(|arg| arg == "coyote")
+                .unwrap_or_else(|| panic!("{args:?}: no inner coyote in {exec:?}"));
+            assert_eq!(
+                exec[coyote - 1],
+                name,
+                "{args:?}: wrong sandbox in {exec:?}"
+            );
+            assert_eq!(
+                exec[coyote + 1..],
+                [shell_flag],
+                "{args:?}: the inner argv is not the shell flag alone"
+            );
+            assert_eq!(out.status.code(), Some(0), "{args:?}:\n{all}");
+            assert_eq!(stdout, format!("{SBX_INNER_STDOUT}\n"), "{args:?}:\n{all}");
+            assert!(
+                find(&out.stdout, ENTER_ALT, 0).is_none(),
+                "{args:?} started a shell on the host:\n{all}"
+            );
         }
     }
-    calls
 }
 
-/// The sandbox flags are split off before the parser and everything else
-/// is forwarded, so a shell flag next to `--sandbox` (named or not, with
-/// or without `--fresh`, in either order) relaunches into the sandbox and
-/// the inner Coyote gets the shell flag alone: `--sandbox`,
-/// `--sandbox-name` and `--fresh` never reach it. `--fresh` without
-/// `--sandbox` stays a usage error that never calls `sbx`.
-#[cfg(unix)]
+/// `--fresh` without `--sandbox` is a usage error that never calls `sbx`
+/// and never starts a shell, whatever shell flag rides along.
 #[test]
 #[serial]
-fn the_shell_flags_are_forwarded_into_the_sandbox_relaunch() {
-    let dir = fresh_config_dir("shell-flag-sandbox-forward");
+fn fresh_without_the_sandbox_flag_is_a_usage_error() {
+    let dir = fresh_config_dir("fresh-without-sandbox");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
-    let default_name = dir.file_name().unwrap().to_str().unwrap().to_string();
-
-    let cases: [(&[&str], &str, &str); 8] = [
-        (&["--sandbox", "--tui"], &default_name, "--tui"),
-        (&["--sandbox", "--repl"], &default_name, "--repl"),
-        (
-            &["--sandbox", "--sandbox-name", "box", "--tui"],
-            "box",
-            "--tui",
-        ),
-        (
-            &["--sandbox", "--sandbox-name", "box", "--repl"],
-            "box",
-            "--repl",
-        ),
-        (&["--sandbox", "--fresh", "--tui"], &default_name, "--tui"),
-        (&["--sandbox", "--fresh", "--repl"], &default_name, "--repl"),
-        (&["--tui", "--sandbox"], &default_name, "--tui"),
-        (&["--repl", "--sandbox"], &default_name, "--repl"),
-    ];
-    let (path, log) = install_stub_sbx(&dir, &default_name);
-    let path = path.to_str().unwrap().to_string();
-    for (args, name, shell_flag) in cases {
-        let _ = fs::remove_file(&log);
-        let out = run_piped(&dir, &[("PATH", &path)], args);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
-        let all = format!("{stdout}\n{stderr}");
-        let execs: Vec<Vec<String>> = sbx_calls(&log)
-            .into_iter()
-            .filter(|c| c.len() > 1 && c[0] == "exec" && c[1] == "-i")
-            .collect();
-        assert_eq!(
-            execs.len(),
-            1,
-            "{args:?} did not relaunch into the sandbox exactly once: {execs:?}\n{all}"
-        );
-        let exec = &execs[0];
-        let coyote = exec
-            .iter()
-            .position(|arg| arg == "coyote")
-            .unwrap_or_else(|| panic!("{args:?}: no inner coyote in {exec:?}"));
-        assert_eq!(
-            exec[coyote - 1],
-            name,
-            "{args:?}: wrong sandbox in {exec:?}"
-        );
-        assert_eq!(
-            exec[coyote + 1..],
-            [shell_flag],
-            "{args:?}: the inner argv is not the shell flag alone"
-        );
-        assert_eq!(out.status.code(), Some(0), "{args:?}:\n{all}");
-        assert_eq!(stdout, format!("{SBX_INNER_STDOUT}\n"), "{args:?}:\n{all}");
-        assert!(
-            find(&out.stdout, ENTER_ALT, 0).is_none(),
-            "{args:?} started a shell on the host:\n{all}"
-        );
-    }
-
-    let _ = fs::remove_file(&log);
+    #[cfg(unix)]
+    let (path, log) = sandbox_relaunch::install_stub_sbx(&dir, "unused");
+    #[cfg(unix)]
+    let extra_env = [("PATH", path.to_str().unwrap())];
+    #[cfg(not(unix))]
+    let extra_env: [(&str, &str); 0] = [];
     let args = ["--fresh", "--tui"];
-    let out = run_piped(&dir, &[("PATH", &path)], &args);
+    let out = run_piped(&dir, &extra_env, &args);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
     let all = format!("{stdout}\n{stderr}");
@@ -591,10 +611,11 @@ fn the_shell_flags_are_forwarded_into_the_sandbox_relaunch() {
         stderr.contains("the following required arguments were not provided:\n  --sandbox\n"),
         "{args:?} was not refused for the missing --sandbox:\n{all}"
     );
+    #[cfg(unix)]
     assert!(
-        sbx_calls(&log).is_empty(),
+        sandbox_relaunch::sbx_calls(&log).is_empty(),
         "{args:?} called sbx: {:?}",
-        sbx_calls(&log)
+        sandbox_relaunch::sbx_calls(&log)
     );
     assert!(
         !all.contains("Welcome to") && find(&out.stdout, ENTER_ALT, 0).is_none(),
