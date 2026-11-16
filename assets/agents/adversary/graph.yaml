@@ -7,7 +7,8 @@ description: |
   (MET / INSPECTED / PARTIAL / UNMET / DIVERGED) passes a deterministic
   contract gate (MET requires evidence including a test proving the behavior;
   INSPECTED, met by inspection, is only for a criterion no test could prove
-  and requires a file:line citation plus the reason no test applies). A
+  or no recorded run covers, and requires a file:line citation plus the
+  reason no test applies). A
   holistic pass then hunts what per-criterion checks cannot
   see: absence (the dog that didn't bark), scope drift, interface substitution,
   silently-overridden recorded decisions, out-of-scope touches, and gamed
@@ -81,6 +82,7 @@ initial_state:
   diff_text: ''
   diff_note: ''
   diff_base: ''
+  git_facts: ''
   exec_results: ''
   debris_findings: []
   debris_summary: ''
@@ -173,7 +175,7 @@ nodes:
   facts:
     id: facts
     type: script
-    description: Deterministic diff resolution — changed files and the (bounded) diff text every criterion branch verifies against.
+    description: Deterministic diff resolution -- changed files and the (bounded) diff text every criterion branch verifies against, plus git_facts, a bounded record of HEAD, the diff base, their merge-base and the commits between them.
     script: scripts/diff_facts.py
     timeout: 120
     fallback: pipeline_fault
@@ -182,7 +184,7 @@ nodes:
   run_checks:
     id: run_checks
     type: script
-    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); a command that timed out here gets a not-run baseline without a base run. The worktree is added with the user's git hooks disabled and removed on normal exit. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge it PARTIAL/unproven; the verdict additionally blocks CONFORMS when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3300s total deadline, started after the review-stack lock (bounded 1200s wait), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
+    description: Deterministic execution evidence. Runs ONLY the commands declared via the verification_commands variable in the project dir and records exec_results; criterion branches cite the record and never execute anything. Each red command is run again in a temporary worktree at diff_base and its record gains a baseline (pre-existing, regression or not-run, compared with the coder agent's gate_lib.sh helpers); a command that timed out here gets a not-run baseline without a base run. The worktree is added with the user's git hooks disabled and removed on normal exit. Undeclared commands degrade to a "none declared" marker, runner errors to an ENVIRONMENT marker (criterion branches judge an execution criterion no run covers on the diff and the working tree, at best INSPECTED naming the command to declare; the verdict additionally blocks CONFORMS on the marker when commands were declared); a declaration that is not a JSON array of strings executes nothing and records a PIPELINE-FAULT (fail-closed). A 3300s total deadline, started after the review-stack lock (bounded 1200s wait), keeps the script under the 4600s node timeout (commands past it are recorded as skipped, reported as not run), and if the node is killed anyway the fallback records a PIPELINE-FAULT.
     script: scripts/run_checks.py
     timeout: 4600
     fallback: pipeline_fault
@@ -211,7 +213,7 @@ nodes:
   check_criterion:
     id: check_criterion
     type: llm
-    description: Fresh-context verification of ONE acceptance criterion against the diff and the working tree (ENVIRONMENT/SKIPPED runs judge PARTIAL here; the deterministic verdict blocks CONFORMS when declared commands did not run because the runner errored).
+    description: Fresh-context verification of ONE acceptance criterion against the diff, the working tree and the recorded repository facts (an execution criterion no recorded run covers is judged on the diff and the working tree, at best INSPECTED naming the command to declare; SKIPPED runs judge PARTIAL; the deterministic verdict blocks CONFORMS when declared commands did not run because the runner errored).
     instructions: |
       You verify ONE acceptance criterion against a code change. Fresh context,
       one criterion, full suspicion: assume the implementer drifted, cut a
@@ -226,8 +228,12 @@ nodes:
       - `INSPECTED` (met by inspection): only for a criterion whose nature
         admits no test that could prove it (documentation, an absence such as
         "does not touch Y", a deletion, no new dependencies, a process or log
-        entry, performance). Evidence MUST cite file:line, and
-        `no_test_reason` says in one line why no test applies.
+        entry, performance), for a static claim about what a file declares or
+        contains (a signature, a query's text, a config value) where the cited
+        source itself is the proof, and for an execution criterion no recorded
+        run covers (see below). A behavioral criterion still needs a test that
+        proves it. Evidence MUST cite file:line, and `no_test_reason` says in
+        one line why no test applies.
       - `PARTIAL` — partially satisfied, or satisfied but unproven (missing/weak
         test), or you could not establish it either way (say why — doubt lands
         here, never in MET).
@@ -272,18 +278,28 @@ nodes:
         `baseline` field saying whether the same failures already occurred on
         the diff base; failures that predate the change are not attributed to
         it unless the criterion asks for them to be fixed.
-      - "none declared" or an ENVIRONMENT marker ⇒ at best PARTIAL, with an
-        ENVIRONMENT note in the complaint naming the exact command the caller
-        should declare via the `verification_commands` variable (structured
-        input, e.g. "cargo test --all") — commands are never declared in the
-        prompt.
+        INSPECTED never overrides a covering red run: it stays UNMET.
+      - an execution criterion no recorded run covers ("none declared", a
+        runner ENVIRONMENT marker, or declared commands that cover only part
+        of it) is judged on the diff and the working tree. When they show it
+        satisfied, return INSPECTED with `no_test_reason` beginning
+        `ENVIRONMENT: declare <command> via the verification_commands variable`,
+        naming the exact command the caller should declare (structured input,
+        e.g. "cargo test --all"); otherwise PARTIAL, UNMET or DIVERGED with the
+        complaint. Commands are never declared in the prompt.
       - a SKIPPED record (the runner's total deadline expired before that
-        command ran) ⇒ at best PARTIAL for the criteria it covers, same
-        treatment as an ENVIRONMENT marker: unproven at the criterion level.
+        command ran) => at best PARTIAL for the criteria it covers: unproven
+        at the criterion level.
         A skipped command does not block the verdict by itself: your judgment
         of the criteria it covers is what blocks. The
         deterministic verdict additionally blocks CONFORMS when a runner error
         (ENVIRONMENT marker) kept declared commands from running.
+
+      Recorded repository facts (HEAD, the diff base, their merge-base and the
+      commits between them, from git) are mechanical evidence like a recorded
+      run: a criterion about repository state (commit count, parentage, branch
+      or ref positions) that they establish is MET, with evidence citing the
+      fact line.
 
       Output format — respond with ONLY this JSON object, no prose around it:
       {"id": "<the criterion's id, echoed>",
@@ -294,7 +310,7 @@ nodes:
        "complaint": "<required unless MET or INSPECTED: what the diff does/omits
       (file:line) and what would make it conform; empty string otherwise>",
        "no_test_reason": "<required for INSPECTED: one line, why no test could prove
-      this criterion; empty string otherwise>"}
+      this criterion, or the ENVIRONMENT: declare line above; empty string otherwise>"}
 
       Your response is machine-validated: a malformed response is rejected back
       to you with the reason, at most twice (the second time quoting your
@@ -319,6 +335,9 @@ nodes:
 
       The diff{{diff_note}}:
       {{diff_text}}
+
+      Repository facts (recorded by the deterministic facts stage):
+      {{git_facts}}
 
       Verification runs (recorded by the deterministic run_checks stage):
       {{exec_results}}
@@ -404,7 +423,8 @@ nodes:
       from that raw output and the diff: one entry with its id, a status
       (MET, INSPECTED, PARTIAL, UNMET or DIVERGED, under the same bar as the
       criterion checks: MET needs a proving test, INSPECTED only where no test
-      could prove it), evidence, complaint, and no_test_reason. Rulings for
+      could prove it or no recorded run covers it), evidence, complaint, and
+      no_test_reason. Rulings for
       any other criterion are ignored. A ruling is held to the criterion
       contract: MET needs evidence, INSPECTED needs a file:line citation in
       its evidence and a no_test_reason, and any other status a complaint.
@@ -424,6 +444,9 @@ nodes:
 
       The diff{{diff_note}}:
       {{diff_text}}
+
+      Repository facts (recorded by the deterministic facts stage):
+      {{git_facts}}
     tools:
       - fs_read
       - fs_cat

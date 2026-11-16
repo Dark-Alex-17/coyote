@@ -16,6 +16,13 @@ for a revision. It is empty when the base cannot be resolved.
 `debris_exclude` dirs, the run's own planning files; it is empty when none
 are configured or the value is unusable (debris_lint.py faults on that).
 `changed_files` and `diff_text` keep those files.
+
+`git_facts` is a bounded text record of the repository state the criterion
+checks cannot read themselves: the HEAD and diff_base SHAs, their merge-base,
+one line per commit in diff_base..HEAD (newest first, capped at
+MAX_LOG_COMMITS) and the base commit's own line, each as `commit parents
+(refs) subject`. A fact git cannot produce becomes a one-line note in it;
+it never affects the other outputs.
 """
 
 import json
@@ -28,6 +35,8 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
 MAX_DIFF_CHARS = 60000
+MAX_LOG_COMMITS = 30
+LOG_FORMAT = "--format=%H %P (%D) %s"
 
 
 def load_state():
@@ -201,5 +210,39 @@ try:
     out["diff_base"] = resolve_base(base_rev) if base_rev else ""
 except Exception:  # noqa: BLE001 -- an unresolvable base means no baseline run
     out["diff_base"] = ""
+
+
+def fact(*args):
+    try:
+        return git(*args).strip() or "(none)"
+    except Exception as e:  # noqa: BLE001 -- a missing fact is a note, never a fault
+        detail = " ".join(str(e).split()) or "git exited non-zero"
+        return f"unavailable ({detail})"
+
+
+def repository_facts(base):
+    if not base:
+        return "no diff base could be resolved, so no commit facts were recorded"
+    log = ("log", "--no-color", "--no-show-signature", LOG_FORMAT)
+    cap = ""
+    try:
+        total = int(git("rev-list", "--count", f"{base}..HEAD", "--").strip())
+        if total > MAX_LOG_COMMITS:
+            cap = f" (capped at the newest {MAX_LOG_COMMITS} of {total} commits)"
+    except Exception:  # noqa: BLE001 -- the log fact below reports the git error
+        pass
+    commits = fact(*log, f"--max-count={MAX_LOG_COMMITS}", f"{base}..HEAD", "--")
+    return "\n".join([
+        f"HEAD: {fact('rev-parse', '--verify', 'HEAD')}",
+        f"diff_base: {base}",
+        f"merge-base of diff_base and HEAD: {fact('merge-base', base, 'HEAD')}",
+        f"commits in diff_base..HEAD, newest first, as commit parents (refs) subject{cap}:",
+        commits,
+        "base commit, as commit parents (refs) subject:",
+        fact(*log, "-1", base, "--"),
+    ])
+
+
+out["git_facts"] = repository_facts(out["diff_base"])
 
 print(json.dumps(out))

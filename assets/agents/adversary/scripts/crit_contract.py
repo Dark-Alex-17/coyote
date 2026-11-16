@@ -2,13 +2,15 @@
 
 A verdict is a JSON object with status in STATUSES. MET needs non-empty
 evidence, INSPECTED needs evidence with a file:line citation and a non-empty
-`no_test_reason`, and every other status needs a non-empty complaint.
+`no_test_reason` (one that starts with ENVIRONMENT_PREFIX must name the
+command after it), and every other status needs a non-empty complaint.
 """
 
 import re
 
 STATUSES = {"MET", "INSPECTED", "PARTIAL", "UNMET", "DIVERGED"}
 CITATION = re.compile(r"[\w./-]+:\d+")
+ENVIRONMENT_PREFIX = "ENVIRONMENT:"
 
 
 def text_field(obj, key):
@@ -44,6 +46,12 @@ def validate(obj):
             raise ValueError(
                 "INSPECTED requires a non-empty no_test_reason saying in one line why "
                 "no test could prove this criterion"
+            )
+        reason = no_test_reason.strip()
+        if reason.startswith(ENVIRONMENT_PREFIX) and not reason.removeprefix(ENVIRONMENT_PREFIX).strip():
+            raise ValueError(
+                "an ENVIRONMENT: no_test_reason must name the command to declare: "
+                "ENVIRONMENT: declare <command> via the verification_commands variable"
             )
     if status not in ("MET", "INSPECTED") and not complaint.strip():
         raise ValueError(
