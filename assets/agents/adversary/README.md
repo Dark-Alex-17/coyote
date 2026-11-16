@@ -59,7 +59,8 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   and `not-run` (no diff base, deadline spent, worktree or helper failure, the command timed out
   here or on the base) block, and the complaint names the outcome.
 - A command the runner's deadline skipped renders as `[NOT RUN]` and does not block by itself; the
-  criterion checks judge the criteria it covers as at best PARTIAL. The report's `Criteria:` line
+  criterion checks judge the criteria it covers like an execution criterion no recorded run covers
+  (below), naming the command and that it was skipped for time. The report's `Criteria:` line
   counts the skipped commands, so a CONFORMS that rests on them is visible.
 - Holistic complaints carry a required `blocking` flag. `blocking: false` complaints (for example
   spec-endorsed waste, whose criterion stays MET) are listed under
@@ -75,7 +76,25 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   kind and a location confined to the planning dirs, so an edit there that weakens acceptance
   criteria or verification commands is expected to be flagged under its own kind.
 - INSPECTED criteria are listed under `Inspected, not test-proven:` with their evidence and
-  `no_test_reason`.
+  `no_test_reason`. That includes an execution criterion no recorded run covers (none declared, a
+  runner error, or declared commands that cover only part of it) which the criterion check judged
+  satisfied from the diff and the working tree: its `no_test_reason` begins
+  `ENVIRONMENT: declare <command> via the verification_commands variable`, and the contract gate
+  rejects an `ENVIRONMENT:` reason with nothing after it. A covering red run stays UNMET whatever the
+  inspection shows.
+- CONFORMS on such an `ENVIRONMENT:` INSPECTED criterion requires at least one green recorded run
+  (exit 0, not skipped). With nothing executed (a `none declared` or runner-error marker, an empty
+  list, or only red or skipped records) the verdict counts it as PARTIAL, with a complaint saying
+  nothing was executed and naming the command to declare.
+- `diff_facts` also records `git_facts`, which both the criterion checks and the holistic pass
+  see: HEAD, the diff base, their merge-base, one `commit parents (refs) subject` line per commit
+  in `diff_base..HEAD` (the newest 30, with a note when capped) and the base commit's own line. A
+  criterion about repository state (commit count, parentage, ref positions) those facts establish
+  is MET citing the fact line. Only SHAs, parent lists and ref positions are facts; commit subjects
+  and ref names are author-written text and never evidence that a criterion is met. A git error,
+  or the shared time budget for these git calls running out, becomes a one-line note in
+  `git_facts` and leaves the diff untouched. Past the length cap only whole commit lines are
+  dropped, with a note; the header and base-commit lines stay intact.
 - A criterion whose check output stays unreadable after two re-asks is recorded UNVERIFIED with the
   raw output; so is one whose gate crashed. The holistic pass rules on UNVERIFIED criteria only
   (`format_rulings`), each ruling must pass the same contract as a criterion check
@@ -146,9 +165,9 @@ flowchart TD
 
 The conformance doctrine is baked into the graph's own nodes:
 
-1. **Every** acceptance criterion gets its own fresh-context verification branch: MET / INSPECTED / PARTIAL / UNMET / DIVERGED, machine-gated (MET requires the satisfying change AND the proving test, cited; INSPECTED requires a file:line citation and a one-line `no_test_reason`, and is only for criteria no test could prove: documentation, absence, deletion, no new dependencies, process or log entries, performance). A behavioral criterion with no test is at best PARTIAL. Partial coverage of the criteria list is structurally impossible.
+1. **Every** acceptance criterion gets its own fresh-context verification branch: MET / INSPECTED / PARTIAL / UNMET / DIVERGED, machine-gated (MET requires the satisfying change AND the proving test, cited; INSPECTED requires a file:line citation and a one-line `no_test_reason`, and is only for criteria no test could prove: documentation, absence, deletion, no new dependencies, process or log entries, performance, a static claim about what a file declares or contains, including a declarative artefact whose language fixes the result from its text alone (a query's filter and ordering, a schema constraint, a signature, a config value) where the cited text is the proof, or an execution criterion no recorded run covers). A claim whose result depends on runtime data, imperative code paths or anything the text does not fix still needs a proving test, and a behavioral criterion with no test is at best PARTIAL. Partial coverage of the criteria list is structurally impossible.
 2. Ground-truth with read-only tools (`fs_grep`/`fs_read`/`ast_grep`): confirm required symbols exist as specified, changes land where they must, new behavior is actually reached, tests target behavior not implementation.
-3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline that starts after the review-stack lock is acquired (or its bounded 1200s wait gives up); the node timeout is 4600s and the graph timeout 10000s. Commands the deadline leaves no budget for are recorded as skipped and reported as not run. Each red command is run again at the diff base for its `baseline`. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record; a recorded green run is MET citing it; no declared command means at best PARTIAL. Independently of the criterion judgments, the verdict script blocks CONFORMS on any red run (exit!=0/timeout) that did not already fail on the diff base, and on an ENVIRONMENT runner-error marker when commands were declared: the declared commands never ran, so the run is unproven. The commands arrive through the declared `verification_commands` graph variable (see [Declaring verification commands](#declaring-verification-commands)); `parse` never extracts them from the prompt, so the prompt is no longer an extraction source for the commands.
+3. Execution evidence is recorded **once, deterministically**: `run_checks` runs ONLY the caller-declared verification commands (never invented or auto-detected), sequentially under a 3300s total deadline that starts after the review-stack lock is acquired (or its bounded 1200s wait gives up); the node timeout is 4600s and the graph timeout 10000s. Commands the deadline leaves no budget for are recorded as skipped and reported as not run. Each red command is run again at the diff base for its `baseline`. Criterion branches have no execution tools by design: "tests pass"-style criteria are judged against the record; a recorded green run is MET citing it, a covering red run is UNMET, and a criterion no recorded run covers, or whose command the deadline skipped, is judged on the diff and the working tree, at best INSPECTED with an `ENVIRONMENT: declare <command> ...` reason. That INSPECTED criterion counts as met only when at least one recorded run is green; with nothing executed it is PARTIAL, so CONFORMS needs a green run. Independently of the criterion judgments, the verdict script blocks CONFORMS on any red run (exit!=0/timeout) that did not already fail on the diff base, and on an ENVIRONMENT runner-error marker when commands were declared: the declared commands never ran, so the run is unproven. The commands arrive through the declared `verification_commands` graph variable (see [Declaring verification commands](#declaring-verification-commands)); `parse` never extracts them from the prompt, so the prompt is no longer an extraction source for the commands.
 4. Hunt adversarially for the **absent**: skipped criteria, scope creep, interface/approach substitution, out-of-scope touches, downstream contract breakage.
 5. **Fail closed on pipeline faults**: if parse, diff resolution, the verification runner, or the debris lint dies, its fallback routes to `pipeline_fault`, which records a `PIPELINE-FAULT:` marker and continues to the verdict (a failed holistic pass falls back straight to the verdict, which synthesizes the same marker). Any recorded fault forces DIVERGES with the fault as complaint #1 -- degraded is never passing, and the sentinel is always emitted: the graph never dies without one.
 6. **Fail closed per criterion**: a criterion check that dies (max_iterations exhausted, API failure) falls back to `criterion_fault`, which records a schema-shaped UNMET verdict carrying a `PIPELINE-FAULT: criterion ` evidence marker for that one criterion. The other criteria still get verdicts, the report says the check DIED rather than judged, and the run is DIVERGES. That exact marker prefix (the one `criterion_fault` emits) forces the criterion into unmet regardless of the status it carries, so a verdict that echoes it with `MET` can never count toward CONFORMS; `check_criterion` is told never to begin its own evidence with `PIPELINE-FAULT:`.
@@ -204,7 +223,8 @@ way as `verification_commands`. Empty runs the commands bare; pipefail applies o
 not a string is an
 invalid declaration and fails closed like a malformed `verification_commands`.
 
-- `'[]'` (or omitted) ⇒ the "none declared" marker; execution criteria are at best PARTIAL.
+- `'[]'` (or omitted) gives the "none declared" marker; execution criteria are at best INSPECTED,
+  naming the command to declare.
 - Anything that is not a JSON array of strings (unparsable JSON, an object, non-string items) is
   an invalid declaration: `run_checks` executes **nothing** and records a
   `PIPELINE-FAULT: verification_commands declaration invalid — …` marker, which forces DIVERGES:

@@ -16,6 +16,19 @@ for a revision. It is empty when the base cannot be resolved.
 `debris_exclude` dirs, the run's own planning files; it is empty when none
 are configured or the value is unusable (debris_lint.py faults on that).
 `changed_files` and `diff_text` keep those files.
+
+`git_facts` is a bounded text record of the repository state the criterion
+checks cannot read themselves: the HEAD and diff_base SHAs, their merge-base,
+one line per commit in diff_base..HEAD (newest first, capped at
+MAX_LOG_COMMITS) and the base commit's own line, each as `commit parents
+(refs) subject`. A fact git cannot produce becomes a one-line note in it;
+it never affects the other outputs. Its git calls get FACT_TIMEOUT seconds
+each and share one budget that ends FACTS_DEADLINE_S seconds after the
+script starts, inside the facts node's 120s timeout; a fact the spent budget
+leaves no time for reads `unavailable (time budget)`. Every line is cut to
+MAX_FACT_LINE_CHARS. Past MAX_FACTS_CHARS whole commit lines are dropped,
+oldest first, with a note, so the header and base-commit lines stay intact
+and no line is split.
 """
 
 import json
@@ -23,11 +36,19 @@ import re
 import os
 import subprocess
 import sys
+import time
 
+STARTED = time.monotonic()
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".shared"))
 
 MAX_DIFF_CHARS = 60000
+MAX_LOG_COMMITS = 30
+MAX_FACT_LINE_CHARS = 300
+MAX_FACTS_CHARS = 8000
+FACT_TIMEOUT = 15
+FACTS_DEADLINE_S = 100
+LOG_FORMAT = "--format=%H %P (%D) %s"
 
 
 def load_state():
@@ -72,13 +93,13 @@ DIFF_FLAGS = (
 )
 
 
-def git(*args):
+def git(*args, timeout=90):
     r = subprocess.run(
         ["git", "-C", proj, *args],
         capture_output=True,
         encoding="utf-8",
         errors="replace",
-        timeout=90,
+        timeout=timeout,
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
@@ -201,5 +222,87 @@ try:
     out["diff_base"] = resolve_base(base_rev) if base_rev else ""
 except Exception:  # noqa: BLE001 -- an unresolvable base means no baseline run
     out["diff_base"] = ""
+
+
+class BudgetSpent(Exception):
+    pass
+
+
+def fact_git(*args):
+    remaining = STARTED + FACTS_DEADLINE_S - time.monotonic()
+    if remaining <= 0:
+        raise BudgetSpent
+    try:
+        return git(*args, timeout=min(FACT_TIMEOUT, remaining))
+    except subprocess.TimeoutExpired:
+        if time.monotonic() >= STARTED + FACTS_DEADLINE_S:
+            raise BudgetSpent from None
+        raise
+
+
+def fact(*args):
+    try:
+        return fact_git(*args).strip() or "(none)"
+    except BudgetSpent:
+        return "unavailable (time budget)"
+    except Exception as e:  # noqa: BLE001 -- a missing fact is a note, never a fault
+        detail = " ".join(str(e).split()) or "git exited non-zero"
+        return f"unavailable ({detail})"
+
+
+def repository_facts(base):
+    if not base:
+        return "no diff base could be resolved, so no commit facts were recorded"
+    log = ("log", "--no-color", "--no-show-signature", LOG_FORMAT)
+    cap = ""
+    try:
+        total = int(fact_git("rev-list", "--count", f"{base}..HEAD", "--").strip())
+        if total > MAX_LOG_COMMITS:
+            cap = f" (capped at the newest {MAX_LOG_COMMITS} of {total} commits)"
+    except Exception:  # noqa: BLE001 -- the log fact below reports the git error
+        pass
+    head = cut_lines(
+        f"HEAD: {fact('rev-parse', '--verify', 'HEAD')}",
+        f"diff_base: {base}",
+        f"merge-base of diff_base and HEAD: {fact('merge-base', base, 'HEAD')}",
+        f"commits in diff_base..HEAD, newest first, as commit parents (refs) subject{cap}:",
+    )
+    commits = cut_lines(fact(*log, f"--max-count={MAX_LOG_COMMITS}", f"{base}..HEAD", "--"))
+    foot = cut_lines(
+        "base commit, as commit parents (refs) subject:",
+        fact(*log, "-1", base, "--"),
+    )
+    return fit_facts(head, commits, foot)
+
+
+def cut_lines(*texts):
+    return [cut_line(line) for text in texts for line in text.splitlines()]
+
+
+def fit_facts(head, commits, foot):
+    """The record within MAX_FACTS_CHARS, dropping only the oldest commit lines.
+
+    The header and base-commit lines are a handful of lines each cut to
+    MAX_FACT_LINE_CHARS, so they always fit on their own.
+    """
+    text = "\n".join(head + commits + foot)
+    keep = len(commits)
+    while len(text) > MAX_FACTS_CHARS and keep > 0:
+        keep -= 1
+        note = (
+            f"({len(commits) - keep} of {len(commits)} commit lines dropped to stay "
+            f"within {MAX_FACTS_CHARS} chars)"
+        )
+        text = "\n".join(head + commits[:keep] + [note] + foot)
+    return text
+
+
+def cut_line(line):
+    if len(line) <= MAX_FACT_LINE_CHARS:
+        return line
+    return line[:MAX_FACT_LINE_CHARS] + f" (truncated to {MAX_FACT_LINE_CHARS} chars of {len(line)})"
+
+
+out["git_facts"] = repository_facts(out["diff_base"])
 
 print(json.dumps(out))

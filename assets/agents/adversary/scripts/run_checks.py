@@ -525,7 +525,7 @@ except Exception as e:  # noqa: BLE001 — never fail the node; degrade visibly
                 "exec_results": (
                     f"ENVIRONMENT: verification runner error: {e} — the declared "
                     "commands could not be executed; execution criteria are unproven "
-                    "(PARTIAL at the criterion level; the verdict blocks CONFORMS when "
+                    "(no recorded run covers them; the verdict blocks CONFORMS when "
                     "commands were declared)"
                 )
             }
