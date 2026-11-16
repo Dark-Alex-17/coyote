@@ -23879,6 +23879,7 @@ mod tests {
                 [
                     shadowed(&["project_dir"]),
                     unreachable(&[
+                        "analyze_fault",
                         "analyze_request",
                         "baseline_tests",
                         "end_rejected",
@@ -23886,6 +23887,7 @@ mod tests {
                         "fix_loop_gate",
                         "gate_approval",
                         "implement",
+                        "implement_fault",
                         "parse_approval",
                         "route_complexity",
                         "route_review_result",
@@ -32603,6 +32605,8 @@ print(json.dumps({
                 "coder",
                 &[
                     ("self_review_fault", "end_failure"),
+                    ("analyze_fault", "end_failure"),
+                    ("implement_fault", "end_failure"),
                     ("route_review_result", "end_failure"),
                     ("route_complexity", "gate_approval"),
                     ("parse_approval", "end_failure"),

@@ -7,6 +7,8 @@ global_tools:
   - ast_grep.sh
   - fs_cat.sh
   - fs_ls.sh
+  - fs_grep.sh
+  - fs_glob.sh
   - fs_write.sh
   - fs_patch.sh
   - execute_command.sh
@@ -129,6 +131,8 @@ nodes:
     instructions: |
       You are a senior engineer's planning assistant. Read the orchestrator's
       request and emit a structured plan. You only plan. You never edit files.
+      Read the repository as needed to name the files the request touches,
+      and stop reading once you can name them.
 
       Score complexity from 1 to 10:
         1-3: trivial - single file, <=20 lines changed, obvious approach
@@ -160,8 +164,9 @@ nodes:
 
       ## New request from the orchestrator
       {{initial_prompt}}
-    tools: []
-    timeout: 300
+    tools: [ast_grep, fs_cat, fs_ls, fs_grep, fs_glob]
+    max_iterations: 60
+    timeout: 1200
     output_schema:
       type: object
       properties:
@@ -191,8 +196,16 @@ nodes:
         ]
     state_updates:
       last_node_output: '{{output}}'
-    fallback: end_failure
+    fallback: analyze_fault
     next: route_complexity
+
+  analyze_fault:
+    id: analyze_fault
+    type: script
+    description: "Reached when analyze_request dies (iteration cap, API failure). Writes an empty plan whose plan_summary quotes the error, adds a risk naming the fault, scores it 7 and routes to gate_approval (baseline_tests under CODER_AUTOAPPROVE=1), so implement plans from the request itself and the fault shows on the Plan: line. A crash of this script fails the run closed."
+    script: scripts/analyze_fault.sh
+    timeout: 5
+    fallback: end_failure
 
   route_complexity:
     id: route_complexity
@@ -456,8 +469,16 @@ nodes:
     state_updates:
       last_node_output: '{{output}}'
       design_trail: "{{design_trail}}\n{{output}}"
-    fallback: end_failure
+    fallback: implement_fault
     next: verify_build
+
+  implement_fault:
+    id: implement_fault
+    type: script
+    description: "Reached when implement dies (iteration cap, API failure). Under the fix budget it spends one fix attempt and loops back to implement with fix_instructions quoting the error, pointing at the edits already on disk and keeping the fix_instructions the dead pass was working on; at the budget it sets gate_error and ends the run. Never routes to verify_build, so a pass that wrote nothing cannot end as CODER_COMPLETE. A crash of this script fails the run closed."
+    script: scripts/implement_fault.sh
+    timeout: 5
+    fallback: end_failure
 
   verify_build:
     id: verify_build
@@ -578,8 +599,8 @@ nodes:
       - fs_cat
       - fs_ls
       - execute_command
-    max_iterations: 15
-    timeout: 600
+    max_iterations: 40
+    timeout: 1200
     output_schema:
       type: object
       properties:
