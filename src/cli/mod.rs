@@ -52,7 +52,7 @@ pub enum McpScopeArg {
 		ArgGroup::new("ui-mode")
 			.args(["tui", "repl"])
 			.multiple(false)
-			.conflicts_with_all(["headless", "acp_server", "execute", "file", "macro_name", "sandbox"])
+			.conflicts_with_all(["headless", "acp_server", "execute", "file", "macro_name"])
 	),
 )]
 pub struct Cli {
@@ -1227,12 +1227,15 @@ mod tests {
                 args.extend_from_slice(other);
                 assert_eq!(conflict(&args), conflicting, "{args:?}");
             }
-            assert_eq!(conflict(&["--sandbox", flag]), conflicting, "{flag}");
-            assert_eq!(
-                conflict(&["--sandbox", "--fresh", flag]),
-                conflicting,
-                "{flag}"
-            );
+            for sandbox in [&["--sandbox"][..], &["--sandbox", "--fresh"]] {
+                let mut args: Vec<std::ffi::OsString> =
+                    sandbox.iter().copied().map(Into::into).collect();
+                args.push(flag.into());
+                let invocation = crate::sandbox::split_sandbox_args(&args)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{args:?} did not take the sandbox relaunch"));
+                assert_eq!(invocation.forwarded, [flag], "{args:?}");
+            }
         }
     }
 }

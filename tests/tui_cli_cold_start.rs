@@ -451,53 +451,155 @@ fn the_shell_flags_conflict_with_every_prompt_path_in_clap() {
     }
 }
 
-/// The sandbox relaunch forwards no flags, so a shell flag next to
-/// `--sandbox` (named or not, with or without `--fresh`, in either
-/// order) is a usage error at the parser: exit 2, the conflict named,
-/// and no relaunch attempted (nothing about `sbx` is said, no shell
-/// starts). `--fresh` on its own is refused the same way.
+const SBX_CALL_END: &str = "<<END>>";
+const SBX_INNER_STDOUT: &str = "INNER-STDOUT";
+
+/// A stub `sbx` first on `PATH` that logs each call one argument per line,
+/// lists `box` and `default_name` as running sandboxes so no create runs,
+/// and on `exec -i` prints a marker instead of starting anything. Returns
+/// the `PATH` value to run under and the call log.
+fn install_stub_sbx(dir: &Path, default_name: &str) -> (std::ffi::OsString, PathBuf) {
+    let bin = dir.join("stub-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("stub-sbx-calls");
+    let stub = bin.join("sbx");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do printf '%s\\n' \"$a\" >> '{log}'; done\n\
+             printf '%s\\n' '{SBX_CALL_END}' >> '{log}'\n\
+             if [ \"$1\" = \"version\" ]; then echo 'sbx version v0.49.1 c5b1995'; exit 0; fi\n\
+             if [ \"$1\" = \"ls\" ]; then printf 'NAME STATUS\\nbox running\\n{default_name} running\\n'; exit 0; fi\n\
+             if [ \"$1\" = \"exec\" ] && [ \"$2\" = \"-i\" ]; then echo '{SBX_INNER_STDOUT}'; exit 0; fi\n\
+             exit 0\n",
+            log = log.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
+    let path = env::join_paths(
+        [bin, fixture_bin]
+            .into_iter()
+            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+    (path, log)
+}
+
+fn sbx_calls(log: &Path) -> Vec<Vec<String>> {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let mut calls = Vec::new();
+    let mut current = Vec::new();
+    for line in text.lines() {
+        if line == SBX_CALL_END {
+            calls.push(std::mem::take(&mut current));
+        } else {
+            current.push(line.to_string());
+        }
+    }
+    calls
+}
+
+/// The sandbox flags are split off before the parser and everything else
+/// is forwarded, so a shell flag next to `--sandbox` (named or not, with
+/// or without `--fresh`, in either order) relaunches into the sandbox and
+/// the inner Coyote gets the shell flag alone: `--sandbox`,
+/// `--sandbox-name` and `--fresh` never reach it. `--fresh` without
+/// `--sandbox` stays a usage error that never calls `sbx`.
+#[cfg(unix)]
 #[test]
 #[serial]
-fn the_shell_flags_conflict_with_the_sandbox_relaunch_in_clap() {
-    let dir = fresh_config_dir("shell-flag-sandbox-conflict");
+fn the_shell_flags_are_forwarded_into_the_sandbox_relaunch() {
+    let dir = fresh_config_dir("shell-flag-sandbox-forward");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
+    let default_name = dir.file_name().unwrap().to_str().unwrap().to_string();
 
-    for args in [
-        &["--sandbox", "--tui"][..],
-        &["--sandbox", "--repl"],
-        &["--sandbox", "box", "--tui"],
-        &["--sandbox", "box", "--repl"],
-        &["--sandbox", "--fresh", "--tui"],
-        &["--sandbox", "--fresh", "--repl"],
-        &["--tui", "--sandbox"],
-        &["--repl", "--sandbox"],
-        &["--fresh", "--tui"],
-    ] {
-        let out = run_piped(&dir, &[], args);
+    let cases: [(&[&str], &str, &str); 8] = [
+        (&["--sandbox", "--tui"], &default_name, "--tui"),
+        (&["--sandbox", "--repl"], &default_name, "--repl"),
+        (
+            &["--sandbox", "--sandbox-name", "box", "--tui"],
+            "box",
+            "--tui",
+        ),
+        (
+            &["--sandbox", "--sandbox-name", "box", "--repl"],
+            "box",
+            "--repl",
+        ),
+        (&["--sandbox", "--fresh", "--tui"], &default_name, "--tui"),
+        (&["--sandbox", "--fresh", "--repl"], &default_name, "--repl"),
+        (&["--tui", "--sandbox"], &default_name, "--tui"),
+        (&["--repl", "--sandbox"], &default_name, "--repl"),
+    ];
+    let (path, log) = install_stub_sbx(&dir, &default_name);
+    let path = path.to_str().unwrap().to_string();
+    for (args, name, shell_flag) in cases {
+        let _ = fs::remove_file(&log);
+        let out = run_piped(&dir, &[("PATH", &path)], args);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
         let all = format!("{stdout}\n{stderr}");
+        let execs: Vec<Vec<String>> = sbx_calls(&log)
+            .into_iter()
+            .filter(|c| c.len() > 1 && c[0] == "exec" && c[1] == "-i")
+            .collect();
         assert_eq!(
-            out.status.code(),
-            Some(2),
-            "{args:?} did not exit with clap's usage error code:\n{all}"
+            execs.len(),
+            1,
+            "{args:?} did not relaunch into the sandbox exactly once: {execs:?}\n{all}"
         );
-        assert!(
-            stderr.contains("cannot be used with")
-                && (stderr.contains("--sandbox") || stderr.contains("--fresh"))
-                && (stderr.contains("--tui") || stderr.contains("--repl")),
-            "{args:?} was not reported as a conflict between the sandbox flags and the shell flag:\n{all}"
+        let exec = &execs[0];
+        let coyote = exec
+            .iter()
+            .position(|arg| arg == "coyote")
+            .unwrap_or_else(|| panic!("{args:?}: no inner coyote in {exec:?}"));
+        assert_eq!(
+            exec[coyote - 1],
+            name,
+            "{args:?}: wrong sandbox in {exec:?}"
         );
-        assert!(
-            !all.contains("sbx"),
-            "{args:?} reached the sandbox relaunch:\n{all}"
+        assert_eq!(
+            exec[coyote + 1..],
+            [shell_flag],
+            "{args:?}: the inner argv is not the shell flag alone"
         );
+        assert_eq!(out.status.code(), Some(0), "{args:?}:\n{all}");
+        assert_eq!(stdout, format!("{SBX_INNER_STDOUT}\n"), "{args:?}:\n{all}");
         assert!(
-            !all.contains("Welcome to") && find(&out.stdout, ENTER_ALT, 0).is_none(),
-            "{args:?} started a shell:\n{all}"
+            find(&out.stdout, ENTER_ALT, 0).is_none(),
+            "{args:?} started a shell on the host:\n{all}"
         );
     }
+
+    let _ = fs::remove_file(&log);
+    let args = ["--fresh", "--tui"];
+    let out = run_piped(&dir, &[("PATH", &path)], &args);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = strip_ansi(&String::from_utf8_lossy(&out.stderr));
+    let all = format!("{stdout}\n{stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{args:?} did not exit with clap's usage error code:\n{all}"
+    );
+    assert!(
+        stderr.contains("the following required arguments were not provided:\n  --sandbox\n"),
+        "{args:?} was not refused for the missing --sandbox:\n{all}"
+    );
+    assert!(
+        sbx_calls(&log).is_empty(),
+        "{args:?} called sbx: {:?}",
+        sbx_calls(&log)
+    );
+    assert!(
+        !all.contains("Welcome to") && find(&out.stdout, ENTER_ALT, 0).is_none(),
+        "{args:?} started a shell:\n{all}"
+    );
 }
 
 /// A shell preference is only a preference for interactive runs: a
