@@ -177,28 +177,33 @@ pub(crate) enum InstanceSession {
 /// cannot be read names none, logged at debug level; `by_destination` warns about it
 /// where the sessions are listed.
 pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, InstanceSession> {
+    try_sessions_by_instance(cache_dir).unwrap_or_else(|unreadable| {
+        debug!("{}", redact_hashes(&unreadable));
+        HashMap::new()
+    })
+}
+
+/// `sessions_by_instance` that tells a registry which cannot be read, for whatever
+/// reason, apart from an empty one: the `Err` says why, in a sentence fit for a log.
+pub(crate) fn try_sessions_by_instance(
+    cache_dir: &Path,
+) -> Result<HashMap<String, InstanceSession>, String> {
     let path = registry_path(cache_dir);
     let rows = match read_judged_rows(&path, SystemTime::now()) {
         Ok(rows) => rows,
-        Err(RegistryRead::Older(found)) => {
-            debug!("{}", older_registry(&path, found));
-            return HashMap::new();
-        }
-        Err(RegistryRead::Version(found)) => {
-            debug!("{}", refusal(&path, found));
-            return HashMap::new();
-        }
+        Err(RegistryRead::Older(found)) => return Err(older_registry(&path, found)),
+        Err(RegistryRead::Version(found)) => return Err(refusal(&path, found)),
         Err(RegistryRead::Corrupt { cause, error }) => {
-            debug!(
+            return Err(format!(
                 "Mesh instance registry '{}' {} ({}), so no session is named",
                 path.display(),
                 redact_hashes(&cause),
                 redact_hashes(&error)
-            );
-            return HashMap::new();
+            ));
         }
     };
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .map(|(instance_id, row)| {
             let session = if row.gone_at.is_some() {
                 InstanceSession::Gone(row.session)
@@ -207,7 +212,7 @@ pub(crate) fn sessions_by_instance(cache_dir: &Path) -> HashMap<String, Instance
             };
             (instance_id, session)
         })
-        .collect()
+        .collect())
 }
 
 /// Applies `change` to the judged rows under the registry's lock and writes the result,

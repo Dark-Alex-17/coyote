@@ -68,10 +68,41 @@ impl InstanceLock {
         Ok(Self { file })
     }
 
+    /// Takes the lock for `instance_id` without waiting and without creating its lock
+    /// file or writing a pid into it, for a caller that only needs to know no session of
+    /// that instance runs. A missing lock file means no session of it ever ran under
+    /// `cache_dir`, so there is nothing to hold.
+    pub(crate) fn try_take_existing(
+        cache_dir: &Path,
+        instance_id: &str,
+    ) -> std::io::Result<ExistingInstanceLock> {
+        let path = mesh_cache_dir(cache_dir).join(format!("{instance_id}.lock"));
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ExistingInstanceLock::Absent);
+            }
+            Err(err) => return Err(err),
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(ExistingInstanceLock::Taken(Self { file })),
+            Err(TryLockError::WouldBlock) => Ok(ExistingInstanceLock::Held),
+            Err(TryLockError::Error(err)) => Err(err),
+        }
+    }
+
     #[cfg(test)]
     fn holder_pid(&mut self) -> Option<u32> {
         read_holder_pid(&mut self.file)
     }
+}
+
+/// What `InstanceLock::try_take_existing` found.
+#[derive(Debug)]
+pub(crate) enum ExistingInstanceLock {
+    Absent,
+    Held,
+    Taken(InstanceLock),
 }
 
 impl Drop for InstanceLock {

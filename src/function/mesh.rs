@@ -2038,9 +2038,8 @@ fn parse_sha256(hex: &str) -> Result<[u8; 32]> {
 /// the model copies it rather than paraphrasing a request to that session's envoy.
 fn request_access_call(peer: &str, path: &str) -> String {
     format!(
-        "mesh__request_access {{\"{key}\": \"{peer}\", \"paths\": [{}], \"reason\": \"<why you need it>\"}}",
+        "mesh__request_access {{\"peer\": \"{peer}\", \"paths\": [{}], \"reason\": \"<why you need it>\"}}",
         Value::from(path),
-        key = "peer",
     )
 }
 

@@ -103,10 +103,11 @@ impl Held {
 /// the session that had it: a resumed session keeps its instance and so continues its
 /// own threads, while another session of the same identity, or a fork, holds its own.
 /// The instance lock keeps the file to one process while a node serves that instance.
-/// A change is made and serialized under `held`, and `write_lock` is taken before
-/// `held` is let go, so a single fsync'd write blocks no reader and the snapshots reach
-/// the disk in the order they were taken. The recipients file is written the same way,
-/// under `recipients` and `recipients_write_lock`.
+/// A change takes `write_lock` first, then `held`, is made and serialized under `held`,
+/// and lets `held` go before the write, so a single fsync'd write blocks no reader, a
+/// change waiting its turn holds nothing a reader needs, and the snapshots reach the
+/// disk in the order they were taken. The recipients file is written the same way,
+/// under `recipients_write_lock` and `recipients`.
 pub(crate) struct SentThreads {
     path: PathBuf,
     held: Mutex<Held>,
@@ -208,6 +209,7 @@ impl SentThreads {
         if !is_wire_id(thread) || destination.is_empty() {
             return;
         }
+        let _order = self.recipients_write_lock.lock();
         let mut recipients = self.recipients.lock();
         if recipients
             .iter()
@@ -229,7 +231,6 @@ impl SentThreads {
         };
         let json =
             serde_json::to_vec(&file).context("Failed to serialize the mesh sent-recipients list");
-        let _write = self.recipients_write_lock.lock();
         drop(recipients);
         #[cfg(test)]
         self.recipients_free_at_write
@@ -277,6 +278,7 @@ impl SentThreads {
         if !is_wire_id(thread) {
             return Ok(());
         }
+        let _order = self.write_lock.lock();
         let mut held = self.held.lock();
         if !change(&mut held) {
             return Ok(());
@@ -289,7 +291,6 @@ impl SentThreads {
         };
         let json =
             serde_json::to_vec(&file).context("Failed to serialize the mesh sent-threads list")?;
-        let _write = self.write_lock.lock();
         drop(held);
         write_atomically_owner_only(&self.path, &json)
     }
@@ -760,6 +761,45 @@ mod tests {
                 assert_eq!(file.received, received(&store), "round {round}");
             }
             assert_eq!(sent(&store).len(), 10 * 2 * 10);
+        }
+
+        /// A change waiting for another's write to finish holds neither list, so a
+        /// reader gets it at once; the waiting change still reaches the file after.
+        #[test]
+        fn a_writer_waiting_on_another_write_leaves_the_lists_to_readers() {
+            let tmp = TempDir::new("sent-threads-two-writers");
+            let threads = store(&tmp);
+            let thread = "a1".repeat(16);
+            let (threads_free, recipients_free) = std::thread::scope(|scope| {
+                let first_write = threads.write_lock.lock();
+                let first_recipient_write = threads.recipients_write_lock.lock();
+                let second = scope.spawn(|| threads.record_sent(&thread));
+                let second_recipient = scope.spawn(|| {
+                    threads.record_recipient(&thread, &"d1".repeat(16), &"e1".repeat(16));
+                });
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let wait = std::time::Duration::from_secs(2);
+                let threads_free = threads.held.try_lock_for(wait).is_some();
+                let recipients_free = threads.recipients.try_lock_for(wait).is_some();
+                drop(first_write);
+                drop(first_recipient_write);
+                second.join().unwrap().unwrap();
+                second_recipient.join().unwrap();
+                (threads_free, recipients_free)
+            });
+
+            assert!(threads_free, "a reader waited behind a queued thread write");
+            assert!(
+                recipients_free,
+                "a reader waited behind a queued recipient write"
+            );
+            assert_eq!(written(threads.path()).sent, std::slice::from_ref(&thread));
+            assert_eq!(
+                store(&tmp)
+                    .recipient(&thread)
+                    .map(|recipient| recipient.destination),
+                Some("d1".repeat(16))
+            );
         }
     }
 

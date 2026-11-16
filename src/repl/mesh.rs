@@ -1829,6 +1829,11 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
                 }
             };
             ctx.app.mesh.remember_sent_thread(&sent.thread);
+            if sent.inferred {
+                ctx.app
+                    .mesh
+                    .remember_sent_recipient(&sent.thread, destination, &sent.identity);
+            }
             out_path_text(
                 &thread_follow_up_line(
                     &outcome,
@@ -1845,11 +1850,14 @@ async fn answer(ctx: &RequestContext, wanted: AnswerRoute, rest: Option<&str>) -
 }
 
 /// A message this session sent whose reply closed it, as a follow-up continues it: the
-/// thread it opened and the session that replied in it.
+/// thread it opened and the session that replied in it. `inferred` marks a session read
+/// from the one reply in the thread rather than kept when the message went out, so it is
+/// kept only once a follow-up reaches it.
 struct SentThread {
     thread: String,
     destination: String,
     identity: String,
+    inferred: bool,
 }
 
 /// The thread `id` names when this session sent it and a reply already closed it, and
@@ -1857,7 +1865,7 @@ struct SentThread {
 /// message that opened it, or the id of a message the inbox holds in that thread, or the
 /// id that message replied to. The session is the recipient kept for the thread when the
 /// message went out. A thread sent before recipients were kept falls back to the one
-/// session that replied in it, which is then kept as its recipient; with no reply in the
+/// session that replied in it, marked `inferred` and not yet kept; with no reply in the
 /// inbox or replies from several sessions it is refused. `None` for a thread another
 /// session sent, or one a session on the other side started.
 fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<Result<SentThread>> {
@@ -1881,6 +1889,7 @@ fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<Result<SentThrea
             thread: recipient.thread,
             destination: recipient.destination,
             identity: recipient.identity,
+            inferred: false,
         }));
     }
     let mut repliers: Vec<(String, String)> = Vec::new();
@@ -1904,14 +1913,12 @@ fn closed_sent_thread(ctx: &RequestContext, id: &str) -> Option<Result<SentThrea
         .peer(short(&thread))
         .frame(" was sent before this session kept where each message went, and ");
     Some(match repliers.as_slice() {
-        [(destination, identity)] => {
-            sent.record_recipient(&thread, destination, identity);
-            Ok(SentThread {
-                thread,
-                destination: destination.clone(),
-                identity: identity.clone(),
-            })
-        }
+        [(destination, identity)] => Ok(SentThread {
+            thread,
+            destination: destination.clone(),
+            identity: identity.clone(),
+            inferred: true,
+        }),
         [] => Err(QuotingError::wrap(before.frame(
             "no reply in its thread is in the inbox to say which session to follow up with. `.mesh messaging inbox` shows what came back; `.mesh messaging send <session> \"text\"` starts a new conversation.",
         ))),
@@ -6358,7 +6365,7 @@ async fn files_list(
         }
         return shares(ctx, &args);
     };
-    if token.contains(GLOB_METACHARACTERS) {
+    if token.contains(GLOB_METACHARACTERS) && names_no_one(ctx, token) {
         return Err(QuotingError::wrap(
             NoticeText::default().frame("'").peer(token.as_str()).frame(
                 "' is a file pattern, not a session. `.mesh files list` shows what you share; `.mesh files list <session> --prefix <path>` narrows what a session shares with you. Nothing was listed.",
@@ -6378,6 +6385,20 @@ async fn files_list(
         args.next.as_deref(),
     )
     .await
+}
+
+/// Whether `token` resolves to no session and no name you know is spelled so. A name
+/// that is known but ambiguous still counts, so its own refusal lists the candidates.
+fn names_no_one(ctx: &RequestContext, token: &str) -> bool {
+    if destination_hash(ctx, token).is_ok() {
+        return false;
+    }
+    let spelled = token.to_lowercase();
+    !ctx.app
+        .mesh
+        .address_names()
+        .iter()
+        .any(|name| name.name.to_lowercase() == spelled)
 }
 
 /// `.mesh files list <session> [--prefix <path>] [--next <cursor>]`: one page of the files
@@ -11287,7 +11308,8 @@ mod tests {
     /// someone on the mesh other than as a user or a session. `propagation node` is the
     /// one named term kept, as the messaging help explains it (with its config keys),
     /// `--peer` is a flag, `not_trusted_by_peer` is an outcome a tool returns, `peer` in
-    /// backticks is the key a tool argument or result names a session by,
+    /// backticks, or quoted as a JSON key (`"peer":`), is the key a tool argument or
+    /// result names a session by,
     /// `SeTakeOwnershipPrivilege` is the Windows privilege `takeown` needs, and a bare
     /// lowercase word, key or path, or an all-caps identifier such as an environment
     /// variable name, alone or built around placeholders, is never prose. The match
@@ -11313,6 +11335,7 @@ mod tests {
                     .replace("--peer", "")
                     .replace("not_trusted_by_peer", "")
                     .replace("`peer`", "")
+                    .replace("\"peer\":", "")
                     .replace("setakeownershipprivilege", "");
                 USER_MODEL_WORDS
                     .iter()
@@ -11413,6 +11436,8 @@ fn shown() {
     let env = "COYOTE_MESH_PEER_DESTINATION";
     out_text("Set COYOTE_MESH_PEER_NAME to name the peer");
     out_text("taking over a file needs SeTakeOwnershipPrivilege");
+    out_text("Run mesh__request_access {\"peer\": \"{dest}\"} to ask the peer");
+    out_text("Run mesh__request_access {\"peer\": \"{dest}\"} to ask");
 }
 const ENVOY_UNDER_THE_HOOD: &str = "a session is a destination on a node";
 pub(crate) const SELF_TRUST_LABEL: &str = "this node";
@@ -11426,7 +11451,8 @@ const OTHER_LABEL: &str = "this node";
                 "8: \"peer\" in \"Peer said no; see scope.peer/1\"",
                 "10: \"peer\" in \"Lists `peers` you trust\"",
                 "13: \"peer\" in \"Set COYOTE_MESH_PEER_NAME to name the peer\"",
-                "18: \"node\" in \"this node\"",
+                "15: \"peer\" in \"Run mesh__request_access {\\\"peer\\\": \\\"{dest}\\\"} to ask the peer\"",
+                "20: \"node\" in \"this node\"",
             ],
             "the scan misreads its fixture"
         );
@@ -53950,6 +53976,59 @@ mod tests {
                     });
                 }
 
+                /// The one replier is kept as the thread's recipient only once a
+                /// follow-up reaches it: a follow-up whose text prompt is cancelled sends
+                /// nothing and keeps nothing, and the next one that goes out keeps it.
+                #[test]
+                #[serial]
+                fn messaging_follow_up_keeps_an_inferred_recipient_only_once_it_is_sent() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-follow-up-legacy-cancel");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_text(&[None]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-follow-up-legacy-cancel").await;
+                        let thread = "4d".repeat(16);
+                        fx.ctx.app.mesh.remember_sent_thread(&thread);
+                        let reply = reply_in_thread(
+                            &fx,
+                            &"7e".repeat(16),
+                            &thread,
+                            &thread,
+                            fx.stub.destination_hex(),
+                            fx.stub.identity_hex(),
+                        );
+                        fx.ctx.app.mesh.deliver_peer(reply);
+                        let recipient = |fx: &PeerFixture| {
+                            fx.ctx.app.mesh.sent_threads().unwrap().recipient(&thread)
+                        };
+
+                        let result = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging follow-up {}", short(&thread)),
+                        )
+                        .await;
+
+                        assert!(result.is_ok(), "{result:?}");
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(
+                            recipient(&fx).is_none(),
+                            "a cancelled follow-up keeps no recipient"
+                        );
+
+                        let result = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh messaging follow-up {} \"x\"", short(&thread)),
+                        )
+                        .await;
+
+                        assert!(result.is_ok(), "{result:?}");
+                        assert_eq!(fx.stub.seen().len(), 1);
+                        let kept = recipient(&fx).expect("the sent follow-up keeps its recipient");
+                        assert_eq!(kept.destination, fx.stub.destination_hex());
+                        fx.stop().await;
+                    });
+                }
+
                 /// With no reply in such a thread, or replies from more than one
                 /// session, nothing says where a follow-up should go: it is refused,
                 /// naming what to run instead, and nothing is sent or recorded.
@@ -56288,6 +56367,50 @@ mod tests {
                             "`.mesh files list <session>` asks that session which files it shares with you; `--peer`, `--effective` and `--all` read your own share rules, so run them without the session, as in `.mesh files list --effective --peer <who>`. Nothing was listed."
                         );
                         assert_eq!(fx.heard().len(), 2, "the refusal asked nothing");
+
+                        fx.stop().await;
+                    });
+                }
+
+                /// A session's name may hold the characters a file pattern uses, so a
+                /// name you gave a session lists that session rather than being refused
+                /// as a pattern.
+                #[test]
+                #[serial]
+                fn files_list_of_a_session_named_with_pattern_characters_lists_it() {
+                    use crate::mesh::test_support::LIST_PATH;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-files-list-bracket-name");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            FetchFixture::new("repl-mesh-files-list-bracket-name", false).await;
+                        fx.stub.serve(LIST_PATH, fx.script.clone());
+                        let to = fx.stub.destination_hex();
+                        fx.started
+                            .runtime
+                            .trust()
+                            .set_session_alias(&fx.stub.identity_hex(), &to, Some("bob[work]"), &[])
+                            .unwrap();
+                        fx.script.replies.lock().push_back(Value::Map(vec![
+                            (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
+                            (Value::from("entries"), Value::Array(Vec::new())),
+                            (Value::from("next"), Value::Nil),
+                        ]));
+
+                        let out = out_of(&mut fx.ctx, ".mesh files list \"bob[work]\"")
+                            .await
+                            .unwrap();
+
+                        assert!(
+                            out.lines()
+                                .last()
+                                .is_some_and(|line| line.contains(" shares nothing with you.")),
+                            "{out}"
+                        );
+                        assert_eq!(fx.heard().len(), 1, "the session was asked: {out}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
 
                         fx.stop().await;
                     });

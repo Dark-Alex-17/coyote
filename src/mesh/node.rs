@@ -1151,6 +1151,7 @@ impl MeshRuntime {
                 config.envoy_memory.clone(),
                 days,
                 move || swept.upgrade().map(|runtime| runtime.current_instance_id()),
+                SystemTime::now,
                 runtime.cancellation_token(),
             )));
         }
@@ -2371,17 +2372,30 @@ impl MeshRuntime {
         *self.identity_lock.lock() = None;
         let instance_id = state.instance_id.clone();
         let destination_hex = state.hash.to_hex_string();
-        // The peer table's write may wait on another process's file lock; nothing past
-        // this point needs the destination.
+        // The tables' writes may wait on another process's file lock, so they run off
+        // the async workers; nothing past this point needs the destination.
         drop(state);
-        if let Err(err) = self.peers.persist_if_dirty() {
-            warn!(
+        let persisted = tokio::task::spawn_blocking({
+            let peers = Arc::clone(&self.peers);
+            let propagation_nodes = Arc::clone(&self.propagation_nodes);
+            move || {
+                let persisted = peers.persist_if_dirty();
+                propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Stop);
+                persisted
+            }
+        })
+        .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(
                 "Failed to persist the mesh peer table on stop: {}",
                 redact_hashes(&format!("{err:#}"))
-            );
+            ),
+            Err(err) => warn!(
+                "Mesh peer table write on stop did not finish: {}",
+                redact_hashes(&err.to_string())
+            ),
         }
-        self.propagation_nodes
-            .persist_if_dirty_or_warn(PersistTrigger::Stop);
         debug!(
             "Stopped mesh node {} (instance {instance_id}, destination {})",
             short(&self.fingerprint),
@@ -4117,12 +4131,14 @@ async fn sweep_envoy_memory(
 /// (the interval's first tick fires at once) and every `ENVOY_STORE_SWEEP_SECS` after.
 /// `current` names the instance this node serves at each tick, since a re-key moves it;
 /// that store and every store whose session the instance registry says is running are
-/// kept. Stops when `current` has no node left or `cancel` fires.
+/// kept. `now` is the time each tick judges by. Stops when `current` has no node left or
+/// `cancel` fires.
 async fn sweep_unused_envoy_stores(
     cache_dir: PathBuf,
     config: EnvoyMemoryConfig,
     days: u64,
     current: impl Fn() -> Option<String> + Send + 'static,
+    now: impl Fn() -> SystemTime + Send + 'static,
     cancel: CancellationToken,
 ) {
     let mut ticks = interval(Duration::from_secs(ENVOY_STORE_SWEEP_SECS));
@@ -4133,20 +4149,9 @@ async fn sweep_unused_envoy_stores(
                 let Some(instance_id) = current() else { break };
                 let cache_dir = cache_dir.clone();
                 let config = config.clone();
+                let now = now();
                 let swept = tokio::task::spawn_blocking(move || {
-                    let mut keep: HashSet<String> = instances::sessions_by_instance(&cache_dir)
-                        .into_iter()
-                        .filter(|(_, session)| matches!(session, InstanceSession::Running(_)))
-                        .map(|(id, _)| id)
-                        .collect();
-                    keep.insert(instance_id);
-                    EnvoySessions::prune_unused_everywhere(
-                        &cache_dir,
-                        &config,
-                        days,
-                        SystemTime::now(),
-                        &keep,
-                    )
+                    prune_unused_envoy_stores(&cache_dir, &config, days, now, instance_id)
                 })
                 .await;
                 log_unused_envoy_stores(swept, days);
@@ -4155,12 +4160,52 @@ async fn sweep_unused_envoy_stores(
     }
 }
 
-fn log_unused_envoy_stores(
-    swept: Result<Result<UnusedStores, EnvoyMemoryError>, tokio::task::JoinError>,
+struct UnusedStoreSweep {
+    unused: Result<UnusedStores, EnvoyMemoryError>,
+    registry_read: bool,
+}
+
+/// One tick of `sweep_unused_envoy_stores`. While the instance registry cannot be read,
+/// which sessions are running is unknown, so the tick only stamps and deletes nothing.
+fn prune_unused_envoy_stores(
+    cache_dir: &Path,
+    config: &EnvoyMemoryConfig,
     days: u64,
-) {
+    now: SystemTime,
+    instance_id: String,
+) -> UnusedStoreSweep {
+    let sessions = instances::try_sessions_by_instance(cache_dir);
+    let registry_read = sessions.is_ok();
+    let mut keep: HashSet<String> = sessions
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, session)| matches!(session, InstanceSession::Running(_)))
+        .map(|(id, _)| id)
+        .collect();
+    keep.insert(instance_id);
+    let unused = if registry_read {
+        EnvoySessions::prune_unused_everywhere(cache_dir, config, days, now, &keep)
+    } else {
+        EnvoySessions::stamp_unstamped_everywhere(cache_dir, config, now, &keep)
+    };
+    UnusedStoreSweep {
+        unused,
+        registry_read,
+    }
+}
+
+fn log_unused_envoy_stores(swept: Result<UnusedStoreSweep, tokio::task::JoinError>, days: u64) {
     match swept {
-        Ok(Ok(unused)) => {
+        Ok(UnusedStoreSweep {
+            unused: Ok(unused),
+            registry_read,
+        }) => {
+            if !registry_read {
+                warn!(
+                    "The mesh instance registry could not be read, so no envoy memory store was removed this time; {} store(s) were stamped as used now",
+                    unused.stamped
+                );
+            }
             if unused.removed > 0 {
                 info!(
                     "Removed {} envoy memory store(s) unused for {days} day(s)",
@@ -4180,7 +4225,9 @@ fn log_unused_envoy_stores(
                 );
             }
         }
-        Ok(Err(err)) => warn!(
+        Ok(UnusedStoreSweep {
+            unused: Err(err), ..
+        }) => warn!(
             "Failed to sweep unused envoy memory stores: {}",
             redact_hashes(&err.to_string())
         ),
@@ -4259,10 +4306,15 @@ async fn persist_tables_periodically(
         tokio::select! {
             () = cancel.cancelled() => break,
             _ = ticks.tick() => {
-                // The write waits up to the file lock's bound on another process.
+                // The writes wait up to the file lock's bound on another process.
                 let persisted = tokio::task::spawn_blocking({
                     let peers = Arc::clone(&peers);
-                    move || peers.persist_if_dirty()
+                    let propagation_nodes = Arc::clone(&propagation_nodes);
+                    move || {
+                        let persisted = peers.persist_if_dirty();
+                        propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Timer);
+                        persisted
+                    }
                 })
                 .await;
                 match persisted {
@@ -4276,7 +4328,6 @@ async fn persist_tables_periodically(
                         redact_hashes(&err.to_string())
                     ),
                 }
-                propagation_nodes.persist_if_dirty_or_warn(PersistTrigger::Timer);
             }
         }
     }
@@ -18727,6 +18778,74 @@ mod tests {
         relay_handle.abort();
     }
 
+    /// With another process holding the peer table's file lock, the stop's write waits
+    /// for it off the async workers: on a runtime with one worker another task keeps
+    /// running for the whole stop.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn stop_waits_on_the_peer_table_lock_without_blocking_a_worker() {
+        use crate::mesh::lock::acquire_mesh_lock;
+
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-persist-peers-off-worker");
+        let paths = mesh_paths(&tmp);
+        let peers_path = mesh_cache_dir(&paths.cache_dir).join("peers.json");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: "persisted-on-stop".to_string(),
+                identity_hash: "identity".to_string(),
+                name_hash: "name".to_string(),
+                public_key: None,
+                display_name: None,
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let held = acquire_mesh_lock(
+            &peers_path.with_added_extension("lock"),
+            "mesh table of heard sessions",
+            Duration::ZERO,
+        )
+        .unwrap();
+        let longest_gap = Arc::new(parking_lot::Mutex::new(Duration::ZERO));
+        let ticker = tokio::spawn({
+            let longest_gap = Arc::clone(&longest_gap);
+            async move {
+                let mut last = std::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let gap = last.elapsed();
+                    let mut longest = longest_gap.lock();
+                    *longest = (*longest).max(gap);
+                    last = std::time::Instant::now();
+                }
+            }
+        });
+
+        let stopped = tokio::spawn(async move { runtime.shutdown().await });
+        stopped.await.unwrap().unwrap();
+        ticker.abort();
+        drop(held);
+
+        let longest = *longest_gap.lock();
+        assert!(
+            longest < Duration::from_secs(1),
+            "the one worker stalled for {longest:?} while the stop waited on the lock"
+        );
+        relay_handle.abort();
+    }
+
     #[cfg(unix)]
     mod persisted_propagation_node_tests {
         use super::*;
@@ -20341,6 +20460,7 @@ mod tests {
     /// With `prune_unused_after_days` set the join sweeps every store, memory on or
     /// off: another instance's store unused for a year goes, the running one's stays
     /// however old its stamp.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_sweeps_unused_envoy_stores_with_the_memory_off() {
         let (addr, relay_handle, _) = loopback_relay().await;
@@ -20374,6 +20494,7 @@ mod tests {
         relay_handle.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_without_prune_unused_after_days_leaves_other_envoy_stores_alone() {
         let (addr, relay_handle, _) = loopback_relay().await;
@@ -20393,6 +20514,132 @@ mod tests {
         relay_handle.abort();
 
         assert!(remembered_record(&other, "old").exists());
+    }
+
+    #[test]
+    fn an_unreadable_instance_registry_removes_no_envoy_store_that_tick() {
+        let tmp = TempDir::new("node-envoy-store-sweep-bad-registry");
+        let paths = mesh_paths(&tmp);
+        let other = plant_year_old_store(&paths, &"ab".repeat(16));
+        std::fs::write(
+            mesh_cache_dir(&paths.cache_dir).join("instances.json"),
+            "{not json",
+        )
+        .unwrap();
+
+        let swept = prune_unused_envoy_stores(
+            &paths.cache_dir,
+            &EnvoyMemoryConfig::default(),
+            30,
+            SystemTime::now(),
+            "cd".repeat(16),
+        );
+
+        assert!(remembered_record(&other, "old").exists());
+        assert!(!swept.registry_read);
+        assert_eq!(swept.unused.unwrap().removed, 0);
+    }
+
+    /// A session that is starting holds its instance lock before it files its registry
+    /// row; its store is left until the lock is free.
+    #[test]
+    fn a_store_whose_instance_lock_is_held_survives_the_sweep_without_a_registry_row() {
+        let tmp = TempDir::new("node-envoy-store-sweep-locked");
+        let paths = mesh_paths(&tmp);
+        let starting_id = "ab".repeat(16);
+        let starting = plant_year_old_store(&paths, &starting_id);
+        let held = InstanceLock::acquire(&paths.cache_dir, &starting_id).unwrap();
+        let sweep = || {
+            prune_unused_envoy_stores(
+                &paths.cache_dir,
+                &EnvoyMemoryConfig::default(),
+                30,
+                SystemTime::now(),
+                "cd".repeat(16),
+            )
+            .unused
+            .unwrap()
+        };
+
+        assert_eq!(sweep(), UnusedStores::default());
+        assert!(remembered_record(&starting, "old").exists());
+
+        drop(held);
+        assert_eq!(sweep().removed, 1);
+        assert!(!starting.dir().exists());
+    }
+
+    /// The real sweep future under a paused clock: a store that crosses the days unused
+    /// after the join sweep goes on the next daily sweep, not before.
+    #[tokio::test(start_paused = true)]
+    async fn the_unused_store_sweep_removes_a_store_on_the_first_daily_sweep_after_it_crosses() {
+        let tmp = TempDir::new("node-envoy-store-sweep-daily");
+        let paths = mesh_paths(&tmp);
+        let days = 30;
+        let joined = SystemTime::now();
+        let already = plant_year_old_store(&paths, &"ab".repeat(16));
+        let crossing = EnvoySessions::open(
+            &paths.cache_dir,
+            &"ef".repeat(16),
+            &EnvoyMemoryConfig {
+                enabled: true,
+                ..EnvoyMemoryConfig::default()
+            },
+        )
+        .unwrap();
+        crossing
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "old",
+                peer_turns(),
+                joined - Duration::from_secs(days * 86_400 - 3_600),
+            )
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let cancel = CancellationToken::new();
+        let current_id = "cd".repeat(16);
+        let sweep = tokio::spawn(sweep_unused_envoy_stores(
+            paths.cache_dir.clone(),
+            EnvoyMemoryConfig::default(),
+            days,
+            move || Some(current_id.clone()),
+            move || joined + started.elapsed(),
+            cancel.clone(),
+        ));
+        let gone = |store: &EnvoySessions| {
+            let dir = store.dir().to_path_buf();
+            async move {
+                for _ in 0..500 {
+                    if !dir.exists() {
+                        return true;
+                    }
+                    tokio::task::yield_now().await;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                false
+            }
+        };
+
+        assert!(
+            gone(&already).await,
+            "the join sweep removes the year-old store"
+        );
+        assert!(remembered_record(&crossing, "old").exists());
+
+        tokio::time::advance(Duration::from_secs(ENVOY_STORE_SWEEP_SECS - 1)).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            remembered_record(&crossing, "old").exists(),
+            "no sweep runs before the day is out"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(gone(&crossing).await, "the daily sweep removes it");
+        cancel.cancel();
+        sweep.await.unwrap();
     }
 
     #[cfg(unix)]
