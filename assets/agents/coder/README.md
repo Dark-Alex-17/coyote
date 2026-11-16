@@ -14,6 +14,11 @@ implement-fix loop enforced as graph edges rather than prose.
 flowchart TD
     resolve_paths{"resolve_paths<br/>script"} --> analyze_request
     analyze_request["analyze_request<br/>llm + output_schema"] --> route_complexity
+    analyze_request -. "planning died" .-> analyze_fault
+    analyze_fault{"analyze_fault<br/>script"}
+    analyze_fault -->|"empty plan, complexity 7"| gate_approval
+    analyze_fault -->|"CODER_AUTOAPPROVE=1"| baseline_tests
+    analyze_fault -. "script crashed" .-> end_failure
     route_complexity{"route_complexity<br/>script"}
     route_complexity -->|"complexity ≥ 7"| gate_approval
     route_complexity -->|else| baseline_tests
@@ -30,6 +35,11 @@ flowchart TD
     baseline_tests{"baseline_tests<br/>script"} --> implement
     baseline_tests -. "script crashed" .-> implement
     implement["implement<br/>llm + fs tools"] --> verify_build
+    implement -. "implement died" .-> implement_fault
+    implement_fault{"implement_fault<br/>script"}
+    implement_fault -->|"budget left"| implement
+    implement_fault -->|"budget spent"| end_failure
+    implement_fault -. "script crashed" .-> end_failure
     verify_build{"verify_build<br/>script"}
     verify_build -->|pass| verify_tests
     verify_build -->|fail| fix_loop_gate
@@ -118,6 +128,14 @@ End nodes emit one of three sentinel outcomes for the caller:
   `verify_tests TIMED OUT` (killed at `build_timeout` / `test_timeout`) or
   with `TIMED OUT` (killed by the engine at the node timeout), and the run
   ends at once instead of spending fix attempts on code nothing showed broken.
+
+A planning or implement pass that dies (iteration cap, timeout, provider
+failure) does not end the run on its own. `analyze_fault` carries on with an
+empty plan whose `Plan:` line quotes the error, scored 7 so an interactive run
+asks for approval first. `implement_fault` sends implement back to the edits
+already on disk, spending one fix attempt per retry; once `max_fix_attempts`
+is spent the run ends as `CODER_FAILED` with the error under
+`Verification gate error:`.
 
 ## Baseline tests
 

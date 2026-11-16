@@ -4500,6 +4500,92 @@ fn coder_self_review_fault_carries_the_trail_ask_lines() {
     }
 }
 
+/// analyze_request's fallback edge carries no state_updates, so the plan
+/// keys are still their seeds. The fault script writes an empty plan that
+/// quotes the engine's error, appends a risk naming it, and scores it 7 so
+/// an interactive run reaches the approval gate; CODER_AUTOAPPROVE=1 skips
+/// the gate as route_complexity does.
+#[test]
+fn coder_analyze_fault_continues_with_an_empty_plan_that_quotes_the_error() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("analyze-fault");
+    let error = "LLM node failed: llm node hit max_iterations (60) before LLM concluded";
+    for (autoapprove, next) in [("0", "gate_approval"), ("1", "baseline_tests")] {
+        let mut state = project_state(&dir.0);
+        state["last_node_output"] = Value::String(error.to_string());
+        state["risks"] = serde_json::json!(["seeded risk"]);
+        state["files_to_modify"] = serde_json::json!(["/stale/a.rs"]);
+        let out = run_script_json(
+            "coder/scripts/analyze_fault.sh",
+            &dir.0,
+            &state,
+            &[("CODER_AUTOAPPROVE", autoapprove)],
+        );
+        assert_eq!(str_field(&out, "_next"), next, "autoapprove {autoapprove}");
+        let summary = str_field(&out, "plan_summary");
+        assert!(summary.contains(error), "{summary}");
+        assert!(summary.contains("without a plan"), "{summary}");
+        assert!(
+            summary.contains("plans from the request itself"),
+            "{summary}"
+        );
+        assert_eq!(out["complexity_score"], 7, "{out}");
+        assert_eq!(out["files_to_modify"], serde_json::json!([]), "{out}");
+        assert_eq!(out["files_to_create"], serde_json::json!([]), "{out}");
+        let risks = out["risks"].as_array().expect("risks is an array");
+        assert_eq!(risks.len(), 2, "{out}");
+        assert_eq!(risks[0], "seeded risk", "{out}");
+        assert!(
+            risks[1].as_str().is_some_and(|r| r.contains(error)),
+            "{out}"
+        );
+    }
+}
+
+/// implement's fallback edge shares fix_loop_gate's budget: under it the
+/// fault script spends one attempt and loops back to implement with the
+/// error and a pointer at the edits on disk; at it the run ends with the
+/// error in gate_error. It never reaches verify_build.
+#[test]
+fn coder_implement_fault_retries_under_budget_and_ends_at_it() {
+    if tools_missing() {
+        return;
+    }
+    let dir = fixture_dir("implement-fault");
+    let error = "LLM node failed: llm node hit max_iterations (200) before LLM concluded";
+    let mut state = project_state(&dir.0);
+    state["last_node_output"] = Value::String(error.to_string());
+    state["fix_attempts"] = serde_json::json!(2);
+    state["max_fix_attempts"] = serde_json::json!(5);
+    let out = run_script_json("coder/scripts/implement_fault.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "implement", "{out}");
+    assert_eq!(out["fix_attempts"], 3, "{out}");
+    let instructions = str_field(&out, "fix_instructions");
+    assert!(instructions.contains("(attempt 3 of 5)"), "{instructions}");
+    assert!(instructions.contains(error), "{instructions}");
+    assert!(instructions.contains("git status"), "{instructions}");
+    assert!(instructions.contains("git diff"), "{instructions}");
+    assert!(
+        instructions.contains(&dir.0.to_string_lossy().to_string()),
+        "{instructions}"
+    );
+    assert!(out.get("gate_error").is_none(), "{out}");
+
+    state["fix_attempts"] = serde_json::json!(5);
+    let out = run_script_json("coder/scripts/implement_fault.sh", &dir.0, &state, &[]);
+    assert_eq!(str_field(&out, "_next"), "end_failure", "{out}");
+    let gate_error = str_field(&out, "gate_error");
+    assert!(
+        gate_error.contains("implement ended without concluding after 5 attempts"),
+        "{gate_error}"
+    );
+    assert!(gate_error.contains(error), "{gate_error}");
+    assert!(out.get("fix_attempts").is_none(), "{out}");
+    assert!(out.get("fix_instructions").is_none(), "{out}");
+}
+
 /// step-runner end_success renders `{{design_decisions}}` under its own
 /// heading, and a null from write_handoff would print as the literal word.
 /// check_handoff's success emit re-emits the key as a string; a non-null
@@ -6444,6 +6530,10 @@ const JQ_ARG_ALLOW_LIST: &[(&str, &[&str])] = &[
         "coder/scripts/fix_loop_gate.sh",
         &["gate_error", "fix_attempts", "next_attempts"],
     ),
+    (
+        "coder/scripts/implement_fault.sh",
+        &["fix_attempts", "next_attempts", "max_fix_attempts"],
+    ),
     ("coder/scripts/resolve_paths.sh", &["resolved"]),
     ("coder/scripts/route_review_result.sh", &["next_review"]),
     ("coder/scripts/verify_build.sh", &["cmd", "exit_code"]),
@@ -7249,6 +7339,8 @@ fn readme_diagrams_draw_the_fail_closed_gate_edges_and_keep_the_open_ones() {
                 ("route_complexity", "gate_approval"),
                 ("route_review_result", "end_failure"),
                 ("self_review_fault", "end_failure"),
+                ("analyze_fault", "end_failure"),
+                ("implement_fault", "end_failure"),
             ][..],
             &[][..],
         ),
