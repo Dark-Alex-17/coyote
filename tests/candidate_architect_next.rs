@@ -6005,6 +6005,36 @@ fn relay_reads_the_discussion_data_line_sisyphus_next_writes() {
     );
 }
 
+/// Both agents read a numbered reply with one implementation: the block of
+/// `scripts/_lib.py` from `_OPTION_LEAD_RE` through `split_option_reply` is
+/// kept byte-identical in architect-next and sisyphus-next, since some
+/// consumers copy an agent's `scripts/` without `.shared`.
+#[test]
+fn split_option_reply_is_byte_identical_to_sisyphus_nexts() {
+    fn reader(lib: &str, agent: &str) -> String {
+        let start = lib
+            .find("\n_OPTION_LEAD_RE = ")
+            .unwrap_or_else(|| panic!("{agent}: _lib.py has no _OPTION_LEAD_RE"));
+        let end_marker = "\n    return own, rest if re.search(r\"\\w\", rest) else \"\"\n";
+        let end = lib[start..]
+            .find(end_marker)
+            .unwrap_or_else(|| panic!("{agent}: split_option_reply lost its last line"));
+        lib[start..start + end + end_marker.len()].to_string()
+    }
+    let ours = fs::read_to_string(candidate_dir().join("scripts/_lib.py")).unwrap();
+    let theirs = fs::read_to_string(agents_dir().join("sisyphus-next/scripts/_lib.py")).unwrap();
+    let ours = reader(&ours, "architect-next");
+    assert!(
+        ours.contains("\ndef split_option_reply(text, options, strict=False):\n"),
+        "the pinned block no longer holds split_option_reply:\n{ours}"
+    );
+    assert_eq!(
+        ours,
+        reader(&theirs, "sisyphus-next"),
+        "split_option_reply and its helpers differ between the two agents (left: architect-next)"
+    );
+}
+
 /// The README subsection under `### <title>`, up to the next `##` or `###`
 /// heading, with every whitespace run folded to one space so a pinned clause
 /// survives rewrapping.

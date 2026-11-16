@@ -515,29 +515,85 @@ def review_fault(blocker):
     return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
 
 
-# a reply led by an option number: "2", "2.", "2)", "(2)", "#2", "Option 2", then optionally a separator ("2: x",
-# "Option 2, but x", a dash) and free text, or a parenthesised gloss ("1 (as planned; log it)")
-OPTION_NUMBER_RE = re.compile(r"(?is)^(?:option\s*)?[(#]?\s*(\d{1,9})\s*(?:$|[-:.)\u2014\u2013]\s*(.*)$|,\s+(.*)$|"
-                              r"\(([^()]*)\)\s*(.*)$)")
+# The reply reader from _OPTION_LEAD_RE through split_option_reply is sisyphus-next's own, byte for byte; a test in
+# tests/candidate_architect_next.rs fails when the two copies differ.
+_OPTION_LEAD_RE = re.compile(r"(?is)^[\s(\[*_`#]*(?:option\s*)?(\d{1,9})(\s*\(recommended\))?([)\]*_`]*)\s*(.*)$")
+_OPTION_SEPARATORS = "-:).\u2014\u2013"
+# an option number standing alone in the free text: not part of a fraction, a decimal or a word. Both patterns read
+# at most nine digits, so int() never meets a number past Python's digit limit.
+_OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d{1,9})(?![\w/]|\.\d)")
+# a number that is the operand of a comparison ("seats < 1", "count >= 2") is a value, never an option reference;
+# an arrow ("1 -> 3", "=> 3") compares nothing
+_COMPARED_RE = re.compile(r"(?:(?<![-=])[<>]|[=\u2264\u2265\u2260])\s*$")
 
 
-def split_option_reply(text, options):
-    """(option text, free text after it) for a reply led by an in-range option number ("2", "(2)", "#2", "Option 2",
-    "2 - x", "2: x", "2) x", "Option 2, but x", an em or en dash, or "1 (gloss)"); (None, text) otherwise. A reply
-    whose free text names another option ("1 - no wait, 3") picks none. Free text that is only punctuation, or only
-    the "(recommended)" label, counts as none."""
+def _names_another_option(rest, picked, count, strict=False):
+    """Whether the free text after a picked number reads as naming a different option ("no wait, 3", "or 2", "1"):
+    an in-range number other than the pick, after "option" or within the first two words (anywhere when `strict`).
+    A number compared against ("seats < 1") names no option."""
+    for m in _OPTION_NUMBER_RE.finditer(rest):
+        n = int(m.group(1))
+        if n == picked or not 1 <= n <= count:
+            continue
+        before = rest[:m.start()]
+        if _COMPARED_RE.search(before):
+            continue
+        if strict or re.search(r"(?i)\boption\s*$", before) or len(re.findall(r"[^\W\d_]+", before)) <= 2:
+            return True
+    return False
+
+
+def _echoes_option(rest, own):
+    """Whether free text only repeats the picked option's own text, as rendered ("<text> (recommended)" too)."""
+    def bare(s):
+        return re.sub(r"[\W_]+$", "", re.sub(r"(?i)\s*\(recommended\)", "", s.strip())).lower()
+    return bool(rest) and bare(rest) == bare(own)
+
+
+def _unwrap_gloss(rest):
+    """The text of a parenthesised gloss leading `rest` ("(keep it as planned) and log it" -> "keep it as planned and
+    log it"), or None when `rest` opens no balanced parenthesis."""
+    if not rest.startswith("("):
+        return None
+    depth = 0
+    for i, ch in enumerate(rest):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0:
+            return " ".join(p for p in (rest[1:i].strip(), rest[i + 1:].strip()) if p)
+    return None
+
+
+def split_option_reply(text, options, strict=False):
+    """(option text, free text after it) for a reply led by an in-range option number; (None, text) otherwise.
+
+    The number may be wrapped ("(2)", "**2**", "[2]", "#2"), labelled ("Option 2", the rendered
+    "Option 1 (recommended)") and followed by a separator ("2: x", "2) x", "2 - x", "Option 2, but x", an em or en
+    dash) or a parenthesised gloss ("1 (as planned; log it)"). Free text that is only punctuation, or only the picked
+    option's own text echoed back, counts as none. A reply whose free text names a different option number
+    ("3) or 2", "2. 1", "1 - no wait, 3") names no single option, so it is (None, text) too; `strict` counts a
+    different option number anywhere in the free text, fractions, decimals and compared values aside."""
     text = (text or "").strip()
-    m = OPTION_NUMBER_RE.match(text)
-    count = len(options or [])
-    if not m or not 1 <= int(m.group(1)) <= count:
+    options = options or []
+    m = _OPTION_LEAD_RE.match(text)
+    if not m or not 1 <= int(m.group(1)) <= len(options):
         return None, text
-    picked = int(m.group(1))
-    gloss = re.sub(r"(?i)^recommended$", "", (m.group(4) or "").strip())
-    after = (m.group(2) or m.group(3) or re.sub(r"^[-:.,\u2014\u2013]\s*", "", m.group(5) or "")).strip()
-    rest = " ".join(p for p in (gloss, after) if p)
-    if any(len(d) <= 9 and int(d) != picked and 1 <= int(d) <= count for d in re.findall(r"\d+", rest)):
+    picked, rest = int(m.group(1)), m.group(4)
+    if rest[:2] in ("->", "=>"):
+        rest = rest[2:]
+    elif rest[:1] and (rest[0] in _OPTION_SEPARATORS or (rest[0] == "," and not rest[1:2].isdigit())):
+        rest = rest[1:]
+    elif (gloss := _unwrap_gloss(rest)) is not None:
+        rest = gloss
+    elif rest and not (m.group(2) or m.group(3)):
+        # a bare number running into prose ("2 or 3", "2 because") is not a pick
         return None, text
-    return options[picked - 1]["text"], rest if re.search(r"\w", rest) else ""
+    rest = rest.strip()
+    own = options[picked - 1]["text"]
+    if _echoes_option(rest, own):
+        return own, ""
+    if _names_another_option(rest, picked, len(options), strict):
+        return None, text
+    return own, rest if re.search(r"\w", rest) else ""
 
 
 def match_option(text, options):

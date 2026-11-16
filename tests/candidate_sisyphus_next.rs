@@ -3404,6 +3404,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "obs_rounds",
     "oracle_retries",
     "owner_polls",
+    "plan_defect_continues",
     "pr_review_poll_fails",
     "pr_review_polls",
     "pr_review_rounds",

@@ -391,6 +391,7 @@ def raise_escalation(state, updates, esc):
     updates["apply_reasks"] = 0
     updates["reply_interpreted"] = False
     updates["reply_source"] = ""
+    updates["answer_source"] = ""
     updates["navigator_reasks"] = 0
     updates["_next"] = "escalate_gate"
     return updates
@@ -415,10 +416,13 @@ def review_fault(blocker):
     return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
 
 
-_OPTION_LEAD_RE = re.compile(r"(?is)^[\s(\[*_`]*(?:option\s*)?(\d+)(\s*\(recommended\))?([)\]*_`]*)\s*(.*)$")
+# The reply reader from _OPTION_LEAD_RE through split_option_reply is architect-next's too, byte for byte; a test in
+# tests/candidate_architect_next.rs fails when the two copies differ.
+_OPTION_LEAD_RE = re.compile(r"(?is)^[\s(\[*_`#]*(?:option\s*)?(\d{1,9})(\s*\(recommended\))?([)\]*_`]*)\s*(.*)$")
 _OPTION_SEPARATORS = "-:).\u2014\u2013"
-# an option number standing alone in the free text: not part of a fraction, a decimal or a word
-_OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d+)(?![\w/]|\.\d)")
+# an option number standing alone in the free text: not part of a fraction, a decimal or a word. Both patterns read
+# at most nine digits, so int() never meets a number past Python's digit limit.
+_OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d{1,9})(?![\w/]|\.\d)")
 # a number that is the operand of a comparison ("seats < 1", "count >= 2") is a value, never an option reference;
 # an arrow ("1 -> 3", "=> 3") compares nothing
 _COMPARED_RE = re.compile(r"(?:(?<![-=])[<>]|[=\u2264\u2265\u2260])\s*$")
@@ -463,12 +467,12 @@ def _unwrap_gloss(rest):
 def split_option_reply(text, options, strict=False):
     """(option text, free text after it) for a reply led by an in-range option number; (None, text) otherwise.
 
-    The number may be wrapped ("(2)", "**2**", "[2]"), labelled ("Option 2", the rendered "Option 1 (recommended)")
-    and followed by a separator ("2: x", "2) x", "2 - x", "Option 2, but x", an em or en dash) or a parenthesised
-    gloss ("1 (as planned; log it)"). Free text that is only punctuation, or only the picked option's own text echoed
-    back, counts as none. A reply whose free text names a different option number ("3) or 2", "2. 1", "1 - no wait,
-    3") names no single option, so it is (None, text) too; `strict` counts a different option number anywhere in the
-    free text, fractions, decimals and compared values aside."""
+    The number may be wrapped ("(2)", "**2**", "[2]", "#2"), labelled ("Option 2", the rendered
+    "Option 1 (recommended)") and followed by a separator ("2: x", "2) x", "2 - x", "Option 2, but x", an em or en
+    dash) or a parenthesised gloss ("1 (as planned; log it)"). Free text that is only punctuation, or only the picked
+    option's own text echoed back, counts as none. A reply whose free text names a different option number
+    ("3) or 2", "2. 1", "1 - no wait, 3") names no single option, so it is (None, text) too; `strict` counts a
+    different option number anywhere in the free text, fractions, decimals and compared values aside."""
     text = (text or "").strip()
     options = options or []
     m = _OPTION_LEAD_RE.match(text)

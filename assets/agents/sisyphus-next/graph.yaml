@@ -247,7 +247,10 @@ initial_state:
   reply_accepts: ''
   reply_interpreted: false
   reply_source: ''
+  reply_author: owner
+  answer_source: ''
   navigator_reasks: 0
+  plan_defect_continues: 0
   choice_parks: {}
   discussion: {}
   discussion_run_id: ''
@@ -1406,14 +1409,15 @@ nodes:
       Read a typed reply to an escalation that names none of its options: one of
       the options, an instruction the question accepts, a discussion, or unclear.
     instructions: |
-      A user was asked a question with fixed options and typed their own text
-      instead of picking one (or the navigator answering on the user's behalf
-      did). Decide what the text is:
+      The owner was asked a question with fixed options, and either the owner
+      or the navigator answering on the owner's behalf typed their own text
+      instead of picking one; the text's heading names its author. Decide what
+      the text is:
       - option: the text means one of the offered options. Set reply_option to
         that option's exact text (never its "Option N" label).
       - instruction: the text asks for something this question accepts (listed
         under "Accepted instructions"). Set reply_instruction to that shape's
-        name and reply_value to its value, taken from the user's words.
+        name and reply_value to its value, taken from the text's own words.
       - discussion: the text asks a question, asks for context, or wants to talk
         the options through.
       - unclear: none of the above, or you cannot tell. Set reply_clarify to ONE
@@ -1430,7 +1434,7 @@ nodes:
       ## Accepted instructions
       {{reply_accepts}}
 
-      ## The user's text
+      ## The {{reply_author}}'s text
       {{last_answer_text}}
     tools: []
     timeout: 120
