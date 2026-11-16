@@ -71,7 +71,7 @@ const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
 /// words after it are what the peer hears.
 pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 /// What the peer hears for a marker with no words after it.
-pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
+pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this session will not handle that request";
 /// What the peer hears when the provider refused to answer; the category stays local.
 pub(crate) const PROVIDER_REFUSAL_TEXT: &str = "the envoy declined to answer";
 /// Ends the owner's line when the provider refused or failed, since another model may
@@ -556,7 +556,7 @@ impl EnvoyRunner {
             self.app
                 .load()
                 .mesh
-                .record_envoy_fallback(message, "the node went off before the envoy could run");
+                .record_envoy_fallback(message, "you left the mesh before the envoy could run");
             drop(reservation);
             return;
         }
@@ -1144,17 +1144,17 @@ impl EnvoyRunner {
                 Some(format!("timed out after {ENVOY_RUN_TIMEOUT_SECS} s")),
             ),
             EnvoyOutcome::Interrupted => (
-                "no answer (this node is shutting down)".to_string(),
+                "no answer (this session is shutting down)".to_string(),
                 Some("shutting down".to_string()),
             ),
             EnvoyOutcome::Unavailable(reason) => (
-                "this node cannot answer right now".to_string(),
+                "this session cannot answer right now".to_string(),
                 Some(format!("unavailable: {reason}")),
             ),
             EnvoyOutcome::Failed(err) | EnvoyOutcome::ProviderFailed(err) => {
                 warn!("Mesh envoy run for {id} failed: {}", redact_hashes(err));
                 (
-                    "this node cannot answer right now".to_string(),
+                    "this session cannot answer right now".to_string(),
                     Some(err.clone()),
                 )
             }
@@ -1564,7 +1564,7 @@ fn run_error_outcome(err: &anyhow::Error) -> EnvoyOutcome {
         redact_hashes(&format!("{err:#}"))
     );
     EnvoyOutcome::ProviderFailed(format!(
-        "{plain}; the peer was told this node cannot answer right now"
+        "{plain}; the sender was told this session cannot answer right now"
     ))
 }
 
@@ -3503,7 +3503,7 @@ mod tests {
         source.remove_dir();
     }
 
-    /// Unavailability on the wire: the peer hears only "this node cannot answer right
+    /// Unavailability on the wire: the peer hears only "this session cannot answer right
     /// now" (no reason leaks), while the leader's idle line carries the reason.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3556,7 +3556,7 @@ mod tests {
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert_eq!(seen[0].kind, PeerKind::Reply);
         assert_eq!(seen[0].in_reply_to.as_deref(), Some("live-u"));
-        assert_eq!(seen[0].content, "this node cannot answer right now");
+        assert_eq!(seen[0].content, "this session cannot answer right now");
         assert_eq!(seen[0].disposition, Some(Disposition::Refused));
         assert_eq!(seen[0].retry_after, None);
         let leader_line = idle
@@ -3990,7 +3990,10 @@ mod tests {
         assert_eq!(heard[0].retry_after, None);
         assert_eq!(heard[0].fields, None);
         assert_eq!(heard[0].thread.as_deref(), Some("live-cut"));
-        assert_eq!(heard[0].content, "no answer (this node is shutting down)");
+        assert_eq!(
+            heard[0].content,
+            "no answer (this session is shutting down)"
+        );
         assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
 
         link.close(&app).await;
@@ -5958,11 +5961,11 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1, "the queued job never ran");
         assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
         wait_until("the queued job to be filed", || {
-            idle.has("the node went off before the envoy could run")
+            idle.has("you left the mesh before the envoy could run")
         })
         .await;
         assert_eq!(
-            idle.count("the node went off before the envoy could run"),
+            idle.count("you left the mesh before the envoy could run"),
             1,
             "{:?}",
             idle.texts()
@@ -6562,7 +6565,7 @@ mod tests {
             assert_eq!(
                 failed[0],
                 &format!(
-                    "envoy failed: 503 the model is overloaded; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
+                    "envoy failed: 503 the model is overloaded; the sender was told this session cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
                     sender_who()
                 )
             );
@@ -6596,7 +6599,7 @@ mod tests {
             assert_eq!(
                 line,
                 &format!(
-                    "envoy failed: the provider sent a reply the envoy could not read; the peer was told this node cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
+                    "envoy failed: the provider sent a reply the envoy could not read; the sender was told this session cannot answer right now; {} asks: are you there? is in the inbox; read it with .mesh messaging inbox, or set mesh.envoy_model to another model",
                     sender_who()
                 )
             );
@@ -7342,7 +7345,7 @@ mod tests {
         assert_eq!(heard[0].retry_after, None);
         assert_eq!(heard[0].fields, None);
         assert_eq!(heard[0].thread.as_deref(), Some("live-x"));
-        assert_eq!(heard[0].content, "this node cannot answer right now");
+        assert_eq!(heard[0].content, "this session cannot answer right now");
         assert!(!runner.holds("live-x"));
         assert!(
             !idle.has("`.mesh envoy answer live-x \"<text>\"`"),
@@ -9640,7 +9643,7 @@ mod tests {
             &id,
             &peer.to_b,
             "refused",
-            "no answer (this node is shutting down)",
+            "no answer (this session is shutting down)",
         );
         runner.stop().await;
         let gone = peer.collect(&id, 1).await;

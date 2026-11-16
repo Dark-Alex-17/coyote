@@ -5563,7 +5563,7 @@ impl MeshSlot {
                 ),
                 HeldEnd::NodeOff => self.record_envoy_fallback(
                     next.message,
-                    "the node went off before the envoy could run",
+                    "you left the mesh before the envoy could run",
                 ),
                 HeldEnd::Rekeyed => self.record_envoy_fallback(
                     next.message,

@@ -1506,7 +1506,7 @@ fn a_bare_marker_declines_with_the_fallback_text() -> Result<(), String> {
     same(
         "the fallback",
         DECLINED_FALLBACK_TEXT,
-        "this node will not handle that request",
+        "this session will not handle that request",
     )?;
     same(
         "the bare marker",

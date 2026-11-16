@@ -11418,8 +11418,9 @@ mod tests {
     }
 
     /// Every help, result and tool line speaks of users, sessions and envoys: no literal
-    /// a user or a model reads in this file, in src/mesh, or in the mesh tools says peer,
-    /// owner, person or node outside a group's "Under the hood" paragraph.
+    /// a user or a model reads in this file, in src/mesh, in the mesh tools or in the
+    /// untrusted-content fence markers says peer, owner, person or node outside a group's
+    /// "Under the hood" paragraph.
     #[test]
     fn no_shown_literal_says_peer_owner_person_or_node() {
         let fixture = r##"
@@ -11494,6 +11495,10 @@ const OTHER_LABEL: &str = "this node";
             (
                 "src/function/mesh.rs".to_string(),
                 include_str!("../function/mesh.rs").to_string(),
+            ),
+            (
+                "src/utils/untrusted_content.rs".to_string(),
+                include_str!("../utils/untrusted_content.rs").to_string(),
             ),
         ]
         .into_iter()
