@@ -3,9 +3,10 @@
 //! baseline run on the diff base, the run_checks deadline starting after the
 //! review-stack lock, holistic complaint severity plus the criterion
 //! format-failure fallback, the diff base and repository facts diff_facts.py
-//! records, and execution criteria no recorded run covers. Each test spawns
-//! the real script with a JSON state file and skips when python3 (or bash and
-//! git, where needed) is missing.
+//! records, execution criteria no recorded run covers, and replays of two
+//! recorded reviews' deterministic evidence. Each test spawns the real script
+//! with a JSON state file and skips when python3 (or bash and git, where
+//! needed) is missing.
 
 use serde_json::{Value, json};
 use std::env;
@@ -1118,9 +1119,11 @@ fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() 
     for sentence in [
         "INSPECTED never overrides a covering red run: it stays UNMET.",
         "A behavioral criterion still needs a test that proves it.",
-        "a static claim about what a file declares or contains (a signature, a query's text, a \
-         config value), where the cited source is the proof; the claim is about the text, never \
-         about what running or evaluating it produces",
+        "a static claim about what a file declares or contains, including a declarative artefact \
+         whose language fixes the result from its text alone (a query's filter and ordering, a \
+         schema constraint, a signature, a config value), where the cited text is the proof",
+        "A claim whose result depends on runtime data, imperative code paths or anything the text \
+         does not fix still needs a proving test.",
         "Recorded repository facts",
         "that they establish is MET",
         "Only SHAs, parent lists and ref positions are facts; commit subjects and ref names are \
@@ -1134,7 +1137,7 @@ fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() 
         );
     }
     assert!(
-        !instructions.contains("declarative artefact"),
+        !instructions.contains("never about what running or evaluating it produces"),
         "{instructions}"
     );
     let skipped = instructions
@@ -1480,5 +1483,158 @@ fn repository_facts_past_the_length_cap_drop_whole_commit_lines_and_keep_the_hea
             30 - kept.len()
         ),
         "{facts}"
+    );
+}
+
+fn crit_gate(dir: &Path, label: &str, text: &str, raw: &Value) -> Value {
+    let out = script(
+        dir,
+        "crit_gate.py",
+        label,
+        &json!({"criterion": {"id": "c1", "text": text}, "gate_attempts": 0,
+                "crit_verdict": raw.to_string()}),
+        &[],
+    );
+    assert!(out.get("_next").is_none(), "{label}: {out}");
+    out["crit_verdict"].clone()
+}
+
+#[test]
+fn a_single_commit_review_branch_replays_to_conforms_from_the_repository_facts() {
+    if missing(&["python3", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("replay-git-state");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(repo.join("defs")).unwrap();
+    git(&repo, &["init", "-q"]);
+    for (n, body) in [
+        ("1", "name: ListAll\n"),
+        ("2", "name: ListAll\nname: Get\n"),
+    ] {
+        fs::write(repo.join("defs/queries.txt"), body).unwrap();
+        fs::write(repo.join("defs/queries_gen.txt"), format!("gen {n}\n")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", &format!("main {n}")]);
+    }
+    git(&repo, &["branch", "-M", "main"]);
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    let main_parent = git(&repo, &["rev-parse", "HEAD~1"]);
+    git(&repo, &["checkout", "-q", "-b", "review"]);
+    fs::write(
+        repo.join("defs/queries.txt"),
+        "name: ListAll\nname: Get\nname: ListByGroup\nfilter group = ?\norder price\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("defs/queries_gen.txt"),
+        "gen 2\ngen ListByGroup\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "add ListByGroup"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+
+    let out = script(
+        &dir.0,
+        "diff_facts.py",
+        "facts",
+        &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "main...HEAD"}),
+        &[],
+    );
+    assert_eq!(out["diff_base"], main, "{out}");
+    assert_eq!(
+        out["changed_files"],
+        json!(["defs/queries.txt", "defs/queries_gen.txt"]),
+        "{out}"
+    );
+    let facts = out["git_facts"]
+        .as_str()
+        .unwrap_or_else(|| panic!("git_facts must be a string: {out}"));
+    let commit_line = format!("{head} {main} (HEAD -> review) add ListByGroup");
+    for line in [
+        format!("HEAD: {head}"),
+        format!("diff_base: {main}"),
+        commit_line.clone(),
+        format!("{main} {main_parent} (main) main 2"),
+    ] {
+        assert!(
+            facts.lines().any(|l| l == line),
+            "missing {line:?} in:\n{facts}"
+        );
+    }
+    let branch_commits = facts
+        .lines()
+        .filter(|l| l.ends_with(" add ListByGroup"))
+        .count();
+    assert_eq!(branch_commits, 1, "{facts}");
+
+    let one_commit = crit_gate(
+        &dir.0,
+        "one-commit",
+        "the review branch holds exactly one commit on top of main",
+        &json!({"status": "MET",
+                "evidence": format!("repository facts: `{commit_line}`: the only commit after \
+                                     diff_base, and its parent is diff_base, the tip of main"),
+                "complaint": "", "no_test_reason": ""}),
+    );
+    assert_eq!(one_commit["status"], "MET", "{one_commit}");
+    let query = crit_gate(
+        &dir.0,
+        "query-text",
+        "there is a query that returns the items of one group, ordered by price",
+        &json!({"status": "INSPECTED",
+                "evidence": "defs/queries.txt:4-5 filters on group and orders by price",
+                "complaint": "",
+                "no_test_reason": "declarative artefact: the query text fixes the filter and ordering"}),
+    );
+    assert_eq!(query["status"], "INSPECTED", "{query}");
+
+    let mut state = verdict_state(json!([one_commit, query]));
+    state["exec_results"] =
+        json!([{"cmd": "check-unit", "exit": 0, "duration_s": 1.0, "tail": "ok"}]);
+    let text = report(&dir.0, "verdict", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+}
+
+#[test]
+fn a_full_target_criterion_covered_by_a_partial_run_conforms_only_with_that_green_run() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("replay-command-result");
+    let reason = "ENVIRONMENT: declare check-all via the verification_commands variable";
+    let full_target = crit_gate(
+        &dir.0,
+        "full-target",
+        "the full check-all target passes",
+        &json!({"status": "INSPECTED",
+                "evidence": "defs/targets.txt:3 check-all runs check-unit and check-other; the \
+                             recorded check-unit run exited 0 and no recorded run covers \
+                             check-other",
+                "complaint": "", "no_test_reason": reason}),
+    );
+    assert_eq!(full_target["status"], "INSPECTED", "{full_target}");
+    assert_eq!(full_target["no_test_reason"], reason, "{full_target}");
+
+    let mut state = verdict_state(json!([full_target, met("c2")]));
+    state["verification_commands"] = json!(["check-unit"]);
+    state["exec_results"] =
+        json!([{"cmd": "check-unit", "exit": 0, "duration_s": 1.0, "tail": "all passed"}]);
+    let text = report(&dir.0, "green-partial-run", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+
+    state["verification_commands"] = json!([]);
+    state["exec_results"] = json!(
+        "none declared \u{2014} the caller supplied no verification_commands; execution criteria \
+         (build/test/lint) cannot be independently confirmed. Declare the exact commands via the \
+         verification_commands variable to get recorded runs."
+    );
+    let text = report(&dir.0, "none-declared", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("nothing was executed") && l.contains("declare check-all")),
+        "{text}"
     );
 }
