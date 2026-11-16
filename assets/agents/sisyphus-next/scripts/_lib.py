@@ -25,6 +25,7 @@ RERUN_ONCE = 1            # adversary/security/probe/debris/debt/obs re-run-once
 SUBTASK_MAX = 6           # A11: in-run subtasks one run takes on; more is the architect's, asked (sizing verdict)
 CLARIFY_MAX = STRIKE_LIMIT
 REASK_MAX = STRIKE_LIMIT
+NAVIGATOR_REASK_MAX = RERUN_ONCE  # navigator words the reply interpreter cannot read go back to the navigator once
 CHOICE_OPTIONS_MIN = 2    # a multiple-choice escalation offers 2-4 options, one recommended (architect-next's bounds)
 CHOICE_OPTIONS_MAX = 4
 OWNER_POLL_MAX = 2        # ask_owner tool budget: wait 30 / poll 25 minutes

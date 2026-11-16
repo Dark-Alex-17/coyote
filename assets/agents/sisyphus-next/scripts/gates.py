@@ -33,8 +33,8 @@ from _lib import (  # noqa: E402
     set_frontmatter, criterion_commands,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
-    names_several_options, note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot,
-    split_option_reply, split_option_led, tail, truthy, var, write_artifact,
+    NAVIGATOR_REASK_MAX, names_several_options, note_script_error, now_iso, option, read_artifact, review_fault,
+    run_dir_for, snapshot, split_option_reply, split_option_led, tail, truthy, var, write_artifact,
 )
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
@@ -1860,9 +1860,6 @@ def interpret_route(state):
     ledger(state, u, f"interpret: {kind}: no verdict for {said!r} (interpreter fault) -> re-ask")
     u["_next"] = "parse_answer"
     return u
-
-
-NAVIGATOR_REASK_MAX = 1
 
 
 def _reask_navigator(state, u, esc, text, verdict):
