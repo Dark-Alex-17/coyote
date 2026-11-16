@@ -153,7 +153,11 @@ pub async fn handle_user_tool(
     }
 
     if HEADLESS.load(Ordering::SeqCst) {
-        emit_headless_default(None, &format!("{USER_FUNCTION_PREFIX}{}", action.name()), None);
+        emit_headless_default(
+            None,
+            &format!("{USER_FUNCTION_PREFIX}{}", action.name()),
+            None,
+        );
         return headless_value(ctx, headless_request(ctx, action, args));
     }
 
