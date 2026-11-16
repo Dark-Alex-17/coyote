@@ -6,8 +6,10 @@
 
 use crate::config::Session;
 use crate::config::mesh_config::{MeshConfig, MeshInterface};
+use crate::hooks::HookEvent;
 use crate::mesh::announce::ANNOUNCE_MAGIC;
 use crate::mesh::envoy::EnvoySink;
+use crate::mesh::events::RecordingHookSink;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
 use crate::mesh::node::{
@@ -434,6 +436,7 @@ fn print_debug_log(mark: Option<usize>) {
 
 /// The pinned Python `rnsd`, sharing its instance where no other daemon listens: this
 /// crate's nodes attach to it as `local` clients, the way they attach to a host's rnsd.
+/// `spawn_relay` runs it as a transport relay the nodes dial over TCP instead.
 /// The config dir outlives a `respawn`, so the second rnsd is the first one restarted:
 /// same endpoint, same `storage/`.
 struct Rnsd {
@@ -451,6 +454,37 @@ impl Rnsd {
     /// `None` when the suite is not switched on; see `require_reference` for what happens
     /// once it is.
     async fn spawn(tag: &str) -> Option<Self> {
+        let (instance, entry) = Self::instance();
+        Self::spawn_with(
+            tag,
+            &format!(
+                "[reticulum]\nenable_transport = No\nshare_instance = Yes\n{instance}[logging]\nloglevel = 6\n[interfaces]\n"
+            ),
+            entry,
+        )
+        .await
+    }
+
+    /// The pinned `rnsd` as a transport node that shares no instance and serves one
+    /// `TCPServerInterface` on a loopback port of this run's own: the relay a node dials
+    /// with a `private` entry, as it dials a team relay. `None` as for `spawn`.
+    async fn spawn_relay(tag: &str) -> Option<Self> {
+        let port = free_port();
+        Self::spawn_with(
+            tag,
+            &format!(
+                "[reticulum]\nenable_transport = Yes\nshare_instance = No\n[logging]\nloglevel = 6\n[interfaces]\n  [[Relay]]\n    type = TCPServerInterface\n    enabled = Yes\n    listen_ip = 127.0.0.1\n    listen_port = {port}\n"
+            ),
+            MeshInterface::Private {
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+        )
+        .await
+    }
+
+    /// rnsd on `config`, ready once `entry` answers.
+    async fn spawn_with(tag: &str, config: &str, entry: MeshInterface) -> Option<Self> {
         if !interop_enabled() {
             eprintln!("{}", off_switch_skip_line("scripts/mesh-interop/setup.sh"));
             return None;
@@ -465,14 +499,7 @@ impl Rnsd {
             dir.join("lxmf").display()
         );
         let config_dir = TempDir::new(tag);
-        let (instance, entry) = Self::instance();
-        fs::write(
-            config_dir.path.join("config"),
-            format!(
-                "[reticulum]\nenable_transport = No\nshare_instance = Yes\n{instance}[logging]\nloglevel = 6\n[interfaces]\n"
-            ),
-        )
-        .unwrap();
+        fs::write(config_dir.path.join("config"), config).unwrap();
         let child = Self::launch(&python, &pythonpath, &config_dir);
         let mut rnsd = Self {
             child,
@@ -516,8 +543,17 @@ impl Rnsd {
         )
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
     async fn answers(&self) -> bool {
+        if let MeshInterface::Private { host, port } = &self.entry {
+            return tokio::net::TcpStream::connect((host.as_str(), *port))
+                .await
+                .is_ok();
+        }
+        self.shared_instance_answers().await
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    async fn shared_instance_answers(&self) -> bool {
         use rns_transport::iface::local::{LocalUnixEndpoint, preflight_unix_connect};
         let MeshInterface::Local {
             instance: Some(name),
@@ -534,7 +570,7 @@ impl Rnsd {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    async fn answers(&self) -> bool {
+    async fn shared_instance_answers(&self) -> bool {
         let MeshInterface::Local {
             port: Some(port), ..
         } = &self.entry
@@ -589,7 +625,8 @@ impl Rnsd {
         }
     }
 
-    /// The `local` entry a node attaches to this rnsd with.
+    /// The entry a node joins this rnsd with: `local` for a shared instance, `private`
+    /// for a relay.
     fn entry(&self) -> MeshInterface {
         self.entry.clone()
     }
@@ -628,6 +665,12 @@ impl Drop for Rnsd {
     }
 }
 
+/// A loopback port nothing holds at the time of the call.
+fn free_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 /// Two distinct loopback ports nothing holds, both bound before either is released so
 /// the second bind cannot be handed the first port back.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
@@ -656,7 +699,9 @@ struct Node {
     instance_id: String,
     port: u16,
     session: Session,
-    tmp: TempDir,
+    /// Shared by every session of one user started on it; the dir is removed once the
+    /// last of them is gone.
+    tmp: Arc<TempDir>,
 }
 
 impl Node {
@@ -676,7 +721,7 @@ impl Node {
     ) -> Self {
         let tmp = TempDir::new(tag);
         trust.write(&mesh_paths(&tmp).config_dir);
-        Self::join(slot, port, session, tmp).await
+        Self::join(slot, port, session, Arc::new(tmp)).await
     }
 
     /// A node whose only interface is `entry`, a `local` client of an `Rnsd`. `port` has
@@ -693,19 +738,43 @@ impl Node {
             interfaces: vec![entry],
             ..MeshConfig::default()
         };
-        Self::join_with(Arc::new(MeshSlot::default()), &config, 0, session, tmp).await
+        Self::join_with(
+            Arc::new(MeshSlot::default()),
+            &config,
+            0,
+            session,
+            Arc::new(tmp),
+        )
+        .await
     }
 
-    async fn join(slot: Arc<MeshSlot>, port: u16, session: Session, tmp: TempDir) -> Self {
+    async fn join(slot: Arc<MeshSlot>, port: u16, session: Session, tmp: Arc<TempDir>) -> Self {
         Self::join_with(slot, &private_config(port), port, session, tmp).await
     }
 
+    /// `join_limiting_ingress` with announce ingress control off, so announces sent close
+    /// together are filed as soon as they arrive.
     async fn join_with(
         slot: Arc<MeshSlot>,
         config: &MeshConfig,
         port: u16,
+        session: Session,
+        tmp: Arc<TempDir>,
+    ) -> Self {
+        let node = Self::join_limiting_ingress(slot, config, port, session, tmp).await;
+        disable_ingress_control(&node.runtime).await;
+        node
+    }
+
+    /// A node on `tmp` with the transport's announce ingress control as it runs outside
+    /// tests. Every node started on one `tmp` loads the same identity, so each is a session
+    /// of one user; a distinct `session` gives each its own instance.
+    async fn join_limiting_ingress(
+        slot: Arc<MeshSlot>,
+        config: &MeshConfig,
+        port: u16,
         mut session: Session,
-        tmp: TempDir,
+        tmp: Arc<TempDir>,
     ) -> Self {
         let runtime = MeshRuntime::start(
             config,
@@ -716,7 +785,6 @@ impl Node {
         )
         .await
         .unwrap();
-        disable_ingress_control(&runtime).await;
         slot.install(runtime.clone()).unwrap();
         Self {
             instance_id: runtime.current_instance_id(),
@@ -758,7 +826,7 @@ struct Parked {
     slot: Arc<MeshSlot>,
     port: u16,
     session: Session,
-    tmp: TempDir,
+    tmp: Arc<TempDir>,
 }
 
 impl Parked {
@@ -2217,6 +2285,278 @@ async fn two_local_clients_of_one_rnsd_knock_through_it_and_follow_it_down_and_b
 
     a.stop().await;
     b.stop().await;
+    let status = rnsd.terminate();
+    assert!(status.success(), "rnsd exited {status} on SIGTERM");
+}
+
+/// How soon after two sessions of one user start together a third client of the same
+/// rnsd must have filed both of their announces. A shared-instance client used to hold
+/// the second of two local announces sent less than about 0.6 s apart for 360 s.
+const SECOND_SESSION_FILED_WITHIN: Duration = Duration::from_secs(2);
+
+/// Whether the nodes of `OneUserTwoSessions` keep the transport's announce ingress
+/// control on.
+#[derive(Clone, Copy)]
+enum AnnounceIngress {
+    /// As a node runs outside tests.
+    Limited,
+    /// As `Node::join_with` leaves it.
+    Unlimited,
+}
+
+/// Two sessions of one user, A1 and A2, and a third user B, all joined with one config.
+/// The sessions share a dir, so they load one identity and one transport identity,
+/// while each has an instance and a destination of its own.
+struct OneUserTwoSessions {
+    b: Node,
+    a1: Node,
+    a2: Node,
+    a1_fires: Arc<RecordingHookSink>,
+    a2_fires: Arc<RecordingHookSink>,
+    /// When both of A's sessions had started.
+    started: Instant,
+}
+
+/// When the second of A's sessions starts.
+#[derive(Clone, Copy)]
+enum SecondSession {
+    /// With the first, so their start announces go out close together.
+    Together,
+    /// Once B has filed the first's announce, so the network already holds a path to
+    /// the first session when the second, on the same identity, joins.
+    OnceTheFirstIsHeard,
+}
+
+impl OneUserTwoSessions {
+    /// B starts first, then A1 and A2 as `second` says. Both know B's identity without
+    /// trusting it, so B's knock is answered `NoAccess` (landed) rather than met with the
+    /// silence a stranger hears.
+    async fn start(
+        tag: &str,
+        config: &MeshConfig,
+        ingress: AnnounceIngress,
+        second: SecondSession,
+    ) -> Self {
+        let join = |tmp: Arc<TempDir>| {
+            let slot = Arc::new(MeshSlot::default());
+            let session = Session::default();
+            async move {
+                match ingress {
+                    AnnounceIngress::Limited => {
+                        Node::join_limiting_ingress(slot, config, 0, session, tmp).await
+                    }
+                    AnnounceIngress::Unlimited => {
+                        Node::join_with(slot, config, 0, session, tmp).await
+                    }
+                }
+            }
+        };
+        let b_dir = TempDir::new(&format!("{tag}-b"));
+        TrustList::default().write(&mesh_paths(&b_dir).config_dir);
+        let b = join(Arc::new(b_dir)).await;
+        let a_dir = TempDir::new(&format!("{tag}-a"));
+        TrustList::default()
+            .identity(b.runtime.fingerprint(), false)
+            .write(&mesh_paths(&a_dir).config_dir);
+        let a_dir = Arc::new(a_dir);
+        let (a1, a2) = match second {
+            SecondSession::Together => tokio::join!(join(a_dir.clone()), join(a_dir)),
+            SecondSession::OnceTheFirstIsHeard => {
+                let a1 = join(a_dir.clone()).await;
+                let a1_hash = a1.runtime.current_destination_hash();
+                let peers = b.runtime.peers();
+                wait_until("B to file A1's announce before A2 starts", || {
+                    peers.get(&a1_hash).is_some()
+                })
+                .await;
+                let a2 = join(a_dir).await;
+                (a1, a2)
+            }
+        };
+        let started = Instant::now();
+
+        assert_eq!(a1.runtime.fingerprint(), a2.runtime.fingerprint());
+        assert_ne!(
+            a1.runtime.current_destination_hash(),
+            a2.runtime.current_destination_hash()
+        );
+        Self {
+            a1_fires: RecordingHookSink::attach(a1.runtime.hooks()),
+            a2_fires: RecordingHookSink::attach(a2.runtime.hooks()),
+            b,
+            a1,
+            a2,
+            started,
+        }
+    }
+
+    /// B files the announces of both of A's sessions within `within` of their start.
+    async fn b_files_both_sessions(&self, within: Duration) {
+        let peers = self.b.runtime.peers();
+        for (node, name) in [(&self.a1, "A1"), (&self.a2, "A2")] {
+            let hash = node.runtime.current_destination_hash();
+            while peers.get(&hash).is_none() {
+                assert!(
+                    self.started.elapsed() < within,
+                    "B did not file {name}'s announce within {within:?} of both sessions starting"
+                );
+                sleep(POLL).await;
+            }
+        }
+        eprintln!(
+            "B filed both sessions {:?} after they started",
+            self.started.elapsed()
+        );
+    }
+
+    /// With both of A's sessions up, B knocks A1 and then A2, and each knock is filed by
+    /// the session it names and by no other.
+    async fn knocks_land_on_the_session_they_name(&self) {
+        for (target, fires, other_fires, name) in [
+            (&self.a1, &self.a1_fires, &self.a2_fires, "A1"),
+            (&self.a2, &self.a2_fires, &self.a1_fires, "A2"),
+        ] {
+            let filed = knocks_received(fires);
+            let filed_elsewhere = knocks_received(other_fires);
+            let desc = self
+                .b
+                .runtime
+                .resolve_destination(&target.runtime.current_destination_hash())
+                .await
+                .unwrap();
+            let outcome = self
+                .b
+                .runtime
+                .knock(
+                    crate::mesh::message::Route::unasked(desc),
+                    &KnockIntro::new(&format!("hi {name} from B")).unwrap(),
+                )
+                .await;
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(KnockOutcome {
+                        via: KnockVia::Direct,
+                        fallback: None,
+                    })
+                ),
+                "B's knock on {name} did not land directly: {outcome:?}"
+            );
+            wait_until(&format!("{name} to file B's knock"), || {
+                knocks_received(fires) == filed + 1
+            })
+            .await;
+            assert_eq!(
+                knocks_received(other_fires),
+                filed_elsewhere,
+                "B's knock on {name} was filed by the other session"
+            );
+        }
+    }
+
+    async fn stop(self) {
+        self.a1.stop().await;
+        self.a2.stop().await;
+        self.b.stop().await;
+    }
+}
+
+fn knocks_received(fires: &RecordingHookSink) -> usize {
+    fires
+        .snapshot()
+        .iter()
+        .filter(|(event, _)| *event == HookEvent::MeshKnockReceived)
+        .count()
+}
+
+/// Two sessions of one user attached to one rnsd as `local` clients, with announce
+/// ingress control on as it runs outside tests and both started together: a third client
+/// files both sessions' announces at once although they went out close together, and a
+/// link to either session reaches that session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn two_sessions_of_one_user_on_one_rnsd() {
+    let Some(mut rnsd) = Rnsd::spawn("interop-rnsd-one-user").await else {
+        return;
+    };
+    let config = MeshConfig {
+        interfaces: vec![rnsd.entry()],
+        ..MeshConfig::default()
+    };
+    let sessions = OneUserTwoSessions::start(
+        "interop-rnsd-one-user",
+        &config,
+        AnnounceIngress::Limited,
+        SecondSession::Together,
+    )
+    .await;
+
+    sessions
+        .b_files_both_sessions(SECOND_SESSION_FILED_WITHIN)
+        .await;
+    sessions.knocks_land_on_the_session_they_name().await;
+
+    sessions.stop().await;
+    let status = rnsd.terminate();
+    assert!(status.success(), "rnsd exited {status} on SIGTERM");
+}
+
+/// Two sessions of one user attached to one rnsd as `local` clients, the second only
+/// once rnsd holds a path to the first: a link to the first still reaches the first
+/// rather than the session that attached last, and a link to the second reaches the
+/// second. A tunnel synthesized on each attach collided here, as both sessions carry
+/// the user's transport identity, and rnsd moved the first's path onto the second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn the_first_of_two_sessions_of_one_user_on_one_rnsd_is_reached_after_the_second_attached() {
+    let Some(mut rnsd) = Rnsd::spawn("interop-rnsd-one-user-later").await else {
+        return;
+    };
+    let config = MeshConfig {
+        interfaces: vec![rnsd.entry()],
+        ..MeshConfig::default()
+    };
+    let sessions = OneUserTwoSessions::start(
+        "interop-rnsd-one-user-later",
+        &config,
+        AnnounceIngress::Unlimited,
+        SecondSession::OnceTheFirstIsHeard,
+    )
+    .await;
+
+    sessions.b_files_both_sessions(LINK_TIMEOUT).await;
+    sessions.knocks_land_on_the_session_they_name().await;
+
+    sessions.stop().await;
+    let status = rnsd.terminate();
+    assert!(status.success(), "rnsd exited {status} on SIGTERM");
+}
+
+/// Two sessions of one user dialing one rnsd transport relay over TCP, as they dial a
+/// team relay, the second only once the relay holds a path to the first: a link to
+/// either session reaches that session, not the one that connected last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn two_sessions_of_one_user_dialing_a_transport_relay_directly_over_tcp() {
+    let Some(mut rnsd) = Rnsd::spawn_relay("interop-rnsd-relay-one-user").await else {
+        return;
+    };
+    let config = MeshConfig {
+        interfaces: vec![rnsd.entry()],
+        ..MeshConfig::default()
+    };
+    let sessions = OneUserTwoSessions::start(
+        "interop-rnsd-relay-one-user",
+        &config,
+        AnnounceIngress::Unlimited,
+        SecondSession::OnceTheFirstIsHeard,
+    )
+    .await;
+
+    sessions.b_files_both_sessions(LINK_TIMEOUT).await;
+    sessions.knocks_land_on_the_session_they_name().await;
+
+    sessions.stop().await;
     let status = rnsd.terminate();
     assert!(status.success(), "rnsd exited {status} on SIGTERM");
 }

@@ -1869,6 +1869,50 @@ pub(crate) mod network {
         requester.stop().await;
     }
 
+    /// A pending link closed before it activates ends the request waiting on it at the
+    /// close, as `LinkNotOpened` naming the close, rather than at the end of its link
+    /// timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_closed_before_activation_fails_the_request_at_the_close() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        responder.stop().await;
+        let pending = requester.transport.link(desc).await.unwrap();
+        let held = Arc::strong_count(&pending);
+        let options = RequestOptions {
+            link_timeout: Duration::from_secs(30),
+            ..RequestOptions::default()
+        };
+        let attempt = link::request(
+            &requester.transport,
+            &requester.identity,
+            &desc,
+            "/echo",
+            requester.envelope(Value::Nil),
+            options,
+        );
+        // The transport hands the request the same pending link, so the request holds it
+        // once its count rises.
+        let close = async {
+            wait_until("the request to hold the pending link", || {
+                Arc::strong_count(&pending) > held
+            })
+            .await;
+            pending.lock().await.close();
+        };
+        let (outcome, ()) = tokio::join!(timeout(Duration::from_secs(5), attempt), close);
+
+        let err = outcome
+            .expect("the request ends at the close, not at its 30 s link timeout")
+            .unwrap_err();
+        assert!(
+            matches!(&err, RequestError::LinkNotOpened(reason) if reason.contains("closed before activation")),
+            "{err:?}"
+        );
+        assert_eq!(recorder.seen_count(), 0);
+        requester.stop().await;
+    }
+
     /// A waiter whose activation deadline runs out on a link another request has
     /// already brought up leaves that link open: the request in flight on it still gets
     /// its answer, and the next request is handed the same link.

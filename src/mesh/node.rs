@@ -14267,6 +14267,50 @@ mod tests {
         assert!(slot.stop().await.unwrap());
     }
 
+    /// A request whose pending link is closed before it activates fails at the close as
+    /// `LinkNotOpened`, well inside its link timeout, and leaves the peer marked
+    /// link-failed, which `.mesh peers` reads as `no route`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_closed_before_activation_marks_the_peer_no_route() {
+        let tag = "node-closed-before-activation";
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on(tag, stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        stub.wait_to_be_filed(&runtime.peers(), &to).await;
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        stub.stop().await;
+        let transport = runtime.transport_handle().await.unwrap();
+        let pending = transport.link(desc).await.unwrap();
+        let held = Arc::strong_count(&pending);
+        let options = RequestOptions {
+            link_timeout: Duration::from_secs(30),
+            ..RequestOptions::default()
+        };
+
+        let attempt = runtime.request(&desc, "/echo", rmpv::Value::Nil, options);
+        let close = async {
+            wait_until("the request to hold the pending link", || {
+                Arc::strong_count(&pending) > held
+            })
+            .await;
+            pending.lock().await.close();
+        };
+        let (result, ()) = tokio::join!(timeout(Duration::from_secs(5), attempt), close);
+
+        let result = result.expect("the request ends at the close, not at its 30 s link timeout");
+        assert!(
+            matches!(&result, Err(RequestError::LinkNotOpened(reason)) if reason.contains("closed before activation")),
+            "{result:?}"
+        );
+        assert!(runtime.link_failed(&to));
+        assert!(slot.stop().await.unwrap());
+    }
+
     /// The same held peer, marked gone by a failed link while it answers path requests:
     /// a foreground request waits on the path request it sends, so the session that is
     /// back is reached on the request the user typed. A background request in the same

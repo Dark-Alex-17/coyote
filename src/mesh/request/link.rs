@@ -375,6 +375,12 @@ pub(crate) async fn open_link(
         Ok(Err(err)) if err.kind() == ErrorKind::TimedOut => {
             Some(deadline.activation_expired(path))
         }
+        // The transport reports a link that closed before it activated as soon as it
+        // closes, naming the close ("link closed before activation: Timeout"); it was
+        // never opened, and the link is already gone, so there is nothing to close.
+        Ok(Err(err)) if err.kind() == ErrorKind::ConnectionAborted => {
+            return Err(RequestError::LinkNotOpened(err.to_string()));
+        }
         Ok(Err(err)) => return Err(RequestError::LinkNotOpened(err.to_string())),
         Err(err) => Some(err),
     };
