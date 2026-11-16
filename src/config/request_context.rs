@@ -33,7 +33,7 @@ use crate::function::{
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
-    skill::SKILL_FUNCTION_PREFIX,
+    skill::{SKILL_FUNCTION_PREFIX, report_withheld_tools},
     todo::TODO_FUNCTION_PREFIX,
     user_interaction::USER_FUNCTION_PREFIX,
 };
@@ -6909,10 +6909,7 @@ impl RequestContext {
         }
 
         println!("✓ Loaded skill '{name}'.");
-        for warning in &warnings {
-            warn!("{warning}");
-            eprintln!("{}", crate::utils::muted_warning_text(warning));
-        }
+        report_withheld_tools(&warnings, true);
         Ok(())
     }
 
@@ -13373,6 +13370,7 @@ mod tests {
     #[serial]
     fn skill_load_inside_an_agent_withholds_an_undeclared_global_tool_and_warns() {
         let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
         let (mut ctx, agent_name) = skill_grant_ctx(Some(&["fs_read"]));
         let agent_name = agent_name.unwrap();
         assert!(
@@ -13388,16 +13386,41 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], "ok", "{result}");
-        assert_eq!(
-            result["warnings"],
-            json!([format!(
-                "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
-            )]),
-            "{result}"
+        let warning = format!(
+            "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
         );
+        assert_eq!(result["warnings"], json!([warning]), "{result}");
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
         let offered = offered_tool_names(&ctx);
         assert!(
             !offered.iter().any(|name| name == "execute_command"),
+            "{offered:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_skill_load_inside_an_agent_withholds_an_undeclared_global_tool_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_grant_ctx(Some(&["fs_read"]));
+        let agent_name = agent_name.unwrap();
+
+        run_async(ctx.load_skill_repl("grants-exec", utils::create_abort_signal())).unwrap();
+
+        let warning = format!(
+            "Skill 'grants-exec' grants tool 'execute_command', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add execute_command to {agent_name}'s global_tools in the agent definition."
+        );
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        let offered = offered_tool_names(&ctx);
+        assert_eq!(
+            (
+                offered.iter().any(|name| name == "fs_read"),
+                offered.iter().any(|name| name == "execute_command")
+            ),
+            (true, false),
             "{offered:?}"
         );
     }

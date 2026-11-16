@@ -207,12 +207,7 @@ async fn handle_load(
         }));
     }
 
-    for warning in &warnings {
-        warn!("{warning}");
-        if ctx.current_depth == 0 {
-            eprintln!("{}", muted_warning_text(warning));
-        }
-    }
+    report_withheld_tools(&warnings, ctx.current_depth == 0);
     let mut result = json!({
         "status": "ok",
         "loaded": name,
@@ -225,6 +220,17 @@ async fn handle_load(
         result["warnings"] = json!(warnings);
     }
     Ok(result)
+}
+
+/// Reports each tool a skill grants but the active agent does not provide:
+/// always to the log, and to stderr when a person is watching this context.
+pub(crate) fn report_withheld_tools(warnings: &[String], to_stderr: bool) {
+    for warning in warnings {
+        warn!("{warning}");
+        if to_stderr {
+            eprintln!("{}", muted_warning_text(warning));
+        }
+    }
 }
 
 async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
