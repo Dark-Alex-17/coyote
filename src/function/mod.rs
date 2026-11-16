@@ -1786,6 +1786,16 @@ impl ToolCall {
                         json!({"tool_call_error": error_msg})
                     })
             }
+            _ if agent
+                .as_ref()
+                .is_some_and(|agent| !agent.functions().contains(&self.name)) =>
+            {
+                let agent_name = agent.as_ref().map(|agent| agent.name()).unwrap_or_default();
+                let error_msg = undeclared_tool_error(&self.name, agent_name);
+                warn!("{error_msg}");
+                emit_tool_warning(quiet, &error_msg, &error_msg);
+                json!({"tool_call_error": error_msg})
+            }
             _ => match run_llm_function(
                 cmd_name,
                 cmd_args,
@@ -2652,25 +2662,25 @@ pub struct ToolAgent {
     pub script: bool,
 }
 
-/// The directories a script tool run prepends to PATH. An agent's functions
-/// script and the global tools the agent declares are built into its bin dir;
-/// a global tool it reaches through the shared tool scope (one a loaded skill
-/// grants) is built only into the global functions bin, which follows the
-/// agent dir so the agent's own copies keep precedence and a declared global
-/// tool missing from the agent dir falls back to its global build.
+/// The directories a script tool run prepends to PATH. Inside an agent only
+/// its own bin dir, which holds its functions script and the global tools it
+/// declares in `global_tools`; outside an agent the global functions bin.
 pub(crate) fn tool_bin_dirs(agent: Option<&ToolAgent>) -> Vec<PathBuf> {
-    let mut dirs = vec![];
-    if let Some(agent) = agent {
-        let dir = paths::agent_bin_dir(&agent.name);
-        if dir.exists() {
-            dirs.push(dir);
+    match agent {
+        Some(agent) => {
+            let dir = paths::agent_bin_dir(&agent.name);
+            if dir.exists() { vec![dir] } else { vec![] }
         }
-        if agent.script {
-            return dirs;
-        }
+        None => vec![paths::functions_bin_dir()],
     }
-    dirs.push(paths::functions_bin_dir());
-    dirs
+}
+
+/// The refusal for a script tool the active agent does not declare. Skills
+/// never widen an agent's `global_tools`, so such a tool is not runnable.
+pub(crate) fn undeclared_tool_error(tool: &str, agent: &str) -> String {
+    format!(
+        "Tool '{tool}' is not enabled for agent '{agent}'. To use it, add {tool} to {agent}'s global_tools in the agent definition."
+    )
 }
 
 /// A spawn failure naming the tool, and for a missing executable the
@@ -5851,11 +5861,15 @@ mod tests {
         assert_eq!(output.attachments[0].source, png.display().to_string());
     }
 
-    /// An agent's bin dir holds only the tools the agent declares; a global
-    /// tool a loaded skill grants lives in the global functions bin. The
-    /// guards keep the config dir and environment in place.
+    /// A global tool `grantedglob` built into both the global functions bin
+    /// and the agent's bin dir, so a refusal cannot be a missing binary, and
+    /// offered through the shared tool scope the way a skill grants it. With
+    /// `declared` the agent lists it in its own tools. The guards keep the
+    /// config dir and environment in place.
     #[cfg(unix)]
-    fn skill_granted_tool_ctx() -> Option<(
+    fn skill_granted_tool_ctx(
+        declared: bool,
+    ) -> Option<(
         RequestContext,
         (
             crate::testing::TestConfigDirGuard,
@@ -5871,58 +5885,81 @@ mod tests {
         }
         let guard = TestConfigDirGuard::new("skill-granted-tool");
         let functions_env = EnvVarGuard::unset(get_env_name("functions_dir"));
-        let bin_dir = paths::functions_bin_dir();
-        fs::create_dir_all(&bin_dir).unwrap();
-        let tool = bin_dir.join("grantedglob");
-        fs::write(
-            &tool,
-            "#!/usr/bin/env bash\nprintf globbed >> \"$LLM_OUTPUT\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
-
         let agent_name = "skill-granted-agent";
-        fs::create_dir_all(paths::agent_bin_dir(agent_name)).unwrap();
+        for bin_dir in [paths::functions_bin_dir(), paths::agent_bin_dir(agent_name)] {
+            fs::create_dir_all(&bin_dir).unwrap();
+            let tool = bin_dir.join("grantedglob");
+            fs::write(
+                &tool,
+                "#!/usr/bin/env bash\nprintf globbed >> \"$LLM_OUTPUT\"\n",
+            )
+            .unwrap();
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
-        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
-        ctx.agent = Some(Agent::test_new(AgentConfig {
+        let declaration = FunctionDeclaration {
+            name: "grantedglob".into(),
+            description: String::new(),
+            parameters: Default::default(),
+            agent: false,
+        };
+        let mut agent = Agent::test_new(AgentConfig {
             name: agent_name.into(),
             ..Default::default()
-        }));
-        ctx.tool_scope
-            .functions
-            .append_declaration(FunctionDeclaration {
-                name: "grantedglob".into(),
-                description: String::new(),
-                parameters: Default::default(),
-                agent: false,
-            });
+        });
+        if declared {
+            agent
+                .functions_mut()
+                .append_declaration(declaration.clone());
+        }
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(agent);
+        ctx.tool_scope.functions.append_declaration(declaration);
         Some((ctx, (guard, functions_env)))
+    }
+
+    /// Runs `grantedglob` through `eval_output`.
+    #[cfg(unix)]
+    fn eval_granted_tool(ctx: &mut RequestContext) -> ToolOutput {
+        // A freshly written script can still be open for writing in a forked
+        // child elsewhere in the process, making exec fail with ETXTBSY.
+        let mut attempts = 0;
+        loop {
+            let output = run_async(
+                call_with_args("grantedglob", json!({"pattern": "*.rs"})).eval_output(ctx),
+            )
+            .unwrap();
+            let busy = output.value.to_string().contains("Text file busy");
+            if !busy || attempts >= 10 {
+                return output;
+            }
+            attempts += 1;
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[cfg(unix)]
     #[test]
     #[serial]
-    fn eval_output_runs_skill_granted_global_tool_inside_agent() {
-        let Some((mut ctx, _guards)) = skill_granted_tool_ctx() else {
+    fn eval_output_refuses_a_global_tool_the_agent_does_not_declare() {
+        let Some((mut ctx, _guards)) = skill_granted_tool_ctx(false) else {
             return;
         };
+        let output = eval_granted_tool(&mut ctx);
+        assert_eq!(
+            output.value,
+            json!({"tool_call_error": "Tool 'grantedglob' is not enabled for agent 'skill-granted-agent'. To use it, add grantedglob to skill-granted-agent's global_tools in the agent definition."})
+        );
+    }
 
-        // A freshly written script can still be open for writing in a forked
-        // child elsewhere in the process, making exec fail with ETXTBSY.
-        let mut attempts = 0;
-        let output = loop {
-            let output = run_async(
-                call_with_args("grantedglob", json!({"pattern": "*.rs"})).eval_output(&mut ctx),
-            )
-            .unwrap();
-            let busy = output.value.to_string().contains("Text file busy");
-            if !busy || attempts >= 10 {
-                break output;
-            }
-            attempts += 1;
-            thread::sleep(Duration::from_millis(50));
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_output_runs_a_global_tool_the_agent_declares() {
+        let Some((mut ctx, _guards)) = skill_granted_tool_ctx(true) else {
+            return;
         };
+        let output = eval_granted_tool(&mut ctx);
         assert_eq!(output.value, json!({"output": "globbed"}));
     }
 
@@ -5952,6 +5989,8 @@ mod tests {
     fn run_llm_function_names_a_missing_global_tool_not_its_arguments() {
         let _guard = crate::testing::TestConfigDirGuard::new("missing-granted-tool");
         let _functions_env = crate::testing::EnvVarGuard::unset(get_env_name("functions_dir"));
+        let agent_bin = paths::agent_bin_dir("missing-tool-agent");
+        fs::create_dir_all(&agent_bin).unwrap();
 
         let err = run_llm_function(
             "grantedmissing".into(),
@@ -5969,11 +6008,10 @@ mod tests {
         .to_string();
 
         assert!(
-            err.starts_with("Unable to run grantedmissing: no 'grantedmissing' executable in ["),
-            "{err}"
-        );
-        assert!(
-            err.contains(&paths::functions_bin_dir().display().to_string()),
+            err.starts_with(&format!(
+                "Unable to run grantedmissing: no 'grantedmissing' executable in [{}] or PATH",
+                agent_bin.display()
+            )),
             "{err}"
         );
         assert!(!err.contains("pattern"), "{err}");
