@@ -1427,6 +1427,7 @@ mod tests {
     fn run_tool(name: &str, envs: HashMap<String, String>, io: ToolIo) -> Value {
         let result = run_llm_function(name.to_string(), vec![], envs, None, None, io, None)
             .unwrap()
+            .output
             .unwrap_or_default();
         match serde_json::from_str::<Value>(&result) {
             Ok(error) if error.get("tool_call_error").is_some() => error,
@@ -4066,6 +4067,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 None,
             )
             .unwrap()
+            .output
             .unwrap_or_default();
             match serde_json::from_str::<Value>(&result) {
                 Ok(error) if error.get("tool_call_error").is_some() => error,

@@ -2717,6 +2717,7 @@ mod tests {
     /// The shared config dir guard plus a config file pinned to an empty
     /// `config.yaml` inside it, which the vault tests load.
     struct TestVaultConfigGuard {
+        path: PathBuf,
         _config_file_env: crate::testing::EnvVarGuard,
         _config: crate::testing::TestConfigDirGuard,
     }
@@ -2727,6 +2728,7 @@ mod tests {
             let config_path = config.path.join("config.yaml");
             fs::write(&config_path, "{}").unwrap();
             Self {
+                path: config.path.clone(),
                 _config_file_env: crate::testing::EnvVarGuard::set(
                     get_env_name("config_file"),
                     &config_path,

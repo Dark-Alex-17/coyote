@@ -5920,6 +5920,7 @@ mod tests {
 
         let result = result
             .unwrap()
+            .output
             .expect("nonzero exit must return an error payload");
         let json: Value = serde_json::from_str(&result).unwrap();
         assert!(
@@ -5983,7 +5984,7 @@ mod tests {
                 envs,
                 None,
                 tool_timeout,
-                true,
+                ToolIo::new(Arc::new(SilentSink), None, 0),
                 abort,
             )
             .unwrap(),

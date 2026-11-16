@@ -651,7 +651,7 @@ pub(crate) async fn turn_interrupt_notice(
 /// Awaits a step that runs before the turn's request, such as the RAG
 /// lookup, so a Ctrl-C that fails it shows the same notice (and, without a
 /// session, cancels the same background work) as an aborted request.
-async fn interruptible_step<T>(
+pub(crate) async fn interruptible_step<T>(
     ctx: &RequestContext,
     abort_signal: &AbortSignal,
     step: impl Future<Output = Result<T>>,
@@ -675,7 +675,7 @@ fn sessionless_cancelling_notice(unfinished: usize) -> String {
 
 /// The notice for agents that had not stopped when the cancel wait of
 /// `wait` gave up.
-fn sessionless_still_running_notice(names: &[String], wait: Duration) -> String {
+pub(crate) fn sessionless_still_running_notice(names: &[String], wait: Duration) -> String {
     format!(
         "{} background agent(s) still running after {}s: {}. Press Ctrl-C again at the idle prompt to cancel them.",
         names.len(),

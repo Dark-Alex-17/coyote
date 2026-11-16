@@ -4262,12 +4262,11 @@ mod tests {
             .notification_queue
             .drain()
             .iter()
-            .map(|notification| {
-                (
-                    notification.event,
-                    notification.id.clone(),
-                    notification.status,
-                )
+            .map(|notification| match notification {
+                SystemNotification::Task {
+                    event, id, status, ..
+                } => (*event, id.clone(), *status),
+                SystemNotification::UserMessage { .. } => panic!("{:?}", notification.to_value()),
             })
             .collect();
         assert_eq!(notified, [("agent_failed", id, "failed")]);
@@ -4472,8 +4471,7 @@ mod tests {
         let _sink = hooks::test_sink::install();
         let bus = crate::events::RecordingSink::install();
 
-        SpawnResultHooks::resolve(&ctx, agent_id, "explore", None)
-            .fire(None, &create_abort_signal());
+        SpawnResultHooks::resolve(&ctx, agent_id, "explore", None).fire(None, false);
 
         let published = bus.drain_hooks_with_env("COYOTE_AGENT_ID", agent_id);
         assert_eq!(published.len(), 1, "{published:?}");
@@ -17136,7 +17134,7 @@ mod tests {
                 .notification_queue
                 .drain()
                 .into_iter()
-                .map(|n| n.id)
+                .map(|n| n.id().unwrap().to_string())
                 .collect();
             assert_eq!(left, vec!["other"]);
         });

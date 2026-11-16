@@ -3025,6 +3025,10 @@ mod tests {
         dim_notice_color, interrupted_turn_notice, maybe_auto_compress, pause_banner_text,
         spawn_turn_interrupt_bridge,
     };
+    use crate::turn::driver::{
+        cancel_sessionless_turn_tasks, interruptible_step, sessionless_still_running_notice,
+        turn_notice_sink,
+    };
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;

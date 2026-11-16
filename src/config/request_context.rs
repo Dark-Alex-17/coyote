@@ -24506,7 +24506,7 @@ mod tests {
     #[serial]
     fn bundled_assets_teach_agent_wait() {
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         for (path, base_rule) in [

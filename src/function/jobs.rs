@@ -4275,7 +4275,7 @@ mod tests {
                 .notification_queue
                 .drain()
                 .into_iter()
-                .map(|n| n.id)
+                .map(|n| n.id().unwrap().to_string())
                 .collect();
             assert_eq!(left, vec!["job_other"]);
         });

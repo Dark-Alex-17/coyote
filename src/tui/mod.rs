@@ -30,7 +30,6 @@ mod todo;
 mod transcript;
 
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
-use crate::utils::process::ProcessStamp;
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, Origin, SubscriptionId};
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
@@ -39,6 +38,7 @@ use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, inp
 use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
 use crate::supervisor::notification::NotificationQueue;
 use crate::supervisor::{TaskKind, TaskRow};
+use crate::utils::process::ProcessStamp;
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, anyhow, bail};
 use bottom_pane::{
@@ -6181,6 +6181,8 @@ mod tests {
                 join_handle,
                 child_supervisor: None,
                 session_id: None,
+                child_session_root: None,
+                succeeded: Default::default(),
             })
             .unwrap();
         ctx.supervisor = Some(supervisor);
@@ -10794,6 +10796,8 @@ mod tests {
             }),
             child_supervisor: None,
             session_id: None,
+            child_session_root: None,
+            succeeded: Default::default(),
         }
     }
 
