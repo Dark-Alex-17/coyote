@@ -2,9 +2,10 @@
 //! criteria met by inspection, red verification runs compared with a
 //! baseline run on the diff base, the run_checks deadline starting after the
 //! review-stack lock, holistic complaint severity plus the criterion
-//! format-failure fallback, and the diff base diff_facts.py resolves. Each
-//! test spawns the real script with a JSON state file and skips when python3
-//! (or bash and git, where needed) is missing.
+//! format-failure fallback, the diff base and repository facts diff_facts.py
+//! records, and execution criteria no recorded run covers. Each test spawns
+//! the real script with a JSON state file and skips when python3 (or bash and
+//! git, where needed) is missing.
 
 use serde_json::{Value, json};
 use std::env;
@@ -973,4 +974,204 @@ fn review_prompts_carry_the_bookkeeping_files_fact() {
         graph["initial_state"]["bookkeeping_files"],
         serde_yaml::Value::Sequence(vec![])
     );
+}
+
+#[test]
+fn diff_facts_records_the_commits_between_the_diff_base_and_head() {
+    if missing(&["python3", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("git-facts");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for n in ["1", "2"] {
+        fs::write(repo.join("f.txt"), format!("{n}\n")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", &format!("main {n}")]);
+    }
+    git(&repo, &["branch", "-M", "main"]);
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    let main_parent = git(&repo, &["rev-parse", "HEAD~1"]);
+    git(&repo, &["checkout", "-q", "-b", "review"]);
+    fs::write(repo.join("g.txt"), "one\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "review one"]);
+    let r1 = git(&repo, &["rev-parse", "HEAD"]);
+
+    let facts = |label: &str, spec: &str| {
+        let out = script(
+            &dir.0,
+            "diff_facts.py",
+            label,
+            &json!({"project_dir": repo.to_string_lossy(), "diff_spec": spec}),
+            &[],
+        );
+        let text = out["git_facts"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{label}: git_facts must be a string: {out}"))
+            .to_string();
+        (out, text)
+    };
+    let (out, text) = facts("one-commit", "main...HEAD");
+    assert_eq!(out["diff_base"], main, "{out}");
+    for line in [
+        format!("HEAD: {r1}"),
+        format!("diff_base: {main}"),
+        format!("merge-base of diff_base and HEAD: {main}"),
+        format!("{r1} {main} (HEAD -> review) review one"),
+        format!("{main} {main_parent} (main) main 2"),
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in:\n{text}"
+        );
+    }
+
+    fs::write(repo.join("g.txt"), "two\n").unwrap();
+    git(&repo, &["commit", "-q", "-am", "review two"]);
+    let r2 = git(&repo, &["rev-parse", "HEAD"]);
+    let (_, text) = facts("two-commits", "main...HEAD");
+    for line in [
+        format!("{r2} {r1} (HEAD -> review) review two"),
+        format!("{r1} {main} () review one"),
+    ] {
+        assert!(
+            text.lines().any(|l| l == line),
+            "missing {line:?} in:\n{text}"
+        );
+    }
+    assert!(!text.contains("capped"), "{text}");
+
+    for n in 0..30 {
+        git(
+            &repo,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                &format!("filler {n}"),
+            ],
+        );
+    }
+    let (_, text) = facts("capped", "main...HEAD");
+    assert!(
+        text.contains("(capped at the newest 30 of 32 commits)"),
+        "{text}"
+    );
+    assert!(!text.contains(&format!("{r1} {main}")), "{text}");
+
+    let (out, text) = facts("no-base", "no-such-ref");
+    assert_eq!(out["diff_base"], "", "{out}");
+    assert_eq!(
+        text, "no diff base could be resolved, so no commit facts were recorded",
+        "{out}"
+    );
+    assert!(
+        !out["diff_text"].as_str().unwrap_or_default().is_empty(),
+        "{out}"
+    );
+}
+
+#[test]
+fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() {
+    let graph: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("adversary/graph.yaml")).unwrap()).unwrap();
+    for node in ["check_criterion", "holistic"] {
+        let prompt = graph["nodes"][node]["prompt"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{node}: prompt"));
+        assert!(
+            prompt.contains(
+                "Repository facts (recorded by the deterministic facts stage):\n{{git_facts}}"
+            ),
+            "{node}: {prompt}"
+        );
+    }
+    assert_eq!(
+        graph["initial_state"]["git_facts"],
+        serde_yaml::Value::from("")
+    );
+
+    let instructions = graph["nodes"]["check_criterion"]["instructions"]
+        .as_str()
+        .unwrap();
+    let uncovered = instructions
+        .split("\n- ")
+        .find(|bullet| bullet.contains("\"none declared\""))
+        .unwrap_or_else(|| panic!("no bullet for the none-declared case: {instructions}"));
+    assert!(!uncovered.contains("at best PARTIAL"), "{uncovered}");
+    assert!(
+        uncovered.contains("return INSPECTED with `no_test_reason` beginning")
+            && uncovered.contains(
+                "`ENVIRONMENT: declare <command> via the verification_commands variable`"
+            ),
+        "{uncovered}"
+    );
+    assert!(
+        instructions.contains("INSPECTED never overrides a covering red run: it stays UNMET."),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("a static claim about what a file declares or\n  contains"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("Recorded repository facts")
+            && instructions.contains("that they establish is MET"),
+        "{instructions}"
+    );
+}
+
+#[test]
+fn an_uncovered_execution_criterion_judged_satisfied_is_inspected_not_partial() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("uncovered-execution");
+    let verdict = |reason: &str| {
+        json!({"status": "INSPECTED",
+               "evidence": "py/notify/backoff.py:34 doubles the delay up to the cap",
+               "complaint": "", "no_test_reason": reason})
+        .to_string()
+    };
+    let reason = "ENVIRONMENT: declare make test via the verification_commands variable";
+    let out = gate(&dir.0, "environment-reason", 0, &verdict(reason));
+    let inspected = out["crit_verdict"].clone();
+    assert_eq!(inspected["status"], "INSPECTED", "{out}");
+    assert_eq!(inspected["no_test_reason"], reason, "{out}");
+
+    for (label, bare) in [("bare", "ENVIRONMENT:"), ("bare-spaced", "ENVIRONMENT:   ")] {
+        let out = gate(&dir.0, label, 0, &verdict(bare));
+        assert_eq!(out["_next"], "check_criterion", "{label}: {out}");
+        assert!(
+            out["gate_feedback"]
+                .as_str()
+                .unwrap()
+                .contains("must name the command to declare"),
+            "{label}: {out}"
+        );
+    }
+
+    let mut state = verdict_state(json!([inspected.clone(), met("c2")]));
+    state["exec_results"] =
+        json!([{"cmd": "sh run-unit-tests.sh", "exit": 0, "duration_s": 1.0, "tail": ""}]);
+    let text = report(&dir.0, "conforms", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    let section = text
+        .split("Inspected, not test-proven:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no inspected section: {text}"));
+    assert!(
+        section.contains("py/notify/backoff.py:34") && section.contains(reason),
+        "{text}"
+    );
+
+    let diverged = json!({"id": "c3", "text": "does c3", "status": "DIVERGED",
+        "evidence": "src/q.rs:4", "complaint": "orders by name, not by price", "no_test_reason": ""});
+    state["crit_verdicts"] = json!([inspected, met("c2"), diverged]);
+    let text = report(&dir.0, "diverges", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(text.contains("orders by name, not by price"), "{text}");
 }
