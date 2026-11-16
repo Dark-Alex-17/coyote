@@ -10243,7 +10243,7 @@ mod tests {
         let (flat, mesh) = info.split_once("\nmesh:\n").expect("mesh: header present");
         assert!(flat.contains("function_calling_support"), "{flat}");
         assert!(
-            mesh.starts_with("  enabled                         false\n"),
+            mesh.starts_with("  enabled                               false\n"),
             "{mesh}"
         );
         let default_interface = if cfg!(any(target_os = "linux", target_os = "android")) {
@@ -10253,7 +10253,7 @@ mod tests {
         };
         assert!(
             mesh.contains(&format!(
-                "  interfaces[0]                   {default_interface}\n"
+                "  interfaces[0]                         {default_interface}\n"
             )),
             "{mesh}"
         );
