@@ -2038,7 +2038,7 @@ nodes:
         );
     }
 
-    /// Usage probe (AC3): "capped at 8 KiB" is a closed bound — a message of
+    /// "Capped at 8 KiB" is a closed bound: a message of
     /// exactly `SCRIPT_FALLBACK_ERROR_MAX_BYTES` is stored verbatim, one byte
     /// more keeps the head ¼ and tail ¾ verbatim around a marker naming the
     /// single dropped byte.

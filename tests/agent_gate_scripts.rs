@@ -1932,8 +1932,9 @@ fn usage_probe_verify_scripts_keep_misaligned_multibyte_transcript_as_valid_json
 
 /// The README anchors the matrix test above does not pin: coder's
 /// CODER_FAILED line names the crashed-twice cause and its env list has the
-/// new override; step-runner's STEP_FAILED bullet names the routing gates
-/// and its Fault handling section has the verify_* bullet.
+/// COYOTE_GATE_OUTPUT_MAX_BYTES override; step-runner's STEP_FAILED bullet
+/// names the routing gates and its Fault handling section has the verify_*
+/// bullet.
 #[test]
 fn usage_probe_readmes_document_the_gate_crash_contract() {
     let coder = fs::read_to_string(asset("coder/README.md")).unwrap();
@@ -2349,10 +2350,10 @@ fn usage_probe_gate_crash_branch_fires_for_every_verify_node_id() {
 }
 
 /// Both arms of coder/route_review_result.sh read `review_notes` from
-/// stdin — a 300 000-byte note set (above the 128 KiB per-argument cap the
-/// change removes) must reach `fix_instructions` on the findings arm and
+/// stdin, so a 300 000-byte note set (above the 128 KiB per-argument cap)
+/// must reach `fix_instructions` on the findings arm and
 /// `review_notes_unresolved` on the budget-exhausted arm, tail intact, with
-/// HEAD's routing targets (`implement` / `end_success`) unchanged.
+/// the routing targets `implement` / `end_success`.
 #[test]
 fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
     if tools_missing() {
@@ -2416,7 +2417,7 @@ fn usage_probe_coder_route_review_result_both_arms_carry_300kb_notes() {
 
 /// Step-runner route_coder_result.sh's `*)` (no recognizable sentinel)
 /// branch ends the step and must clear the gate-crash keys like CODER_FAILED
-/// does, keeping HEAD's blocking_reason; CODER_REJECTED keeps routing to
+/// does, keeping the blocking_reason already set; CODER_REJECTED keeps routing to
 /// end_rejected.
 #[test]
 fn usage_probe_step_runner_route_coder_result_unknown_sentinel_clears_gate_keys() {
@@ -4339,7 +4340,7 @@ fn bullet_lines<'a>(doc: &'a str, prefix: &str) -> Vec<&'a str> {
 /// CODER_FAILED now has three causes (fix budget spent, verification gate
 /// crashed twice, routing gate crashed), so the step-runner's
 /// blocking_reason for it is cause-neutral: the same label for every
-/// cause-shaped coder report, never the old fix-loop wording. The sisyphus
+/// cause-shaped coder report, never a fix-loop label. The sisyphus
 /// instructions that read that result name all three causes.
 #[test]
 fn step_runner_route_coder_result_failed_label_is_cause_neutral_and_sisyphus_names_the_causes() {

@@ -3,8 +3,10 @@
 //! no builtins bootstrap). Only --info guarantees output on stdout; the
 //! list flags legitimately emit an empty listing on a pristine dir, so
 //! their contract is exit 0 + zero writes. Vault-backed flags like
-//! --list-secrets depend on host state and are not covered
-//! here. Agent runs, by contrast,
+//! --list-secrets depend on host state outside a sandbox, so only their
+//! sandbox-mode readout is pinned here
+//! (sandbox_list_secrets_prints_informational_message_and_writes_nothing).
+//! Agent runs, by contrast,
 //! must still bootstrap builtins even when combined with --info — see
 //! agent_info_on_empty_config_dir_bootstraps_builtins. Flags that write,
 //! like --sync-models, are NOT inspection flags and must stay on the
