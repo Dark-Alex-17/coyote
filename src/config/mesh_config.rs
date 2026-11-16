@@ -180,6 +180,10 @@ pub struct EnvoyMemoryConfig {
     pub max_bytes: u64,
     /// Hours a thread is remembered after its last written exchange.
     pub ttl_hours: u64,
+    /// Days a whole store may go without its envoy loading or saving a thread before
+    /// any joined session deletes it, whether or not memory is enabled. `None` leaves
+    /// each session pruning only its own store.
+    pub prune_unused_after_days: Option<u64>,
 }
 
 impl Default for EnvoyMemoryConfig {
@@ -191,6 +195,7 @@ impl Default for EnvoyMemoryConfig {
             max_turns: DEFAULT_ENVOY_MEMORY_MAX_TURNS,
             max_bytes: DEFAULT_ENVOY_MEMORY_MAX_BYTES,
             ttl_hours: DEFAULT_ENVOY_MEMORY_TTL_HOURS,
+            prune_unused_after_days: None,
         }
     }
 }
@@ -411,6 +416,11 @@ impl MeshConfig {
                 bail!("mesh.envoy_memory.{name} is 0, which is out of range; use 1 or more");
             }
         }
+        if memory.prune_unused_after_days == Some(0) {
+            bail!(
+                "mesh.envoy_memory.prune_unused_after_days is 0, which is out of range; use 1 or more, or null to keep only each session's own pruning"
+            );
+        }
         Ok(())
     }
 }
@@ -582,7 +592,10 @@ impl From<MeshInterface> for RawMeshInterface {
 pub fn render_mesh_info(mesh: &MeshConfig) -> String {
     mesh_settings_rows(mesh, true)
         .into_iter()
-        .map(|(name, value)| format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
+        .map(|(name, value)| {
+            let width = MESH_INFO_LABEL_WIDTH.max(name.len() + 2);
+            format!("  {name:<width$}{value}\n")
+        })
         .collect()
 }
 
@@ -699,6 +712,10 @@ pub fn mesh_settings_rows(mesh: &MeshConfig, with_interfaces: bool) -> Vec<(Stri
     row("envoy_memory.max_turns", memory.max_turns.to_string());
     row("envoy_memory.max_bytes", memory.max_bytes.to_string());
     row("envoy_memory.ttl_hours", memory.ttl_hours.to_string());
+    row(
+        "envoy_memory.prune_unused_after_days",
+        super::format_option_value(&memory.prune_unused_after_days),
+    );
     rows
 }
 
@@ -1824,11 +1841,49 @@ mod tests {
                     max_turns: 1,
                     max_bytes: 1,
                     ttl_hours: 1,
+                    prune_unused_after_days: Some(1),
                 },
                 ..Default::default()
             };
             mesh.validate(true).unwrap();
         }
+    }
+
+    #[test]
+    fn mesh_envoy_memory_prune_unused_after_days_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            prune_unused_after_days: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.prune_unused_after_days is 0, which is out of range; use 1 or more, or null to keep only each session's own pruning"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_prune_unused_after_days_defaults_to_null_and_parses() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  envoy_memory: {}\n").unwrap();
+        assert_eq!(cfg.mesh.envoy_memory.prune_unused_after_days, None);
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  envoy_memory:\n    prune_unused_after_days: null\n")
+                .unwrap();
+        assert_eq!(cfg.mesh.envoy_memory.prune_unused_after_days, None);
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  envoy_memory:\n    prune_unused_after_days: 1\n")
+                .unwrap();
+        assert_eq!(cfg.mesh.envoy_memory.prune_unused_after_days, Some(1));
+        let mesh = MeshConfig {
+            enabled: true,
+            ..cfg.mesh
+        };
+        mesh.validate(true).unwrap();
+        MeshConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .validate(true)
+        .unwrap();
     }
 
     #[test]
@@ -2131,6 +2186,7 @@ mod tests {
                 "  envoy_memory.max_turns          40\n",
                 "  envoy_memory.max_bytes          65536\n",
                 "  envoy_memory.ttl_hours          168\n",
+                "  envoy_memory.prune_unused_after_days  null\n",
             )),
             "{info}"
         );
@@ -2179,7 +2235,10 @@ mod tests {
             "{info}"
         );
         assert!(
-            info.ends_with("  envoy_memory.ttl_hours          168\n"),
+            info.ends_with(concat!(
+                "  envoy_memory.ttl_hours          168\n",
+                "  envoy_memory.prune_unused_after_days  null\n",
+            )),
             "{info}"
         );
     }

@@ -18,7 +18,8 @@ use crate::mesh::card_cadence::{
 use crate::mesh::card_refusals::card_refusals_path;
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::envoy_sessions::{
-    EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn, Forgotten, RememberedOf,
+    EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn, Forgotten,
+    RememberedOf, UnusedStores,
 };
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
@@ -151,6 +152,9 @@ const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
 const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
+/// How often a node whose config sets `envoy_memory.prune_unused_after_days` sweeps every
+/// instance's envoy memory store for ones left unused that long, after the sweep at join.
+pub(crate) const ENVOY_STORE_SWEEP_SECS: u64 = 86_400;
 /// Refusal shared by `MeshSlot::install` and the `.mesh on` pre-check.
 pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
 /// Floor between two snapshot captures made at progress points inside a turn. Turn
@@ -1137,6 +1141,16 @@ impl MeshRuntime {
             let swept = Arc::downgrade(&runtime);
             runtime.register_task(tokio::spawn(sweep_envoy_memory(
                 move || swept.upgrade().and_then(|runtime| runtime.envoy_memory()),
+                runtime.cancellation_token(),
+            )));
+        }
+        if let Some(days) = config.envoy_memory.prune_unused_after_days {
+            let swept = Arc::downgrade(&runtime);
+            runtime.register_task(tokio::spawn(sweep_unused_envoy_stores(
+                runtime.cache_dir.clone(),
+                config.envoy_memory.clone(),
+                days,
+                move || swept.upgrade().map(|runtime| runtime.current_instance_id()),
                 runtime.cancellation_token(),
             )));
         }
@@ -4096,6 +4110,84 @@ async fn sweep_envoy_memory(
                 prune_envoy_memory(&store);
             },
         }
+    }
+}
+
+/// Deletes every instance's envoy memory store left unused for `days` days, once at join
+/// (the interval's first tick fires at once) and every `ENVOY_STORE_SWEEP_SECS` after.
+/// `current` names the instance this node serves at each tick, since a re-key moves it;
+/// that store and every store whose session the instance registry says is running are
+/// kept. Stops when `current` has no node left or `cancel` fires.
+async fn sweep_unused_envoy_stores(
+    cache_dir: PathBuf,
+    config: EnvoyMemoryConfig,
+    days: u64,
+    current: impl Fn() -> Option<String> + Send + 'static,
+    cancel: CancellationToken,
+) {
+    let mut ticks = interval(Duration::from_secs(ENVOY_STORE_SWEEP_SECS));
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => {
+                let Some(instance_id) = current() else { break };
+                let cache_dir = cache_dir.clone();
+                let config = config.clone();
+                let swept = tokio::task::spawn_blocking(move || {
+                    let mut keep: HashSet<String> = instances::sessions_by_instance(&cache_dir)
+                        .into_iter()
+                        .filter(|(_, session)| matches!(session, InstanceSession::Running(_)))
+                        .map(|(id, _)| id)
+                        .collect();
+                    keep.insert(instance_id);
+                    EnvoySessions::prune_unused_everywhere(
+                        &cache_dir,
+                        &config,
+                        days,
+                        SystemTime::now(),
+                        &keep,
+                    )
+                })
+                .await;
+                log_unused_envoy_stores(swept, days);
+            },
+        }
+    }
+}
+
+fn log_unused_envoy_stores(
+    swept: Result<Result<UnusedStores, EnvoyMemoryError>, tokio::task::JoinError>,
+    days: u64,
+) {
+    match swept {
+        Ok(Ok(unused)) => {
+            if unused.removed > 0 {
+                info!(
+                    "Removed {} envoy memory store(s) unused for {days} day(s)",
+                    unused.removed
+                );
+            }
+            if unused.stamped > 0 {
+                debug!(
+                    "Stamped {} envoy memory store(s) seen for the first time as used now",
+                    unused.stamped
+                );
+            }
+            if unused.unreadable_stores > 0 {
+                warn!(
+                    "{} envoy memory store(s) could not be read, so whether they are unused is unknown; they were left as they are",
+                    unused.unreadable_stores
+                );
+            }
+        }
+        Ok(Err(err)) => warn!(
+            "Failed to sweep unused envoy memory stores: {}",
+            redact_hashes(&err.to_string())
+        ),
+        Err(err) => warn!(
+            "Failed to sweep unused envoy memory stores: {}",
+            redact_hashes(&err.to_string())
+        ),
     }
 }
 
@@ -20224,6 +20316,83 @@ mod tests {
         assert_eq!(store.stats().unwrap(), (1, 1));
         runtime.shutdown().await.unwrap();
         relay_handle.abort();
+    }
+
+    /// Plants an envoy memory store under `instance_id` last used a year ago.
+    fn plant_year_old_store(paths: &MeshPaths, instance_id: &str) -> EnvoySessions {
+        let on = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = EnvoySessions::open(&paths.cache_dir, instance_id, &on).unwrap();
+        let year_ago = SystemTime::now() - Duration::from_secs(365 * 86_400);
+        store
+            .save(
+                REMEMBERED_PEER,
+                &remembered_from(),
+                "old",
+                peer_turns(),
+                year_ago,
+            )
+            .unwrap();
+        store
+    }
+
+    /// With `prune_unused_after_days` set the join sweeps every store, memory on or
+    /// off: another instance's store unused for a year goes, the running one's stays
+    /// however old its stamp.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_sweeps_unused_envoy_stores_with_the_memory_off() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-envoy-store-sweep");
+        let paths = mesh_paths(&tmp);
+        let config = MeshConfig {
+            envoy_memory: EnvoyMemoryConfig {
+                enabled: false,
+                prune_unused_after_days: Some(30),
+                ..EnvoyMemoryConfig::default()
+            },
+            ..private_config(addr.port())
+        };
+        let mut session = Session::default();
+        let instance_id = session.ensure_mesh_instance_id().to_string();
+        let running = plant_year_old_store(&paths, &instance_id);
+        let other = plant_year_old_store(&paths, "inst-other");
+
+        let runtime =
+            MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+                .await
+                .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while other.dir().exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!other.dir().exists(), "the unused store went at join");
+        assert!(remembered_record(&running, "old").exists());
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_without_prune_unused_after_days_leaves_other_envoy_stores_alone() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-envoy-store-no-sweep");
+        let paths = mesh_paths(&tmp);
+        let config = private_config(addr.port());
+        assert_eq!(config.envoy_memory.prune_unused_after_days, None);
+        let mut session = Session::default();
+        let other = plant_year_old_store(&paths, "inst-other");
+
+        let runtime =
+            MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+                .await
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+
+        assert!(remembered_record(&other, "old").exists());
     }
 
     #[cfg(unix)]

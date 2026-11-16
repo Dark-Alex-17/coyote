@@ -38,6 +38,11 @@ const STORE_NAME: &str = "envoy memory";
 const INDEX_FILE: &str = "index.json";
 const RECORD_EXTENSION: &str = "yaml";
 
+/// How stale a store's last-used stamp may be before a load rewrites the index to bump
+/// it; a save always does. Days-scale pruning needs no finer stamp, and a busy envoy
+/// then rewrites the index for a read at most once an hour.
+pub(crate) const STORE_STAMP_REFRESH: Duration = Duration::from_secs(3600);
+
 /// The envoy memory as the trust list sees it: a revoked identity's conversations go
 /// with its trust. Implemented by the node, which knows which instance's store is
 /// current; a no-op while the memory is off.
@@ -79,6 +84,16 @@ impl Remembered {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Forgotten {
     pub removed: usize,
+    pub unreadable_stores: usize,
+}
+
+/// What `prune_unused_everywhere` did: `removed` counts whole stores deleted, `stamped`
+/// the stores seen with no last-used stamp and stamped now, `unreadable_stores` the
+/// stores whose index could not be read, left as they were.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnusedStores {
+    pub removed: usize,
+    pub stamped: usize,
     pub unreadable_stores: usize,
 }
 
@@ -149,6 +164,11 @@ pub(crate) enum EnvoyRole {
 pub(crate) struct EnvoySessionIndex {
     pub version: u64,
     pub entries: Vec<EnvoySessionEntry>,
+    /// RFC 3339 UTC seconds of the last time the envoy loaded or saved a thread here;
+    /// what `prune_unused_everywhere` judges. Absent on an index written before the
+    /// field existed, which keeps the version.
+    #[serde(default)]
+    pub store_last_used: Option<String>,
 }
 
 /// One conversation as the index knows it. Eviction judges the entry alone and never
@@ -500,6 +520,50 @@ impl EnvoySessions {
         })
     }
 
+    /// Deletes every instance's store under `cache_dir` whose envoy has neither loaded
+    /// nor saved a thread for more than `days` days, by the store's last-used stamp and
+    /// not by the age of what it holds. A store with no stamp yet is stamped `now`
+    /// instead, so it is judged from first sight and never deleted on it; a stamp in the
+    /// future counts as fresh. Stores named in `keep` (sessions that are running) are
+    /// not touched, and a store whose index cannot be read is logged, counted and left.
+    /// `days` of 0 does nothing: the config reaching here is not always validated. Same
+    /// walk as `delete_identity_everywhere`, whether or not the memory is on.
+    pub(crate) fn prune_unused_everywhere(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+        days: u64,
+        now: SystemTime,
+        keep: &HashSet<String>,
+    ) -> Result<UnusedStores, EnvoyMemoryError> {
+        if days == 0 {
+            return Ok(UnusedStores::default());
+        }
+        let unused_for = Duration::from_secs(days.saturating_mul(86_400));
+        let mut removed = 0;
+        let mut stamped = 0;
+        let unreadable_stores = Self::sweep(cache_dir, config, "swept", |store| {
+            let kept = store
+                .dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| keep.contains(name));
+            if kept {
+                return Ok(());
+            }
+            match store.remove_if_unused(unused_for, now)? {
+                StoreUse::Removed => removed += 1,
+                StoreUse::Stamped => stamped += 1,
+                StoreUse::Used => {}
+            }
+            Ok(())
+        })?;
+        Ok(UnusedStores {
+            removed,
+            stamped,
+            unreadable_stores,
+        })
+    }
+
     /// Hands every instance's store under `cache_dir` to `visit`, whether or not the
     /// memory is on: records may remain from a time it was. A store is a directory of its
     /// own, never one behind a symlink, that holds an index or at least one record file;
@@ -555,7 +619,8 @@ impl EnvoySessions {
     /// index on the way. A record under this key that names another identity or another
     /// destination is refused, never returned. One past `ttl_hours` since its last save
     /// is forgotten here and now rather than handed back; the rest of the store waits
-    /// for `prune`.
+    /// for `prune`. A store whose index exists has its last-used stamp bumped when the
+    /// stamp is missing or `STORE_STAMP_REFRESH` old.
     pub(crate) fn load(
         &self,
         identity: &str,
@@ -574,6 +639,10 @@ impl EnvoySessions {
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut index = self.read_index()?;
+        if self.index_path().exists() && stamp_is_stale(&index, now) {
+            index.store_last_used = Some(rfc3339_utc(now));
+            self.write_index(&index)?;
+        }
         let Some(indexed) = self.owned(&index, &key, &identity, &destination)? else {
             return Ok(None);
         };
@@ -774,6 +843,7 @@ impl EnvoySessions {
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut index = self.read_index()?;
+        index.store_last_used = Some(rfc3339_utc(now));
         let indexed = match self.owned(&index, &key, &identity, &destination)? {
             Some(indexed)
                 if matches!(mode, Write::Append { .. })
@@ -887,6 +957,34 @@ impl EnvoySessions {
         Ok(evicted.len())
     }
 
+    /// Under both locks: stamps a store that has no last-used stamp, removes one whose
+    /// stamp is more than `unused_for` before `now` (every record file and the index,
+    /// then the lock file and the directory if nothing else is left in it), and leaves
+    /// any other as it is.
+    fn remove_if_unused(
+        &self,
+        unused_for: Duration,
+        now: SystemTime,
+    ) -> Result<StoreUse, EnvoyMemoryError> {
+        let _guard = self.write_lock.lock();
+        let _file_lock = self.file_lock()?;
+        let mut index = self.read_index()?;
+        let Some(last_used) = index.store_last_used.as_deref().and_then(parse_rfc3339) else {
+            index.store_last_used = Some(rfc3339_utc(now));
+            self.write_index(&index)?;
+            return Ok(StoreUse::Stamped);
+        };
+        if now.duration_since(last_used).unwrap_or_default() <= unused_for {
+            return Ok(StoreUse::Used);
+        }
+        self.wipe_unread()?;
+        // Best effort and still under the lock, so no other handle takes a fresh one on a
+        // directory about to go; where an open file cannot be removed both stay behind.
+        let _ = fs::remove_file(self.index_path().with_added_extension("lock"));
+        let _ = fs::remove_dir(&self.dir);
+        Ok(StoreUse::Removed)
+    }
+
     /// `(conversations, distinct identities)`; `(0, 0)` while the store does not exist.
     pub(crate) fn stats(&self) -> Result<(usize, usize), EnvoyMemoryError> {
         if !self.dir.exists() {
@@ -971,8 +1069,9 @@ impl EnvoySessions {
         Ok(removed.len())
     }
 
-    /// Called under both locks by `delete_all`; removes every record file and the index
-    /// without reading either, and counts the record files that went.
+    /// Called under both locks by `delete_all` and `remove_if_unused`; removes every
+    /// record file and the index without reading either, and counts the record files
+    /// that went.
     fn wipe_unread(&self) -> Result<usize, EnvoyMemoryError> {
         let records = self.record_files()?;
         for path in &records {
@@ -1083,6 +1182,7 @@ impl EnvoySessions {
         .unwrap_or(EnvoySessionIndex {
             version: ENVOY_SESSION_INDEX_VERSION,
             entries: Vec::new(),
+            store_last_used: None,
         }))
     }
 
@@ -1184,6 +1284,12 @@ struct Indexed {
     record: Option<EnvoySessionFile>,
 }
 
+enum StoreUse {
+    Used,
+    Stamped,
+    Removed,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Write {
     /// The turns given are the whole record.
@@ -1224,6 +1330,15 @@ fn text_bytes(turns: &[EnvoyTurn]) -> u64 {
 /// the future (clock stepped back) reads as just made.
 fn is_expired(stamp: &str, now: SystemTime, ttl: Duration) -> bool {
     parse_rfc3339(stamp).is_none_or(|at| now.duration_since(at).unwrap_or_default() >= ttl)
+}
+
+/// Whether a load should rewrite `index` to bump its last-used stamp: it has none, or
+/// one that does not parse, or one `STORE_STAMP_REFRESH` or more before `now`.
+fn stamp_is_stale(index: &EnvoySessionIndex, now: SystemTime) -> bool {
+    index
+        .store_last_used
+        .as_deref()
+        .is_none_or(|stamp| is_expired(stamp, now, STORE_STAMP_REFRESH))
 }
 
 /// Drops whole exchanges from the front of `turns`, oldest first, until it fits
@@ -3742,5 +3857,277 @@ mod tests {
                 && !message.contains(&forget_thread)),
             "captured: {warns:#?}"
         );
+    }
+
+    const DAY: u64 = 86_400;
+
+    fn stamp_of(store: &EnvoySessions) -> Option<String> {
+        store.read_index().unwrap().store_last_used
+    }
+
+    /// Rewrites `store`'s index as a build before the stamp existed wrote it.
+    fn unstamp(store: &EnvoySessions) {
+        let mut index: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(store.index_path()).unwrap()).unwrap();
+        index.as_object_mut().unwrap().remove("store_last_used");
+        fs::write(store.index_path(), index.to_string()).unwrap();
+    }
+
+    fn keep_none() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    #[test]
+    fn a_save_an_append_and_a_load_stamp_the_store_as_used() {
+        let tmp = TempDir::new("envoy-sessions-store-stamp");
+        let store = store(&tmp, &enabled());
+        store
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(1_000))));
+
+        store
+            .append(
+                IDENTITY_A,
+                DEST_A,
+                "thread-one",
+                exchange(2),
+                t(2_000),
+                false,
+            )
+            .unwrap();
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(2_000))));
+
+        store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(2_000 + 1_800))
+            .unwrap();
+        assert_eq!(
+            stamp_of(&store),
+            Some(rfc3339_utc(t(2_000))),
+            "a load inside the refresh window leaves the index alone"
+        );
+        store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(2_000 + 3_600))
+            .unwrap();
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(2_000 + 3_600))));
+
+        unstamp(&store);
+        assert_eq!(stamp_of(&store), None, "an index without the field reads");
+        let session = store.session_thread(IDENTITY_A, DEST_A, Some("thread-one"), "m-2", t(6_000));
+        assert!(session.resumed.is_some());
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(t(6_000))));
+        assert_eq!(store.read_index().unwrap().version, 1);
+    }
+
+    #[test]
+    fn a_load_stamps_no_store_whose_index_does_not_exist() {
+        let tmp = TempDir::new("envoy-sessions-stamp-no-index");
+        let store = store(&tmp, &enabled());
+        assert_eq!(
+            store
+                .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+                .unwrap(),
+            None
+        );
+        assert!(!tmp.path.join("mesh").exists());
+        let orphan = store.dir().join(format!("{}.yaml", "de".repeat(16)));
+        fs::create_dir_all(store.dir()).unwrap();
+        fs::write(&orphan, "version: 1\n").unwrap();
+        store
+            .load(IDENTITY_A, DEST_A, "thread-one", t(1_000))
+            .unwrap();
+        assert!(!store.index_path().exists());
+    }
+
+    /// Two stores whose records are a year old: one last used a year ago, one loaded
+    /// yesterday. Only the one unused for the configured days goes, whole.
+    #[test]
+    fn prune_unused_removes_a_store_unused_for_n_days_and_keeps_one_used_yesterday() {
+        let tmp = TempDir::new("envoy-sessions-prune-unused");
+        let config = EnvoyMemoryConfig {
+            ttl_hours: 2 * 366 * 24,
+            ..enabled()
+        };
+        let now = t(400 * DAY);
+        let year_ago = t(35 * DAY);
+        let old = EnvoySessions::open(&tmp.path, "inst-old", &config).unwrap();
+        let recent = EnvoySessions::open(&tmp.path, "inst-recent", &config).unwrap();
+        for store in [&old, &recent] {
+            store
+                .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), year_ago)
+                .unwrap();
+        }
+        let yesterday = now - Duration::from_secs(DAY);
+        assert!(
+            recent
+                .load(IDENTITY_A, DEST_A, "thread-one", yesterday)
+                .unwrap()
+                .is_some()
+        );
+
+        assert_eq!(
+            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 30, now, &keep_none())
+                .unwrap(),
+            UnusedStores {
+                removed: 1,
+                stamped: 0,
+                unreadable_stores: 0,
+            }
+        );
+
+        assert!(
+            !old.dir().exists(),
+            "the whole store goes, lock and directory"
+        );
+        assert_eq!(stamp_of(&recent), Some(rfc3339_utc(yesterday)));
+        assert_eq!(
+            recent
+                .load(IDENTITY_A, DEST_A, "thread-one", now)
+                .unwrap()
+                .unwrap()
+                .last_used,
+            rfc3339_utc(year_ago),
+            "the year-old thread stays"
+        );
+        assert_eq!(
+            EnvoySessions::prune_unused_everywhere(
+                &tmp.path,
+                &config,
+                0,
+                t(900 * DAY),
+                &keep_none()
+            )
+            .unwrap(),
+            UnusedStores::default(),
+            "0 days does nothing"
+        );
+        assert!(recent.dir().exists());
+    }
+
+    #[test]
+    fn prune_unused_stamps_an_unstamped_store_and_never_deletes_it_on_sight() {
+        let tmp = TempDir::new("envoy-sessions-prune-unstamped");
+        let config = enabled();
+        let store = EnvoySessions::open(&tmp.path, "inst-old", &config).unwrap();
+        store
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        unstamp(&store);
+        let orphan_only = stores_dir(&tmp.path).join("inst-orphan");
+        fs::create_dir_all(&orphan_only).unwrap();
+        fs::write(
+            orphan_only.join(format!("{}.yaml", "de".repeat(16))),
+            "version: 1\n",
+        )
+        .unwrap();
+        let now = t(400 * DAY);
+
+        assert_eq!(
+            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 1, now, &keep_none())
+                .unwrap(),
+            UnusedStores {
+                removed: 0,
+                stamped: 2,
+                unreadable_stores: 0,
+            }
+        );
+        assert_eq!(stamp_of(&store), Some(rfc3339_utc(now)));
+        assert!(record_path(&store, IDENTITY_A, "thread-one").exists());
+        assert!(orphan_only.join(INDEX_FILE).exists());
+
+        let later = now + Duration::from_secs(DAY);
+        assert_eq!(
+            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 1, later, &keep_none())
+                .unwrap()
+                .removed,
+            0,
+            "exactly the days since the stamp is not more than them"
+        );
+        assert_eq!(
+            EnvoySessions::prune_unused_everywhere(
+                &tmp.path,
+                &config,
+                1,
+                later + Duration::from_secs(1),
+                &keep_none()
+            )
+            .unwrap()
+            .removed,
+            2
+        );
+        assert!(!store.dir().exists());
+        assert!(!orphan_only.exists());
+    }
+
+    #[test]
+    fn prune_unused_keeps_the_running_stores_and_a_stamp_in_the_future() {
+        let tmp = TempDir::new("envoy-sessions-prune-keep");
+        let config = enabled();
+        let running = EnvoySessions::open(&tmp.path, "inst-running", &config).unwrap();
+        running
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        let ahead = EnvoySessions::open(&tmp.path, "inst-ahead", &config).unwrap();
+        ahead
+            .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(900 * DAY))
+            .unwrap();
+        let keep = HashSet::from(["inst-running".to_string()]);
+
+        assert_eq!(
+            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 1, t(400 * DAY), &keep)
+                .unwrap(),
+            UnusedStores::default()
+        );
+        assert_eq!(stamp_of(&running), Some(rfc3339_utc(t(1_000))));
+        assert!(record_path(&running, IDENTITY_A, "thread-one").exists());
+        assert!(record_path(&ahead, IDENTITY_A, "thread-one").exists());
+    }
+
+    #[test]
+    fn prune_unused_leaves_a_store_whose_index_cannot_be_read_and_counts_it() {
+        let tmp = TempDir::new("envoy-sessions-prune-unreadable");
+        let config = enabled();
+        let mut planted = Vec::new();
+        for (instance, to) in [
+            ("inst-newer", "\"version\":2"),
+            ("inst-unknown", "\"version\":1,\"bogus\":1"),
+        ] {
+            let store = EnvoySessions::open(&tmp.path, instance, &config).unwrap();
+            store
+                .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+                .unwrap();
+            unstamp(&store);
+            plant(&store.index_path(), "\"version\":1", to);
+            planted.push((
+                store,
+                fs::read_to_string(store_index(&tmp, instance)).unwrap(),
+            ));
+        }
+
+        for days in [1, 3_650] {
+            assert_eq!(
+                EnvoySessions::prune_unused_everywhere(
+                    &tmp.path,
+                    &config,
+                    days,
+                    t(400 * DAY),
+                    &keep_none()
+                )
+                .unwrap(),
+                UnusedStores {
+                    removed: 0,
+                    stamped: 0,
+                    unreadable_stores: 2,
+                }
+            );
+        }
+        for (store, text) in &planted {
+            assert_eq!(&fs::read_to_string(store.index_path()).unwrap(), text);
+            assert_refused_in_place(store, &store.index_path(), text);
+        }
+    }
+
+    fn store_index(tmp: &TempDir, instance: &str) -> PathBuf {
+        stores_dir(&tmp.path).join(instance).join(INDEX_FILE)
     }
 }

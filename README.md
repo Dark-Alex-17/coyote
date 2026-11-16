@@ -416,6 +416,7 @@ destinations leaves it), and `.mesh envoy memory forget <identity|all> [thread]`
 | `mesh.envoy_memory.max_turns`     | `40`            | Most turns kept per thread; the oldest exchange goes first; must be `1` or more                                                                                              |
 | `mesh.envoy_memory.max_bytes`     | `65536`         | Most bytes of turn text kept per thread; the oldest exchange goes first, and kept turns that do not fit the envoy model's context are left out of the run, oldest first, and stay remembered; must be `1` or more |
 | `mesh.envoy_memory.ttl_hours`     | `168`           | Hours a thread is remembered after its last written exchange; must be `1` or more                                                                                            |
+| `mesh.envoy_memory.prune_unused_after_days` | `null` | Days an instance's whole store may go unused (its envoy neither loading nor saving a thread) before any session that joins the mesh deletes it, at join and once a day after, even with memory off; `null` keeps only each session's own pruning; must be `1` or more |
 
 ---
 

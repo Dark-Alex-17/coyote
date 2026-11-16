@@ -3064,10 +3064,11 @@ fn the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enfor
 
 /// The `envoy_memory:` block is documented wherever the other mesh keys are: the template,
 /// the example, the README table and the Configuration page's yaml block and Keys table
-/// each carry all six keys; every documented default is the `DEFAULT_ENVOY_MEMORY_*`
-/// constant (and `enabled` the `false` of the `Default` impl); the template, example and
-/// wiki yaml lines are byte-equal; and `enabled`'s README and wiki rows say the memory is
-/// off by default.
+/// each carry all seven keys; every documented default is the `DEFAULT_ENVOY_MEMORY_*`
+/// constant (and `enabled` the `false` of the `Default` impl, `prune_unused_after_days`
+/// its `None`); the template, example and wiki yaml lines are byte-equal; and `enabled`'s
+/// README and wiki rows say the memory is off by default. `prune_unused_after_days`
+/// applies whether or not the memory is enabled, so its wiki condition says when set.
 #[test]
 fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_code_uses() {
     let Some(wiki) = wiki_dir() else { return };
@@ -3132,6 +3133,10 @@ fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_co
         default_impl.contains("enabled: false,"),
         "EnvoyMemoryConfig::default no longer turns the memory off:\n{default_impl}"
     );
+    assert!(
+        default_impl.contains("prune_unused_after_days: None,"),
+        "EnvoyMemoryConfig::default no longer leaves prune_unused_after_days unset:\n{default_impl}"
+    );
     let bound = |name: &str| const_u64("src/config/mesh_config.rs", name).to_string();
     let keys = [
         ("enabled", "false".to_string()),
@@ -3143,6 +3148,7 @@ fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_co
         ("max_turns", bound("DEFAULT_ENVOY_MEMORY_MAX_TURNS")),
         ("max_bytes", bound("DEFAULT_ENVOY_MEMORY_MAX_BYTES")),
         ("ttl_hours", bound("DEFAULT_ENVOY_MEMORY_TTL_HOURS")),
+        ("prune_unused_after_days", "null".to_string()),
     ];
 
     for (key, default) in &keys {
@@ -3200,7 +3206,11 @@ fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_co
             );
             assert_eq!(
                 table_cells(&wiki_row(key)).last().map(String::as_str),
-                Some(">= 1 when enabled"),
+                Some(if *key == "prune_unused_after_days" {
+                    ">= 1 when set"
+                } else {
+                    ">= 1 when enabled"
+                }),
                 "{}",
                 wiki_row(key)
             );

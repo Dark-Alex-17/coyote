@@ -58633,6 +58633,7 @@ mod tests {
                     "envoy_memory.max_turns",
                     "envoy_memory.max_bytes",
                     "envoy_memory.ttl_hours",
+                    "envoy_memory.prune_unused_after_days",
                 ] {
                     assert!(has_info_row(&out, key), "{key} row missing: {out}");
                 }

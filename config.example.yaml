@@ -435,6 +435,9 @@ mesh:
     max_bytes: 65536             # Most bytes of turn text kept per thread; the oldest exchange goes first, and kept turns that do not fit the envoy model's
                                  # context are left out of the run, oldest first, and stay remembered (default: 65536; must be 1 or more)
     ttl_hours: 168               # Hours a thread is remembered after its last written exchange (default: 168; must be 1 or more)
+    prune_unused_after_days: null # Days an instance's whole store may go unused (its envoy neither loading nor saving a thread) before any session that
+                                  # joins the mesh deletes it, swept at join and daily even with enabled: false; null keeps only each session's own pruning
+                                  # (default: null; must be 1 or more)
 
 # ---- Clients ----
 # See the [Clients documentation](https://github.com/Dark-Alex-17/coyote/wiki/Clients) for more details
