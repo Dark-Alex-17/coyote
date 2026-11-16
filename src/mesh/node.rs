@@ -6198,10 +6198,9 @@ impl MeshSlot {
                         .is_some_and(|claimed| claimed != opened)
                     {
                         debug!(
-                            "Mesh reply {} from {} names thread {} but answers {id}, sent in {opened}; filing it in {opened}",
+                            "Mesh reply {} from {} names another thread than {id}, which was sent in {opened}; filing it in {opened}",
                             reply.message_id,
-                            short(&reply.source_identity),
-                            reply.thread.as_deref().unwrap_or_default()
+                            short(&reply.source_identity)
                         );
                     }
                     reply.thread = Some(opened);
