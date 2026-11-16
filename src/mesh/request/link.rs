@@ -10,7 +10,7 @@ use crate::mesh::request::{redact_hashes, short};
 use rmpv::Value;
 use rns_transport::delivery::await_link_activation;
 use rns_transport::destination::DestinationDesc;
-use rns_transport::destination::link::Link;
+use rns_transport::destination::link::{Link, LinkCloseReason};
 use rns_transport::destination::request::{
     RequestError as LibraryRequestError, RequestOptions as LibraryRequestOptions, RequestReceipt,
 };
@@ -128,6 +128,16 @@ impl Deadline {
         RequestError::LinkActivationTimeout {
             path: path.to_string(),
             after: self.after,
+            recently_seen: false,
+        }
+    }
+
+    /// As `activation_expired`, for a link the transport closed at its own establishment
+    /// timeout before this deadline ran out: the wait lasted only as long as it ran.
+    fn activation_closed(self, path: &str) -> RequestError {
+        RequestError::LinkActivationTimeout {
+            path: path.to_string(),
+            after: self.after.saturating_sub(self.remaining()),
             recently_seen: false,
         }
     }
@@ -376,9 +386,17 @@ pub(crate) async fn open_link(
             Some(deadline.activation_expired(path))
         }
         // The transport reports a link that closed before it activated as soon as it
-        // closes, naming the close ("link closed before activation: Timeout"); it was
-        // never opened, and the link is already gone, so there is nothing to close.
+        // closes. A close at the link's own establishment timeout is the peer not
+        // answering in time, as this request's deadline running out is; any other close
+        // means the link was never opened. The link is already gone either way, so there
+        // is nothing to close.
         Ok(Err(err)) if err.kind() == ErrorKind::ConnectionAborted => {
+            let reason = deadline
+                .bound_locally(path, async { link.lock().await.close_reason() })
+                .await?;
+            if matches!(reason, Some(LinkCloseReason::Timeout)) {
+                return Err(deadline.activation_closed(path));
+            }
             return Err(RequestError::LinkNotOpened(err.to_string()));
         }
         Ok(Err(err)) => return Err(RequestError::LinkNotOpened(err.to_string())),

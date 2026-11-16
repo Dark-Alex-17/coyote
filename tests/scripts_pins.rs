@@ -1879,12 +1879,10 @@ fn cargo_toml_dependency_version(cargo_toml: &str, name: &str) -> String {
 }
 
 /// The run of comment lines directly above the `coyote-rns-transport` pin (every paragraph
-/// of it, not only the fork-surface one) names the per-interface connect counter the pinned
-/// release brings and its synchronous twin.
-#[test]
-fn the_transport_pin_comment_names_the_fork_connect_counter() {
+/// of it, not only the fork-surface one), joined into one line.
+fn transport_pin_comment() -> String {
     let cargo_toml = read(repo_root().join("Cargo.toml"));
-    let comment: String = cargo_toml
+    cargo_toml
         .split_once(&format!("\n{TRANSPORT_CRATE} = \""))
         .map(|(before, _)| before)
         .unwrap_or_else(|| panic!("Cargo.toml pins `{TRANSPORT_CRATE}`"))
@@ -1896,7 +1894,14 @@ fn the_transport_pin_comment_names_the_fork_connect_counter() {
         .into_iter()
         .rev()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+/// The comment above the `coyote-rns-transport` pin names the per-interface connect counter
+/// the pinned release brings and its synchronous twin.
+#[test]
+fn the_transport_pin_comment_names_the_fork_connect_counter() {
+    let comment = transport_pin_comment();
     for name in [
         "`Transport::interface_connect_count`",
         "`TcpRuntimeStatusHandle::connected_streams`",
@@ -1904,6 +1909,28 @@ fn the_transport_pin_comment_names_the_fork_connect_counter() {
         assert!(
             comment.contains(name),
             "the comment above the `{TRANSPORT_CRATE}` pin must name {name}"
+        );
+    }
+}
+
+/// The comment above the `coyote-rns-transport` pin records that Coyote leaves the shared
+/// instance tunnel off and why, and how `open_link` reads the activation wait's fail-fast
+/// close.
+#[test]
+fn the_transport_pin_comment_records_the_tunnel_and_activation_contracts() {
+    let comment = transport_pin_comment();
+    for needle in [
+        "`SharedInstanceOptions::with_tunnel_synthesis`",
+        "Coyote leaves it off on purpose",
+        "one transport identity per user",
+        "`io::ErrorKind::ConnectionAborted`",
+        "`link closed before activation: <reason>`",
+        "`RequestError::LinkActivationTimeout`",
+        "`RequestError::LinkNotOpened`",
+    ] {
+        assert!(
+            comment.contains(needle),
+            "the comment above the `{TRANSPORT_CRATE}` pin must say {needle}"
         );
     }
 }

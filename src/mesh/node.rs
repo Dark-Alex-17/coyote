@@ -14291,6 +14291,7 @@ mod tests {
             link_timeout: Duration::from_secs(30),
             ..RequestOptions::default()
         };
+        assert!(!runtime.link_failed(&to));
 
         let attempt = runtime.request(&desc, "/echo", rmpv::Value::Nil, options);
         let close = async {

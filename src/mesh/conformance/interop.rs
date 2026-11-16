@@ -2289,10 +2289,11 @@ async fn two_local_clients_of_one_rnsd_knock_through_it_and_follow_it_down_and_b
     assert!(status.success(), "rnsd exited {status} on SIGTERM");
 }
 
-/// How soon after two sessions of one user start together a third client of the same
-/// rnsd must have filed both of their announces. A shared-instance client used to hold
+/// How soon after the second of two sessions of one user begins to start a third client
+/// of the same rnsd must have filed both of their announces; the bound covers the
+/// session's own start, which sends the announce. A shared-instance client used to hold
 /// the second of two local announces sent less than about 0.6 s apart for 360 s.
-const SECOND_SESSION_FILED_WITHIN: Duration = Duration::from_secs(2);
+const SECOND_SESSION_FILED_WITHIN: Duration = Duration::from_secs(1);
 
 /// Whether the nodes of `OneUserTwoSessions` keep the transport's announce ingress
 /// control on.
@@ -2313,8 +2314,9 @@ struct OneUserTwoSessions {
     a2: Node,
     a1_fires: Arc<RecordingHookSink>,
     a2_fires: Arc<RecordingHookSink>,
-    /// When both of A's sessions had started.
-    started: Instant,
+    /// When A2 began to start: with A1 when they start together, else once B had filed
+    /// A1.
+    a2_starting: Instant,
 }
 
 /// When the second of A's sessions starts.
@@ -2359,8 +2361,12 @@ impl OneUserTwoSessions {
             .identity(b.runtime.fingerprint(), false)
             .write(&mesh_paths(&a_dir).config_dir);
         let a_dir = Arc::new(a_dir);
-        let (a1, a2) = match second {
-            SecondSession::Together => tokio::join!(join(a_dir.clone()), join(a_dir)),
+        let (a1, a2, a2_starting) = match second {
+            SecondSession::Together => {
+                let a2_starting = Instant::now();
+                let (a1, a2) = tokio::join!(join(a_dir.clone()), join(a_dir));
+                (a1, a2, a2_starting)
+            }
             SecondSession::OnceTheFirstIsHeard => {
                 let a1 = join(a_dir.clone()).await;
                 let a1_hash = a1.runtime.current_destination_hash();
@@ -2369,11 +2375,11 @@ impl OneUserTwoSessions {
                     peers.get(&a1_hash).is_some()
                 })
                 .await;
+                let a2_starting = Instant::now();
                 let a2 = join(a_dir).await;
-                (a1, a2)
+                (a1, a2, a2_starting)
             }
         };
-        let started = Instant::now();
 
         assert_eq!(a1.runtime.fingerprint(), a2.runtime.fingerprint());
         assert_ne!(
@@ -2386,26 +2392,27 @@ impl OneUserTwoSessions {
             b,
             a1,
             a2,
-            started,
+            a2_starting,
         }
     }
 
-    /// B files the announces of both of A's sessions within `within` of their start.
+    /// B files the announces of both of A's sessions within `within` of A2 beginning to
+    /// start.
     async fn b_files_both_sessions(&self, within: Duration) {
         let peers = self.b.runtime.peers();
         for (node, name) in [(&self.a1, "A1"), (&self.a2, "A2")] {
             let hash = node.runtime.current_destination_hash();
             while peers.get(&hash).is_none() {
                 assert!(
-                    self.started.elapsed() < within,
-                    "B did not file {name}'s announce within {within:?} of both sessions starting"
+                    self.a2_starting.elapsed() < within,
+                    "B did not file {name}'s announce within {within:?} of A2 beginning to start"
                 );
                 sleep(POLL).await;
             }
         }
         eprintln!(
-            "B filed both sessions {:?} after they started",
-            self.started.elapsed()
+            "B filed both sessions {:?} after A2 began to start",
+            self.a2_starting.elapsed()
         );
     }
 
@@ -2501,10 +2508,11 @@ async fn two_sessions_of_one_user_on_one_rnsd() {
     assert!(status.success(), "rnsd exited {status} on SIGTERM");
 }
 
-/// Two sessions of one user attached to one rnsd as `local` clients, the second only
-/// once rnsd holds a path to the first: a link to the first still reaches the first
-/// rather than the session that attached last, and a link to the second reaches the
-/// second. A tunnel synthesized on each attach collided here, as both sessions carry
+/// Two sessions of one user attached to one rnsd as `local` clients, with announce
+/// ingress control on, the second only once rnsd holds a path to the first: a third
+/// client files the second's announce at once, a link to the first still reaches the
+/// first rather than the session that attached last, and a link to the second reaches
+/// the second. A tunnel synthesized on each attach collided here, as both sessions carry
 /// the user's transport identity, and rnsd moved the first's path onto the second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
@@ -2519,12 +2527,14 @@ async fn the_first_of_two_sessions_of_one_user_on_one_rnsd_is_reached_after_the_
     let sessions = OneUserTwoSessions::start(
         "interop-rnsd-one-user-later",
         &config,
-        AnnounceIngress::Unlimited,
+        AnnounceIngress::Limited,
         SecondSession::OnceTheFirstIsHeard,
     )
     .await;
 
-    sessions.b_files_both_sessions(LINK_TIMEOUT).await;
+    sessions
+        .b_files_both_sessions(SECOND_SESSION_FILED_WITHIN)
+        .await;
     sessions.knocks_land_on_the_session_they_name().await;
 
     sessions.stop().await;

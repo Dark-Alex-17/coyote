@@ -1913,6 +1913,47 @@ pub(crate) mod network {
         requester.stop().await;
     }
 
+    /// A pending link the transport closes at its own establishment timeout, before the
+    /// request's longer link timeout, ends the request at the close as the activation
+    /// timeout the peer's silence is, reporting how long the wait actually ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_the_transport_times_out_first_fails_as_an_activation_timeout_at_the_close() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        responder.stop().await;
+        let pending = requester.transport.link(desc).await.unwrap();
+        pending
+            .lock()
+            .await
+            .set_establishment_timeout(Duration::from_secs(1));
+        let link_timeout = Duration::from_secs(30);
+        let options = RequestOptions {
+            link_timeout,
+            ..RequestOptions::default()
+        };
+
+        let err = timeout(
+            Duration::from_secs(10),
+            link::request(
+                &requester.transport,
+                &requester.identity,
+                &desc,
+                "/echo",
+                requester.envelope(Value::Nil),
+                options,
+            ),
+        )
+        .await
+        .expect("the request ends at the transport's close, not at its 30 s link timeout")
+        .unwrap_err();
+        assert!(
+            matches!(&err, RequestError::LinkActivationTimeout { after, .. } if *after < link_timeout),
+            "{err:?}"
+        );
+        assert_eq!(recorder.seen_count(), 0);
+        requester.stop().await;
+    }
+
     /// A waiter whose activation deadline runs out on a link another request has
     /// already brought up leaves that link open: the request in flight on it still gets
     /// its answer, and the next request is handed the same link.

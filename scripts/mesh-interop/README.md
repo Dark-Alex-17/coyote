@@ -4,9 +4,14 @@ The interop half of the mesh conformance suite (`src/mesh/conformance/interop.rs
 test spawns the pinned Python Reticulum/LXMF reference as a subprocess, joins this crate's
 node to it as a TCP client (the production `rnsd` relay topology) and proves the two agree
 on the wire: announce filing, request replies, message delivery and store-and-forward
-through a real LXMF propagation node. One case spawns the pinned `rnsd` itself instead and
-attaches two of this crate's nodes to it as `local` shared-instance clients: a knock lands
-through it, both rows follow it down when it is killed and back when it is restarted. The
+through a real LXMF propagation node. Four cases spawn the pinned `rnsd` itself instead.
+Three attach this crate's nodes to it as `local` shared-instance clients: a knock lands
+through it and both rows follow it down when it is killed and back when it is restarted;
+two sessions of one user started together are both heard by a third user at once; and a
+link to the first of two sessions of one user still reaches it after the second attached.
+The fourth runs it as a transport relay with a TCP server interface that two sessions of
+one user and a third user dial with a `private` entry, and a link to either session
+reaches that session. The
 vectors half, which needs nothing but Rust, lives next to it in the `*_vectors.rs` modules
 of that directory (and, for the REPL's attachment rules, in
 `src/repl/mesh_share_vectors.rs`).

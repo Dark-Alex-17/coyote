@@ -161,19 +161,28 @@ arc-swap = "1.9.2"
 # has established since it was spawned, every reconnect included); Coyote does not read
 # them yet.
 #
-# The 0.18.2 release adds `SharedInstanceOptions::with_tunnel_synthesis`, which has the
-# shared instance client synthesize a tunnel on its rnsd connection at attach and on
-# every reconnect. Coyote leaves it off on purpose: every session of one user carries
-# the user's identity as its transport identity, so two sessions on one rnsd would send
-# the same tunnel id, and rnsd would move the first session's paths onto the second and
-# deliver the first session's links there. Python's local client synthesizes no tunnel
-# either. A TCP client of a transport relay synthesizes none in this crate, so sessions
-# of one user dialing one relay do not collide that way. The same release has
-# `delivery::await_link_activation` return `io::ErrorKind::ConnectionAborted`, with the
-# text `link closed before activation: <reason>`, as soon as the link closes before it
-# activates, rather than waiting out the caller's deadline; `open_link` reads it as a
-# link that was never opened (`RequestError::LinkNotOpened`), so the request fails at
-# the close and the peer reads `no route`.
+# The 0.18.2 release turns off the tunnel that 0.15.1 to 0.18.1 always synthesized on
+# the shared instance client's rnsd connection, at attach and on every reconnect, and
+# adds `SharedInstanceOptions::with_tunnel_synthesis` to turn it back on. Coyote leaves
+# it off on purpose: every session of one user carries the user's identity as its
+# transport identity, so two sessions on one rnsd would send the same tunnel id, and
+# rnsd would move the first session's paths onto the second and deliver the first
+# session's links there. Python's local client synthesizes no tunnel either. With it
+# off, a restarted rnsd learns Coyote's paths again from the re-announce the crate sends
+# after each reconnect. A TCP client of a transport relay synthesizes none in this
+# crate, and two sessions of one user dialing one relay were tested to reach each its
+# own links, so Coyote keeps one transport identity per user rather than one per
+# session; that holds only while such sessions are not misrouted. The same release sends
+# a pending link's request once, with no repeat, and closes the link at its own
+# establishment timeout, and it has `delivery::await_link_activation` return
+# `io::ErrorKind::ConnectionAborted`, with the text `link closed before activation:
+# <reason>`, as soon as the link closes before it activates, rather than waiting out the
+# caller's deadline. `open_link` reads a close at the establishment timeout as the
+# activation timeout it is (`RequestError::LinkActivationTimeout`, reporting how long
+# the wait ran) and any other close as a link that was never opened
+# (`RequestError::LinkNotOpened`); either way the request fails at the close and the
+# peer reads `no route`. Local announces reach the other clients of one rnsd without
+# the ingress hold 0.18.1 put on a second announce sent close behind the first.
 #
 # `lxmf-wire` still comes from upstream LXMF-rs, so its version no longer matches the
 # fork's. What ties the two is `reticulum-rs-core`: the fork depends on
