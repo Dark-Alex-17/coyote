@@ -33,8 +33,8 @@ from _lib import (  # noqa: E402
     set_frontmatter, criterion_commands,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
-    note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot, split_option_reply,
-    tail, truthy, var, write_artifact,
+    names_several_options, note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot,
+    split_option_reply, split_option_led, tail, truthy, var, write_artifact,
 )
 from _lib import raise_escalation as _raise_escalation  # noqa: E402
 
@@ -1575,17 +1575,32 @@ def consult_route(state):
     verdict, value = _consult_verdict(state.get("consult_result") or "")
     if verdict == "ANSWER" and value:
         # a navigator's note naming another option number anywhere ("1 - hmm, actually 3") names no single option
-        ambiguous = bool(split_option_reply(value, options)[0]) and not split_option_reply(value, options, True)[0]
-        choice = None if ambiguous else _pick_with_note(value, options) if options else value
+        ambiguous = names_several_options(value, options)
+        if not options:
+            choice = value
+        elif ambiguous:
+            choice = None
+        else:
+            # "Narrow the scope first: only the code files" opens with an option's own text; its note goes with it
+            led, note = split_option_led(value, options, True)
+            choice = _pick_with_note(value, options) or (f"{led}: {note}" if led and note else led)
         if choice:
             u.update({"last_answer": choice, "last_answer_text": choice})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
             u["_next"] = "apply_answer"
             return u
-        # an answer naming no option, or several, is the owner's call; the navigator's words go with the question
-        ledger(state, u, f"consult: {kind}: the navigator's answer names no single option -> owner: {value}")
-        _note_question(u, esc, f"The navigator answered {value!r}, which names no single option; your call.")
-        u["_next"] = "ask_dispatch"
+        if ambiguous:
+            # an answer naming several options is the owner's call; the navigator's words go with the question
+            ledger(state, u, f"consult: {kind}: the navigator's answer names more than one option -> owner: {value}")
+            _note_question(u, esc, f"The navigator answered {value!r}, which names no single option; your call.")
+            u["_next"] = "ask_dispatch"
+            return u
+        # an answer in the navigator's own words is read once by the reply interpreter, never re-asked blind: unasked,
+        # the owner's headless answer would take the recommended option whatever the navigator said
+        ledger(state, u, f"consult: {kind}: the navigator's answer names no option by number or text -> interpret: {value}")
+        u.update({"last_answer_text": value, "reply_accepts": _accepts_text(kind), "reply_source": "navigator",
+                  "reply_interpreted": False})
+        u["_next"] = "interpret_reply"
         return u
     reason = "deferred" if verdict == "DEFER" else "no parseable consult verdict (timeout/fault)"
     ledger(state, u, f"consult: {kind}: {reason} -> owner")
@@ -1797,11 +1812,12 @@ def interpret_route(state):
     kind = esc.get("kind", "")
     text = (state.get("last_answer_text") or "").strip()
     said = tail(text, 200)
+    navigator = str(state.get("reply_source") or "") == "navigator"
     verdict = str(state.get("reply_verdict") or "").strip().lower()
     reason = tail(str(state.get("reply_reason") or ""), 200)
     shape = str(state.get("reply_instruction") or "").strip()
     u.update({"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "",
-              "reply_reason": "", "reply_interpreted": True})
+              "reply_reason": "", "reply_interpreted": True, "reply_source": ""})
 
     def decide(answer, how):
         u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})
@@ -1826,6 +1842,9 @@ def interpret_route(state):
         else:
             ledger(state, u, f"interpret: {kind}: the instruction {shape}={tail(value, 120)!r} could not be applied; unclear")
         verdict = "unclear"
+    if verdict == "discussion" and navigator:
+        # the navigator answers for the owner; it holds no discussion of its own, so the owner settles it
+        verdict = "unclear"
     if verdict == "discussion":
         ledger(state, u, f"interpret: {kind}: {said!r} is a discussion ({reason or 'no reason given'}) -> park for discussion")
         u["_next"] = "choice_park"
@@ -1835,9 +1854,16 @@ def interpret_route(state):
         asked = data.get("asked") or esc.get("question", "")
         clarify = str(state.get("reply_clarify") or "").strip() or "Which option do you mean, or what should happen instead?"
         # the question goes into the escalation itself so a remote owner sees it too
-        u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"You wrote: {said!r}. {clarify}\n\n{asked}"}
+        wrote = "The navigator answered" if navigator else "You wrote"
+        u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"{wrote}: {said!r}. {clarify}\n\n{asked}"}
         u["ask_question"] = render_question(u["escalation"])
         ledger(state, u, f"interpret: {kind}: {said!r} is unclear -> one clarifying question: {tail(clarify, 200)}")
+        u["_next"] = "ask_dispatch"
+        return u
+    if navigator:
+        # the owner never typed the navigator's words, so a fault puts the question to them with those words beside it
+        ledger(state, u, f"interpret: {kind}: no verdict for the navigator's {said!r} (interpreter fault) -> owner")
+        _note_question(u, esc, f"The navigator answered {text!r}, which names no option; your call.")
         u["_next"] = "ask_dispatch"
         return u
     ledger(state, u, f"interpret: {kind}: no verdict for {said!r} (interpreter fault) -> re-ask")

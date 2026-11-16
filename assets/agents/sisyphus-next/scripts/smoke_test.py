@@ -679,11 +679,46 @@ _amb = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: AN
 check("answers: a navigator answer naming two options goes to the owner with the navigator's words, never applied",
       _amb["_next"] == "ask_dispatch" and "1 - no wait, 3" in _amb["ask_question"] and "last_answer" not in _amb)
 _free = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER go with whatever is safest"))
-check("answers: a navigator answer naming no option goes to the owner, never applied as raw text",
-      _free["_next"] == "ask_dispatch" and "last_answer" not in _free
+check("answers: a navigator answer naming no option is read by the reply interpreter, never applied as raw text",
+      _free["_next"] == "interpret_reply" and "last_answer" not in _free
+      and _free["last_answer_text"] == "go with whatever is safest" and _free["reply_source"] == "navigator"
       and gates.consult_route(base_state(escalation=escalation("clarify", "q", []),
                                          consult_result="CONSULT: ANSWER the read path only"))["last_answer"]
       == "the read path only")
+PD2 = [option("Stop; the plan needs amending (report it)", True),
+       option("Continue; treat the criterion as amended (state the amendment)")]
+pd2 = escalation("plan_defect", "Is the criterion wrong?", PD2)
+NARROW2 = [option("Proceed", True), option("Narrow the scope first (say how)")]
+_led = gates.consult_route(base_state(escalation=escalation("design_choice", "How?", NARROW2), consult_result=(
+    "CONSULT: ANSWER Narrow the scope first: proceed with the 4 code files and leave out the notes file")))
+check("answers: a navigator answer opening with an option's own text picks it and keeps the rest as its note",
+      _led["_next"] == "apply_answer"
+      and _led["last_answer"] == "Narrow the scope first (say how): proceed with the 4 code files and leave out the notes file")
+_comma = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 2, but keep the logs"))
+check("answers: a navigator 'Option 2, but ...' picks option 2 with the qualification as its note, never re-asked",
+      _comma["_next"] == "apply_answer" and _comma["last_answer"] == "Abort the run: but keep the logs")
+_cmp = gates.consult_route(base_state(escalation=pd2, consult_result=(
+    "CONSULT: ANSWER 2 \u2014 Continue; the criterion is amended: missing seats or seats < 1 \u2192 400")))
+check("answers: a compared value in a navigator's note ('seats < 1') is not another option number",
+      _cmp["_next"] == "apply_answer" and _cmp["last_answer"].startswith(PD2[1]["text"] + ": Continue;")
+      and _lib.split_option_reply("2 - only when count >= 1", PD2, True)[0] == PD2[1]["text"])
+_gloss = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 (as planned; note the open caveat)"))
+check("answers: a navigator '1 (gloss)' picks option 1 and keeps the gloss as its note",
+      _gloss["_next"] == "apply_answer" and _gloss["last_answer"] == "Proceed with the plan: as planned; note the open caveat"
+      and _lib.split_option_reply("1 (recommended)", ROUTE3) == ("Proceed with the plan", ""))
+_para = [gates.consult_route(base_state(escalation=pd2, consult_result=f"CONSULT: ANSWER {t}"))
+         for t in ("Continue with no amendment: record the status output as evidence",
+                   "Other: not a plan defect. Continue without amending")]
+check("answers: a navigator paraphrase of an option goes to the reply interpreter, never to the owner's headless default",
+      all(p["_next"] == "interpret_reply" and "last_answer" not in p and p["reply_source"] == "navigator" for p in _para))
+_nav_unclear = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_verdict="unclear",
+                                                reply_source="navigator"))
+_nav_disc = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_verdict="discussion",
+                                             reply_source="navigator"))
+_nav_fault = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_source="navigator"))
+check("answers: an interpreter that cannot read the navigator's words asks the owner and names the navigator as their author",
+      all(r["_next"] == "ask_dispatch" and "The navigator answered" in r["escalation"]["question"]
+          and "You wrote" not in r["escalation"]["question"] and r["reply_source"] == "" for r in (_nav_unclear, _nav_disc, _nav_fault)))
 check("answers: a picked number with a later quantity or fraction in its note is still that pick",
       _lib.split_option_reply("2: only for the first 3 files", ROUTE3) == ("Abort the run", "only for the first 3 files")
       and _lib.split_option_reply("2 - see 1/3 of it", ROUTE3) == ("Abort the run", "see 1/3 of it"))

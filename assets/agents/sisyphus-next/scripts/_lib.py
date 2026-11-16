@@ -416,16 +416,21 @@ _OPTION_LEAD_RE = re.compile(r"(?is)^[\s(\[*_`]*(?:option\s*)?(\d+)(\s*\(recomme
 _OPTION_SEPARATORS = "-:).\u2014\u2013"
 # an option number standing alone in the free text: not part of a fraction, a decimal or a word
 _OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d+)(?![\w/]|\.\d)")
+# a number that is the operand of a comparison ("seats < 1", "count >= 2") is a value, never an option reference
+_COMPARED_RE = re.compile(r"(?:[<>=\u2264\u2265\u2260]|!=)\s*$")
 
 
 def _names_another_option(rest, picked, count, strict=False):
     """Whether the free text after a picked number reads as naming a different option ("no wait, 3", "or 2", "1"):
-    an in-range number other than the pick, after "option" or within the first two words (anywhere when `strict`)."""
+    an in-range number other than the pick, after "option" or within the first two words (anywhere when `strict`).
+    A number compared against ("seats < 1") names no option."""
     for m in _OPTION_NUMBER_RE.finditer(rest):
         n = int(m.group(1))
         if n == picked or not 1 <= n <= count:
             continue
         before = rest[:m.start()]
+        if _COMPARED_RE.search(before):
+            continue
         if strict or re.search(r"(?i)\boption\s*$", before) or len(re.findall(r"[^\W\d_]+", before)) <= 2:
             return True
     return False
@@ -438,22 +443,38 @@ def _echoes_option(rest, own):
     return bool(rest) and bare(rest) == bare(own)
 
 
+def _unwrap_gloss(rest):
+    """The text of a parenthesised gloss leading `rest` ("(keep it as planned) and log it" -> "keep it as planned and
+    log it"), or None when `rest` opens no balanced parenthesis."""
+    if not rest.startswith("("):
+        return None
+    depth = 0
+    for i, ch in enumerate(rest):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0:
+            return " ".join(p for p in (rest[1:i].strip(), rest[i + 1:].strip()) if p)
+    return None
+
+
 def split_option_reply(text, options, strict=False):
     """(option text, free text after it) for a reply led by an in-range option number; (None, text) otherwise.
 
     The number may be wrapped ("(2)", "**2**", "[2]"), labelled ("Option 2", the rendered "Option 1 (recommended)")
-    and followed by a separator ("2: x", "2) x", "2 - x", an em or en dash). Free text that is only punctuation, or
-    only the picked option's own text echoed back, counts as none. A reply whose free text names a different option
-    number ("3) or 2", "2. 1", "1 - no wait, 3") names no single option, so it is (None, text) too; `strict` counts
-    a different option number anywhere in the free text, fractions and decimals aside."""
+    and followed by a separator ("2: x", "2) x", "2 - x", "Option 2, but x", an em or en dash) or a parenthesised
+    gloss ("1 (as planned; log it)"). Free text that is only punctuation, or only the picked option's own text echoed
+    back, counts as none. A reply whose free text names a different option number ("3) or 2", "2. 1", "1 - no wait,
+    3") names no single option, so it is (None, text) too; `strict` counts a different option number anywhere in the
+    free text, fractions, decimals and compared values aside."""
     text = (text or "").strip()
     options = options or []
     m = _OPTION_LEAD_RE.match(text)
     if not m or not 1 <= int(m.group(1)) <= len(options):
         return None, text
     picked, rest = int(m.group(1)), m.group(4)
-    if rest[:1] and rest[0] in _OPTION_SEPARATORS:
+    if rest[:1] and (rest[0] in _OPTION_SEPARATORS or (rest[0] == "," and not rest[1:2].isdigit())):
         rest = rest[1:]
+    elif (gloss := _unwrap_gloss(rest)) is not None:
+        rest = gloss
     elif rest and not (m.group(2) or m.group(3)):
         # a bare number running into prose ("2 or 3", "2 because") is not a pick
         return None, text
@@ -464,6 +485,56 @@ def split_option_reply(text, options, strict=False):
     if _names_another_option(rest, picked, len(options), strict):
         return None, text
     return own, rest if re.search(r"\w", rest) else ""
+
+
+_LED_SEPARATORS = ":;,.-\u2014\u2013"
+
+
+def _led_option(text, options):
+    """(1-based pick, option text, free text) when exactly one option's own text, its trailing parenthesised prompt
+    ("(say how)") aside, opens `text` and is followed by a separator or the end; None otherwise."""
+    low = text.lower()
+    led = []
+    for i, o in enumerate(options, 1):
+        own = (o.get("text") or "").strip()
+        core = re.sub(r"\s*\([^()]*\)\s*$", "", re.sub(r"(?i)\s*\(recommended\)\s*$", "", own)).rstrip(_LED_SEPARATORS + " ")
+        nxt = low[len(core):len(core) + 1]
+        if core and low.startswith(core.lower()) and (not nxt or nxt in _LED_SEPARATORS or nxt == "("):
+            led.append((i, own, text[len(core):]))
+    if len(led) != 1:
+        return None
+    picked, own, rest = led[0]
+    rest = (_unwrap_gloss(rest.strip()) if rest.strip().startswith("(") else None) or rest.lstrip(_LED_SEPARATORS + " ")
+    return picked, own, rest.strip()
+
+
+def split_option_led(text, options, strict=False):
+    """(option text, free text after it) for a reply that opens with one option's own text ("Narrow the scope first:
+    only the 4 code files"); (None, text) when no option, or more than one, leads it, or the free text names another
+    option number (see split_option_reply for `strict`)."""
+    text = (text or "").strip()
+    options = options or []
+    found = _led_option(text, options)
+    if not found:
+        return None, text
+    picked, own, rest = found
+    if _echoes_option(rest, own) or not re.search(r"\w", rest):
+        return own, ""
+    if _names_another_option(rest, picked, len(options), strict):
+        return None, text
+    return own, rest
+
+
+def names_several_options(text, options):
+    """Whether a reply opening with one option, by number or by its own text, names a different option number
+    anywhere after it ("1 - no wait, 3", "2: then option 3"); an echo of the picked option's text names no other."""
+    text = (text or "").strip()
+    options = options or []
+    m = _OPTION_LEAD_RE.match(text)
+    if m and 1 <= int(m.group(1)) <= len(options) and not split_option_reply(text, options, True)[0]:
+        return _names_another_option(m.group(4), int(m.group(1)), len(options), True)
+    found = _led_option(text, options)
+    return bool(found) and not split_option_led(text, options, True)[0]
 
 
 def match_option(text, options):
