@@ -515,21 +515,26 @@ def review_fault(blocker):
     return "PIPELINE-FAULT" in blocker or "review incomplete" in blocker.lower()
 
 
-# a reply led by an option number: "2", "2.", "2)", "(2)", "#2", "Option 2", then optionally a separator and free text
-OPTION_NUMBER_RE = re.compile(r"(?is)^(?:option\s*)?[(#]?\s*(\d{1,9})\s*(?:$|[-:.)\u2014\u2013]\s*(.*)$)")
+# a reply led by an option number: "2", "2.", "2)", "(2)", "#2", "Option 2", then optionally a separator ("2: x",
+# "Option 2, but x", a dash) and free text, or a parenthesised gloss ("1 (as planned; log it)")
+OPTION_NUMBER_RE = re.compile(r"(?is)^(?:option\s*)?[(#]?\s*(\d{1,9})\s*(?:$|[-:.)\u2014\u2013]\s*(.*)$|,\s+(.*)$|"
+                              r"\(([^()]*)\)\s*(.*)$)")
 
 
 def split_option_reply(text, options):
     """(option text, free text after it) for a reply led by an in-range option number ("2", "(2)", "#2", "Option 2",
-    "2 - x", "2: x", "2) x", or an em or en dash); (None, text) otherwise. A reply whose free text names another
-    option ("1 - no wait, 3") picks none. Free text that is only punctuation counts as none."""
+    "2 - x", "2: x", "2) x", "Option 2, but x", an em or en dash, or "1 (gloss)"); (None, text) otherwise. A reply
+    whose free text names another option ("1 - no wait, 3") picks none. Free text that is only punctuation, or only
+    the "(recommended)" label, counts as none."""
     text = (text or "").strip()
     m = OPTION_NUMBER_RE.match(text)
     count = len(options or [])
     if not m or not 1 <= int(m.group(1)) <= count:
         return None, text
     picked = int(m.group(1))
-    rest = (m.group(2) or "").strip()
+    gloss = re.sub(r"(?i)^recommended$", "", (m.group(4) or "").strip())
+    after = (m.group(2) or m.group(3) or re.sub(r"^[-:.,\u2014\u2013]\s*", "", m.group(5) or "")).strip()
+    rest = " ".join(p for p in (gloss, after) if p)
     if any(len(d) <= 9 and int(d) != picked and 1 <= int(d) <= count for d in re.findall(r"\d+", rest)):
         return None, text
     return options[picked - 1]["text"], rest if re.search(r"\w", rest) else ""

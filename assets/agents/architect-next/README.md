@@ -123,7 +123,7 @@ environment assignment, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:713:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
+scripts/_lib.py:718:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
 scripts/gates.py:51:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
 scripts/gates.py:4376:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
 scripts/gates.py:4385:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
@@ -136,7 +136,7 @@ scripts/smoke_test.py:1908:   ... "acceptance_criteria": ["`...`"], ...   (a com
 scripts/smoke_test.py:2594:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:713` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:718` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:51` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
 lockfile names), `gates.py:4376` and `:4385` are an English verb in prompt prose, and

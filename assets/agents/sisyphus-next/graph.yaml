@@ -246,6 +246,8 @@ initial_state:
   reply_reason: ''
   reply_accepts: ''
   reply_interpreted: false
+  reply_source: ''
+  navigator_reasks: 0
   choice_parks: {}
   discussion: {}
   discussion_run_id: ''
@@ -1249,7 +1251,11 @@ nodes:
   consult_route:
     id: consult_route
     type: script
-    description: Parse the consult; an answer is ledgered and applied, a defer or a fault goes to the owner.
+    description: >-
+      Parse the consult; an answer naming one option (by number, label or its own
+      text, with any note kept) is ledgered and applied, one in the navigator's own
+      words or naming several options goes to interpret_reply, a defer or a fault
+      goes to the owner.
     script: scripts/consult_route.py
     fallback: end_failure
 
@@ -1401,7 +1407,8 @@ nodes:
       the options, an instruction the question accepts, a discussion, or unclear.
     instructions: |
       A user was asked a question with fixed options and typed their own text
-      instead of picking one. Decide what the text is:
+      instead of picking one (or the navigator answering on the user's behalf
+      did). Decide what the text is:
       - option: the text means one of the offered options. Set reply_option to
         that option's exact text (never its "Option N" label).
       - instruction: the text asks for something this question accepts (listed
@@ -1454,6 +1461,8 @@ nodes:
       An option or an accepted instruction is applied through apply_answer, a
       discussion goes to choice_park, an unclear reply gets one clarifying
       question, and an interpreter fault falls back to parse_answer's re-ask.
+      The navigator's words that read as no single option go back to the
+      navigator once with the clarifying question, then to the owner.
     script: scripts/interpret_route.py
     fallback: end_failure
 
