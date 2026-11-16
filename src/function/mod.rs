@@ -1627,7 +1627,13 @@ impl ToolCall {
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
         let quiet = current_depth > 0;
-        let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
+        let tool_agent = agent.as_ref().map(|agent| ToolAgent {
+            name: agent.name().to_owned(),
+            script: agent
+                .functions()
+                .find(&self.name)
+                .is_some_and(|function| function.agent),
+        });
         let (call_name, cmd_name, mut cmd_args, mut envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
             None => self.extract_call_config_from_ctx(&functions)?,
@@ -1784,7 +1790,7 @@ impl ToolCall {
                 cmd_name,
                 cmd_args,
                 envs,
-                agent_name,
+                tool_agent,
                 ctx.app.config.tool_timeout,
                 quiet,
                 ctx.session_abort.clone(),
@@ -2637,28 +2643,74 @@ fn merge_attachment_report(value: Value, attached_images: Vec<Value>, notes: Vec
     Value::Object(object)
 }
 
+/// The active agent a script tool runs under. `script` marks a function from
+/// the agent's own functions script, which runs as the agent-named binary with
+/// the function name as its first argument; any other tool runs as itself.
+#[derive(Debug, Clone)]
+pub struct ToolAgent {
+    pub name: String,
+    pub script: bool,
+}
+
+/// The directories a script tool run prepends to PATH. An agent's functions
+/// script and the global tools the agent declares are built into its bin dir;
+/// a global tool it reaches through the shared tool scope (one a loaded skill
+/// grants) is built only into the global functions bin, which follows the
+/// agent dir so the agent's own copies keep precedence.
+pub(crate) fn tool_bin_dirs(agent: Option<&ToolAgent>) -> Vec<PathBuf> {
+    let mut dirs = vec![];
+    if let Some(agent) = agent {
+        let dir = paths::agent_bin_dir(&agent.name);
+        if dir.exists() {
+            dirs.push(dir);
+        }
+        if agent.script {
+            return dirs;
+        }
+    }
+    dirs.push(paths::functions_bin_dir());
+    dirs
+}
+
+/// A spawn failure naming the tool, and for a missing executable the
+/// directories that were searched ahead of the inherited PATH.
+pub(crate) fn spawn_error(
+    display_name: &str,
+    executable: &str,
+    bin_dirs: &[PathBuf],
+    err: &io::Error,
+) -> anyhow::Error {
+    if err.kind() != io::ErrorKind::NotFound {
+        return anyhow!("Unable to run {display_name}, {err}");
+    }
+    let searched = bin_dirs
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow!(
+        "Unable to run {display_name}: no '{executable}' executable in [{searched}] or PATH, {err}"
+    )
+}
+
 pub fn run_llm_function(
     cmd_name: String,
     cmd_args: Vec<String>,
     mut envs: HashMap<String, String>,
-    agent_name: Option<String>,
+    agent: Option<ToolAgent>,
     tool_timeout: Option<u64>,
     quiet: bool,
     abort: Option<AbortSignal>,
 ) -> Result<ScriptRunOutput> {
-    let mut bin_dirs: Vec<PathBuf> = vec![];
-    let mut command_name = cmd_name.clone();
-    if let Some(agent_name) = agent_name {
-        command_name = cmd_args[0].clone();
-        let dir = paths::agent_bin_dir(&agent_name);
-        if dir.exists() {
-            bin_dirs.push(dir);
-        }
-        if graph::agent_has_graph(&agent_name) {
-            envs.insert("AUTO_CONFIRM".into(), "true".into());
-        }
-    } else {
-        bin_dirs.push(paths::functions_bin_dir());
+    let command_name = match &agent {
+        Some(agent) if agent.script => cmd_args[0].clone(),
+        _ => cmd_name.clone(),
+    };
+    let bin_dirs = tool_bin_dirs(agent.as_ref());
+    if let Some(agent) = &agent
+        && graph::agent_has_graph(&agent.name)
+    {
+        envs.insert("AUTO_CONFIRM".into(), "true".into());
     }
     let current_path = env::var("PATH").context("No PATH environment variable")?;
     let prepend_path = bin_dirs
@@ -2709,7 +2761,7 @@ pub fn run_llm_function(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+        .map_err(|err| spawn_error(&command_name, &cmd_name, &bin_dirs, &err))?;
     debug!("Spawned tool process '{command_name}' pid {}", child.id());
     let spawned = Instant::now();
 
@@ -5796,6 +5848,192 @@ mod tests {
         );
         assert_eq!(output.attachments.len(), 1);
         assert_eq!(output.attachments[0].source, png.display().to_string());
+    }
+
+    /// An agent's bin dir holds only the tools the agent declares; a global
+    /// tool a loaded skill grants lives in the global functions bin. The
+    /// guards keep the config dir and environment in place.
+    #[cfg(unix)]
+    fn skill_granted_tool_ctx() -> Option<(
+        RequestContext,
+        (
+            crate::testing::TestConfigDirGuard,
+            crate::testing::EnvVarGuard,
+        ),
+    )> {
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+        use std::os::unix::fs::PermissionsExt;
+
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return None;
+        }
+        let guard = TestConfigDirGuard::new("skill-granted-tool");
+        let functions_env = EnvVarGuard::unset(get_env_name("functions_dir"));
+        let bin_dir = paths::functions_bin_dir();
+        fs::create_dir_all(&bin_dir).unwrap();
+        let tool = bin_dir.join("grantedglob");
+        fs::write(
+            &tool,
+            "#!/usr/bin/env bash\nprintf globbed >> \"$LLM_OUTPUT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let agent_name = "skill-granted-agent";
+        fs::create_dir_all(paths::agent_bin_dir(agent_name)).unwrap();
+
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        }));
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "grantedglob".into(),
+                description: String::new(),
+                parameters: Default::default(),
+                agent: false,
+            });
+        Some((ctx, (guard, functions_env)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_output_runs_skill_granted_global_tool_inside_agent() {
+        let Some((mut ctx, _guards)) = skill_granted_tool_ctx() else {
+            return;
+        };
+
+        // A freshly written script can still be open for writing in a forked
+        // child elsewhere in the process, making exec fail with ETXTBSY.
+        let mut attempts = 0;
+        let output = loop {
+            let output = run_async(
+                call_with_args("grantedglob", json!({"pattern": "*.rs"})).eval_output(&mut ctx),
+            )
+            .unwrap();
+            let busy = output.value.to_string().contains("Text file busy");
+            if !busy || attempts >= 10 {
+                break output;
+            }
+            attempts += 1;
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(output.value, json!({"output": "globbed"}));
+    }
+
+    #[test]
+    fn spawn_error_names_the_missing_executable_and_searched_dirs() {
+        let dirs = [
+            PathBuf::from("/agents/a/bin"),
+            PathBuf::from("/functions/bin"),
+        ];
+        let missing = io::Error::from(io::ErrorKind::NotFound);
+        let message = spawn_error("fs_glob", "fs_glob", &dirs, &missing).to_string();
+        assert!(
+            message.starts_with(
+                "Unable to run fs_glob: no 'fs_glob' executable in [/agents/a/bin, /functions/bin] or PATH"
+            ),
+            "{message}"
+        );
+
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        let message = spawn_error("fs_glob", "fs_glob", &dirs, &denied).to_string();
+        assert!(message.starts_with("Unable to run fs_glob, "), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_names_a_missing_global_tool_not_its_arguments() {
+        let _guard = crate::testing::TestConfigDirGuard::new("missing-granted-tool");
+        let _functions_env = crate::testing::EnvVarGuard::unset(get_env_name("functions_dir"));
+
+        let err = run_llm_function(
+            "grantedmissing".into(),
+            vec![json!({"pattern": "*.rs"}).to_string()],
+            HashMap::new(),
+            Some(ToolAgent {
+                name: "missing-tool-agent".into(),
+                script: false,
+            }),
+            None,
+            true,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.starts_with("Unable to run grantedmissing: no 'grantedmissing' executable in ["),
+            "{err}"
+        );
+        assert!(
+            err.contains(&paths::functions_bin_dir().display().to_string()),
+            "{err}"
+        );
+        assert!(!err.contains("pattern"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_runs_agent_script_as_agent_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("agent-script-tool");
+        let _functions_env = crate::testing::EnvVarGuard::unset(get_env_name("functions_dir"));
+        let agent_name = "script-agent";
+        let bin_dir = paths::agent_bin_dir(agent_name);
+        fs::create_dir_all(&bin_dir).unwrap();
+        let script = bin_dir.join(agent_name);
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\nprintf '%s\\n%s' \"$1\" \"$PATH\" >> \"$LLM_OUTPUT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = ToolAgent {
+            name: agent_name.into(),
+            script: true,
+        };
+
+        // A freshly written script can still be open for writing in a forked
+        // child elsewhere in the process, making exec fail with ETXTBSY.
+        let mut attempts = 0;
+        let output = loop {
+            let run = run_llm_function(
+                agent_name.into(),
+                vec!["scripted".into(), "{}".into()],
+                HashMap::new(),
+                Some(agent.clone()),
+                None,
+                true,
+                None,
+            );
+            match run {
+                Err(err) if err.to_string().contains("Text file busy") && attempts < 10 => {
+                    attempts += 1;
+                    thread::sleep(Duration::from_millis(50));
+                }
+                run => break run.unwrap().output.unwrap(),
+            }
+        };
+
+        let (function, path) = output.split_once('\n').unwrap();
+        assert_eq!(function, "scripted");
+        let functions_bin = paths::functions_bin_dir().display().to_string();
+        assert!(
+            !path.split(PATH_SEP).any(|dir| dir == functions_bin),
+            "{path}"
+        );
+        assert_eq!(
+            path.split(PATH_SEP).next(),
+            Some(bin_dir.display().to_string().as_str())
+        );
     }
 
     #[cfg(unix)]
