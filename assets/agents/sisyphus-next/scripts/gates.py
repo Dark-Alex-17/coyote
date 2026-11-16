@@ -1595,7 +1595,7 @@ def consult_route(state):
         why = "may name more than one option" if ambiguous else "names no option by number or text"
         ledger(state, u, f"consult: {kind}: the navigator's answer {why} -> interpret: {value}")
         u.update({"last_answer_text": value, "reply_accepts": _accepts_text(kind), "reply_source": "navigator",
-                  "reply_interpreted": False})
+                  "reply_author": "navigator", "reply_interpreted": False})
         u["_next"] = "interpret_reply"
         return u
     reason = "deferred" if verdict == "DEFER" else "no parseable consult verdict (timeout/fault)"
@@ -1717,7 +1717,7 @@ def parse_answer(state):
             choice = text
         if choice is None and text and not truthy(state.get("reply_interpreted")):
             # the first typed reply that names no option is interpreted once, never re-asked blind
-            u["reply_accepts"] = _accepts_text(kind)
+            u.update({"reply_accepts": _accepts_text(kind), "reply_author": "owner"})
             u["_next"] = "interpret_reply"
             return u
     if choice is None:
@@ -1813,7 +1813,7 @@ def interpret_route(state):
     reason = tail(str(state.get("reply_reason") or ""), 200)
     shape = str(state.get("reply_instruction") or "").strip()
     u.update({"reply_verdict": "", "reply_option": "", "reply_instruction": "", "reply_value": "", "reply_clarify": "",
-              "reply_reason": "", "reply_interpreted": True, "reply_source": ""})
+              "reply_reason": "", "reply_interpreted": True, "reply_source": "", "reply_author": "owner"})
 
     def decide(answer, how):
         u.update({"last_answer": answer, "last_answer_text": text, "parked": "", "reply_interpreted": False})

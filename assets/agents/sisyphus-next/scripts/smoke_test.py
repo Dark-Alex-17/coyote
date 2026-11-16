@@ -738,6 +738,15 @@ check("answers: the interpreter's option for the navigator's words keeps those w
       _nav_pick["_next"] == "apply_answer"
       and _nav_pick["last_answer"] == PD2[1]["text"] + ": Continue with no amendment: log the output"
       and gates._stated_reason(_nav_pick["last_answer"], PD2) == "Continue with no amendment: log the output")
+_owner_read = gates.parse_answer(base_state(escalation=pd2, last_answer_text="carry on, it holds", reply_author="navigator"))
+_interp_block = open(os.path.join(HERE, "..", "graph.yaml")).read().split("\n  interpret_reply:\n")[1].split("\n  interpret_route:\n")[0]
+check("answers: the reply interpreter's text is headed by its author, the navigator's or the owner's, reset after reading",
+      _free.get("reply_author") == "navigator" and _owner_read["_next"] == "interpret_reply"
+      and _owner_read.get("reply_author") == "owner" and _nav_pick.get("reply_author") == "owner"
+      and _nav_then[0].get("reply_author") == "owner"
+      and "## The {{reply_author}}'s text\n      {{last_answer_text}}" in _interp_block and "user's" not in _interp_block
+      and re.search(r"(?m)^  reply_author: owner$", open(os.path.join(HERE, "..", "graph.yaml")).read()),
+      (_free.get("reply_author"), _owner_read.get("reply_author"), _nav_pick.get("reply_author")))
 _qty = gates.consult_route(base_state(escalation=pd2, consult_result="CONSULT: ANSWER 2 \u2014 Continue; only touch 1 file"))
 check("answers: a quantity in a navigator's note that may name another option goes to the interpreter, never the owner's default",
       _qty["_next"] == "interpret_reply" and "last_answer" not in _qty)

@@ -3390,6 +3390,11 @@ check("graph: confirm_seed offers exactly the seed_confirm options intake raises
       NODES.get("confirm_seed", {}).get("options") == [o["text"] for o in E_SEED["options"]], NODES.get("confirm_seed", {}).get("options"))
 check("graph: confirm_draft offers exactly the draft_confirm options draft_route raises",
       NODES.get("confirm_draft", {}).get("options") == [o["text"] for o in E_DRAFT["options"]], NODES.get("confirm_draft", {}).get("options"))
+check("graph: classify_reply and interpret_reply head the typed text as the owner's, the only author either reads",
+      all("## The owner's text\n{{last_answer_text}}" in NODES.get(n, {}).get("prompt", "")
+          and "user" not in NODES.get(n, {}).get("prompt", "") + NODES.get(n, {}).get("instructions", "")
+          for n in ("classify_reply", "interpret_reply")),
+      {n: NODES.get(n, {}).get("prompt") for n in ("classify_reply", "interpret_reply")})
 
 
 def render_inputs(node, state, nodes=None):
