@@ -1580,6 +1580,28 @@ u = gates.triage_route(base_state(triage=[{"finding": "USAGE_PROBE: INCONCLUSIVE
 check("triage_route: probe INCONCLUSIVE is an environment gap escalation, never a coder fix", u["escalation"]["kind"] == "probe_gap")
 u = gates.triage_route(base_state(triage=[{"finding": "criterion 3 is impossible as written", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]))
 check("triage_route: plan-is-root-cause -> plan_defect escalation", u["escalation"]["kind"] == "plan_defect")
+_PD_TRI = [{"finding": "criterion 3 is impossible as written", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]
+_pd_open = {n: gates.triage_route(base_state(triage=_PD_TRI, plan_defect_continues=n))["escalation"] for n in (0, STRIKE_LIMIT)}
+check("triage_route: plan_defect recommends continuing until STRIKE_LIMIT continues, then stopping, the count in the evidence",
+      [o["text"] for o in _pd_open[0]["options"] if o["recommended"]] == [gates.PLAN_DEFECT_CONTINUE]
+      and f"0/{STRIKE_LIMIT} continues used in this run" in _pd_open[0]["options"][0]["evidence"]
+      and [o["text"] for o in _pd_open[STRIKE_LIMIT]["options"] if o["recommended"]] == [gates.PLAN_DEFECT_STOP], _pd_open)
+_pd_headless = {}
+for _n, _esc in _pd_open.items():
+    _pick = gates.parse_answer(base_state(escalation=_esc, last_answer_text=_lib.HEADLESS_GUIDANCE))
+    _pd_headless[_n] = gates.apply_answer(base_state(escalation=_esc, last_answer=_pick["last_answer"], spec_text="AC",
+                                                     plan_defect_continues=_n))
+check("apply_answer: a headless plan_defect continues below the cap with the adversary's finding as the amendment, "
+      "counted, and stops at the cap",
+      _pd_headless[0]["_next"] == "build_gauntlet_prompt" and _pd_headless[0].get("plan_defect_continues") == 1
+      and "AMENDED by the user: " + gates.PLAN_DEFECT_CONTINUE in _pd_headless[0]["spec_text"]
+      and "criterion 3 is impossible as written" in _pd_headless[0]["spec_text"]
+      and _pd_headless[STRIKE_LIMIT]["_next"] == "end_blocked", _pd_headless)
+u = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer="Continue; treat the criterion as amended: drop AC3",
+                                  spec_text="AC", plan_defect_continues=1))
+check("apply_answer: a stated plan_defect amendment is recorded as stated and counted",
+      u.get("plan_defect_continues") == 2
+      and u["spec_text"].endswith("AMENDED by the user: Continue; treat the criterion as amended: drop AC3"), u)
 u = gates.triage_route(base_state(triage=[{"finding": "🟡 maybe", "action": "escalate", "lane": "code-review"}]))
 check("triage_route: unsure yellow -> fix-or-accept escalation", u["escalation"]["kind"] == "yellow_findings")
 u = gates.triage_route(base_state(triage=[], gauntlet_blockers=["b1", "b2"], last_script_error="llm died"))

@@ -2353,18 +2353,23 @@ def apply_answer(state):
         a = "continue" if _says_continue(said) and not leads_stop else "stop"
         if not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
             _reask_unmatched(state, u, esc, answer, "says neither stop nor continue")
-        elif a == "continue" and _subtask_phase(state):
-            # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
-            subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
-            cur = max(as_int(state.get("subtask_index")) - 1, 0)
-            subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [answer]
-            _seal_subtasks(state, subtasks)
-            u["subtasks"] = subtasks
-            ledger(state, u, f"plan amendment (user) to subtask {cur + 1}: {answer}")
-            u["_next"] = "build_gauntlet_prompt"
         elif a == "continue":
-            u["spec_text"] = (state.get("spec_text") or "") + f"\n\nAMENDED by the user: {answer}"
-            ledger(state, u, f"plan amendment (user): {answer}")
+            u["plan_defect_continues"] = as_int(state.get("plan_defect_continues")) + 1
+            if _stated_reason(answer, options) == NO_STATED_REASON:
+                # a bare or headless pick states no amendment, so the adversary's finding is the criterion it amends
+                answer = (f"{answer}: no amendment was stated, so the criterion is amended to resolve the adversary's "
+                          f"finding: {esc.get('evidence') or '(none recorded)'}")
+            if _subtask_phase(state):
+                # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
+                subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
+                cur = max(as_int(state.get("subtask_index")) - 1, 0)
+                subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [answer]
+                _seal_subtasks(state, subtasks)
+                u["subtasks"] = subtasks
+                ledger(state, u, f"plan amendment (user) to subtask {cur + 1}: {answer}")
+            else:
+                u["spec_text"] = (state.get("spec_text") or "") + f"\n\nAMENDED by the user: {answer}"
+                ledger(state, u, f"plan amendment (user): {answer}")
             u["_next"] = "build_gauntlet_prompt"
         else:
             u["failure_reason"] = f"the plan itself is the root cause of a conformance failure; the user chose to stop: {answer}"
@@ -2762,6 +2767,10 @@ def inbox_route(state):
 # Past the rejection budget: another plan round with the user's changes, or a stop.
 REJECTED_CONTINUE = "Plan again with these changes (state them)"
 REJECTED_STOP = "Stop and report"
+
+# The plan itself as the root cause: amend the criterion in place, or stop.
+PLAN_DEFECT_CONTINUE = "Continue; treat the criterion as amended (state the amendment)"
+PLAN_DEFECT_STOP = "Stop; the plan needs amending (report it)"
 
 
 def _coder_error_tail(result):
@@ -3691,10 +3700,16 @@ def triage_route(state):
                                      evidence="a consumer-facing change that cannot be exercised locally is itself a finding")],
                              evidence=str(e.get("finding", "")))
         elif kind == "plan_defect":
+            used = as_int(state.get("plan_defect_continues"))
+            # continue is recommended below the cap, so a headless run amends in place instead of stopping; past
+            # the cap Stop is, so it never amends forever
+            spent = used >= STRIKE_LIMIT
+            note = f"{used}/{STRIKE_LIMIT} continues used in this run"
             esc = escalation("plan_defect", "The adversary reports the PLAN itself as the root cause (impossible or "
                                             "contradictory criterion). Never fixed by changing scope: amend the plan, or stop?",
-                             [option("Stop; the plan needs amending (report it)", recommended=True),
-                              option("Continue; treat the criterion as amended (state the amendment)")],
+                             [option(PLAN_DEFECT_CONTINUE, not spent,
+                                     f"the criterion is amended in place with the stated amendment; {note}"),
+                              option(PLAN_DEFECT_STOP, spent)],
                              evidence=str(e.get("finding", "")))
         else:
             esc = escalation("yellow_findings", "A review warning at production rigor: fix it, or accept it as scoped-out?",
