@@ -2651,6 +2651,14 @@ check("parse_answer: 'Option 2', '(2)' and '#2' to a typed escalation -> apply_a
 cr_ = {f: gates.consult_route(base_state(escalation=E_PICK, consult_result=f"CONSULT: ANSWER {f}")) for f in ("2 - x", "2 \u2014 x", "Option 2")}
 check("consult_route: 'CONSULT: ANSWER 2 - x' (and the dash and 'Option' forms) -> option 2",
       all(v["_next"] == "apply_answer" and v["last_answer"] == "Abort the run" for v in cr_.values()), cr_)
+GLOSS_ = {"2 (keep it as planned; log the open caveat)": "keep it as planned; log the open caveat",
+          "Option 2, but keep the logs": "but keep the logs"}
+cg_ = {f: gates.consult_route(base_state(escalation=E_PICK, consult_result=f"CONSULT: ANSWER {f}")) for f in GLOSS_}
+check("consult_route: '2 (gloss)' and 'Option 2, but ...' -> option 2, the navigator's words kept as the stated reason",
+      all(v["_next"] == "apply_answer" and v["last_answer"] == "Abort the run" and v["last_answer_text"] == f for f, v in cg_.items())
+      and all(_lib.split_option_reply(f, PICK_OPTS) == ("Abort the run", r) for f, r in GLOSS_.items())
+      and _lib.split_option_reply("2 (recommended)", PICK_OPTS) == ("Abort the run", "")
+      and _lib.split_option_reply("2 (or 3)", PICK_OPTS)[0] is None, cg_)
 AMEND_CAP_NEW = [option("Allow one more amendment cycle", True), option("Stop and report")]
 E_AC = escalation("amend_cap", "q", AMEND_CAP_NEW, data={"source": "gate1", "over": ["source"]})
 neg_ = {"amend_cap don't stop": AA("amend_cap", "don't stop, allow one more", esc=E_AC, amend_counts={"gate1": 9})["_next"],
