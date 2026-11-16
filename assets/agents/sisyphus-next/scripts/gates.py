@@ -2851,7 +2851,8 @@ def route_coder_result(state):
             err = "coder returned no recognizable sentinel (expected CODER_COMPLETE / CODER_REJECTED / CODER_FAILED)\n" + err
         u["last_coder_error"] = err
         ledger(state, u, f"coder: {u['coder_sentinel']} strike {strikes}/{STRIKE_LIMIT}")
-        m = re.search(r"Last script error:\s*\n(.*?)(?:\n\s*\n|\nLast |\Z)", result, re.S)
+        # an empty value renders as a blank line; the body must not run on into the next section header
+        m = re.search(r"Last script error:[ \t]*\n(.*?)(?=\n[ \t]*\n|\nLast |\Z)", result, re.S)
         if m and m.group(1).strip() and m.group(1).strip() != "null":
             return raise_escalation(state, u, escalation(
                 "engine_fault",

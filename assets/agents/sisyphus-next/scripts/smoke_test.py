@@ -1320,6 +1320,21 @@ u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\nLast script 
 check("route_coder_result: B5 strike 3 -> strikeout", u["_next"] == "strikeout")
 u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' failed: exit 2\n\nLast build output:\n", fix_strikes=0))
 check("route_coder_result: crashed gate -> engine_fault escalation (not a code fix)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "engine_fault")
+# the coder's own end_failure template, rendered the way a red test gate leaves it: no script error
+_coder_end = re.search(r"(?ms)^  end_failure:\n.*?^    output: \|\n(.*?)(?=^  \w+:\n|\Z)",
+                       open(os.path.join(HERE, "..", "..", "coder", "graph.yaml")).read()).group(1)
+_red_vars = {"plan_summary": "p", "fix_attempts": "5", "max_fix_attempts": "5", "gate_error": "",
+             "last_script_error": "", "build_output": "", "tests_output": "FAIL pkg/a",
+             "last_node_output": "I made no edits this round; the test gate still fails (exit 2)."}
+red = re.sub(r"\{\{(\w+)\}\}", lambda m: _red_vars.get(m.group(1), ""),
+             "\n".join(l[6:] for l in _coder_end.splitlines()))
+check("route_coder_result: the rendered coder end_failure carries an empty Last script error section",
+      "Last script error:\n\n\nLast node output:" in red)
+u = gates.route_coder_result(base_state(coder_result=red, fix_strikes=0))
+check("route_coder_result: empty script error + red test gate -> fix round, not engine_fault",
+      u["_next"] == "compose_fix" and not u.get("escalation") and "FAIL pkg/a" in u["last_coder_error"])
+u = gates.route_coder_result(base_state(coder_result=red, fix_strikes=STRIKE_LIMIT - 1))
+check("route_coder_result: empty script error at the strike limit -> strikeout, not engine_fault", u["_next"] == "strikeout")
 u = gates.route_coder_result(base_state(coder_result="Agent node failed: child timed out", fix_strikes=0))
 check("route_coder_result: agent-node failure counts as a strike", u["fix_strikes"] == 1 and u["_next"] == "compose_fix")
 u = gates.route_coder_result(base_state(coder_result="I did some stuff", fix_strikes=0))
