@@ -2168,17 +2168,26 @@ fn sessions_child_section_names_the_layout_and_the_lifecycle_rules() {
         "const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(",
         ')',
     );
-    // Every bounded drain in the REPL but the sessionless Ctrl-C helper is a
-    // session command the subsection lists.
+    // Every bounded drain in the REPL is a session command the subsection
+    // lists; the turn driver's one is the sessionless Ctrl-C helper.
     let repl_production = before_test_module(&repl);
     let drains = repl_production
         .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
         .count();
-    let sessionless = fn_body(repl_production, "async fn cancel_sessionless_turn_tasks(")
+    let driver = src(&["turn", "driver.rs"]);
+    let driver_production = before_test_module(&driver);
+    assert_eq!(
+        driver_production
+            .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
+            .count(),
+        1,
+        "the turn driver drains only in the sessionless Ctrl-C helper"
+    );
+    let sessionless = fn_body(driver_production, "async fn cancel_sessionless_turn_tasks(")
         .matches("cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;")
         .count();
     assert_eq!(sessionless, 1, "the sessionless Ctrl-C helper drains once");
-    let command_drains = match drains - sessionless {
+    let command_drains = match drains {
         5 => "Five",
         n => panic!(
             "the REPL drains at {n} session-command sites; update the Session commands list and this pin"
@@ -2879,9 +2888,10 @@ fn ctrl_c_wording_names_the_session_split() {
         ),
         "the .help footer lost its session qualifier"
     );
-    let mut literals = string_literals(&fn_body(&repl, "fn sessionless_cancelling_notice("));
+    let driver = src(&["turn", "driver.rs"]);
+    let mut literals = string_literals(&fn_body(&driver, "fn sessionless_cancelling_notice("));
     literals.extend(string_literals(&fn_body(
-        &repl,
+        &driver,
         "fn sessionless_still_running_notice(",
     )));
     for notice in [
@@ -2898,27 +2908,27 @@ fn ctrl_c_wording_names_the_session_split() {
     // abort, in a session or not. Only that error branch checkpoints the
     // failed turn; the graph turn prints the notice and returns its error
     // before it, so it checkpoints nothing.
-    let repl_production = before_test_module(&repl);
+    let driver_production = before_test_module(&driver);
     assert!(
-        repl_production.contains(
-            "                    if abort_signal.aborted_ctrlc() {\n                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                    }\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n"
+        driver_production.contains(
+            "                        if abort_signal.aborted_ctrlc() {\n                            emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                        }\n                        ctx.on_chat_completion_error(app.as_ref(), &input);\n"
         ),
         "the error branch of the ask loop no longer prints the interrupt notice in every turn"
     );
     assert!(
-        !repl_production.contains("aborted_ctrlc() && ctx.session.is_none()"),
+        !driver_production.contains("aborted_ctrlc() && ctx.session.is_none()"),
         "an interrupt notice is limited to sessionless turns again"
     );
     assert_eq!(
-        repl_production
+        driver_production
             .matches("ctx.on_chat_completion_error(app.as_ref(), &input);")
             .count(),
         1,
         "the ask loop checkpoints a failed request at one site"
     );
     assert!(
-        repl_production.contains(
-            "                Err(err) => {\n                    if abort_signal.aborted_ctrlc() {\n                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                    }\n                    return Err(err);\n                }\n            };\n            match turn {\n"
+        driver_production.contains(
+            "                    Err(err) => {\n                        if abort_signal.aborted_ctrlc() {\n                            emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);\n                        }\n                        return Err(err);\n                    }\n                };\n                match turn {\n"
         ),
         "the graph turn no longer returns its error before the checkpointing branch"
     );

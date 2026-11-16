@@ -10060,6 +10060,39 @@ local_hello() {\n\
 
     #[test]
     #[serial]
+    fn sessionless_interrupt_in_the_full_screen_ui_leaves_background_tasks_running() {
+        let _sink = test_sink::install();
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let marker = "sessionless-tui-interrupt-k4q";
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx(marker);
+            turn_notice_sink::drain();
+
+            let (agent_abort, job_abort) =
+                interrupt_a_tool_round_over_agent_and_job(&mut ctx).await;
+
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            let notices = turn_notice_sink::drain();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(
+                notices[0].starts_with("Turn interrupted; 2 background task(s) still running"),
+                "{notices:?}"
+            );
+            {
+                let sup = ctx.supervisor.as_ref().unwrap().read();
+                assert_eq!(sup.is_finished("a1"), Some(false));
+                assert!(sup.has_active_tasks());
+            }
+            agent_abort.set_ctrlc();
+            job_abort.set_ctrlc();
+            yield_until_no_active_tasks(&ctx).await;
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    #[serial]
     fn session_ctrl_c_in_a_tool_round_leaves_abort_aware_tasks_alive() {
         let _sink = test_sink::install();
         let marker = "session-ctrlc-tool-round-w8d";
@@ -10503,7 +10536,7 @@ local_hello() {\n\
         let helper = &helper[..helper.find("\n}\n").unwrap()];
         assert!(
             helper.contains(
-                "    if ctx.session.is_none() {\n        cancel_sessionless_turn_tasks(ctx, abort_signal).await\n    } else {\n        interrupted_turn_notice(ctx)\n    }"
+                "    if ctx.session.is_none() && !crate::tui::active() {\n        cancel_sessionless_turn_tasks(ctx, abort_signal).await\n    } else {\n        interrupted_turn_notice(ctx)\n    }"
             ),
             "{helper}"
         );

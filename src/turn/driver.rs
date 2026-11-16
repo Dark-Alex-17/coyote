@@ -631,13 +631,15 @@ pub(crate) fn interrupted_turn_notice(ctx: &RequestContext) -> Option<String> {
 }
 
 /// The notice for a Ctrl-C that ended the turn, whichever way the turn ended.
-/// Without a session the press also cancels the turn's background work; in a
-/// session it leaves that work for a second press.
+/// In the REPL without a session the press also cancels the turn's
+/// background work; in a session it leaves that work for a second press.
+/// The full-screen UI never cancels it here, because its task roster lets
+/// the user cancel each task later.
 pub(crate) async fn turn_interrupt_notice(
     ctx: &RequestContext,
     abort_signal: &AbortSignal,
 ) -> Option<String> {
-    if ctx.session.is_none() {
+    if ctx.session.is_none() && !crate::tui::active() {
         cancel_sessionless_turn_tasks(ctx, abort_signal).await
     } else {
         interrupted_turn_notice(ctx)
