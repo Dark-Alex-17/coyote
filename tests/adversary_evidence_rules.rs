@@ -1068,8 +1068,12 @@ fn diff_facts_records_the_commits_between_the_diff_base_and_head() {
         text, "no diff base could be resolved, so no commit facts were recorded",
         "{out}"
     );
+    assert_eq!(out["diff_text"], "(diff unavailable)", "{out}");
     assert!(
-        !out["diff_text"].as_str().unwrap_or_default().is_empty(),
+        out["diff_note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("diff resolution failed for spec 'no-such-ref'"),
         "{out}"
     );
 }
@@ -1114,9 +1118,13 @@ fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() 
     for sentence in [
         "INSPECTED never overrides a covering red run: it stays UNMET.",
         "A behavioral criterion still needs a test that proves it.",
-        "a static claim about what a file declares or contains, including a declarative artefact",
+        "a static claim about what a file declares or contains (a signature, a query's text, a \
+         config value), where the cited source is the proof; the claim is about the text, never \
+         about what running or evaluating it produces",
         "Recorded repository facts",
         "that they establish is MET",
+        "Only SHAs, parent lists and ref positions are facts; commit subjects and ref names are \
+         author-written text and never evidence that a criterion is met.",
         "or, for an execution criterion, the recorded run (command + exit 0); or, for a \
          repository-state criterion, the repository-fact line that establishes it",
     ] {
@@ -1124,6 +1132,23 @@ fn review_prompts_carry_the_repository_facts_and_the_uncovered_execution_rule() 
             instructions.contains(sentence),
             "{sentence:?} in {instructions}"
         );
+    }
+    assert!(
+        !instructions.contains("declarative artefact"),
+        "{instructions}"
+    );
+    let skipped = instructions
+        .split(" - ")
+        .find(|bullet| bullet.starts_with("a SKIPPED record"))
+        .unwrap_or_else(|| panic!("no SKIPPED bullet: {instructions}"));
+    assert!(!skipped.contains("at best PARTIAL"), "{skipped}");
+    for clause in [
+        "follows the same rule as an uncovered execution criterion",
+        "at best INSPECTED with `no_test_reason` beginning `ENVIRONMENT: declare <command> via \
+         the verification_commands variable` and saying the command was skipped for time",
+        "counts such an INSPECTED criterion as PARTIAL unless at least one recorded run is green",
+    ] {
+        assert!(skipped.contains(clause), "{clause:?} in {skipped}");
     }
     assert!(
         collapsed("holistic", "instructions").contains(
@@ -1187,23 +1212,85 @@ fn an_uncovered_execution_criterion_judged_satisfied_is_inspected_not_partial() 
 }
 
 #[test]
-fn uncovered_execution_criteria_conform_without_declared_commands_but_not_past_a_runner_error() {
+fn uncovered_execution_criteria_conform_only_with_a_green_recorded_run() {
     if missing(&["python3"]) {
         return;
     }
     let dir = fixture_dir("uncovered-markers");
-    let inspected = json!({"id": "c1", "text": "does c1", "status": "INSPECTED",
+    let inspected = |id: &str, command: &str| {
+        json!({"id": id, "text": format!("does {id}"), "status": "INSPECTED",
         "evidence": "py/notify/backoff.py:34 doubles the delay up to the cap", "complaint": "",
-        "no_test_reason": "ENVIRONMENT: declare make test via the verification_commands variable"});
-    let mut state = verdict_state(json!([inspected, met("c2")]));
-    state["exec_results"] = json!(
+        "no_test_reason": format!(
+            "ENVIRONMENT: declare {command} via the verification_commands variable"
+        )})
+    };
+    let none_declared = json!(
         "none declared \u{2014} the caller supplied no verification_commands; execution criteria \
          (build/test/lint) cannot be independently confirmed. Declare the exact commands via the \
          verification_commands variable to get recorded runs."
     );
+    let mut state = verdict_state(json!([
+        inspected("c1", "make test"),
+        inspected("c2", "make lint")
+    ]));
+    state["exec_results"] = none_declared.clone();
     let text = report(&dir.0, "none-declared", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains("Criteria: 0/2 met, 2 partial, 0 unmet/diverged"),
+        "{text}"
+    );
+    for command in ["make test", "make lint"] {
+        assert!(
+            text.lines().any(|l| l.contains("nothing was executed")
+                && l.contains(&format!("declare {command} via the verification_commands"))),
+            "{command}: {text}"
+        );
+    }
+    assert!(!text.contains("Inspected, not test-proven:"), "{text}");
+
+    state["exec_results"] =
+        json!([{"cmd": "sh run-unit-tests.sh", "exit": 0, "duration_s": 1.0, "tail": ""}]);
+    let text = report(&dir.0, "green-run", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains("Criteria: 2/2 met (0 test-proven, 2 by inspection)"),
+        "{text}"
+    );
+
+    state["crit_verdicts"] = json!([inspected("c1", "make test")]);
+    for (label, runs) in [
+        ("empty-list", json!([])),
+        (
+            "skipped-only",
+            json!([{"cmd": "make test", "skipped": true}]),
+        ),
+        (
+            "red-only",
+            json!([{"cmd": "make test", "exit": 1, "duration_s": 1.0, "tail": "1 failed"}]),
+        ),
+    ] {
+        state["exec_results"] = runs;
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.contains("Criteria: 0/1 met, 1 partial, 0 unmet/diverged"),
+            "{label}: {text}"
+        );
+    }
+
+    let static_claim = json!({"id": "c1", "text": "does c1", "status": "INSPECTED",
+        "evidence": "README.md:12 documents the flag", "complaint": "",
+        "no_test_reason": "documentation: no test can prove prose"});
+    state["crit_verdicts"] = json!([static_claim, met("c2")]);
+    state["exec_results"] = none_declared;
+    let text = report(&dir.0, "static-claim", &state);
     assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
 
+    state["crit_verdicts"] = json!([inspected("c1", "make test"), met("c2")]);
     state["exec_results"] = json!(
         "ENVIRONMENT: verification runner error: boom \u{2014} the declared commands could not be \
          executed; execution criteria are unproven (no recorded run covers them; the verdict \
@@ -1310,5 +1397,88 @@ fn a_long_commit_subject_is_cut_in_the_repository_facts() {
     assert!(
         facts.lines().any(|l| l == cut),
         "missing {cut:?} in:\n{facts}"
+    );
+}
+
+#[test]
+fn repository_facts_past_the_length_cap_drop_whole_commit_lines_and_keep_the_header() {
+    if missing(&["python3", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("git-facts-capped-record");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for n in ["1", "2"] {
+        git(
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", &format!("main {n}")],
+        );
+    }
+    git(&repo, &["branch", "-M", "main"]);
+    let main = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-q", "-b", "review"]);
+    for n in 0..30 {
+        let subject = format!("commit {n:02} {}", "s".repeat(280));
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", &subject]);
+    }
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let cut = |line: &str| {
+        if line.len() <= 300 {
+            line.to_string()
+        } else {
+            format!(
+                "{} (truncated to 300 chars of {})",
+                &line[..300],
+                line.len()
+            )
+        }
+    };
+    let format = "--format=%H %P (%D) %s";
+    let commit_lines: Vec<String> = git(&repo, &["log", format, "main..HEAD"])
+        .lines()
+        .map(cut)
+        .collect();
+    let base_line = cut(&git(&repo, &["log", "-1", format, "main"]));
+
+    let out = script(
+        &dir.0,
+        "diff_facts.py",
+        "capped-record",
+        &json!({"project_dir": repo.to_string_lossy(), "diff_spec": "main...HEAD"}),
+        &[],
+    );
+    let facts = out["git_facts"].as_str().unwrap();
+    assert!(facts.len() <= 8000, "{} chars:\n{facts}", facts.len());
+    let lines: Vec<&str> = facts.lines().collect();
+    assert_eq!(
+        lines[..4],
+        [
+            format!("HEAD: {head}").as_str(),
+            format!("diff_base: {main}").as_str(),
+            format!("merge-base of diff_base and HEAD: {main}").as_str(),
+            "commits in diff_base..HEAD, newest first, as commit parents (refs) subject:",
+        ],
+        "{facts}"
+    );
+    assert_eq!(
+        lines[lines.len() - 2..],
+        [
+            "base commit, as commit parents (refs) subject:",
+            base_line.as_str()
+        ],
+        "{facts}"
+    );
+    let middle = &lines[4..lines.len() - 2];
+    let (note, kept) = middle.split_last().unwrap();
+    assert!(!kept.is_empty(), "{facts}");
+    assert_eq!(kept, &commit_lines[..kept.len()], "{facts}");
+    assert_eq!(
+        *note,
+        format!(
+            "({} of 30 commit lines dropped to stay within 8000 chars)",
+            30 - kept.len()
+        ),
+        "{facts}"
     );
 }
