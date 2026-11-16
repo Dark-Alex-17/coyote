@@ -1137,10 +1137,14 @@ fn or_diagnose<T>(pty: &Pty, result: std::io::Result<T>) -> T {
 /// once more.
 const INTERRUPT_RESEND_AFTER: Duration = Duration::from_secs(2);
 
-/// Waits for echo to be off (the hidden read is armed), types part of a
-/// secret, then sends the terminal's interrupt character. A second one
-/// follows if the tool has not exited within `INTERRUPT_RESEND_AFTER`,
-/// and the resend is logged with the terminal's state.
+/// Waits for echo to be off, types part of a secret, then sends the
+/// terminal's interrupt character. When the terminal started with echo on,
+/// echo going off means the hidden read is armed; under a prelude that
+/// already turned it off the wait returns at once and the prompt marker is
+/// the only ordering. If the tool has not exited within
+/// `INTERRUPT_RESEND_AFTER`, a second interrupt lets it exit cleanly, but
+/// the first one was lost, so the call still fails with the terminal's
+/// state as it was before the resend.
 fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
     wait_for_echo_off(pty)?;
     pty.send(TYPED_BEFORE_INTERRUPT)?;
@@ -1148,11 +1152,15 @@ fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
     pty.send(b"\x03")?;
     match pty.wait_for("tool-exit=", INTERRUPT_RESEND_AFTER) {
         Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
-            eprintln!(
-                "no tool-exit= {INTERRUPT_RESEND_AFTER:?} after the interrupt; sending it again\n{}",
-                pty.diagnostics()
-            );
-            pty.send(b"\x03")
+            let before = pty.diagnostics();
+            pty.send(b"\x03")?;
+            let _ = pty.wait_for("tool-exit=", PTY_DEADLINE);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no tool-exit= {INTERRUPT_RESEND_AFTER:?} after the interrupt; a second one was sent\nbefore the resend:\n{before}"
+                ),
+            ))
         }
         other => other.map(drop),
     }
@@ -1170,7 +1178,7 @@ fn wait_for_echo_off(pty: &mut Pty) -> std::io::Result<()> {
                 ),
             ));
         }
-        pty.read_for(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(20));
     }
     Ok(())
 }

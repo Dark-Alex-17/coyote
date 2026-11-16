@@ -44,13 +44,24 @@ impl Pty {
         let (master, slave) = open_pair(40, 100)?;
         let slave_fd = slave.as_raw_fd();
         // SAFETY: the hook calls only libc functions that are plain
-        // syscalls (getrlimit included, which sysconf is not on every
-        // libc) on descriptors that stay open in the parent until after
-        // spawn returns.
+        // syscalls or async-signal-safe (signal, getrlimit included, which
+        // sysconf is not on every libc) on descriptors that stay open in
+        // the parent until after spawn returns.
         unsafe {
             cmd.pre_exec(move || {
                 if libc::setsid() == -1 {
                     return Err(std::io::Error::last_os_error());
+                }
+                // A runner started in the background by a non-interactive
+                // shell inherits SIGINT and SIGQUIT ignored, one under nohup
+                // inherits SIGHUP ignored, and an ignored signal survives
+                // exec: a shell cannot even trap it. The child leads a
+                // terminal session, so it gets the dispositions a terminal's
+                // session leader starts with.
+                for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+                    if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 // The request constant's integer type differs between libc targets.
                 if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
