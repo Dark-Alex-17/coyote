@@ -79,7 +79,7 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   runner error, or declared commands that cover only part of it) which the criterion check judged
   satisfied from the diff and the working tree: its `no_test_reason` begins
   `ENVIRONMENT: declare <command> via the verification_commands variable`, and the contract gate
-  rejects a bare `ENVIRONMENT:` that names no command. A covering red run stays UNMET whatever the
+  rejects an `ENVIRONMENT:` reason with nothing after it. A covering red run stays UNMET whatever the
   inspection shows.
 - `diff_facts` also records `git_facts`, which both the criterion checks and the holistic pass
   see: HEAD, the diff base, their merge-base, one `commit parents (refs) subject` line per commit

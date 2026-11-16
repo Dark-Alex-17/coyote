@@ -22,7 +22,9 @@ checks cannot read themselves: the HEAD and diff_base SHAs, their merge-base,
 one line per commit in diff_base..HEAD (newest first, capped at
 MAX_LOG_COMMITS) and the base commit's own line, each as `commit parents
 (refs) subject`. A fact git cannot produce becomes a one-line note in it;
-it never affects the other outputs.
+it never affects the other outputs. Its git calls get FACT_TIMEOUT seconds
+each, every line is cut to MAX_FACT_LINE_CHARS and the whole record to
+MAX_FACTS_CHARS, each cut with a note.
 """
 
 import json
@@ -36,6 +38,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 MAX_DIFF_CHARS = 60000
 MAX_LOG_COMMITS = 30
+MAX_FACT_LINE_CHARS = 300
+MAX_FACTS_CHARS = 8000
+FACT_TIMEOUT = 15
 LOG_FORMAT = "--format=%H %P (%D) %s"
 
 
@@ -81,13 +86,13 @@ DIFF_FLAGS = (
 )
 
 
-def git(*args):
+def git(*args, timeout=90):
     r = subprocess.run(
         ["git", "-C", proj, *args],
         capture_output=True,
         encoding="utf-8",
         errors="replace",
-        timeout=90,
+        timeout=timeout,
     )
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
@@ -214,7 +219,7 @@ except Exception:  # noqa: BLE001 -- an unresolvable base means no baseline run
 
 def fact(*args):
     try:
-        return git(*args).strip() or "(none)"
+        return git(*args, timeout=FACT_TIMEOUT).strip() or "(none)"
     except Exception as e:  # noqa: BLE001 -- a missing fact is a note, never a fault
         detail = " ".join(str(e).split()) or "git exited non-zero"
         return f"unavailable ({detail})"
@@ -226,13 +231,13 @@ def repository_facts(base):
     log = ("log", "--no-color", "--no-show-signature", LOG_FORMAT)
     cap = ""
     try:
-        total = int(git("rev-list", "--count", f"{base}..HEAD", "--").strip())
+        total = int(git("rev-list", "--count", f"{base}..HEAD", "--", timeout=FACT_TIMEOUT).strip())
         if total > MAX_LOG_COMMITS:
             cap = f" (capped at the newest {MAX_LOG_COMMITS} of {total} commits)"
     except Exception:  # noqa: BLE001 -- the log fact below reports the git error
         pass
     commits = fact(*log, f"--max-count={MAX_LOG_COMMITS}", f"{base}..HEAD", "--")
-    return "\n".join([
+    text = "\n".join(cut_line(line) for line in "\n".join([
         f"HEAD: {fact('rev-parse', '--verify', 'HEAD')}",
         f"diff_base: {base}",
         f"merge-base of diff_base and HEAD: {fact('merge-base', base, 'HEAD')}",
@@ -240,7 +245,16 @@ def repository_facts(base):
         commits,
         "base commit, as commit parents (refs) subject:",
         fact(*log, "-1", base, "--"),
-    ])
+    ]).splitlines())
+    if len(text) > MAX_FACTS_CHARS:
+        text = text[:MAX_FACTS_CHARS] + f"\n(truncated to {MAX_FACTS_CHARS} chars of {len(text)})"
+    return text
+
+
+def cut_line(line):
+    if len(line) <= MAX_FACT_LINE_CHARS:
+        return line
+    return line[:MAX_FACT_LINE_CHARS] + f" (truncated to {MAX_FACT_LINE_CHARS} chars of {len(line)})"
 
 
 out["git_facts"] = repository_facts(out["diff_base"])
