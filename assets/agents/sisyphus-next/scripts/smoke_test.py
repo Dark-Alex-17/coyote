@@ -1320,6 +1320,14 @@ u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\nLast script 
 check("route_coder_result: B5 strike 3 -> strikeout", u["_next"] == "strikeout")
 u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' failed: exit 2\n\nLast build output:\n", fix_strikes=0))
 check("route_coder_result: crashed gate -> engine_fault escalation (not a code fix)", u["_next"] == "escalate_gate" and u["escalation"]["kind"] == "engine_fault")
+red = ("CODER_FAILED\nPlan: p\nAttempts: 5/5\n\nVerification gate error:\n\n\nLast script error:\n\n\n"
+       "Last node output:\nI made no edits this round; the test gate still fails (exit 2).\n\n"
+       "Last build output:\n\n\nLast tests output:\nFAIL pkg/a\n")
+u = gates.route_coder_result(base_state(coder_result=red, fix_strikes=0))
+check("route_coder_result: empty script error + red test gate -> fix round, not engine_fault",
+      u["_next"] == "compose_fix" and not u.get("escalation") and "FAIL pkg/a" in u["last_coder_error"])
+u = gates.route_coder_result(base_state(coder_result=red, fix_strikes=STRIKE_LIMIT - 1))
+check("route_coder_result: empty script error at the strike limit -> strikeout, not engine_fault", u["_next"] == "strikeout")
 u = gates.route_coder_result(base_state(coder_result="Agent node failed: child timed out", fix_strikes=0))
 check("route_coder_result: agent-node failure counts as a strike", u["fix_strikes"] == 1 and u["_next"] == "compose_fix")
 u = gates.route_coder_result(base_state(coder_result="I did some stuff", fix_strikes=0))
