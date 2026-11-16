@@ -4150,8 +4150,9 @@ async fn sweep_unused_envoy_stores(
                 let cache_dir = cache_dir.clone();
                 let config = config.clone();
                 let now = now();
+                let stopping = cancel.clone();
                 let swept = tokio::task::spawn_blocking(move || {
-                    prune_unused_envoy_stores(&cache_dir, &config, days, now, instance_id)
+                    prune_unused_envoy_stores(&cache_dir, &config, days, now, instance_id, &|| stopping.is_cancelled())
                 })
                 .await;
                 log_unused_envoy_stores(swept, days);
@@ -4167,12 +4168,14 @@ struct UnusedStoreSweep {
 
 /// One tick of `sweep_unused_envoy_stores`. While the instance registry cannot be read,
 /// which sessions are running is unknown, so the tick only stamps and deletes nothing.
+/// `stop` is asked before each store, so a node leaving the mesh ends the walk early.
 fn prune_unused_envoy_stores(
     cache_dir: &Path,
     config: &EnvoyMemoryConfig,
     days: u64,
     now: SystemTime,
     instance_id: String,
+    stop: &dyn Fn() -> bool,
 ) -> UnusedStoreSweep {
     let sessions = instances::try_sessions_by_instance(cache_dir);
     let registry_read = sessions.is_ok();
@@ -4184,9 +4187,9 @@ fn prune_unused_envoy_stores(
         .collect();
     keep.insert(instance_id);
     let unused = if registry_read {
-        EnvoySessions::prune_unused_everywhere(cache_dir, config, days, now, &keep)
+        EnvoySessions::prune_unused_everywhere(cache_dir, config, days, now, &keep, stop)
     } else {
-        EnvoySessions::stamp_unstamped_everywhere(cache_dir, config, now, &keep)
+        EnvoySessions::stamp_unstamped_everywhere(cache_dir, config, now, &keep, stop)
     };
     UnusedStoreSweep {
         unused,
@@ -20549,6 +20552,7 @@ mod tests {
         let starting_id = "ab".repeat(16);
         let starting = plant_year_old_store(&paths, &starting_id);
         let held = InstanceLock::acquire(&paths.cache_dir, &starting_id).unwrap();
+            &|| false,
         let sweep = || {
             prune_unused_envoy_stores(
                 &paths.cache_dir,
@@ -20572,6 +20576,7 @@ mod tests {
     /// The real sweep future under a paused clock: a store that crosses the days unused
     /// after the join sweep goes on the next daily sweep, not before.
     #[tokio::test(start_paused = true)]
+                &|| false,
     async fn the_unused_store_sweep_removes_a_store_on_the_first_daily_sweep_after_it_crosses() {
         let tmp = TempDir::new("node-envoy-store-sweep-daily");
         let paths = mesh_paths(&tmp);

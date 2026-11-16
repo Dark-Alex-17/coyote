@@ -536,19 +536,22 @@ impl EnvoySessions {
     /// judged, so no session starts on it mid-delete. A store whose index or stamp cannot
     /// be read is logged, counted and left. `days` of 0 does nothing: the config reaching
     /// here is not always validated. Same walk as `delete_identity_everywhere`, whether
-    /// or not the memory is on.
+    /// or not the memory is on. `stop` is asked before each store; once it says to, the
+    /// walk ends and returns what it did so far, so a node leaving the mesh is not held
+    /// up by the stores still to judge.
     pub(crate) fn prune_unused_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         days: u64,
         now: SystemTime,
         keep: &HashSet<String>,
+        stop: &dyn Fn() -> bool,
     ) -> Result<UnusedStores, EnvoyMemoryError> {
         if days == 0 {
             return Ok(UnusedStores::default());
         }
         let unused_for = Duration::from_secs(days.saturating_mul(86_400));
-        Self::judge_unused_everywhere(cache_dir, config, Some(unused_for), now, keep)
+        Self::judge_unused_everywhere(cache_dir, config, Some(unused_for), now, keep, stop)
     }
 
     /// `prune_unused_everywhere` that deletes nothing, only stamping the stores with no
@@ -558,8 +561,9 @@ impl EnvoySessions {
         config: &EnvoyMemoryConfig,
         now: SystemTime,
         keep: &HashSet<String>,
+        stop: &dyn Fn() -> bool,
     ) -> Result<UnusedStores, EnvoyMemoryError> {
-        Self::judge_unused_everywhere(cache_dir, config, None, now, keep)
+        Self::judge_unused_everywhere(cache_dir, config, None, now, keep, stop)
     }
 
     fn judge_unused_everywhere(
@@ -568,10 +572,11 @@ impl EnvoySessions {
         unused_for: Option<Duration>,
         now: SystemTime,
         keep: &HashSet<String>,
+        stop: &dyn Fn() -> bool,
     ) -> Result<UnusedStores, EnvoyMemoryError> {
         let mut removed = 0;
         let mut stamped = 0;
-        let unreadable_stores = Self::sweep(cache_dir, config, "swept", |store| {
+        let unreadable_stores = Self::sweep_until(cache_dir, config, "swept", stop, |store| {
             let name = store.dir.file_name().and_then(|name| name.to_str());
             if name.is_some_and(|name| keep.contains(name)) {
                 return Ok(());
@@ -619,6 +624,18 @@ impl EnvoySessions {
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         verb: &'static str,
+        visit: impl FnMut(&Self) -> Result<(), EnvoyMemoryError>,
+    ) -> Result<usize, EnvoyMemoryError> {
+        Self::sweep_until(cache_dir, config, verb, &|| false, visit)
+    }
+
+    /// `sweep` that asks `stop` before each store and visits none once it says to,
+    /// returning what it counted so far.
+    fn sweep_until(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+        verb: &'static str,
+        stop: &dyn Fn() -> bool,
         mut visit: impl FnMut(&Self) -> Result<(), EnvoyMemoryError>,
     ) -> Result<usize, EnvoyMemoryError> {
         let stores = stores_dir(cache_dir);
@@ -635,6 +652,9 @@ impl EnvoySessions {
             let is_dir = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
             if !is_dir || !looks_like_a_store(&path) {
                 continue;
+            }
+            if stop() {
+                break;
             }
             let store = Self::listed(path, config);
             if let Err(err) = visit(&store) {
@@ -3962,6 +3982,77 @@ mod tests {
         HashSet::new()
     }
 
+    fn never() -> bool {
+        false
+    }
+
+    /// A sweep asks whether to stop before it judges each store and judges none once
+    /// told to, so a node that leaves the mesh mid-sweep is not held up by the rest.
+    #[test]
+    fn prune_unused_stops_between_stores_once_told_to() {
+        let tmp = TempDir::new("envoy-sessions-prune-stop");
+        let config = enabled();
+        let stores: Vec<EnvoySessions> = ["inst-a", "inst-b", "inst-c"]
+            .into_iter()
+            .map(|instance| {
+                let store = EnvoySessions::open(&tmp.path, instance, &config).unwrap();
+                store
+                    .save(IDENTITY_A, DEST_A, "thread-one", exchange(1), t(1_000))
+                    .unwrap();
+                store
+            })
+            .collect();
+        let now = t(400 * DAY);
+
+        let swept = EnvoySessions::prune_unused_everywhere(
+            &tmp.path,
+            &config,
+            1,
+            now,
+            &keep_none(),
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(swept, UnusedStores::default(), "told to stop at once");
+        assert!(stores.iter().all(|store| store.dir().exists()));
+
+        let asked = std::cell::Cell::new(0);
+        let after_one = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        let swept = EnvoySessions::prune_unused_everywhere(
+            &tmp.path,
+            &config,
+            1,
+            now,
+            &keep_none(),
+            &after_one,
+        )
+        .unwrap();
+        assert_eq!(swept.removed, 1, "{swept:?}");
+        assert_eq!(asked.get(), 2, "asked before each store until told to stop");
+        assert_eq!(
+            stores.iter().filter(|store| store.dir().exists()).count(),
+            2
+        );
+
+        let stamp_only = std::cell::Cell::new(0);
+        let swept = EnvoySessions::stamp_unstamped_everywhere(
+            &tmp.path,
+            &config,
+            now,
+            &keep_none(),
+            &|| {
+                stamp_only.set(stamp_only.get() + 1);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(swept, UnusedStores::default());
+        assert_eq!(stamp_only.get(), 1, "the stamping walk stops the same way");
+    }
+
     #[test]
     fn a_save_an_append_and_a_load_stamp_the_store_as_used() {
         let tmp = TempDir::new("envoy-sessions-store-stamp");
@@ -4051,8 +4142,15 @@ mod tests {
         );
 
         assert_eq!(
-            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 30, now, &keep_none())
-                .unwrap(),
+            EnvoySessions::prune_unused_everywhere(
+                &tmp.path,
+                &config,
+                30,
+                now,
+                &keep_none(),
+                &never
+            )
+            .unwrap(),
             UnusedStores {
                 removed: 1,
                 stamped: 0,
@@ -4080,7 +4178,8 @@ mod tests {
                 &config,
                 0,
                 t(900 * DAY),
-                &keep_none()
+                &keep_none(),
+                &never
             )
             .unwrap(),
             UnusedStores::default(),
@@ -4108,8 +4207,15 @@ mod tests {
         let now = t(400 * DAY);
 
         assert_eq!(
-            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 1, now, &keep_none())
-                .unwrap(),
+            EnvoySessions::prune_unused_everywhere(
+                &tmp.path,
+                &config,
+                1,
+                now,
+                &keep_none(),
+                &never
+            )
+            .unwrap(),
             UnusedStores {
                 removed: 0,
                 stamped: 2,
@@ -4122,9 +4228,16 @@ mod tests {
 
         let later = now + Duration::from_secs(DAY);
         assert_eq!(
-            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 1, later, &keep_none())
-                .unwrap()
-                .removed,
+            EnvoySessions::prune_unused_everywhere(
+                &tmp.path,
+                &config,
+                1,
+                later,
+                &keep_none(),
+                &never
+            )
+            .unwrap()
+            .removed,
             0,
             "exactly the days since the stamp is not more than them"
         );
@@ -4134,7 +4247,8 @@ mod tests {
                 &config,
                 1,
                 later + Duration::from_secs(1),
-                &keep_none()
+                &keep_none(),
+                &never
             )
             .unwrap()
             .removed,
@@ -4159,8 +4273,15 @@ mod tests {
         let keep = HashSet::from(["inst-running".to_string()]);
 
         assert_eq!(
-            EnvoySessions::prune_unused_everywhere(&tmp.path, &config, 1, t(400 * DAY), &keep)
-                .unwrap(),
+            EnvoySessions::prune_unused_everywhere(
+                &tmp.path,
+                &config,
+                1,
+                t(400 * DAY),
+                &keep,
+                &never
+            )
+            .unwrap(),
             UnusedStores::default()
         );
         assert_eq!(stamp_of(&running), Some(rfc3339_utc(t(1_000))));
@@ -4196,7 +4317,8 @@ mod tests {
                     &config,
                     days,
                     t(400 * DAY),
-                    &keep_none()
+                    &keep_none(),
+                    &never
                 )
                 .unwrap(),
                 UnusedStores {
@@ -4229,7 +4351,8 @@ mod tests {
                 &config,
                 1,
                 t(400 * DAY),
-                &keep_none()
+                &keep_none(),
+                &never
             )
             .unwrap(),
             UnusedStores {
@@ -4261,7 +4384,8 @@ mod tests {
                 &config,
                 1,
                 t(400 * DAY),
-                &keep_none()
+                &keep_none(),
+                &never
             )
             .unwrap(),
             UnusedStores {
@@ -4323,7 +4447,8 @@ mod tests {
                 &config,
                 1,
                 t(400 * DAY),
-                &keep_none()
+                &keep_none(),
+                &never
             )
             .unwrap(),
             UnusedStores {
