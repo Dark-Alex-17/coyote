@@ -391,6 +391,7 @@ def raise_escalation(state, updates, esc):
     updates["apply_reasks"] = 0
     updates["reply_interpreted"] = False
     updates["reply_source"] = ""
+    updates["answer_source"] = ""
     updates["navigator_reasks"] = 0
     updates["_next"] = "escalate_gate"
     return updates

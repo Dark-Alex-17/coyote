@@ -638,8 +638,13 @@ s2, u = chain(base_state(escalation=pd, consult_result=f"...\nCONSULT: ANSWER {P
                          subtask_index=1, spec_text="AC"), "consult_route", "apply_answer")
 check("answers: a navigator pick with an em-dash amendment continues on subtask 1 with the amendment, never end_blocked",
       s2["last_answer"].startswith(PD_CONT) and "only _test.go files changed" in s2["last_answer"]
-      and u["_next"] == "build_gauntlet_prompt" and "only _test.go files changed" in s2["subtasks"][0]["amendments"][0]
+      and u["_next"] == "build_gauntlet_prompt" and "only _test.go files changed" in s2["subtasks"][0]["amendments"][0]["text"]
+      and s2["subtasks"][0]["amendments"][0]["author"] == "navigator"
+      and "AMENDED by the navigator: " in gates._subtask_spec(dict(s2, subtask_index=1))[0]
       and not s2["subtasks"][1].get("amendments"), u.get("_next"))
+check("answers: a subtask amendment stored as a plain string by an older run still renders as the user's",
+      "AMENDED by the user: vet exit 0 is enough" in gates._subtask_spec(base_state(
+          subtasks=[dict(PD_SUBTASKS[0], amendments=["vet exit 0 is enough"])] + PD_SUBTASKS[1:], subtask_index=1))[0])
 u = gates.ladder_route(base_state(escalation=pd, ladder_resolution="ruling", ladder_choice="2: drop the vet criterion"))
 check("answers: a ladder ruling naming an option number keeps its amendment",
       u["_next"] == "apply_answer" and u["last_answer"] == f"{PD_CONT}: drop the vet criterion")
@@ -788,7 +793,7 @@ for _wrap in ("**2** \u2014 ", "(2) \u2014 ", "Option 2: "):
                              subtasks=PD_SUBTASKS, subtask_index=1, spec_text="AC"), "consult_route", "apply_answer")
     check(f"answers: the seed plan_defect amendment led by {_wrap.strip()!r} continues with the amendment",
           u["_next"] == "build_gauntlet_prompt" and s2["last_answer"].startswith(PD_CONT)
-          and PD_REPLY[4:] in s2["subtasks"][0]["amendments"][0], u.get("_next"))
+          and PD_REPLY[4:] in s2["subtasks"][0]["amendments"][0]["text"], u.get("_next"))
 # an answer apply_answer cannot act on is asked again; at the cap only a recommended option that keeps going is taken
 SO3 = [option("Abort and report", True), option("One more fix round anyway"), option("Accept the findings unresolved and proceed")]
 _UNMATCHED = [("strikeout", so_nav), ("lane_stuck", SO3), ("review_exhausted", SO3), ("oracle_fault", of_nav),
@@ -1604,11 +1609,33 @@ for _n, _esc in _pd_open.items():
     _pd_headless[_n] = gates.apply_answer(base_state(escalation=_esc, last_answer=_pick["last_answer"], spec_text="AC",
                                                      plan_defect_continues=_n))
 check("apply_answer: a headless plan_defect continues below the cap with the adversary's finding as the amendment, "
-      "counted, and stops at the cap",
+      "labeled as the default, counted, and stops at the cap",
       _pd_headless[0]["_next"] == "build_gauntlet_prompt" and _pd_headless[0].get("plan_defect_continues") == 1
-      and "AMENDED by the user: " + gates.PLAN_DEFECT_CONTINUE in _pd_headless[0]["spec_text"]
-      and "criterion 3 is impossible as written" in _pd_headless[0]["spec_text"]
+      and _pd_headless[0]["spec_text"].endswith(
+          "AMENDED by default (no amendment was stated; resolves the adversary's finding): "
+          f"{gates.PLAN_DEFECT_CONTINUE}: criterion 3 is impossible as written")
+      and "AMENDED by the user" not in _pd_headless[0]["spec_text"]
+      and any("plan amendment (default, no amendment stated): " in d for d in _pd_headless[0]["decisions"])
       and _pd_headless[STRIKE_LIMIT]["_next"] == "end_blocked", _pd_headless)
+_PD_LONG = "x" * 1000 + "the finding's end"
+_pd_long = gates.apply_answer(base_state(escalation=dict(_pd_open[0], evidence=_PD_LONG),
+                                         last_answer=gates.PLAN_DEFECT_CONTINUE, spec_text="AC"))
+check("apply_answer: the default plan_defect amendment embeds only the tail of a long finding",
+      _pd_long["spec_text"].endswith(f"{gates.PLAN_DEFECT_CONTINUE}: {_lib.tail(_PD_LONG, 300)}")
+      and "x" * 400 not in _pd_long["spec_text"], _pd_long["spec_text"])
+_nav_pd, u = chain(base_state(escalation=_pd_open[0], spec_text="AC",
+                              consult_result="CONSULT: ANSWER 1 - amendment: vet exit 0 is enough"),
+                   "consult_route", "apply_answer")
+check("apply_answer: a plan_defect amendment the navigator stated is labeled the navigator's, never the user's",
+      u["_next"] == "build_gauntlet_prompt" and _nav_pd["spec_text"].endswith(
+          f"AMENDED by the navigator: {gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough")
+      and any("plan amendment (navigator): " in d for d in _nav_pd["decisions"]), _nav_pd.get("spec_text"))
+_owner_pd, u = chain(base_state(escalation=_pd_open[0], spec_text="AC", answer_source="navigator",
+                                last_answer=f"{gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough"),
+                     "ask_dispatch", "apply_answer")
+check("apply_answer: an owner's amendment after the navigator handed the question over is labeled the user's",
+      _owner_pd["spec_text"].endswith(f"AMENDED by the user: {gates.PLAN_DEFECT_CONTINUE}: amendment: vet exit 0 is enough"),
+      _owner_pd.get("spec_text"))
 u = gates.apply_answer(base_state(escalation=_pd_open[0], last_answer="Continue; treat the criterion as amended: drop AC3",
                                   spec_text="AC", plan_defect_continues=1))
 check("apply_answer: a stated plan_defect amendment is recorded as stated and counted",

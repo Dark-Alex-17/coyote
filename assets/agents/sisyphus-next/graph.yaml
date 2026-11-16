@@ -248,6 +248,7 @@ initial_state:
   reply_interpreted: false
   reply_source: ''
   reply_author: owner
+  answer_source: ''
   navigator_reasks: 0
   plan_defect_continues: 0
   choice_parks: {}

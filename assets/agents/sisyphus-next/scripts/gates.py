@@ -1263,13 +1263,33 @@ def _scope_guards(state):
     return out
 
 
+# who wrote a plan amendment: the spec label after "AMENDED by", and the ledger's tag
+AMENDMENT_AUTHORS = {
+    "default": ("default (no amendment was stated; resolves the adversary's finding)", "default, no amendment stated"),
+    "navigator": ("the navigator", "navigator"),
+    "user": ("the user", "user"),
+}
+
+
+def _amendment(a):
+    """(text, author) of a subtask amendment; a plain string from an older state is the user's."""
+    if isinstance(a, dict):
+        author = a.get("author")
+        return str(a.get("text") or ""), author if author in AMENDMENT_AUTHORS else "user"
+    return str(a), "user"
+
+
+def _amended_line(text, author):
+    return f"AMENDED by {AMENDMENT_AUTHORS[author][0]}: {text}"
+
+
 def _subtask_amendments(state):
-    """Every user amendment made to a subtask's criteria, as settled rulings for the final review."""
+    """Every amendment made to a subtask's criteria, as settled rulings for the final review."""
     lines = []
     for i, s in enumerate(as_list(state.get("subtasks")), 1):
-        for a in as_list(_subtask_at([s], 0).get("amendments")):
-            if str(a).strip():
-                lines.append(f"subtask {i}: {a}")
+        for text, _ in map(_amendment, as_list(_subtask_at([s], 0).get("amendments"))):
+            if text.strip():
+                lines.append(f"subtask {i}: {text}")
     return lines
 
 
@@ -1301,7 +1321,8 @@ def _subtask_spec(state, files=None):
     stated = [str(c) for c in as_list(s.get("acceptance_criteria")) if str(c).strip()]
     ac = [c for c in stated if not GIT_STATE_RE.search(c)]
     lines += ["", "Acceptance criteria:"] + ([f"- {c}" for c in ac] or ["- the outcome above, as stated"])
-    lines += [f"AMENDED by the user: {a}" for a in as_list(s.get("amendments")) if str(a).strip()]
+    lines += [_amended_line(text, author) for text, author in map(_amendment, as_list(s.get("amendments")))
+              if text.strip()]
     if files:
         shown = files[:SUBTASK_FILES_SHOWN]
         more = f" (and {len(files) - len(shown)} more)" if len(files) > len(shown) else ""
@@ -1585,7 +1606,8 @@ def consult_route(state):
             led, note = split_option_led(value, options, True)
             choice = _pick_with_note(value, options) or (f"{led}: {note}" if led and note else led)
         if choice:
-            u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0})
+            u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0,
+                      "answer_source": "navigator"})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
             u["_next"] = "apply_answer"
             return u
@@ -1595,7 +1617,7 @@ def consult_route(state):
         why = "may name more than one option" if ambiguous else "names no option by number or text"
         ledger(state, u, f"consult: {kind}: the navigator's answer {why} -> interpret: {value}")
         u.update({"last_answer_text": value, "reply_accepts": _accepts_text(kind), "reply_source": "navigator",
-                  "reply_author": "navigator", "reply_interpreted": False})
+                  "reply_author": "navigator", "reply_interpreted": False, "answer_source": "navigator"})
         u["_next"] = "interpret_reply"
         return u
     reason = "deferred" if verdict == "DEFER" else "no parseable consult verdict (timeout/fault)"
@@ -1643,6 +1665,8 @@ def ask_dispatch(state):
         return u
     esc = as_dict(state.get("escalation"))
     u["parked"] = esc.get("kind", "")
+    # whatever answers from here on is the owner's, even after the navigator was consulted
+    u["answer_source"] = ""
     snapshot(state, u, "parked")
     if OWNER_REMOTE_INPUT and truthy(state.get("top_level")) and truthy(state.get("owner_away")):
         u["owner_polls"] = 0
@@ -2356,20 +2380,24 @@ def apply_answer(state):
         elif a == "continue":
             u["plan_defect_continues"] = as_int(state.get("plan_defect_continues")) + 1
             if _stated_reason(answer, options) == NO_STATED_REASON:
-                # a bare or headless pick states no amendment, so the adversary's finding is the criterion it amends
-                answer = (f"{answer}: no amendment was stated, so the criterion is amended to resolve the adversary's "
-                          f"finding: {esc.get('evidence') or '(none recorded)'}")
+                # a bare or headless pick states no amendment, so the run amends the criterion to the adversary's finding
+                author = "default"
+                answer = f"{answer}: {tail(esc.get('evidence') or '', 300) or '(no finding recorded)'}"
+            else:
+                author = "navigator" if state.get("answer_source") == "navigator" else "user"
+            tag = AMENDMENT_AUTHORS[author][1]
             if _subtask_phase(state):
                 # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
                 subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
                 cur = max(as_int(state.get("subtask_index")) - 1, 0)
-                subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [answer]
+                subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [
+                    {"text": answer, "author": author}]
                 _seal_subtasks(state, subtasks)
                 u["subtasks"] = subtasks
-                ledger(state, u, f"plan amendment (user) to subtask {cur + 1}: {answer}")
+                ledger(state, u, f"plan amendment ({tag}) to subtask {cur + 1}: {answer}")
             else:
-                u["spec_text"] = (state.get("spec_text") or "") + f"\n\nAMENDED by the user: {answer}"
-                ledger(state, u, f"plan amendment (user): {answer}")
+                u["spec_text"] = (state.get("spec_text") or "") + "\n\n" + _amended_line(answer, author)
+                ledger(state, u, f"plan amendment ({tag}): {answer}")
             u["_next"] = "build_gauntlet_prompt"
         else:
             u["failure_reason"] = f"the plan itself is the root cause of a conformance failure; the user chose to stop: {answer}"
@@ -3332,7 +3360,7 @@ def build_gauntlet_prompt(state):
                      "the run base: every acceptance criterion above must hold.")
             amended = _subtask_amendments(state)
             if amended:
-                spec += ("\n\nSubtask criteria the user amended during the run (settled rulings; the parent criteria "
+                spec += ("\n\nSubtask criteria amended during the run (settled rulings; the parent criteria "
                          "above are unchanged):\n" + "\n".join(f"- {a}" for a in amended))
     cmds = state.get("verification_commands")
     cmds = "[]" if cmds is None else cmds
@@ -3344,7 +3372,7 @@ def build_gauntlet_prompt(state):
         declared = [c.strip() for c in arr if isinstance(c, str)]
         source = spec
         if _subtask_phase(state):
-            # only the subtask's criteria and the user's amendments, never its planner-written outcome or constraints
+            # only the subtask's criteria and their amendments, never its planner-written outcome or constraints
             m = re.search(r"^Acceptance criteria:\n((?:.+\n?)*)", spec, re.M)
             source = m.group(1) if m else ""
         kept, capped = criterion_commands(source, state.get("project_dir") or root, declared)
