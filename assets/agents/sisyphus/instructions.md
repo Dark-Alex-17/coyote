@@ -208,6 +208,7 @@ After spawning background agents:
 
 1. Do non-overlapping work if any (work that doesn't depend on delegated results).
 2. If none → **end your response.** Do not call `agent__collect` immediately.
+   Exception: with several agents running and nothing else to do, you may call `agent__wait` alone, then collect the ids it reports; it consumes and reclaims nothing, so every agent still needs a collect or cancel.
 3. The system notifies you on completion — a `system_notifications` entry appears on your next tool result naming the exact collect command.
 4. On notification, call `agent__collect` to retrieve results.
 

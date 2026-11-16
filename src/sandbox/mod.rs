@@ -3,10 +3,11 @@ use rust_embed::RustEmbed;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::{env, io};
 use which::which;
 
@@ -40,7 +41,92 @@ const MIN_SBX_VERSION: (u64, u64, u64) = (0, 45, 0);
 #[exclude = "**/.*"]
 struct EmbeddedKit;
 
-pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+pub struct SandboxInvocation {
+    pub name: Option<String>,
+    pub fresh: bool,
+    pub forwarded: Vec<OsString>,
+}
+
+/// Runs before clap so that every other flag reaches the inner Coyote
+/// untouched, even one the host binary does not know.
+pub fn split_sandbox_args(args: &[OsString]) -> Result<Option<SandboxInvocation>> {
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let (options, trailing) = args.split_at(separator);
+    if !options
+        .iter()
+        .any(|arg| arg == "--sandbox" || has_prefix(arg, "--sandbox="))
+    {
+        return Ok(None);
+    }
+
+    let mut invocation = SandboxInvocation {
+        name: None,
+        fresh: false,
+        forwarded: Vec::with_capacity(args.len()),
+    };
+    let mut options = options.iter();
+    while let Some(arg) = options.next() {
+        if arg == "--sandbox" {
+            continue;
+        }
+        if arg == "--fresh" {
+            invocation.fresh = true;
+            continue;
+        }
+        if has_prefix(arg, "--sandbox=") {
+            bail!("--sandbox takes no value; pass the name with --sandbox-name <NAME>");
+        }
+        if has_prefix(arg, "--fresh=") {
+            bail!("--fresh takes no value");
+        }
+        let value = if arg == "--sandbox-name" {
+            sandbox_name_value(options.next().ok_or_else(missing_name_value)?)?
+        } else if has_prefix(arg, "--sandbox-name=") {
+            sandbox_name_value(arg)?.split_off("--sandbox-name=".len())
+        } else {
+            invocation.forwarded.push(arg.clone());
+            continue;
+        };
+        if value.trim().is_empty() {
+            return Err(missing_name_value());
+        }
+        if value.starts_with('-') {
+            bail!("--sandbox-name requires a value (got '{value}', which looks like a flag)");
+        }
+        if invocation.name.replace(value).is_some() {
+            bail!("--sandbox-name given more than once");
+        }
+    }
+    invocation.forwarded.extend_from_slice(trailing);
+
+    Ok(Some(invocation))
+}
+
+fn has_prefix(arg: &OsStr, prefix: &str) -> bool {
+    arg.as_encoded_bytes().starts_with(prefix.as_bytes())
+}
+
+fn missing_name_value() -> anyhow::Error {
+    anyhow!("--sandbox-name requires a value")
+}
+
+fn sandbox_name_value(value: &OsString) -> Result<String> {
+    value
+        .to_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("--sandbox-name must be valid UTF-8"))
+}
+
+pub fn launch(invocation: SandboxInvocation) -> Result<i32> {
+    let SandboxInvocation {
+        name,
+        fresh,
+        forwarded,
+    } = invocation;
     ensure_sbx_installed()?;
     bail_if_nested()?;
 
@@ -109,7 +195,7 @@ pub fn launch(name: Option<String>, fresh: bool) -> Result<()> {
         }
     }
 
-    exec_run(&name)
+    exec_coyote(&name, &forwarded)
 }
 
 fn ensure_sbx_installed() -> Result<()> {
@@ -176,26 +262,30 @@ fn bail_if_nested() -> Result<()> {
 }
 
 fn resolve_name(name: Option<String>) -> Result<String> {
-    if let Some(n) = name {
-        let trimmed = n.trim();
-        if !trimmed.is_empty() {
-            let sanitized = sanitize_name(trimmed);
-            if sanitized.is_empty() {
-                bail!("Sandbox name '{trimmed}' sanitizes to an empty string");
-            }
+    let Some(name) = name else {
+        let cwd = env::current_dir().context("Failed to determine current directory")?;
+        let basename = cwd.file_name().and_then(|s| s.to_str()).ok_or_else(|| {
+            anyhow!(
+                "Could not derive sandbox name from current directory; pass --sandbox-name <NAME>"
+            )
+        })?;
+        return name_from_basename(basename);
+    };
 
-            return Ok(sanitized);
-        }
+    let sanitized = sanitize_name(&name);
+    if sanitized.is_empty() {
+        bail!("Sandbox name '{name}' sanitizes to an empty string");
     }
 
-    let cwd = env::current_dir().context("Failed to determine current directory")?;
-    let basename = cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Could not derive sandbox name from current directory"))?;
+    Ok(sanitized)
+}
+
+fn name_from_basename(basename: &str) -> Result<String> {
     let sanitized = sanitize_name(basename);
     if sanitized.is_empty() {
-        bail!("Could not derive a valid sandbox name from '{basename}'; pass --sandbox <NAME>");
+        bail!(
+            "Could not derive a valid sandbox name from '{basename}'; pass --sandbox-name <NAME>"
+        );
     }
 
     Ok(sanitized)
@@ -949,11 +1039,8 @@ fn split_columns(line: &str) -> Vec<&str> {
 }
 
 fn sbx_secret_set(service: &str, secret_value: &str) -> Result<()> {
-    let mut child = Command::new(SBX_BINARY)
-        .args(["secret", "set", service])
+    let mut child = setup_command(["secret", "set", service])
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
         .spawn()
         .context("Failed to spawn `sbx secret set`")?;
 
@@ -992,11 +1079,8 @@ fn sbx_secret_set_custom(env_var: &str, targets: &[String], secret_value: &str) 
         targets.join(", ")
     );
 
-    let mut child = Command::new(SBX_BINARY)
-        .args(&args)
+    let mut child = setup_command(&args)
         .stdin(Stdio::piped())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
         .spawn()
         .context("Failed to spawn `sbx secret set-custom`")?;
 
@@ -1026,11 +1110,7 @@ fn sbx_secret_set_custom(env_var: &str, targets: &[String], secret_value: &str) 
 
 fn sbx_secret_rm_custom(placeholder: &str) -> Result<bool> {
     debug!("sbx secret rm --placeholder {placeholder} -f");
-    let status = Command::new(SBX_BINARY)
-        .args(["secret", "rm", "--placeholder", placeholder, "-f"])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let status = setup_command(["secret", "rm", "--placeholder", placeholder, "-f"])
         .status()
         .context("Failed to spawn `sbx secret rm`")?;
 
@@ -1067,11 +1147,7 @@ fn create_sandbox(
     info!("Creating sandbox '{name}'");
     let args = build_create_args(name, kit_path, kits, credentials_kit)?;
     debug!("sbx {}", args.join(" "));
-    let status = Command::new(SBX_BINARY)
-        .args(&args)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let status = setup_command(&args)
         .status()
         .context("Failed to spawn `sbx create`")?;
 
@@ -1178,11 +1254,7 @@ fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
 
     debug!("sbx exec {sandbox}: {cmd}");
 
-    let status = Command::new(SBX_BINARY)
-        .args(["exec", sandbox, "sh", "-c", &cmd])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let status = setup_command(["exec", sandbox, "sh", "-c", &cmd])
         .status()
         .context("Failed to spawn `sbx exec` to prepare destination directory")?;
 
@@ -1195,11 +1267,7 @@ fn ensure_sandbox_dir(sandbox: &str, dir: &str) -> Result<()> {
 
 fn sbx_cp(src: &str, dest: &str) -> Result<()> {
     debug!("sbx cp {src} {dest}");
-    let status = Command::new(SBX_BINARY)
-        .args(["cp", src, dest])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let status = setup_command(["cp", src, dest])
         .status()
         .context("Failed to spawn `sbx cp`")?;
 
@@ -1210,22 +1278,182 @@ fn sbx_cp(src: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_run(name: &str) -> Result<()> {
-    let args = run_args(name);
-    debug!("sbx {}", args.join(" "));
-    let status = Command::new(SBX_BINARY)
+fn exec_coyote(name: &str, forwarded: &[OsString]) -> Result<i32> {
+    let stdin_is_tty = io::stdin().is_terminal();
+    let interactive = is_interactive(stdin_is_tty, io::stdout().is_terminal(), forwarded);
+    let (subcommand, args, stdin) = if interactive {
+        (
+            "run",
+            forwarding_run_args(name, forwarded),
+            Stdio::inherit(),
+        )
+    } else {
+        let cwd = env::current_dir().context("Failed to determine current directory")?;
+        let cwd = logical_cwd(env::var_os("PWD").as_deref(), &cwd);
+        let args = exec_args(name, &cwd, stdin_is_tty, forwarded);
+        ("exec", args, exec_stdin_mode(stdin_is_tty).into())
+    };
+    debug!("{}", launch_log_line(subcommand, name, forwarded.len()));
+    let mut child = Command::new(SBX_BINARY)
         .args(&args)
-        .stdin(Stdio::inherit())
+        .stdin(stdin)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
-        .context("Failed to spawn `sbx run`")?;
+        .spawn()
+        .with_context(|| format!("Failed to spawn `sbx {subcommand}`"))?;
+    let _ignore_signals = SignalIgnoreGuard::new();
+    let status = child
+        .wait()
+        .with_context(|| format!("Failed to wait for `sbx {subcommand}`"))?;
 
-    if !status.success() {
-        bail!("`sbx run` exited with {status}");
+    Ok(exit_code(status))
+}
+
+/// Forwarded arguments can carry the user's prompt, so only their count is
+/// logged.
+fn launch_log_line(subcommand: &str, name: &str, forwarded_count: usize) -> String {
+    format!("sbx {subcommand} in sandbox '{name}' with {forwarded_count} forwarded argument(s)")
+}
+
+/// The terminal sends Ctrl-C to the whole foreground process group, so the
+/// host must survive it to propagate the child's exit code. Install it only
+/// after spawning: an ignored disposition is inherited across exec and would
+/// make the child ignore Ctrl-C too.
+#[cfg(unix)]
+struct SignalIgnoreGuard {
+    saved: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+#[cfg(unix)]
+impl SignalIgnoreGuard {
+    fn new() -> Self {
+        let saved = [libc::SIGINT, libc::SIGQUIT]
+            .into_iter()
+            .filter_map(|signal| {
+                // SAFETY: an all-zero sigaction is a valid value (empty mask, no flags).
+                let mut ignore: libc::sigaction = unsafe { std::mem::zeroed() };
+                ignore.sa_sigaction = libc::SIG_IGN;
+                // SAFETY: as above; sigaction overwrites it on success.
+                let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+                // SAFETY: both pointers refer to live, initialised sigaction values.
+                let rc = unsafe { libc::sigaction(signal, &ignore, &mut previous) };
+                (rc == 0).then_some((signal, previous))
+            })
+            .collect();
+        Self { saved }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalIgnoreGuard {
+    fn drop(&mut self) {
+        for (signal, previous) in &self.saved {
+            // SAFETY: `previous` is the disposition sigaction returned for this signal.
+            unsafe { libc::sigaction(*signal, previous, std::ptr::null_mut()) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct SignalIgnoreGuard;
+
+#[cfg(not(unix))]
+impl SignalIgnoreGuard {
+    fn new() -> Self {
+        Self
+    }
+}
+
+/// sbx records the workspace under the path the user typed, so a cwd reached
+/// through a symlink must be named by `$PWD` rather than its resolved target.
+fn logical_cwd(pwd: Option<&OsStr>, current: &Path) -> PathBuf {
+    let same_dir = |pwd: &Path| match (fs::canonicalize(pwd), fs::canonicalize(current)) {
+        (Ok(pwd), Ok(current)) => pwd == current,
+        _ => false,
+    };
+    pwd.map(Path::new)
+        .filter(|pwd| pwd.is_absolute() && same_dir(pwd))
+        .unwrap_or(current)
+        .to_path_buf()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdinMode {
+    Inherit,
+    Null,
+}
+
+impl From<StdinMode> for Stdio {
+    fn from(mode: StdinMode) -> Self {
+        match mode {
+            StdinMode::Inherit => Stdio::inherit(),
+            StdinMode::Null => Stdio::null(),
+        }
+    }
+}
+
+/// Setup children must not swallow piped stdin meant for the inner Coyote,
+/// but keep a terminal so sbx can still prompt.
+fn setup_stdin_mode(stdin_is_tty: bool) -> StdinMode {
+    if stdin_is_tty {
+        StdinMode::Inherit
+    } else {
+        StdinMode::Null
+    }
+}
+
+/// The inner Coyote reads stdin whenever it is not a terminal, so forwarding
+/// the user's terminal through `sbx exec -i` would block it until Ctrl-D. It
+/// gets EOF instead; only piped input is passed through.
+fn exec_stdin_mode(stdin_is_tty: bool) -> StdinMode {
+    if stdin_is_tty {
+        StdinMode::Null
+    } else {
+        StdinMode::Inherit
+    }
+}
+
+/// Only the inner Coyote may write to stdout, so a setup child's stdout is
+/// sent to stderr.
+fn setup_command<I, S>(args: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut command = Command::new(SBX_BINARY);
+    command
+        .args(args)
+        .stdin(setup_stdin_mode(io::stdin().is_terminal()))
+        .stdout(Stdio::from(io::stderr()))
+        .stderr(Stdio::inherit());
+    command
+}
+
+fn exit_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
     }
 
-    Ok(())
+    1
+}
+
+/// `sbx run` allocates a pty and writes terminal queries to stdout, which
+/// corrupts piped output, so it is only used when a human is attached and
+/// the inner Coyote is not asked to run headless.
+fn is_interactive(stdin_tty: bool, stdout_tty: bool, forwarded: &[OsString]) -> bool {
+    stdin_tty
+        && stdout_tty
+        && !forwarded
+            .iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--headless" || arg == "--acp-server")
 }
 
 /// Kits are bound at create time; sbx rejects `--kit` on a `run` against an
@@ -1234,17 +1462,36 @@ fn run_args(name: &str) -> Vec<String> {
     vec!["run".to_string(), "--name".to_string(), name.to_string()]
 }
 
+fn forwarding_run_args(name: &str, forwarded: &[OsString]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = run_args(name).into_iter().map(OsString::from).collect();
+    if !forwarded.is_empty() {
+        args.push("--".into());
+        args.extend_from_slice(forwarded);
+    }
+
+    args
+}
+
+/// The sandbox mounts the workspace at the same absolute path as the host,
+/// so the host working directory is valid inside it.
+fn exec_args(name: &str, cwd: &Path, stdin_is_tty: bool, forwarded: &[OsString]) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["exec".into()];
+    if !stdin_is_tty {
+        args.push("-i".into());
+    }
+    args.extend(["-w".into(), cwd.into(), name.into(), "coyote".into()]);
+    args.extend_from_slice(forwarded);
+
+    args
+}
+
 fn chown_agent_recursive(sandbox: &str, path: &str) -> Result<()> {
     let path_q = shell_words::quote(path);
     let cmd = format!("sudo chown -R agent:agent {path_q}");
 
     debug!("sbx exec {sandbox}: {cmd}");
 
-    let status = Command::new(SBX_BINARY)
-        .args(["exec", sandbox, "sh", "-c", &cmd])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let status = setup_command(["exec", sandbox, "sh", "-c", &cmd])
         .status()
         .context("Failed to spawn `sbx exec` to chown copied files")?;
 
@@ -1699,6 +1946,15 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
     }
 
     #[test]
+    fn resolve_name_refuses_an_explicit_name_that_sanitizes_to_nothing() {
+        let err = resolve_name(Some("___".to_string())).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Sandbox name '___' sanitizes to an empty string"
+        );
+    }
+
+    #[test]
     fn compute_kit_hash_is_deterministic() {
         let h1 = compute_kit_hash().unwrap();
         let h2 = compute_kit_hash().unwrap();
@@ -2006,6 +2262,385 @@ my-box   api.stripe.com   API_KEY   sbx-cs-abc12   sk-***
     #[test]
     fn run_args_names_the_sandbox_and_nothing_else() {
         assert_eq!(run_args("n"), vec!["run", "--name", "n"]);
+    }
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn split(args: &[&str]) -> Result<Option<SandboxInvocation>> {
+        split_sandbox_args(&os_args(args))
+    }
+
+    #[test]
+    fn split_sandbox_args_is_none_without_the_sandbox_flag() {
+        assert_eq!(split(&[]).unwrap(), None);
+        assert_eq!(split(&["--agent", "x", "hello"]).unwrap(), None);
+        assert_eq!(split(&["--sandbox-name", "box"]).unwrap(), None);
+        assert_eq!(split(&["--mcp-add", "s", "--", "--sandbox"]).unwrap(), None);
+    }
+
+    #[test]
+    fn split_sandbox_args_bare_flag_forwards_nothing() {
+        assert_eq!(
+            split(&["--sandbox"]).unwrap(),
+            Some(SandboxInvocation {
+                name: None,
+                fresh: false,
+                forwarded: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn split_sandbox_args_reads_the_name_in_both_forms() {
+        let separate = split(&["--sandbox", "--sandbox-name", "box"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(separate.name.as_deref(), Some("box"));
+        assert!(separate.forwarded.is_empty());
+
+        let joined = split(&["--sandbox-name=box", "--sandbox"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(joined.name.as_deref(), Some("box"));
+        assert!(joined.forwarded.is_empty());
+    }
+
+    #[test]
+    fn split_sandbox_args_refuses_a_missing_name_value() {
+        let err = split(&["--sandbox", "--sandbox-name"]).unwrap_err();
+        assert_eq!(err.to_string(), "--sandbox-name requires a value");
+        assert!(split(&["--sandbox", "--sandbox-name", "--", "x"]).is_err());
+    }
+
+    #[test]
+    fn split_sandbox_args_refuses_an_empty_or_flag_like_name_value() {
+        for args in [
+            &["--sandbox", "--sandbox-name="][..],
+            &["--sandbox", "--sandbox-name", ""],
+            &["--sandbox", "--sandbox-name", "  "],
+            &["--sandbox", "--sandbox-name=\t"],
+        ] {
+            let err = split(args).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "--sandbox-name requires a value",
+                "{args:?}"
+            );
+        }
+        for (args, got) in [
+            (
+                &["--sandbox", "--sandbox-name", "--headless", "hi"][..],
+                "--headless",
+            ),
+            (&["--sandbox", "--sandbox-name", "-m"], "-m"),
+            (&["--sandbox", "--sandbox-name=--headless"], "--headless"),
+            (&["--sandbox", "--sandbox-name=-m"], "-m"),
+        ] {
+            let err = split(args).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("--sandbox-name requires a value (got '{got}', which looks like a flag)"),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_sandbox_args_refuses_a_repeated_name() {
+        for args in [
+            &["--sandbox", "--sandbox-name", "a", "--sandbox-name", "b"][..],
+            &["--sandbox", "--sandbox-name=a", "--sandbox-name=a"],
+        ] {
+            let err = split(args).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "--sandbox-name given more than once",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_sandbox_args_refuses_a_value_on_the_fresh_flag() {
+        for args in [
+            &["--sandbox", "--fresh="][..],
+            &["--sandbox", "--fresh=yes"],
+        ] {
+            let err = split(args).unwrap_err();
+            assert_eq!(err.to_string(), "--fresh takes no value", "{args:?}");
+        }
+        let after_separator = split(&["--sandbox", "--", "--fresh=yes"]).unwrap().unwrap();
+        assert_eq!(after_separator.forwarded, os_args(&["--", "--fresh=yes"]));
+    }
+
+    #[test]
+    fn split_sandbox_args_refuses_a_value_on_the_sandbox_flag() {
+        let err = split(&["--sandbox", "--sandbox=box"]).unwrap_err();
+        assert!(err.to_string().contains("--sandbox-name <NAME>"), "{err}");
+
+        let err = split(&["--sandbox=box", "--info"]).unwrap_err();
+        assert!(err.to_string().contains("--sandbox-name <NAME>"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn split_sandbox_args_matches_host_tokens_with_non_utf8_values() {
+        use std::os::unix::ffi::OsStringExt;
+        let with_bytes = |prefix: &str| {
+            let mut bytes = prefix.as_bytes().to_vec();
+            bytes.push(0xff);
+            OsString::from_vec(bytes)
+        };
+
+        let err = split_sandbox_args(&[with_bytes("--sandbox=")]).unwrap_err();
+        assert!(err.to_string().contains("--sandbox-name <NAME>"), "{err}");
+
+        let err =
+            split_sandbox_args(&["--sandbox".into(), with_bytes("--sandbox-name=")]).unwrap_err();
+        assert_eq!(err.to_string(), "--sandbox-name must be valid UTF-8");
+    }
+
+    #[test]
+    fn split_sandbox_args_forwards_memory_migrate() {
+        let invocation = split(&["--sandbox", "--memory-migrate", "all"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(invocation.forwarded, os_args(&["--memory-migrate", "all"]));
+    }
+
+    #[test]
+    fn split_sandbox_args_consumes_fresh() {
+        let invocation = split(&["--fresh", "--sandbox", "-a", "x"])
+            .unwrap()
+            .unwrap();
+        assert!(invocation.fresh);
+        assert_eq!(invocation.forwarded, os_args(&["-a", "x"]));
+    }
+
+    #[test]
+    fn split_sandbox_args_forwards_everything_else_in_order() {
+        let invocation = split(&[
+            "--agent",
+            "sisyphus",
+            "--sandbox",
+            "--info",
+            "--sandbox-name",
+            "box",
+            "--install",
+            "x/y",
+            "do x",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(invocation.name.as_deref(), Some("box"));
+        assert_eq!(
+            invocation.forwarded,
+            os_args(&["--agent", "sisyphus", "--info", "--install", "x/y", "do x"])
+        );
+    }
+
+    #[test]
+    fn split_sandbox_args_leaves_everything_after_the_separator_untouched() {
+        let invocation = split(&[
+            "--sandbox",
+            "--mcp-add",
+            "s",
+            "--",
+            "--sandbox",
+            "--fresh",
+            "--sandbox-name=n",
+            "--",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(invocation.name, None);
+        assert!(!invocation.fresh);
+        assert_eq!(
+            invocation.forwarded,
+            os_args(&[
+                "--mcp-add",
+                "s",
+                "--",
+                "--sandbox",
+                "--fresh",
+                "--sandbox-name=n",
+                "--"
+            ])
+        );
+    }
+
+    #[test]
+    fn is_interactive_needs_both_terminals_and_no_headless_flag() {
+        let prompt = os_args(&["--agent", "x", "hi"]);
+        assert!(is_interactive(true, true, &[]));
+        assert!(is_interactive(true, true, &prompt));
+        assert!(!is_interactive(false, true, &prompt));
+        assert!(!is_interactive(true, false, &prompt));
+        assert!(!is_interactive(true, true, &os_args(&["--headless", "hi"])));
+        assert!(!is_interactive(true, true, &os_args(&["--acp-server"])));
+        assert!(is_interactive(
+            true,
+            true,
+            &os_args(&["--mcp-add", "s", "--", "srv", "--headless"])
+        ));
+    }
+
+    #[test]
+    fn forwarding_run_args_appends_forwarded_args_after_a_separator() {
+        assert_eq!(forwarding_run_args("n", &[]), vec!["run", "--name", "n"]);
+        assert_eq!(
+            forwarding_run_args("box", &os_args(&["--agent", "sisyphus", "do x"])),
+            vec!["run", "--name", "box", "--", "--agent", "sisyphus", "do x"]
+        );
+    }
+
+    #[test]
+    fn setup_children_keep_a_terminal_but_never_take_piped_stdin() {
+        assert_eq!(setup_stdin_mode(true), StdinMode::Inherit);
+        assert_eq!(setup_stdin_mode(false), StdinMode::Null);
+    }
+
+    #[test]
+    fn the_inner_exec_takes_piped_stdin_but_never_the_terminal() {
+        assert_eq!(exec_stdin_mode(true), StdinMode::Null);
+        assert_eq!(exec_stdin_mode(false), StdinMode::Inherit);
+    }
+
+    #[test]
+    fn launch_log_line_counts_forwarded_args_without_their_contents() {
+        let forwarded = os_args(&["--agent", "x", "SENTINEL-PROMPT-TOKEN"]);
+        let line = launch_log_line("exec", "box", forwarded.len());
+        assert_eq!(
+            line,
+            "sbx exec in sandbox 'box' with 3 forwarded argument(s)"
+        );
+        assert!(!line.contains("SENTINEL-PROMPT-TOKEN"));
+    }
+
+    #[cfg(unix)]
+    fn current_handler(signal: libc::c_int) -> libc::sighandler_t {
+        // SAFETY: an all-zero sigaction is a valid value.
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null new action only reads the disposition into `current`.
+        let rc = unsafe { libc::sigaction(signal, std::ptr::null(), &mut current) };
+        assert_eq!(rc, 0);
+        current.sa_sigaction
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn signal_ignore_guard_ignores_and_then_restores_sigint_and_sigquit() {
+        let signals = [libc::SIGINT, libc::SIGQUIT];
+        let before = signals.map(current_handler);
+        let guard = SignalIgnoreGuard::new();
+        assert_eq!(signals.map(current_handler), [libc::SIG_IGN; 2]);
+        drop(guard);
+        assert_eq!(signals.map(current_handler), before);
+    }
+
+    #[test]
+    fn exec_args_attaches_piped_stdin_and_runs_coyote_in_the_working_directory() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            exec_args("n", cwd, false, &[]),
+            vec!["exec", "-i", "-w", "/work/project", "n", "coyote"]
+        );
+        assert_eq!(
+            exec_args("n", cwd, false, &os_args(&["--headless", "say hi"])),
+            vec![
+                "exec",
+                "-i",
+                "-w",
+                "/work/project",
+                "n",
+                "coyote",
+                "--headless",
+                "say hi"
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_args_leaves_stdin_detached_when_it_is_a_terminal() {
+        assert_eq!(
+            exec_args(
+                "n",
+                Path::new("/work/project"),
+                true,
+                &os_args(&["--headless", "say hi"])
+            ),
+            vec![
+                "exec",
+                "-w",
+                "/work/project",
+                "n",
+                "coyote",
+                "--headless",
+                "say hi"
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_command_runs_sbx_with_the_given_args() {
+        let command = setup_command(["cp", "src", "box:/dest/"]);
+
+        assert_eq!(command.get_program(), SBX_BINARY);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec!["cp", "src", "box:/dest/"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn logical_cwd_keeps_a_pwd_that_reaches_the_cwd_through_a_symlink() {
+        let root = env::temp_dir().join(format!("coyote-logical-cwd-{}", std::process::id()));
+        let real = root.join("real");
+        let link = root.join("link");
+        fs::create_dir_all(&real).unwrap();
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let current = real.canonicalize().unwrap();
+
+        assert_eq!(logical_cwd(Some(link.as_os_str()), &current), link);
+        assert_eq!(logical_cwd(Some(root.as_os_str()), &current), current);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn logical_cwd_ignores_a_missing_relative_or_stale_pwd() {
+        let current = env::current_dir().unwrap();
+        assert_eq!(logical_cwd(None, &current), current);
+        assert_eq!(logical_cwd(Some(OsStr::new(".")), &current), current);
+        let stale = current.join("coyote-no-such-dir");
+        assert_eq!(logical_cwd(Some(stale.as_os_str()), &current), current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_code_passes_codes_through_and_maps_signals_to_128_plus_n() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exit_code(ExitStatus::from_raw(7 << 8)), 7);
+        assert_eq!(exit_code(ExitStatus::from_raw(9)), 137);
+    }
+
+    #[test]
+    fn name_from_basename_sanitizes_the_directory_name() {
+        assert_eq!(
+            name_from_basename("My Project_v2").unwrap(),
+            "my-project-v2"
+        );
+    }
+
+    #[test]
+    fn name_from_basename_points_at_the_name_flag_when_nothing_survives() {
+        let err = name_from_basename("___").unwrap_err();
+        assert!(err.to_string().contains("--sandbox-name <NAME>"), "{err}");
     }
 
     #[test]

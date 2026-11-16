@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// Mirrors `WORKSPACE_MEMORY_ROOT_TEST_ENV` in `src/config/memory.rs`;
+/// `the_test_memory_root_env_name_matches_the_source_const` keeps the two
+/// equal.
+const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = "COYOTE_TEST_WORKSPACE_MEMORY_ROOT";
+
 struct Fixture {
     dir: PathBuf,
     workspace: PathBuf,
@@ -412,5 +417,73 @@ fn a_workspace_that_cannot_be_written_stops_after_global_and_names_both_backups(
             workspace_backup.display()
         )),
         "{stderr}"
+    );
+}
+
+/// The unit-test workspace memory pin is a test-build seam: a real
+/// `--memory-migrate --apply` that carries it still migrates the store above
+/// its cwd and leaves the pinned workspace byte-for-byte untouched.
+#[test]
+fn usage_probe_apply_migrates_the_cwd_workspace_and_ignores_the_test_root_pin() {
+    let fx = fixture("pin");
+    let decoy = fx.dir.join("decoy");
+    let decoy_store = decoy.join(".coyote").join("memory");
+    fs::create_dir_all(&decoy_store).unwrap();
+    fs::write(
+        decoy_store.join("MEMORY.md"),
+        "## Drill files\n- [[d-note]]: decoy note\n",
+    )
+    .unwrap();
+    fs::write(
+        decoy_store.join("d-note.md"),
+        "---\nname: d-note\nowner: alice\ntype: project\n---\n\nbody\n",
+    )
+    .unwrap();
+    let decoy_before = snapshot(&decoy);
+
+    let output = command(&fx, &["--memory-migrate", "all", "--apply"])
+        .env(TEST_WORKSPACE_MEMORY_ROOT_ENV, &decoy)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = assert_success(&output);
+
+    let printed = Path::new(header_dir(&stdout, "workspace"));
+    assert!(
+        fs::canonicalize(printed).unwrap() == fs::canonicalize(fx.workspace_store()).unwrap(),
+        "workspace header {printed:?} is not the cwd store\n{stdout}"
+    );
+    assert!(!stdout.contains("d-note"), "{stdout}");
+    assert_eq!(
+        snapshot(&decoy),
+        decoy_before,
+        "the pinned root was rewritten"
+    );
+    let index = fs::read_to_string(fx.workspace_store().join("MEMORY.md")).unwrap();
+    assert!(
+        !index.contains("[[w-note]]"),
+        "cwd store not migrated:\n{index}"
+    );
+    let drill = fs::read_to_string(fx.workspace_store().join("w-note.md")).unwrap();
+    assert!(
+        drill.contains("description: workspace note"),
+        "cwd drill not migrated:\n{drill}"
+    );
+}
+
+/// `TEST_WORKSPACE_MEMORY_ROOT_ENV` is a copy of the source const, so a
+/// rename there would leave the probe above setting a variable no build
+/// reads; this keeps the two equal.
+#[test]
+fn the_test_memory_root_env_name_matches_the_source_const() {
+    let source_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config/memory.rs");
+    let source = fs::read_to_string(&source_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", source_path.display()));
+    let needle =
+        format!("WORKSPACE_MEMORY_ROOT_TEST_ENV: &str = \"{TEST_WORKSPACE_MEMORY_ROOT_ENV}\"");
+    assert!(
+        source.contains(&needle),
+        "{} no longer declares {needle}",
+        source_path.display()
     );
 }

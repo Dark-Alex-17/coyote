@@ -2,13 +2,13 @@ use super::reducer;
 use super::staging::BranchWrites;
 use super::types::{GraphState, Reducer};
 use super::{GRAPH_STATE_ENV, MAX_STATE_SIZE_BYTES, SCRIPT_FALLBACK_ERROR_KEY};
+use crate::utils::fs::write_private_atomic;
 use crate::utils::temp_file;
 use anyhow::{Context, Result, bail};
 use fancy_regex::Regex;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::fs::write;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
@@ -107,17 +107,21 @@ impl StateManager {
         Some(current)
     }
 
+    /// A spilled representation is valid until the next call or `cleanup`.
     pub fn serialize_state(&mut self) -> Result<StateRepresentation> {
         let json = self.state.to_json()?;
         if spills_to_file(json.len()) {
             let path = temp_file("-graph-state-", ".json");
-            write(&path, json.as_bytes()).with_context(|| {
+            write_private_atomic(&path, &json).with_context(|| {
                 format!("Failed to write state to temp file at '{}'", path.display())
             })?;
-            self.temp_file = Some(path.clone());
+            if let Some(old) = self.temp_file.replace(path.clone()) {
+                let _ = fs::remove_file(old);
+            }
 
             Ok(StateRepresentation::File(path))
         } else {
+            self.cleanup();
             Ok(StateRepresentation::Inline(json))
         }
     }
@@ -618,6 +622,62 @@ mod tests {
 
         drop(manager);
         assert!(!path.exists(), "temp file should be cleaned up on drop");
+    }
+
+    #[test]
+    fn a_second_spill_removes_the_first_spill_file() {
+        let big = "x".repeat(MAX_STATE_SIZE_BYTES + 1024);
+        let mut manager = manager_with(&[("blob", json!(big))]);
+
+        let first = manager.serialize_state().unwrap();
+        let first = first.as_file_path().unwrap().clone();
+        let second = manager.serialize_state().unwrap();
+        let second = second.as_file_path().unwrap().clone();
+
+        assert_ne!(first, second);
+        assert!(
+            !first.exists(),
+            "the first spill file outlived the second spill"
+        );
+        assert!(second.exists());
+
+        manager.cleanup();
+        assert!(
+            !second.exists(),
+            "cleanup left the latest spill file behind"
+        );
+    }
+
+    #[test]
+    fn going_back_inline_removes_the_previous_spill_file() {
+        let big = "x".repeat(MAX_STATE_SIZE_BYTES + 1024);
+        let mut manager = manager_with(&[("blob", json!(big))]);
+        let spilled = manager.serialize_state().unwrap();
+        let spilled = spilled.as_file_path().unwrap().clone();
+        assert!(spilled.exists());
+
+        manager.merge_script_output(r#"{"blob": "small"}"#).unwrap();
+        let repr = manager.serialize_state().unwrap();
+
+        assert!(matches!(repr, StateRepresentation::Inline(_)));
+        assert!(
+            !spilled.exists(),
+            "the spill file outlived the return to an inline state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_spill_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let big = "x".repeat(MAX_STATE_SIZE_BYTES + 1024);
+        let mut manager = manager_with(&[("blob", json!(big))]);
+
+        let repr = manager.serialize_state().unwrap();
+
+        let path = repr.as_file_path().unwrap();
+        let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "spill file mode {mode:o}");
     }
 
     /// A state that fits MAX_STATE_SIZE_BYTES only when the `GRAPH_STATE=`

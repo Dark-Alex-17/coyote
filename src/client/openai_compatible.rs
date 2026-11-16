@@ -269,6 +269,7 @@ pub fn generic_build_rerank_body(data: &RerankData, model: &Model) -> Value {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::function::{ImageAttachment, ToolResult};
     use std::sync::Arc;
 
     fn compat_config(wire_api: Option<WireApi>) -> OpenAICompatibleConfig {
@@ -293,11 +294,23 @@ mod tests {
         client: &OpenAICompatibleClient,
         stream: bool,
     ) -> Result<(RequestData, WireApi)> {
-        let data = ChatCompletionsData {
-            messages: vec![Message::new(
+        prepare_messages(
+            client,
+            vec![Message::new(
                 MessageRole::User,
                 MessageContent::Text("hello".to_string()),
             )],
+            stream,
+        )
+    }
+
+    fn prepare_messages(
+        client: &OpenAICompatibleClient,
+        messages: Vec<Message>,
+        stream: bool,
+    ) -> Result<(RequestData, WireApi)> {
+        let data = ChatCompletionsData {
+            messages,
             temperature: None,
             top_p: None,
             reasoning_effort: None,
@@ -392,6 +405,49 @@ mod tests {
         assert_eq!(
             request_data.url,
             "https://compat.example/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_wire_sends_tool_images_in_a_user_message_after_the_tool_message() {
+        let client = make_client(compat_config(Some(WireApi::Chat)));
+        let result = ToolResult::new(
+            ToolCall::new("fs_read".into(), json!({"path": "x"}), Some("call_A".into())),
+            json!("ok"),
+        )
+        .with_attachments(vec![ImageAttachment {
+            source: "/tmp/a.png".into(),
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }]);
+        let messages = vec![
+            Message::new(
+                MessageRole::User,
+                MessageContent::Text("hello".to_string()),
+            ),
+            Message::new(
+                MessageRole::Assistant,
+                MessageContent::ToolCalls(MessageContentToolCalls {
+                    tool_results: vec![result],
+                    text: String::new(),
+                    sequence: false,
+                    round_starts: vec![],
+                }),
+            ),
+        ];
+
+        let (request_data, _) = prepare_messages(&client, messages, false).unwrap();
+
+        let messages = request_data.body["messages"].as_array().unwrap();
+        let roles: Vec<_> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "user"]);
+        assert_eq!(messages[3]["content"][1]["type"], "image_url");
+        assert_eq!(
+            messages[3]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
         );
     }
 }

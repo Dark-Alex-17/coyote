@@ -7,13 +7,14 @@ use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::CompletionRunner;
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
-use crate::repl::DEFAULT_CONTINUATION_PROMPT;
+use crate::repl::{DEFAULT_CONTINUATION_PROMPT, EXIT_CANCEL_WAIT, latch_prompt_interrupt};
 use crate::supervisor::TaskKind;
 use crate::utils::{AbortSignal, TaskCancelGuard, wait_user_interrupt};
 use anyhow::{Error, Result};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Which turn loop `TurnDriver::run_turn` runs: the interactive REPL's
 /// (compression, auto-continue, interrupt bookkeeping, a divider at the
@@ -87,6 +88,9 @@ impl TurnDriver<'_> {
         with_embeddings: bool,
         forced: Option<Branch>,
     ) -> Result<TurnOutcome> {
+        // The graph branch never reaches the runner's preflight, so a refused
+        // image must stop the turn here, before it is recorded or routed.
+        input.guard_images()?;
         let mut input = input;
         let mut with_embeddings = with_embeddings;
         // One compress-and-retry per fresh input; tool-loop iterations share it.
@@ -105,7 +109,8 @@ impl TurnDriver<'_> {
             }
             ctx.session_abort = Some(abort_signal.clone());
             if with_embeddings {
-                input.use_embeddings(abort_signal.clone()).await?;
+                let embeddings = input.use_embeddings(abort_signal.clone());
+                interruptible_step(ctx, &abort_signal, embeddings).await?;
                 with_embeddings = false;
             }
             while ctx.is_compressing_session() {
@@ -124,8 +129,22 @@ impl TurnDriver<'_> {
             {
                 routed = true;
                 ctx.before_chat_completion(&input)?;
-                match run_graph_turn(ctx, &input, abort_signal.clone(), forced, self.runner).await?
-                {
+                let turn =
+                    match run_graph_turn(ctx, &input, abort_signal.clone(), forced, self.runner)
+                        .await
+                    {
+                        Ok(turn) => turn,
+                        Err(err) => {
+                            if abort_signal.aborted_ctrlc() {
+                                emit_turn_notice(
+                                    ctx,
+                                    turn_interrupt_notice(ctx, &abort_signal).await,
+                                );
+                            }
+                            return Err(err);
+                        }
+                    };
+                match turn {
                     GraphTurn::Run { output, last_run } => {
                         emit_assistant_text(ui.as_ref(), app.as_ref(), &output)?;
                         input.clear_continue_output();
@@ -169,6 +188,12 @@ impl TurnDriver<'_> {
                             input.refresh_session(ctx);
                             retried_after_compress = true;
                             continue;
+                        }
+                        // A request aborted by Ctrl-C without streamed text ends
+                        // here rather than in the interrupted arm below, and gets
+                        // the same notice.
+                        if abort_signal.aborted_ctrlc() {
+                            emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
                         }
                         ctx.on_chat_completion_error(app.as_ref(), &input);
                         return Err(err);
@@ -219,10 +244,11 @@ impl TurnDriver<'_> {
             }
 
             // The guardrail must not run on an interrupted turn: its reminders
-            // would be saved as phantom exchanges and its force-terminate would
-            // cancel the background tasks the user chose to leave running.
+            // would be saved as phantom exchanges and, in a session, its
+            // force-terminate would cancel the background tasks the user chose to
+            // leave running; without one, the arm cancels them itself.
             if interrupted {
-                emit_interrupted_turn_notice(ctx);
+                emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
             } else {
                 match check_pending_tasks_guardrail(ctx) {
                     GuardrailAction::Inject(prompt) => {
@@ -333,12 +359,10 @@ impl TurnDriver<'_> {
 
         if graph::active_agent_graph_name(ctx).is_some() {
             ctx.before_chat_completion(&input)?;
-            let output = graph::run_active_agent_graph(ctx, &input.text(), abort_signal.clone())
-                .await?
-                .result
-                .output;
-            emit_assistant_text(ui.as_ref(), app.as_ref(), &output)?;
-            ctx.after_chat_completion(app.as_ref(), &input, &output, &[])?;
+            let graph::dispatch::ChildGraphRun { result, last_run } =
+                graph::run_active_agent_graph(ctx, &input, abort_signal.clone()).await?;
+            emit_assistant_text(ui.as_ref(), app.as_ref(), &result.output)?;
+            ctx.record_graph_run(app.as_ref(), &input, &result.output, last_run)?;
             return Ok(TurnOutcome::Completed);
         }
 
@@ -610,8 +634,110 @@ pub(crate) fn interrupted_turn_notice(ctx: &RequestContext) -> Option<String> {
     ))
 }
 
-fn emit_interrupted_turn_notice(ctx: &RequestContext) {
-    if let Some(text) = interrupted_turn_notice(ctx) {
+/// The notice for a Ctrl-C that ended the turn, whichever way the turn ended.
+/// Without a session the press also cancels the turn's background work; in a
+/// session it leaves that work for a second press.
+pub(crate) async fn turn_interrupt_notice(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+) -> Option<String> {
+    if ctx.session.is_none() {
+        cancel_sessionless_turn_tasks(ctx, abort_signal).await
+    } else {
+        interrupted_turn_notice(ctx)
+    }
+}
+
+/// Awaits a step that runs before the turn's request, such as the RAG
+/// lookup, so a Ctrl-C that fails it shows the same notice (and, without a
+/// session, cancels the same background work) as an aborted request.
+async fn interruptible_step<T>(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    step: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let result = step.await;
+    if result.is_err() && abort_signal.aborted_ctrlc() {
+        emit_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);
+    }
+    result
+}
+
+/// The notice for a sessionless turn whose interrupt is cancelling
+/// `unfinished` top-level tasks; zero means only a sub-agent's own children
+/// were live, which have no top-level id to count.
+fn sessionless_cancelling_notice(unfinished: usize) -> String {
+    if unfinished == 0 {
+        return "Turn interrupted; cancelling the background work.".into();
+    }
+    format!("Turn interrupted; cancelling {unfinished} background task(s).")
+}
+
+/// The notice for agents that had not stopped when the cancel wait of
+/// `wait` gave up.
+fn sessionless_still_running_notice(names: &[String], wait: Duration) -> String {
+    format!(
+        "{} background agent(s) still running after {}s: {}. Press Ctrl-C again at the idle prompt to cancel them.",
+        names.len(),
+        wait.as_secs(),
+        names.join(", ")
+    )
+}
+
+/// Without a session the next prompt carries no history of what this turn
+/// started, so the interrupt that ended the turn also cancels that work and
+/// waits for the agents to finish. The cancel is announced before the wait,
+/// which can take seconds; returns the notice naming the agents still
+/// running when the wait gave up, or `None` when nothing was running or
+/// everything stopped in time.
+pub(crate) async fn cancel_sessionless_turn_tasks(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+) -> Option<String> {
+    let supervisor = ctx.supervisor.clone()?;
+    let has_active_tasks = supervisor.read().has_active_tasks();
+    if !has_active_tasks {
+        return None;
+    }
+    let unfinished = pending_tasks(ctx)
+        .into_iter()
+        .filter(|task| !task.finished)
+        .count();
+    latch_prompt_interrupt(abort_signal, &supervisor);
+    emit_turn_notice(
+        ctx,
+        Some(
+            ctx.render_hints(&sessionless_cancelling_notice(unfinished))
+                .into_owned(),
+        ),
+    );
+    ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
+    let mut still_running: Vec<String> = {
+        let supervisor = supervisor.read();
+        supervisor
+            .list_agents()
+            .into_iter()
+            .filter(|(id, _)| supervisor.is_finished(id) == Some(false))
+            .map(|(id, _)| id.to_string())
+            .collect()
+    };
+    if still_running.is_empty() {
+        return None;
+    }
+    still_running.sort();
+    Some(
+        ctx.render_hints(&sessionless_still_running_notice(
+            &still_running,
+            EXIT_CANCEL_WAIT,
+        ))
+        .into_owned(),
+    )
+}
+
+fn emit_turn_notice(ctx: &RequestContext, notice: Option<String>) {
+    if let Some(text) = notice {
+        #[cfg(test)]
+        turn_notice_sink::record(&text);
         emit_notice(
             ctx.ui.as_ref(),
             NoticeKind::Interrupted,
@@ -620,6 +746,26 @@ fn emit_interrupted_turn_notice(ctx: &RequestContext) {
                 dim_notice_color(&ctx.app.config).italic().paint(text)
             ),
         );
+    }
+}
+
+/// Records every notice `emit_turn_notice` shows on the current thread, so
+/// a test running the turn on its own runtime thread reads only its own.
+#[cfg(test)]
+pub(crate) mod turn_notice_sink {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(text: &str) {
+        NOTICES.with(|notices| notices.borrow_mut().push(text.to_string()));
+    }
+
+    /// Removes and returns everything this thread recorded so far.
+    pub(crate) fn drain() -> Vec<String> {
+        NOTICES.with(|notices| notices.take())
     }
 }
 

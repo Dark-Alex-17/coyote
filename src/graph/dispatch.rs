@@ -8,7 +8,7 @@ use crate::config::paths;
 use crate::config::{Input, RequestContext, Session, TEMP_SESSION_NAME};
 use crate::events::NoticeKind;
 use crate::turn::emit_notice;
-use crate::utils::AbortSignal;
+use crate::utils::{AbortSignal, render_image_slots, strip_image_slots};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
 use log::info;
@@ -29,21 +29,64 @@ pub struct ChildGraphRun {
     pub last_run: Option<LastRun>,
 }
 
+/// The one-shot run of the active agent's graph: `input` is seeded the way
+/// a REPL `.run` turn is (its patched text under `initial_prompt`) and the
+/// record, when the input is attached to the engaged session, names the
+/// bare typed text.
 pub async fn run_active_agent_graph(
     ctx: &mut RequestContext,
-    prompt: &str,
+    input: &Input,
     abort_signal: AbortSignal,
 ) -> Result<ChildGraphRun> {
-    run_active_agent_graph_with_inputs(ctx, prompt, abort_signal, None).await
+    let (seed_prompt, record_prompt) = graph_prompts(input);
+    run_seeded_graph(
+        ctx,
+        &seed_prompt,
+        &record_prompt,
+        false,
+        input.session(&ctx.session).is_some(),
+        abort_signal,
+        None,
+    )
+    .await
 }
 
-/// Runs the active agent's graph with `inputs` overlaid on its
-/// `initial_state` before the executor starts. `None` seeds exactly what
-/// `run_active_agent_graph` does: the prompt under `initial_prompt` and the
-/// session transcript under `previous_turns`.
+/// Runs the active agent's graph for a child context, with `inputs`
+/// overlaid on its `initial_state` before the executor starts.
+/// `seed_prompt` lands under `initial_prompt` and the session transcript
+/// under `previous_turns`; the record always names `record_prompt`, which
+/// differs from the seed when the caller appends run-only context (a
+/// teammate roster) that must not be stored as the child's prompt.
 pub async fn run_active_agent_graph_with_inputs(
     ctx: &mut RequestContext,
-    prompt: &str,
+    seed_prompt: &str,
+    record_prompt: &str,
+    abort_signal: AbortSignal,
+    inputs: Option<HashMap<String, Value>>,
+) -> Result<ChildGraphRun> {
+    let has_session = ctx.session.is_some();
+    run_seeded_graph(
+        ctx,
+        seed_prompt,
+        record_prompt,
+        true,
+        has_session,
+        abort_signal,
+        inputs,
+    )
+    .await
+}
+
+/// Loads, seeds and runs the active agent's graph without routing.
+/// `seed_prompt` lands under `initial_prompt`; `record_prompt` is what the
+/// record names, which differs from the seed when the one-shot input
+/// carries a request-only patch.
+async fn run_seeded_graph(
+    ctx: &mut RequestContext,
+    seed_prompt: &str,
+    record_prompt: &str,
+    child: bool,
+    has_session: bool,
     abort_signal: AbortSignal,
     inputs: Option<HashMap<String, Value>>,
 ) -> Result<ChildGraphRun> {
@@ -64,7 +107,7 @@ pub async fn run_active_agent_graph_with_inputs(
     let carried = carried_for(ctx, &graph.carry);
     seed_initial_state(
         &mut graph.initial_state,
-        prompt,
+        seed_prompt,
         inputs,
         &previous_turns,
         &carried,
@@ -77,19 +120,31 @@ pub async fn run_active_agent_graph_with_inputs(
         expose.as_deref(),
         &carry,
         &result,
-        prompt,
-        true,
-        ctx.session.is_some(),
+        record_prompt,
+        child,
+        has_session,
     );
     Ok(ChildGraphRun { result, last_run })
 }
 
+/// The prompts a graph run takes from `input`: the seed for
+/// `initial_prompt` (its patched text) and the record (its bare typed
+/// text). Graph state holds text only, so each image position shows as its
+/// `[Image #k]` marker.
+fn graph_prompts(input: &Input) -> (String, String) {
+    let images = input.medias().len();
+    (
+        render_image_slots(&input.text(), images),
+        render_image_slots(input.bare_text(), images),
+    )
+}
+
 /// The record a finished run leaves behind, or `None` when there is
 /// nothing to store it on. A child always records: its caller seats it on
-/// its own session. A REPL turn records only when a session is engaged and
-/// the graph gives the record a home: a `session:` block (`expose` is
-/// `Some`, possibly empty) or a non-empty `carry:` list whose values the
-/// next run reads back.
+/// its own session. A REPL turn or a one-shot run records only when its
+/// input is attached to the engaged session and the graph gives the record
+/// a home: a `session:` block (`expose` is `Some`, possibly empty) or a
+/// non-empty `carry:` list whose values the next run reads back.
 pub fn last_run_for(
     expose: Option<&[String]>,
     carry: &[String],
@@ -98,8 +153,14 @@ pub fn last_run_for(
     child: bool,
     has_session: bool,
 ) -> Option<LastRun> {
-    (child || (has_session && (expose.is_some() || !carry.is_empty())))
-        .then(|| LastRun::capture(result, prompt, expose.unwrap_or(&[]), carry))
+    (child || (has_session && (expose.is_some() || !carry.is_empty()))).then(|| {
+        LastRun::capture(
+            result,
+            &strip_image_slots(prompt),
+            expose.unwrap_or(&[]),
+            carry,
+        )
+    })
 }
 
 pub enum GraphTurn {
@@ -136,6 +197,7 @@ pub async fn run_graph_turn(
         .load_from_file(&graph_path)
         .with_context(|| format!("Failed to load graph.yaml for agent '{agent_name}'"))?;
 
+    let (seed_prompt, record_prompt) = graph_prompts(input);
     let block = match (&graph.session, ctx.session.is_some()) {
         (Some(block), true) => block.clone(),
         (block, _) => {
@@ -150,7 +212,7 @@ pub async fn run_graph_turn(
             let carried = carried_for(ctx, &graph.carry);
             seed_initial_state(
                 &mut graph.initial_state,
-                &input.text(),
+                &seed_prompt,
                 None,
                 &previous_turns,
                 &carried,
@@ -162,9 +224,9 @@ pub async fn run_graph_turn(
                 expose.as_deref(),
                 &carry,
                 &result,
-                input.bare_text(),
+                &record_prompt,
                 false,
-                ctx.session.is_some(),
+                input.session(&ctx.session).is_some(),
             );
             return Ok(GraphTurn::Run {
                 output: result.output,
@@ -174,7 +236,7 @@ pub async fn run_graph_turn(
     };
     let branch = match forced {
         Some(branch) => branch,
-        None => route::classify(ctx, &graph, &block, input.bare_text(), &abort, runner).await?,
+        None => route::classify(ctx, &graph, &block, &record_prompt, &abort, runner).await?,
     };
     ctx.set_last_graph_branch(branch, forced.is_some());
     emit_notice(
@@ -188,7 +250,7 @@ pub async fn run_graph_turn(
             let carried = carried_for(ctx, &graph.carry);
             seed_initial_state(
                 &mut graph.initial_state,
-                &input.text(),
+                &seed_prompt,
                 None,
                 &previous_turns,
                 &carried,
@@ -199,9 +261,9 @@ pub async fn run_graph_turn(
                 Some(&block.expose),
                 &carry,
                 &result,
-                input.bare_text(),
+                &record_prompt,
                 false,
-                ctx.session.is_some(),
+                input.session(&ctx.session).is_some(),
             );
             Ok(GraphTurn::Run {
                 output: result.output,
@@ -282,10 +344,12 @@ fn delegated_chat_input(
     Ok(attached)
 }
 
-/// Runs a seeded graph and cancels whatever jobs it left in the supervisor,
-/// the same way `run_active_agent_graph_with_inputs` finishes. Boxed so the
-/// executor's large future is not reserved on this frame too; see the
-/// comment on `GraphExecutor::execute`.
+/// Runs a seeded graph and cancels whatever jobs it left in the supervisor;
+/// every run arm (`run_seeded_graph` and both `run_graph_turn` arms) finishes
+/// through here. The executor future is boxed because it is large and, in
+/// debug builds, every async layer reserves room for the child future it
+/// constructs; left inline it would be reserved on this frame too, and one
+/// such frame per nested graph overflows the 2 MiB stack of a test thread.
 async fn execute_graph(
     ctx: &mut RequestContext,
     agent_name: &str,
@@ -360,8 +424,8 @@ pub fn carried_for(ctx: &RequestContext, carry: &[String]) -> IndexMap<String, V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{Model, ModelData};
-    use crate::config::{AppState, LastMessage, RoleLike, WorkingMode};
+    use crate::client::{MessageContent, MessageContentPart, Model, ModelData};
+    use crate::config::{AppState, LastMessage, Role, RoleLike, WorkingMode};
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::supervisor::mailbox::Inbox;
@@ -681,7 +745,9 @@ mod tests {
         let earlier = Input::from_str(&ctx, "earlier", None).unwrap();
         ctx.last_message = Some(LastMessage::new(earlier, "earlier reply".to_string()));
         let image = paths::agent_data_dir(&name).join("shot.png");
-        write(&image, b"not really a png").unwrap();
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
         let input = Input::from_files(
             &ctx,
             "typed",
@@ -1072,7 +1138,8 @@ mod tests {
     /// A child agent context (as `use_agent` from a graph node builds it)
     /// runs a block graph straight through the child entry point, with no
     /// classification, even with a session engaged. The run's record comes
-    /// back to the caller; nothing is stored on the session here.
+    /// back to the caller naming the record prompt, not the seed the graph
+    /// read; nothing is stored on the session here.
     #[tokio::test]
     #[serial]
     async fn run_active_agent_graph_with_inputs_bypasses_routing_for_a_child_context() {
@@ -1096,6 +1163,7 @@ mod tests {
 
         let run = run_active_agent_graph_with_inputs(
             &mut ctx,
+            "from a node\n\nrun-only context",
             "from a node",
             create_abort_signal(),
             None,
@@ -1103,16 +1171,223 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run.result.output, "from a node");
+        assert_eq!(run.result.output, "from a node\n\nrun-only context");
         assert!(!run.result.trace.is_empty());
         let last_run = run.last_run.as_ref().expect("a child run is recorded");
         assert_eq!(last_run.prompt, "from a node");
-        assert_eq!(last_run.output, "from a node");
+        assert_eq!(last_run.output, "from a node\n\nrun-only context");
         assert!(last_run.exposed.is_empty());
         assert_eq!(last_run.trace, run.result.trace);
         assert_eq!(ctx.current_depth, 1);
         assert!(ctx.session.as_ref().unwrap().last_run().is_none());
         assert_eq!(ctx.last_graph_branch, None);
+    }
+
+    /// A one-shot run seeds the request-only patch the way a REPL `.run`
+    /// does, but its record names the typed text: the patch is for the
+    /// model, not for the session.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_seeds_the_patched_text_and_records_the_bare_prompt() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let mut input = Input::from_str(&ctx, "hello", None).unwrap();
+        input.set_patched_text("hello (retrieved)");
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "hello (retrieved)");
+        assert_eq!(run.last_run.unwrap().prompt, "hello");
+        assert!(ctx.session.as_ref().unwrap().last_run().is_none());
+    }
+
+    /// An input from the REPL image route, its one image placed mid-text.
+    async fn input_with_an_image_slot(ctx: &RequestContext, agent: &str) -> Input {
+        let image = paths::agent_data_dir(agent).join("shot.png");
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
+        Input::from_files_with_image_slots(
+            ctx,
+            &format!("see {} now", crate::utils::IMAGE_SLOT),
+            vec![image.to_string_lossy().to_string()],
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_shows_image_slots_as_markers() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot_slot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "see [Image #1] now");
+        assert_eq!(run.last_run.unwrap().prompt, "see [Image #1] now");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_shows_image_slots_as_markers() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("turn_slot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let mut route_prompts: Vec<String> = Vec::new();
+        let mut runner = completion_runner(|input, _ctx, _abort| {
+            route_prompts.push(input.text());
+            boxed_completion(async { Ok((r#"{"decision":"run"}"#.to_string(), vec![])) })
+        });
+        let turn = run_graph_turn(&mut ctx, &input, create_abort_signal(), None, &mut runner)
+            .await
+            .unwrap();
+
+        assert!(
+            !route_prompts[0].contains(crate::utils::IMAGE_SLOT),
+            "{}",
+            route_prompts[0]
+        );
+        assert!(
+            route_prompts[0].contains("see [Image #1] now"),
+            "{}",
+            route_prompts[0]
+        );
+        let GraphTurn::Run { output, last_run } = turn else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "see [Image #1] now");
+        assert_eq!(last_run.unwrap().prompt, "see [Image #1] now");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_without_a_session_shows_image_slots_as_markers() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("turn_slot_no_session");
+        write_graph_agent(&name, "");
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+
+        assert!(roles.is_empty());
+        let GraphTurn::Run { output, .. } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "see [Image #1] now");
+    }
+
+    fn assert_the_image_sits_between_the_words(attached: &Input) {
+        let MessageContent::Array(parts) = attached.message_content() else {
+            panic!("expected parts");
+        };
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|part| match part {
+                MessageContentPart::Text { text } => format!("text:{text}"),
+                MessageContentPart::ImageUrl { .. } => "image".to_string(),
+            })
+            .collect();
+        assert_eq!(shape, ["text:see", "image", "text:now"]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_chat_branch_keeps_the_image_positions() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("chat_slot");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        assert_the_image_sits_between_the_words(&attached);
+        assert_eq!(attached.render(), input.render());
+        assert_eq!(attached.raw(), input.raw());
+        assert_eq!(attached.summary(), input.summary());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_delegated_chat_keeps_the_image_positions() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("delegating_slot");
+        let chat_agent = unique("chat_agent_slot");
+        let chat_agent_dir = paths::agent_data_dir(&chat_agent);
+        create_dir_all(&chat_agent_dir).unwrap();
+        write(
+            chat_agent_dir.join("config.yaml"),
+            format!("name: {chat_agent}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        write_graph_agent(
+            &name,
+            &format!("session:\n  chat:\n    agent: {chat_agent}\n"),
+        );
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = input_with_an_image_slot(&ctx, &name).await;
+
+        let (turn, _) = turn_with_reply(&mut ctx, &input, Some(Branch::Chat), "unused").await;
+        ctx.leave_delegate_turn();
+
+        let GraphTurn::Chat(attached) = turn.unwrap() else {
+            panic!("expected a chat");
+        };
+        assert_the_image_sits_between_the_words(&attached);
+        assert_eq!(attached.render(), input.render());
+    }
+
+    /// Without an engaged session a one-shot run has nowhere to be
+    /// recorded, block graph or not.
+    #[tokio::test]
+    #[serial]
+    async fn run_active_agent_graph_records_nothing_without_a_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let name = unique("one_shot_no_session");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        let input = Input::from_str(&ctx, "hello", None).unwrap();
+
+        let run = run_active_agent_graph(&mut ctx, &input, create_abort_signal())
+            .await
+            .unwrap();
+
+        assert_eq!(run.result.output, "hello");
+        assert!(run.last_run.is_none());
+    }
+
+    /// `execute_graph` boxes the executor future and says why where the
+    /// box is; the explanation is not deferred to another comment.
+    #[test]
+    fn execute_graph_carries_its_own_stack_rationale() {
+        let source = include_str!("dispatch.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]").unwrap()];
+        assert_eq!(production.matches("overflows the 2 MiB stack").count(), 1);
+        assert_eq!(production.matches("GraphExecutor::execute`").count(), 0);
+        assert_eq!(production.matches("see the comment on").count(), 0);
     }
 
     /// A child run on a `carry:` graph starts from the values the session's
@@ -1143,6 +1418,7 @@ mod tests {
 
         let run = run_active_agent_graph_with_inputs(
             &mut ctx,
+            "from a node",
             "from a node",
             create_abort_signal(),
             None,
@@ -1187,6 +1463,7 @@ mod tests {
 
         let run = run_active_agent_graph_with_inputs(
             &mut ctx,
+            "from a node",
             "from a node",
             create_abort_signal(),
             None,
@@ -1686,6 +1963,16 @@ mod tests {
     }
 
     #[test]
+    fn last_run_for_records_no_image_slot() {
+        let result = run_that_said("x");
+        let prompt = format!("see [Image #1] {}", crate::utils::IMAGE_SLOT);
+
+        let run = last_run_for(None, &[], &result, &prompt, true, false).unwrap();
+
+        assert_eq!(run.prompt, "see [Image #1] ");
+    }
+
+    #[test]
     fn last_run_for_a_repl_turn_records_nothing_without_a_block_or_a_carry() {
         let result = run_that_said("x");
         assert!(last_run_for(None, &[], &result, "p", false, true).is_none());
@@ -1747,27 +2034,51 @@ mod tests {
         );
     }
 
-    /// The bundled coder carries its plan between runs and tells both model
-    /// nodes about the earlier turns in their prompts, not their standing
-    /// instructions.
+    /// A detached input is not attached to the session even when one is
+    /// engaged, so neither run arm computes a record for it.
+    #[tokio::test]
+    #[serial]
+    async fn run_graph_turn_records_nothing_for_an_input_detached_from_the_session() {
+        let _guard = TestConfigDirGuard::new("dispatch");
+        let role = Role::new(ROUTE_ROLE_NAME, "p");
+
+        let name = unique("detached_block");
+        write_graph_agent(&name, SESSION_BLOCK);
+        let mut ctx = ctx_with_agent(&name).await;
+        ctx.session = Some(chat_session());
+        let input = Input::detached_with_role(&ctx, "typed", role.clone());
+        let (turn, roles) = turn_with_reply(&mut ctx, &input, Some(Branch::Run), "unused").await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert!(roles.is_empty());
+        assert_eq!(output, "typed");
+        assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
+
+        let name = unique("detached_carry");
+        write_agent(&name, "", CARRY_ECHO_GRAPH);
+        let mut ctx = ctx_with_agent(&name).await;
+        let mut session = chat_session();
+        session.set_last_run(Some(first_run_that_said("from the first run")));
+        ctx.session = Some(session);
+        let input = Input::detached_with_role(&ctx, "typed", role);
+        let (turn, _) = turn_with_reply(&mut ctx, &input, None, "unused").await;
+        let GraphTurn::Run { output, last_run } = turn.unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(output, "from the first run");
+        assert!(last_run.is_none(), "{:?}", last_run.map(|run| run.prompt));
+    }
+
+    /// The bundled coder carries no state between runs: its orchestrator
+    /// sends a fresh request each time, and both model nodes read the
+    /// earlier turns in their prompts, not their standing instructions.
     #[test]
-    fn bundled_coder_carries_its_plan_and_reads_the_earlier_turns_in_its_prompts() {
+    fn bundled_coder_carries_nothing_and_reads_the_earlier_turns_in_its_prompts() {
         let graph: Graph =
             serde_yaml::from_str(include_str!("../../assets/agents/coder/graph.yaml")).unwrap();
 
-        assert_eq!(
-            graph.carry,
-            ["plan_summary", "files_to_modify", "files_to_create"]
-        );
-        // design_trail accumulates every implement pass's Design lines;
-        // carrying it across runs would re-raise questions already answered.
-        assert!(!graph.carry.iter().any(|key| key == "design_trail"));
-        for key in &graph.carry {
-            assert!(
-                graph.initial_state.contains_key(key),
-                "carry key '{key}' is not declared in initial_state"
-            );
-        }
+        assert!(graph.carry.is_empty(), "{:?}", graph.carry);
 
         let turns_heading = "## Earlier turns with this agent (empty on a first run)";
         for node_id in ["analyze_request", "implement"] {
@@ -1801,23 +2112,18 @@ mod tests {
             panic!("analyze_request is not an llm node");
         };
         assert!(
-            analyze
-                .prompt
-                .contains("## Plan carried from the earlier run (empty on a first run)"),
+            !analyze.prompt.contains("Plan carried from the earlier run"),
             "{}",
             analyze.prompt
         );
         assert!(
-            analyze.prompt.contains("may not have been applied"),
+            !analyze.prompt.contains("may not have been applied"),
             "{}",
             analyze.prompt
         );
-        // analyze_request overwrites these carried keys through its required
-        // output_schema fields, so the prompt must show the earlier values or
-        // the carry is lost on the second turn.
         for key in ["plan_summary", "files_to_modify", "files_to_create"] {
             let placeholder = format!("{{{{{key}}}}}");
-            assert!(analyze.prompt.contains(&placeholder), "{}", analyze.prompt);
+            assert!(!analyze.prompt.contains(&placeholder), "{}", analyze.prompt);
         }
     }
 }

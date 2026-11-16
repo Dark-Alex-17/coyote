@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::config::memory::{
     KindField, MEMORY_DESCRIPTION_CAP, MEMORY_FILE_HARD_CAP, MemoryFile, MemoryFrontmatter,
-    MemoryKind, catalogue_entry, discover_workspace_memory,
+    MemoryKind, WorkspaceMemory, catalogue_entry, find_workspace_memory,
 };
 use crate::config::{
     MEMORY_INDEX_FILE_NAME, MigrateScope, RoundChains, paths, sanitize_display_text,
@@ -30,7 +30,21 @@ const STALE_DURING_APPLY: &str = "it was not rewritten";
 /// pointed at the newest, as `memory__write` does.
 pub fn run(scope: MigrateScope, apply: bool, round_chains: RoundChains) -> Result<Report> {
     let cwd = env::current_dir().context("get cwd")?;
-    let targets = targets(scope, paths::global_memory_dir(), &cwd);
+    run_from(&cwd, scope, apply, round_chains)
+}
+
+/// `run` for a process started in `cwd`.
+pub(crate) fn run_from(
+    cwd: &Path,
+    scope: MigrateScope,
+    apply: bool,
+    round_chains: RoundChains,
+) -> Result<Report> {
+    let targets = targets(
+        scope,
+        paths::global_memory_dir(),
+        find_workspace_memory(cwd),
+    );
     migrate(
         &targets,
         &paths::cache_dir().join(BACKUP_DIR_NAME),
@@ -72,7 +86,11 @@ struct Target {
     dir: Option<PathBuf>,
 }
 
-fn targets(scope: MigrateScope, global_dir: PathBuf, cwd: &Path) -> Vec<Target> {
+fn targets(
+    scope: MigrateScope,
+    global_dir: PathBuf,
+    workspace: Option<WorkspaceMemory>,
+) -> Vec<Target> {
     let mut out = Vec::new();
     if matches!(scope, MigrateScope::Global | MigrateScope::All) {
         out.push(Target {
@@ -83,7 +101,7 @@ fn targets(scope: MigrateScope, global_dir: PathBuf, cwd: &Path) -> Vec<Target> 
     if matches!(scope, MigrateScope::Workspace | MigrateScope::All) {
         out.push(Target {
             label: "workspace",
-            dir: discover_workspace_memory(cwd).map(|ws| ws.dir),
+            dir: workspace.map(|ws| ws.dir),
         });
     }
     out
@@ -1121,7 +1139,11 @@ mod tests {
         }
 
         fn targets(&self, scope: MigrateScope) -> Vec<Target> {
-            targets(scope, self.global.clone(), &self.workspace_root)
+            let workspace = WorkspaceMemory {
+                workspace_root: self.workspace_root.clone(),
+                dir: self.workspace.clone(),
+            };
+            targets(scope, self.global.clone(), Some(workspace))
         }
 
         fn migrate(&self, apply: bool) -> Report {

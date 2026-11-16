@@ -81,10 +81,10 @@ fn live_prereqs_in(path: &std::ffi::OsStr) -> Result<(), String> {
     Ok(())
 }
 
-/// A stub written moments ago by the skip-gate tests can still be open for
-/// writing in a child another test thread forked meanwhile, so exec fails
-/// with ETXTBSY until that child execs or exits; retry briefly instead of
-/// turning the race into a skip reason.
+/// A stub written moments ago by the skip-gate and guard tests can still be
+/// open for writing in a child another test thread forked meanwhile, so exec
+/// fails with ETXTBSY until that child execs or exits; retry briefly instead
+/// of turning the race into a skip reason or a failed spawn.
 fn output_with_etxtbsy_retry(command: &mut Command) -> io::Result<Output> {
     let mut attempts = 0;
     loop {
@@ -149,10 +149,7 @@ impl SandboxGuard {
 impl Drop for SandboxGuard {
     fn drop(&mut self) {
         println!("record: [rm] $ {} rm -f {}", self.sbx.display(), self.name);
-        match Command::new(&self.sbx)
-            .args(["rm", "-f", &self.name])
-            .output()
-        {
+        match output_with_etxtbsy_retry(Command::new(&self.sbx).args(["rm", "-f", &self.name])) {
             Ok(out) => println!("record: [rm] exit status: {}", out.status),
             Err(err) => println!("record: [rm] failed to spawn: {err}"),
         }

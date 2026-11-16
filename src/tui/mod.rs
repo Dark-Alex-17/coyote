@@ -29,7 +29,8 @@ mod terminal;
 mod todo;
 mod transcript;
 
-use crate::config::child_sessions::ChildSessionRoot;
+use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
+use crate::utils::process::ProcessStamp;
 use crate::config::{AppConfig, RequestContext};
 use crate::events::{EventSink, NoticeKind, Origin, SubscriptionId};
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
@@ -2334,11 +2335,18 @@ impl App {
             Some(root) => match root.list_children() {
                 Ok(children) if children.is_empty() => none_yet(),
                 Ok(children) => {
-                    rows.extend(
-                        children
-                            .iter()
-                            .map(|meta| ThreadRow::child(meta, meta.effective_status())),
-                    );
+                    let running: Vec<ProcessStamp> = children
+                        .iter()
+                        .filter(|meta| meta.status == ChildStatus::Running)
+                        .map(ChildMeta::stamp)
+                        .collect();
+                    let alive = ProcessStamp::alive_set(&running);
+                    rows.extend(children.iter().map(|meta| {
+                        ThreadRow::child(
+                            meta,
+                            meta.effective_status_with(|stamp| alive.contains(stamp)),
+                        )
+                    }));
                     None
                 }
                 Err(err) => {

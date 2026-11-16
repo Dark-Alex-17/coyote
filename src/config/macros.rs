@@ -43,6 +43,8 @@ pub async fn macro_execute(
         for step in &macro_value.steps {
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
+            // The `.macro` line's pasted images are not the step's.
+            live.pasted_images.clear();
             run_repl_command_with_prefix(&mut live, abort_signal.clone(), &command, prefix).await?;
         }
 

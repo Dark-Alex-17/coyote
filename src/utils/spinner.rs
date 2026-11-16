@@ -231,15 +231,26 @@ pub async fn abortable_run_with_spinner<F, T>(
 where
     F: Future<Output = Result<T>>,
 {
-    let (_, spinner_rx) = Spinner::create(message);
-    abortable_run_with_spinner_rx(task, spinner_rx, abort_signal, policy).await
+    abortable_run_with_spinner_on(task, message, abort_signal, *IS_STDOUT_TERMINAL, policy).await
 }
 
-/// Under the full-screen UI no spinner runs and no SIGINT listener is
-/// armed, whatever the caller's `policy` says: the frames would land in the
-/// turn's fd capture as escape garbage, and the spinner's abort polling
-/// would read keystrokes the UI's event stream owns. The UI turns Esc into
-/// `set_ctrlc`, which `run_abortable` still honours.
+/// `abortable_run_with_spinner` with the terminal check made by the caller.
+/// Off a terminal the task runs bare: no spinner, and the abort signal is not
+/// watched.
+pub async fn abortable_run_with_spinner_on<F, T>(
+    task: F,
+    message: &str,
+    abort_signal: AbortSignal,
+    on_terminal: bool,
+    policy: UserInterrupt,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let (_, spinner_rx) = Spinner::create(message);
+    run_with_spinner_rx(task, spinner_rx, abort_signal, on_terminal, policy).await
+}
+
 pub async fn abortable_run_with_spinner_rx<F, T>(
     task: F,
     spinner_rx: UnboundedReceiver<SpinnerEvent>,
@@ -249,11 +260,29 @@ pub async fn abortable_run_with_spinner_rx<F, T>(
 where
     F: Future<Output = Result<T>>,
 {
+    run_with_spinner_rx(task, spinner_rx, abort_signal, *IS_STDOUT_TERMINAL, policy).await
+}
+
+/// Under the full-screen UI no spinner runs and no SIGINT listener is
+/// armed, whatever the caller's `policy` says: the frames would land in the
+/// turn's fd capture as escape garbage, and the spinner's abort polling
+/// would read keystrokes the UI's event stream owns. The UI turns Esc into
+/// `set_ctrlc`, which `run_abortable` still honours.
+async fn run_with_spinner_rx<F, T>(
+    task: F,
+    spinner_rx: UnboundedReceiver<SpinnerEvent>,
+    abort_signal: AbortSignal,
+    on_terminal: bool,
+    policy: UserInterrupt,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
     if crate::tui::active() {
         let (done_tx, _done_rx) = oneshot::channel();
         return run_abortable(task, &abort_signal, UserInterrupt::NotOwned, done_tx).await;
     }
-    if *IS_STDOUT_TERMINAL {
+    if on_terminal {
         let (done_tx, done_rx) = oneshot::channel();
         let (task_ret, spinner_ret) = tokio::join!(
             run_abortable(task, &abort_signal, policy, done_tx),
@@ -669,7 +698,7 @@ mod tests {
     /// `policy`; a new call site has to pick one of those on purpose. The
     /// `NotOwned` literal itself belongs only to the derivation in
     /// `request_context.rs` and, in this file, the match and the
-    /// full-screen UI's choke point in `abortable_run_with_spinner_rx`. The
+    /// full-screen UI's choke point in `run_with_spinner_rx`. The
     /// census assumes the production half of a file ends at a
     /// `\n#[cfg(test)]\nmod tests` marker, and `call_args` is not
     /// string-literal aware, so a paren or comma inside a quoted argument
@@ -705,6 +734,7 @@ mod tests {
             }
             for needle in [
                 "abortable_run_with_spinner(",
+                "abortable_run_with_spinner_on(",
                 "abortable_run_with_spinner_rx(",
             ] {
                 for (start, _) in production.match_indices(needle) {

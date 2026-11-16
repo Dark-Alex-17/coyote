@@ -7,7 +7,7 @@ use super::{
 
 use crate::config::AppConfig;
 use crate::function::ToolResult;
-use crate::utils::{estimate_token_length, strip_think_tag};
+use crate::utils::{IMAGE_TOKEN_ESTIMATE, estimate_token_length, strip_think_tag};
 
 use super::oauth::OAuthConfig;
 use anyhow::{Result, bail};
@@ -216,6 +216,10 @@ impl Model {
         self.data.supports_function_calling
     }
 
+    pub fn supports_vision(&self) -> bool {
+        self.data.supports_vision
+    }
+
     pub fn no_stream(&self) -> bool {
         self.data.no_stream
     }
@@ -278,7 +282,7 @@ impl Model {
                     .iter()
                     .map(|v| match v {
                         MessageContentPart::Text { text } => estimate_token_length(text),
-                        MessageContentPart::ImageUrl { .. } => 0,
+                        MessageContentPart::ImageUrl { .. } => IMAGE_TOKEN_ESTIMATE,
                     })
                     .sum(),
                 MessageContent::ToolCalls(tool_calls) => self.tool_calls_tokens(tool_calls),
@@ -396,9 +400,19 @@ pub struct ProviderModels {
 }
 
 pub fn tool_result_tokens(result: &ToolResult) -> usize {
-    serde_json::to_string(result)
+    // Attachments are sent as image blocks, not text, so each is charged a
+    // flat image estimate instead of the length of its base64.
+    let without_attachments = ToolResult {
+        call: result.call.clone(),
+        output: result.output.clone(),
+        text: result.text.clone(),
+        thinking: result.thinking.clone(),
+        attachments: vec![],
+    };
+    let text_tokens = serde_json::to_string(&without_attachments)
         .map(|v| estimate_token_length(&v))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    text_tokens + IMAGE_TOKEN_ESTIMATE * result.attachments.len()
 }
 
 fn default_model_type() -> String {
@@ -680,6 +694,69 @@ reasoning_levels: [none, low, medium, high]
         assert_eq!(
             tokens,
             model.messages_tokens(std::slice::from_ref(&message))
+        );
+    }
+
+    #[test]
+    fn supports_vision_reflects_model_data() {
+        let mut data = ModelData::new("vision");
+        data.supports_vision = true;
+        let models = Model::from_config("openai", &[data.clone()]);
+        assert!(models[0].supports_vision());
+
+        data.supports_vision = false;
+        let models = Model::from_config("openai", &[data]);
+        assert!(!models[0].supports_vision());
+    }
+
+    #[test]
+    fn messages_tokens_counts_each_image() {
+        use crate::client::{ImageUrl, MessageRole};
+
+        let model = Model::new("openai", "test");
+        let text = "describe these two pictures";
+        let image = || MessageContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "data:image/png;base64,abc".into(),
+            },
+        };
+        let message = Message::new(
+            MessageRole::User,
+            MessageContent::Array(vec![
+                MessageContentPart::Text { text: text.into() },
+                image(),
+                image(),
+            ]),
+        );
+
+        assert_eq!(
+            model.messages_tokens(std::slice::from_ref(&message)),
+            estimate_token_length(text) + 2 * IMAGE_TOKEN_ESTIMATE
+        );
+    }
+
+    #[test]
+    fn tool_result_tokens_charges_an_attachment_as_one_image() {
+        use crate::function::{ImageAttachment, ToolCall};
+        use serde_json::json;
+
+        let result = ToolResult::new(
+            ToolCall::new(
+                "fs_read".into(),
+                json!({"path": "a.png"}),
+                Some("id-1".into()),
+            ),
+            json!("read a.png"),
+        );
+        let with_image = result.clone().with_attachments(vec![ImageAttachment {
+            source: "/tmp/a.png".into(),
+            mime_type: "image/png".into(),
+            data: "A".repeat(1024 * 1024),
+        }]);
+
+        assert_eq!(
+            tool_result_tokens(&with_image) - tool_result_tokens(&result),
+            IMAGE_TOKEN_ESTIMATE
         );
     }
 }

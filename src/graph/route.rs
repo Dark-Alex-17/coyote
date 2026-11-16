@@ -122,7 +122,10 @@ fn recent_messages(messages: &[Message]) -> String {
             };
             match &m.content {
                 MessageContent::ToolCalls(_) => None,
-                content => Some(format!("{speaker}: {}", content.to_text())),
+                content => Some(format!(
+                    "{speaker}: {}",
+                    content.to_text_with_image_placeholders()
+                )),
             }
         })
         .collect();
@@ -645,7 +648,9 @@ mod tests {
             .unwrap();
 
         let image = std::env::temp_dir().join(format!("{}.png", unique("route_probe")));
-        write(&image, b"not really a png").unwrap();
+        image::RgbaImage::new(1, 1)
+            .save_with_format(&image, image::ImageFormat::Png)
+            .unwrap();
         let with_image =
             Input::from_files(&ctx, "q2", vec![image.to_string_lossy().to_string()], None)
                 .await
@@ -701,7 +706,10 @@ mod tests {
         assert_eq!(outcome.unwrap(), Branch::Run);
         let text = seen[0].text();
         let recent = recent_section(&text);
-        assert_eq!(recent, "user: q1\nassistant: r1\nuser: q2\nassistant: r2");
+        assert_eq!(
+            recent,
+            "user: q1\nassistant: r1\nuser: q2 [image]\nassistant: r2"
+        );
         assert!(!text.contains("SYSTEM-PROMPT-LINE"), "{text}");
         assert!(!text.contains("TOOL-OUTPUT"), "{text}");
         assert!(!text.contains("calling a tool"), "{text}");

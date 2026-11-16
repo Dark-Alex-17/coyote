@@ -1,5 +1,6 @@
 use fmt::{Debug, Formatter};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fmt;
 
 pub(crate) const USER_MESSAGE_EVENT: &str = "user_message";
@@ -140,6 +141,15 @@ impl NotificationQueue {
         let mut pending = self.pending.lock();
         let index = pending.iter().rposition(matches)?;
         Some(pending.remove(index))
+    }
+
+    pub fn take_ids(&self, ids: &HashSet<&str>) -> Vec<SystemNotification> {
+        let mut pending = self.pending.lock();
+        let (taken, kept) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|n| n.id().is_some_and(|id| ids.contains(id)));
+        *pending = kept;
+        taken
     }
 }
 
@@ -283,5 +293,22 @@ mod tests {
         assert_eq!(left[0].id(), None);
         assert_eq!(left[1].id(), Some("job_1"));
         assert!(queue.take_last_where(|_| true).is_none());
+    }
+
+    #[test]
+    fn take_ids_removes_only_the_named_events() {
+        let queue = NotificationQueue::new();
+        queue.push(job_notification("job_1", "execute_command", true));
+        queue.push(agent_notification("agent_a", "explore", false));
+        queue.push(job_notification("job_2", "execute_command", true));
+
+        let taken = queue.take_ids(&HashSet::from(["job_1", "agent_a", "job_9"]));
+
+        assert_eq!(taken.len(), 2);
+        assert_eq!(taken[0].id(), Some("job_1"));
+        assert_eq!(taken[1].id(), Some("agent_a"));
+        let rest = queue.drain();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].id(), Some("job_2"));
     }
 }

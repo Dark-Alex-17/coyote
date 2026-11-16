@@ -641,7 +641,7 @@ pub(crate) fn headless_reply(req: &PromptRequest) -> Value {
         "action": req.action.name(),
         "question": req.question,
         "options": req.options,
-        "guidance": "No human is present. Apply a sensible default or abort the task.",
+        "guidance": crate::function::user_interaction::HEADLESS_GUIDANCE,
     })
 }
 
@@ -1034,7 +1034,7 @@ mod tests {
                 "action": name,
                 "question": "proceed? pm-4t8",
                 "options": ["a", "b"],
-                "guidance": "No human is present. Apply a sensible default or abort the task.",
+                "guidance": "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment.",
             });
             assert_eq!(reply, expected);
             assert_eq!(reply.to_string(), expected.to_string());
