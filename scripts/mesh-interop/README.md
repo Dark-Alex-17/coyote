@@ -20,17 +20,17 @@ of that directory (and, for the REPL's attachment rules, in
 
 ### Verification record
 
-Last verified 2026-11-06, on macOS (the netns rows do not exist on this host; they and the
+Last verified 2026-11-16, on macOS (the netns rows do not exist on this host; they and the
 Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side at
-[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.18.1`
+[`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.18.2`
 (Coyote's fork of `reticulum-rs-transport`), `lxmf-wire` `0.14.0` and `reticulum-rs-core`
 `0.14.0`, and the Python side at RNS `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 77 passed, 0 ignored |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 80 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
-| `cargo test --all --no-fail-fast` | 8405 passed, 0 failed, 17 ignored in the unit binary; 630 passed, 1 failed, 1 ignored across the integration binaries (the failure is the `docker_entrypoint_script` signal test, which passes when run alone) |
+| `cargo test --all --no-fail-fast` | 9100 passed, 0 failed, 20 ignored in the unit binary; 693 passed, 1 failed, 1 ignored across the integration binaries (the failure is the `docker_entrypoint_script` signal test, which passes when run alone) |
 
 Rows 2 and 3 also run on all three legs of the CI matrix, and row 1 runs only in the Linux
 `Mesh Interop` job; none of those runs is part of this record.

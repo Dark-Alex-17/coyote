@@ -161,6 +161,20 @@ arc-swap = "1.9.2"
 # has established since it was spawned, every reconnect included); Coyote does not read
 # them yet.
 #
+# The 0.18.2 release adds `SharedInstanceOptions::with_tunnel_synthesis`, which has the
+# shared instance client synthesize a tunnel on its rnsd connection at attach and on
+# every reconnect. Coyote leaves it off on purpose: every session of one user carries
+# the user's identity as its transport identity, so two sessions on one rnsd would send
+# the same tunnel id, and rnsd would move the first session's paths onto the second and
+# deliver the first session's links there. Python's local client synthesizes no tunnel
+# either. A TCP client of a transport relay synthesizes none in this crate, so sessions
+# of one user dialing one relay do not collide that way. The same release has
+# `delivery::await_link_activation` return `io::ErrorKind::ConnectionAborted`, with the
+# text `link closed before activation: <reason>`, as soon as the link closes before it
+# activates, rather than waiting out the caller's deadline; `open_link` reads it as a
+# link that was never opened (`RequestError::LinkNotOpened`), so the request fails at
+# the close and the peer reads `no route`.
+#
 # `lxmf-wire` still comes from upstream LXMF-rs, so its version no longer matches the
 # fork's. What ties the two is `reticulum-rs-core`: the fork depends on
 # `reticulum-rs-core = "0.14.0"` from crates.io and `lxmf-wire` pulls the same crate, so
@@ -186,7 +200,7 @@ arc-swap = "1.9.2"
 # re-exports surface this crate does not use, and it covers only the `rns-*` crates and
 # not `lxmf-wire`, so it cannot replace both entries anyway. Depending on the two
 # directly keeps one mechanism instead of two.
-coyote-rns-transport = "0.18.1"
+coyote-rns-transport = "0.18.2"
 lxmf-wire = "0.14.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the
