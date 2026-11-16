@@ -1154,10 +1154,12 @@ fn interrupt_mid_read(pty: &mut Pty) -> std::io::Result<()> {
     match pty.wait_for("tool-exit=", INTERRUPT_RESEND_AFTER) {
         Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
             let before = pty.diagnostics();
-            pty.send(b"\x03")?;
-            let after = match pty.wait_for("tool-exit=", PTY_DEADLINE) {
-                Ok(transcript) => transcript,
-                Err(err) => err.to_string(),
+            let after = match pty.send(b"\x03") {
+                Err(err) => format!("the resend failed: {err}"),
+                Ok(()) => match pty.wait_for("tool-exit=", PTY_DEADLINE) {
+                    Ok(transcript) => transcript,
+                    Err(err) => err.to_string(),
+                },
             };
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

@@ -11618,7 +11618,10 @@ mod tests {
     fn the_codex_attribution_names_the_repo_and_its_licence_in_both_files() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let apache = std::fs::read_to_string(root.join("LICENSE-APACHE")).unwrap();
-        assert!(apache.contains("Version 2.0, January 2004"), "{apache}");
+        assert!(
+            apache.contains("Version 2.0, January 2004"),
+            "LICENSE-APACHE is not the Apache License 2.0 text"
+        );
         for file in ["NOTICE", "CREDITS.md"] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
             for needle in [
