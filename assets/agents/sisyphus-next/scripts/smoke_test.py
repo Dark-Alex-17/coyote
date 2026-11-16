@@ -676,8 +676,8 @@ check("answers: a reply naming two option numbers resolves to no option (match_o
       and all(gates.parse_answer(base_state(escalation=r3, last_answer_text=t))["_next"] == "interpret_reply"
               for t in ("3) or 2", "2. 1", "1 - no wait, 3")))
 _amb = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - no wait, 3", ask_question="Q?"))
-check("answers: a navigator answer naming two options goes to the owner with the navigator's words, never applied",
-      _amb["_next"] == "ask_dispatch" and "1 - no wait, 3" in _amb["ask_question"] and "last_answer" not in _amb)
+check("answers: a navigator answer naming two options is read by the reply interpreter, never applied",
+      _amb["_next"] == "interpret_reply" and _amb["last_answer_text"] == "1 - no wait, 3" and "last_answer" not in _amb)
 _free = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER go with whatever is safest"))
 check("answers: a navigator answer naming no option is read by the reply interpreter, never applied as raw text",
       _free["_next"] == "interpret_reply" and "last_answer" not in _free
@@ -711,14 +711,39 @@ _para = [gates.consult_route(base_state(escalation=pd2, consult_result=f"CONSULT
                    "Other: not a plan defect. Continue without amending")]
 check("answers: a navigator paraphrase of an option goes to the reply interpreter, never to the owner's headless default",
       all(p["_next"] == "interpret_reply" and "last_answer" not in p and p["reply_source"] == "navigator" for p in _para))
-_nav_unclear = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_verdict="unclear",
-                                                reply_source="navigator"))
-_nav_disc = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_verdict="discussion",
-                                             reply_source="navigator"))
-_nav_fault = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_source="navigator"))
-check("answers: an interpreter that cannot read the navigator's words asks the owner and names the navigator as their author",
-      all(r["_next"] == "ask_dispatch" and "The navigator answered" in r["escalation"]["question"]
-          and "You wrote" not in r["escalation"]["question"] and r["reply_source"] == "" for r in (_nav_unclear, _nav_disc, _nav_fault)))
+
+
+def _nav_read(verdict, reasks):
+    return gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue, sort of", reply_verdict=verdict,
+                                            reply_clarify="Amended how?", reply_source="navigator",
+                                            navigator_reasks=reasks, reply_interpreted=True))
+
+
+_nav_first = [_nav_read(v, 0) for v in ("unclear", "discussion", "")]
+check("answers: navigator words the interpreter cannot read go back to the navigator once with the clarifying question",
+      all(r["_next"] == "consult_navigator" and r["navigator_reasks"] == 1 and "'Continue, sort of'" in r["ask_question"]
+          and "option number" in r["ask_question"] and "last_answer" not in r for r in _nav_first)
+      and "Amended how?" in _nav_first[0]["ask_question"])
+_nav_then = [_nav_read(v, 1) for v in ("unclear", "discussion", "")]
+check("answers: still unread after the navigator's second answer, the owner is asked with the navigator named as the author "
+      "and the owner's own reply is interpreted",
+      all(r["_next"] == "ask_dispatch" and "The navigator answered 'Continue, sort of'" in r["escalation"]["question"]
+          and "You wrote" not in r["escalation"]["question"] and r["reply_source"] == "" and r["reply_interpreted"] is False
+          for r in _nav_then)
+      and gates.parse_answer(base_state(escalation=pd2, last_answer_text="carry on, it holds",
+                                        reply_interpreted=_nav_then[0]["reply_interpreted"]))["_next"] == "interpret_reply")
+_nav_pick = gates.interpret_route(base_state(escalation=pd2, last_answer_text="Continue with no amendment: log the output",
+                                             reply_verdict="option", reply_option=PD2[1]["text"], reply_source="navigator"))
+check("answers: the interpreter's option for the navigator's words keeps those words as the pick's stated reason",
+      _nav_pick["_next"] == "apply_answer"
+      and _nav_pick["last_answer"] == PD2[1]["text"] + ": Continue with no amendment: log the output"
+      and gates._stated_reason(_nav_pick["last_answer"], PD2) == "Continue with no amendment: log the output")
+_qty = gates.consult_route(base_state(escalation=pd2, consult_result="CONSULT: ANSWER 2 \u2014 Continue; only touch 1 file"))
+check("answers: a quantity in a navigator's note that may name another option goes to the interpreter, never the owner's default",
+      _qty["_next"] == "interpret_reply" and "last_answer" not in _qty)
+check("answers: an arrow compares nothing, so '1 -> 3' names two options",
+      _lib.names_several_options("1 -> 3", ROUTE3) and _lib.names_several_options("1 => 3", ROUTE3)
+      and not _lib.names_several_options("1 - only when n >= 3", ROUTE3))
 check("answers: a picked number with a later quantity or fraction in its note is still that pick",
       _lib.split_option_reply("2: only for the first 3 files", ROUTE3) == ("Abort the run", "only for the first 3 files")
       and _lib.split_option_reply("2 - see 1/3 of it", ROUTE3) == ("Abort the run", "see 1/3 of it"))
@@ -789,9 +814,9 @@ finally:
 check("answers: at the cap a recommendation that would still abort is not taken; the run blocks, never aborts",
       _spent["_next"] == "end_blocked" and any("would abort here" in d for d in _spent["decisions"]), _spent.get("_next"))
 _late = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER 1 - hmm, actually let's go with 3"))
-check("answers: a navigator note naming another option number anywhere goes to the owner, never applied",
-      _late["_next"] == "ask_dispatch" and "last_answer" not in _late
-      and "1 - hmm, actually let's go with 3" in _late["escalation"]["question"])
+check("answers: a navigator note naming another option number anywhere goes to the reply interpreter, never applied",
+      _late["_next"] == "interpret_reply" and "last_answer" not in _late
+      and _late["last_answer_text"] == "1 - hmm, actually let's go with 3")
 check("answers: an echoed option text, in either rendered shape, is a clean pick even when the text holds a number",
       _lib.split_option_reply("Option 1: Use 2 caches", [option("Use 2 caches"), option("Use one")]) == ("Use 2 caches", "")
       and _lib.split_option_reply("1) Proceed with the plan (recommended)", ROUTE3) == ("Proceed with the plan", ""))

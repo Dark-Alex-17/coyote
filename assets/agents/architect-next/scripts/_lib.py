@@ -518,7 +518,7 @@ def review_fault(blocker):
 # a reply led by an option number: "2", "2.", "2)", "(2)", "#2", "Option 2", then optionally a separator ("2: x",
 # "Option 2, but x", a dash) and free text, or a parenthesised gloss ("1 (as planned; log it)")
 OPTION_NUMBER_RE = re.compile(r"(?is)^(?:option\s*)?[(#]?\s*(\d{1,9})\s*(?:$|[-:.)\u2014\u2013]\s*(.*)$|,\s+(.*)$|"
-                              r"\((.*)\)\s*(.*)$)")
+                              r"\(([^()]*)\)\s*(.*)$)")
 
 
 def split_option_reply(text, options):
@@ -533,7 +533,8 @@ def split_option_reply(text, options):
         return None, text
     picked = int(m.group(1))
     gloss = re.sub(r"(?i)^recommended$", "", (m.group(4) or "").strip())
-    rest = " ".join(p for p in (gloss, (m.group(2) or m.group(3) or m.group(5) or "").strip()) if p)
+    after = (m.group(2) or m.group(3) or re.sub(r"^[-:.,\u2014\u2013]\s*", "", m.group(5) or "")).strip()
+    rest = " ".join(p for p in (gloss, after) if p)
     if any(len(d) <= 9 and int(d) != picked and 1 <= int(d) <= count for d in re.findall(r"\d+", rest)):
         return None, text
     return options[picked - 1]["text"], rest if re.search(r"\w", rest) else ""

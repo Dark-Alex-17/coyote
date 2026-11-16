@@ -1585,19 +1585,15 @@ def consult_route(state):
             led, note = split_option_led(value, options, True)
             choice = _pick_with_note(value, options) or (f"{led}: {note}" if led and note else led)
         if choice:
-            u.update({"last_answer": choice, "last_answer_text": choice})
+            u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
             u["_next"] = "apply_answer"
             return u
-        if ambiguous:
-            # an answer naming several options is the owner's call; the navigator's words go with the question
-            ledger(state, u, f"consult: {kind}: the navigator's answer names more than one option -> owner: {value}")
-            _note_question(u, esc, f"The navigator answered {value!r}, which names no single option; your call.")
-            u["_next"] = "ask_dispatch"
-            return u
-        # an answer in the navigator's own words is read once by the reply interpreter, never re-asked blind: unasked,
-        # the owner's headless answer would take the recommended option whatever the navigator said
-        ledger(state, u, f"consult: {kind}: the navigator's answer names no option by number or text -> interpret: {value}")
+        # an answer in the navigator's own words, or one whose later numbers may name other options, is read by the
+        # reply interpreter, never handed to the owner blind: unasked, the owner's headless answer would take the
+        # recommended option whatever the navigator said
+        why = "may name more than one option" if ambiguous else "names no option by number or text"
+        ledger(state, u, f"consult: {kind}: the navigator's answer {why} -> interpret: {value}")
         u.update({"last_answer_text": value, "reply_accepts": _accepts_text(kind), "reply_source": "navigator",
                   "reply_interpreted": False})
         u["_next"] = "interpret_reply"
@@ -1829,6 +1825,9 @@ def interpret_route(state):
     if verdict == "option":
         choice = _exact_option(str(state.get("reply_option") or ""), esc.get("options") or [])
         if choice:
+            if navigator and text.strip().lower() != choice.strip().lower():
+                # the navigator's words go with its pick as the stated reason, as a numbered pick's note does
+                return decide(f"{choice}: {text}", f"the option {choice!r}")
             return decide(choice, f"the option {choice!r}")
         ledger(state, u, f"interpret: {kind}: {said!r} named no offered option ({state.get('reply_option')!r}); unclear")
         verdict = "unclear"
@@ -1842,9 +1841,8 @@ def interpret_route(state):
         else:
             ledger(state, u, f"interpret: {kind}: the instruction {shape}={tail(value, 120)!r} could not be applied; unclear")
         verdict = "unclear"
-    if verdict == "discussion" and navigator:
-        # the navigator answers for the owner; it holds no discussion of its own, so the owner settles it
-        verdict = "unclear"
+    if navigator:
+        return _reask_navigator(state, u, esc, text, verdict)
     if verdict == "discussion":
         ledger(state, u, f"interpret: {kind}: {said!r} is a discussion ({reason or 'no reason given'}) -> park for discussion")
         u["_next"] = "choice_park"
@@ -1854,20 +1852,42 @@ def interpret_route(state):
         asked = data.get("asked") or esc.get("question", "")
         clarify = str(state.get("reply_clarify") or "").strip() or "Which option do you mean, or what should happen instead?"
         # the question goes into the escalation itself so a remote owner sees it too
-        wrote = "The navigator answered" if navigator else "You wrote"
-        u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"{wrote}: {said!r}. {clarify}\n\n{asked}"}
+        u["escalation"] = {**esc, "data": {**data, "asked": asked}, "question": f"You wrote: {said!r}. {clarify}\n\n{asked}"}
         u["ask_question"] = render_question(u["escalation"])
         ledger(state, u, f"interpret: {kind}: {said!r} is unclear -> one clarifying question: {tail(clarify, 200)}")
         u["_next"] = "ask_dispatch"
         return u
-    if navigator:
-        # the owner never typed the navigator's words, so a fault puts the question to them with those words beside it
-        ledger(state, u, f"interpret: {kind}: no verdict for the navigator's {said!r} (interpreter fault) -> owner")
-        _note_question(u, esc, f"The navigator answered {text!r}, which names no option; your call.")
-        u["_next"] = "ask_dispatch"
-        return u
     ledger(state, u, f"interpret: {kind}: no verdict for {said!r} (interpreter fault) -> re-ask")
     u["_next"] = "parse_answer"
+    return u
+
+
+NAVIGATOR_REASK_MAX = 1
+
+
+def _reask_navigator(state, u, esc, text, verdict):
+    """Words of the navigator's that the interpreter could not read as one option or instruction (unclear, a
+    discussion, or no verdict): the clarifying question goes back to the navigator once, then to the owner, with the
+    navigator's words beside it each time. Neither is handed a default, and the owner's own reply is interpreted."""
+    kind = esc.get("kind", "")
+    said = tail(text, 200)
+    fault = verdict not in ("unclear", "discussion")
+    clarify = ("The reply interpreter returned no reading of it." if fault else
+               str(state.get("reply_clarify") or "").strip() or "Which option do you mean, or what should happen instead?")
+    reasks = as_int(state.get("navigator_reasks"))
+    u["reply_interpreted"] = False
+    if reasks < NAVIGATOR_REASK_MAX:
+        u["navigator_reasks"] = reasks + 1
+        _note_question(u, esc, f"You answered {text!r}, which could not be read as one option. {clarify} Answer with "
+                               f"one option number and any note after it, or defer.")
+        ledger(state, u, f"interpret: {kind}: the navigator's {said!r} was not read as one option ({verdict or 'no verdict'})"
+                         f" -> the navigator again: {tail(clarify, 200)}")
+        u["_next"] = "consult_navigator"
+        return u
+    _note_question(u, esc, f"The navigator answered {text!r}, which could not be read as one option. {clarify}")
+    ledger(state, u, f"interpret: {kind}: the navigator's {said!r} was still not read as one option "
+                     f"({verdict or 'no verdict'}) -> owner")
+    u["_next"] = "ask_dispatch"
     return u
 
 

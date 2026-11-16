@@ -247,6 +247,7 @@ initial_state:
   reply_accepts: ''
   reply_interpreted: false
   reply_source: ''
+  navigator_reasks: 0
   choice_parks: {}
   discussion: {}
   discussion_run_id: ''
@@ -1253,7 +1254,7 @@ nodes:
     description: >-
       Parse the consult; an answer naming one option (by number, label or its own
       text, with any note kept) is ledgered and applied, one in the navigator's own
-      words goes to interpret_reply, one naming several options, a defer or a fault
+      words or naming several options goes to interpret_reply, a defer or a fault
       goes to the owner.
     script: scripts/consult_route.py
     fallback: end_failure
@@ -1460,6 +1461,8 @@ nodes:
       An option or an accepted instruction is applied through apply_answer, a
       discussion goes to choice_park, an unclear reply gets one clarifying
       question, and an interpreter fault falls back to parse_answer's re-ask.
+      The navigator's words that read as no single option go back to the
+      navigator once with the clarifying question, then to the owner.
     script: scripts/interpret_route.py
     fallback: end_failure
 

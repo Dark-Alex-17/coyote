@@ -2659,6 +2659,9 @@ check("consult_route: '2 (gloss)' and 'Option 2, but ...' -> option 2, the navig
       and all(_lib.split_option_reply(f, PICK_OPTS) == ("Abort the run", r) for f, r in GLOSS_.items())
       and _lib.split_option_reply("2 (recommended)", PICK_OPTS) == ("Abort the run", "")
       and _lib.split_option_reply("2 (or 3)", PICK_OPTS)[0] is None, cg_)
+check("split_option_reply: a gloss ends at its own parenthesis, and a separator after it is dropped",
+      _lib.split_option_reply("2 (as planned) and (log it)", PICK_OPTS) == ("Abort the run", "as planned and (log it)")
+      and _lib.split_option_reply("2 (recommended) - keep logs", PICK_OPTS) == ("Abort the run", "keep logs"))
 AMEND_CAP_NEW = [option("Allow one more amendment cycle", True), option("Stop and report")]
 E_AC = escalation("amend_cap", "q", AMEND_CAP_NEW, data={"source": "gate1", "over": ["source"]})
 neg_ = {"amend_cap don't stop": AA("amend_cap", "don't stop, allow one more", esc=E_AC, amend_counts={"gate1": 9})["_next"],

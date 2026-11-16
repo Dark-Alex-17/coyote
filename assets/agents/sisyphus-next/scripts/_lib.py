@@ -389,6 +389,8 @@ def raise_escalation(state, updates, esc):
     updates["reask_rounds"] = 0
     updates["apply_reasks"] = 0
     updates["reply_interpreted"] = False
+    updates["reply_source"] = ""
+    updates["navigator_reasks"] = 0
     updates["_next"] = "escalate_gate"
     return updates
 
@@ -416,8 +418,9 @@ _OPTION_LEAD_RE = re.compile(r"(?is)^[\s(\[*_`]*(?:option\s*)?(\d+)(\s*\(recomme
 _OPTION_SEPARATORS = "-:).\u2014\u2013"
 # an option number standing alone in the free text: not part of a fraction, a decimal or a word
 _OPTION_NUMBER_RE = re.compile(r"(?<![\w/.])(\d+)(?![\w/]|\.\d)")
-# a number that is the operand of a comparison ("seats < 1", "count >= 2") is a value, never an option reference
-_COMPARED_RE = re.compile(r"(?:[<>=\u2264\u2265\u2260]|!=)\s*$")
+# a number that is the operand of a comparison ("seats < 1", "count >= 2") is a value, never an option reference;
+# an arrow ("1 -> 3", "=> 3") compares nothing
+_COMPARED_RE = re.compile(r"(?:(?<![-=])[<>]|[=\u2264\u2265\u2260])\s*$")
 
 
 def _names_another_option(rest, picked, count, strict=False):
@@ -471,7 +474,9 @@ def split_option_reply(text, options, strict=False):
     if not m or not 1 <= int(m.group(1)) <= len(options):
         return None, text
     picked, rest = int(m.group(1)), m.group(4)
-    if rest[:1] and (rest[0] in _OPTION_SEPARATORS or (rest[0] == "," and not rest[1:2].isdigit())):
+    if rest[:2] in ("->", "=>"):
+        rest = rest[2:]
+    elif rest[:1] and (rest[0] in _OPTION_SEPARATORS or (rest[0] == "," and not rest[1:2].isdigit())):
         rest = rest[1:]
     elif (gloss := _unwrap_gloss(rest)) is not None:
         rest = gloss
