@@ -30,7 +30,7 @@ from _lib import (  # noqa: E402
     RESOLVE_DEADLINE_SECS, RESUME_RE, REVIEW_CI_POLL_BUDGET, RUN_VARIABLES, TAIL_CHARS,
     REVIEW_CI_POLL_CEILING, REVIEW_MAX_POLLS, REVIEW_MAX_ROUNDS, REVIEW_PERM_SECS, REVIEW_POLL_SLEEP, REVIEW_WALL_SECS,
     STRIKE_LIMIT, SUBTASK_MAX, added_lines_since, bare_go_ahead, choice_label, frontmatter, read_file, render_question,
-    set_frontmatter,
+    set_frontmatter, criterion_commands,
     append_artifact, as_dict, as_int, as_list, changed_files_since, emit, ensure_run_dir,
     escalation, git, git_out, harvest_anomalies, headless_recommended, ledger, load_state, match_option,
     note_script_error, now_iso, option, read_artifact, review_fault, run_dir_for, snapshot, split_option_reply,
@@ -205,14 +205,19 @@ def _parked_state(run_id):
     return parked if isinstance(parked, dict) and parked.get("parked") == DISCUSSION_PARKED else {}
 
 
+def _plans_path(state, project):
+    """The configured plans dir as a path; a relative one resolves against the project dir."""
+    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
+    return plans if os.path.isabs(plans) else os.path.join(project or ".", plans)
+
+
 def _planning_exclude(state, project, top):
     """The configured plans dir as a `debris_exclude` value relative to the git top level, or "" when it is missing
-    or outside the repository; a preset value wins."""
-    preset = state.get("debris_exclude")
+    or outside the repository; a preset value, from the state or the variable environment, wins."""
+    preset = var(state, "debris_exclude")
     if preset:
         return preset
-    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
-    plans = plans if os.path.isabs(plans) else os.path.join(project, plans)
+    plans = _plans_path(state, project)
     if not os.path.isdir(plans):
         return ""
     try:
@@ -278,7 +283,7 @@ def intake(state):
     if q := QUALITY_RE.search(brief):
         u["quality_rigor"] = q.group(1).strip().lower()
         u["quality_surfaces"] = (q.group(2) or "").strip()
-    plans = os.path.join(project_abs, "plans")
+    plans = _plans_path(state, project_abs)
     u["plans_detected"] = os.path.isdir(os.path.join(plans, "steps")) and os.path.isdir(
         os.path.join(plans, "handoffs")
     )
@@ -689,8 +694,7 @@ def _not_a_step_run(state):
     """
     if truthy(state.get("delegated")):
         return "a delegated task brief is implemented here, never handed to the step-runner"
-    plans = os.path.expanduser(str(var(state, "plans_dir", "plans") or "plans"))
-    steps = os.path.join(plans if os.path.isabs(plans) else os.path.join(state.get("project_dir") or ".", plans), "steps")
+    steps = os.path.join(_plans_path(state, state.get("project_dir")), "steps")
     return "" if os.path.isdir(steps) else f"there is no step plans directory at {steps}"
 
 
@@ -2455,15 +2459,12 @@ def apply_answer(state):
             if status == "no_checks":
                 ledger(state, u, f"ci: finished without CI at the user's say-so ({reason}); no CI checks reported")
                 note = "CI never ran: the PR reports no CI checks; finished without CI"
-                text = "The PR reports no CI checks and the user chose to finish without CI: flip the PR to ready."
             else:
                 ledger(state, u, f"ci: inconclusive treated as green at the user's say-so ({reason}); non-pass checks: {non_pass}")
                 note = f"CI treated as green with non-pass checks: {non_pass}"
-                text = (f"Not every CI check passed ({non_pass}) and the user chose to treat CI as green: "
-                        "flip the PR to ready.")
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"{note} (reason: {reason})"]
             u["ci_green_by"] = status
-            _ci_finish_green(state, u, f"{status} accepted", text)
+            _ci_finish_green(state, u, f"{status} accepted")
         elif _watch_started(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Review watch stopped with CI {status} on the ready PR: {non_pass}"]
@@ -3118,7 +3119,7 @@ def _literal(paths):
 
 def _plans_exclude(state, root):
     """The pathspec that leaves the in-repo planning store out, or [] when there is none inside root."""
-    plans = os.path.join(state.get("project_dir") or root, "plans")
+    plans = _plans_path(state, state.get("project_dir") or root)
     if os.path.isdir(plans):
         try:
             rel = os.path.relpath(os.path.realpath(plans), os.path.realpath(root))
@@ -3281,6 +3282,26 @@ def build_gauntlet_prompt(state):
             if amended:
                 spec += ("\n\nSubtask criteria the user amended during the run (settled rulings; the parent criteria "
                          "above are unchanged):\n" + "\n".join(f"- {a}" for a in amended))
+    cmds = state.get("verification_commands")
+    cmds = "[]" if cmds is None else cmds
+    try:
+        arr = json.loads(cmds)
+    except (TypeError, json.JSONDecodeError):
+        arr = None
+    if isinstance(arr, list):
+        declared = [c.strip() for c in arr if isinstance(c, str)]
+        source = spec
+        if _subtask_phase(state):
+            # only the subtask's criteria and the user's amendments, never its planner-written outcome or constraints
+            m = re.search(r"^Acceptance criteria:\n((?:.+\n?)*)", spec, re.M)
+            source = m.group(1) if m else ""
+        kept, capped = criterion_commands(source, state.get("project_dir") or root, declared)
+        extra = [c for c in kept if c not in declared]
+        if extra:
+            cmds = json.dumps(arr + extra)
+            over = f" ({capped} more dropped by the cap)" if capped else ""
+            ledger(state, u, f"verify: declared {len(extra)} criterion command(s) as verification runs{over}: {'; '.join(extra)}")
+    u["review_verification_commands"] = cmds
     if spec:
         lines += ["Plan / acceptance criteria:", spec]
     if dropped or as_list(state.get("publish_criteria")) or _publish_asks(state)["commit"]:
@@ -3786,12 +3807,6 @@ def ci_gate(state):
         u["anomalies"] = []
     task = as_dict(state.get("git_task"))
     ret = task.get("return_to") or "final_report"
-    if task.get("kind") == "flip_ready":
-        _confirm_pr_ready(state, u)
-        if _review_mode(state) and truthy(state.get("ci_owner")):
-            return _start_review_watch(state, u)
-        u["_next"] = "final_report"
-        return u
     if task.get("kind") == "review_update":
         u["_next"] = "pr_review_resolve"
         return u
@@ -3957,7 +3972,8 @@ def _confirm_pr_ready(state, u):
     else:
         watch = "; the review watch starts anyway" if _review_mode(state) and truthy(state.get("ci_owner")) else ""
         ledger(state, u, f"ci: PR flip to ready NOT confirmed ({detail}){watch}")
-        u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [f"PR flip to ready not confirmed: {detail}{watch}"]
+        u["follow_ups"] = list(as_list(u.get("follow_ups", state.get("follow_ups")))) + [
+            f"PR flip to ready not confirmed: {detail}{watch}"]
 
 
 def _review_mode(state):
@@ -4180,14 +4196,16 @@ def _ci_leave_option(state):
     return "Stop watching and report" if _watch_started(state) else "Leave the PR in draft and report"
 
 
-def _ci_finish_green(state, u, note, text):
+def _ci_finish_green(state, u, note):
     if _review_mode(state) and truthy(state.get("flip_ready")):
         ledger(state, u, f"ci: {note} -> back to the review watch")
         return _start_review_watch(state, u)
-    u["git_task"] = {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True, "text": text}
     u["flip_ready"] = True
     ledger(state, u, f"ci: {note} -> flip to ready")
-    u["_next"] = "git_ops"
+    _confirm_pr_ready(state, u)
+    if _review_mode(state) and truthy(state.get("ci_owner")):
+        return _start_review_watch(state, u)
+    u["_next"] = "final_report"
     return u
 
 
@@ -4313,8 +4331,7 @@ def ci_route(state):
     if status == "green":
         if state.get("ci_green_by"):
             u["ci_green_by"] = ""
-        return _ci_finish_green(state, u, "green",
-                                "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready).")
+        return _ci_finish_green(state, u, "green")
     elif status in ("inconclusive", "no_checks"):
         return _ci_unclear(state, u, status)
     elif status == "red":

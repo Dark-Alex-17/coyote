@@ -82,7 +82,7 @@ BASE = subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"], capture_output=T
 check("env: no caller SISYPHUS_GH_* seam, poll sleep or owner/Slack binary survives the scrub",
       not [k for k in os.environ if k.startswith("SISYPHUS_GH_") or k in SCRUBBED_SEAMS]
       and {"SISYPHUS_ASK_OWNER_BIN", "SISYPHUS_SLACK_PING_BIN"} <= set(SCRUBBED_SEAMS))
-# every flip_ready row re-reads the PR and may run `gh pr ready`, so the real gh calls must never run here; the
+# every CI-green row flips the PR, re-reads it and may run `gh pr ready`, so the real gh calls must never run here; the
 # default PR has the fixture repo's branch as its head, so a report's pull URL resolves to it
 BRANCH = subprocess.run(["git", "-C", REPO, "branch", "--show-current"], capture_output=True, text=True).stdout.strip()
 _PR_VIEW_DEFAULT = "echo '{\"isDraft\": false, \"headRefName\": \"" + BRANCH + "\"}'"
@@ -182,6 +182,30 @@ st3 = gates.intake({"initial_prompt": "do it\nSisyphus run id: 20200101T000000-d
 check("intake: unknown run id -> fresh run, declared", not st3.get("resume_mode") and "no durable state" in st3["resume_note"])
 st4 = gates.intake({"initial_prompt": "typo fix", "project_dir": REPO})
 check("intake: standalone brief is top-level", st4["top_level"] and not st4["delegated"])
+PD_REPO = os.path.join(TMP, "plans-dir-repo")
+for _d in ("steps", "handoffs"):
+    os.makedirs(os.path.join(PD_REPO, "docs", "planning", _d))
+st5 = gates.intake({"initial_prompt": "typo fix", "project_dir": PD_REPO, "plans_dir": "docs/planning"})
+check("intake: a plan repo under the configured plans_dir is detected", st5["plans_detected"] is True, st5.get("plans_detected"))
+st6 = gates.intake({"initial_prompt": "typo fix", "project_dir": PD_REPO})
+check("intake: no plan repo under the default plans/ -> not detected", st6["plans_detected"] is False, st6.get("plans_detected"))
+os.environ["LLM_AGENT_VAR_DEBRIS_EXCLUDE"] = '["preset"]'
+try:
+    st7 = gates.intake({"initial_prompt": "typo fix", "project_dir": REPO})
+finally:
+    del os.environ["LLM_AGENT_VAR_DEBRIS_EXCLUDE"]
+check("intake: a debris_exclude preset through the variable environment wins over the plans dir",
+      st7["debris_exclude"] == '["preset"]', st7.get("debris_exclude"))
+st8 = gates.intake({"initial_prompt": "typo fix", "project_dir": REPO, "debris_exclude": '["state"]'})
+check("intake: a debris_exclude preset in the state wins over the plans dir",
+      st8["debris_exclude"] == '["state"]', st8.get("debris_exclude"))
+check("plans exclude: the dirty-check pathspec follows the configured plans_dir",
+      gates._plans_exclude({"project_dir": PD_REPO, "plans_dir": "docs/planning"}, PD_REPO) == [":(exclude,literal)docs/planning"]
+      and gates._plans_exclude({"project_dir": PD_REPO}, PD_REPO) == [])
+_git_ops = re.search(r"(?ms)^  git_ops:\n(.*?)(?=^  \w+:\n)", open(os.path.join(HERE, "..", "graph.yaml")).read()).group(1)
+_git_ops = " ".join(_git_ops.split())
+check("git_ops: the instructions forbid gh pr ready and never ask for it",
+      "Never run gh pr ready" in _git_ops and _git_ops.count("gh pr ready") == 1, _git_ops[:200])
 roster, own = gates._parse_roster("Implement TASK-003 ...\nTeammate roster:\n- TASK-002 agent_x scope: src/auth/, src/api/users.go\n- TASK-003 agent_y scope: src/payments/\n")
 check("intake: roster parse", roster.get("TASK-002") == ["src/auth/", "src/api/users.go"] and own == ["src/payments/"])
 
@@ -1327,6 +1351,86 @@ finally:
     shutil.rmtree(os.path.join(REPO, "plans"))
     if os.path.exists(os.path.join(REPO, "untracked.txt")):
         os.remove(os.path.join(REPO, "untracked.txt"))
+
+# ---------------------------------------------------------------- criterion commands declared as verification runs
+CC_DIR = os.path.join(TMP, "criterion-commands")
+
+
+def cc_exe(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    os.chmod(path, 0o755)
+
+
+cc_exe(os.path.join(CC_DIR, "tools", "check"))
+cc_exe(os.path.join(TMP, "outside", "tool"))
+
+
+def cc_row(name, text, want, declared=("true",)):
+    got = _lib.criterion_commands(text, CC_DIR, list(declared))[0]
+    check(name, got == want, got)
+
+
+cc_row("criterion_commands: `rm -rf x` passes -> dropped, rm is not a declared program", "- `rm -rf x` passes\n", [])
+cc_row("criterion_commands: `sh -c 'x'` passes -> dropped for its quotes even with sh declared",
+       "- `sh -c 'x'` passes\n", [], declared=("true", "sh run.sh"))
+cc_row("criterion_commands: `git grep -Oecho -e a` passes -> dropped, grep is not read-only and -O runs a program",
+       "- `git grep -Oecho -e a` passes\n", [])
+cc_row("criterion_commands: `git diff -Oecho` and `git log --ext-diff` pass -> dropped for the unsafe argument",
+       "- `git diff -Oecho --exit-code` and `git log --ext-diff -p` pass\n", [])
+cc_row("criterion_commands: `git push origin x` passes -> dropped even when a declared command is git",
+       "- `git push origin x` passes\n", [], declared=("git diff --check",))
+cc_row("criterion_commands: `../outside/tool run` passes -> dropped, the executable is outside cwd",
+       "- `../outside/tool run` passes\n", [])
+cc_row("criterion_commands: `./tools/check run` passes -> kept, an executable inside cwd",
+       "- `./tools/check run` passes\n", ["./tools/check run"])
+cc_row("criterion_commands: a declared program passes -> kept; a bare program or a missing path is not",
+       "- `true x` passes, `true` alone passes, `./missing.sh run` passes\n", ["true x"])
+cc_row("criterion_commands: a NAME=value prefix is dropped, on git and on a declared program alike",
+       "- `GIT_EXTERNAL_DIFF=rm git diff --exit-code -- f` and `PATH=. true x` and `LD_PRELOAD=x.so true y` pass\n", [])
+cc_row("criterion_commands: `git status --short` is clean -> dropped, its exit does not decide the criterion",
+       "- `git status --short` is clean\n", [])
+cc_row("criterion_commands: `true --bad` exits 2 -> dropped, the criterion expects a failing exit",
+       "- `true --bad` exits 2\n", [])
+cc_row("criterion_commands: a line stating both a pass and a failure -> dropped", "- `true x` passes, `true y` fails\n", [])
+cc_row("criterion_commands: a read-only git span that writes a file through --output is dropped",
+       "- `git diff --output=x.patch` and `git diff --exit-code -- a` pass\n", ["git diff --exit-code -- a"])
+cc_many = "".join(f"- `true a{i}` passes\n" for i in range(12)) + "- `true a0` passes\n"
+check("criterion_commands: at most 8 by default and the cap honoured, the first ones kept and the rest counted once each",
+      (_lib.criterion_commands(cc_many, CC_DIR, ["true"]), _lib.criterion_commands(cc_many, CC_DIR, ["true"], cap=3))
+      == (([f"true a{i}" for i in range(8)], 4), (["true a0", "true a1", "true a2"], 9)))
+CC_DIFF = f"git diff --exit-code {BASE} -- f"
+CC_SUBS = [{"title": "one", "outcome": "o1", "acceptance_criteria": [f"`{CC_DIFF}` passes"]},
+           {"title": "two", "outcome": "o2", "acceptance_criteria": ["AC2"]}]
+u = gates.build_gauntlet_prompt(base_state(subtasks=CC_SUBS, subtask_index=1, subtask_changed_files=["f"],
+                                           verification_commands='["true x"]'))
+check("build_gauntlet: a subtask criterion's exit-code git diff is declared after the brief's commands and ledgered",
+      json.loads(u["review_verification_commands"]) == ["true x", CC_DIFF]
+      and f"verify: declared 1 criterion command(s) as verification runs: {CC_DIFF}" in u["decisions"], u)
+u = gates.build_gauntlet_prompt(base_state(spec_text="AC1: hello endpoint", verification_commands='["true x"]'))
+check("build_gauntlet: no command in the criteria -> review_verification_commands is verification_commands",
+      u["review_verification_commands"] == '["true x"]' and not any(d.startswith("verify:") for d in u["decisions"]), u)
+u = gates.build_gauntlet_prompt(base_state(spec_text=f"- `{CC_DIFF}` passes", verification_commands="run the suite"))
+check("build_gauntlet: a verification_commands that is not a JSON list passes through unchanged",
+      u["review_verification_commands"] == "run the suite" and not any(d.startswith("verify:") for d in u["decisions"]), u)
+u = gates.build_gauntlet_prompt(base_state(
+    subtasks=[{"title": "one", "outcome": f"`{CC_DIFF}` passes", "constraints": f"`{CC_DIFF}` passes",
+               "acceptance_criteria": ["AC1"]}, CC_SUBS[1]],
+    subtask_index=1, subtask_changed_files=["f"], verification_commands='["true x"]'))
+check("build_gauntlet: a command in a subtask's outcome or constraints is never declared, only its criteria count",
+      u["review_verification_commands"] == '["true x"]', u.get("review_verification_commands"))
+CC_TOP = os.path.join(TMP, "cc-nested-repo")
+CC_NESTED = os.path.join(CC_TOP, "svc")
+os.makedirs(os.path.join(CC_NESTED, "tools"), exist_ok=True)
+subprocess.run(["git", "init", "-q", CC_TOP], check=True)
+with open(os.path.join(CC_NESTED, "tools", "check"), "w") as _fh:
+    _fh.write("#!/bin/sh\nexit 0\n")
+os.chmod(os.path.join(CC_NESTED, "tools", "check"), 0o755)
+u = gates.build_gauntlet_prompt(base_state(project_dir=CC_NESTED, git_root=CC_TOP, base_sha="", head_sha="",
+                                           spec_text="- `./tools/check run` passes", verification_commands='["true x"]'))
+check("build_gauntlet: an in-tree executable is vetted against the project dir the gauntlet runs in, not the git root",
+      json.loads(u["review_verification_commands"]) == ["true x", "./tools/check run"], u.get("review_verification_commands"))
 passed = ("GAUNTLET: PASS\n\n| lane | status | detail |\n|------|--------|--------|\n| code-review | GREEN | PASS, 0 critical |\n"
           "| adversary | GREEN | CONFORMS |\n| security | GREEN (attention) | PASS (attention items) |\n| probe | SKIPPED | not selected |\n"
           "| debris | GREEN | clean |\n\n## Human attention required\n- check X\n")
@@ -1463,7 +1567,6 @@ check("ci_gate: instruction return -> run_coder", gates.ci_gate(base_state(git_t
 check("ci_gate: parent-owned PR lifecycle -> draft left, final_report", gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True}, delegated=True, git_report="https://github.com/o/r/pull/5"))["_next"] == "final_report")
 u = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True}, delegated=False, git_report="opened https://github.com/o/r/pull/5"))
 check("ci_gate: standalone owns the flip -> ci_poll", u["_next"] == "ci_poll" and u["ci_owner"])
-check("ci_gate: flip_ready done -> final_report", gates.ci_gate(base_state(git_task={"kind": "flip_ready"}))["_next"] == "final_report")
 os.environ["SISYPHUS_CI_SLEEP"] = "0"
 os.environ["SISYPHUS_GH_CHECKS_CMD"] = "echo '[{\"name\":\"build\",\"bucket\":\"pass\"},{\"name\":\"test\",\"bucket\":\"pending\"}]'"
 u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=0))
@@ -1480,7 +1583,9 @@ u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_poll_fails=2, c
 check("ci_poll: B15 consecutive poll errors -> route poll_error", u["ci_status"] == "poll_error" and u["_next"] == "ci_route")
 u = gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=1))
 check("ci_poll: B15 wall clock exceeded -> timeout", u["ci_status"] == "timeout")
-check("ci_route: green -> flip via git_ops", gates.ci_route(base_state(ci_status="green"))["git_task"]["kind"] == "flip_ready")
+u = gates.ci_route(base_state(ci_status="green"))
+check("ci_route: green -> the gate flips the PR and reports, never git_ops",
+      u["_next"] == "final_report" and u["flip_ready"] and "pr_ready_confirmed" in u and "git_task" not in u)
 check("ci_route: poll_error -> ci_exhausted escalation", gates.ci_route(base_state(ci_status="poll_error"))["escalation"]["kind"] == "ci_exhausted")
 u = gates.ci_route(base_state(ci_status="red", ci_failing=[["build", "https://x/actions/runs/1"]]))
 check("ci_route: red -> evidence pack -> diagnose", u["_next"] == "ci_diagnose" and "### build" in u["ci_evidence"])
@@ -1577,19 +1682,18 @@ for _s in _states:
 check("ci_poll: a blank-bucket check falls back to its state: error-like states read red, waiting-like states pending",
       _seen == _states, _seen)
 u = gates.apply_answer(base_state(escalation=_esc_none, last_answer=gates.CI_NO_CI, ci_status="no_checks"))
-_task = u.get("git_task") or {}
-check("apply: ci_no_checks headless pick -> the flip-to-ready path with a CI-never-ran follow-up, never ci_status green",
-      u.get("_next") == "git_ops" and _task.get("kind") == "flip_ready" and u.get("flip_ready")
-      and "CI is green" not in _task.get("text", "") and u.get("ci_green_by") == "no_checks" and "ci_status" not in u
-      and len(u.get("follow_ups", [])) == 1 and u["follow_ups"][0].startswith("CI never ran"), u)
+check("apply: ci_no_checks headless pick -> the gate flips with a CI-never-ran follow-up, never ci_status green",
+      u.get("_next") == "final_report" and "git_task" not in u and u.get("flip_ready")
+      and u.get("ci_green_by") == "no_checks" and "ci_status" not in u
+      and len(u.get("follow_ups", [])) == 2 and u["follow_ups"][0].startswith("CI never ran")
+      and u["follow_ups"][1].startswith("PR flip to ready not confirmed"), u)
 u = gates.apply_answer(base_state(escalation=_esc_quiet, last_answer=f"{gates.CI_TREAT_GREEN}: docs are skipped on purpose",
                                   ci_status="inconclusive"))
-_task = u.get("git_task") or {}
 check("apply: ci_inconclusive treat as green -> reason and non-pass checks recorded, flip path, never ci_status green",
-      u.get("_next") == "git_ops" and _task.get("kind") == "flip_ready" and "CI is green" not in _task.get("text", "")
+      u.get("_next") == "final_report" and "git_task" not in u and u.get("flip_ready")
       and u.get("ci_green_by") == "inconclusive" and "ci_status" not in u
-      and u.get("follow_ups") == ["CI treated as green with non-pass checks: docs (skipping), deploy (neutral) "
-                                  "(reason: docs are skipped on purpose)"]
+      and u.get("follow_ups", [])[:1] == ["CI treated as green with non-pass checks: docs (skipping), deploy (neutral) "
+                                          "(reason: docs are skipped on purpose)"]
       and any("docs are skipped on purpose" in d and "docs (skipping)" in d for d in u.get("decisions", [])), u)
 _rerun_log = os.path.join(TMP, "ci-cancel-reruns.log")
 os.environ["SISYPHUS_GH_RERUN_CMD"] = f"echo \"$SISYPHUS_RUN_ID\" >> '{_rerun_log}'"
@@ -1776,12 +1880,10 @@ def thread(tid, comments, resolved=False, outdated=False, association="MEMBER"):
 
 
 u = gates.ci_route(base_state(ci_status="green", flip_ready=True))
-check("pr_tracking ci: ci_route green -> flip with the ci-mode text unchanged",
-      u["_next"] == "git_ops" and u["decisions"] == ["ci: green -> flip to ready"]
-      and u["git_task"] == {"kind": "flip_ready", "return_to": "final_report", "flip_ready": True,
-                            "text": "CI is green and the verification loop is complete: flip the PR to ready (gh pr ready)."})
-check("pr_tracking ci: ci_gate flip_ready on an owned PR -> final_report",
-      gates.ci_gate(base_state(git_task={"kind": "flip_ready"}, ci_owner=True))["_next"] == "final_report")
+check("pr_tracking ci: ci_route green ignores the flip state outside review mode -> the gate flips, no review watch",
+      u["_next"] == "final_report" and u["decisions"][0] == "ci: green -> flip to ready" and "git_task" not in u)
+check("pr_tracking ci: ci_route green on an owned PR -> final_report",
+      gates.ci_route(base_state(ci_status="green", ci_owner=True))["_next"] == "final_report")
 os.environ["SISYPHUS_GH_CHECKS_CMD"] = "echo '[{\"name\":\"build\",\"bucket\":\"pass\"}]'"
 check("pr_tracking ci: ci_poll counts the first visit in ci_polls_run",
       gates.ci_poll(base_state(git_report="pull/5", ci_polls=0, ci_started_at=_now)).get("ci_polls_run") == 1)
@@ -1806,17 +1908,17 @@ check("pr_tracking ci: the report carries no review-watch line",
 u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                              delegated=False, git_report="opened https://github.com/o/r/pull/7"))
 check("pr_tracking review: the first watch start records pr_ref", u["_next"] == "ci_poll" and u["pr_ref"] == "7")
-u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=0, pr_review_watch_polls=4))
-check("pr_tracking review: ci_gate flip_ready -> pr_review_poll with started_at set",
+u = gates.ci_route(rs(ci_status="green", flip_ready=False, pr_review_started_at=0, pr_review_watch_polls=4))
+check("pr_tracking review: ci_route green before the flip -> the gate flips, then pr_review_poll with started_at set",
       u["_next"] == "pr_review_poll" and u["pr_review_started_at"] >= _now and u["pr_review_watch_polls"] == 0
+      and u["flip_ready"] and "pr_ready_confirmed" in u and "git_task" not in u
       and "review-watch: PR #7 watching" in u["decisions"])
-u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=5))
+u = gates.ci_route(rs(ci_status="green", flip_ready=False, pr_review_started_at=5))
 check("pr_tracking review: a later watch start keeps the run's started_at", "pr_review_started_at" not in u)
 u = gates.ci_route(rs(ci_status="green"))
 check("pr_tracking review: ci_route green after the flip -> pr_review_poll, no flip task",
-      u["_next"] == "pr_review_poll" and "git_task" not in u and "ci: green -> back to the review watch" in u["decisions"])
-u = gates.ci_route(rs(ci_status="green", flip_ready=False))
-check("pr_tracking review: ci_route green before the flip -> the flip task", u.get("git_task", {}).get("kind") == "flip_ready")
+      u["_next"] == "pr_review_poll" and "pr_ready_confirmed" not in u
+      and "ci: green -> back to the review watch" in u["decisions"])
 u = gates.ci_gate(base_state(pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                              delegated=True, git_report="https://github.com/o/r/pull/5"))
 check("pr_tracking review: a delegated run logs the not-started line",
@@ -2842,7 +2944,7 @@ check("pr_tracking review: a ci_poll node error at CI_POLL_FAILS -> the review p
       and "review-watch: PR #7 stop: ci_poll_error" in u["decisions"])
 u = gates.ci_route(base_state(ci_status="green", last_script_error="killed", ci_poll_fails=0, ci_polls_run=4))
 check("pr_tracking ci: a ci_poll node error keeps the status routing and counts one poll into ci_polls_run",
-      u["_next"] == "git_ops" and u["git_task"]["kind"] == "flip_ready" and "ci_poll_fails" not in u
+      u["_next"] == "final_report" and u.get("flip_ready") is True and "ci_poll_fails" not in u
       and u.get("ci_polls_run") == 5 and not any("review-watch" in d for d in u["decisions"]))
 review_doc(decision="APPROVED")
 code, out = run_entry("pr_review_poll", rs())
@@ -2861,7 +2963,7 @@ u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_t
 check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
 u = gates.ci_gate({"git_report": "ok", "anomalies": ["inbox-final observation"], "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
 check("ci_gate: inbox-final schema anomalies harvested through git_ops", any("inbox-final observation" in e for e in u.get("anomalies_log", [])))
-u = gates.ci_gate({"git_report": "clean exit 0", "git_task": {"kind": "flip_ready"}, "run_dir": TMP, "anomalies_log": []})
+u = gates.ci_gate({"git_report": "clean exit 0", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
 check("ci_gate: clean case adds nothing", u.get("anomalies_log", []) == [] and u["_next"] == "final_report")
 
 # --- route_gauntlet pre-check is the parser's verdict regex; report round lines carry lane details ---
@@ -4215,6 +4317,39 @@ check("caps: initial_state seeds apply_reasks next to reask_rounds, and the audi
 check("caps: initial_state seeds clarify_extensions and sizing_extensions next to their round counters",
       re.search(r"(?m)^  clarify_rounds: 0\n  clarify_extensions: 0$", _initial) is not None
       and re.search(r"(?m)^  sizing_rounds: 0\n  sizing_extensions: 0$", _initial) is not None)
+
+
+def _written_and_read_back(src, graph):
+    """State keys gates.py writes into its update dict `u` and reads back through state.get, state[...], the
+    report's g(...) or a {{key}} template in graph.yaml."""
+    written, read = set(), set(re.findall(r"\{\{(\w+)\}\}", graph))
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "u" and isinstance(node.value, ast.Dict):
+                    written.update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+                elif isinstance(t, ast.Subscript) and getattr(t.value, "id", "") == "u" and isinstance(t.slice, ast.Constant):
+                    written.add(t.slice.value)
+        elif isinstance(node, ast.Call):
+            first = node.args[0] if node.args else None
+            owner = getattr(node.func, "value", None)
+            if (getattr(node.func, "attr", "") == "update" and getattr(owner, "id", "") == "u"
+                    and isinstance(first, ast.Dict)):
+                written.update(k.value for k in first.keys if isinstance(k, ast.Constant))
+            elif isinstance(first, ast.Constant) and (
+                    (getattr(node.func, "attr", "") == "get" and getattr(owner, "id", "") == "state")
+                    or getattr(node.func, "id", "") == "g"):
+                read.add(first.value)
+        elif (isinstance(node, ast.Subscript) and getattr(node.value, "id", "") == "state"
+              and isinstance(node.slice, ast.Constant) and isinstance(node.ctx, ast.Load)):
+            read.add(node.slice.value)
+    return {k for k in written & read if isinstance(k, str) and not k.startswith("_")}
+
+
+_read_back = _written_and_read_back(open(os.path.join(HERE, "gates.py"), encoding="utf-8").read(), _graph_text)
+_unseeded = sorted(_read_back - set(re.findall(r"(?m)^  (\w+):", _initial)) - set(_vars))
+check("initial_state: every state key the gates write and read back is seeded (variables aside)",
+      len(_read_back) > 50 and not _unseeded, _unseeded)
 check("caps: the final whole-task review resets oracle_retries",
       gates._start_final_review(base_state(subtasks=subs, oracle_retries=RERUN_ONCE), {}, len(subs))
       .get("oracle_retries") == 0)
@@ -4246,33 +4381,43 @@ def flip_seams(view, ready):
 
 
 _view_after_ready = f"if [ -f '{_FLIP_MARK}' ]; then {_READY_JSON}; else {_DRAFT_JSON}; fi"
-_flip = dict(git_task={"kind": "flip_ready"}, flip_ready=True, git_report="https://github.com/o/r/pull/9", pr_ref="9")
+_flip = dict(ci_status="green", git_report="https://github.com/o/r/pull/9", pr_ref="9")
 flip_seams(f"echo \"$SISYPHUS_PR_REF\" >> '{_VIEW_LOG}'; {_READY_JSON}", "exit 0")
-u = gates.ci_gate(base_state(**_flip))
+u = gates.ci_route(base_state(**_flip))
 check("flip: an already-ready PR still runs gh pr ready once, and the re-read receives the PR ref",
       u.get("pr_ready_confirmed") is True and u.get("_next") == "final_report" and seam_log(_FLIP_LOG) == "9\n"
       and seam_log(_VIEW_LOG) == "9\n"
       and any("flip to ready confirmed" in d for d in u["decisions"]), u)
 flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'")
-u = gates.ci_gate(base_state(**_flip))
+_ci = gates.ci_route(base_state(**_flip))
+_ci_ready = seam_log(_FLIP_LOG)
+flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'")
+_rv = gates.ci_route(rs(**dict(_flip, flip_ready=False, pr_review_started_at=0)))
+_rv_ready = seam_log(_FLIP_LOG)
+check("flip: CI green runs gh pr ready exactly once in the gate and never routes to git_ops, in both modes",
+      _ci.get("_next") == "final_report" and _ci.get("pr_ready_confirmed") is True and _ci_ready == "9\n"
+      and _rv.get("_next") == "pr_review_poll" and _rv.get("pr_ready_confirmed") is True and _rv_ready == "9\n"
+      and "git_task" not in _ci and "git_task" not in _rv, (_ci, _rv))
+flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'")
+u = gates.ci_route(base_state(**_flip))
 check("flip: still a draft -> gh pr ready once on the PR ref, rc 0 and a ready re-read -> confirmed",
       u.get("pr_ready_confirmed") is True and seam_log(_FLIP_LOG) == "9\n" and not u.get("follow_ups"), u)
 flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'; exit 1")
-u = gates.ci_gate(base_state(**_flip))
+u = gates.ci_route(base_state(**_flip))
 check("flip: gh pr ready rc 1 -> not confirmed with a follow-up, even when the re-read is not a draft",
       u.get("pr_ready_confirmed") is False and u.get("_next") == "final_report"
       and any(f.startswith("PR flip to ready not confirmed: gh pr ready rc 1") for f in as_list_(u.get("follow_ups")))
       and any("flip to ready NOT confirmed" in d for d in u["decisions"]), u)
 flip_seams(_DRAFT_JSON, "exit 0")
-u = gates.ci_gate(base_state(**_flip))
+u = gates.ci_route(base_state(**_flip))
 check("flip: gh pr ready rc 0 but the re-read is still a draft -> not confirmed, the detail names isDraft",
       u.get("pr_ready_confirmed") is False and "isDraft true" in str(u.get("pr_ready_detail")), u)
 flip_seams("exit 1", "exit 0")
-u = gates.ci_gate(base_state(**_flip))
+u = gates.ci_route(base_state(**_flip))
 check("flip: the re-read itself failing -> not confirmed, the detail says gh pr view failed",
       u.get("pr_ready_confirmed") is False and "gh pr view failed" in str(u.get("pr_ready_detail")), u)
 flip_seams("echo not-json", "exit 0")
-u = gates.ci_gate(base_state(**_flip))
+u = gates.ci_route(base_state(**_flip))
 check("flip: a re-read that prints unparseable output -> not confirmed, the detail says gh pr view failed",
       u.get("pr_ready_confirmed") is False and "gh pr view failed" in str(u.get("pr_ready_detail")), u)
 flip_seams(_READY_JSON, "exit 0")
@@ -4280,8 +4425,8 @@ _watch = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_
                                   git_report="opened https://github.com/o/r/pull/9"))
 seam_log(_FLIP_LOG)
 flip_seams(_view_after_ready, f"touch '{_FLIP_MARK}'")
-u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_watch.get("pr_ref"), git_report="fixed #12 then flipped")))
-_noref = gates.ci_gate(base_state(**dict(_flip, pr_ref="")))
+u = gates.ci_route(base_state(**dict(_flip, pr_ref=_watch.get("pr_ref"), git_report="fixed #12 then flipped")))
+_noref = gates.ci_route(base_state(**dict(_flip, pr_ref="")))
 check("flip: ci mode saves pr_ref at the watch start, the flip runs gh pr ready on it and never on a report's other #N",
       _watch.get("pr_ref") == "9" and u.get("pr_ready_confirmed") is True and seam_log(_FLIP_LOG) == "9\n"
       and _noref.get("pr_ready_confirmed") is False and "no PR ref" in str(_noref.get("pr_ready_detail"))
@@ -4289,7 +4434,7 @@ check("flip: ci mode saves pr_ref at the watch start, the flip runs gh pr ready 
 flip_seams(_READY_JSON, "exit 0")
 _w12 = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                                 git_report="opened the draft PR. Closes #12"))
-u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_w12.get("pr_ref"), git_report="Closes #12")))
+u = gates.ci_route(base_state(**dict(_flip, pr_ref=_w12.get("pr_ref"), git_report="Closes #12")))
 _ready12 = seam_log(_FLIP_LOG)
 _fake_gh = os.path.join(TMP, "fake-gh")
 os.makedirs(_fake_gh)
@@ -4324,7 +4469,7 @@ _publish41 = dict(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr"
                   git_report="opened the draft PR; supersedes https://github.com/o/r/pull/41")
 flip_seams(f"case \"$SISYPHUS_PR_REF\" in {_other41} *) {_ours9};; esac", "exit 0")
 _w41 = gates.ci_gate(base_state(**_publish41))
-u = gates.ci_gate(base_state(**dict(_flip, pr_ref=_w41.get("pr_ref"), git_report=_publish41["git_report"])))
+u = gates.ci_route(base_state(**dict(_flip, pr_ref=_w41.get("pr_ref"), git_report=_publish41["git_report"])))
 _ready41 = seam_log(_FLIP_LOG)
 flip_seams(f"case \"$SISYPHUS_PR_REF\" in {_other41} *) exit 1;; esac", "exit 0")
 _n41 = gates.ci_gate(base_state(**_publish41))
@@ -4334,13 +4479,13 @@ check("flip: a publish report whose first pull URL is another PR (pull/41) never
       and _n41.get("ci_watch_note") == "not watched: no PR found for the current branch",
       (_w41.get("pr_ref"), _ready41, _n41))
 flip_seams("echo '{\"isDraft\": false, \"headRefName\": \"other\"}'", "exit 0")
-u = gates.ci_gate(base_state(**_flip))
+u = gates.ci_route(base_state(**_flip))
 check("flip: a re-read whose head is not the current branch -> not confirmed, the detail names both branches",
       u.get("pr_ready_confirmed") is False and "'other'" in str(u.get("pr_ready_detail"))
       and repr(BRANCH) in str(u.get("pr_ready_detail")), u)
 seam_log(_FLIP_LOG)
 flip_seams(_DRAFT_JSON, "exit 0")
-u = gates.ci_gate(rs(git_task={"kind": "flip_ready"}, pr_review_started_at=0))
+u = gates.ci_route(rs(ci_status="green", flip_ready=False, pr_review_started_at=0))
 check("flip: review mode with an unconfirmed flip still starts the watch, and the follow-up says so",
       u.get("_next") == "pr_review_poll" and u.get("pr_ready_confirmed") is False
       and any("not confirmed" in f and "review watch" in f for f in as_list_(u.get("follow_ups"))), u)

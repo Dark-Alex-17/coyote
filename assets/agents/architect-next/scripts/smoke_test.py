@@ -1740,6 +1740,25 @@ t3dir = gates.task_dir_for(base_state(plan_path=PROMOTED), T3)
 check("debt_assign: owner named -> criterion appended to the owner + debt-assigned logged; no owner -> chore task via bin/new-task",
       u["_next"] == "task_done" and "Remove the debt marker" in read_file(os.path.join(t3dir, "index.md")) and "debt-assigned" in read_file(os.path.join(t3dir, "log.md"))
       and len(u["tasks"]) == 4 and u["tasks"][-1]["type"] == "chore" and any(l.startswith("debt-assigned:") for l in u["ledger_lines"]))
+SCAN_FAILED = "debt scan FAILED (subtask 1): debt_scan.py exited 2; the diff was not scanned"
+RESCAN = f"({T1}) Re-run the debt scan for subtask 1: debt_scan.py exited 2"
+u = gates.harvest_report(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, follow_ups=[], report_parsed={"debt": [SCAN_FAILED], "follow_ups": []}))
+u2 = gates.debt_assign(base_state(plan_path=PROMOTED, tasks=copy.deepcopy(TS1), current_task=T1, debt_items=u["debt_items"], ledger_lines=[]))
+check("harvest_report: a scan-FAILED debt line -> no debt item, one re-run follow-up, ledgered; debt_assign makes no chore",
+      u["debt_items"] == [] and u["follow_ups"] == [RESCAN] and any("routed to a re-run follow-up" in d for d in u["decisions"])
+      and len(u2["tasks"]) == len(TS1), (u["debt_items"], u["follow_ups"], len(u2["tasks"])))
+u = gates.harvest_report(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, follow_ups=[], report_parsed={
+    "debt": [SCAN_FAILED.replace("subtask 1", "Subtask 1")], "follow_ups": ["Re-run the debt scan for subtask 1: debt_scan.py exited 2"]}))
+check("harvest_report: a scan-FAILED line beside the child's own re-run follow-up for that scope -> no duplicate follow-up",
+      u["debt_items"] == [] and u["follow_ups"] == [RESCAN], u["follow_ups"])
+u = gates.harvest_report(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, follow_ups=[], report_parsed={
+    "debt": [SCAN_FAILED, "src/x.rs:3 -- #[allow(dead_code)] -- none"], "follow_ups": []}))
+check("harvest_report: a scan-FAILED line beside a real debt line -> only the real line reaches debt_assign",
+      u["debt_items"] == ["src/x.rs:3 -- #[allow(dead_code)] -- none"] and u["follow_ups"] == [RESCAN], (u["debt_items"], u["follow_ups"]))
+u = gates.harvest_report(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, follow_ups=[], report_parsed={
+    "debt": ["DEBT_SCAN_FAILED: git diff failed"], "follow_ups": []}))
+check("harvest_report: a DEBT_SCAN_FAILED line -> no debt item, a re-run follow-up for the diff",
+      u["debt_items"] == [] and u["follow_ups"] == [f"({T1}) Re-run the debt scan for the diff: git diff failed"], (u["debt_items"], u["follow_ups"]))
 u = gates.task_done_verify(base_state(plan_path=PROMOTED, tasks=TS1, current_task=T1, report_parsed=pr_, ledger_lines=["design-decision: introduced a WidgetStore interface in src/a.go"], task_done_report="edited\nANOMALY: week plan row missing"))
 t1d = gates.task_by_id(u["tasks"], T1)
 check("task_done_verify: completed entry appended by the script when missing; ledger line re-appended; task closed in the store; status complete; A10 harvested",

@@ -170,6 +170,8 @@ initial_state:
   clarify_extensions: 0
   needs_oracle: false
   oracle_question: ''
+  assess_needs_oracle: false
+  assess_oracle_question: ''
   architecture_scale: false
   has_spec: false
   spec_text: ''
@@ -177,6 +179,7 @@ initial_state:
   security_posture: 'standard'
   posture_reason: ''
   verification_commands: '[]'
+  review_verification_commands: '[]'
   local_run_recipe: ''
   git_actions: {}
   publish_criteria: []
@@ -219,6 +222,7 @@ initial_state:
   oracle_consulted: false
   oracle_result: ''
   architecture_proposal: ''
+  proposal_confirmed: false
   # --- escalation ladder ---
   escalation: {}
   ask_question: ''
@@ -248,24 +252,32 @@ initial_state:
   discussion_message: ''
   settled_answer: ''
   autonomous_digest: []
+  autonomous_kinds: []
   decisions: []
   # --- implementation ---
   coder_brief: {}
   coder_prompt: ''
   expected_files: []
   scope_breach: ''
+  scope_confirmed: false
   fix_instructions: ''
+  fix_source: ''
+  fix_note: ''
+  fix_items: []
   fix_round: 0
   coder_result: ''
   coder_sentinel: ''
   fix_strikes: 0
   rejected_rounds: 0
+  rejected_cap_resets: 0
   strikeout_rounds: 0
+  strikeout_stash: ''
   diagnosis: ''
   last_coder_error: ''
   design_block: ''
   design_asks: []
   design_ask_rounds: 0
+  design_ask_pending_done: false
   oracle_retries: 0
   design_decisions: []
   inbox_instructions: ''
@@ -278,6 +290,7 @@ initial_state:
     grep exit 1 with no lines = no debt; -n numbers the DIFF, so resolve each hit to its real <file:line> with the fs_grep tool: the hit text after the + is its pattern (regex metacharacters escaped) -- never paste diff text into a shell string -- and keep only matches in files the diff touched; bare cfg_attr( without allow|expect is not debt.'
   debt_items: []
   debt_left_behind: []
+  debt_scan_failures: {}
   debt_rounds: 0
   diff_stat: ''
   changed_files: []
@@ -319,16 +332,24 @@ initial_state:
   publish_retries: 0
   publish_checks: []
   ci_owner: false
+  ci_watch_note: ''
   ci_polls: 0
   ci_poll_fails: 0
   ci_status: ''
+  ci_checks: []
+  ci_failing: []
+  ci_green_by: ''
   ci_started_at: 0
   ci_evidence: ''
   ci_diagnosis: ''
   ci_reruns: {}
+  ci_rerun_ids: []
   ci_fix_strikes: 0
   flip_ready: false
+  pr_ready_confirmed: false
+  pr_ready_detail: ''
   ci_polls_run: 0
+  ci_poll_budget: 0
   pr_ref: ''
   pr_review_status: ''
   pr_review_rounds: 0
@@ -625,7 +646,7 @@ nodes:
       Project directory: {{project_dir}}
       Review cadence: {{review_cadence}}   Parallel batch member: {{parallel}}
       Delegated brief (task file / plan / roster present): {{delegated}}
-      Plan repo detected (plans/ with steps/ and handoffs/): {{plans_detected}}
+      Plan repo detected (the plans dir with steps/ and handoffs/): {{plans_detected}}
       Declared quality bar: rigor={{quality_rigor}} surfaces={{quality_surfaces}}
     prompt: |
       ## Message
@@ -1469,7 +1490,7 @@ nodes:
     type: script
     description: The continuation switch on the escalation kind (design doc 2.3).
     script: scripts/apply_answer.py
-    # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each
+    # CI_LOG_RUNS_MAX x GH_CALL_SECS + 30: a ci_inconclusive or ci_no_checks answer re-runs up to CI_LOG_RUNS_MAX cancelled runs, one gh call each, or flips the PR with two
     timeout: 300
     fallback: end_failure
 
@@ -1829,7 +1850,7 @@ nodes:
     prompt: |
       {{gauntlet_prompt}}
     inputs:
-      verification_commands: '{{verification_commands}}'
+      verification_commands: '{{review_verification_commands}}'
       debris_exclude: '{{debris_exclude}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'
@@ -2063,18 +2084,14 @@ nodes:
 
       Rules that always apply:
       - Commit messages reference the task id when the brief names one.
-      - Draft-first PRs: open every PR as a DRAFT (gh pr create --draft). Flip it
-        (gh pr ready) ONLY when the task block says flip_ready - that means the
-        verification loop is complete AND CI checks are green. Never flip a
-        ready PR back to draft.
+      - Draft-first PRs: open every PR as a DRAFT (gh pr create --draft). Never
+        run gh pr ready and never change a PR's draft state: the gates flip the
+        PR to ready themselves once CI is green.
       - The PR DESCRIPTION is a stable document (what, how to verify, the digest
         sections given below). Every review round's evidence is a NEW comment
         titled "## Review round N @ <full head SHA>"; every later push is a NEW
         top-level comment "## Update @ <full head SHA>" mapping each addressed
         finding to its commit. NEVER rewrite the description as a changelog.
-      - When an orchestrator owns the PR lifecycle (e.g. the architect's single
-        run PR), the flip is NOT yours - leave draft state alone unless the PR
-        is one you authored.
       - Parallel batch member: never touch the shared branch; commit and push
         ONLY your own task branch; no merging, no branch switching - integration
         belongs to the parent. Leave the worktree removable:
@@ -2118,7 +2135,7 @@ nodes:
       Check the publish step's git and PR state (one git_ops retry, then follow-ups, never a stop); watch checks
       only for a PR this run owns the flip of; a parent-owned lifecycle leaves the draft alone.
     script: scripts/ci_gate.py
-    # 2 x GH_CALL_SECS + 30: the flip confirmation runs gh pr ready and then gh pr view
+    # 2 x GH_CALL_SECS + 30: the publish check and the watch start each read the PR with gh pr view
     timeout: 210
     fallback: final_report
 
@@ -2138,11 +2155,11 @@ nodes:
     id: ci_route
     type: script
     description: >-
-      green -> flip ready via git_ops; red -> diagnose; exhausted -> escalate with the evidence pack;
+      green -> gh pr ready, confirmed by a re-read; red -> diagnose; exhausted -> escalate with the evidence pack;
       inconclusive or no_checks -> escalate with every check and its bucket; poll_cap -> escalate
       with the polls used against the poll budget.
     script: scripts/ci_route.py
-    # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin
+    # CI_LOG_RUNS_MAX (3) x GH_CALL_SECS (90) + 30 margin; the green flip makes two gh calls
     timeout: 300
     fallback: final_report
 

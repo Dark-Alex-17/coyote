@@ -1948,18 +1948,18 @@ fn intake_and_reply_smoke_rows_go_red_under_the_recorded_sabotages() {
             (
                 "strikeout-whole-reply",
                 "a = \"abort\" if stop else _answered(state, {\"round\": [\"apply\", \"one more\", \
-                 \"round\"], \"accept\": [\"accept\"]},",
+                 \"round\"], \"accept\": [\"accept\"],",
                 "a = _answered(state, {\"abort\": [\"abort\"], \"round\": [\"apply\", \"one more\", \
-                 \"round\"], \"accept\": [\"accept\"]},",
+                 \"round\"], \"accept\": [\"accept\"],",
                 "apply_answer: strikeout / lane_stuck replies that mention abort are no abort; the \
                  whole reply or the option is",
             ),
             (
                 "owner-judgment-whole-reply",
                 "a = \"stop\" if stop else _answered(state, {\"skip\": [\"skip\"], \"fix\": [\"fix\", \
-                 \"address\"]}, \"stop\")",
+                 \"address\"], \"stop\": [\"stop\"]})",
                 "a = _answered(state, {\"stop\": [\"stop\"], \"skip\": [\"skip\"], \"fix\": [\"fix\", \
-                 \"address\"]}, \"stop\")",
+                 \"address\"]})",
                 "apply_answer: pr_review_owner_judgment 'please address these, don't stop' is a fix \
                  round, never a stop",
             ),
@@ -2022,14 +2022,17 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
             ),
             (
                 "choice-empty-recommended",
-                "        if not text and options and picker and not esc.get(\"hard_trigger\"):\n",
+                "        if not text and options and picker and not esc.get(\"hard_trigger\") \
+                 and not _is_stop_text(options[0].get(\"text\")):\n",
                 "        if False:\n",
                 "choice: an empty picker reply after the re-asks takes the recommended option, ledgered",
             ),
             (
                 "hard-trigger-no-auto-pick",
-                "        if not text and options and picker and not esc.get(\"hard_trigger\"):\n",
-                "        if not text and options and picker:\n",
+                "        if not text and options and picker and not esc.get(\"hard_trigger\") \
+                 and not _is_stop_text(options[0].get(\"text\")):\n",
+                "        if not text and options and picker and \
+                 not _is_stop_text(options[0].get(\"text\")):\n",
                 "sizing: an empty reply after the re-asks never picks the hard-trigger recommendation -> \
                  end_redirect, no file",
             ),
@@ -2039,7 +2042,7 @@ fn choice_and_sizing_smoke_rows_go_red_under_the_recorded_sabotages() {
                 "    return next((o.get(\"text\") for o in options if o.get(\"text\", \"\").lower() in \
                  reply.lower()), None) or _exact_option(m.group(1) if m else reply, options)\n",
                 "sizing: only an exact option counts - a negated reply naming the architect picks none \
-                 -> end_redirect, nothing written",
+                 -> asked again, then end_redirect, nothing written",
             ),
             (
                 "architect-top-level",
@@ -3064,6 +3067,90 @@ fn blocked_after_findings_prior_report_yields_no_settled_lanes_line() {
     );
 }
 
+/// The text of `_lib.py` from `GIT_READ_ONLY = ` through the return of
+/// `criterion_commands`.
+fn criterion_commands_block(agent: &str) -> String {
+    let lib = fs::read_to_string(agents_dir().join(agent).join("scripts/_lib.py")).unwrap();
+    let start = lib
+        .find("\nGIT_READ_ONLY = ")
+        .unwrap_or_else(|| panic!("no GIT_READ_ONLY in {agent}'s _lib.py"))
+        + 1;
+    let def = start
+        + lib[start..]
+            .find("\ndef criterion_commands(")
+            .unwrap_or_else(|| {
+                panic!("no criterion_commands after GIT_READ_ONLY in {agent}'s _lib.py")
+            });
+    let ret = "\n    return out, dropped\n";
+    let end = def
+        + lib[def..]
+            .find(ret)
+            .unwrap_or_else(|| panic!("no return in {agent}'s criterion_commands"))
+        + ret.len();
+    lib[start..end].to_string()
+}
+
+/// The guard that decides which criterion spans may run is architect-next's,
+/// copied as is, so the two candidates cannot drift apart on what they run.
+#[test]
+fn criterion_commands_block_is_identical_to_architect_nexts() {
+    let ours = criterion_commands_block(CANDIDATE);
+    assert!(
+        ours.contains("\ndef _command_args(span):\n")
+            && ours.contains("\ndef _in_tree_executable(prog, cwd):\n"),
+        "{ours}"
+    );
+    assert_eq!(
+        ours,
+        criterion_commands_block("architect-next"),
+        "sisyphus-next's criterion_commands block differs from architect-next's (left: ours)"
+    );
+}
+
+/// A review round declares the exit-code command a criterion quotes as one
+/// more verification run after the brief's own, and ledgers it; the `git
+/// status` span, whose exit does not decide its criterion, stays out.
+#[test]
+fn criterion_commands_are_declared_as_review_verification_runs() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("criterion-commands");
+    let (repo, first, second) = two_commit_repo(&scratch);
+    let diff = format!("git diff --exit-code {first} -- README.md");
+    let state = json!({
+        "project_dir": repo,
+        "git_root": repo,
+        "base_sha": first,
+        "head_sha": second,
+        "run_dir": scratch.0.join("runs").join("x"),
+        "decisions": [],
+        "anomalies": [],
+        "anomalies_log": [],
+        "spec_text": format!("- `git status --short` is clean.\n- The README is unchanged: `{diff}` passes.\n"),
+        "quality_rigor": "production",
+        "round_heads": [],
+        "verification_commands": "[\"true\"]",
+    });
+    let composed = gate_json("build_gauntlet_prompt", &state, &scratch);
+    let declared = composed["review_verification_commands"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no review_verification_commands in {composed}"));
+    let commands: Vec<String> = serde_json::from_str(declared).unwrap();
+    assert_eq!(commands, ["true", diff.as_str()], "{composed}");
+    assert!(
+        composed.get("verification_commands").is_none(),
+        "the brief's own list is left as it was: {composed}"
+    );
+    let line = format!("verify: declared 1 criterion command(s) as verification runs: {diff}");
+    assert!(
+        composed["decisions"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|l| l.as_str() == Some(line.as_str()))),
+        "{composed}"
+    );
+}
+
 /// Feeds `report` to `gates._parse_gauntlet` in a fresh interpreter and
 /// returns the verdict, incomplete list, lane statuses, lane details and
 /// blockers, and the attention text.
@@ -3300,6 +3387,7 @@ const FROZEN_NODE_BOUNDS: &[(&str, &str, i64)] = &[
 const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "apply_reasks",
     "ci_fix_strikes",
+    "ci_poll_budget",
     "ci_poll_fails",
     "ci_polls",
     "ci_polls_run",
@@ -3322,6 +3410,7 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "pr_review_watch_polls",
     "publish_retries",
     "reask_rounds",
+    "rejected_cap_resets",
     "rejected_rounds",
     "review_rounds",
     "sizing_extensions",
