@@ -197,6 +197,8 @@ initial_state:
   subtask_head: ''
   subtask_started_at: null
   subtask_changed_files: null
+  carried_failures: []
+  failure_baseline: []
   run_must_not_do: []
   final_rejections_from: null
   current_task: ''

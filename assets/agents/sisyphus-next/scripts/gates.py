@@ -1185,6 +1185,9 @@ def next_subtask(state):
         ac = as_list(s.get("acceptance_criteria"))
         if ac:
             text += "\n\nAcceptance criteria:\n" + "\n".join(f"- {c}" for c in ac)
+    carried = _carried(state)
+    if carried:
+        text += "\n\n" + _carried_section(carried, idx + 1)
     if idx == 0 and (state.get("architecture_proposal") or "").strip():
         text += "\n\nArchitecture-reviewer proposal (adopt only if confirmed below):\n" + tail(state["architecture_proposal"], 4000)
     u["run_must_not_do"] = _scope_guards(state)
@@ -1197,6 +1200,8 @@ def next_subtask(state):
         "explore_slices": [], "librarian_questions": [], "design_options": [], "register_question": "",
         "coder_brief": {}, "expected_files": [], "fix_instructions": "", "gauntlet_lanes": {},
         "scope_confirmed": False, "subtask_changed_files": None,
+        # the failures carried in, so the red test gate can tell them from ones this subtask introduces
+        "failure_baseline": [f["paths"] for f in carried],
     })
     root = state.get("git_root") or state.get("project_dir") or "."
     head = git_out(root, "rev-parse", "HEAD", default="")
@@ -1250,6 +1255,13 @@ def _start_final_review(state, u, n):
     ledger(state, u, f"subtasks: all {n} reviewed against their own criteria -> one whole-task review over "
                      f"{base or 'the worktree'}..HEAD against the parent task's acceptance criteria")
     snapshot(state, u, "final whole-task review")
+    carried = _carried(state)
+    if carried:
+        # the whole task must be green before its review; the fix round's CODER_COMPLETE is held to `Tests: passed`
+        u.update({"fix_source": "review", "_next": "compose_fix",
+                  "fix_items": [f"carried-forward test failure, must pass: {_carried_line(f)}" for f in carried]})
+        ledger(state, u, f"final review: {len(carried)} carried test failure(s) still red; fixing them before the review")
+        return u
     u["_next"] = "review_gate"
     return u
 
@@ -2807,12 +2819,69 @@ def _coder_error_tail(result):
     return tail(body, 4000)
 
 
+def _blank_section(result, title):
+    m = re.search(rf"{title}:[ \t]*\n(.*?)(?=\n[ \t]*\n|\nLast |\Z)", result, re.S)
+    return not m or m.group(1).strip() in ("", "null")
+
+
+def _exit_code(text):
+    m = re.search(r"^Exit code:[ \t]*(\d+)", text, re.M)
+    return as_int(m.group(1)) if m else 0
+
+
+def _red_test_gate(state, result):
+    """The tests output of a CODER_FAILED result whose only fault is a red, finished test gate in a subtask that is not
+    the last; None when the result is anything else, so the plain strike ladder applies."""
+    cur, n = as_int(state.get("subtask_index")), len(as_list(state.get("subtasks")))
+    if not (_subtask_phase(state) and 1 <= cur < n and "CODER_FAILED" in result
+            and _blank_section(result, "Last script error") and _blank_section(result, "Verification gate error")):
+        return None
+    head, sep, tests = result.rpartition("\nLast tests output:")
+    build = head.rpartition("\nLast build output:")[2]
+    if not sep or _exit_code(build) or not _exit_code(tests) or "TIMED OUT" in tests:
+        return None
+    return tests
+
+
+def _strike_next(u, strikes):
+    if strikes >= STRIKE_LIMIT:
+        u["_next"] = "strikeout"
+    elif strikes == 2:
+        u["_next"] = "diagnose_failure"
+    else:
+        u["fix_source"] = "coder_failed"
+        u["_next"] = "compose_fix"
+
+
+def _owes_carried(state, carried):
+    """True where carried failures must be green: the last subtask, the final review, or the subtask that owns one."""
+    cur = as_int(state.get("subtask_index"))
+    return (truthy(state.get("final_review")) or cur >= len(as_list(state.get("subtasks")))
+            or any(as_int(f.get("owner")) == cur for f in carried))
+
+
 def route_coder_result(state):
     u = {}
     note_script_error(state, u, "run_coder")
     result = state.get("coder_result") or ""
     if "CODER_COMPLETE" in result:
+        carried = _carried(state)
+        m = re.search(r"^Tests:[ \t]*(.*)$", result, re.M)
+        verdict = m.group(1).strip() if m else ""
+        if carried and verdict != "passed" and _owes_carried(state, carried):
+            strikes = as_int(state.get("fix_strikes")) + 1
+            u.update({"fix_strikes": strikes, "coder_sentinel": "CODER_COMPLETE", "last_coder_error": "\n".join(
+                [f"The coder reported CODER_COMPLETE with `Tests: {verdict or '(none)'}`, but these carried-forward "
+                 "test failures are owed here and must pass:"] + [f"- {_carried_line(f)}" for f in carried])})
+            ledger(state, u, f"coder: CODER_COMPLETE with tests not passed while {len(carried)} carried test "
+                             f"failure(s) are owed here; strike {strikes}/{STRIKE_LIMIT}")
+            _strike_next(u, strikes)
+            snapshot(state, u, "coder")
+            return u
         u.update({"coder_sentinel": "CODER_COMPLETE", "fix_strikes": 0, "fix_instructions": "", "last_coder_error": ""})
+        if carried and verdict == "passed":
+            u["carried_failures"] = []
+            ledger(state, u, f"coder: tests passed; {len(carried)} carried test failure(s) cleared")
         block, asks = _design_block(result)
         u["design_block"], u["design_asks"] = block, asks
         u["debt_base"] = state.get("base_sha") or ""
@@ -2843,12 +2912,27 @@ def route_coder_result(state):
             "The coder's plan was rejected at the approval gate. What should change before it plans again?",
             [], evidence=tail(result, 1500), tier3_ok=False))
     else:
+        tests = _red_test_gate(state, result)
+        classified = _classify_test_failures(state, u, tests) if tests is not None else None
+        if classified and classified["pending"] and not classified["blocks"]:
+            pending = classified["pending"]
+            u.update({"coder_sentinel": "CODER_FAILED", "fix_strikes": 0, "fix_instructions": "", "last_coder_error": "",
+                      "carried_failures": pending, "debt_base": state.get("base_sha") or ""})
+            u["design_block"], u["design_asks"] = _design_block(result)
+            for f in pending:
+                ledger(state, u, f"coder: red test gate at {', '.join(f['paths'])} is pending, owned by subtask "
+                                 f"{f['owner']}; carried forward ({f['evidence']})")
+            u["_next"] = "debt_scan"
+            snapshot(state, u, "coder")
+            return u
         strikes = as_int(state.get("fix_strikes")) + 1
         u["fix_strikes"] = strikes
         u["coder_sentinel"] = "CODER_FAILED" if "CODER_FAILED" in result else "NO_SENTINEL"
         err = _coder_error_tail(result) if result else "coder returned no output"
         if not result or ("CODER_FAILED" not in result and "Agent node failed" not in result):
             err = "coder returned no recognizable sentinel (expected CODER_COMPLETE / CODER_REJECTED / CODER_FAILED)\n" + err
+        if classified:
+            err += "\n\n" + _classification_note(classified)
         u["last_coder_error"] = err
         ledger(state, u, f"coder: {u['coder_sentinel']} strike {strikes}/{STRIKE_LIMIT}")
         # an empty value renders as a blank line; the body must not run on into the next section header
@@ -2859,13 +2943,7 @@ def route_coder_result(state):
                 f"The coder's verification gate crashed (an engine-side fault, not a code fix): {m.group(1).strip()[:300]}. Retry the round or abort?",
                 [option("Retry the coder round", recommended=True, evidence="a crashed gate is transient more often than not"),
                  option("Abort this task")], evidence=err))
-        if strikes >= STRIKE_LIMIT:
-            u["_next"] = "strikeout"
-        elif strikes == 2:
-            u["_next"] = "diagnose_failure"
-        else:
-            u["fix_source"] = "coder_failed"
-            u["_next"] = "compose_fix"
+        _strike_next(u, strikes)
     snapshot(state, u, "coder")
     return u
 
@@ -3296,6 +3374,148 @@ def _subtask_changes(state):
                 and all(as_int(t) < since for t in stamps)):
             result.update({"files": [], "pulled": len(stamps)})
     return result
+
+
+FAILURE_FILE_RE = re.compile(r"(?<![\w.~@+/-])((?:\.\.?/|/)?[\w.~@+-]+(?:/[\w.~@+-]+)*\.[A-Za-z]\w*):\d+")
+FAILURE_SLASH_RE = re.compile(r"[\w.~@+-]*/[\w./~@+-]*")
+FAILURE_WORD_RE = re.compile(r"\b(?:fail|failed|failure|error)\b", re.I)
+CARRIED_HEADER = "Carried-forward test failures (pending from earlier subtasks):"
+
+
+def _parse_failure_locations(tests):
+    """(token, is_file, line) for every path:LINE token, and every slash token on a line carrying a failure word."""
+    out = []
+    for line in tests.splitlines():
+        if re.match(r"(?:Ran|Ran in|Exit code):", line):
+            continue
+        out += [(t, True, line) for t in FAILURE_FILE_RE.findall(line)]
+        if FAILURE_WORD_RE.search(line):
+            out += [(t, False, line) for t in FAILURE_SLASH_RE.findall(line)]
+    return out
+
+
+def _resolve_failure_tokens(root, tokens):
+    """[{"paths", "evidence"}] for the tokens that name repo paths (a directory ends in "/"), one per distinct set of
+    paths; tokens naming nothing in the repo (toolchain frames, paths outside it) are dropped."""
+    code, out, _ = git(root, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+    if code != 0:
+        return []
+    files = set(_nul_names(out))
+    dirs = {f.rsplit("/", i)[0] for f in files for i in range(1, f.count("/") + 1)}
+    prefix = os.path.realpath(root).rstrip("/") + "/"
+    found, seen = [], set()
+    for token, is_file, line in tokens:
+        t = token.removeprefix(prefix).removeprefix(root.rstrip("/") + "/").rstrip("/").removesuffix("/...")
+        while t.startswith("./"):
+            t = t[2:]
+        if is_file:
+            paths = sorted(f for f in files if f == t or f.endswith("/" + t))
+        else:
+            parts = [p for p in t.split("/") if p not in ("", ".")]
+            suffixes = ("/".join(parts[i:]) for i in range(len(parts)))
+            paths = next(([s] if s in files else [s + "/"] for s in suffixes if s in files or s in dirs), [])
+        if paths and tuple(paths) not in seen:
+            seen.add(tuple(paths))
+            found.append({"paths": paths, "evidence": line.strip()[:200]})
+    return found
+
+
+def _failure_touched(paths, changed):
+    """True when a changed file is the failing file, shares its directory, or lies under the failing directory."""
+    for p in paths:
+        for c in changed:
+            if c.startswith(p) if p.endswith("/") else (c == p or c.rpartition("/")[0] == p.rpartition("/")[0]):
+                return True
+    return False
+
+
+def _declares_path(text, paths):
+    names = set()
+    for p in paths:
+        if p.endswith("/"):
+            names.add(p[:-1])
+        else:
+            names.update(n for n in (p, p.rpartition("/")[0], p.rpartition("/")[2]) if n)
+    return any(re.search(rf"(?<![\w./-])(?:\./)?{re.escape(n)}(?:/\.\.\.|/)?(?![\w/-]|\.[\w/.-])", text) for n in names)
+
+
+def _declares_gate(s, ran, tests):
+    """True when an acceptance criterion backticks the gate's whole command, as run or as the runner echoed it."""
+    lines = {l.strip() for l in tests.splitlines() if l.strip()} | ({ran} if ran else set())
+    return any(len(cmd.split()) >= 2 and cmd.strip() in lines
+               for c in as_list(s.get("acceptance_criteria")) for cmd in re.findall(r"`([^`\n]+)`", str(c)))
+
+
+def _failure_owner(subtasks, cur, paths, ran, tests):
+    """The earliest subtask after `cur` (1-based) whose declarations name the failure or the whole gate, else None."""
+    for n in range(cur + 1, len(subtasks) + 1):
+        s = _subtask_at(subtasks, n - 1)
+        text = "\n".join([str(s.get(k) or "") for k in ("title", "outcome", "constraints")]
+                         + [str(c) for c in as_list(s.get("acceptance_criteria"))])
+        if _declares_path(text, paths) or _declares_gate(s, ran, tests):
+            return n
+    return None
+
+
+def _carried(state):
+    return [f for f in as_list(state.get("carried_failures")) if isinstance(f, dict) and as_list(f.get("paths"))]
+
+
+def _failure_key(paths):
+    return tuple(str(p) for p in as_list(paths))
+
+
+def _classify_test_failures(state, u, tests):
+    """{"pending", "blocks"} for a red test gate: a failure is pending when a later subtask owns it and it was carried
+    in at subtask start or lies outside this subtask's changes; anything else, or anything unclear, blocks."""
+    cur, subtasks = as_int(state.get("subtask_index")), as_list(state.get("subtasks"))
+    root = state.get("git_root") or state.get("project_dir") or "."
+    changes = _subtask_changes(state)
+    located = _resolve_failure_tokens(root, _parse_failure_locations(tests)) if changes is not None else []
+    if not located:
+        why = ("git could not say which files this subtask changed" if changes is None
+               else "no failure location in the tests output resolves to a repo path")
+        ledger(state, u, f"coder: red test gate not classified ({why}); it blocks")
+        return {"pending": [], "blocks": [f"unclassified: {why}"]}
+    m = re.search(r"^Ran:[ \t]*(.+)$", tests, re.M)
+    ran = m.group(1).strip() if m else ""
+    baseline = {_failure_key(p) for p in as_list(state.get("failure_baseline"))}
+    since = {_failure_key(f["paths"]): as_int(f.get("since"), cur) for f in _carried(state)}
+    owed = {_failure_key(f["paths"]) for f in _carried(state) if as_int(f.get("owner")) <= cur}
+    pending, blocks = [], []
+    for f in located:
+        key, where = _failure_key(f["paths"]), ", ".join(f["paths"])
+        if key in owed:
+            blocks.append(f"{where}: carried in and owned by this subtask ({f['evidence']})")
+            continue
+        owner = _failure_owner(subtasks, cur, f["paths"], ran, tests)
+        touched = key not in baseline and _failure_touched(f["paths"], changes["files"])
+        if owner and not touched:
+            pending.append({"paths": f["paths"], "owner": owner, "since": since.get(key, cur) if key in baseline else cur,
+                            "evidence": f["evidence"]})
+        else:
+            blocks.append(f"{where}: " + ("this subtask's changes touch it" if touched
+                                          else "no later subtask declares it") + f" ({f['evidence']})")
+    return {"pending": pending, "blocks": blocks}
+
+
+def _classification_note(c):
+    lines = ["Test failure classification (against the failures carried at subtask start and the later subtasks' "
+             "declarations):"]
+    lines += [f"- blocks: {b}" for b in c["blocks"]]
+    lines += [f"- pending, owned by subtask {f['owner']}: {', '.join(f['paths'])} ({f['evidence']})" for f in c["pending"]]
+    return "\n".join(lines)
+
+
+def _carried_line(f, n=0):
+    owner = as_int(f.get("owner"))
+    mine = "; you own this: it must pass" if owner == n else ""
+    return (f"{', '.join(_failure_key(f.get('paths')))} (owned by subtask {owner}, since subtask "
+            f"{as_int(f.get('since'))}{mine}): {f.get('evidence', '')}")
+
+
+def _carried_section(carried, n):
+    return "\n".join([CARRIED_HEADER] + [f"- {_carried_line(f, n)}" for f in carried]) if carried else ""
 
 
 def _posture(state):
@@ -5157,6 +5377,8 @@ def _assemble_report(state, u, pre_publish=False):
         lines += [g("observability_artifact"), ""]
     fus = list(as_list(g("follow_ups", []))) + list(as_list(g("deferred_findings", [])))
     fus += [f"Re-run the debt scan for {scope}: {why}" for scope, why in as_dict(g("debt_scan_failures", {})).items()]
+    fus += [f"Carried-forward test failure still red: {_carried_line(f)}"
+            for f in _carried({"carried_failures": g("carried_failures", [])})]
     if g("whetstone_note"):
         fus.append(g("whetstone_note"))
     lines += ["FOLLOW-UPS:"] + ([f"- {f}" for f in fus] or ["none"]) + [""]
