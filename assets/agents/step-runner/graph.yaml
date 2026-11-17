@@ -26,7 +26,6 @@ skills_enabled: true
 enabled_skills:
   - step-implementation
   - handoff-protocol
-  - code-review
   - ai-slop-remover
 
 variables:
