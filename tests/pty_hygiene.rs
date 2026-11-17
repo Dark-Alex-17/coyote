@@ -43,10 +43,11 @@ fn scratch_dir(scenario: &str) -> PathBuf {
 
 /// Nothing the test runner holds leaks into the child, neither side of
 /// the pty nor an ordinary file opened without close-on-exec: it sees
-/// only its three standard streams and, on the lowest free number, `ls`'s
-/// own handle on the directory it lists. On a tty `ls` prints its entries
-/// in columns, so the list is read word by word. A placeholder keeps the
-/// scratch file off fd 3, where `ls`'s own handle would be mistaken for it.
+/// only its three standard streams and, on the lowest free numbers, `ls`'s
+/// own handles: one for GNU `ls`, two for BSD `ls`. On a tty `ls` prints
+/// its entries in columns, so the list is read word by word. Two
+/// placeholders keep the scratch file off fds 3 and 4, where `ls`'s own
+/// handles would be mistaken for it.
 #[test]
 #[serial]
 fn the_child_inherits_no_pty_descriptor() {
@@ -60,7 +61,7 @@ fn the_child_inherits_no_pty_descriptor() {
     }
     let dir = scratch_dir("fd-leak");
     let _guard = TempDirGuard(dir.clone());
-    let _placeholder = fs::File::open(&dir).unwrap();
+    let _placeholders = [fs::File::open(&dir).unwrap(), fs::File::open(&dir).unwrap()];
     let scratch = fs::File::create(dir.join("scratch")).unwrap();
     // SAFETY: fcntl with F_SETFD takes no pointers; the result is checked.
     assert_ne!(
@@ -68,9 +69,9 @@ fn the_child_inherits_no_pty_descriptor() {
         -1
     );
     let scratch_fd = u32::try_from(scratch.as_raw_fd()).unwrap();
-    assert_ne!(
-        scratch_fd, 3,
-        "the placeholder did not keep the scratch file off fd 3"
+    assert!(
+        scratch_fd > 4,
+        "the placeholders did not keep the scratch file off fds 3 and 4"
     );
 
     let mut cmd = Command::new("sh");
@@ -84,10 +85,9 @@ fn the_child_inherits_no_pty_descriptor() {
         !on_pty.contains(&scratch_fd),
         "the parent's scratch file (fd {scratch_fd}) reached the pty child:\n{transcript}"
     );
-    assert_eq!(
-        on_pty,
-        (0..=3).collect(),
-        "the pty child sees more than its standard streams and ls's own directory fd:\n{transcript}"
+    assert!(
+        on_pty == (0..=3).collect() || on_pty == (0..=4).collect(),
+        "the pty child sees more than its standard streams and ls's own fds:\n{transcript}"
     );
 }
 

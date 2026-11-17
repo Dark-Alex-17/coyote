@@ -2555,11 +2555,18 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         use std::process::Stdio;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        /// Seconds the `timeout` hang guards in these bodies allow. A hang is
+        /// Seconds the hang guards in these bodies allow. A hang is
         /// unbounded, so the guard only has to outlast a loaded host's bash
         /// start-up; a value near the expected run time turns load into false
         /// failures.
         const HANG_GUARD_SECS: u64 = 60;
+
+        /// A command prefix that kills what it runs after `HANG_GUARD_SECS`.
+        /// Perl's alarm survives the exec; `timeout` is GNU coreutils and
+        /// absent from stock macOS.
+        fn hang_guard() -> String {
+            format!("perl -e 'alarm shift; exec @ARGV' {HANG_GUARD_SECS}")
+        }
 
         fn is_request_line(line: &str) -> bool {
             line.trim_start().as_bytes().starts_with(MARKER)
@@ -3658,9 +3665,9 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             // returns an empty buffer. `timeout` is only a hang guard.
             let body = format!(
                 "export EDITOR=true; \
-                 r=\"$(timeout {guard} bash -c 'source \"$PROMPT_UTILS\"; range \"How many?\" 1 3 5' 2>/dev/null)\"; echo \"range=[$r] rc=$?\"; \
-                 e=\"$(timeout {guard} bash -c 'source \"$PROMPT_UTILS\"; editor \"Notes?\"' 2>/dev/null)\"; echo \"editor=[$e] rc=$?\"",
-                guard = HANG_GUARD_SECS,
+                 r=\"$({guard} bash -c 'source \"$PROMPT_UTILS\"; range \"How many?\" 1 3 5' 2>/dev/null)\"; echo \"range=[$r] rc=$?\"; \
+                 e=\"$({guard} bash -c 'source \"$PROMPT_UTILS\"; editor \"Notes?\"' 2>/dev/null)\"; echo \"editor=[$e] rc=$?\"",
+                guard = hang_guard(),
             );
             let run = run_helper(&dir, Some(&[json!(true)]), &body, true);
             assert!(
@@ -3697,11 +3704,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let dead = dead_reply_path();
             let body = format!(
                 "{}; \
-                 COYOTE_PROMPT_REPLY={dead} timeout {guard} bash -c '{}'; echo \"outer rc=$?\"; \
-                 COYOTE_PROMPT_REPLY={dead} timeout {guard} bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
+                 COYOTE_PROMPT_REPLY={dead} {guard} bash -c '{}'; echo \"outer rc=$?\"; \
+                 COYOTE_PROMPT_REPLY={dead} {guard} bash -c 'source \"$PROMPT_UTILS\"; guard_operation \"Really?\"; echo continued'; echo \"guard rc=$?\"",
                 capture("confirm \"Warm up?\""),
                 "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; rc=$?; echo \"v=[$v] rc=$rc\"; exit 0",
-                guard = HANG_GUARD_SECS,
+                guard = hang_guard(),
             );
             let started = std::time::Instant::now();
             let run = run_helper(
@@ -3762,11 +3769,11 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let inner =
                 "source \"$PROMPT_UTILS\"; v=\"$(confirm \"Go?\")\"; echo \"{tag} v=[$v] rc=$?\"";
             let body = format!(
-                "env -u {reply} -u {out} timeout {guard} bash -c '{unset}' 2>/dev/null; echo \"unset outer=$?\"; \
-                 {reply}=/dev/fd/9 env -u {out} timeout {guard} bash -c '{fd9}' 2>/dev/null; echo \"fd9 outer=$?\"",
+                "env -u {reply} -u {out} {guard} bash -c '{unset}' 2>/dev/null; echo \"unset outer=$?\"; \
+                 {reply}=/dev/fd/9 env -u {out} {guard} bash -c '{fd9}' 2>/dev/null; echo \"fd9 outer=$?\"",
                 reply = REPLY_ENV,
                 out = OUT_FD_ENV,
-                guard = HANG_GUARD_SECS,
+                guard = hang_guard(),
                 unset = inner.replace("{tag}", "unset"),
                 fd9 = inner.replace("{tag}", "fd9"),
             );

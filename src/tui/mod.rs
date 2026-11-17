@@ -7164,9 +7164,9 @@ mod tests {
         let script = crate::utils::temp_file("-editor-", ".sh");
         std::fs::write(
             &script,
-            "#!/bin/sh\nstat -f '%Lp %Lp' \"$(dirname \"$1\")\" \"$1\" >\"$1.modes\" 2>/dev/null \
-             || stat -c '%a' \"$(dirname \"$1\")\" \"$1\" | tr '\\n' ' ' >\"$1.modes\"\n\
-             cat \"$1.modes\" > \"$1\"\nexit 0\n",
+            "#!/bin/sh\nstat -f '%Lp' \"$(dirname \"$1\")\" \"$1\" >\"$1.modes\" 2>/dev/null \
+             || stat -c '%a' \"$(dirname \"$1\")\" \"$1\" >\"$1.modes\"\n\
+             tr '\\n' ' ' <\"$1.modes\" >\"$1\"\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -213,9 +213,12 @@ _coyote_prompt_map() {
 _coyote_prompt() {
   declare action="$1"
   declare question="$2"
+  # shift, not "${@:3}": bash 3.2 joins a "${@:N}" slice into one word when
+  # IFS holds no space.
+  shift 2
   declare options='[]'
-  if [[ $# -gt 2 ]]; then
-    options="$(printf '%s\0' "${@:3}" | jq -cRs 'split("\u0000") | .[:-1]')" || return 1
+  if [[ $# -gt 0 ]]; then
+    options="$(printf '%s\0' "$@" | jq -cRs 'split("\u0000") | .[:-1]')" || return 1
   fi
 
   # $RANDOM is not reseeded in $(...) subshells on bash < 5.1, so sibling
@@ -400,14 +403,16 @@ confirm() {
 }
 
 list() {
+  declare question="$1"
+  shift
   if _coyote_prompt_enabled; then
-    _coyote_prompt select "$1" "${@:2}"
+    _coyote_prompt select "$question" "$@"
     return $?
   fi
   _coyote_refuse_terminal_under_tui
-  _prompt_text "$1 "
-  declare opts=("${@:2}")
-  declare opts_count=$(($# - 1))
+  _prompt_text "$question "
+  declare opts=("$@")
+  declare opts_count=$#
 
   _new_line_foreach_item "${#opts[@]}"
 
@@ -449,16 +454,18 @@ list() {
 }
 
 checkbox() {
+  declare question="$1"
+  shift
   if _coyote_prompt_enabled; then
-    _coyote_prompt checkbox "$1" "${@:2}"
+    _coyote_prompt checkbox "$question" "$@"
     return $?
   fi
   _coyote_refuse_terminal_under_tui
-  _prompt_text "$1"
+  _prompt_text "$question"
   declare opts
-  opts=("${@:2}")
+  opts=("$@")
   declare opts_count
-  opts_count=$(($# - 1))
+  opts_count=$#
 
   _new_line_foreach_item "${#opts[@]}"
 
