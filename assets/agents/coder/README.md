@@ -160,6 +160,12 @@ stored so a later run on the same commit reuses it:
   record is never replaced.
 - A stored record is reused whether or not the tree has changed since; the
   suite is not run again.
+- With no record for HEAD on a clean tree and a `baseline_floor` commit set,
+  the nearest record on HEAD's first-parent chain (at most 50 commits back)
+  is reused when the floor is an ancestor of that record's commit, no merge
+  commit lies between it and HEAD, and every commit since was made after the
+  record. The note names the record's commit and the commits since. Without
+  a floor only HEAD's own record counts.
 - With no record, the suite runs only when `git status --porcelain` is empty
   (untracked files count, ignored files do not). On a tree that already holds
   changes, `baseline_status` is `dirty` and no baseline is taken, so every
@@ -277,6 +283,11 @@ working directory; each gate's transcript names the directory on its
   ```bash
   coyote -a coder --agent-variable build_lock 'flock -w 240 /tmp/coyote-cargo.lock' "Add..."
   ```
+
+- `baseline_floor` (default empty): the commit a calling run started from.
+  It lets `baseline_tests` reuse a record taken on one of that run's own
+  earlier commits instead of running the suite again on a later one (see
+  [Baseline tests](#baseline-tests)).
 
 Environment overrides honored by the script nodes:
 

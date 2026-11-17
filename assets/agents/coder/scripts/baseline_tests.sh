@@ -69,6 +69,22 @@ store_baseline() {
   [[ -e "$record" ]]
 }
 
+# reuse_record emits stored record $1 as this run's baseline, its four state
+# fields unchanged; the caller sets BASELINE_EXTRA to say where it came from.
+reuse_record() {
+  BASELINE_STATUS=$(jq -r '.status' "$1")
+  BASELINE_EXIT=$(jq -r '.exit_code // 0' "$1")
+  BASELINE_HASH=$(jq -r '.failure_hash // ""' "$1")
+  BASELINE_REASON=$(jq -r '.unidentified_reason // ""' "$1")
+  BASELINE_NOTE="All tests passed before you changed anything."
+  jq -r '.failures // [] | .[]' "$1" | emit_baseline
+}
+
+# valid_record succeeds when file $1 is a readable green or red record.
+valid_record() {
+  jq -e '.version == 1 and (.status == "green" or .status == "red")' "$1" >/dev/null 2>&1
+}
+
 export BASELINE_STATUS=none BASELINE_EXIT=0 BASELINE_HASH='' BASELINE_NOTE='' BASELINE_REASON='' BASELINE_EXTRA=''
 
 project_dir=$(gate_workdir "$state")
@@ -113,7 +129,11 @@ if [[ "$workdir" == "$top" ]]; then
 else
   rel_dir=${workdir#"$top"/}
 fi
-key=$(printf '%s\n%s\n%s' "$head" "$rel_dir" "$cmd" | gate_sha256 | cut -c1-16)
+# record_key prints the record key of commit $1 for this directory and command.
+record_key() {
+  printf '%s\n%s\n%s' "$1" "$rel_dir" "$cmd" | gate_sha256 | cut -c1-16
+}
+key=$(record_key "$head")
 if ! records_dir=$(git -C "$workdir" rev-parse --git-path coyote-baselines 2>/dev/null) || [[ -z "$records_dir" ]]; then
   BASELINE_NOTE="git could not name a directory to keep the baseline in, so a pristine tree cannot be told from an edited one and no baseline was recorded."
   printf '' | emit_baseline
@@ -125,19 +145,14 @@ record="$records_dir/tests-$key.json"
 short_head=${head:0:7}
 
 if [[ -e "$record" ]]; then
-  if ! jq -e '.version == 1 and (.status == "green" or .status == "red")' "$record" >/dev/null 2>&1; then
+  if ! valid_record "$record"; then
     BASELINE_NOTE="The stored baseline $record cannot be read, so no baseline was recorded and every failing test counts as this run's to fix. Delete that file to take a new baseline on a clean tree."
     printf '' | emit_baseline
     exit 0
   fi
-  BASELINE_STATUS=$(jq -r '.status' "$record")
-  BASELINE_EXIT=$(jq -r '.exit_code // 0' "$record")
-  BASELINE_HASH=$(jq -r '.failure_hash // ""' "$record")
-  BASELINE_REASON=$(jq -r '.unidentified_reason // ""' "$record")
   recorded_at=$(jq -r '.recorded_at // ""' "$record")
-  BASELINE_NOTE="All tests passed before you changed anything."
   BASELINE_EXTRA="This baseline was recorded on HEAD $short_head before any edit ($recorded_at) and reused; the suite was not run again."
-  jq -r '.failures // [] | .[]' "$record" | emit_baseline
+  reuse_record "$record"
   exit 0
 fi
 
@@ -152,6 +167,43 @@ if [[ -n "$porcelain" ]]; then
   BASELINE_NOTE="The work tree already held uncommitted changes at the start of this run and no baseline is stored for HEAD $short_head, so no baseline was recorded and every failing test counts as this run's to fix."
   printf '' | emit_baseline
   exit 0
+fi
+
+# When the caller names the commit its run started from (baseline_floor), the
+# commits between that floor and HEAD are the run's own, so a record taken on
+# one of them still describes the tree before this run's edits. The nearest
+# record on HEAD's first-parent chain is reused only when the floor is an
+# ancestor of it and every commit after it is a plain commit made after the
+# record was taken; anything else runs the suite.
+floor=${LLM_AGENT_VAR_BASELINE_FLOOR:-}
+if [[ -n "$floor" ]] && floor=$(git -C "$workdir" rev-parse --verify -q "$floor^{commit}" 2>/dev/null); then
+  ancestor=''
+  ancestor_record=''
+  while IFS= read -r sha; do
+    candidate="$records_dir/tests-$(record_key "$sha").json"
+    if [[ -e "$candidate" ]]; then
+      ancestor=$sha
+      ancestor_record=$candidate
+      break
+    fi
+  done < <(git -C "$workdir" rev-list --first-parent --skip=1 --max-count=50 HEAD 2>/dev/null)
+  if [[ -n "$ancestor" ]] && valid_record "$ancestor_record" &&
+    git -C "$workdir" merge-base --is-ancestor "$floor" "$ancestor" 2>/dev/null &&
+    merges=$(git -C "$workdir" rev-list --merges "$ancestor..HEAD" 2>/dev/null) && [[ -z "$merges" ]]; then
+    recorded_at=$(jq -r '.recorded_at // ""' "$ancestor_record")
+    # Fixed-width UTC timestamps compare as strings, so the earliest committer
+    # date sorts first.
+    dates=$(TZ=UTC git -C "$workdir" log --format=%cd --date='format-local:%Y-%m-%dT%H:%M:%SZ' "$ancestor..HEAD" 2>/dev/null) || dates=''
+    earliest=$(printf '%s\n' "$dates" | LC_ALL=C sort | head -n 1)
+    if [[ "$recorded_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] &&
+      [[ -n "$earliest" && ! "$earliest" < "$recorded_at" ]]; then
+      between=$(git -C "$workdir" rev-list --reverse --abbrev-commit --abbrev=7 "$ancestor..HEAD" | paste -sd ' ' -)
+      count=$(printf '%s\n' "$dates" | wc -l | tr -d ' ')
+      BASELINE_EXTRA="This baseline was recorded on ${ancestor:0:7} ($recorded_at), $count commit(s) before HEAD $short_head ($between), all made after it, and reused; the suite was not run again."
+      reuse_record "$ancestor_record"
+      exit 0
+    fi
+  fi
 fi
 
 out_file=$(mktemp)

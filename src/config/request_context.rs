@@ -24392,6 +24392,8 @@ mod tests {
                             "render_coder_prompt",
                             "research_answer",
                             "research_dispatch",
+                            "research_fanout_solo",
+                            "research_fanout_team",
                             "review_gate",
                             "route_coder_result",
                             "route_gauntlet",

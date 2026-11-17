@@ -266,6 +266,7 @@ initial_state:
   # --- implementation ---
   coder_brief: {}
   coder_prompt: ''
+  coder_baseline_floor: ''
   expected_files: []
   scope_breach: ''
   scope_confirmed: false
@@ -342,6 +343,9 @@ initial_state:
   git_task: ''
   publish_retries: 0
   publish_checks: []
+  pr_published: false
+  review_rounds_posted: 0
+  push_fix_retries: 0
   ci_owner: false
   ci_watch_note: ''
   ci_polls: 0
@@ -891,9 +895,27 @@ nodes:
   research_dispatch:
     id: research_dispatch
     type: script
-    description: Trivial tasks skip research; otherwise pick the team or solo explore map (a dead plan_research degrades to one slice).
+    description: Trivial tasks skip research; otherwise pick the team or solo research fan-out (a dead plan_research degrades to one slice).
     script: scripts/research_dispatch.py
     fallback: end_failure
+
+  research_fanout_team:
+    id: research_fanout_team
+    type: script
+    description: Starts the team explore map and the librarian map in one super-step; both join at synthesize_context.
+    script: scripts/research_fanout.py
+    state_updates: {}
+    fallback: end_failure
+    next: [explore_fanout_team, librarian_fanout]
+
+  research_fanout_solo:
+    id: research_fanout_solo
+    type: script
+    description: Starts the solo explore map and the librarian map in one super-step; both join at synthesize_context.
+    script: scripts/research_fanout.py
+    state_updates: {}
+    fallback: end_failure
+    next: [explore_fanout_solo, librarian_fanout]
 
   explore_fanout_team:
     id: explore_fanout_team
@@ -904,7 +926,7 @@ nodes:
     branch: explore_slice_team
     output_key: finding
     collect_into: explore_findings
-    next: librarian_fanout
+    next: synthesize_context
 
   explore_slice_team:
     id: explore_slice_team
@@ -939,7 +961,7 @@ nodes:
     branch: explore_slice_solo
     output_key: finding
     collect_into: explore_findings
-    next: librarian_fanout
+    next: synthesize_context
 
   explore_slice_solo:
     id: explore_slice_solo
@@ -1663,6 +1685,7 @@ nodes:
     prompt: |
       {{coder_prompt}}
     inputs:
+      baseline_floor: '{{coder_baseline_floor}}'
       build_lock: '{{build_lock}}'
       project_dir: '{{project_dir}}'
     timeout: 0

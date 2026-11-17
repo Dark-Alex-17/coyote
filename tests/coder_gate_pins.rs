@@ -113,6 +113,10 @@ fn project(dir: &Path, name: &str) {
 /// Runs git in `dir` without the host's system or global config, so a
 /// fixture commit has an author and never tries to sign.
 fn git(dir: &Path, args: &[&str]) -> String {
+    git_with_env(dir, args, &[])
+}
+
+fn git_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> String {
     let output = Command::new("git")
         .args([
             "-c",
@@ -132,6 +136,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .envs(envs.iter().copied())
         .output()
         .expect("spawn git");
     assert!(
@@ -185,7 +190,8 @@ fn run_script(rel: &str, dir: &Path, state: &Value, envs: &[(&str, &str)]) -> Va
         .env_remove("LLM_AGENT_VAR_PROJECT_DIR")
         .env_remove("LLM_AGENT_VAR_TEST_COMMAND")
         .env_remove("LLM_AGENT_VAR_BUILD_TIMEOUT")
-        .env_remove("LLM_AGENT_VAR_TEST_TIMEOUT");
+        .env_remove("LLM_AGENT_VAR_TEST_TIMEOUT")
+        .env_remove("LLM_AGENT_VAR_BASELINE_FLOOR");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -2055,6 +2061,164 @@ fn baseline_tests_reuses_the_record_stored_on_a_clean_tree() {
     assert_eq!(baseline_ids(&out), ["planted"], "{out}");
     assert_eq!(fs::read_to_string(&record).unwrap(), planted);
     assert_eq!(stored_records(&dir.0), [record]);
+}
+
+/// A committed project at `root/name` whose suite fails one known test and
+/// appends a line to a counter file outside the tree on every run, with a
+/// baseline already recorded on its first commit. Returns the work tree,
+/// that commit and the suite command.
+fn recorded_project(root: &Path, name: &str) -> (PathBuf, String, String) {
+    let dir = root.join(name);
+    committed_project(&dir, "here");
+    let counter = root.join(format!("{name}-runs.txt"));
+    let cmd = format!(
+        "echo run >> '{}'; printf 'test known ... FAILED\\n'; exit 101",
+        counter.display()
+    );
+    let floor = git(&dir, &["rev-parse", "HEAD"]);
+    let out = run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_eq!(str_field(&out, "baseline_status"), "red", "{out}");
+    assert_eq!(suite_runs(root, name), 1, "{out}");
+    (dir, floor, cmd)
+}
+
+fn suite_runs(root: &Path, name: &str) -> usize {
+    fs::read_to_string(root.join(format!("{name}-runs.txt")))
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+fn commit_file(dir: &Path, file: &str) -> String {
+    fs::write(dir.join(file), file).unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", file]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+/// With a floor, a clean tree whose HEAD has no record reuses the record of
+/// the nearest first-parent ancestor the run itself built on: the four
+/// state fields are the record's and the note names the commits since.
+#[test]
+fn baseline_tests_reuses_an_ancestor_record_above_the_floor() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-floor");
+    let (dir, floor, cmd) = recorded_project(&root.0, "reuse");
+    let first = run_script(BASELINE, &dir, &project_state(&dir), &[("TEST_CMD", &cmd)]);
+    let one = commit_file(&dir, "one.txt");
+    let two = commit_file(&dir, "two.txt");
+
+    let out = run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_baseline_shape(&out);
+    assert_eq!(
+        suite_runs(&root.0, "reuse"),
+        1,
+        "the suite ran again: {out}"
+    );
+    for key in [
+        "baseline_status",
+        "baseline_exit_code",
+        "baseline_failures",
+        "baseline_failure_hash",
+    ] {
+        assert_eq!(out[key], first[key], "{key}: {out}");
+    }
+    assert_eq!(baseline_ids(&out), ["known"], "{out}");
+    let stored: Value =
+        serde_json::from_str(&fs::read_to_string(&stored_records(&dir)[0]).unwrap()).unwrap();
+    let note = str_field(&out, "baseline_note");
+    assert!(
+        note.ends_with(&format!(
+            "\n\nThis baseline was recorded on {} ({}), 2 commit(s) before HEAD {} ({} {}), all made after it, and reused; the suite was not run again.",
+            &floor[..7],
+            str_field(&stored, "recorded_at"),
+            &two[..7],
+            &one[..7],
+            &two[..7]
+        )),
+        "{note}"
+    );
+    assert_eq!(stored_records(&dir).len(), 1, "a reuse stores nothing");
+}
+
+/// The ancestor record is not reused without a floor, when the floor is not
+/// an ancestor of the record's commit, across a merge, or past a commit
+/// dated before the record: each of those runs the suite as before.
+#[test]
+fn baseline_tests_runs_the_suite_when_an_ancestor_record_cannot_be_trusted() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-floor-refused");
+
+    let (dir, _, cmd) = recorded_project(&root.0, "no-floor");
+    commit_file(&dir, "one.txt");
+    run_script(BASELINE, &dir, &project_state(&dir), &[("TEST_CMD", &cmd)]);
+    assert_eq!(
+        suite_runs(&root.0, "no-floor"),
+        2,
+        "no floor reuses nothing"
+    );
+
+    let (dir, _, cmd) = recorded_project(&root.0, "above");
+    let one = commit_file(&dir, "one.txt");
+    commit_file(&dir, "two.txt");
+    run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &one)],
+    );
+    assert_eq!(
+        suite_runs(&root.0, "above"),
+        2,
+        "a floor past the record reuses nothing"
+    );
+
+    let (dir, floor, cmd) = recorded_project(&root.0, "merge");
+    git(&dir, &["checkout", "-q", "-b", "side"]);
+    commit_file(&dir, "side.txt");
+    git(&dir, &["checkout", "-q", "main"]);
+    commit_file(&dir, "one.txt");
+    git(&dir, &["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+    run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_eq!(suite_runs(&root.0, "merge"), 2, "a merge reuses nothing");
+
+    let (dir, floor, cmd) = recorded_project(&root.0, "older");
+    fs::write(dir.join("old.txt"), "old").unwrap();
+    git(&dir, &["add", "-A"]);
+    git_with_env(
+        &dir,
+        &["commit", "-q", "-m", "old"],
+        &[("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")],
+    );
+    run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_eq!(
+        suite_runs(&root.0, "older"),
+        2,
+        "a commit older than the record reuses nothing"
+    );
 }
 
 /// With no stored record, a tree that already holds changes (an untracked
