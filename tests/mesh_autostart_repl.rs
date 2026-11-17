@@ -6619,6 +6619,364 @@ fn a_revoked_user_stays_known_and_their_request_to_be_trusted_reads_user_slash_s
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+/// `people_command` for a REPL whose prompt is `prompt` (a regex): sends `line` and
+/// returns the escape-stripped transcript through the next prompt painted after a
+/// cursor position query.
+fn command_at(session: &mut Target, line: &str, prompt: &str) -> String {
+    session.send(format!("{line}\r")).expect("type the command");
+    let query = b"\x1b[6n";
+    let mut seen = Vec::new();
+    let mut asked = false;
+    loop {
+        let captures = session
+            .expect(Any([Regex(prompt), Regex(CURSOR_POSITION_QUERY)]))
+            .unwrap_or_else(|err| panic!("waiting for the prompt after {line:?}: {err}"));
+        let involved = captures.as_bytes().to_vec();
+        let mut from = 0;
+        while let Some(at) = involved[from..]
+            .windows(query.len())
+            .position(|window| window == query)
+        {
+            let at = from + at;
+            session
+                .send(cursor_position_reply(&involved[..at]))
+                .expect("reply to the cursor position query");
+            from = at + query.len();
+            asked = true;
+        }
+        let painted = captures.get(0).unwrap_or_default() != query;
+        seen.extend_from_slice(&involved);
+        if painted && asked {
+            let text = strip_escapes(&seen);
+            return match text.find("\r\n") {
+                Some(at) => text[at + 2..].to_string(),
+                None => text,
+            };
+        }
+    }
+}
+
+/// The `<user8> / <dest8>` hashes cell of the first `.mesh people list` row whose line
+/// contains `needle`, as the dest8.
+fn dest8_of_row(list: &str, needle: &str) -> Option<String> {
+    let line = list.lines().find(|line| line.contains(needle))?;
+    let chars: Vec<char> = line.chars().collect();
+    let hex = |s: &[char]| {
+        s.iter()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(c))
+    };
+    (0..chars.len().saturating_sub(18)).find_map(|at| {
+        let window = &chars[at..at + 19];
+        let (user, rest) = window.split_at(8);
+        (hex(user) && rest[..3] == [' ', '/', ' '] && hex(&rest[3..]))
+            .then(|| rest[3..].iter().collect())
+    })
+}
+
+/// Cold start over a seeded trust list: `.mesh help` lists `.mesh session`; `people
+/// name` refuses a `<user>/<session>` pointing at `session name` and writes nothing; a
+/// session may be labelled with its own user's name (advertised or given), which reads
+/// `<name> / <name>` while the bare name still reaches the user; another user's session
+/// may not take it; `--clear` gives back the advertised session name.
+#[test]
+fn a_session_label_may_read_as_its_own_users_name_at_a_cold_prompt() {
+    let relay = SilentRelay::start();
+    let probe = Probe::new("session-label-own-user", true, &[relay.port]);
+    seed_people_trust_file(&probe.config_dir);
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut session = spawn_repl(command);
+    wait_for(&mut session, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    let dir = probe.config_dir.clone();
+    let mut failures = Vec::new();
+    let mut check = |ok: bool, what: &str, out: &str| {
+        if !ok {
+            failures.push(format!("{what}: {out:?}"));
+        }
+    };
+
+    let help = people_command(&mut session, ".mesh help");
+    check(
+        help.lines().any(|line| {
+            line.contains(".mesh session ")
+                && line.contains("Give one session the label you call it")
+        }),
+        ".mesh help lists .mesh session",
+        &help,
+    );
+
+    let before = people_section(&dir);
+    let out = people_command(&mut session, ".mesh people name carol/desk \"x\"");
+    check(
+        out.contains("`.mesh people name` names a user; to label one of their sessions run `.mesh session name <user>/<session> \"label\"`."),
+        "people name refuses a session pointing at session name",
+        &out,
+    );
+    check(
+        people_section(&dir) == before,
+        "the refusal writes nothing",
+        &format!("{:?}", people_section(&dir)),
+    );
+
+    // Advertised user name `carol`, owner label `carol` on her session.
+    let out = people_command(&mut session, ".mesh session name carol/desk \"carol\"");
+    check(
+        out.contains("carol / desk is now carol / carol;"),
+        "a session label may read as its user's advertised name",
+        &out,
+    );
+    let info = people_command(&mut session, ".mesh people info carol");
+    check(
+        info.contains("user: carol (the name they advertise)")
+            && info.contains(&format!("carol / carol . {CAROL_ONE}")),
+        "the bare name reaches the user, whose session reads carol / carol",
+        &info,
+    );
+    let out = people_command(&mut session, ".mesh session name carol/carol --clear");
+    check(
+        out.contains("Cleared the label you gave 3333cccc; it shows as carol / desk."),
+        "clearing gives back the advertised session name",
+        &out,
+    );
+
+    // A name you give the user, then the same name (case aside) on her session.
+    let out = people_command(&mut session, ".mesh people name carol \"Bob\"");
+    check(out.contains("is now Bob"), "name the user Bob", &out);
+    let out = people_command(&mut session, ".mesh session name Bob/desk \"bob\"");
+    check(
+        out.contains("Bob / desk is now Bob / bob;"),
+        "a session label may read as its user's given name",
+        &out,
+    );
+    let info = people_command(&mut session, ".mesh people info Bob");
+    check(
+        info.contains("user: Bob (the name you gave)"),
+        "the bare name reaches the user",
+        &info,
+    );
+    // A user's given name still collides with another user's session label.
+    let out = people_command(&mut session, ".mesh session name a1b2c3d4/1111aaaa \"BOB\"");
+    check(
+        out.contains("Another user or session already has that name"),
+        "another user's session may not take the name",
+        &out,
+    );
+    let out = people_command(&mut session, ".mesh session name Bob/bob --clear");
+    check(
+        out.contains("Cleared the label you gave 3333cccc; it shows as Bob / desk."),
+        "clearing the label",
+        &out,
+    );
+
+    let status = exit_clean(&mut session);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+/// Two sessions of one user on one config dir and a real rnsd: `sib` is asked once
+/// while it runs, so a path to it is held, then SIGKILLed. The survivor lists it as
+/// `sib (ended)`, and `.mesh people status` typed by its name or its hash resolves and
+/// fails within 3 s saying the session ended, never waiting out a link.
+#[test]
+fn a_sigkilled_sibling_session_reads_ended_and_status_of_it_fails_at_once() {
+    let Some(relay) = RnsdRelay::start("sigkilled-sibling") else {
+        eprintln!("skipped: no rnsd on the PATH");
+        return;
+    };
+    let probe = Probe::new("sigkilled-sibling", true, &[relay.port]).with_announce();
+    let mut command = probe.command();
+    command.args(["--session", "probe"]);
+    let mut mine = spawn_repl(command);
+    wait_for(&mut mine, SESSION_PROMPT);
+    probe.wait_for_marker("MESH_STARTED");
+    let mut command = probe.command();
+    command.args(["--session", "sib"]);
+    let mut sib = spawn_repl(command);
+    wait_for(&mut sib, &session_prompt("sib"));
+    probe.wait_for_marker_count("MESH_STARTED", 2);
+
+    let list = people_command(&mut mine, ".mesh people list");
+    let sib8 = dest8_of_row(&list, "sib").unwrap_or_else(|| panic!("no sib row: {list:?}"));
+    // Asked while it runs, so a path to it is held.
+    let alive = people_command(&mut mine, &format!(".mesh people status {sib8}"));
+
+    let pid = sib.get_process().pid().to_string();
+    let killed = Command::new("kill").args(["-9", &pid]).status().unwrap();
+    assert!(killed.success());
+    // Drain the pty so the killed process can finish exiting, then reap it as a shell
+    // would; an unreaped or still-exiting pid reads as running.
+    let _ = sib.expect(Eof);
+    let _ = sib.get_process().wait();
+
+    let list = people_command(&mut mine, ".mesh people list");
+    assert!(
+        list.lines()
+            .any(|line| line.contains("sib (ended)") && line.contains(&sib8)),
+        "the killed session reads ended: {list:?} (while alive: {alive:?})"
+    );
+    let ended = "you / sib ended (its process on this computer is gone), so it cannot answer; .mesh people list shows your running sessions.";
+    let mut timings = Vec::new();
+    for line in [
+        ".mesh people status sib".to_string(),
+        format!(".mesh people status {sib8}"),
+        ".mesh people status sib".to_string(),
+    ] {
+        // A local read of the same token just before, as the pty round trip (typing
+        // included) a refusal at once would take on a host as loaded as it is now.
+        let asked = Instant::now();
+        let _ = people_command(&mut mine, &line.replacen(" status ", " info ", 1));
+        let control = asked.elapsed();
+        let asked = Instant::now();
+        let out = people_command(&mut mine, &line);
+        let waited = asked.elapsed();
+        assert!(out.contains(ended), "{line}: {out:?}");
+        timings.push((line, waited, control));
+    }
+    eprintln!("(line, waited, people info just before): {timings:?}");
+    // The pty round trip of a debug build is the floor; a refusal at once stays well
+    // under the 2 s path wait above it, and far under the 10 s link timeout.
+    for (line, waited, control) in &timings {
+        assert!(
+            *waited <= Duration::from_secs(3) || *waited <= *control + Duration::from_millis(1500),
+            "{line} took {waited:?} (people info took {control:?}); all: {timings:?}"
+        );
+    }
+
+    let status = exit_clean(&mut mine);
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+}
+
+/// A saved peer session that trusts this user is heard here, leaves with `.exit`, is
+/// trusted here while it is away, and starts again (same session hash) under a new
+/// `person_name`: within the link timeout and a few seconds more, with nothing typed but
+/// `.mesh people list`, this node names its session by what its card advertises, from
+/// one card request on the re-hear.
+#[test]
+fn a_peer_that_restarts_is_named_from_its_new_card_with_nothing_typed() {
+    let Some(relay) = RnsdRelay::start("reheard-peer") else {
+        eprintln!("skipped: no rnsd on the PATH");
+        return;
+    };
+    let me = Probe::new("reheard-me", true, &[relay.port]).with_announce();
+    let log_path = me.temp_root.join("reheard-me.log");
+    let mut command = me.command();
+    command
+        .env("COYOTE_LOG_PATH", &log_path)
+        .env("COYOTE_LOG_LEVEL", "debug")
+        .args(["--session", "probe"]);
+    let mut mine = spawn_repl(command);
+    wait_for(&mut mine, SESSION_PROMPT);
+    me.wait_for_marker("MESH_STARTED");
+    let my_id = me.own_identity();
+
+    let peer = Probe::new("reheard-peer", true, &[relay.port]).with_announce();
+    // A saved session keeps its instance id, so its session hash, across a restart.
+    let path = peer.config_dir.join("config.yaml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("save_session: false\n"), "{text}");
+    fs::write(
+        &path,
+        text.replace("save_session: false\n", "save_session: true\n"),
+    )
+    .unwrap();
+    let set_person_name = |name: &str| {
+        let path = peer.config_dir.join("config.yaml");
+        let text = fs::read_to_string(&path).unwrap();
+        let text = match text.find("  person_name: ") {
+            Some(at) => {
+                let end = at + text[at..].find('\n').unwrap() + 1;
+                format!("{}  person_name: {name}\n{}", &text[..at], &text[end..])
+            }
+            None => text.replace(
+                "  announce: true\n",
+                &format!("  announce: true\n  person_name: {name}\n"),
+            ),
+        };
+        fs::write(&path, text).unwrap();
+    };
+    set_person_name("Beatrice");
+    let laptop = session_prompt("laptop");
+    let mut command = peer.command();
+    command.args(["--session", "laptop"]);
+    let mut theirs = spawn_repl(command);
+    wait_for(&mut theirs, &laptop);
+    peer.wait_for_marker("MESH_STARTED");
+    let peer_id = peer.own_identity();
+
+    // The peer trusts this user; this node has not trusted it yet, so it asks it nothing.
+    let out = command_at(
+        &mut theirs,
+        &format!(".mesh access trust user {my_id} --yes"),
+        &laptop,
+    );
+    assert!(out.contains("Trusted"), "{out:?}");
+    let peer8 = &peer_id[..8];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let laptop8 = loop {
+        let list = people_command(&mut mine, ".mesh people list");
+        if let Some(dest8) = dest8_of_row(&list, &format!("{peer8} / ")) {
+            break dest8;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the peer was never heard: {list:?}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    };
+
+    let _ = exit_clean(&mut theirs);
+    let left = people_command(&mut mine, ".mesh people list");
+    // Trusted while it is away: there is nothing to ask until it is heard again.
+    let out = people_command(
+        &mut mine,
+        &format!(".mesh access trust user {peer_id} --yes"),
+    );
+    assert!(out.contains("Trusted"), "{out:?}");
+    set_person_name("Beatrix");
+    let mut command = peer.command();
+    command.args(["--session", "laptop"]);
+    let mut theirs = spawn_repl(command);
+    wait_for(&mut theirs, &laptop);
+    peer.wait_for_marker_count("MESH_STARTED", 2);
+    let restarted = Instant::now();
+
+    let named = |line: &str| {
+        line.contains("Beatrix") && line.contains("laptop") && line.contains(laptop8.as_str())
+    };
+    let list = loop {
+        let list = people_command(&mut mine, ".mesh people list");
+        if list.lines().any(named) || restarted.elapsed() > Duration::from_secs(30) {
+            break list;
+        }
+        thread::sleep(Duration::from_millis(500));
+    };
+    let waited = restarted.elapsed();
+    let _ = exit_clean(&mut theirs);
+    let status = exit_clean(&mut mine);
+    assert!(
+        list.lines().any(named),
+        "the restarted peer ({laptop8}) was never named Beatrix / laptop: {list:?}\nafter its .exit: {left:?}"
+    );
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let cards: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(laptop8.as_str()))
+        .collect();
+    // Trusted while it was away, the peer is first asked over its old path; that ask
+    // fails at the 10 s link timeout and the restarted peer, heard meanwhile, is asked
+    // again at once, so the name lands within the link timeout and a few seconds more.
+    assert!(
+        waited <= Duration::from_secs(15),
+        "named after {waited:?}: {cards:#?}"
+    );
+    assert!(matches!(status, WaitStatus::Exited(_, 0)), "{status:?}");
+    let reheard = format!("Mesh background status card for {laptop8} (Reheard): ");
+    let asked: Vec<&str> = log.lines().filter(|line| line.contains(&reheard)).collect();
+    assert_eq!(asked.len(), 1, "one card request on the re-hear: {asked:?}");
+    assert!(asked[0].ends_with("read"), "{asked:?}");
+}
+
 /// Result lines speak of users and sessions: the refusal a session-less `.mesh on`
 /// prints and the line a set objective prints say neither "this node" nor
 /// "destination" nor "instance"; only a group help's "Under the hood" paragraph does.

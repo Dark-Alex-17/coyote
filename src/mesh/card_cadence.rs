@@ -16,7 +16,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -556,6 +556,7 @@ impl MeshRuntime {
         };
         let route = Route::unasked(desc);
         let options = route.options(self.request_timeouts().raise(RequestOptions::default()));
+        let asked_at = SystemTime::now();
         let result = self.fetch_status(&route.desc, options).await;
         let stopped = matches!(
             result,
@@ -571,6 +572,22 @@ impl MeshRuntime {
             Err(StatusError::Transport(_)) => "not delivered",
         };
         debug!("Mesh background status card for {dest8} ({trigger:?}): {outcome}");
+        if matches!(result, Err(StatusError::Transport(_))) {
+            // The request never reached the session, as when its link never came up while
+            // it was away, so the next hearing of it may ask at once; one that announced
+            // while the request was out, as a session that restarted does, is asked now.
+            self.card_cadence().unasked(destination);
+            let heard_since = self
+                .peers()
+                .get(destination)
+                .is_some_and(|peer| peer.last_seen >= asked_at);
+            if heard_since {
+                debug!(
+                    "Mesh background status card for {dest8}: heard again while it was asked, asking again"
+                );
+                self.consider_card_fetch(destination, CardTrigger::Reheard);
+            }
+        }
         if stopped && !self.card_cadence().is_refused(destination) {
             debug!(
                 "Mesh background status card for {dest8}: contacted while it was asked, asking again"
@@ -1192,6 +1209,70 @@ mod network {
             .await
             .unwrap();
         assert_eq!(status_requests(a_rt), 2);
+
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// A node that restarts keeps its peer rows but has heard nobody in the new run: the
+    /// first announce from a trusted session it already knows asks for that session's card
+    /// once, though that session never served it, and A names it from the card within
+    /// seconds with nothing typed. A second announce inside the interval asks nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_known_session_heard_first_in_a_new_run_is_named_from_its_card() {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("cadence-new-run-a", relay.port).await;
+        let b = started_runtime_on_with("cadence-new-run-b", relay.port, |config| {
+            config.person_name = Some("Beatrice".into());
+        })
+        .await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        slot_b.rename_session("after-restart");
+        let (a_rt, b_rt) = (&a.runtime, &b.runtime);
+        let a_dest = a_rt.current_destination_hash();
+        let b_dest = b_rt.current_destination_hash();
+        wait_for_peer(a_rt, &b_dest).await;
+        wait_for_peer(b_rt, &a_dest).await;
+        a_rt.card_cadence().note_heard(&b_dest);
+        for (slot, runtime, peer) in [(&slot_a, a_rt, &b_dest), (&slot_b, b_rt, &a_dest)] {
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    peer,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let before = status_requests(a_rt);
+
+        // A new run: the row is kept, the hearing is not.
+        a_rt.card_cadence().forget_heard(&b_dest);
+        b_rt.announce_on_connect().await.unwrap();
+        let started = Instant::now();
+        while a_rt.who_at(&b_dest).to_string() != "Beatrice / after-restart" {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "A never named B's session after its restart: {}",
+                a_rt.who_at(&b_dest)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status_requests(a_rt), before + 1, "one card request");
+
+        b_rt.announce_on_connect().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            status_requests(a_rt),
+            before + 1,
+            "a second hearing asks nothing"
+        );
 
         assert!(slot_a.stop().await.unwrap());
         assert!(slot_b.stop().await.unwrap());

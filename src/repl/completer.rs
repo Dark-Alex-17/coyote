@@ -471,7 +471,7 @@ mod prefix_tests {
         // Every `.mesh` row the completer knows is a top-level verb or a group the
         // table has; none is a cut verb.
         let all = values_of(CommandPrefix::Dot, ".mesh ");
-        assert_eq!(all.len(), 10, "{all:?}");
+        assert_eq!(all.len(), 11, "{all:?}");
         for cut in [" reply", " message", " peers"] {
             assert!(!all.iter().any(|v| v.ends_with(cut)), "{cut}: {all:?}");
         }

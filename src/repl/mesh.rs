@@ -2751,6 +2751,13 @@ fn quoted_send_failure(err: anyhow::Error, who: &str) -> anyhow::Error {
         Some(send @ SendError::NoAnswer(no_answer)) => {
             return quoted_peer_side(send, no_answer, no_answer.clone().named(Some(who)).notice());
         }
+        Some(SendError::LeftNoPropagationNode { who: owner_who, .. }) => {
+            let text = err.to_string();
+            return match text.strip_prefix(owner_who.as_str()) {
+                Some(tail) => QuotingError::wrap(NoticeText::default().peer(who).frame(tail)),
+                None => err,
+            };
+        }
         Some(SendError::Throttled { destination }) => {
             ("", short(destination).to_string(), destination.clone())
         }
@@ -2882,6 +2889,25 @@ mod peer_side_refusal_tests {
         assert!(!text.contains(&destination), "{text}");
         let other = quoted_send_failure(SendError::NotRunning.into(), "Ann / laptop");
         assert_eq!(other.to_string(), SendError::NotRunning.to_string());
+    }
+
+    /// A session that said it left is named the way the send named it, not by the owner's
+    /// names alone the refusal was built with.
+    #[test]
+    fn a_left_session_with_no_propagation_node_is_named_by_user_and_session() {
+        let left = quoted_send_failure(
+            SendError::LeftNoPropagationNode {
+                destination: "ab".repeat(16),
+                who: "cdcdcdcd / abababab".to_string(),
+                age: "8s ago".to_string(),
+            }
+            .into(),
+            "Ann / laptop",
+        );
+        assert_eq!(
+            left.to_string(),
+            "Ann / laptop left 8s ago and no propagation node is known to hold the message, so it was not sent. It is delivered once a propagation node is heard or that session is back; .mesh people list shows both."
+        );
     }
 
     /// An access request to a busy or unreachable session names it the way a send does.
@@ -38019,10 +38045,7 @@ mod tests {
                     .await
                     .unwrap_err()
                     .to_string();
-                    let who = runtime
-                        .owner_namer()
-                        .who(Some(&stub.identity_hex()), &peer)
-                        .to_string();
+                    let who = runtime.who_at(&peer).to_string();
                     assert!(
                         err.starts_with(&format!("{who} left "))
                             && err.contains(

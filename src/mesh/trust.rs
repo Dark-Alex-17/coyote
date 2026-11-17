@@ -14146,7 +14146,7 @@ mod tests {
                 (&b, None, "bad\u{7}", &[][..], "control"),
                 (&b, None, "ALEX", &[][..], NAME_TAKEN),
                 (&b, None, "Main", &["main"][..], NAME_TAKEN),
-                (&a, Some(&d), "alex", &[][..], NAME_TAKEN),
+                (&b, Some(&d), "alex", &[][..], NAME_TAKEN),
             ] {
                 let err = match destination {
                     None => fx.store.set_person_alias(identity, Some(name), own),
@@ -14182,6 +14182,16 @@ mod tests {
                 session_name(&fx.store, &b, &d).as_deref(),
                 Some("alex-review")
             );
+            let own = fake_hash(0x04);
+            fx.store
+                .set_session_alias(&a, &own, Some("alex"), &[])
+                .unwrap();
+            assert_eq!(
+                session_name(&fx.store, &a, &own).as_deref(),
+                Some("alex"),
+                "a session may read as its own user's name"
+            );
+            fx.store.set_session_alias(&a, &own, None, &[]).unwrap();
 
             fx.store.set_person_alias(&a, None, &[]).unwrap();
             assert_eq!(person_name(&fx.store, &a), None);

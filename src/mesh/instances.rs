@@ -107,7 +107,7 @@ pub(crate) fn session_names(cache_dir: &Path) -> HashMap<String, String> {
 }
 
 /// The rows whose node still runs, by the destination each serves. A tombstone is never
-/// among them, so no name resolves to a session that has gone.
+/// among them.
 pub(crate) fn live(cache_dir: &Path) -> HashMap<String, InstanceRow> {
     by_destination(cache_dir).running
 }

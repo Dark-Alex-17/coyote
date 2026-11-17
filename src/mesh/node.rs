@@ -1183,7 +1183,8 @@ impl MeshRuntime {
 
     /// The sessions of yours running on this cache dir, this one included, by the
     /// destination each serves, as the instance registry lists them. A session that has
-    /// gone is never among them, so no session name resolves to it.
+    /// gone is never among them; `address_names` still resolves its name while the
+    /// registry keeps its tombstone.
     pub(crate) fn own_sessions(&self) -> HashMap<String, String> {
         instances::live(&self.cache_dir)
             .into_iter()
@@ -1336,9 +1337,9 @@ impl MeshRuntime {
     }
 
     /// Every name the human verbs resolve: your running sessions in destination order,
-    /// then the ended ones the registry keeps whose name no running session goes by, `you`,
-    /// then each user's and session's addressable name in hash order, the labels you gave
-    /// your own sessions among them. An unnamed session names nothing. A user's
+    /// then the ended ones the registry keeps whose name nothing else on this list goes
+    /// by, `you`, then each user's and session's addressable name in hash order, the labels
+    /// you gave your own sessions among them. An unnamed session names nothing. A user's
     /// sessions are the ones `known_sessions` proves, the same set `<user>/<session>` picks
     /// from, never a row's identity column on its word.
     pub(crate) fn address_names(&self) -> Vec<AddressName> {
@@ -1355,13 +1356,10 @@ impl MeshRuntime {
             .map(|(destination, row)| (destination, row.session))
             .filter(|(destination, session)| {
                 !session.trim().is_empty()
-                    && !sessions.iter().any(|(running, name)| {
-                        running == destination || name.eq_ignore_ascii_case(session)
-                    })
+                    && !sessions.iter().any(|(running, _)| running == destination)
             })
             .collect();
         ended.sort_unstable();
-        sessions.extend(ended);
         let known = self.known_sessions();
         // `you` stands for the same sessions `you/<session>` picks from: the ones running
         // here and every proven session of this identity heard elsewhere.
@@ -1427,6 +1425,21 @@ impl MeshRuntime {
                 target,
             });
         }
+        // An ended session's name stands for it only while no live name reads the same, so
+        // a tombstone never makes a name ambiguous.
+        let live: HashSet<String> = names.iter().map(|name| name.name.to_lowercase()).collect();
+        names.extend(
+            ended
+                .into_iter()
+                .filter(|(_, session)| !live.contains(&session.to_lowercase()))
+                .map(|(destination, session)| AddressName {
+                    name: session,
+                    target: NameTarget::Session {
+                        destination,
+                        identity: self.fingerprint.clone(),
+                    },
+                }),
+        );
         names
     }
 
@@ -1929,7 +1942,7 @@ impl MeshRuntime {
         // says that a link would wait out its whole timeout for nothing.
         if options.foreground && self.own_session_ended(&dest_hex) {
             return Err(RequestError::LinkNotOpened(
-                "that session of yours has ended, its process on this computer is gone".into(),
+                "that session of yours has ended (its process on this computer is gone), so nothing can answer; .mesh people list shows your running sessions".into(),
             ));
         }
         let transport = self
@@ -19819,6 +19832,23 @@ mod tests {
                 ["a", "temp", "temp-fork"],
                 "a gone session the registry keeps is still a name"
             );
+
+            let (peer, peer_dest) = ("ab".repeat(16), "cd".repeat(16));
+            a.trust()
+                .set_session_alias(&peer, &peer_dest, Some("Temp-Fork"), &["a"])
+                .unwrap();
+            let spelled: Vec<String> = a
+                .address_names()
+                .into_iter()
+                .filter(|name| name.name.eq_ignore_ascii_case("temp-fork"))
+                .filter_map(|name| name.target.destination().map(str::to_string))
+                .collect();
+            assert_eq!(
+                spelled,
+                [peer_dest],
+                "a live name another session goes by outranks a tombstone's"
+            );
+            assert_eq!(session_names(&a), ["a", "temp"]);
 
             a.shutdown().await.unwrap();
             assert!(instances::live(&tmp.path.join("cache")).is_empty());

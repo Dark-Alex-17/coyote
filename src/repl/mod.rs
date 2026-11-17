@@ -175,7 +175,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 79]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -227,6 +227,11 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 78]> = LazyLock::new(|| {
         ReplCommand::new(
             ".mesh status",
             "Show your session's status card or set its objective",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh session",
+            "Give one session the label you call it, or clear it; the user's name is `.mesh people name`",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -9874,8 +9879,8 @@ local_hello() {\n\
     }
 
     #[test]
-    fn repl_commands_has_78_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 78);
+    fn repl_commands_has_79_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 79);
     }
 
     #[test]
@@ -9901,7 +9906,7 @@ local_hello() {\n\
             .map(|(_, verb, _, summary)| (*verb, *summary))
             .chain(mesh::GROUPS.iter().copied())
             .collect();
-        assert_eq!(commands.len(), 10);
+        assert_eq!(commands.len(), 11);
         assert_eq!(commands, tree);
         let help = mesh::COMMANDS
             .iter()
