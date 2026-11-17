@@ -240,6 +240,10 @@ fn shimmed_path(home: &Home, os: &str) -> std::ffi::OsString {
 
 const SHIM_ENTRIES: [&str; 3] = ["shim", "shim/launchctl", "shim/uname"];
 
+/// A hand-written config that can serve Coyote sessions: transport on and a listener on
+/// 4242, with no header of the script's own, so the script proceeds without writing to it.
+const SERVES_COYOTE: &str = "[reticulum]\nenable_transport = True\n\n[interfaces]\n  [[Loop]]\n    type = TCPServerInterface\n    listen_ip = 127.0.0.1\n    listen_port = 4242\n";
+
 /// The line a macOS run prints after bootstrapping the agent.
 const FIREWALL_POINTER: &str = "If macOS asks whether Python may accept incoming connections, allow it, or the LAN interface stays silent (AutoInterface: 'No multicast echoes received'); System Settings > Network > Firewall > Options. Nodes using only the loopback relay are unaffected.";
 
@@ -257,6 +261,16 @@ fn hold_loopback_4242() -> MutexGuard<'static, ()> {
 fn loopback_4242_in_use() -> bool {
     let addr = "127.0.0.1:4242".parse().unwrap();
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// For a scenario whose readiness wait only needs 4242 open: a listener of its own, or
+/// `Some(None)` when one is already there (a developer's rnsd). `None` when 4242 can be
+/// neither found open nor bound.
+fn loopback_4242_open() -> Option<Option<TcpListener>> {
+    if loopback_4242_in_use() {
+        return Some(None);
+    }
+    TcpListener::bind("127.0.0.1:4242").ok().map(Some)
 }
 
 /// Files directly under `dir`, sorted, so a "no temp file left behind" check can
@@ -457,7 +471,8 @@ fn assert_no_announce_rate_setting(text: &str, what: &str) {
 /// A reader whose host already has a hand-written Reticulum config is told to merge the
 /// script's settings by hand, so the printed advice must carry the shared-instance keys
 /// every `type: local` session attaches through, consecutive and in the written order,
-/// next to the 4242 listener the remote rungs keep; the file itself stays untouched.
+/// next to the 4242 listener the remote rungs keep; the file itself stays untouched. This
+/// config has no listener on 4242, so the run stops there with exit 2 and says why.
 #[test]
 fn an_existing_config_is_told_to_carry_the_shared_instance_keys_and_the_4242_listener() {
     let bash = bash_or_skip!();
@@ -468,7 +483,14 @@ fn an_existing_config_is_told_to_carry_the_shared_instance_keys_and_the_4242_lis
     fs::write(home.reticulum_config(), hand_written).unwrap();
 
     let (code, out, err) = run(&mut home.relay(&bash, &["--no-service", "--dry-run"]));
-    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains(&format!(
+            "Your Reticulum config at {} has no [[Coyote Sessions]] stanza on 127.0.0.1:4242, so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again.",
+            home.reticulum_config().display()
+        )),
+        "{err}"
+    );
     assert!(out.contains("already exists, not touched"), "{out}");
     let advice = &out[out.find("already exists, not touched").unwrap()..];
     assert!(
@@ -492,6 +514,380 @@ fn an_existing_config_is_told_to_carry_the_shared_instance_keys_and_the_4242_lis
         hand_written,
         "an existing config was modified"
     );
+}
+
+/// A config like the one an older Reticulum install leaves behind: transport off, no
+/// listener on 4242, an AutoInterface and a run of `TCPClientInterface` stanzas. Three of
+/// the enabled ones dial public hosts (a name, a routable address, 172.32/16 just past the
+/// RFC1918 block); the disabled one, `localhost`, loopback and the three RFC1918 ranges do not count.
+const STALE_CONFIG: &str = "[reticulum]\n  enable_transport = no\n  share_instance = Yes\n\n[logging]\n  loglevel = 4\n\n[interfaces]\n  [[Default Interface]]\n    type = AutoInterface\n    enabled = Yes\n\n  [[RNS Testnet Dublin]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = dublin.connect.reticulum.network\n    target_port = 4965\n\n  [[Routable]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 203.0.113.7\n    target_port = 4242\n\n  [[Past RFC1918]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 172.32.0.5\n    target_port = 4242\n\n  [[Switched Off]]\n    type = TCPClientInterface\n    enabled = no\n    target_host = 198.51.100.1\n    target_port = 4242\n\n  [[Home]]\n    type = TCPClientInterface\n    interface_enabled = True\n    target_host = 192.168.1.20\n    target_port = 4242\n\n  [[Office]]\n    type = TCPClientInterface\n    target_host = 10.1.2.3\n    target_port = 4242\n\n  [[Docker]]\n    type = TCPClientInterface\n    target_host = 172.20.0.5\n    target_port = 4242\n\n  [[Here]]\n    type = TCPClientInterface\n    target_host = localhost\n    target_port = 4242\n\n  [[Loopback]]\n    type = TCPClientInterface\n    target_host = 127.0.0.1\n    target_port = 4243\n";
+
+const PUBLIC_DIALS_NOTE: &str = "Note: this config also dials 3 public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).";
+
+/// An existing `~/.config/reticulum/config` that carries neither the 4242 listener nor
+/// `enable_transport` stops the run with exit 2 right after the printed stanzas, on a real
+/// run and a dry run, on Linux and macOS: no unit or plist is written, no service manager is
+/// called and nothing waits for a port. The explanation names the path and both gaps, and
+/// the public hosts the config dials are counted in a note.
+#[test]
+fn a_config_that_cannot_serve_coyote_stops_with_exit_2_before_any_service_step() {
+    let bash = bash_or_skip!();
+    let home = Home::new("stale-config");
+    home.seed_rnsd();
+    let config = home.xdg_reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, STALE_CONFIG).unwrap();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .fake("systemctl", &log, "exit 0")
+        .fake("journalctl", &log, "exit 0")
+        .fake("launchctl", &log, "exit 1");
+    let explanation = format!(
+        "[coyote-mesh] Error: Your Reticulum config at {} has no [[Coyote Sessions]] stanza on 127.0.0.1:4242 and enable_transport is off, so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again.\n",
+        config.display()
+    );
+
+    for (os, args) in [
+        ("Linux", &[][..]),
+        ("Linux", &["--dry-run"][..]),
+        ("Darwin", &[][..]),
+        ("Darwin", &["--dry-run"][..]),
+    ] {
+        tools.uname_answering(os);
+        fs::write(&log, "").unwrap();
+        let (code, out, err) = run(home.relay(&bash, args).env("PATH", tools.path()));
+        assert_eq!(code, 2, "{os} {args:?}: stdout:\n{out}\nstderr:\n{err}");
+        assert_eq!(err, explanation, "{os} {args:?}: stdout:\n{out}");
+        assert!(
+            out.contains(&format!("{} already exists, not touched", config.display()))
+                && out.contains("[[Coyote Sessions]]")
+                && out.contains("enable_transport = True"),
+            "{os} {args:?}: the stanzas are printed before the stop:\n{out}"
+        );
+        assert_eq!(
+            out.matches(PUBLIC_DIALS_NOTE).count(),
+            1,
+            "{os} {args:?}:\n{out}"
+        );
+        for absent in [
+            "Waiting for rnsd",
+            "rnsd did not open",
+            "does not name the config file",
+            "does not set enable_transport",
+            "Would write",
+            "Next:",
+        ] {
+            assert!(!out.contains(absent), "{os} {args:?}: {absent:?}:\n{out}");
+        }
+        assert_eq!(
+            recorded(&log),
+            "",
+            "{os} {args:?}: no service manager is called"
+        );
+        assert!(
+            !home.config_home().join("systemd").exists(),
+            "{os} {args:?}"
+        );
+        assert!(!home.path().join("Library").exists(), "{os} {args:?}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), STALE_CONFIG);
+    }
+}
+
+/// One gap at a time: a config with the listener but transport off, and one with transport
+/// on but no listener, each stop with exit 2 and name only what is missing.
+#[test]
+fn a_config_missing_one_of_the_listener_or_transport_names_only_that_gap() {
+    let bash = bash_or_skip!();
+    let home = Home::new("stale-one-gap");
+    home.seed_rnsd();
+    let config = home.reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let tail = "so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again.";
+
+    for (text, gap) in [
+        (
+            SERVES_COYOTE.replace("enable_transport = True", "enable_transport = False"),
+            "has enable_transport off,",
+        ),
+        (
+            SERVES_COYOTE.replace("listen_port = 4242", "listen_port = 4965"),
+            "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
+        ),
+        (
+            SERVES_COYOTE.replace(
+                "type = TCPServerInterface",
+                "type = TCPServerInterface\n    enabled = No",
+            ),
+            "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
+        ),
+    ] {
+        fs::write(&config, &text).unwrap();
+        let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
+        assert_eq!(code, 2, "{text}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            err.contains(&format!(
+                "Your Reticulum config at {} {gap} {tail}",
+                config.display()
+            )),
+            "{text}\n{err}"
+        );
+        assert!(!err.contains(" and enable_transport is off"), "{err}");
+        assert!(!out.contains("Note: this config also dials"), "{out}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+    }
+}
+
+/// A config that serves Coyote proceeds as before, and still counts the public hosts it
+/// dials; with none, the note is not printed.
+#[test]
+fn a_config_that_serves_coyote_proceeds_and_counts_the_public_nodes_it_dials() {
+    let bash = bash_or_skip!();
+    let home = Home::new("public-dials");
+    home.seed_rnsd();
+    let config = home.reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let interfaces = STALE_CONFIG.split_once("[interfaces]\n").unwrap().1;
+    let dialing = format!("{SERVES_COYOTE}{interfaces}");
+    fs::write(&config, &dialing).unwrap();
+
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out.matches(PUBLIC_DIALS_NOTE).count(), 1, "{out}");
+    assert!(
+        out.contains("Next: start coyote and run `.mesh on`"),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(&config).unwrap(), dialing);
+
+    fs::write(&config, SERVES_COYOTE).unwrap();
+    let (code, out, _) = run(&mut home.relay(&bash, &["--no-service"]));
+    assert_eq!(code, 0);
+    assert!(!out.contains("Note: this config also dials"), "{out}");
+}
+
+/// `--relay` on the config the script wrote puts the `[[Team Relay]]` stanza in the file,
+/// atomically and owner-only, and restarts the running service so it dials it; a second
+/// relay replaces the stanza, leaving the file as a fresh run with that relay writes it;
+/// the same relay again changes nothing and restarts nothing.
+#[test]
+fn relay_on_the_scripts_own_config_replaces_the_stanza_and_restarts_the_linux_service() {
+    let bash = bash_or_skip!();
+    let _port = hold_loopback_4242();
+    let Some(_listener) = loopback_4242_open() else {
+        eprintln!("skipping: cannot bind 127.0.0.1:4242");
+        return;
+    };
+    let home = Home::new("relay-append");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .uname_answering("Linux")
+        .fake("systemctl", &log, "exit 0");
+    let config = home.reticulum_config();
+
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--relay", "192.168.0.84:4244"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Added [[Team Relay]] -> 192.168.0.84:4244 to {} and restarted coyote-rnsd.",
+            config.display()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("already exists, not touched"), "{out}");
+    let text = fs::read_to_string(&config).unwrap();
+    assert_eq!(text.matches("[[Team Relay]]").count(), 1, "{text}");
+    assert!(
+        text.contains("    target_host = 192.168.0.84\n    target_port = 4244\n"),
+        "{text}"
+    );
+    assert_eq!(mode_of(&config), 0o600);
+    assert_eq!(
+        names_in(config.parent().unwrap()),
+        vec!["config".to_string()]
+    );
+    assert!(
+        recorded(&log).contains("systemctl --user restart coyote-rnsd\n"),
+        "{}",
+        recorded(&log)
+    );
+
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--relay", "relay.example.org:4965"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Added [[Team Relay]] -> relay.example.org:4965 to {} and restarted coyote-rnsd.",
+            config.display()
+        )),
+        "{out}"
+    );
+    let fresh = Home::new("relay-append-fresh");
+    fresh.seed_rnsd();
+    let (code, _, _) = run(&mut fresh.relay(
+        &bash,
+        &["--no-service", "--relay", "relay.example.org:4965"],
+    ));
+    assert_eq!(code, 0);
+    assert_eq!(
+        fs::read_to_string(&config).unwrap(),
+        fs::read_to_string(fresh.reticulum_config()).unwrap(),
+        "the replaced stanza leaves the file as a fresh run with that relay writes it"
+    );
+    assert!(recorded(&log).contains("systemctl --user restart coyote-rnsd\n"));
+
+    fs::write(&log, "").unwrap();
+    let before = fs::read(&config).unwrap();
+    let (code, out, _) = run(home
+        .relay(&bash, &["--relay", "relay.example.org:4965"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0);
+    assert!(!out.contains("Added [[Team Relay]]"), "{out}");
+    assert!(
+        out.contains("coyote-rnsd is already running; not restarted"),
+        "{out}"
+    );
+    assert_eq!(fs::read(&config).unwrap(), before);
+    assert!(!recorded(&log).contains("restart"), "{}", recorded(&log));
+}
+
+/// The macOS twin: the loaded agent whose plist did not change is restarted in place with
+/// `launchctl kickstart -k`; with `--no-service` the stanza is still added and the run says
+/// how to restart instead.
+#[test]
+fn relay_on_the_scripts_own_config_kickstarts_the_agent_or_says_how_to_restart() {
+    let bash = bash_or_skip!();
+    let _port = hold_loopback_4242();
+    let Some(_listener) = loopback_4242_open() else {
+        eprintln!("skipping: cannot bind 127.0.0.1:4242");
+        return;
+    };
+    let home = Home::new("relay-kickstart");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.uname_answering("Darwin").fake(
+        "launchctl",
+        &log,
+        "case \"$1\" in\n  print) [ -f \"$HOME/launchd.loaded\" ] && exit 0; exit 1 ;;\n  bootstrap) : > \"$HOME/launchd.loaded\"; exit 0 ;;\n  kickstart) exit 0 ;;\nesac\nexit 1",
+    );
+    let config = home.reticulum_config();
+    let uid = current_uid();
+
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--relay", "192.168.0.84:4244"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Added [[Team Relay]] -> 192.168.0.84:4244 to {} and restarted com.coyote.rnsd.",
+            config.display()
+        )),
+        "{out}"
+    );
+    let calls = recorded(&log);
+    assert!(
+        calls.contains(&format!(
+            "launchctl kickstart -k gui/{uid}/com.coyote.rnsd\n"
+        )),
+        "{calls}"
+    );
+    assert!(!calls.contains("bootout"), "{calls}");
+
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--relay", "10.0.0.9:4244"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Added [[Team Relay]] -> 10.0.0.9:4244 to {}. Restart rnsd so it dials the relay: launchctl kickstart -k gui/{uid}/com.coyote.rnsd",
+            config.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("target_host = 10.0.0.9\n")
+    );
+    assert_eq!(recorded(&log), "", "--no-service calls no service manager");
+}
+
+/// `--relay` on a config the script did not write leaves the file alone: the stanza is
+/// printed and the closing line says where it goes and what to restart, per platform,
+/// instead of the usual next step. A dry run on the script's own config plans the edit.
+#[test]
+fn relay_on_a_foreign_config_writes_nothing_and_names_the_path_and_the_restart() {
+    let bash = bash_or_skip!();
+    let home = Home::new("relay-foreign");
+    home.seed_rnsd();
+    let config = home.reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(&config, SERVES_COYOTE).unwrap();
+    let tools = Tools::new(&home);
+    let uid = current_uid();
+
+    for (os, restart) in [
+        ("Linux", "systemctl --user restart coyote-rnsd".to_string()),
+        (
+            "Darwin",
+            format!("launchctl kickstart -k gui/{uid}/com.coyote.rnsd"),
+        ),
+    ] {
+        tools.uname_answering(os);
+        let (code, out, err) = run(home
+            .relay(&bash, &["--no-service", "--relay", "192.168.0.84:4244"])
+            .env("PATH", tools.path()));
+        assert_eq!(code, 0, "{os}: stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains("target_host = 192.168.0.84") && out.contains("[[Team Relay]]"),
+            "{os}:\n{out}"
+        );
+        assert!(
+            out.ends_with(&format!(
+                "[coyote-mesh] Next: add the [[Team Relay]] stanza above to {}, then {restart}\n",
+                config.display()
+            )),
+            "{os}:\n{out}"
+        );
+        assert!(!out.contains("Next: start coyote"), "{os}:\n{out}");
+        assert!(!out.contains("Added [[Team Relay]]"), "{os}:\n{out}");
+        assert_eq!(fs::read_to_string(&config).unwrap(), SERVES_COYOTE);
+    }
+
+    let own = Home::new("relay-own-dry");
+    own.seed_rnsd();
+    let (code, _, _) = run(&mut own.relay(&bash, &["--no-service"]));
+    assert_eq!(code, 0);
+    let before = fs::read(own.reticulum_config()).unwrap();
+    let (code, out, err) = run(&mut own.relay(
+        &bash,
+        &["--no-service", "--dry-run", "--relay", "192.168.0.84:4244"],
+    ));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Would add [[Team Relay]] -> 192.168.0.84:4244 to {}",
+            own.reticulum_config().display()
+        )),
+        "{out}"
+    );
+    assert_eq!(fs::read(own.reticulum_config()).unwrap(), before);
 }
 
 #[test]
@@ -665,30 +1061,27 @@ fn a_relay_lands_in_a_fresh_config_and_an_existing_config_is_only_printed_around
         );
     }
 
-    // A later run with a different relay prints the stanza but leaves the file alone.
-    let before = fs::read(&config).unwrap();
+    // A later run with a different relay replaces the stanza in the file the script wrote.
     let (code, out, _) =
         run(&mut home.relay(&bash, &["--no-service", "--relay", "other.example:5000"]));
     assert_eq!(code, 0);
-    assert!(out.contains("already exists, not touched"), "{out}");
+    let text = fs::read_to_string(&config).unwrap();
     assert!(
-        out.contains("target_host = other.example") && out.contains("target_port = 5000"),
-        "{out}"
-    );
-    assert_eq!(
-        fs::read(&config).unwrap(),
-        before,
-        "an existing config was modified"
+        text.contains("target_host = other.example")
+            && text.contains("target_port = 5000")
+            && !text.contains("relay.example"),
+        "{out}\n{text}"
     );
 
-    // A hand-written config the script knows nothing about gets the same treatment.
+    // A hand-written config the script knows nothing about is never written to; this one
+    // cannot serve Coyote at all, so the run stops with exit 2.
     let other = Home::new("relay-existing");
     other.seed_rnsd();
     fs::create_dir_all(other.reticulum_config().parent().unwrap()).unwrap();
     fs::write(other.reticulum_config(), "custom\n").unwrap();
     let (code, out, _) =
         run(&mut other.relay(&bash, &["--no-service", "--relay", "relay.example:4242"]));
-    assert_eq!(code, 0);
+    assert_eq!(code, 2);
     assert_eq!(
         fs::read_to_string(other.reticulum_config()).unwrap(),
         "custom\n"
@@ -1324,7 +1717,7 @@ fn an_rnsd_on_path_is_linked_into_bin_dir_and_no_installer_runs() {
     // The same file with an AutoInterface: the warning comes back, the file still untouched.
     fs::write(
         &config,
-        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n",
+        format!("{SERVES_COYOTE}  [[LAN]]\n    type = AutoInterface\n"),
     )
     .unwrap();
     let before = fs::read(&config).unwrap();
@@ -2702,7 +3095,7 @@ fn the_firewall_warning_follows_an_enabled_autointerface_and_the_os() {
 
     fs::write(
         &config,
-        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n    enabled = No\n  [[Loop]]\n    type = TCPServerInterface\n    enabled = Yes\n",
+        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n    enabled = No\n  [[Loop]]\n    type = TCPServerInterface\n    enabled = Yes\n    listen_port = 4242\n",
     )
     .unwrap();
     let (code, out, err) = run(home
@@ -2716,7 +3109,7 @@ fn the_firewall_warning_follows_an_enabled_autointerface_and_the_os() {
 
     fs::write(
         &config,
-        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n    enabled = Yes\n",
+        format!("{SERVES_COYOTE}  [[LAN]]\n    type = AutoInterface\n    enabled = Yes\n"),
     )
     .unwrap();
     let (code, out, _) = run(home
@@ -2753,7 +3146,7 @@ fn a_config_under_dot_config_reticulum_is_the_one_rnsd_reads_and_the_service_pin
     home.seed_rnsd();
     let config = home.xdg_reticulum_config();
     fs::create_dir_all(config.parent().unwrap()).unwrap();
-    fs::write(&config, "custom\n").unwrap();
+    fs::write(&config, SERVES_COYOTE).unwrap();
     let dir = config.parent().unwrap().display().to_string();
 
     let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
@@ -2770,7 +3163,7 @@ fn a_config_under_dot_config_reticulum_is_the_one_rnsd_reads_and_the_service_pin
         !home.path().join(".reticulum").exists(),
         "~/.reticulum must not be created when rnsd reads ~/.config/reticulum"
     );
-    assert_eq!(fs::read_to_string(&config).unwrap(), "custom\n");
+    assert_eq!(fs::read_to_string(&config).unwrap(), SERVES_COYOTE);
 
     let log = home.path().join("calls.log");
     let tools = Tools::new(&home);
@@ -2811,7 +3204,7 @@ fn a_system_config_under_etc_reticulum_is_print_only_and_skips_the_service() {
     home.seed_rnsd();
     let etc = home.path().join("etc-reticulum");
     fs::create_dir_all(&etc).unwrap();
-    fs::write(etc.join("config"), "system\n").unwrap();
+    fs::write(etc.join("config"), SERVES_COYOTE).unwrap();
     let log = home.path().join("calls.log");
     let tools = Tools::new(&home);
     tools
@@ -2845,7 +3238,10 @@ fn a_system_config_under_etc_reticulum_is_print_only_and_skips_the_service() {
     );
     assert!(!home.config_home().join("systemd").exists());
     assert!(!home.path().join(".reticulum").exists());
-    assert_eq!(fs::read_to_string(etc.join("config")).unwrap(), "system\n");
+    assert_eq!(
+        fs::read_to_string(etc.join("config")).unwrap(),
+        SERVES_COYOTE
+    );
 }
 
 /// An rnsd under uv's tool tree that reports an older version than the pin is
@@ -3531,6 +3927,42 @@ fn the_dry_run_plan_is_the_config_block_the_deployment_page_quotes_line_for_line
             .collect::<Vec<_>>(),
         ["mesh:", "interfaces:", "- type: local"],
         "the script's matching-config snippet and the page's yaml block disagree on the interfaces entry"
+    );
+
+    // The silent-LAN fix: one host listens on its LAN address, the others run the script
+    // with `--relay`, and the page shows the stanza that run adds.
+    let (code, lan_out, err) = run(&mut home.relay(
+        &bash,
+        &["--no-service", "--dry-run", "--relay", "192.168.0.84:4244"],
+    ));
+    assert_eq!(code, 0, "stdout:\n{lan_out}\nstderr:\n{err}");
+    let lan_relay_stanza = planned_config_lines(&lan_out)[plain.len()..].to_vec();
+    let silent = wiki_section(&page, "## When the LAN is silent");
+    let silent_blocks = fenced_text_blocks(&silent);
+    let server = silent_blocks
+        .iter()
+        .find(|block| block.iter().any(|line| line == "[[LAN Relay]]"))
+        .unwrap_or_else(|| {
+            panic!("`## When the LAN is silent` has no [[LAN Relay]] block:\n{silent}")
+        });
+    for line in [
+        "type = TCPServerInterface",
+        "enabled = Yes",
+        "listen_ip = 192.168.0.84",
+        "listen_port = 4244",
+    ] {
+        assert!(
+            server.iter().any(|have| have == line),
+            "the [[LAN Relay]] block lacks {line:?}: {server:?}"
+        );
+    }
+    assert!(
+        silent_blocks.contains(&lan_relay_stanza),
+        "`## When the LAN is silent` does not show the stanza `--relay 192.168.0.84:4244` adds: {lan_relay_stanza:?}"
+    );
+    assert!(
+        silent.contains("scripts/mesh-relay.sh --relay 192.168.0.84:4244"),
+        "{silent}"
     );
 }
 

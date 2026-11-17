@@ -216,6 +216,37 @@ fn a_task_already_registered_with_this_shape_and_running_is_left_alone() {
     run.assert_store_holds_the_desired_shape();
 }
 
+/// A running task whose definition is unchanged is stopped and started once after
+/// `-Relay` added the `[[Team Relay]]` stanza to the config, so rnsd dials the relay.
+#[test]
+fn a_running_task_is_restarted_once_after_the_relay_stanza_was_added() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "unchanged-running-relay-added");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    assert_eq!(run.call_count("Register-ScheduledTask"), 0, "{out}");
+    assert_eq!(run.call_count("Set-ScheduledTask"), 0, "{out}");
+    assert_eq!(
+        run.calls()
+            .lines()
+            .filter(|line| line.contains("ScheduledTask 'Coyote rnsd'") && !line.starts_with("Get-"))
+            .collect::<Vec<_>>(),
+        [
+            "Stop-ScheduledTask 'Coyote rnsd'",
+            "Start-ScheduledTask 'Coyote rnsd'"
+        ],
+        "{out}"
+    );
+    assert_eq!(run.call_count("Wait-Ready"), 1, "{out}");
+    assert!(
+        run.stdout
+            .contains("Restarting 'Coyote rnsd' so it dials the new [[Team Relay]]..."),
+        "{out}"
+    );
+    assert!(!run.stdout.contains("not restarted"), "{out}");
+    assert_eq!(run.state(), "Running", "{out}");
+}
+
 /// A changed action and a changed trigger are both stored with one full
 /// `Set-ScheduledTask`, the running instance is left alone and the restart pair is
 /// printed. The trigger case is what an action-only compare could not see.

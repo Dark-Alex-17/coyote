@@ -33,6 +33,8 @@ $script:ListenPort = 4242
 $script:RnsdCmd = Join-Path (Join-Path $root 'bin') 'rnsd.cmd'
 $script:RnsDir = Join-Path $root '.reticulum'
 $script:LogFile = Join-Path (Join-Path $root 'logs') 'rnsd.log'
+$script:RelayAdded = $false
+$script:RnsdReload = ''
 $testUser = 'TESTHOST\tester'
 
 function Add-Call([string]$Line) {
@@ -145,6 +147,17 @@ function Start-ScheduledTask {
   }
 }
 
+function Stop-ScheduledTask {
+  [CmdletBinding(SupportsShouldProcess)]
+  param([string]$TaskName)
+  Add-Call "Stop-ScheduledTask '$TaskName'"
+  if ($PSCmdlet.ShouldProcess($TaskName)) {
+    $task = Read-Store
+    $task.State = 'Ready'
+    Write-Store $task
+  }
+}
+
 # The stored task before Install-Service runs: the desired shape, except where the
 # scenario's arguments deviate from it.
 function Initialize-Store([string]$State, [string]$Arguments, [string]$TriggerClass) {
@@ -161,6 +174,10 @@ $desiredArguments = Get-TaskActionArgument
 switch ($Scenario) {
   'fresh' { }
   'unchanged-running' { Initialize-Store 'Running' $desiredArguments 'MSFT_TaskLogonTrigger' }
+  'unchanged-running-relay-added' {
+    Initialize-Store 'Running' $desiredArguments 'MSFT_TaskLogonTrigger'
+    $script:RelayAdded = $true
+  }
   'changed-arguments-running' { Initialize-Store 'Running' '/c stale' 'MSFT_TaskLogonTrigger' }
   'changed-trigger-running' { Initialize-Store 'Running' $desiredArguments 'MSFT_TaskDailyTrigger' }
   'stale-ready' { Initialize-Store 'Ready' '/c stale' 'MSFT_TaskLogonTrigger' }

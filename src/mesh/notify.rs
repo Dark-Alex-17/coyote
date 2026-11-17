@@ -29,16 +29,19 @@ pub(crate) enum Source {
     Propagation,
     /// Access requests from trusted peers asking to read paths this node does not share.
     Access,
+    /// Advice on reaching peers through a relay when the node's own network carries none.
+    Relay,
 }
 
 impl Source {
-    pub(crate) const ALL: [Source; 6] = [
+    pub(crate) const ALL: [Source; 7] = [
         Source::Mesh,
         Source::Knock,
         Source::Message,
         Source::Reply,
         Source::Propagation,
         Source::Access,
+        Source::Relay,
     ];
 
     pub(crate) fn prefix(self) -> &'static str {
@@ -49,6 +52,7 @@ impl Source {
             Source::Reply => "[mesh:reply]",
             Source::Propagation => "[mesh:propagation]",
             Source::Access => "[mesh:access]",
+            Source::Relay => "[mesh:relay]",
         }
     }
 }
@@ -360,6 +364,7 @@ mod tests {
             Source::Reply,
             Source::Propagation,
             Source::Access,
+            Source::Relay,
         ] {
             match source {
                 Source::Mesh
@@ -367,11 +372,12 @@ mod tests {
                 | Source::Message
                 | Source::Reply
                 | Source::Propagation
-                | Source::Access => {}
+                | Source::Access
+                | Source::Relay => {}
             }
             assert!(Source::ALL.contains(&source), "{source:?} missing from ALL");
         }
-        assert_eq!(Source::ALL.len(), 6);
+        assert_eq!(Source::ALL.len(), 7);
         for source in Source::ALL {
             assert!(source.prefix().starts_with("[mesh"), "{source:?}");
         }
@@ -381,6 +387,7 @@ mod tests {
         assert_eq!(Source::Reply.prefix(), "[mesh:reply]");
         assert_eq!(Source::Propagation.prefix(), "[mesh:propagation]");
         assert_eq!(Source::Access.prefix(), "[mesh:access]");
+        assert_eq!(Source::Relay.prefix(), "[mesh:relay]");
     }
 
     #[test]

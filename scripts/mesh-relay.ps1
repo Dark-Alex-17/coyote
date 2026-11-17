@@ -22,7 +22,9 @@ Parameters:
   -AllowRoot          Permit running as Administrator.
 
 Exit codes: 0 done or nothing to do; 1 usage; 2 unsupported OS or no way to
-install rnsd; 3 task registered but 127.0.0.1:4242 did not come up in 30 s.
+install rnsd, or an existing config without the 127.0.0.1:4242 listener or with
+enable_transport off (no task is registered then); 3 task registered but 127.0.0.1:4242
+did not come up in 30 s.
 #>
 
 [CmdletBinding()]
@@ -213,6 +215,130 @@ function Test-ConfigEnablesAutoInterface {
   return ($inAuto -and $enabled)
 }
 
+function Test-ConfigEnablesTransport {
+  param([string]$Path)
+  return [bool](Select-String -LiteralPath $Path -Pattern '^\s*enable_transport\s*=\s*(true|yes)' -Quiet)
+}
+
+# True for a target_host outside loopback and the RFC1918 ranges. A name other than
+# localhost counts as public: what it resolves to is not this script's to guess.
+function Test-PublicHost {
+  param([string]$Target)
+  if ($Target -eq 'localhost' -or $Target -eq '::1') { return $false }
+  if ($Target -match '^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$') {
+    $a = [int]$Matches[1]
+    $b = [int]$Matches[2]
+    if ($a -eq 10 -or $a -eq 127) { return $false }
+    if ($a -eq 172 -and $b -ge 16 -and $b -le 31) { return $false }
+    if ($a -eq 192 -and $b -eq 168) { return $false }
+  }
+  return $true
+}
+
+# The existing config's stanzas: ServesSessions when an enabled TCPServerInterface listens
+# on $ListenPort, and PublicDials, the enabled TCPClientInterface stanzas that dial a public host.
+function Read-ConfigStanzas {
+  param([string]$Path)
+  $stanzas = New-Object System.Collections.Generic.List[hashtable]
+  $current = @{ Type = ''; Enabled = $true; Port = ''; Target = '' }
+  foreach ($line in [IO.File]::ReadAllLines($Path)) {
+    if ($line -match '^\s*\[') {
+      $stanzas.Add($current)
+      $current = @{ Type = ''; Enabled = $true; Port = ''; Target = '' }
+    } elseif ($line -match '^\s*type\s*=\s*([A-Za-z]+)') {
+      $current.Type = $Matches[1]
+    } elseif ($line -match '^\s*(interface_)?enabled\s*=\s*(no|false|0)\b') {
+      $current.Enabled = $false
+    } elseif ($line -match '^\s*listen_port\s*=\s*(\d+)') {
+      $current.Port = $Matches[1]
+    } elseif ($line -match '^\s*target_host\s*=\s*([^\s#]+)') {
+      $current.Target = $Matches[1]
+    }
+  }
+  $stanzas.Add($current)
+  $serves = $false
+  $public = 0
+  foreach ($stanza in $stanzas) {
+    if (-not $stanza.Enabled) { continue }
+    if ($stanza.Type -eq 'TCPServerInterface' -and $stanza.Port -eq "$ListenPort") { $serves = $true }
+    if ($stanza.Type -eq 'TCPClientInterface' -and $stanza.Target -and (Test-PublicHost -Target $stanza.Target)) { $public++ }
+  }
+  return @{ ServesSessions = $serves; PublicDials = $public }
+}
+
+# An rnsd on this config would never open 127.0.0.1:$ListenPort or would not relay between
+# sessions, so the run stops before registering a task that could only time out.
+function Stop-UnlessConfigServesCoyote {
+  param([bool]$ServesSessions, [bool]$Transport)
+  $gap = ''
+  if (-not $ServesSessions) { $gap = "has no [[Coyote Sessions]] stanza on 127.0.0.1:$ListenPort" }
+  if (-not $Transport) {
+    if ($gap) { $gap += ' and enable_transport is off' } else { $gap = 'has enable_transport off' }
+  }
+  if (-not $gap) { return }
+  Write-Failure "Your Reticulum config at $script:RnsConfig $gap, so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again."
+  exit 2
+}
+
+# True when the existing config opens with the header Get-ConfigText writes.
+function Test-ConfigIsOwn {
+  param([string]$Path)
+  $header = ((Get-ConfigText) -split "\r?\n")[0]
+  $first = @([IO.File]::ReadAllLines($Path) | Select-Object -First 1)
+  return ($first.Count -gt 0 -and $first[0] -ceq $header)
+}
+
+# The existing config's lines without its [[Team Relay]] stanza (up to the next section
+# header), without the comment this script writes above that stanza, and without trailing blank lines.
+function Get-ConfigLinesWithoutTeamRelay {
+  param([string]$Path)
+  $kept = New-Object System.Collections.Generic.List[string]
+  $pending = New-Object System.Collections.Generic.List[string]
+  $skipping = $false
+  foreach ($line in [IO.File]::ReadAllLines($Path)) {
+    if ($line -match '^\s*\[\[Team Relay\]\]') {
+      $skipping = $true
+      $pending.Clear()
+      continue
+    }
+    if ($line -match '^\s*\[') { $skipping = $false }
+    if ($skipping) { continue }
+    if ($line -match '^\s*$' -or $line -match "^\s*# Your team's relay ") {
+      $pending.Add($line)
+      continue
+    }
+    $kept.AddRange($pending)
+    $pending.Clear()
+    $kept.Add($line)
+  }
+  return ,$kept.ToArray()
+}
+
+function Get-RestartCommand {
+  return "Stop-ScheduledTask -TaskName '$TaskName'; Start-ScheduledTask -TaskName '$TaskName'"
+}
+
+# -Relay on a config this script wrote: the [[Team Relay]] stanza replaces the one the file
+# holds, if any, in one atomic write, and RelayAdded has the service step restart the task.
+function Add-TeamRelay {
+  $interfaces = Get-InterfaceText
+  $stanza = $interfaces.Substring($interfaces.IndexOf("  # Your team's relay"))
+  $text = ((Get-ConfigLinesWithoutTeamRelay -Path $script:RnsConfig) -join "`n") + "`n`n" + $stanza + "`n"
+  if ($text -ceq [IO.File]::ReadAllText($script:RnsConfig)) {
+    Write-Info "$script:RnsConfig already dials ${script:RelayHost}:$script:RelayPort as its [[Team Relay]]; not touched"
+    return
+  }
+  if ($DryRun) {
+    Write-Info "Would add [[Team Relay]] -> ${script:RelayHost}:$script:RelayPort to ${script:RnsConfig}:"
+    Write-Output ''
+    Write-Output $stanza
+    Write-Output ''
+    return
+  }
+  Write-TextFile -Path $script:RnsConfig -Text $text
+  $script:RelayAdded = $true
+}
+
 # Writes to a temp file beside the target and moves it into place, so a crash never leaves a half-written file.
 function Write-TextFile {
   param([string]$Path, [string]$Text, [Text.Encoding]$Encoding = (New-Object System.Text.UTF8Encoding($false)))
@@ -241,15 +367,23 @@ function Get-OemEncoding {
 
 function Write-Config {
   if (Test-Path -LiteralPath $script:RnsConfig -PathType Leaf) {
+    $stanzas = Read-ConfigStanzas -Path $script:RnsConfig
+    $transport = Test-ConfigEnablesTransport -Path $script:RnsConfig
+    if ($script:RelayHost -and $stanzas.ServesSessions -and $transport -and (Test-ConfigIsOwn -Path $script:RnsConfig)) {
+      Add-TeamRelay
+      return
+    }
     Write-Info "$script:RnsConfig already exists, not touched. Make sure it carries these settings and stanzas:"
     Write-Output ''
     Write-Output (Get-SettingsText)
     Write-Output (Get-InterfaceText)
     Write-Output ''
-    if (-not (Select-String -LiteralPath $script:RnsConfig -Pattern '^\s*enable_transport\s*=\s*(true|yes)' -Quiet)) {
-      Write-Info "WARNING: $script:RnsConfig does not set enable_transport = True; without it this rnsd will not relay between Coyote sessions."
+    if ($stanzas.PublicDials -gt 0) {
+      Write-Info "Note: this config also dials $($stanzas.PublicDials) public Reticulum nodes; your announces reach them (see mesh.display_name_on_public)."
     }
+    Stop-UnlessConfigServesCoyote -ServesSessions $stanzas.ServesSessions -Transport $transport
     if (Test-ConfigEnablesAutoInterface -Path $script:RnsConfig) { Write-FirewallWarning }
+    if ($script:RelayHost) { $script:RelayForHandEdit = $true }
     return
   }
   if ($DryRun) {
@@ -585,8 +719,6 @@ function Write-ReadinessReport {
   $reported = @(Select-String -LiteralPath $script:LogFile -Pattern 'Configuration loaded from' | Select-Object -Last 1)
   if ($reported.Count -gt 0) {
     Write-Info "The daemon reported: $($reported[0].Line)"
-  } else {
-    Write-Info 'The log does not name the config file at loglevel 4'
   }
 }
 
@@ -681,12 +813,18 @@ function Install-Service {
   if ($existing.State -eq 'Running') {
     if ($changed) {
       Write-Info "Note: the service definition changed; apply it with: Stop-ScheduledTask -TaskName '$TaskName'; Start-ScheduledTask -TaskName '$TaskName'"
+    } elseif ($script:RelayAdded) {
+      Write-Info "Restarting '$TaskName' so it dials the new [[Team Relay]]..."
+      Stop-ScheduledTask -TaskName $TaskName
+      Start-ScheduledTask -TaskName $TaskName
+      $script:RnsdReload = 'restarted'
     } else {
       Write-Info "'$TaskName' is already running; not restarted"
     }
   } else {
     Start-ScheduledTask -TaskName $TaskName
     Write-Info "Started '$TaskName'"
+    $script:RnsdReload = 'started'
   }
   Write-Info "Logs: $script:LogFile"
   Wait-Ready
@@ -696,6 +834,14 @@ function Install-Service {
 }
 
 function Write-NextStep {
+  if ($script:RelayAdded) {
+    $relay = "${script:RelayHost}:$script:RelayPort"
+    switch ($script:RnsdReload) {
+      'restarted' { Write-Info "Added [[Team Relay]] -> $relay to $script:RnsConfig and restarted '$TaskName'." }
+      'started' { Write-Info "Added [[Team Relay]] -> $relay to $script:RnsConfig and started '$TaskName'." }
+      default { Write-Info "Added [[Team Relay]] -> $relay to $script:RnsConfig. Restart rnsd so it dials the relay: $(Get-RestartCommand)" }
+    }
+  }
   Write-Info "Diagnostics: 'rnstatus' attaches to the shared instance and lists its interfaces"
   Write-Info 'Matching coyote config (this is the shipped default; normally nothing to paste):'
   Write-Output ''
@@ -705,7 +851,11 @@ mesh:
     - type: local
 "@
   Write-Output ''
-  Write-Info 'Next: start coyote and run `.mesh on`'
+  if ($script:RelayForHandEdit) {
+    Write-Info "Next: add the [[Team Relay]] stanza above to $script:RnsConfig, then $(Get-RestartCommand)"
+  } else {
+    Write-Info 'Next: start coyote and run `.mesh on`'
+  }
 }
 
 if ($Help) {
@@ -721,6 +871,9 @@ if (-not $isWin) {
 
 $script:RelayHost = ''
 $script:RelayPort = ''
+$script:RelayAdded = $false
+$script:RelayForHandEdit = $false
+$script:RnsdReload = ''
 if ($Relay) {
   if ($Relay -match '^([A-Za-z0-9._-]+):([0-9]{1,5})$' -and [int]$Matches[2] -ge 1 -and [int]$Matches[2] -le 65535) {
     $script:RelayHost = $Matches[1]

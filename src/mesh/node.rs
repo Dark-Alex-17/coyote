@@ -115,7 +115,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, sleep, timeout, timeout_at};
+use tokio::time::{interval, interval_at, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 /// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
@@ -148,6 +148,11 @@ const LOCAL_EVENT_CAPACITY: usize = 64;
 /// How long the shared-instance client waits before redialing rnsd after a drop; the row
 /// reads `lost, retrying` until a redial lands.
 const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
+/// How long a node on `lan` or `local` alone goes without hearing any peer before it
+/// suggests a TCP relay, and how often it looks again until it has.
+const LAN_PEERLESS_GRACE_SECS: u64 = 120;
+/// The idle line for a LAN that stayed silent through `LAN_PEERLESS_GRACE_SECS`.
+const LAN_SILENT_HINT: &str = "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find peers; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -3904,7 +3909,8 @@ fn reconcile_tcp_after_lag(
 /// by itself, so no line is printed and no announce sent for an rnsd. The watcher holds
 /// no peer-controlled state: a fixed list from the node's own config, two flags, a
 /// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
-/// when the node or its slot is gone.
+/// when the node or its slot is gone. Every `LAN_PEERLESS_GRACE_SECS` until it is told,
+/// the watcher also asks `lan_silent_hint_due` whether to print `LAN_SILENT_HINT`.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -3923,10 +3929,32 @@ async fn watch_interfaces(
     let Some(mut events) = events else {
         return;
     };
+    let grace = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
+    let mut lan_silent_ticks = interval_at(tokio::time::Instant::now() + grace, grace);
+    let mut lan_silent_told = false;
     loop {
         let mut transitions = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
+            _ = lan_silent_ticks.tick(), if !lan_silent_told => {
+                let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
+                    return;
+                };
+                let joined_at = runtime.joined_at();
+                let kinds: Vec<&str> = runtime.interface_states().iter().map(|status| status.kind).collect();
+                let any_peer_heard = runtime.peers().snapshot().iter().any(|peer| peer.last_seen >= joined_at);
+                let elapsed = joined_at.elapsed().unwrap_or_default();
+                if lan_silent_hint_due(elapsed, &kinds, any_peer_heard, lan_silent_told) {
+                    lan_silent_told = true;
+                    info!("Mesh heard no other host on the LAN within {LAN_PEERLESS_GRACE_SECS}s; suggested a TCP relay");
+                    slot.push_idle(IdleNotify {
+                        source: Source::Relay,
+                        text: LAN_SILENT_HINT.into(),
+                        origin: Origin::Local,
+                        model_note: None,
+                    });
+                }
+            }
             received = next_interface_event(&mut events) => match received {
                 Ok(event) => {
                     transitions.extend(follow_tcp_event(&mut watches, event.iface(), event.kind()));
@@ -4036,6 +4064,24 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
             "{label} reconnected; this session does not announce, so nothing was sent over it. To announce, set `mesh.announce` to true in the config and restart Coyote."
         ),
     }
+}
+
+/// Whether `LAN_SILENT_HINT` is due: not told yet, up `LAN_PEERLESS_GRACE_SECS`, joined
+/// through a `lan` or `local` interface with no `private` relay configured, and no peer
+/// heard in this run. Neither the in-process AutoInterface nor the shared-instance client
+/// reports AutoInterface peer counts, so a heard peer is what tells the LAN works; the
+/// LAN may also simply be empty while the mesh works, which a heard peer shows too.
+fn lan_silent_hint_due(
+    elapsed: Duration,
+    kinds: &[&str],
+    any_peer_heard: bool,
+    already_told: bool,
+) -> bool {
+    !already_told
+        && !any_peer_heard
+        && elapsed >= Duration::from_secs(LAN_PEERLESS_GRACE_SECS)
+        && kinds.iter().any(|kind| matches!(*kind, "lan" | "local"))
+        && !kinds.contains(&"private")
 }
 
 /// Folds one state event of the attached `local` rnsd's client into its row. `Connected`
@@ -4771,7 +4817,13 @@ impl MeshSlot {
         // Fired outside the lock: the sink is not the slot's to trust with it.
         drop(slot);
         self.hooks.fire(MeshEvent::Started(facts));
-        if !runtime.watched_interfaces().is_empty() {
+        // A `lan` interface has nothing to watch, but its silence is told from the watcher.
+        if !runtime.watched_interfaces().is_empty()
+            || runtime
+                .interface_states()
+                .iter()
+                .any(|status| status.kind == "lan")
+        {
             runtime.register_task(tokio::spawn(watch_interfaces(
                 Arc::downgrade(self),
                 Arc::downgrade(&runtime),
@@ -18478,6 +18530,80 @@ mod tests {
                 "the hour holds the second, third and fourth greetings and the one just taken"
             );
             assert!(budget.take(at(3660)), "an hour after the second greeting");
+        }
+    }
+
+    mod lan_silent_hint_tests {
+        use super::*;
+
+        const GRACE: Duration = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
+
+        #[test]
+        fn the_hint_is_due_at_the_grace_on_a_lan_only_node_that_heard_nobody() {
+            assert_eq!(LAN_PEERLESS_GRACE_SECS, 120);
+            for kinds in [
+                &["lan"][..],
+                &["local"],
+                &["lan", "local"],
+                &["local", "public"],
+            ] {
+                assert!(lan_silent_hint_due(GRACE, kinds, false, false), "{kinds:?}");
+                assert!(
+                    lan_silent_hint_due(GRACE * 3, kinds, false, false),
+                    "{kinds:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn the_hint_is_not_due_before_the_grace() {
+            assert!(!lan_silent_hint_due(
+                GRACE - Duration::from_millis(1),
+                &["lan"],
+                false,
+                false
+            ));
+            assert!(!lan_silent_hint_due(
+                Duration::ZERO,
+                &["local"],
+                false,
+                false
+            ));
+        }
+
+        #[test]
+        fn a_private_interface_or_no_lan_interface_keeps_the_hint_away() {
+            for kinds in [
+                &["lan", "private"][..],
+                &["private", "local"],
+                &["public"],
+                &[],
+            ] {
+                assert!(
+                    !lan_silent_hint_due(GRACE, kinds, false, false),
+                    "{kinds:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_heard_peer_keeps_the_hint_away() {
+            assert!(!lan_silent_hint_due(GRACE, &["lan"], true, false));
+            assert!(!lan_silent_hint_due(GRACE, &["local"], true, false));
+        }
+
+        #[test]
+        fn the_hint_is_printed_once() {
+            assert!(!lan_silent_hint_due(GRACE, &["lan"], false, true));
+            assert!(!lan_silent_hint_due(GRACE * 10, &["local"], false, true));
+        }
+
+        #[test]
+        fn the_hint_points_at_the_deployment_page_section() {
+            assert_eq!(
+                LAN_SILENT_HINT,
+                "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find peers; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
+            );
         }
     }
 

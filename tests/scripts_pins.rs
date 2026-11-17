@@ -160,16 +160,24 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
             "Get-TaskShape must compare {token}: a registered task is matched on its whole shape, not only the action arguments"
         );
     }
+    let relay_branch = ps1
+        .split("} elseif ($script:RelayAdded) {")
+        .nth(1)
+        .and_then(|rest| rest.split("} else {").next())
+        .expect("mesh-relay.ps1 restarts a running task after adding the [[Team Relay]] stanza");
     let stop_lines: Vec<&str> = ps1
         .lines()
         .filter(|line| line.contains("Stop-ScheduledTask"))
+        .filter(|line| !relay_branch.lines().any(|branch| branch == *line))
         .collect();
     assert!(
         !stop_lines.is_empty()
-            && stop_lines
-                .iter()
-                .all(|line| line.contains("Note:") || line.contains("Would run:")),
-        "Stop-ScheduledTask is advice only; a running task is never restarted by the script: {stop_lines:?}"
+            && stop_lines.iter().all(|line| {
+                line.contains("Note:")
+                    || line.contains("Would run:")
+                    || line.trim_start().starts_with("return \"Stop-ScheduledTask")
+            }),
+        "Stop-ScheduledTask is advice only outside the [[Team Relay]] restart; a running task is otherwise never restarted by the script: {stop_lines:?}"
     );
     assert!(
         !ps1.contains("Test-NetConnection"),
@@ -1236,6 +1244,73 @@ fn relay_scripts_print_the_local_entry_as_the_matching_config() {
             "{name}'s matching-config snippet still carries `type: private`:\n{snippet}"
         );
     }
+}
+
+/// Both relay scripts stop with exit 2 on an existing config that cannot serve Coyote,
+/// explain it in the same words, count the public nodes such a config dials, edit only a
+/// config whose first line is their own header when `--relay` is given, and close with
+/// where to paste the stanza otherwise. Neither prints the loglevel line, which named a
+/// detail of rnsd's log rather than the problem.
+#[test]
+fn relay_scripts_stop_on_a_config_that_cannot_serve_coyote_and_edit_only_their_own() {
+    let sh = read(scripts_dir().join("mesh-relay.sh"));
+    let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
+    for (name, script) in [("mesh-relay.sh", &sh), ("mesh-relay.ps1", &ps1)] {
+        for needle in [
+            "Your Reticulum config at ",
+            "has no [[Coyote Sessions]] stanza on 127.0.0.1:",
+            " and enable_transport is off",
+            "has enable_transport off",
+            ", so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again.",
+            "Note: this config also dials ",
+            " public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).",
+            "Added [[Team Relay]] -> ",
+            "Next: add the [[Team Relay]] stanza above to ",
+        ] {
+            assert!(script.contains(needle), "{name} lacks {needle:?}");
+        }
+        assert!(
+            !script.contains("The log does not name the config file at loglevel 4"),
+            "{name} still prints the loglevel line before exit 3"
+        );
+        assert!(
+            !script.contains("does not set enable_transport = True; without it"),
+            "{name} still only warns about enable_transport instead of stopping"
+        );
+    }
+    for needle in [
+        "launchctl kickstart -k \"gui/$(id -u)/$LAUNCHD_LABEL\"",
+        "Would add [[Team Relay]] -> ",
+    ] {
+        assert!(sh.contains(needle), "mesh-relay.sh lacks {needle:?}");
+    }
+    for needle in [
+        "Stop-ScheduledTask -TaskName $TaskName",
+        "Would add [[Team Relay]] -> ",
+    ] {
+        assert!(ps1.contains(needle), "mesh-relay.ps1 lacks {needle:?}");
+    }
+
+    let exit_codes: String = sh
+        .lines()
+        .skip_while(|line| !line.starts_with("# Exit codes:"))
+        .map_while(|line| line.strip_prefix("# "))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        exit_codes.contains("enable_transport"),
+        "mesh-relay.sh's exit-2 clause must cover the config that cannot serve Coyote: {exit_codes:?}"
+    );
+    let ps1_exit_codes = ps1
+        .lines()
+        .skip_while(|line| !line.starts_with("Exit codes:"))
+        .take_while(|line| !line.starts_with("#>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        ps1_exit_codes.contains("enable_transport"),
+        "mesh-relay.ps1's exit-2 clause must cover the config that cannot serve Coyote: {ps1_exit_codes:?}"
+    );
 }
 
 /// The comment under `enable_transport = True` says why Coyote's heartbeat is hourly in

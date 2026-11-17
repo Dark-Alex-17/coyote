@@ -4791,6 +4791,7 @@ fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
         [
             "The ladder",
             "Setting up rnsd",
+            "When the LAN is silent",
             "Two laptops on one network",
             "Joining with some interfaces down",
             "Running without rnsd",
@@ -5046,6 +5047,55 @@ fn the_platform_page_names_the_services_and_quotes_the_firewall_prompts() {
         !page.contains("two-instances-on-one-machine"),
         "Mesh-Platform-Support.md still links the retired two-instance recipe"
     );
+}
+
+/// Every wiki URL with an anchor that Coyote prints, such as the idle line about a silent
+/// LAN, names a heading of that page by its GitHub slug.
+#[test]
+fn every_wiki_anchor_coyote_prints_resolves_to_a_heading() {
+    const WIKI_URL: &str = "https://github.com/Dark-Alex-17/coyote/wiki/";
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    rust_files(&repo_root().join("src"), &mut files);
+    let mut links = Vec::new();
+    for file in &files {
+        let text = read(file);
+        for (at, _) in text.match_indices(WIKI_URL) {
+            let rest = &text[at + WIKI_URL.len()..];
+            let link: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '#'))
+                .collect();
+            if let Some((page, anchor)) = link.split_once('#') {
+                links.push((file.clone(), page.to_string(), anchor.to_string()));
+            }
+        }
+    }
+    assert!(
+        links.iter().any(
+            |(_, page, anchor)| page == "Mesh-Deployment" && anchor == "when-the-lan-is-silent"
+        ),
+        "src/ no longer prints the Mesh-Deployment#when-the-lan-is-silent link: {links:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    for (file, page, anchor) in &links {
+        let slugs = heading_slugs(&read(wiki.join(format!("{page}.md"))));
+        assert!(
+            slugs.contains(anchor),
+            "{} links {page}#{anchor}, which is none of that page's headings: {slugs:?}",
+            file.display()
+        );
+    }
 }
 
 /// Every `](Page#anchor)` link from a Mesh page into one of the restructured pages names a

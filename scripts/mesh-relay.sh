@@ -25,9 +25,10 @@ set -euo pipefail
 #   COYOTE_MESH_ETC_RETICULUM=<dir>  Where the system config lives (default /etc/reticulum); for the test harness.
 #
 # Exit codes: 0 done or nothing to do; 1 usage; 2 unsupported OS or no way to
-# install rnsd; 3 service installed but it did not come up: 127.0.0.1:4242 stayed closed
-# for 30 s, launchd kept the old agent loaded for 5 s, or the new service failed to start
-# after the old one was stopped.
+# install rnsd, or an existing config without the 127.0.0.1:4242 listener or with
+# enable_transport off (nothing is installed as a service then); 3 service installed but
+# it did not come up: 127.0.0.1:4242 stayed closed for 30 s, launchd kept the old agent
+# loaded for 5 s, or the new service failed to start after the old one was stopped.
 
 # Must track `ARG RNS_VERSION` in deployment/propagation-node/Dockerfile (the interop-verified version).
 DEFAULT_RNS_SPEC="rns==1.5.2"
@@ -86,6 +87,9 @@ parse_args() {
   KEEP_RNSD=0
   DRY_RUN=0
   ALLOW_ROOT=0
+  RELAY_ADDED=0
+  RELAY_FOR_HAND_EDIT=0
+  RNSD_RELOAD=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -591,17 +595,164 @@ config_enables_autointerface() {
   [[ "$in_auto" -eq 1 && "$enabled" -eq 1 ]]
 }
 
+config_enables_transport() {
+  grep -qiE '^[[:space:]]*enable_transport[[:space:]]*=[[:space:]]*(true|yes)' "$RNS_CONFIG"
+}
+
+# True for a target_host outside loopback and the RFC1918 ranges. A name other than
+# localhost counts as public: what it resolves to is not this script's to guess.
+public_host() {
+  local a b
+  if [[ "$1" == "localhost" || "$1" == "::1" ]]; then return 1; fi
+  if [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+    a=$((10#${BASH_REMATCH[1]}))
+    b=$((10#${BASH_REMATCH[2]}))
+    if [[ "$a" -eq 10 || "$a" -eq 127 ]]; then return 1; fi
+    if [[ "$a" -eq 172 && "$b" -ge 16 && "$b" -le 31 ]]; then return 1; fi
+    if [[ "$a" -eq 192 && "$b" -eq 168 ]]; then return 1; fi
+  fi
+  return 0
+}
+
+# Folds one interface stanza into CONFIG_SERVES_SESSIONS and CONFIG_PUBLIC_DIALS: $1 its
+# type, $2 0 when it is switched off, $3 its listen_port, $4 its target_host.
+tally_stanza() {
+  if [[ "$2" -eq 0 ]]; then return 0; fi
+  if [[ "$1" == "TCPServerInterface" && "$3" == "$LISTEN_PORT" ]]; then CONFIG_SERVES_SESSIONS=1; fi
+  if [[ "$1" == "TCPClientInterface" && -n "$4" ]] && public_host "$4"; then
+    CONFIG_PUBLIC_DIALS=$((CONFIG_PUBLIC_DIALS + 1))
+  fi
+}
+
+# Reads the existing config's stanzas: CONFIG_SERVES_SESSIONS is 1 when an enabled
+# TCPServerInterface listens on $LISTEN_PORT, and CONFIG_PUBLIC_DIALS counts the enabled
+# TCPClientInterface stanzas that dial a public host.
+scan_existing_config() {
+  local line type="" enabled=1 port="" host=""
+  CONFIG_SERVES_SESSIONS=0
+  CONFIG_PUBLIC_DIALS=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*\[ ]]; then
+      tally_stanza "$type" "$enabled" "$port" "$host"
+      type=""; enabled=1; port=""; host=""
+    elif [[ "$line" =~ ^[[:space:]]*type[[:space:]]*=[[:space:]]*([A-Za-z]+) ]]; then
+      type="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*(interface_)?enabled[[:space:]]*=[[:space:]]*([Nn]o|[Ff]alse|0) ]]; then
+      enabled=0
+    elif [[ "$line" =~ ^[[:space:]]*listen_port[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+      port="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*target_host[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
+      host="${BASH_REMATCH[1]}"
+    fi
+  done < "$RNS_CONFIG"
+  tally_stanza "$type" "$enabled" "$port" "$host"
+}
+
+# An rnsd on this config would never open 127.0.0.1:$LISTEN_PORT or would not relay
+# between sessions, so the run stops before installing a service that could only time out.
+stop_unless_config_serves_coyote() {
+  local gap=""
+  if [[ "$CONFIG_SERVES_SESSIONS" -eq 0 ]]; then gap="has no [[Coyote Sessions]] stanza on 127.0.0.1:$LISTEN_PORT"; fi
+  if ! config_enables_transport; then
+    if [[ -n "$gap" ]]; then gap="$gap and enable_transport is off"; else gap="has enable_transport off"; fi
+  fi
+  if [[ -z "$gap" ]]; then return 0; fi
+  err "Your Reticulum config at $RNS_CONFIG $gap, so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again."
+  exit 2
+}
+
+# True when the existing config opens with the header config_text writes.
+config_is_own() {
+  local first="" header=""
+  IFS= read -r header < <(config_text) || true
+  IFS= read -r first < "$RNS_CONFIG" || true
+  [[ -n "$header" && "$first" == "$header" ]]
+}
+
+# The stanza interfaces_text adds for --relay, from the comment above it.
+team_relay_text() {
+  local text marker="  # Your team's relay"
+  text="$(interfaces_text)"
+  printf '%s%s\n' "$marker" "${text#*"$marker"}"
+}
+
+# The existing config without its [[Team Relay]] stanza (up to the next section header),
+# without the comment this script writes above that stanza, and without trailing blank lines.
+config_without_team_relay() {
+  local line pending="" skipping=0
+  local stanza='^[[:space:]]*\[\[Team Relay\]\]' comment="^[[:space:]]*# Your team's relay " blank='^[[:space:]]*$'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ $stanza ]]; then
+      skipping=1
+      pending=""
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*\[ ]]; then skipping=0; fi
+    if [[ "$skipping" -eq 1 ]]; then continue; fi
+    if [[ "$line" =~ $blank || "$line" =~ $comment ]]; then
+      pending="$pending$line"$'\n'
+      continue
+    fi
+    printf '%s%s\n' "$pending" "$line"
+    pending=""
+  done < "$RNS_CONFIG"
+}
+
+service_label() {
+  if [[ "$OS" == "darwin" ]]; then echo "$LAUNCHD_LABEL"; else echo "$SERVICE_NAME"; fi
+}
+
+restart_command() {
+  if [[ "$OS" == "darwin" ]]; then
+    echo "launchctl kickstart -k gui/$(id -u)/$LAUNCHD_LABEL"
+  else
+    echo "systemctl --user restart $SERVICE_NAME"
+  fi
+}
+
+# --relay on a config this script wrote: the [[Team Relay]] stanza replaces the one the
+# file holds, if any, in one owner-only atomic write, and RELAY_ADDED has the service step
+# restart the daemon so it dials the relay.
+add_team_relay() {
+  local text
+  text="$(config_without_team_relay)"$'\n\n'"$(team_relay_text)"
+  if [[ "$text" == "$(cat "$RNS_CONFIG")" ]]; then
+    log "$RNS_CONFIG already dials $RELAY_HOST:$RELAY_PORT as its [[Team Relay]]; not touched"
+    return 0
+  fi
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "Would add [[Team Relay]] -> $RELAY_HOST:$RELAY_PORT to $RNS_CONFIG (mode 600):"
+    echo
+    team_relay_text
+    echo
+    return 0
+  fi
+  TMP_FILE="$(umask 077 && mktemp "$RNS_DIR/.config.XXXXXX")"
+  printf '%s\n' "$text" > "$TMP_FILE"
+  chmod 600 "$TMP_FILE"
+  mv "$TMP_FILE" "$RNS_CONFIG"
+  TMP_FILE=""
+  RELAY_ADDED=1
+}
+
 write_config() {
   if [[ -f "$RNS_CONFIG" ]]; then
+    scan_existing_config
+    if [[ -n "$RELAY_HOST" && "$RNS_DIR_SYSTEM" -eq 0 && "$CONFIG_SERVES_SESSIONS" -eq 1 ]] && config_enables_transport && config_is_own; then
+      add_team_relay
+      return 0
+    fi
     log "$RNS_CONFIG already exists, not touched. Make sure it carries these settings and stanzas:"
     echo
     settings_text
     interfaces_text
     echo
-    if ! grep -qiE '^[[:space:]]*enable_transport[[:space:]]*=[[:space:]]*(true|yes)' "$RNS_CONFIG"; then
-      log "WARNING: $RNS_CONFIG does not set enable_transport = True; without it this rnsd will not relay between Coyote sessions."
+    if [[ "$CONFIG_PUBLIC_DIALS" -gt 0 ]]; then
+      log "Note: this config also dials $CONFIG_PUBLIC_DIALS public Reticulum nodes; your announces reach them (see mesh.display_name_on_public)."
     fi
+    stop_unless_config_serves_coyote
     if config_enables_autointerface; then firewall_warning; fi
+    if [[ -n "$RELAY_HOST" ]]; then RELAY_FOR_HAND_EDIT=1; fi
     return 0
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -736,8 +887,6 @@ readiness_diagnostics() {
   fi
   if [[ -n "$reported" ]]; then
     log "The daemon reported: $reported"
-  else
-    log "The log does not name the config file at loglevel 4"
   fi
 }
 
@@ -809,18 +958,24 @@ service_linux() {
   fi
   systemctl --user daemon-reload
   if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-    if [[ "$changed" -eq 1 ]]; then
-      log "Restarting $SERVICE_NAME so the new unit takes effect..."
+    if [[ "$changed" -eq 1 || "$RELAY_ADDED" -eq 1 ]]; then
+      if [[ "$changed" -eq 1 ]]; then
+        log "Restarting $SERVICE_NAME so the new unit takes effect..."
+      else
+        log "Restarting $SERVICE_NAME so it dials the new [[Team Relay]]..."
+      fi
       if ! systemctl --user restart "$SERVICE_NAME"; then
         err "systemctl --user restart $SERVICE_NAME failed and the service may be stopped; check: systemctl --user status $SERVICE_NAME, then run: systemctl --user restart $SERVICE_NAME"
         exit 3
       fi
+      RNSD_RELOAD="restarted"
     else
       log "$SERVICE_NAME is already running; not restarted"
     fi
   else
     systemctl --user enable --now "$SERVICE_NAME"
     log "Enabled and started $SERVICE_NAME"
+    RNSD_RELOAD="started"
   fi
   linger_hint
   wait_ready "journalctl --user -u $SERVICE_NAME"
@@ -896,6 +1051,14 @@ service_darwin() {
         exit 3
       fi
       log "Bootstrapped $LAUNCHD_LABEL"
+      RNSD_RELOAD="restarted"
+    elif [[ "$RELAY_ADDED" -eq 1 ]]; then
+      log "Restarting $LAUNCHD_LABEL so it dials the new [[Team Relay]]..."
+      if ! launchctl kickstart -k "gui/$(id -u)/$LAUNCHD_LABEL"; then
+        err "launchctl kickstart -k gui/$(id -u)/$LAUNCHD_LABEL failed; check: launchctl print gui/$(id -u)/$LAUNCHD_LABEL, then run that kickstart again"
+        exit 3
+      fi
+      RNSD_RELOAD="restarted"
     else
       log "$LAUNCHD_LABEL is already loaded; not restarted"
     fi
@@ -903,6 +1066,7 @@ service_darwin() {
     launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
     log "Bootstrapped $LAUNCHD_LABEL"
     firewall_pointer_darwin
+    RNSD_RELOAD="started"
   fi
   log "Logs: $LAUNCHD_LOG"
   wait_ready "$LAUNCHD_LOG"
@@ -912,6 +1076,13 @@ service_darwin() {
 }
 
 print_next_steps() {
+  if [[ "$RELAY_ADDED" -eq 1 ]]; then
+    case "$RNSD_RELOAD" in
+      restarted) log "Added [[Team Relay]] -> $RELAY_HOST:$RELAY_PORT to $RNS_CONFIG and restarted $(service_label).";;
+      started) log "Added [[Team Relay]] -> $RELAY_HOST:$RELAY_PORT to $RNS_CONFIG and started $(service_label).";;
+      *) log "Added [[Team Relay]] -> $RELAY_HOST:$RELAY_PORT to $RNS_CONFIG. Restart rnsd so it dials the relay: $(restart_command)";;
+    esac
+  fi
   log "Diagnostics: 'rnstatus' attaches to the shared instance and lists its interfaces"
   log "Matching coyote config (this is the shipped default; normally nothing to paste):"
   echo
@@ -921,7 +1092,13 @@ mesh:
     - type: local
 EOF
   echo
-  log "Next: start coyote and run \`.mesh on\`"
+  if [[ "$RELAY_FOR_HAND_EDIT" -eq 0 ]]; then
+    log "Next: start coyote and run \`.mesh on\`"
+  elif [[ "$RNS_DIR_SYSTEM" -eq 1 ]]; then
+    log "Next: add the [[Team Relay]] stanza above to $RNS_CONFIG, then restart the rnsd that reads it"
+  else
+    log "Next: add the [[Team Relay]] stanza above to $RNS_CONFIG, then $(restart_command)"
+  fi
 }
 
 main() {
