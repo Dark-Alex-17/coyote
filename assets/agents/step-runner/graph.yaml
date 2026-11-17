@@ -15,6 +15,7 @@ max_agent_depth: 4
 global_tools:
   - ast_grep.sh
   - fs_cat.sh
+  - fs_read.sh
   - fs_grep.sh
   - fs_ls.sh
   - fs_write.sh
