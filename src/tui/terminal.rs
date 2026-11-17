@@ -941,6 +941,19 @@ impl Screen {
         set_tty_modes(self.fd, &self.cooked)
     }
 
+    /// Drops what was typed while the terminal was released. Keys typed
+    /// at a cooked terminal wait in its line buffer, and switching raw
+    /// mode back on does not wake the event reader on Linux, so they
+    /// would otherwise surface with the next keystroke.
+    #[cfg(unix)]
+    fn discard_typeahead(&self) -> io::Result<()> {
+        // SAFETY: tcflush takes a descriptor and a queue selector only.
+        if unsafe { libc::tcflush(self.fd, libc::TCIFLUSH) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn restore_cooked_modes(&self) -> io::Result<()> {
         match self.input_mode {
@@ -987,6 +1000,10 @@ impl Screen {
     pub(crate) fn with_terminal_released<T>(&mut self, f: impl FnOnce() -> T) -> io::Result<T> {
         self.leave()?;
         let value = f();
+        #[cfg(unix)]
+        if let Err(err) = self.discard_typeahead() {
+            warn!("Failed to drop the input typed while the terminal was released: {err}");
+        }
         if let Err(err) = self.restore_cooked_modes() {
             warn!("Failed to restore the terminal modes after the terminal was released: {err}");
         }

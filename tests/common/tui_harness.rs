@@ -129,8 +129,12 @@ pub fn wait_wrapper_with_stdout_to(path: &Path) -> String {
 /// wrapper regains the terminal, says so, reports the tty flags it sees,
 /// and after a moment resumes the job with `fg` as a user would. (`fg`
 /// must keep its own stdout: redirecting it stops bash handing the tty
-/// over.)
-pub const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}'{args} <{stdin}; rc=$?; \
+/// over.) A non-interactive bash 3.2 (macOS's `/bin/bash`) never sees its
+/// foreground job stop and waits on it for good, so under bash 3 the
+/// wrapper first re-runs itself as an interactive shell.
+pub const JOB_CONTROL_WRAPPER: &str = "if [ \"${BASH_VERSINFO[0]}\" -lt 4 ] && [ -z \"${_JOB_CONTROL_SHELL:-}\" ]; then \
+     export _JOB_CONTROL_SHELL=1; exec bash --norc --noprofile -i -c \"$BASH_EXECUTION_STRING\"; fi; \
+     set -m; '{coyote}'{args} <{stdin}; rc=$?; \
      while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";

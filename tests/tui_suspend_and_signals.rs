@@ -32,8 +32,12 @@ const WAIT_WRAPPER: &str =
     "'{coyote}' <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 /// The user's shell shape: the binary is the foreground job; when it
 /// stops the wrapper reports what it sees and resumes it with `fg` after
-/// a second.
-const JOB_CONTROL_WRAPPER: &str = "set -m; '{coyote}' <{stdin}; rc=$?; \
+/// a second. A non-interactive bash 3.2 (macOS's `/bin/bash`) never sees
+/// its foreground job stop, so under bash 3 the wrapper first re-runs
+/// itself as an interactive shell.
+const JOB_CONTROL_WRAPPER: &str = "if [ \"${BASH_VERSINFO[0]}\" -lt 4 ] && [ -z \"${_JOB_CONTROL_SHELL:-}\" ]; then \
+     export _JOB_CONTROL_SHELL=1; exec bash --norc --noprofile -i -c \"$BASH_EXECUTION_STRING\"; fi; \
+     set -m; '{coyote}' <{stdin}; rc=$?; \
      while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";
