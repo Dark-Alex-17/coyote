@@ -2787,42 +2787,52 @@ nodes: {}
         assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
     }
 
-    /// Skills never widen an agent's `global_tools`, so every read-only tool
-    /// a skill an agent is told to load grants must be declared by that
-    /// agent. Write and exec grants stay withheld on purpose.
+    /// Skills never widen an agent's `global_tools` or `mcp_servers`. For
+    /// every skill a bundled agent is told to load or lists in its
+    /// `enabled_skills`, each granted tool and MCP server must be declared
+    /// by the agent, except the write and exec grants the owner keeps
+    /// withheld on purpose, which must stay undeclared.
     #[test]
-    fn bundled_agents_declare_the_read_only_tools_of_the_skills_they_are_told_to_load() {
-        const READ_ONLY: [&str; 6] = [
-            "fs_read", "fs_cat", "fs_grep", "fs_glob", "fs_ls", "ast_grep",
-        ];
+    fn bundled_agents_declare_what_their_skills_grant_except_the_withheld_write_and_exec_tools() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
-        let global_tools = |agent: &str| -> Vec<String> {
+        let definition = |agent: &str| -> serde_yaml::Value {
             let dir = root.join("agents").join(agent);
             let file = ["config.yaml", "graph.yaml"]
                 .into_iter()
                 .map(|name| dir.join(name))
                 .find(|path| path.exists())
                 .unwrap_or_else(|| panic!("{agent} has no definition"));
-            let yaml: serde_yaml::Value =
-                serde_yaml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-            yaml["global_tools"]
-                .as_sequence()
-                .unwrap_or_else(|| panic!("{} declares no global_tools", file.display()))
-                .iter()
-                .map(|entry| entry.as_str().unwrap().to_string())
-                .collect()
+            serde_yaml::from_str(&fs::read_to_string(&file).unwrap()).unwrap()
         };
-        let instructed = [
+        let list = |yaml: &serde_yaml::Value, key: &str| -> Vec<String> {
+            yaml[key]
+                .as_sequence()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .map(|entry| entry.as_str().unwrap().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        // (agent, skills its prompts tell it to load, grants the owner keeps withheld)
+        let agents = [
             (
                 "coder",
                 &["code-review", "frontend-ui-ux", "git-master"][..],
+                &["fs_mkdir", "git_command"][..],
             ),
             (
                 "architect",
                 &["task-tracking", "design-session", "plan-authoring"],
+                &[],
             ),
-            ("oracle", &["plan-authoring"]),
-            ("step-runner", &["handoff-protocol"]),
+            (
+                "oracle",
+                &["plan-authoring", "iwe-knowledge-base"],
+                &["fs_write"],
+            ),
+            ("step-runner", &["handoff-protocol"], &[]),
             (
                 "sisyphus",
                 &[
@@ -2832,53 +2842,52 @@ nodes: {}
                     "observability-review",
                     "frontend-ui-ux",
                     "git-master",
+                    "iwe-knowledge-base",
                 ],
+                &["fs_mkdir", "git_command"],
             ),
         ];
-        for (agent, skills) in instructed {
-            let declared = global_tools(agent);
+        for (agent, instructed, withheld) in agents {
+            let yaml = definition(agent);
+            let declared = list(&yaml, "global_tools");
+            let servers = list(&yaml, "mcp_servers");
             for entry in &declared {
                 assert!(
                     root.join("functions/tools").join(entry).exists(),
                     "{agent}'s global_tools entry {entry} is not a shipped tool"
                 );
             }
-            for skill in skills {
-                let content =
-                    fs::read_to_string(root.join("skills").join(skill).join("SKILL.md")).unwrap();
-                let granted = super::super::Skill::new(skill, &content)
-                    .enabled_tools()
-                    .unwrap_or_default()
-                    .to_vec();
-                for tool in granted
+            let declares = |tool: &str| {
+                declared
                     .iter()
-                    .filter(|tool| READ_ONLY.contains(&tool.as_str()))
-                {
-                    assert!(
-                        declared
-                            .iter()
-                            .any(|entry| entry.split('.').next() == Some(tool)),
-                        "{agent} is told to load {skill}, which needs read-only {tool}, but {tool} is not in its global_tools"
-                    );
-                }
-            }
-        }
-
-        // Write and exec grants of those skills that the owner left withheld.
-        let withheld = [
-            ("coder", &["fs_mkdir", "git_command"][..]),
-            ("sisyphus", &["fs_mkdir", "git_command"]),
-            ("oracle", &["fs_write"]),
-        ];
-        for (agent, tools) in withheld {
-            let declared = global_tools(agent);
-            for tool in tools {
+                    .any(|entry| entry.split('.').next() == Some(tool))
+            };
+            for tool in withheld {
                 assert!(
-                    !declared
-                        .iter()
-                        .any(|entry| entry.split('.').next() == Some(tool)),
+                    !declares(tool),
                     "{agent} must not declare {tool}: write and exec grants of its skills stay withheld"
                 );
+            }
+            let mut skills: Vec<String> = instructed.iter().map(|s| s.to_string()).collect();
+            skills.extend(list(&yaml, "enabled_skills"));
+            skills.sort();
+            skills.dedup();
+            for skill in &skills {
+                let content =
+                    fs::read_to_string(root.join("skills").join(skill).join("SKILL.md")).unwrap();
+                let skill_def = super::super::Skill::new(skill, &content);
+                for tool in skill_def.enabled_tools().unwrap_or_default() {
+                    assert!(
+                        declares(tool) || withheld.contains(&tool.as_str()),
+                        "{agent} can load {skill}, which grants {tool}, but {tool} is neither in its global_tools nor a withheld write or exec grant"
+                    );
+                }
+                for server in skill_def.enabled_mcp_servers().unwrap_or_default() {
+                    assert!(
+                        servers.contains(server),
+                        "{agent} can load {skill}, which grants MCP server {server}, but {server} is not in its mcp_servers"
+                    );
+                }
             }
         }
     }
