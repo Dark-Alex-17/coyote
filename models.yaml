@@ -954,7 +954,7 @@
     max_input_tokens: 262144
     input_price: 0.0
     output_price: 0.0
-    cache_read_price: 0.0425
+    cache_read_price: 0.05
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -6710,7 +6710,7 @@
     max_input_tokens: 262144
     input_price: 0.6
     output_price: 3.6
-    cache_read_price: 0.12
+    cache_read_price: 0.22
     patch:
       body:
         enable_thinking: false
@@ -8315,10 +8315,10 @@
   - name: deepseek/deepseek-v4.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.14
-    output_price: 0.42
-    cache_read_price: 0.0042
-    max_output_tokens: 393216
+    input_price: 0.051
+    output_price: 0.567
+    cache_read_price: 0.018
+    max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash-1017
@@ -8334,7 +8334,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.036
-    output_price: 0.32
+    output_price: 0.15
     cache_read_price: 0.003
     max_output_tokens: 943718
     supports_vision: true
@@ -8784,9 +8784,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.0765
-    output_price: 0.255
-    cache_read_price: 0.0425
+    input_price: 0.09
+    output_price: 0.3
+    cache_read_price: 0.05
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -9126,9 +9126,9 @@
   - name: minimax/minimax-m3.1-flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.075
-    output_price: 0.3
-    cache_read_price: 0.0075
+    input_price: 0.15
+    output_price: 0.6
+    cache_read_price: 0.015
     max_output_tokens: 524288
     supports_vision: true
     supports_function_calling: true
@@ -9372,8 +9372,8 @@
   - name: moonshotai/kimi-k2.7-code
     type: chat
     max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 3.5
+    input_price: 0.7
+    output_price: 3.75
     cache_read_price: 0.16
     max_output_tokens: 235929
     supports_vision: true
@@ -9401,7 +9401,7 @@
     max_input_tokens: 1048576
     input_price: 0.372
     output_price: 5.583
-    cache_read_price: 0.119
+    cache_read_price: 0.1
     max_output_tokens: 943718
     supports_vision: true
   - name: moonshotai/kimi-k3:batch
@@ -9504,10 +9504,10 @@
   - name: nvidia/nemotron-3-ultra-550b-a55b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 2.4
-    cache_read_price: 0.12
-    max_output_tokens: 182520
+    input_price: 0.5
+    output_price: 2.2
+    cache_read_price: 0.1
+    max_output_tokens: 16384
     supports_function_calling: true
   - name: nvidia/nemotron-3-ultra-550b-a55b:free
     type: chat
@@ -10885,18 +10885,18 @@
   - name: qwen/qwen3.5-397b-a17b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.6
-    output_price: 3.6
-    cache_read_price: 0.12
-    max_output_tokens: 64000
+    input_price: 0.45
+    output_price: 3.0
+    cache_read_price: 0.22
+    max_output_tokens: 81920
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.5-9b
     type: chat
     max_input_tokens: 262144
-    input_price: 0.17
-    output_price: 0.25
-    cache_read_price: 0.153
+    input_price: 0.144
+    output_price: 0.211
+    cache_read_price: 0.129
     max_output_tokens: 40960
     supports_vision: true
     supports_function_calling: true
@@ -11645,7 +11645,7 @@
     max_input_tokens: 1048576
     input_price: 0.024
     output_price: 0.069
-    cache_read_price: 0.012
+    cache_read_price: 0.01
     max_output_tokens: 943718
     supports_vision: true
     supports_function_calling: true
@@ -11678,10 +11678,10 @@
   - name: z-ai/glm-5.3:batch
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.45
-    output_price: 2.0
-    cache_read_price: 0.1
-    max_output_tokens: 131072
+    input_price: 0.281
+    output_price: 1.25
+    cache_read_price: 0.062
+    max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5v-turbo
     type: chat
