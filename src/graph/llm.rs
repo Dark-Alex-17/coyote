@@ -205,7 +205,7 @@ async fn run(
         let agent_tools = parent_ctx
             .agent
             .as_ref()
-            .map(|agent| AgentToolGate::new(agent, &parent_ctx.app.config.mapping_tools));
+            .map(|agent| AgentToolGate::new(agent, &parent_ctx.app.config));
         parent_ctx
             .skill_registry
             .effective_role(&role, &policy, agent_tools.as_ref())

@@ -1,23 +1,43 @@
-use super::Agent;
+use super::mcp_tool_policy::expand_mcp_server_alias;
 use super::role::{Role, RoleLike};
 use super::skill::Skill;
 use super::skill_policy::SkillPolicy;
+use super::{Agent, AppConfig};
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashSet};
 
-/// The tools an active agent provides. A skill loaded inside an agent only
-/// brings into reach the granted tools the agent already provides; it never
-/// widens the agent's `global_tools`.
+/// The tools and MCP servers an active agent provides. A skill loaded inside
+/// an agent only brings into reach what the agent already provides; it never
+/// widens the agent's `global_tools` or `mcp_servers`.
 pub struct AgentToolGate<'a> {
     agent_name: &'a str,
     provided: HashSet<String>,
     mapping_tools: &'a IndexMap<String, String>,
+    /// The agent's MCP server ids with aliases expanded; `None` when the
+    /// agent declares `all`.
+    mcp_servers: Option<BTreeSet<String>>,
+    mapping_mcp_servers: &'a IndexMap<String, String>,
 }
 
 impl<'a> AgentToolGate<'a> {
-    pub fn new(agent: &'a Agent, mapping_tools: &'a IndexMap<String, String>) -> Self {
+    pub fn new(agent: &'a Agent, app: &'a AppConfig) -> Self {
+        let mut mcp_servers = Some(BTreeSet::new());
+        for entry in agent.mcp_server_names().iter().map(|entry| entry.trim()) {
+            if entry == "all" {
+                mcp_servers = None;
+                break;
+            }
+            if let Some(servers) = mcp_servers.as_mut() {
+                let members = expand_mcp_server_alias(&app.mapping_mcp_servers, entry);
+                if members.is_empty() {
+                    servers.insert(entry.to_string());
+                } else {
+                    servers.extend(members);
+                }
+            }
+        }
         Self {
             agent_name: agent.name(),
             provided: agent
@@ -26,7 +46,9 @@ impl<'a> AgentToolGate<'a> {
                 .iter()
                 .map(|declaration| declaration.name.clone())
                 .collect(),
-            mapping_tools,
+            mapping_tools: &app.mapping_tools,
+            mcp_servers,
+            mapping_mcp_servers: &app.mapping_mcp_servers,
         }
     }
 
@@ -64,13 +86,60 @@ impl<'a> AgentToolGate<'a> {
         (allowed, denied)
     }
 
-    /// One warning per granted tool the agent does not provide.
+    /// Whether the agent declares the MCP server `server`.
+    pub fn allows_mcp_server(&self, server: &str) -> bool {
+        self.mcp_servers
+            .as_ref()
+            .is_none_or(|servers| servers.contains(server))
+    }
+
+    /// Splits a skill's granted MCP server entries into the servers the agent
+    /// declares and the ones it does not. An alias expands to its members and
+    /// `all` to every server the agent declares.
+    pub fn partition_mcp_servers(&self, granted: &[String]) -> (Vec<String>, Vec<String>) {
+        let mut allowed = vec![];
+        let mut denied = vec![];
+        for entry in granted.iter().map(|entry| entry.trim()) {
+            if entry.is_empty() {
+                continue;
+            }
+            if entry == "all" {
+                match &self.mcp_servers {
+                    Some(servers) => allowed.extend(servers.iter().cloned()),
+                    None => allowed.push(entry.to_string()),
+                }
+                continue;
+            }
+            let mut members = expand_mcp_server_alias(self.mapping_mcp_servers, entry);
+            if members.is_empty() {
+                members.push(entry.to_string());
+            }
+            for server in members {
+                let bucket = if self.allows_mcp_server(&server) {
+                    &mut allowed
+                } else {
+                    &mut denied
+                };
+                if !bucket.contains(&server) {
+                    bucket.push(server);
+                }
+            }
+        }
+        (allowed, denied)
+    }
+
+    /// One warning per granted tool or MCP server the agent does not provide.
     pub fn warnings(&self, skill: &Skill) -> Vec<String> {
         let (_, denied) = self.partition(skill.enabled_tools().unwrap_or_default());
-        denied
+        let (_, denied_servers) =
+            self.partition_mcp_servers(skill.enabled_mcp_servers().unwrap_or_default());
+        let tool_warnings = denied
             .iter()
-            .map(|tool| not_enabled_warning(skill.name(), tool, self.agent_name))
-            .collect()
+            .map(|tool| not_enabled_warning(skill.name(), tool, self.agent_name));
+        let server_warnings = denied_servers
+            .iter()
+            .map(|server| mcp_not_enabled_warning(skill.name(), server, self.agent_name));
+        tool_warnings.chain(server_warnings).collect()
     }
 }
 
@@ -78,6 +147,13 @@ pub fn not_enabled_warning(skill: &str, tool: &str, agent: &str) -> String {
     format!(
         "Skill '{skill}' grants tool '{tool}', but it is not enabled for agent '{agent}' and will not be offered. \
          To use it with this skill, add {tool} to {agent}'s global_tools in the agent definition."
+    )
+}
+
+pub fn mcp_not_enabled_warning(skill: &str, server: &str, agent: &str) -> String {
+    format!(
+        "Skill '{skill}' grants MCP server '{server}', but it is not enabled for agent '{agent}' and will not be offered. \
+         To use it with this skill, add {server} to {agent}'s mcp_servers in the agent definition."
     )
 }
 
@@ -113,7 +189,9 @@ impl SkillRegistry {
         self.loaded.values()
     }
 
-    pub fn loaded_mcp_servers(&self) -> BTreeSet<String> {
+    /// The MCP servers the loaded skills grant. Inside an agent, `agent_tools`
+    /// keeps them to the servers the agent declares.
+    pub fn loaded_mcp_servers(&self, agent_tools: Option<&AgentToolGate>) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for skill in self.loaded.values() {
             if let Some(servers) = skill.enabled_mcp_servers() {
@@ -125,7 +203,13 @@ impl SkillRegistry {
                 }
             }
         }
-        out
+        match agent_tools {
+            Some(gate) => {
+                let granted: Vec<String> = out.into_iter().collect();
+                gate.partition_mcp_servers(&granted).0.into_iter().collect()
+            }
+            None => out,
+        }
     }
 
     pub fn is_loaded(&self, name: &str) -> bool {
@@ -171,7 +255,10 @@ impl SkillRegistry {
                 }
             }
             if let Some(servers) = skill.enabled_mcp_servers() {
-                mcps.extend(servers.iter().cloned());
+                match agent_tools {
+                    Some(gate) => mcps.extend(gate.partition_mcp_servers(servers).0),
+                    None => mcps.extend(servers.iter().cloned()),
+                }
             }
             if !skip_body && !skill.body().is_empty() {
                 let separator = if effective.is_empty_prompt() {
@@ -421,10 +508,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_gate_holds_skill_mcp_servers_to_the_agents_declaration() {
+        let app = AppConfig {
+            mapping_mcp_servers: IndexMap::from([("gh".to_string(), "github, gitlab".to_string())]),
+            ..AppConfig::default()
+        };
+        let agent = Agent::test_new(super::super::AgentConfig {
+            name: "gated".into(),
+            mcp_servers: vec!["gh".into()],
+            ..Default::default()
+        });
+        let gate = AgentToolGate::new(&agent, &app);
+
+        let granted = ["github", "slack"].map(String::from);
+        assert_eq!(
+            gate.partition_mcp_servers(&granted),
+            (vec!["github".to_string()], vec!["slack".to_string()])
+        );
+        assert_eq!(
+            gate.partition_mcp_servers(&["all".to_string()]),
+            (vec!["github".to_string(), "gitlab".to_string()], vec![])
+        );
+
+        let open = Agent::test_new(super::super::AgentConfig {
+            name: "open".into(),
+            mcp_servers: vec!["all".into()],
+            ..Default::default()
+        });
+        assert!(AgentToolGate::new(&open, &app).allows_mcp_server("slack"));
+    }
+
+    #[test]
     fn agent_gate_expands_aliases_and_all_before_splitting() {
         let agent = agent_providing(&["fs_read", "fs_ls"]);
-        let mapping = IndexMap::from([("fs".to_string(), "fs_read, fs_write".to_string())]);
-        let gate = AgentToolGate::new(&agent, &mapping);
+        let app = AppConfig {
+            mapping_tools: IndexMap::from([("fs".to_string(), "fs_read, fs_write".to_string())]),
+            ..AppConfig::default()
+        };
+        let gate = AgentToolGate::new(&agent, &app);
 
         let granted = ["fs", "execute_command", "fs_read"].map(String::from);
         assert_eq!(
@@ -449,8 +570,8 @@ mod tests {
             "body",
         ));
         let agent = agent_providing(&["fs_read"]);
-        let mapping = IndexMap::new();
-        let gate = AgentToolGate::new(&agent, &mapping);
+        let app = AppConfig::default();
+        let gate = AgentToolGate::new(&agent, &app);
         let policy = SkillPolicy {
             skills_enabled: true,
             enabled: registry.loaded.keys().cloned().collect(),
