@@ -2690,14 +2690,14 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// A response resource that fails under a request in flight fails it as `LinkFailed`
-    /// naming the failed transfer, and does so when the transfer fails rather than when
-    /// the request's budget runs out: the budget is long enough that a timeout cannot
+    /// A response resource that fails under a request in flight fails it as `LinkDropped`,
+    /// and does so when the transfer fails rather than when the request's budget runs
+    /// out: the budget is long enough that a timeout cannot
     /// stand in for it. The responder cancels its own outbound once the requester has
     /// taken a first part of it, which is how a peer that gives up mid-transfer looks from
     /// here. The body is random so it compresses to nothing and crosses as many parts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_response_resource_that_fails_mid_transfer_fails_the_request_as_link_failed() {
+    async fn a_response_resource_that_fails_mid_transfer_fails_the_request_as_link_dropped() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let (in_flight, seen) = hanging_request_on(
@@ -2725,12 +2725,7 @@ pub(crate) mod network {
         assert!(cancelled, "the response was still being sent");
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         let failed_in = cancelling.elapsed();
-        assert_eq!(
-            result.unwrap_err(),
-            RequestError::LinkFailed(
-                "the response resource failed before it completed".to_string()
-            )
-        );
+        assert_eq!(result.unwrap_err(), RequestError::LinkDropped);
         assert!(
             failed_in < TRANSFER_REQUEST_TIMEOUT / 2,
             "the request outlived its response resource by {failed_in:?}"
@@ -2853,7 +2848,7 @@ pub(crate) mod network {
         );
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert!(
-            matches!(result, Err(RequestError::LinkFailed(_))),
+            matches!(result, Err(RequestError::LinkDropped)),
             "{result:?}"
         );
 

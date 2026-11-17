@@ -2073,6 +2073,7 @@ impl MeshRuntime {
             Err(
                 err @ (RequestError::LinkActivationTimeout { .. }
                 | RequestError::LinkFailed(_)
+                | RequestError::LinkDropped
                 | RequestError::LinkNotOpened(_)
                 | RequestError::LinkClosed),
             ) => (KnockFallback::Unreachable, err),
@@ -3440,6 +3441,7 @@ fn note_link_outcome(
             | RequestError::ResponseIncomplete { .. }
             | RequestError::RequestIncomplete { .. }
             | RequestError::LinkFailed(_)
+            | RequestError::LinkDropped
             | RequestError::LinkClosed
             | RequestError::ResponseOversize { .. }
             | RequestError::Decode(_)
@@ -3906,7 +3908,8 @@ fn reconcile_tcp_after_lag(
 /// reads each client's status instead, see `reconcile_tcp_after_lag`. The `local`
 /// rnsd's shared-instance client's state events drive its row, see
 /// `follow_local_event`. That client re-announces and redials
-/// by itself, so no line is printed and no announce sent for an rnsd. The watcher holds
+/// by itself, so no announce is sent for an rnsd; losing it and having it back are each
+/// told once, and its redials are not told at all. The watcher holds
 /// no peer-controlled state: a fixed list from the node's own config, two flags, a
 /// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
 /// when the node or its slot is gone. Every `LAN_PEERLESS_GRACE_SECS` until it is told,
@@ -3966,10 +3969,17 @@ async fn watch_interfaces(
             // lost to a broadcast `Lagged` could not be caught up. This stream drops when
             // full too, which `LOCAL_EVENT_CAPACITY` is sized to keep out of reach.
             event = next_shared_instance_event(&mut local) => {
-                let Some(runtime) = runtime.upgrade() else {
+                let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
                     return;
                 };
-                follow_local_event(&runtime, &mut local, event);
+                if let Some(line) = follow_local_event(&runtime, &mut local, event) {
+                    slot.push_idle(IdleNotify {
+                        source: Source::Relay,
+                        text: line.into(),
+                        origin: Origin::Local,
+                        model_note: None,
+                    });
+                }
             }
         }
         if transitions.is_empty() {
@@ -4093,24 +4103,24 @@ fn lan_silent_hint_due(
 /// the row's until a stream is back. A `DialFailed` puts its sentence on a row that is
 /// still `connecting` and leaves a lost or connected row alone; it is logged at debug
 /// only when its sentence differs from the last one logged since the last `Connected`,
-/// as the client redials every `LOCAL_RECONNECT_WAIT`. No idle line and no announce for
-/// any of it: the client re-announces over a restored socket itself. `None` is the end
-/// of the stream, which the detach at stop brings, and the receiver is let go.
+/// as the client redials every `LOCAL_RECONNECT_WAIT`. Returns the idle line for a row
+/// that went from connected to lost or from lost back to connected, see
+/// `local_rnsd_line`; nothing is announced, as the client re-announces over a restored
+/// socket itself. `None` is the end of the stream, which the detach at stop brings, and
+/// the receiver is let go.
 fn follow_local_event(
     runtime: &MeshRuntime,
     local: &mut Option<LocalWatch>,
     event: Option<SharedInstanceEvent>,
-) {
-    let Some(watch) = local.as_mut() else {
-        return;
-    };
+) -> Option<String> {
+    let watch = local.as_mut()?;
     let Some(event) = event else {
         debug!(
             "Mesh interface {} stopped reporting; its client is detached",
             watch.label
         );
         *local = None;
-        return;
+        return None;
     };
     let LocalWatch {
         index,
@@ -4120,6 +4130,14 @@ fn follow_local_event(
         ..
     } = watch;
     let index = *index;
+    let row = || {
+        runtime
+            .interface_states
+            .read()
+            .get(index)
+            .map(|status| status.state.clone())
+    };
+    let before = row();
     let lose = |reason: String| {
         let state = InterfaceState::Disconnected { reason };
         if runtime.mark_interface_state(index, state).is_some() {
@@ -4167,6 +4185,27 @@ fn follow_local_event(
         }
         // Guard for future variants.
         other => debug!("Mesh interface {label} reported {other:?}"),
+    }
+    local_rnsd_line(endpoint, &before?, &row()?)
+}
+
+/// The idle line for the `local` rnsd's row moving from `before` to `after`: one when a
+/// connected row was lost and one when a lost row is back, none for the first connect
+/// or anything the redials do to a row that is still lost or connecting.
+fn local_rnsd_line(
+    endpoint: &LocalEndpoint,
+    before: &InterfaceState,
+    after: &InterfaceState,
+) -> Option<String> {
+    match (before, after) {
+        (InterfaceState::Connected, InterfaceState::Disconnected { .. }) => Some(format!(
+            "Lost the local rnsd ({endpoint}); redialing every {} s. Other sessions read \"no route\" until it is back.",
+            LOCAL_RECONNECT_WAIT.as_secs()
+        )),
+        (InterfaceState::Disconnected { .. }, InterfaceState::Connected) => Some(format!(
+            "Back on the local rnsd ({endpoint}); this session announced again, and routes return as other sessions announce or when you address one."
+        )),
+        _ => None,
     }
 }
 
@@ -5131,7 +5170,8 @@ impl MeshSlot {
         self.brief.load_full()
     }
 
-    /// Rebuilds the served brief from the current snapshot, digest and user brief. The
+    /// Rebuilds the served brief from the current snapshot, digest and user brief, its card
+    /// carrying the session and person names `/status` serves. The
     /// snapshot's `brief.mode` decides what goes in; with no snapshot yet there is no mode
     /// to honour, so nothing is served. Rebuilds are serialised: the digest task and the
     /// turn boundary may both store and rebuild at once, and without the lock the later
@@ -5159,7 +5199,13 @@ impl MeshSlot {
                 about.as_deref(),
                 &CardSource::caps(self),
                 now,
-            );
+            )
+            .with_configured_names(
+                CardSource::person_name(self).as_deref(),
+                CardSource::shared_session(self).as_deref(),
+                true,
+            )
+            .with_session_label(CardSource::session_label(self).as_deref());
             let user_brief = self.user_brief();
             assemble_brief(
                 snapshot.brief.mode,
@@ -7667,6 +7713,44 @@ mod tests {
         assert_eq!(slot.user_brief().unwrap().as_str(), "Working on the mesh");
         slot.set_user_brief(Some(" \n".into()));
         assert!(slot.user_brief().is_none());
+    }
+
+    /// The brief's card names the session and its person as `/status` does: the published
+    /// session name and `mesh.person_name`, and the label you gave this session in place
+    /// of its name once you give it one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_brief_names_the_session_and_person_the_card_advertises() {
+        let started = started_runtime_with("node-brief-own-names", |config| {
+            config.person_name = Some("Maki".into());
+            config.share_session_name = true;
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.publish(MeshSnapshot {
+            session: Some("m2".into()),
+            ..snapshot_fixture()
+        });
+        let text = slot.brief().unwrap().text.clone();
+        assert!(text.contains("Session: m2\nUser: Maki\n"), "{text}");
+
+        runtime
+            .trust()
+            .set_session_alias(
+                runtime.fingerprint(),
+                &runtime.current_destination_hash(),
+                Some("maki-two"),
+                &[],
+            )
+            .unwrap();
+        slot.reassemble_brief();
+        let text = slot.brief().unwrap().text.clone();
+        assert!(text.contains("Session: maki-two\nUser: Maki\n"), "{text}");
+
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
     }
 
     #[test]
@@ -15631,10 +15715,24 @@ mod tests {
         assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
         sleep(WATCH_SETTLE * 2).await;
         assert_eq!(connects_told(), 2, "{:?}", info_snapshot());
-        assert!(
-            notifier.0.lock().is_empty(),
-            "a local row prints no idle line: {:?}",
-            notifier.0.lock()
+        let told: Vec<String> = notifier
+            .0
+            .lock()
+            .iter()
+            .flat_map(|rendered| rendered.lines())
+            .collect();
+        assert_eq!(
+            told,
+            [
+                format!(
+                    "[mesh:relay] Lost the local rnsd ({endpoint}); redialing every {} s. Other sessions read \"no route\" until it is back.",
+                    LOCAL_RECONNECT_WAIT.as_secs()
+                ),
+                format!(
+                    "[mesh:relay] Back on the local rnsd ({endpoint}); this session announced again, and routes return as other sessions announce or when you address one."
+                ),
+            ],
+            "the first connect and the redials tell nothing; the loss and the return once each"
         );
 
         let transport = runtime.transport_handle().await.unwrap();
@@ -15914,10 +16012,23 @@ mod tests {
             info_snapshot(),
             warn_snapshot()
         );
-        assert!(
-            notifier.0.lock().is_empty(),
-            "a local row prints no idle line: {:?}",
-            notifier.0.lock()
+        let lost_told = format!(
+            "[mesh:relay] Lost the local rnsd ({endpoint}); redialing every {} s. Other sessions read \"no route\" until it is back.",
+            LOCAL_RECONNECT_WAIT.as_secs()
+        );
+        let back_told = format!(
+            "[mesh:relay] Back on the local rnsd ({endpoint}); this session announced again, and routes return as other sessions announce or when you address one."
+        );
+        let told: Vec<String> = notifier
+            .0
+            .lock()
+            .iter()
+            .flat_map(|rendered| rendered.lines())
+            .collect();
+        assert_eq!(
+            told,
+            [lost_told.as_str(), back_told.as_str()].repeat(losses_told),
+            "each loss of the local rnsd and each return from it is told once"
         );
 
         let transport = runtime.transport_handle().await.unwrap();
@@ -21562,6 +21673,79 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// Losing the `local` rnsd and having it back are told once each, in order; the first
+    /// connect, the redial attempt and its dial failures in between tell nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_local_rnsd_lost_and_back_is_told_once_per_transition() {
+        let started = started_runtime("node-local-lost-and-back").await;
+        let runtime = &started.runtime;
+        let (_sender, events) = mpsc::channel(1);
+        let mut local = Some(LocalWatch {
+            index: 0,
+            label: "local rnsd at @rns/default".to_string(),
+            endpoint: LocalEndpoint::Abstract("@rns/default".to_string()),
+            events,
+            logged_dial_failure: None,
+        });
+        runtime.mark_interface_state(0, InterfaceState::Connecting { dial_failure: None });
+        let refused = || SharedInstanceEvent::DialFailed {
+            reason: DialFailureKind::Refused,
+        };
+        let sequence = [
+            SharedInstanceEvent::Connected,
+            SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::Reset,
+            },
+            SharedInstanceEvent::Connecting,
+            refused(),
+            refused(),
+            refused(),
+            SharedInstanceEvent::Connected,
+        ];
+
+        let lines: Vec<(usize, String)> = sequence
+            .into_iter()
+            .enumerate()
+            .filter_map(|(at, event)| {
+                follow_local_event(runtime, &mut local, Some(event)).map(|line| (at, line))
+            })
+            .collect();
+
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    1,
+                    "Lost the local rnsd (@rns/default); redialing every 2 s. Other sessions read \"no route\" until it is back.".to_string()
+                ),
+                (
+                    6,
+                    "Back on the local rnsd (@rns/default); this session announced again, and routes return as other sessions announce or when you address one.".to_string()
+                ),
+            ]
+        );
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn the_local_rnsd_line_is_only_for_a_row_lost_or_back() {
+        let endpoint = LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap());
+        let lost = InterfaceState::Disconnected {
+            reason: "the connection was reset".to_string(),
+        };
+        let connecting = InterfaceState::Connecting { dial_failure: None };
+        let connected = InterfaceState::Connected;
+        assert!(local_rnsd_line(&endpoint, &connected, &lost).is_some());
+        assert!(local_rnsd_line(&endpoint, &lost, &connected).is_some());
+        assert_eq!(local_rnsd_line(&endpoint, &connecting, &connected), None);
+        assert_eq!(local_rnsd_line(&endpoint, &lost, &lost), None);
+        assert_eq!(local_rnsd_line(&endpoint, &connected, &connected), None);
+        assert_eq!(local_rnsd_line(&endpoint, &lost, &connecting), None);
+    }
+
     #[test]
     fn disconnect_sentence_names_each_reason() {
         assert_eq!(
@@ -23790,14 +23974,7 @@ mod tests {
             now,
         );
         assert!(peers.link_failed(&hash));
-        let _ = note_link_outcome(
-            &peers,
-            &hash,
-            Err(RequestError::LinkFailed(
-                "the response resource failed before it completed".to_string(),
-            )),
-            now,
-        );
+        let _ = note_link_outcome(&peers, &hash, Err(RequestError::LinkDropped), now);
         assert!(
             !peers.link_failed(&hash),
             "a transfer that failed on a link that came up clears the mark"

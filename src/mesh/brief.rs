@@ -115,12 +115,18 @@ pub(crate) fn assemble_brief(
 /// card's text is capped by `build_card`, but a line separator inside a field could still
 /// start a forged heading. An unknown state adds no line, so a card with nothing else in it
 /// yields no section.
-/// The card's `session` and `person_name` are never rendered: the envoy answers peers from
-/// the brief, and those names go to trusted peers on the card alone.
+/// The card's `session` and `person_name` are rendered when the card advertises them, so
+/// the envoy can name the session it speaks for, as the card itself does.
 fn render_card(card: &StatusCard) -> Option<String> {
     let mut lines = Vec::new();
     if let Some(name) = &card.display_name {
         lines.push(format!("Name: {name}"));
+    }
+    if let Some(session) = &card.session {
+        lines.push(format!("Session: {session}"));
+    }
+    if let Some(person) = &card.person_name {
+        lines.push(format!("User: {person}"));
     }
     if let Some(objective) = &card.objective {
         lines.push(format!("Objective: {objective}"));
@@ -387,17 +393,24 @@ mod tests {
     }
 
     #[test]
-    fn the_brief_never_carries_the_cards_session_or_person_name() {
+    fn the_brief_carries_the_cards_session_and_person_name_only_when_set() {
         let mut named = card();
-        named.session = Some("SESSION-NAME-MARKER".into());
-        named.person_name = Some("PERSON-NAME-MARKER".into());
+        named.session = Some("m2".into());
+        named.person_name = Some("Maki".into());
         let text = assemble_brief(MeshBrief::Auto, Some(&named), None, None, &todo())
             .unwrap()
             .text;
-        assert!(text.contains("Name: Alex"), "{text}");
         assert!(
-            !text.contains("SESSION-NAME-MARKER") && !text.contains("PERSON-NAME-MARKER"),
-            "the envoy's brief never carries the card's names, so the envoy cannot repeat them: {text}"
+            text.contains("Name: Alex\nSession: m2\nUser: Maki\n"),
+            "the envoy can name the session it speaks for: {text}"
+        );
+
+        let unnamed = assemble_brief(MeshBrief::Auto, Some(&card()), None, None, &todo())
+            .unwrap()
+            .text;
+        assert!(
+            !unnamed.contains("Session:") && !unnamed.contains("User:"),
+            "{unnamed}"
         );
     }
 

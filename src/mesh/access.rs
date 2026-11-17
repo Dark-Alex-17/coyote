@@ -677,6 +677,7 @@ impl MeshRuntime {
                     | RequestError::RequestIncomplete { .. }
                     | RequestError::LinkActivationTimeout { .. }
                     | RequestError::LinkFailed(_)
+                    | RequestError::LinkDropped
                     | RequestError::LinkNotOpened(_)
                     | RequestError::LinkClosed),
                 ) => err,

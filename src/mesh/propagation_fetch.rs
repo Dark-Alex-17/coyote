@@ -3697,6 +3697,7 @@ mod tests {
                 after,
             },
             RequestError::LinkFailed("request not sent".to_string()),
+            RequestError::LinkDropped,
             RequestError::LinkNotOpened("no known path to destination 00".to_string()),
             RequestError::LinkClosed,
             RequestError::Oversize { len: 2, max: 1 },
@@ -3742,7 +3743,7 @@ mod tests {
         );
     }
 
-    const REQUEST_ERROR_VARIANTS: usize = 17;
+    const REQUEST_ERROR_VARIANTS: usize = 18;
 
     /// No wildcard arm: a new `RequestError` variant fails to compile here until it is
     /// numbered, `REQUEST_ERROR_VARIANTS` raised and a sample of it added to the sweep.
@@ -3765,6 +3766,7 @@ mod tests {
             RequestError::UnsupportedVersion { .. } => 14,
             RequestError::NotRunning => 15,
             RequestError::Shutdown => 16,
+            RequestError::LinkDropped => 17,
         }
     }
 

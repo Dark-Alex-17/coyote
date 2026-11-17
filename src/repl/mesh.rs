@@ -37,6 +37,7 @@ use crate::mesh::pending::{
     question_not_an_access_request,
 };
 use crate::mesh::people::{AliasSource, NAME_TAKEN, Namer, Who, YOU, hash_after, with_hash};
+use crate::mesh::request::RequestError;
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
     MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
@@ -999,7 +1000,11 @@ fn session_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     {
         bail!(NAME_TAKEN);
     }
-    write_name(&runtime, &identity, Some(&destination), alias.as_deref())
+    write_name(&runtime, &identity, Some(&destination), alias.as_deref())?;
+    // The brief's card names this session by its label, so the envoy speaks under the
+    // new one before the next turn republishes.
+    ctx.app.mesh.reassemble_brief();
+    Ok(())
 }
 
 /// Sets, or with `None` clears, the name of the user `identity` or, given `destination`,
@@ -1277,7 +1282,14 @@ async fn peer_status(
     );
     result_follows();
     let card = tokio::select! {
-        outcome = runtime.request_status(route) => outcome.map_err(|err| quoted_status_failure(err, &who))?,
+        outcome = runtime.request_status(route) => outcome.map_err(|err| match err {
+            StatusError::Transport(RequestError::LinkDropped) => link_dropped_failure(
+                "The answer from",
+                &with_hash(&who, &destination),
+                &format!(".mesh people status {}", typed_session(token, &destination)),
+            ),
+            err => quoted_status_failure(err, &who),
+        })?,
         _ = wait_user_interrupt(Some(abort_signal)) => {
             out_text("Status request interrupted.");
             return Ok(());
@@ -2628,6 +2640,19 @@ async fn message(
         Ok(outcome) => outcome,
         Err(err) => {
             ctx.app.mesh.correlations().abandon(&out.id);
+            if matches!(
+                err.downcast_ref::<SendError>(),
+                Some(SendError::Direct(RequestError::LinkDropped))
+            ) {
+                return Err(link_dropped_failure(
+                    "The message to",
+                    &with_hash(&name, &destination),
+                    &format!(
+                        ".mesh messaging send {} <text>",
+                        typed_session(target, &destination)
+                    ),
+                ));
+            }
             return Err(quoted_send_failure(err, &name));
         }
     };
@@ -2836,11 +2861,79 @@ fn quoted_fetch_failure(err: FileFetchError, who: &str) -> anyhow::Error {
     }
 }
 
+/// A request whose answer the link dropped under, as the REPL shows it, in place of the
+/// transport's account, which stays in the log. `what` names what was cut off and leads
+/// into `named`, the session's `<user> / <session>` name with its short hash; `retry` is
+/// the command that asks again, spelled with the session as the user typed it.
+fn link_dropped_failure(what: &str, named: &str, retry: &str) -> anyhow::Error {
+    QuotingError::wrap(NoticeText::from_template(
+        "{what} {named} stopped partway: the link to that session dropped. Nothing was kept; run {retry} again once .mesh people list shows it reachable.",
+        &[("what", what), ("retry", retry)],
+        &[("named", named)],
+    ))
+}
+
 #[cfg(test)]
 mod peer_side_refusal_tests {
     use super::*;
     use crate::mesh::request::{NoAnswer, RemoteRefusal};
     use crate::render::{MeshVerbError, command_error_text};
+
+    /// A fetch whose answer the link dropped under names what was cut off and from whom,
+    /// says nothing was kept and gives the retry with the session as typed; the
+    /// transport's account of the failed transfer stays out of the line.
+    #[test]
+    fn a_fetch_the_link_dropped_under_says_what_stopped_and_how_to_ask_again() {
+        let destination = "51".repeat(16);
+        let err = link_dropped_failure(
+            "The transfer of `notes.md` from",
+            &with_hash("Maki / m", &destination),
+            ".mesh files fetch m notes.md",
+        );
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "The transfer of `notes.md` from Maki / m (51515151) stopped partway: the link to that session dropped. Nothing was kept; run .mesh files fetch m notes.md again once .mesh people list shows it reachable."
+        );
+        assert!(!text.contains("resource"), "{text}");
+        let fallback = quoted_fetch_failure(
+            FileFetchError::Transport(RequestError::LinkDropped),
+            "Maki / m",
+        )
+        .to_string();
+        assert!(!fallback.contains("resource"), "{fallback}");
+    }
+
+    /// A listing's hint spells the session as it was typed when that was its name, and by
+    /// the short hash when it was typed as a hash or as more than one word.
+    #[test]
+    fn a_remote_listings_hint_spells_the_session_as_typed() {
+        let destination = "51".repeat(16);
+        let empty = SharesPage {
+            entries: Vec::new(),
+            next: None,
+        };
+        let hint = |token: &str| {
+            listed_page(
+                &empty,
+                "Maki / m (51515151)",
+                &typed_session(token, &destination),
+                None,
+            )
+            .plain()
+        };
+        assert_eq!(
+            hint("m"),
+            "Maki / m (51515151) shares nothing with you. `.mesh files request m <path>` asks its user for a path it does not share."
+        );
+        for typed in [destination.as_str(), "51515151", "maki m"] {
+            assert!(
+                hint(typed).contains("`.mesh files request 51515151 <path>`"),
+                "{typed}: {}",
+                hint(typed)
+            );
+        }
+    }
 
     /// A session that is busy, unreachable or not trusted is named the way the send
     /// named it, `<user> / <session>` with its short hash, never by its bare hash.
@@ -4183,6 +4276,17 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             | FileFetchError::UnknownStatus),
         ) => {
             return Err(undelivered_refusal(&named, peer, &shown, &args.path, &err));
+        }
+        Err(FileFetchError::Transport(RequestError::LinkDropped)) => {
+            return Err(link_dropped_failure(
+                &format!("The transfer of `{shown}` from"),
+                &named,
+                &format!(
+                    ".mesh files fetch {} {}",
+                    typed_session(&args.destination, &destination),
+                    args.path
+                ),
+            ));
         }
         Err(err) => return Err(quoted_fetch_failure(err, &who)),
     }
@@ -6397,12 +6501,15 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     if total > 1 {
         out_path_text(&format!("`{pattern}` is held by:"));
+        let namer = ctx.app.mesh.namer();
         for (layer, held) in &targets {
             for holder in held {
                 let scope = match &holder.peer {
                     None if holder.kind == "allow" => " (every trusted session)".to_string(),
                     None => String::new(),
-                    Some(hash) if is_canonical_peer(hash) => format!(" (only {})", short(hash)),
+                    Some(hash) if is_canonical_peer(hash) => {
+                        format!(" (only {})", rule_peer_name(&namer, hash))
+                    }
                     Some(text) => {
                         format!(" (scoped to no user or session: `{}`)", shown_pattern(text))
                     }
@@ -6602,10 +6709,35 @@ async fn list_remote(
                 &[("named", &named)],
             )));
         }
+        Err(FileFetchError::Transport(RequestError::LinkDropped)) => {
+            let mut retry = format!(".mesh files list {}", typed_session(token, &destination));
+            if let Some(prefix) = prefix {
+                retry.push_str(&format!(" --prefix {prefix}"));
+            }
+            if let Some(cursor) = cursor {
+                retry.push_str(&format!(" --next {cursor}"));
+            }
+            return Err(link_dropped_failure("The listing from", &named, &retry));
+        }
         Err(err) => return Err(quoted_fetch_failure(err, &who)),
     };
-    out_path_text(&listed_page(&page, &named, peer, prefix).render(live_prefix()));
+    let spelled = typed_session(token, &destination);
+    out_path_text(&listed_page(&page, &named, &spelled, prefix).render(live_prefix()));
     Ok(())
+}
+
+/// The session as a command this REPL suggests spells it: as the user typed it when that
+/// was a name the command takes as one word, else the short hash, so a hash typed in full
+/// or as a prefix reads as `.mesh people list` prints it.
+fn typed_session(token: &str, destination: &str) -> String {
+    let hashed = canonical_hash(token).is_some() || is_hash_prefix(token);
+    let one_word = !token.is_empty()
+        && !token.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`'));
+    if hashed || !one_word {
+        short(destination).to_string()
+    } else {
+        token.to_string()
+    }
 }
 
 /// One page of a session's listing as the REPL shows it: a line per file, its path quoted
@@ -6699,7 +6831,13 @@ fn shares(ctx: &RequestContext, args: &MutationArgs) -> Result<()> {
             DEFAULT_LIST_WALK_BOUND,
         )
     } else {
-        render_share_rules(&set, &peer_ref, peer.as_deref(), ctx.command_prefix())
+        render_share_rules(
+            &set,
+            &peer_ref,
+            peer.as_deref(),
+            &ctx.app.mesh.namer(),
+            ctx.command_prefix(),
+        )
     };
     out_path_text(&text);
     Ok(())
@@ -7171,12 +7309,28 @@ fn listed_paths(paths: &[String]) -> String {
         .join(", ")
 }
 
+/// A share rule's peer as the listings name it: a user hash by the user's name, a session
+/// hash by `<user> / <session>` once its user or its own name is known, and the short
+/// hash when no name is.
+fn rule_peer_name(namer: &Namer, hash: &str) -> String {
+    let people = namer.people();
+    if namer.is_you(hash) || people.person(hash).is_some_and(|alias| alias.displayable()) {
+        return namer.user(Some(hash));
+    }
+    match people.identity_of_session(hash) {
+        Some(identity) => namer.who(Some(identity), hash).to_string(),
+        None if namer.own_session(hash).is_some() => namer.who(None, hash).to_string(),
+        None => short(hash).to_string(),
+    }
+}
+
 /// The listing is printed byte for byte for its patterns' sake, so the two hints it can
 /// carry are rendered in `prefix` here.
 fn render_share_rules(
     set: &ShareSet,
     peer: &PeerRef<'_>,
     scoped_to: Option<&str>,
+    namer: &Namer,
     prefix: CommandPrefix,
 ) -> String {
     let locations = set.locations();
@@ -7202,7 +7356,9 @@ fn render_share_rules(
                     }
                     let note = match &peer {
                         None => "every trusted session".to_string(),
-                        Some(hash) if is_canonical_peer(hash) => format!("only {}", short(hash)),
+                        Some(hash) if is_canonical_peer(hash) => {
+                            format!("only {}", rule_peer_name(namer, hash))
+                        }
                         Some(text) => format!(
                             "scoped to no user or session (`{}` is not a user or session hash)",
                             shown_pattern(text)
@@ -16440,8 +16596,71 @@ mod tests {
             identity: &identity,
             destination: &destination,
         };
-        let text = render_share_rules(&fx.set(), &peer, None, CommandPrefix::Dot);
+        let text = render_share_rules(
+            &fx.set(),
+            &peer,
+            None,
+            &Namer::default(),
+            CommandPrefix::Dot,
+        );
         assert_eq!(fx.placeholders(&text), SHARES_SNAPSHOT);
+    }
+
+    /// An allow scoped to a user or one of their sessions names them as every other line
+    /// does, `only Bob` and `only Maki / m`; one scoped to a hash nobody is named by keeps
+    /// the short hash.
+    #[test]
+    fn a_scoped_allow_names_its_user_or_session_and_keeps_the_hash_of_an_unnamed_one() {
+        use crate::mesh::people::{People, PersonEntry, SessionNames};
+        let bob = "b0".repeat(16);
+        let maki = "4a".repeat(16);
+        let maki_m = "51".repeat(16);
+        let unnamed = "e7".repeat(16);
+        let fx = ShareSnapshot::new(
+            "repl-mesh-shares-named-peers",
+            &format!(
+                "version: 1\nallow:\n- pattern: a.md\n  peer: {bob}\n- pattern: b.md\n  peer: {maki_m}\n- pattern: c.md\n  peer: {unnamed}\n"
+            ),
+            &[],
+        );
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            bob.clone(),
+            PersonEntry {
+                alias: Some("Bob".to_string()),
+                ..PersonEntry::default()
+            },
+        );
+        entries.insert(
+            maki.clone(),
+            PersonEntry {
+                alias: Some("Maki".to_string()),
+                sessions: BTreeMap::from([(
+                    maki_m.clone(),
+                    SessionNames {
+                        alias: Some("m".to_string()),
+                        ..SessionNames::default()
+                    },
+                )]),
+                ..PersonEntry::default()
+            },
+        );
+        let namer = Namer::new(People::new(&entries, &[]), None, Default::default());
+
+        let text = render_share_rules(
+            &fx.set(),
+            &PeerRef::unscoped(),
+            None,
+            &namer,
+            CommandPrefix::Dot,
+        );
+
+        assert!(text.contains("only Bob "), "{text}");
+        assert!(text.contains("only Maki / m "), "{text}");
+        assert!(
+            text.contains(&format!("only {} ", short(&unnamed))),
+            "{text}"
+        );
     }
 
     const SHARES_SNAPSHOT: &str = r#"Share rules (global <config_dir>/mesh/shares.yaml; workspace <root>/.coyote/mesh-shares.yaml (absent)):
@@ -27793,13 +28012,30 @@ mod tests {
                     .await;
                     assert_eq!(runtime.interface_kinds(), vec!["private", "local"]);
 
-                    assert!(
+                    let told = || -> Vec<String> {
                         idle.0
                             .lock()
                             .iter()
-                            .all(|text| !text.contains("local rnsd")),
-                        "a local rnsd prints no idle line for any of it: {:?}",
-                        idle.0.lock()
+                            .filter(|text| text.contains("local rnsd"))
+                            .cloned()
+                            .collect()
+                    };
+                    let back_told = format!(
+                        "Back on the local rnsd ({endpoint}); this session announced again, and routes return as other sessions announce or when you address one."
+                    );
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                    while !told().contains(&back_told) && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    assert_eq!(
+                        told(),
+                        vec![
+                            format!(
+                                "Lost the local rnsd ({endpoint}); redialing every 2 s. Other sessions read \"no route\" until it is back."
+                            ),
+                            back_told,
+                        ],
+                        "the first connect tells nothing; the loss and the return are told once each"
                     );
                     assert_eq!(
                         warnings().len(),
@@ -42951,6 +43187,7 @@ mod tests {
                                     destination: &hash,
                                 },
                                 Some(&hash),
+                                &Namer::default(),
                                 CommandPrefix::Slash,
                             );
                             assert_eq!(

@@ -261,9 +261,8 @@ pub(crate) async fn request_on_link(
         }
         Err(err @ LibraryRequestError::Send) => return Err(RequestError::Send(err.to_string())),
         Err(LibraryRequestError::Receive) => {
-            return Err(RequestError::LinkFailed(
-                "the response resource failed before it completed".to_string(),
-            ));
+            debug!("Mesh request for {path}: the response resource failed before it completed");
+            return Err(RequestError::LinkDropped);
         }
         Err(err) => return Err(RequestError::LinkFailed(err.to_string())),
     };

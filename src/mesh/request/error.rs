@@ -37,8 +37,12 @@ pub(crate) enum RequestError {
     /// had not completed within `after`, so the peer never had the whole request to answer.
     RequestIncomplete { path: String, after: Duration },
     /// The link was up but the request or its proof could not be put on it, or its
-    /// answer failed in transfer.
+    /// answer failed in a way other than the link dropping under it.
     LinkFailed(String),
+    /// The answer had begun to arrive as a resource when the transfer failed, as it does
+    /// when the link to the peer drops mid-response; none of it was kept. Its own variant
+    /// so the REPL can say what was cut off without the transport's words.
+    LinkDropped,
     /// The link was never established: no path to the peer, or the transport refused to
     /// open or activate it. Reads as `LinkFailed` does; only callers that track whether
     /// the peer is reachable tell the two apart.
@@ -149,6 +153,10 @@ impl fmt::Display for RequestError {
             Self::LinkFailed(reason) | Self::LinkNotOpened(reason) => {
                 write!(f, "The mesh link failed: {reason}")
             }
+            Self::LinkDropped => write!(
+                f,
+                "The mesh link dropped before the answer finished arriving, so nothing of it was kept"
+            ),
             Self::LinkClosed => write!(f, "The mesh link closed before the request completed"),
             Self::Oversize { len, max } => write!(
                 f,
@@ -246,6 +254,7 @@ pub(crate) fn request_remedy(err: &RequestError) -> &'static str {
         | RequestError::ResponseIncomplete { .. }
         | RequestError::RequestIncomplete { .. }
         | RequestError::LinkFailed(_)
+        | RequestError::LinkDropped
         | RequestError::LinkNotOpened(_)
         | RequestError::LinkClosed => {
             "Try again in a minute; `.mesh people list` shows when that session was last heard"
