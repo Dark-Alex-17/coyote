@@ -412,19 +412,19 @@ def base_run_store(proj, diff_base, subdir, prefix, deadline):
     return os.path.join(proj, records), tree, subdir, prefix
 
 
-def base_run_path(store, cmd):
-    records, tree, subdir, prefix = store
+def base_run_path(saved_runs, cmd):
+    records, tree, subdir, prefix = saved_runs
     parts = [BASE_RUN_FORMAT, tree, subdir, cmd, prefix, PER_COMMAND_TIMEOUT_SECS]
     key = hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()[:16]
     return os.path.join(records, f"adversary-{key}.json")
 
 
-def load_base_run(store, cmd):
+def load_base_run(saved_runs, cmd):
     """The saved (exit, output) of `cmd` at the diff base; None when absent or unreadable."""
-    if store is None:
+    if saved_runs is None:
         return None
     try:
-        with open(base_run_path(store, cmd), encoding="utf-8") as f:
+        with open(base_run_path(saved_runs, cmd), encoding="utf-8") as f:
             saved = json.load(f)
     except (OSError, ValueError):
         return None
@@ -436,11 +436,11 @@ def load_base_run(store, cmd):
     return code, output
 
 
-def save_base_run(store, cmd, base, base_path, deadline):
+def save_base_run(saved_runs, cmd, base, base_path, deadline):
     """Keep a completed base run for later rounds. A timed-out or signal-killed run is
     never kept, and an existing record is never replaced: the first writer wins."""
     code = base["exit"]
-    if store is None or code < 0 or code >= 128:
+    if saved_runs is None or code < 0 or code >= 128:
         return
     try:
         if gate_killed(base_path, left(deadline)):
@@ -449,7 +449,7 @@ def save_base_run(store, cmd, base, base_path, deadline):
             output = f.read()
     except (GateUnavailable, OSError):
         return
-    records = store[0]
+    records = saved_runs[0]
     record = {"version": BASE_RUN_FORMAT, "cmd": cmd, "exit": code, "output": output}
     try:
         os.makedirs(records, exist_ok=True)
@@ -459,7 +459,7 @@ def save_base_run(store, cmd, base, base_path, deadline):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(record, f)
-        os.link(tmp, base_run_path(store, cmd))
+        os.link(tmp, base_run_path(saved_runs, cmd))
     except OSError:
         pass
     finally:
@@ -500,10 +500,10 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
         except GateUnavailable as e:
             results[i]["baseline"] = dict(not_run(f"baseline comparison unavailable: {e}"), exit=base["exit"])
 
-    store = base_run_store(proj, diff_base, subdir, prefix, deadline)
+    saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
     misses = []
     for i in reds:
-        saved = load_base_run(store, results[i]["cmd"])
+        saved = load_base_run(saved_runs, results[i]["cmd"])
         if saved is None:
             misses.append(i)
             continue
@@ -548,7 +548,7 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
             if base["exit"] == -1:
                 results[i]["baseline"] = not_run("the command timed out on the diff base")
                 continue
-            save_base_run(store, results[i]["cmd"], base, base_path, deadline)
+            save_base_run(saved_runs, results[i]["cmd"], base, base_path, deadline)
             compare(i, base, base_path)
     finally:
         remove_worktree(top, tree)
