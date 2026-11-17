@@ -1085,7 +1085,7 @@ pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> V
     text.push((help.into_owned(), plain));
     text.push((
         format!(
-            "\"?\" or \"{}{}\" lists the keys.",
+            "On an empty prompt \"?\" or \"{}{}\" lists the keys.",
             prefix.display(),
             super::KEYS_COMMAND
         ),
@@ -1491,8 +1491,10 @@ mod tests {
                 assert!(text.contains("openai:test-model"), "{text}");
                 assert!(text.contains("Tip: Press Ctrl-C"), "{text}");
                 assert!(text.contains(".help"), "{text}");
+            }
+            if width >= 80 {
                 assert!(
-                    text.contains("\"?\" or \".keys\" lists the keys."),
+                    text.contains("On an empty prompt \"?\" or \".keys\" lists the keys."),
                     "{text}"
                 );
             }

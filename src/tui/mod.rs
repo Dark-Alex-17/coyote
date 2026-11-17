@@ -1713,6 +1713,14 @@ impl App {
     /// Takes the trimmed draft out of the composer and into the history;
     /// None when there is nothing but whitespace.
     fn take_composer_line(&mut self) -> Option<String> {
+        let line = self.clear_sent_draft()?;
+        self.record_history(&line);
+        Some(line)
+    }
+
+    /// Empties the composer the way sending a line does and returns the
+    /// trimmed draft; None when there is nothing but whitespace.
+    fn clear_sent_draft(&mut self) -> Option<String> {
         let text = self.composer_text();
         if text.trim().is_empty() {
             return None;
@@ -1722,9 +1730,7 @@ impl App {
         self.transcript.clear_focus();
         // The next line is typed, so the vi layer starts it in insert.
         self.vi_mode = self.vi_mode.map(|_| ViMode::Insert);
-        let line = text.trim().to_string();
-        self.record_history(&line);
-        Some(line)
+        Some(text.trim().to_string())
     }
 
     fn submit_composer(&mut self) -> Option<Command> {
@@ -1743,7 +1749,9 @@ impl App {
 
     /// Takes a draft that is the `.keys` command and nothing else out of
     /// the composer, as any sent line is, and opens the key help in
-    /// place of sending it.
+    /// place of sending it. The plain REPL shares the history file and
+    /// does not know `.keys`, so the line is kept in this session's
+    /// history only.
     fn take_keys_command(&mut self) -> bool {
         let text = self.composer_text();
         let command = self.config.command_prefix.normalize(text.trim());
@@ -1754,7 +1762,9 @@ impl App {
         {
             return false;
         }
-        self.take_composer_line();
+        if let Some(line) = self.clear_sent_draft() {
+            self.history.push(&line);
+        }
         self.help = Some(Help::default());
         true
     }
@@ -3601,6 +3611,12 @@ async fn join_unattended<T>(
         }
     })
     .await;
+    // One pass of the select can find the channel empty and then the task
+    // done, when the task's thread sends its last notice and ends between
+    // the two polls; whatever it sent is queued by then.
+    while let Ok(msg) = rx.try_recv() {
+        answer_unattended(msg, &mut late);
+    }
     let joined = match joined {
         Ok(Ok(value)) => Join::Finished(value),
         Ok(Err(err)) => Join::Panicked(err),
@@ -5621,6 +5637,87 @@ mod tests {
             PromptAnswer::Text("notes two".to_string())
         );
         assert_eq!(harness.app.composer_text(), "draft");
+    }
+
+    /// The readline chords a user reaches for first, sent through the
+    /// app's key handling, edit the composer and an input question's
+    /// field alike. Each starts from a line with a cut to paste back and
+    /// an edit to undo, the cursor inside a word; a marker typed after
+    /// the chord shows where the cursor went.
+    #[test]
+    fn readline_chords_edit_the_composer_and_an_input_field() {
+        use ratatui_textarea::CursorMove;
+        let key = |code: KeyCode, modifiers: KeyModifiers| KeyEvent::new(code, modifiers);
+        let ctrl = |c: char| key(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let alt = |c: char| key(KeyCode::Char(c), KeyModifiers::ALT);
+        let marker = key(KeyCode::Char('|'), KeyModifiers::NONE);
+        let chords = [
+            alt('f'),
+            alt('b'),
+            ctrl('w'),
+            ctrl('u'),
+            ctrl('k'),
+            ctrl('y'),
+            ctrl('e'),
+        ];
+
+        let composer_after = |chord: Option<KeyEvent>| {
+            let mut harness = Harness::standalone(80, 24);
+            harness.app.composer.set_text("alpha beta gamma delta");
+            harness.app.composer.input(ctrl('w'));
+            harness.app.composer.move_cursor(keys::ViMotion::Head);
+            harness
+                .app
+                .composer
+                .move_cursor(keys::ViMotion::WordForward);
+            harness.app.composer.move_cursor(keys::ViMotion::Forward);
+            for key in chord.into_iter().chain([marker]) {
+                assert_eq!(harness.app.handle_key(key), None, "{key:?}");
+            }
+            harness.app.composer_text()
+        };
+        let unmoved = composer_after(None);
+        assert_eq!(unmoved, "alpha b|eta gamma ");
+        for chord in chords {
+            assert_ne!(
+                composer_after(Some(chord)),
+                unmoved,
+                "{chord:?} in the composer"
+            );
+        }
+
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest::new(PromptAction::Input, "Session name:", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        let mut field_after = |chord: Option<KeyEvent>| {
+            let field = harness
+                .app
+                .prompts
+                .front_mut()
+                .unwrap()
+                .field
+                .as_mut()
+                .unwrap();
+            *field = new_field(false);
+            field.insert_str("alpha beta gamma delta");
+            field.delete_word();
+            field.move_cursor(CursorMove::Head);
+            field.move_cursor(CursorMove::WordForward);
+            field.move_cursor(CursorMove::Forward);
+            for key in chord.into_iter().chain([marker]) {
+                assert_eq!(harness.app.key_context().modal, Some(ModalKind::Input));
+                assert_eq!(harness.app.handle_key(key), None, "{key:?}");
+            }
+            let field = harness.app.prompts.front().unwrap().field.as_ref().unwrap();
+            field.lines().join("\n")
+        };
+        let unmoved = field_after(None);
+        assert_eq!(unmoved, "alpha b|eta gamma ");
+        for chord in chords {
+            assert_ne!(field_after(Some(chord)), unmoved, "{chord:?} in the field");
+        }
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
     }
 
     fn list_request(action: PromptAction, tool: Option<&str>) -> PromptRequest {
@@ -9084,6 +9181,29 @@ mod tests {
         assert!(history_file(&saving, None).is_some_and(|p| p.ends_with("default")));
         assert!(history_file(&saving, Some("a/b")).is_some_and(|p| p.ends_with("session_a_b")));
         assert_eq!(history_file(&plain_config(), Some("a")), None);
+    }
+
+    /// The plain REPL shares the history file and does not know `.keys`,
+    /// so the line never reaches the file, while Up in this session
+    /// still brings it back.
+    #[test]
+    fn dot_keys_is_recalled_in_the_session_but_never_written_to_the_history_file() {
+        let dir = crate::testing::ScratchDirGuard::new("tui-history-keys");
+        let path = dir.path.join("history");
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.history_file = Some(path.clone());
+        submit(&mut harness, "hello");
+        harness.type_text(".keys");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(harness.app.help.is_some(), ".keys opens the help");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(harness.app.help.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        assert_eq!(ComposerHistory::load(&path).unwrap().search(""), ["hello"]);
+        assert_eq!(harness.press(KeyCode::Up), None);
+        assert_eq!(harness.app.composer_text(), ".keys");
+        assert_eq!(harness.press(KeyCode::Up), None);
+        assert_eq!(harness.app.composer_text(), "hello");
     }
 
     fn search(harness: &Harness) -> Option<&SearchState> {

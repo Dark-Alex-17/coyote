@@ -719,6 +719,22 @@ mod tests {
         assert!(set.contains("highlight"), "{set:?}");
     }
 
+    /// `.keys` is the TUI's own command, not the REPL's, so the palette
+    /// built from the REPL's table never offers it, while a prefix of a
+    /// REPL command still finds that command.
+    #[test]
+    fn the_palette_never_offers_dot_keys() {
+        for prefix in [CommandPrefix::Dot, CommandPrefix::Both] {
+            let ctx = ctx_with(prefix, true);
+            for line in [".", ".k", ".ke", ".keys"] {
+                let names = palette_names(&ctx, line);
+                assert!(!names.contains(".keys"), "{prefix} {line:?}: {names:?}");
+            }
+            let help = palette_names(&ctx, ".he");
+            assert!(help.contains(".help"), "{prefix}: {help:?}");
+        }
+    }
+
     /// `.info` is a command and the head of a group: with a space after
     /// it the group's verbs are argument rows replacing the second token,
     /// not command rows replacing the line. A third token is past them.

@@ -538,13 +538,9 @@ fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'stat
 }
 
 /// A composer arm's guard that names a popup or vi insert mode moves the
-/// arm to that table context; a guard that only asks for no popup keeps
-/// it in the composer.
+/// arm to that table context.
 fn composer_subcontext(guard: &str) -> &'static str {
-    if guard
-        .replace("ctx.popup.is_none()", "")
-        .contains("ctx.popup")
-    {
+    if guard.contains("ctx.popup") {
         "Popup"
     } else if guard.contains("ViMode::Insert") {
         "Vi insert"

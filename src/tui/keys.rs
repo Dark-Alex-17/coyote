@@ -116,11 +116,16 @@ pub(crate) struct KeyContext {
 
 impl KeyContext {
     /// Whether a plain `?` on the composer opens the help: only an empty
-    /// composer with nothing open over it gives it up. Anywhere else it
-    /// is typing, vi normal mode's swallowing included. The status strip
-    /// advertises `?` by the same test.
+    /// composer with nothing open over it (no band, question, pager or
+    /// help) gives it up. Anywhere else it is typing, vi normal mode's
+    /// swallowing included. The status strip advertises `?` by the same
+    /// test.
     pub(crate) fn question_mark_opens_help(&self) -> bool {
-        self.composer_empty && self.popup.is_none()
+        self.composer_empty
+            && self.popup.is_none()
+            && self.modal.is_none()
+            && self.pager.is_none()
+            && !self.help
     }
 }
 
@@ -292,6 +297,11 @@ const fn row(context: HelpContext, keys: &'static str, does: &'static str) -> He
 /// unit tests replay every row through `map_key` and sweep the key map
 /// for bindings no row names, so the two cannot drift apart. The mouse
 /// wheel rows are not keys; the app's tests pin them.
+///
+/// Some text area chords are left out on purpose: Ctrl+A and Ctrl+B are
+/// terminal multiplexer prefixes (screen, tmux), and terminals send Ctrl+H
+/// and Ctrl+M for Backspace and Enter, so naming them would promise keys
+/// many users never get.
 pub(crate) const KEY_HELP: &[HelpRow] = {
     use HelpContext::*;
     &[
@@ -418,7 +428,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(ComposerEditing, "Ctrl+K", "Cut to the end of the line"),
         row(ComposerEditing, "Ctrl+Y", "Paste what was last cut"),
         row(ComposerEditing, "Ctrl+U", "Undo"),
-        row(ComposerEditing, "Shift+Left / Shift+Right", "Select text"),
+        row(
+            ComposerEditing,
+            "Shift+Left / Shift+Right",
+            "Select text to type over or delete; there is no cut, Ctrl+X opens the todo panel",
+        ),
         row(TurnRunning, "Esc / Ctrl+C", "Interrupt the turn"),
         row(TurnRunning, "Enter", "Hold the line for the running turn"),
         row(Question, "y / n", "Answer yes or no"),
@@ -434,7 +448,11 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         ),
         row(Question, "Up / Down / j / k", "Move between the options"),
         row(Question, "Space", "Tick or untick an option"),
-        row(Question, "1-9", "Choose that option"),
+        row(
+            Question,
+            "1-9",
+            "Choose that option, in a single-choice list",
+        ),
         row(Question, "Esc / Ctrl+C", "Cancel the question"),
         row(Bands, "Up / Down / Tab / Shift+Tab", "Move the highlight"),
         row(Bands, "Enter", "Take the highlighted row"),
@@ -3117,11 +3135,166 @@ mod tests {
             (TYPING, false),
             (SEARCH, false),
             (PALETTE, false),
+            (CONFIRM, false),
+            (INPUT, false),
+            (BROWSE, false),
         ];
         for (ctx, opens) in cases {
             assert_eq!(ctx.question_mark_opens_help(), opens, "{ctx:?}");
             let toggles = map_key(mark, &ctx) == Action::ToggleHelp;
             assert_eq!(toggles, opens, "{ctx:?}");
+        }
+        assert!(!HELP.question_mark_opens_help());
+    }
+
+    /// Every chord ratatui-textarea 0.9.4 binds in `TextArea::input`, by
+    /// name: typed characters, the mouse and the clipboard keys aside.
+    /// Shift extends a selection with the named keys that move.
+    fn text_area_chords() -> Vec<(String, KeyEvent)> {
+        let alt = |code: KeyCode| press(code, KeyModifiers::ALT);
+        let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
+        let ctrl_alt = |code: KeyCode| press(code, KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let mut chords: Vec<KeyEvent> = "mhdkjwnpfbaeuryxcv".chars().map(ctrl).collect();
+        chords.extend("hdnpfb<>][v".chars().map(|c| alt(KeyCode::Char(c))));
+        chords.extend([
+            plain(KeyCode::Enter),
+            plain(KeyCode::Tab),
+            alt(KeyCode::Backspace),
+            alt(KeyCode::Delete),
+            plain(KeyCode::Backspace),
+            plain(KeyCode::Delete),
+        ]);
+        for code in [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            chords.push(plain(code));
+            chords.push(press(code, KeyModifiers::SHIFT));
+        }
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+            chords.push(control(code));
+            chords.push(ctrl_alt(code));
+        }
+        chords.extend("bfpn".chars().map(|c| ctrl_alt(KeyCode::Char(c))));
+        chords
+            .into_iter()
+            .map(|key| (chord_name(key), key))
+            .collect()
+    }
+
+    fn chord_name(key: KeyEvent) -> String {
+        let mut name = String::new();
+        for (modifier, prefix) in [
+            (KeyModifiers::CONTROL, "Ctrl+"),
+            (KeyModifiers::ALT, "Alt+"),
+            (KeyModifiers::SHIFT, "Shift+"),
+        ] {
+            if key.modifiers.contains(modifier) {
+                name.push_str(prefix);
+            }
+        }
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_alphabetic() => name.push(c.to_ascii_uppercase()),
+            KeyCode::Char(c) => name.push(c),
+            KeyCode::PageUp => name.push_str("PgUp"),
+            KeyCode::PageDown => name.push_str("PgDn"),
+            code => name.push_str(&format!("{code:?}")),
+        }
+        name
+    }
+
+    /// The text area chords the key map keeps for itself in `ctx`, by name.
+    fn shadowed(ctx: &KeyContext) -> Vec<String> {
+        let mut names: Vec<String> = text_area_chords()
+            .into_iter()
+            .filter(|(_, key)| {
+                !matches!(
+                    map_key(*key, ctx),
+                    Action::ComposerInput(_) | Action::ModalInput(_)
+                )
+            })
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn sorted(names: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// Each text area chord the key map takes before the text area sees
+    /// it is listed here, so every shadowing is a choice: everything else
+    /// the text area binds reaches it, in the composer and in a question's
+    /// text field.
+    #[test]
+    fn the_key_map_shadows_only_the_listed_text_area_chords() {
+        let always = [
+            "Enter",
+            "Ctrl+J",
+            "Ctrl+C",
+            "Ctrl+X",
+            "Shift+Up",
+            "Shift+Down",
+            "PgUp",
+            "PgDn",
+            "Shift+PgUp",
+            "Shift+PgDn",
+        ];
+        let composer = [
+            &always[..],
+            &[
+                "Ctrl+R",
+                "Ctrl+Up",
+                "Ctrl+Down",
+                "Ctrl+Alt+Up",
+                "Ctrl+Alt+Down",
+            ],
+        ]
+        .concat();
+        let empty_composer = [&composer[..], &["Ctrl+D", "Up", "Down"]].concat();
+        let one_line_draft = [&composer[..], &["Up", "Down"]].concat();
+        let cases = [
+            (IDLE, sorted(&empty_composer)),
+            (TYPING, sorted(&one_line_draft)),
+            (MULTI_LINE, sorted(&composer)),
+            (INPUT, sorted(&always)),
+            (CUSTOM_FIELD, sorted(&always)),
+        ];
+        for (ctx, expected) in cases {
+            assert_eq!(shadowed(&ctx), expected, "{ctx:?}");
+        }
+    }
+
+    /// The readline chords users reach for first are handed on whole, so
+    /// they edit the composer and a question's text field.
+    #[test]
+    fn readline_chords_reach_the_composer_and_the_text_field() {
+        let alt = |c: char| press(KeyCode::Char(c), KeyModifiers::ALT);
+        let chords = [
+            alt('f'),
+            alt('b'),
+            ctrl('w'),
+            ctrl('u'),
+            ctrl('k'),
+            ctrl('y'),
+            ctrl('e'),
+        ];
+        for key in chords {
+            for ctx in [IDLE, TYPING, MULTI_LINE, VI_INSERT_TYPING, RUNNING_TYPING] {
+                assert_eq!(map_key(key, &ctx), Action::ComposerInput(key), "{ctx:?}");
+            }
+            for ctx in [INPUT, PASSWORD, CUSTOM_FIELD] {
+                assert_eq!(map_key(key, &ctx), Action::ModalInput(key), "{ctx:?}");
+            }
         }
     }
 

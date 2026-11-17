@@ -198,10 +198,22 @@ fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_cl
         squeezed(&all).contains(&squeezed(LAST_HELP_ROW)),
         "paging never showed the help's last row:\n{all}"
     );
-    for chord in ["Ctrl+G", "Ctrl+X", "Ctrl+T", "Ctrl+L"] {
+    for chord in [
+        "Ctrl+G", "Ctrl+X", "Ctrl+T", "Ctrl+L", "Ctrl+R", "Ctrl+O", "Ctrl+Z",
+    ] {
         assert!(
             all.contains(chord),
             "the key help never lists {chord}:\n{all}"
+        );
+    }
+    for group in [
+        "Composer and text field editing",
+        "Pager find",
+        "Thread picker",
+    ] {
+        assert!(
+            squeezed(&all).contains(&squeezed(group)),
+            "the key help never shows the {group:?} group:\n{all}"
         );
     }
     if let Some(named) = names_a_function_key(&all) {
@@ -446,9 +458,8 @@ fn question_mark_in_the_history_search_band_opens_no_help() {
 }
 
 /// Under a Select modal `?` and F1-F12 leave the modal up and open no key
-/// help, Ctrl+G opens no roster (the modal has the keyboard, as F3 did
-/// nothing there), and Ctrl+X still shows the todo panel beside the
-/// question, as F2 did.
+/// help, Ctrl+G opens no roster (the modal has the keyboard), and Ctrl+X
+/// still shows the todo panel beside the question.
 #[test]
 #[serial]
 fn under_a_select_modal_ctrl_x_shows_the_todo_and_ctrl_g_and_question_mark_do_nothing() {
@@ -499,21 +510,43 @@ fn under_a_select_modal_ctrl_x_shows_the_todo_and_ctrl_g_and_question_mark_do_no
     leave(pty);
 }
 
-/// `.keys` belongs to the TUI but the command palette does not offer it.
+/// The palette band of a repainted frame: from the end of the status row
+/// above it down to the composer's rule under it; empty with no band open.
+fn palette_band(frame: &str) -> &str {
+    let strip_end = "Ctrl+X = todo";
+    let after = frame
+        .rfind(strip_end)
+        .map(|at| &frame[at + strip_end.len()..])
+        .unwrap_or_else(|| panic!("the status row is not on screen:\n{frame}"));
+    after.split('\u{2500}').next().unwrap_or_default()
+}
+
+/// `.keys` belongs to the TUI but the command palette does not offer it,
+/// while a prefix of a REPL command does open the band on that command.
 #[test]
 #[serial]
 fn the_palette_does_not_offer_dot_keys() {
     let (_guard, mut pty) = boot("palette-keys", "");
+    pty.send(b".he").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = flipped_frame(&mut pty);
+    let band = palette_band(&frame);
+    assert!(
+        band.contains(".help"),
+        "the palette does not offer .help for .he:\n{frame}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+
     pty.send(b".ke").unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = flipped_frame(&mut pty);
-    let offered: Vec<&str> = frame
-        .lines()
-        .filter(|line| line.contains(".keys") && !line.contains("Press"))
-        .collect();
+    let band = palette_band(&frame);
     assert!(
-        offered.is_empty(),
-        "the palette offers .keys: {offered:?}\n{frame}"
+        !band.contains(".keys"),
+        "the palette offers .keys: {band:?}\n{frame}"
     );
     leave(pty);
 }

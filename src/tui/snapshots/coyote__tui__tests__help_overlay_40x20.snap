@@ -2,7 +2,7 @@
 source: src/tui/mod.rs
 expression: "&frame"
 ---
-"Keys                            1-18/203"
+"Keys                            1-18/206"
 "Anywhere                                "
 "  Ctrl+Z                                "
 "    Suspend to the shell                "
@@ -21,4 +21,4 @@ expression: "&frame"
 "    scrolled                            "
 "  Mouse wheel                           "
 "    Scroll the transcript               "
-"j/k scroll  PgUp/PgDn page  q close     "
+"j/k scroll  PgUp/PgDn page  q/Esc close "
