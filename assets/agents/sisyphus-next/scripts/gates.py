@@ -2502,6 +2502,7 @@ def apply_answer(state):
             u["_next"] = "ci_poll"
         elif a == "fix" and not stop:
             u["fix_source"] = "ci"
+            u["ci_fix_active"] = True
             u["_next"] = "compose_fix"
         elif _watch_started(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
@@ -2793,8 +2794,8 @@ def render_coder_prompt(state):
                   fix, "", "### Your previous result", tail(state.get("coder_result") or "", 4000)]
     prompt = "\n".join(parts)
     u["coder_prompt"] = prompt
-    # The coder may reuse a test baseline recorded on any commit this run made on top of its base.
-    u["coder_baseline_floor"] = state.get("run_base_sha") or state.get("base_sha") or ""
+    # While carried failures are pending, an earlier record would list them as failures that were already there.
+    u["coder_baseline_floor"] = "" if _carried(state) else state.get("run_base_sha") or state.get("base_sha") or ""
     write_artifact(state.get("run_dir", ""), f"coder-prompt-{as_int(state.get('fix_round'))}.md", prompt)
     u["_next"] = "check_inbox_pre" if truthy(state.get("parallel_mode")) else "run_coder"
     return u
@@ -4288,8 +4289,9 @@ def _publish_asks(state):
 
 
 def _ci_fix_push(state):
-    """A CI fix round on the PR this run published and watches: it only needs a push to that PR's head."""
-    return (state.get("fix_source") == "ci" and truthy(state.get("ci_owner")) and truthy(state.get("pr_published"))
+    """A CI fix round on the PR this run published and watches: it only needs a push to that PR's head. The flag
+    outlives the gauntlet or observability rounds inside the fix, which overwrite fix_source."""
+    return (truthy(state.get("ci_fix_active")) and truthy(state.get("ci_owner")) and truthy(state.get("pr_published"))
             and bool(str(state.get("pr_ref") or "").strip()))
 
 
@@ -4364,7 +4366,8 @@ def ci_gate(state):
                              "recorded as follow-ups, the CI watch goes on")
         else:
             ledger(state, u, f"push_fix: every check passed ({', '.join(n for n, _, _ in rows)})")
-        u["review_rounds_posted"] = len([r for r in as_list(state.get("round_heads")) if isinstance(r, dict)])
+            u["review_rounds_posted"] = len([r for r in as_list(state.get("round_heads")) if isinstance(r, dict)])
+        u["ci_fix_active"] = False
         _reset_ci_watch(u)
         u["ci_rerun_ids"] = []
         u["_next"] = "ci_poll"
@@ -4377,6 +4380,7 @@ def ci_gate(state):
         u["_next"] = "final_report"
         return u
     if task.get("kind") == "publish":
+        u["ci_fix_active"] = False
         rows = _publish_checks(state)
         failed = [r for r in rows if not r[1]]
         tries = as_int(state.get("publish_retries"))
@@ -4490,7 +4494,7 @@ def _push_fix_checks(state):
     head = None if pr is None else pr.get("headRefName")
     return [_clean_worktree_row(state, root), _pushed_row(root),
             ("PR head", bool(branch) and head == branch,
-             "gh pr view failed" if pr is None else f"PR head {head!r}, current branch {branch or '(detached HEAD)'!r}")]
+             "the PR could not be read" if pr is None else f"PR head {head!r}, current branch {branch or '(detached HEAD)'!r}")]
 
 
 def _pr_view(state, ref=""):
@@ -5055,6 +5059,7 @@ def ci_apply(state):
                 [option("Resume with one more coder fix round"), option("Leave the PR in draft and report", recommended=True)],
                 evidence=tail(state.get("ci_evidence", ""), 2000)))
         u["fix_source"] = "ci"
+        u["ci_fix_active"] = True
         u["_next"] = "compose_fix"
         return u
     if verdict == "infra":

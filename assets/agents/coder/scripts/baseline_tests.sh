@@ -27,6 +27,7 @@ emit_baseline() {
         "baseline_exit_code": $rc,
         "baseline_failures": $ids,
         "baseline_failure_hash": env.BASELINE_HASH,
+        "baseline_reused_from": env.BASELINE_REUSED_FROM,
         "baseline_note": (
           (if env.BASELINE_STATUS != "red" then env.BASELINE_NOTE
           elif ($ids | length) > 0 then
@@ -85,7 +86,7 @@ valid_record() {
   jq -e '.version == 1 and (.status == "green" or .status == "red")' "$1" >/dev/null 2>&1
 }
 
-export BASELINE_STATUS=none BASELINE_EXIT=0 BASELINE_HASH='' BASELINE_NOTE='' BASELINE_REASON='' BASELINE_EXTRA=''
+export BASELINE_STATUS=none BASELINE_EXIT=0 BASELINE_HASH='' BASELINE_NOTE='' BASELINE_REASON='' BASELINE_EXTRA='' BASELINE_REUSED_FROM=''
 
 project_dir=$(gate_workdir "$state")
 cmd=$(gate_test_command_for_run "$(gate_test_command "$project_dir")")
@@ -170,11 +171,10 @@ if [[ -n "$porcelain" ]]; then
 fi
 
 # When the caller names the commit its run started from (baseline_floor), the
-# commits between that floor and HEAD are the run's own, so a record taken on
-# one of them still describes the tree before this run's edits. The nearest
-# record on HEAD's first-parent chain is reused only when the floor is an
-# ancestor of it and every commit after it is a plain commit made after the
-# record was taken; anything else runs the suite.
+# nearest record on HEAD's first-parent chain is reused only when the floor is
+# an ancestor of the record's commit, no merge commit lies between that commit
+# and HEAD, and every commit in between has a committer date on or after the
+# record's recorded_at. Anything else runs the suite.
 floor=${LLM_AGENT_VAR_BASELINE_FLOOR:-}
 if [[ -n "$floor" ]] && floor=$(git -C "$workdir" rev-parse --verify -q "$floor^{commit}" 2>/dev/null); then
   ancestor=''
@@ -200,6 +200,7 @@ if [[ -n "$floor" ]] && floor=$(git -C "$workdir" rev-parse --verify -q "$floor^
       between=$(git -C "$workdir" rev-list --reverse --abbrev-commit --abbrev=7 "$ancestor..HEAD" | paste -sd ' ' -)
       count=$(printf '%s\n' "$dates" | wc -l | tr -d ' ')
       BASELINE_EXTRA="This baseline was recorded on ${ancestor:0:7} ($recorded_at), $count commit(s) before HEAD $short_head ($between), all made after it, and reused; the suite was not run again."
+      BASELINE_REUSED_FROM="${ancestor:0:7}, $count commit(s) before HEAD $short_head"
       reuse_record "$ancestor_record"
       exit 0
     fi

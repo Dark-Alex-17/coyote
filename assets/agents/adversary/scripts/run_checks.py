@@ -507,9 +507,16 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
         if saved is None:
             misses.append(i)
             continue
+        if left(deadline) <= 0:
+            results[i]["baseline"] = not_run("the deadline was spent before this command's baseline run")
+            continue
         base_path = os.path.join(work, f"base-{i}.txt")
-        with open(base_path, "w", encoding="utf-8", newline="") as f:
-            f.write(saved[1])
+        try:
+            with open(base_path, "w", encoding="utf-8", newline="") as f:
+                f.write(saved[1])
+        except OSError as e:
+            results[i]["baseline"] = not_run(f"the saved diff-base run could not be written out: {e}")
+            continue
         compare(i, {"exit": saved[0]}, base_path)
     if not misses:
         return

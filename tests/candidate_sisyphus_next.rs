@@ -6184,6 +6184,25 @@ fn research_fanouts_start_explore_and_librarian_maps_together() {
 }
 
 /// One run of the lifted research fan-out on the real binary (which
+/// `run_coder` hands the coder the floor `render_coder_prompt` computes, so
+/// a later coder round can reuse a test baseline from an earlier commit.
+#[test]
+fn run_coder_passes_the_baseline_floor_to_the_coder() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &shipped["nodes"]["run_coder"];
+    assert_eq!(
+        node["inputs"]["baseline_floor"].as_str(),
+        Some("{{coder_baseline_floor}}"),
+        "{node:?}"
+    );
+    assert_eq!(
+        shipped["initial_state"]["coder_baseline_floor"].as_str(),
+        Some("")
+    );
+}
+
+/// One run of the lifted research fan-out on the real binary (which
 /// validates the graph first): the solo pass-through, the shipped explore
 /// and librarian maps with their shipped fault scripts, and stub lanes in
 /// place of the agents. One explore slice dies and falls back to its fault

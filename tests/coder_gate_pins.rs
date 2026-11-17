@@ -696,12 +696,13 @@ const VERIFY_TESTS: &str = "coder/scripts/verify_tests.sh";
 
 /// The keys baseline_tests may write: ids, hash and note, never a transcript
 /// and never the implementer's `last_node_output`.
-const BASELINE_KEYS: [&str; 6] = [
+const BASELINE_KEYS: [&str; 7] = [
     "_next",
     "baseline_exit_code",
     "baseline_failure_hash",
     "baseline_failures",
     "baseline_note",
+    "baseline_reused_from",
     "baseline_status",
 ];
 
@@ -2219,6 +2220,264 @@ fn baseline_tests_runs_the_suite_when_an_ancestor_record_cannot_be_trusted() {
         2,
         "a commit older than the record reuses nothing"
     );
+}
+
+fn empty_commits(dir: &Path, count: usize) {
+    for n in 0..count {
+        git(
+            dir,
+            &["commit", "-q", "--allow-empty", "-m", &format!("empty {n}")],
+        );
+    }
+}
+
+/// The ancestor walk looks at most 50 first-parent commits back from HEAD:
+/// a record exactly 50 commits behind is reused, one 51 behind is not.
+#[test]
+fn baseline_tests_looks_for_an_ancestor_record_at_most_50_commits_back() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-floor-cap");
+    let (dir, floor, cmd) = recorded_project(&root.0, "cap");
+    let envs = [
+        ("TEST_CMD", cmd.as_str()),
+        ("LLM_AGENT_VAR_BASELINE_FLOOR", floor.as_str()),
+    ];
+    empty_commits(&dir, 50);
+    let out = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    assert_eq!(suite_runs(&root.0, "cap"), 1, "50 back is reused: {out}");
+    assert!(
+        str_field(&out, "baseline_note").contains(", 50 commit(s) before HEAD "),
+        "{out}"
+    );
+    empty_commits(&dir, 1);
+    let out = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    assert_eq!(
+        suite_runs(&root.0, "cap"),
+        2,
+        "51 back is past the walk: {out}"
+    );
+}
+
+/// The nearest record wins: one taken on a later commit of the run, not the
+/// floor's, is reused and the note names it and only the commits after it.
+#[test]
+fn baseline_tests_reuses_the_nearest_record_above_the_floor() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-floor-nearest");
+    let (dir, floor, cmd) = recorded_project(&root.0, "nearest");
+    let mid = commit_file(&dir, "one.txt");
+    run_script(BASELINE, &dir, &project_state(&dir), &[("TEST_CMD", &cmd)]);
+    assert_eq!(suite_runs(&root.0, "nearest"), 2);
+    let two = commit_file(&dir, "two.txt");
+    let three = commit_file(&dir, "three.txt");
+
+    let out = run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_eq!(
+        suite_runs(&root.0, "nearest"),
+        2,
+        "the suite ran again: {out}"
+    );
+    let mid_record: Value = stored_records(&dir)
+        .iter()
+        .map(|p| serde_json::from_str::<Value>(&fs::read_to_string(p).unwrap()).unwrap())
+        .find(|r| r["head"] == mid)
+        .expect("a record on the intermediate commit");
+    let note = str_field(&out, "baseline_note");
+    assert!(
+        note.ends_with(&format!(
+            "\n\nThis baseline was recorded on {} ({}), 2 commit(s) before HEAD {} ({} {}), all made after it, and reused; the suite was not run again.",
+            &mid[..7],
+            str_field(&mid_record, "recorded_at"),
+            &three[..7],
+            &two[..7],
+            &three[..7]
+        )),
+        "{note}"
+    );
+}
+
+/// A floor that names no commit is no floor: the suite runs.
+#[test]
+fn baseline_tests_runs_the_suite_when_the_floor_does_not_resolve() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-floor-unresolved");
+    let (dir, _, cmd) = recorded_project(&root.0, "unresolved");
+    commit_file(&dir, "one.txt");
+    let out = run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[
+            ("TEST_CMD", &cmd),
+            ("LLM_AGENT_VAR_BASELINE_FLOOR", "no-such-commit"),
+        ],
+    );
+    assert_eq!(suite_runs(&root.0, "unresolved"), 2, "{out}");
+    assert_eq!(str_field(&out, "baseline_status"), "red", "{out}");
+}
+
+/// A floor does not reach a dirty tree: with no record for HEAD it is still
+/// `dirty` and the suite does not run.
+#[test]
+fn baseline_tests_keeps_a_dirty_tree_dirty_with_a_floor() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-floor-dirty");
+    let (dir, floor, cmd) = recorded_project(&root.0, "dirty");
+    commit_file(&dir, "one.txt");
+    fs::write(dir.join("edit.txt"), "edit").unwrap();
+    let out = run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_eq!(str_field(&out, "baseline_status"), "dirty", "{out}");
+    assert_eq!(suite_runs(&root.0, "dirty"), 1, "{out}");
+}
+
+/// An ancestor reuse names the record's commit and the distance to HEAD in
+/// `baseline_reused_from`, which verify_tests turns into a report line.
+#[test]
+fn baseline_tests_ancestor_reuse_names_the_record_in_baseline_reused_from() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-reused-from");
+    let (dir, floor, cmd) = recorded_project(&root.0, "named");
+    commit_file(&dir, "one.txt");
+    let two = commit_file(&dir, "two.txt");
+    let out = run_script(
+        BASELINE,
+        &dir,
+        &project_state(&dir),
+        &[("TEST_CMD", &cmd), ("LLM_AGENT_VAR_BASELINE_FLOOR", &floor)],
+    );
+    assert_eq!(suite_runs(&root.0, "named"), 1, "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_reused_from"),
+        format!("{}, 2 commit(s) before HEAD {}", &floor[..7], &two[..7]),
+        "{out}"
+    );
+}
+
+/// A reuse of HEAD's own record and a fresh run both leave
+/// `baseline_reused_from` empty.
+#[test]
+fn baseline_tests_head_record_and_fresh_run_leave_baseline_reused_from_empty() {
+    if tools_missing() {
+        return;
+    }
+    let root = temp_dir("baseline-reused-from-empty");
+    let dir = root.0.join("here");
+    committed_project(&dir, "here");
+    let envs = [("TEST_CMD", "echo fine")];
+    let fresh = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    assert_eq!(str_field(&fresh, "baseline_status"), "green", "{fresh}");
+    assert_eq!(str_field(&fresh, "baseline_reused_from"), "", "{fresh}");
+    let reused = run_script(BASELINE, &dir, &project_state(&dir), &envs);
+    assert!(
+        str_field(&reused, "baseline_note").contains("recorded on HEAD"),
+        "{reused}"
+    );
+    assert_eq!(str_field(&reused, "baseline_reused_from"), "", "{reused}");
+}
+
+const REUSE_LINE: &str = "Baseline reused from abc1234, 2 commit(s) before HEAD def5678: recorded before this run's later commits; the suite was not run again on HEAD.";
+
+/// With `baseline_reused_from` set, the report carries one line naming it,
+/// after a green run and after a run that matches the baseline, and a
+/// failing run carries it too so the failure report shows it.
+#[test]
+fn verify_tests_report_shows_the_reused_baseline_line() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-reused-from");
+    project(&dir.0, "here");
+    let reused = "abc1234, 2 commit(s) before HEAD def5678";
+
+    let mut green = project_state(&dir.0);
+    green["baseline_status"] = Value::from("green");
+    green["baseline_reused_from"] = Value::from(reused);
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &green, "fine\n", 0);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(str_field(&out, "tests_verdict"), "passed", "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        format!("\n{REUSE_LINE}"),
+        "{out}"
+    );
+    assert!(
+        str_field(&out, "tests_output").starts_with("Ran: "),
+        "{out}"
+    );
+
+    let a = "tests/test_a.py::test_one";
+    let mut red = red_baseline(&dir.0, &[a], 1, "");
+    red["baseline_reused_from"] = Value::from(reused);
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &red, &pytest_failing(&[a]), 1);
+    assert_eq!(out["tests_ok"], Value::Bool(true), "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        format!("\nPre-existing failures: {a}\n{REUSE_LINE}"),
+        "{out}"
+    );
+
+    let b = "tests/test_b.py::test_two";
+    let out = run_transcript(VERIFY_TESTS, &dir.0, &red, &pytest_failing(&[a, b]), 1);
+    assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+    assert_eq!(
+        str_field(&out, "baseline_report"),
+        format!("\n{REUSE_LINE}"),
+        "{out}"
+    );
+}
+
+/// An empty or missing `baseline_reused_from` leaves the report exactly as
+/// it is without one.
+#[test]
+fn verify_tests_report_is_unchanged_without_a_reused_baseline() {
+    if tools_missing() {
+        return;
+    }
+    let dir = temp_dir("verify-reused-from-empty");
+    project(&dir.0, "here");
+    let a = "tests/test_a.py::test_one";
+    for reused in [None, Some("")] {
+        let mut state = red_baseline(&dir.0, &[a], 1, "");
+        if let Some(value) = reused {
+            state["baseline_reused_from"] = Value::from(value);
+        }
+        let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[a]), 1);
+        assert_eq!(
+            str_field(&out, "baseline_report"),
+            format!("\nPre-existing failures: {a}"),
+            "{reused:?}: {out}"
+        );
+        let mut green = project_state(&dir.0);
+        if let Some(value) = reused {
+            green["baseline_reused_from"] = Value::from(value);
+        }
+        let out = run_transcript(VERIFY_TESTS, &dir.0, &green, "fine\n", 0);
+        assert_eq!(str_field(&out, "baseline_report"), "", "{reused:?}: {out}");
+        let b = "tests/test_b.py::test_two";
+        let out = run_transcript(VERIFY_TESTS, &dir.0, &state, &pytest_failing(&[b]), 1);
+        assert_eq!(out["tests_ok"], Value::Bool(false), "{out}");
+        assert!(out.get("baseline_report").is_none(), "{reused:?}: {out}");
+    }
 }
 
 /// With no stored record, a tree that already holds changes (an untracked

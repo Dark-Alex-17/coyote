@@ -165,7 +165,11 @@ stored so a later run on the same commit reuses it:
   is reused when the floor is an ancestor of that record's commit, no merge
   commit lies between it and HEAD, and every commit since was made after the
   record. The note names the record's commit and the commits since. Without
-  a floor only HEAD's own record counts.
+  a floor only HEAD's own record counts. With a floor, failures introduced by
+  the calling run's own later commits count as this run's to fix: the record
+  taken before them is the baseline. Such a reuse sets
+  `baseline_reused_from` to `<record commit>, N commit(s) before HEAD <head>`,
+  and the final `Tests:` line names it.
 - With no record, the suite runs only when `git status --porcelain` is empty
   (untracked files count, ignored files do not). On a tree that already holds
   changes, `baseline_status` is `dirty` and no baseline is taken, so every

@@ -344,6 +344,7 @@ initial_state:
   publish_retries: 0
   publish_checks: []
   pr_published: false
+  ci_fix_active: false
   review_rounds_posted: 0
   push_fix_retries: 0
   ci_owner: false

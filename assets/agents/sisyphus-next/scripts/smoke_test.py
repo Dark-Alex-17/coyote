@@ -5250,7 +5250,8 @@ check("research fan-out: both explore maps and the librarian map join at synthes
 
 # ---------------------------------------------------------------- CI fix push on the run's own PR
 _heads = [{"round": 1, "head": "a" * 40}, {"round": 2, "head": "b" * 40}]
-_ci_fix = dict(git_actions={"commit": True, "push": True, "open_pr": True}, fix_source="ci", ci_owner=True, pr_ref="9",
+_ci_fix = dict(git_actions={"commit": True, "push": True, "open_pr": True}, fix_source="ci", ci_fix_active=True,
+               ci_owner=True, pr_ref="9",
                pr_published=True, review_rounds_posted=1, round_heads=_heads,
                ci_failing=[["build", "https://github.com/o/r/actions/runs/1/job/2"]])
 u = gates.pr_gate(base_state(**_ci_fix))
@@ -5267,7 +5268,7 @@ check("ci fix push: the task posts only the review rounds not yet on the PR and 
       and "DRAFT PR" not in _txt and "new feature branch" not in _txt, _txt)
 u = gates.pr_gate(base_state(**{**_ci_fix, "pr_tracking": "review", "flip_ready": False}))
 check("ci fix push: review mode before the flip sends the same push_fix", u["git_task"]["kind"] == "push_fix", u)
-for _k, _v in (("pr_published", False), ("fix_source", "review"), ("ci_owner", False), ("pr_ref", "")):
+for _k, _v in (("pr_published", False), ("ci_fix_active", False), ("ci_owner", False), ("pr_ref", "")):
     u = gates.pr_gate(base_state(**{**_ci_fix, _k: _v}))
     check(f"ci fix push: {_k}={_v!r} keeps the full publish task", u["git_task"]["kind"] == "publish", u["git_task"])
 u = gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, pr_review_pending=[],
@@ -5303,7 +5304,7 @@ check("ci fix push: a dirty tree after the push -> exactly one more git_ops roun
       and "ci_polls" not in u and "review_rounds_posted" not in u, u)
 u = gates.ci_gate(dict(_pfs, push_fix_retries=RERUN_ONCE))
 check("ci fix push: the check failing again -> a follow-up and the CI watch with reset budgets",
-      u.get("_next") == "ci_poll" and u.get("ci_polls") == 0 and u.get("review_rounds_posted") == 2
+      u.get("_next") == "ci_poll" and u.get("ci_polls") == 0
       and any(f.startswith("CI fix push check failed: clean worktree: uncommitted:") for f in u.get("follow_ups", [])), u)
 os.unlink(os.path.join(PUB_REPO, "ci-fix.txt"))
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"u\", \"isDraft\": false, \"headRefName\": \"main\", "
@@ -5312,6 +5313,58 @@ u = gates.ci_gate(_pfs)
 os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
 _ok = u.get("_next") == "git_ops" and "- PR head: PR head 'main', current branch 'feat/void-invoices'" in str(_lib.as_dict(u.get("git_task")).get("text"))
 check("ci fix push: a PR headed by another branch fails the PR head check", _ok, u)
+
+check("ci fix push: a push whose check still fails after the retry leaves review_rounds_posted alone",
+      "review_rounds_posted" not in gates.ci_gate(dict(_pfs, push_fix_retries=RERUN_ONCE)))
+
+# ---------------------------------------------------------------- CI fix flag across the fix cycle
+_cs = base_state(**{**_ci_fix, "ci_fix_active": False, "ci_verdict": "real", "ci_fix_strikes": 0,
+                    "failing_checks": ["build"], "intent": "implementation", "spec_text": "AC"})
+u = gates.ci_apply(_cs)
+check("ci fix flag: a real CI verdict starts a CI fix and marks it active",
+      u.get("_next") == "compose_fix" and u.get("ci_fix_active") is True, u)
+_cs.update(u)
+u = gates.apply_answer(base_state(escalation={"kind": "ci_exhausted"}, last_answer="Resume with one more coder fix round"))
+check("ci fix flag: the owner's fix answer on a CI escalation marks the CI fix active",
+      u.get("_next") == "compose_fix" and u.get("ci_fix_active") is True, u)
+u = gates.pr_gate(base_state(**{**_cs, "fix_source": "review"}))
+check("ci fix flag: a gauntlet BLOCKED inside the CI fix (fix_source review) still sends push_fix",
+      (u.get("git_task") or {}).get("kind") == "push_fix", u.get("git_task"))
+u = gates.pr_gate(base_state(**{**_cs, "fix_source": "observability"}))
+check("ci fix flag: an observability coder round inside the CI fix still sends push_fix",
+      (u.get("git_task") or {}).get("kind") == "push_fix", u.get("git_task"))
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _DRAFT_ON_FEAT
+check("ci fix flag: ci_gate after the push_fix clears the flag",
+      gates.ci_gate(dict(_pfs, ci_fix_active=True)).get("ci_fix_active") is False)
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
+
+# ---------------------------------------------------------------- a CI fix still passes the gauntlet and observability
+u = gates.compose_fix(_cs)
+check("ci fix route: compose_fix hands the CI fix to the coder", u.get("_next") == "render_coder_prompt", u)
+_cs.update(u)
+u = gates.review_gate(_cs)
+check("ci fix route: the coder's CI fix goes to the gauntlet", u.get("_next") == "build_gauntlet_prompt", u)
+_cs.update(u)
+u = gates.build_gauntlet_prompt(_cs)
+check("ci fix route: build_gauntlet_prompt spawns a review round for the CI fix",
+      "_next" not in u and len(u.get("round_heads") or []) == len(_heads) + 1 and bool(u.get("gauntlet_prompt"))
+      and "\n    next: run_gauntlet" in node_block("build_gauntlet_prompt"), u)
+_cs.update(u)
+u = gates.route_gauntlet(dict(_cs, gauntlet_result=passed))
+check("ci fix route: a passing gauntlet goes to observability_gate, not pr_gate", u.get("_next") == "observability_gate", u)
+_cs.update(u)
+u = gates.observability_gate(_cs)
+check("ci fix route: observability_gate runs before pr_gate", u.get("_next") in ("observability_pass", "whetstone_gate"), u)
+
+# ---------------------------------------------------------------- coder baseline floor
+_rcp = dict(coder_brief={"goal": "g"}, run_base_sha="r" * 40, base_sha="b" * 40)
+check("baseline floor: run_base_sha wins", gates.render_coder_prompt(base_state(**_rcp))["coder_baseline_floor"] == "r" * 40)
+check("baseline floor: base_sha when the run base is unknown",
+      gates.render_coder_prompt(base_state(**{**_rcp, "run_base_sha": ""}))["coder_baseline_floor"] == "b" * 40)
+check("baseline floor: empty while carried test failures are pending",
+      gates.render_coder_prompt(base_state(**_rcp, carried_failures=[{"paths": ["t/x"]}]))["coder_baseline_floor"] == "")
+_floor_input = "\n      baseline_floor: '{{coder_baseline_floor}}'"
+check("baseline floor: run_coder passes it as the coder's baseline_floor", _floor_input in node_block("run_coder"))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
