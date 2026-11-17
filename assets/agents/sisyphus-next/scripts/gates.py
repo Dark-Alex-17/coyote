@@ -22,7 +22,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _lib import (  # noqa: E402
     CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_CANCELLED, CI_FAIL, CI_FLAKE_RERUNS, CI_LOG_RUNS_MAX, CI_MAX_ROUNDS,
-    CI_PASS, CI_PENDING, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
+    CI_PASS, CI_PENDING, CI_POLL_BACKOFF, CI_POLL_FAILS, CI_POLL_SLEEP, CI_QUIET, CI_WALL_SECS, CLARIFY_MAX, CONTINUE_RE,
     DELEGATED_RE, DISCUSSION_PARKS_MAX, DRAFT_ROUNDS_MAX, FIX_ROUND_CEILING, GH_CALL_SECS, OWNER_POLL_MAX,
     ENGINE_VISIT_CAP, POLL_VISIT_BUDGET, CI_NO_CHECKS_SECS,
     OWNER_POLL_MINUTES,
@@ -2538,9 +2538,11 @@ def apply_answer(state):
                         ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) re-run call failed")
             _reset_ci_watch(u)
             # a re-run run is never offered again, so a run that stays cancelled cannot loop a headless pick;
-            # ci_polls 1 makes the first re-poll sleep instead of reading the same cancelled state at once
+            # the settle flag makes the first re-poll sleep the full CI_POLL_SLEEP instead of reading the same
+            # cancelled state at once
             u["ci_rerun_ids"] = done
             u["ci_polls"] = 1
+            u["ci_rerun_settle"] = True
             u["_next"] = "ci_poll"
         elif a == "green" and not stop:
             reason = _stated_reason(answer, options)
@@ -3390,6 +3392,13 @@ def _worktree_tree(root):
             os.unlink(tmp)
 
 
+def _inputs_key(tree, *parts):
+    """A digest of a worktree tree and the other inputs of a pass, or "" when the tree is unknown, so it never matches."""
+    if not tree:
+        return ""
+    return hashlib.sha256(json.dumps([tree, *parts], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def _snapshot_base(root, head):
     """A commit of the worktree (untracked, non-ignored files included) on top of HEAD, so a later subtask's diff
     leaves out the earlier subtasks' uncommitted work, new files too. Returns (sha, error): HEAD itself when the
@@ -3786,9 +3795,18 @@ def build_gauntlet_prompt(state):
             note += f"\n{PROBE_HOUSE_NOTE}"
         lines += ["Local-run recipe / usage suites:", note]
     u["gauntlet_prompt"] = "\n".join(lines)
-    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": _worktree_tree(root), "started": now_iso()}]
+    tree = _worktree_tree(root)
+    key = _inputs_key(tree, u["gauntlet_prompt"], cmds)
     u["head_sha"] = head
     u["prior_review_decisions"] = "\n".join(_review_decisions(state))
+    last = rounds[-1] if rounds and isinstance(rounds[-1], dict) else {}
+    # only a PASS is reused: a BLOCKED or incomplete round on the same inputs is reviewed again, since that can flip
+    if key and last.get("review_key") == key and last.get("verdict") == "PASS" and not last.get("incomplete"):
+        ledger(state, u, f"gauntlet: round {len(rounds)} reused: same code tree, prompt and verification commands, "
+                         "and it passed")
+        u["_next"] = "route_gauntlet"
+        return u
+    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": tree, "review_key": key, "started": now_iso()}]
     ledger(state, u, f"gauntlet: round {n} spawned @ {head or '(no git)'}")
     snapshot(state, u, f"gauntlet round {n}")
     return u
@@ -4151,9 +4169,18 @@ def observability_gate(state):
                                if agent else "No observability agent is configured - note in the artifact that the inventory is repo-derived.")
     u["operational_surface"] = surface
     if surface:
-        u["_next"] = "observability_pass"
+        files = u.get("changed_files", state.get("changed_files"))
+        key = _inputs_key(_worktree_tree(root), files, state.get("diff_stat"), state.get("current_task"))
+        if key and key == state.get("observability_key") and (state.get("observability_artifact") or "").strip():
+            ledger(state, u, "observability: code tree, changed files, diff stat and task unchanged since the last "
+                             "pass; its artifact stands")
+            u["_next"] = "whetstone_gate"
+        else:
+            u["observability_pending_key"] = key
+            u["_next"] = "observability_pass"
     else:
         u["observability_artifact"] = "## Observability\n\nNo operational surface added by this change (no endpoints, error paths, jobs, queues, deps or metrics); pass skipped."
+        u["observability_key"] = ""
         u["_next"] = "whetstone_gate"
     return u
 
@@ -4161,6 +4188,8 @@ def observability_gate(state):
 def observability_route(state):
     u = {}
     harvest_anomalies(state, u, "observability_pass")
+    out = state.get("last_node_output")
+    passed = isinstance(out, str) and out.lstrip().startswith("{") and bool((state.get("observability_artifact") or "").strip())
     note_script_error(state, u, "observability_pass")
     brief = (state.get("obs_coder_brief") or "").strip()
     if not (state.get("observability_artifact") or "").strip():
@@ -4174,6 +4203,8 @@ def observability_route(state):
         if brief:
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + ["Observability: alert-as-code changes recommended but not applied this run: " + tail(brief, 300)]
         u["_next"] = "whetstone_gate"
+    # the key vouches for the artifact only after a real pass that asked for no coder round
+    u["observability_key"] = (state.get("observability_pending_key") or "") if passed and not brief and u["_next"] == "whetstone_gate" else ""
     return u
 
 
@@ -4228,6 +4259,11 @@ def pr_gate(state):
     if reqs:
         text += ("\n\nRequirements this publish must meet (the PR body included; a script checks the git and PR state "
                  "afterwards):\n" + "\n".join(f"- {c}" for c in reqs))
+    if asks["commit"]:
+        code, _, listing = _uncommitted_paths(state, state.get("git_root") or state.get("project_dir") or ".")
+        if code == 0 and listing:
+            text += ("\n\nA script checks afterwards that nothing outside the plans directory is left uncommitted. "
+                     f"Uncommitted now: {listing}")
     task = {"kind": "publish", "return_to": "ci_gate", **asks, "base": actions.get("base") or "",
             "draft": True, "flip_ready": False, "text": text}
     u["git_task"] = task
@@ -4338,6 +4374,16 @@ def ci_gate(state):
     return u
 
 
+def _uncommitted_paths(state, root):
+    """(git status exit code, its stderr, the uncommitted paths outside the plans directory, capped, or "")."""
+    exclude = _plans_exclude(state, root)
+    code, out, err = git(root, "status", "--porcelain", "--untracked-files=normal",
+                         *(["--", ".", *exclude] if exclude else []))
+    dirty = [l.strip() for l in out.splitlines() if l.strip()]
+    listing = ", ".join(dirty[:10]) + (f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else "")
+    return code, err.strip(), listing
+
+
 def _publish_checks(state):
     """(name, ok, detail) rows for the git and PR state the publish step was asked to leave."""
     asks = _publish_asks(state)
@@ -4345,17 +4391,14 @@ def _publish_checks(state):
     branch = git_out(root, "branch", "--show-current", default="")
     rows = []
     if asks["commit"]:
-        exclude = _plans_exclude(state, root)
-        code, out, err = git(root, "status", "--porcelain", "--untracked-files=normal",
-                             *(["--", ".", *exclude] if exclude else []))
-        dirty = [l.strip() for l in out.splitlines() if l.strip()]
+        code, err, listing = _uncommitted_paths(state, root)
         if code:
-            detail = f"git status failed: {err.strip()}"
-        elif dirty:
-            detail = "uncommitted: " + ", ".join(dirty[:10]) + (f" (and {len(dirty) - 10} more)" if len(dirty) > 10 else "")
+            detail = f"git status failed: {err}"
+        elif listing:
+            detail = "uncommitted: " + listing
         else:
             detail = "nothing left uncommitted"
-        rows.append(("clean worktree", code == 0 and not dirty, detail))
+        rows.append(("clean worktree", code == 0 and not listing, detail))
     if asks["new_branch"]:
         start = str(state.get("start_branch") or "")
         default = git_out(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", default="")
@@ -4640,7 +4683,7 @@ CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
 
 def _reset_ci_watch(u):
     u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": [],
-              "ci_green_by": ""})
+              "ci_green_by": "", "ci_rerun_settle": False})
 
 
 def _ci_poll_budget(state):
@@ -4684,8 +4727,12 @@ def ci_poll(state):
         return u
     polls = as_int(state.get("ci_polls"))
     started = as_int(state.get("ci_started_at")) or int(time.time())
+    settle = truthy(state.get("ci_rerun_settle"))
+    if settle:
+        u["ci_rerun_settle"] = False
     if polls > 0:
-        time.sleep(int(os.environ.get("SISYPHUS_CI_SLEEP", CI_POLL_SLEEP)))
+        wait = CI_POLL_SLEEP if settle or polls > len(CI_POLL_BACKOFF) else CI_POLL_BACKOFF[polls - 1]
+        time.sleep(int(os.environ.get("SISYPHUS_CI_SLEEP", wait)))
     u["ci_polls"] = polls + 1
     if time.time() - started > CI_WALL_SECS or polls + 1 > CI_MAX_ROUNDS:
         u["ci_status"] = "timeout"
