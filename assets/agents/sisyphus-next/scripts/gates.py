@@ -3508,7 +3508,7 @@ def _resolve_failure_tokens(root, tokens, index=None):
 
 def _unlocated_failure_lines(root, tests, index):
     """How many failure-word lines name no repo path, on the line or on the more-indented lines under it; a line of
-    marker words alone (a bare FAIL) or a runner's exit banner (`make: *** [check] Error 1`) is not counted."""
+    marker words alone (a bare FAIL) or a runner's exit banner (`runner: *** [check] Error 1`) is not counted."""
     lines = [l[:FAILURE_LINE_CAP] for l in tests.splitlines()]
     count = 0
     for i, line in enumerate(lines):
