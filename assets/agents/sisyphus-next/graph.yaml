@@ -331,6 +331,8 @@ initial_state:
   operational_surface: false
   obs_inventory_note: ''
   observability_artifact: ''
+  observability_key: ''
+  observability_pending_key: ''
   obs_rounds: 0
   obs_coder_brief: ''
   whetstone_result: ''

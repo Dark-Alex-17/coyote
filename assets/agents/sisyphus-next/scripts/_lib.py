@@ -33,6 +33,7 @@ OWNER_WAIT_MINUTES = 30
 OWNER_POLL_MINUTES = 25
 CI_FLAKE_RERUNS = 2       # section 10.12: max 2 re-runs per check per PR
 CI_POLL_SLEEP = 60        # pr-watch/scripts/poll_pr.py SLEEP_SECS
+CI_POLL_BACKOFF = (10, 20, 40)  # sleeps before the first re-polls of a watch; later re-polls sleep CI_POLL_SLEEP
 CI_POLL_FAILS = 3         # pr-watch/scripts/poll_pr.py MAX_CONSECUTIVE_FAILS
 CI_WALL_SECS = 14400      # coder/graph.yaml settings.timeout (hardware-bound wall clock)
 CI_MAX_ROUNDS = CI_WALL_SECS // CI_POLL_SLEEP  # ci_poll visits per watch (240), a bound beside the elapsed-time limit
