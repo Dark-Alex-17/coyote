@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 7745
 expression: "&frame"
 ---
 "> remember                                                                      "

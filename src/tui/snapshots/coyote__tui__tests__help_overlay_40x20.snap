@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 10933
 expression: "&frame"
 ---
 "Keys                            1-18/203"

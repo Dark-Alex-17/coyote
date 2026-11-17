@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 4483
 expression: frame
 ---
 "> first question                                                                "

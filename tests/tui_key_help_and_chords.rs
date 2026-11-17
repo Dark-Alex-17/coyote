@@ -151,29 +151,45 @@ fn composer_row(frame: &str, footer_marker: &str) -> String {
         .join(" ")
 }
 
+/// A full repaint of the key help at 30 rows by 100 columns. The page scan
+/// compares frames, so they must share a height; the detour from 30 goes
+/// through a shorter size, since a taller one would clamp the help's
+/// scroll back.
+fn help_page(pty: &mut Pty) -> String {
+    if pty.rows().unwrap() == 30 {
+        repainted_frame(pty, 28, 100);
+    }
+    repainted_frame(pty, 30, 100)
+}
+
 #[test]
 #[serial]
 fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_close_key() {
     let (_guard, mut pty) = boot("dot-keys", "");
 
     pty.send(b".keys\r").unwrap();
-    let first = repainted_frame_showing(&mut pty, HELP_MARK, ".keys did not open the key help");
-    let mut pages = vec![first.clone()];
+    repainted_frame_showing(&mut pty, HELP_MARK, ".keys did not open the key help");
+    let mut pages = vec![help_page(&mut pty)];
     // Page until the help's last row is on screen, or until a PageDown
     // no longer moves the text.
     while !squeezed(pages.last().unwrap()).contains(&squeezed(LAST_HELP_ROW)) {
         assert!(pages.len() < 40, "the key help never reached its end");
         pty.send(PAGE_DOWN).unwrap();
         pty.read_for(Duration::from_millis(200));
-        let page = flipped_frame(&mut pty);
+        let page = help_page(&mut pty);
         let stuck = squeezed(&page) == squeezed(pages.last().unwrap());
         pages.push(page);
         if stuck {
             break;
         }
     }
+    assert!(
+        pages.len() > 1,
+        "the key help fits one 30-row page, so PageDown was never tried:\n{}",
+        pages[0]
+    );
     assert_ne!(
-        squeezed(&first),
+        squeezed(&pages[0]),
         squeezed(&pages[1]),
         "PageDown did not scroll the key help"
     );
@@ -419,6 +435,10 @@ fn question_mark_in_the_history_search_band_opens_no_help() {
     assert!(
         !squeezed(&frame).contains(&squeezed(HELP_MARK)),
         "? in the history search band opened the key help:\n{frame}"
+    );
+    assert!(
+        squeezed(&frame).contains(&squeezed("history: ?")),
+        "the history search band closed or did not take ? as its query:\n{frame}"
     );
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(400));

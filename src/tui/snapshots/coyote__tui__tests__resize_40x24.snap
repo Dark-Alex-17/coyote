@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 6522
 expression: "&narrow"
 ---
 "> explain                               "

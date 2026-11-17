@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 6519
 expression: "&wide"
 ---
 "> explain                                                                       "

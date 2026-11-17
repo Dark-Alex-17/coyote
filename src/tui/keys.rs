@@ -114,6 +114,16 @@ pub(crate) struct KeyContext {
     pub(crate) help: bool,
 }
 
+impl KeyContext {
+    /// Whether a plain `?` on the composer opens the help: only an empty
+    /// composer with nothing open over it gives it up. Anywhere else it
+    /// is typing, vi normal mode's swallowing included. The status strip
+    /// advertises `?` by the same test.
+    pub(crate) fn question_mark_opens_help(&self) -> bool {
+        self.composer_empty && self.popup.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Action {
     /// Send the composer text as the next line.
@@ -658,10 +668,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter => Action::Submit,
             KeyCode::Up if ctx.single_line && key.modifiers.is_empty() => Action::HistoryPrev,
             KeyCode::Down if ctx.single_line && key.modifiers.is_empty() => Action::HistoryNext,
-            // Only an empty composer with nothing open over it gives `?` to
-            // the help: anywhere else it is typing, vi normal mode's
-            // swallowing included.
-            KeyCode::Char('?') if !ctrl && !alt && ctx.composer_empty && ctx.popup.is_none() => {
+            KeyCode::Char('?') if !ctrl && !alt && ctx.question_mark_opens_help() => {
                 Action::ToggleHelp
             }
             KeyCode::Char(_) if !ctrl && ctx.vi == Some(ViMode::Normal) => vi_normal(key.code),
@@ -3097,6 +3104,24 @@ mod tests {
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// The status strip shows `? = keys` by `question_mark_opens_help`,
+    /// so on the composer that test and the key map must agree.
+    #[test]
+    fn the_question_mark_guard_matches_the_key_map() {
+        let mark = plain(KeyCode::Char('?'));
+        let cases = [
+            (IDLE, true),
+            (TYPING, false),
+            (SEARCH, false),
+            (PALETTE, false),
+        ];
+        for (ctx, opens) in cases {
+            assert_eq!(ctx.question_mark_opens_help(), opens, "{ctx:?}");
+            let toggles = map_key(mark, &ctx) == Action::ToggleHelp;
+            assert_eq!(toggles, opens, "{ctx:?}");
         }
     }
 

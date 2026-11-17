@@ -60,6 +60,7 @@ use std::{env, fs, iter, process};
 
 use common::fake_llm::{Chunk, FakeLlm, HOLD_LIMIT, Reply};
 use common::pty::{Pty, strip_ansi};
+use common::tui_harness::CTRL_X;
 use serial_test::serial;
 
 /// Covers the keyboard-enhancement probe, which waits two seconds for an
@@ -69,7 +70,6 @@ const PTY_DEADLINE: Duration = Duration::from_secs(20);
 /// (1 s) old; 1200 ms settles it.
 const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 
-const CTRL_X: &[u8] = b"\x18";
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
 const END: &[u8] = b"\x1b[F";

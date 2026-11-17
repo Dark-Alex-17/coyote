@@ -1,6 +1,5 @@
 ---
 source: src/tui/mod.rs
-assertion_line: 9729
 expression: "&frame"
 ---
 "> plan it                                             ┌Todo────────────────────┐"

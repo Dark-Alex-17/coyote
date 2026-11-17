@@ -319,6 +319,7 @@ const IDLE_STATUS: &str = "Ctrl+G = tasks  Ctrl+X = todo";
 const IDLE_STATUS_WITH_HELP: &str = "? = keys  Ctrl+G = tasks  Ctrl+X = todo";
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+const IDLE_HINT: Style = DIM.add_modifier(Modifier::ITALIC);
 
 /// The UI's own fixed colours. `no_color` keeps the attributes and drops
 /// the colour, which is what `NO_COLOR` asks for.
@@ -3120,23 +3121,25 @@ impl App {
         &cells[..end.min(cells.len())]
     }
 
-    fn status_text(&self) -> Option<String> {
+    /// Every state is dim and the idle hint is italic as well. The
+    /// terminal backend only rewrites cells whose symbol or style changed,
+    /// so a shared style would let a turn's first frame skip the letters
+    /// it has in common with the hint and leave a torn word in the output
+    /// stream. Modifiers survive `NO_COLOR`, so this holds there too.
+    fn status_text(&self) -> Option<Span<'static>> {
         if self.exiting {
-            return Some("Leaving...".to_string());
+            return Some(Span::styled("Leaving...", DIM));
         }
         let Some(turn) = self.turn.as_ref() else {
             if !self.prompts.is_empty() {
                 return None;
             }
-            // The key map's guard: anywhere else `?` is typing.
-            let ctx = self.key_context();
-            let help_opens = ctx.composer_empty && ctx.popup.is_none();
-            let status = if help_opens {
+            let status = if self.key_context().question_mark_opens_help() {
                 IDLE_STATUS_WITH_HELP
             } else {
                 IDLE_STATUS
             };
-            return Some(status.to_string());
+            return Some(Span::styled(status, IDLE_HINT));
         };
         let now = self.clock.now();
         let secs = |since: Instant| now.duration_since(since).as_secs();
@@ -3152,9 +3155,9 @@ impl App {
             )
         };
         if self.prompts.is_empty() {
-            Some(format!("{state}  Esc to interrupt"))
+            Some(Span::styled(format!("{state}  Esc to interrupt"), DIM))
         } else {
-            Some(state)
+            Some(Span::styled(state, DIM))
         }
     }
 
@@ -3297,7 +3300,7 @@ impl App {
     }
 }
 
-struct StatusStrip(Option<String>);
+struct StatusStrip(Option<Span<'static>>);
 
 impl Widget for StatusStrip {
     fn render(self, area: Rect, buf: &mut Buffer) {
@@ -3306,7 +3309,7 @@ impl Widget for StatusStrip {
             return;
         }
         if let Some(text) = self.0 {
-            Paragraph::new(Line::from(Span::styled(text, DIM))).render(area, buf);
+            Paragraph::new(Line::from(text)).render(area, buf);
         }
     }
 }
@@ -8426,7 +8429,7 @@ mod tests {
             (
                 "status strip",
                 Box::new(|area, buf| {
-                    StatusStrip(Some("thinking for 3s".to_string())).render(area, buf);
+                    StatusStrip(Some(Span::styled("thinking for 3s", DIM))).render(area, buf);
                 }),
             ),
             (
@@ -10861,13 +10864,11 @@ mod tests {
     /// or a band open above the composer takes it as typing.
     #[test]
     fn the_idle_status_drops_the_help_key_where_it_types() {
+        let status = |harness: &Harness| harness.app.status_text().map(|span| span.content);
         let mut harness = Harness::standalone(80, 24);
-        assert_eq!(
-            harness.app.status_text().as_deref(),
-            Some(IDLE_STATUS_WITH_HELP)
-        );
+        assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS_WITH_HELP));
         harness.type_text("draft");
-        assert_eq!(harness.app.status_text().as_deref(), Some(IDLE_STATUS));
+        assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS));
         let frame = harness.draw();
         assert!(frame.contains(IDLE_STATUS), "{frame}");
         assert!(!frame.contains("? = keys"), "{frame}");
@@ -10875,12 +10876,60 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "");
         press_ctrl(&mut harness, 'r');
         assert!(matches!(harness.app.view, View::HistorySearch(_)));
-        assert_eq!(harness.app.status_text().as_deref(), Some(IDLE_STATUS));
+        assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS));
         harness.press(KeyCode::Esc);
-        assert_eq!(
-            harness.app.status_text().as_deref(),
-            Some(IDLE_STATUS_WITH_HELP)
-        );
+        assert_eq!(status(&harness).as_deref(), Some(IDLE_STATUS_WITH_HELP));
+    }
+
+    /// A turn's first frame rewrites every cell of the working text over
+    /// either idle hint, with and without colour, so the output stream
+    /// carries the words whole rather than only the letters that differ.
+    #[test]
+    fn the_first_working_frame_rewrites_the_idle_hint_whole() {
+        for no_color in [false, true] {
+            for draft in ["", "draft"] {
+                let mut harness = Harness::standalone(80, 24);
+                harness.app.set_no_color(no_color);
+                harness.type_text(draft);
+                let idle = harness.draw();
+                let hint = if draft.is_empty() {
+                    IDLE_STATUS_WITH_HELP
+                } else {
+                    IDLE_STATUS
+                };
+                assert!(idle.contains(hint), "{idle}");
+                let before = harness.terminal.backend().buffer().clone();
+                harness.app.begin_turn("work", false);
+                let working = harness.draw();
+                let after = harness.terminal.backend().buffer();
+                let row = (0..after.area.height)
+                    .find(|&y| {
+                        (0..after.area.width)
+                            .map(|x| after[(x, y)].symbol())
+                            .collect::<String>()
+                            .starts_with("Working . 0s  Esc to interrupt")
+                    })
+                    .unwrap_or_else(|| panic!("no working row: {working}"));
+                let updated: Vec<u16> = before
+                    .diff(after)
+                    .into_iter()
+                    .filter(|&(_, y, _)| y == row)
+                    .map(|(x, _, _)| x)
+                    .collect();
+                let text = "Working . 0s  Esc to interrupt";
+                for (x, c) in (0u16..).zip(text.chars()) {
+                    assert!(
+                        updated.contains(&x),
+                        "no_color {no_color}, draft {draft:?}: column {x} ({c}) kept from {hint:?}"
+                    );
+                    let modifier = after[(x, row)].modifier;
+                    assert!(
+                        modifier.contains(Modifier::DIM) && !modifier.contains(Modifier::ITALIC),
+                        "no_color {no_color}, draft {draft:?}: column {x} ({c}) is {modifier:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The wheel scrolls whatever covers the screen: the key help, the
