@@ -30923,6 +30923,161 @@ mod tests {
                 });
             }
 
+            /// `.mesh session name` typed without a
+            /// label prints its usage or refuses with it; setting the same label twice is
+            /// harmless; two sessions of ONE user cannot share a label, sessions of two users
+            /// can; a label may read as its own user's name but not as another user's; a
+            /// bare user name still names the user; `<user>/<label>` clears it; and `people
+            /// name` still names a user afterwards.
+            #[test]
+            #[serial]
+            fn usage_probe_session_name_arity_repeat_and_collisions() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::people::NAME_TAKEN;
+                use crate::mesh::session_destination_name;
+                use crate::mesh::test_support::PeerSighting;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+                use rns_transport::rand_core::OsRng;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-session-name-arity");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-session-name-arity").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let now = SystemTime::now();
+                    let tia = PrivateIdentity::new_from_rand(OsRng);
+                    let heard_as = |instance: &str| {
+                        let name = session_destination_name(instance);
+                        let announced = SingleInputDestination::new(tia.clone(), name);
+                        let destination = announced.desc.address_hash.to_hex_string();
+                        let identity = announced.desc.identity.address_hash.to_hex_string();
+                        runtime.peers().observe(
+                            PeerSighting {
+                                destination_hash: destination.clone(),
+                                identity_hash: identity.clone(),
+                                name_hash: hex_lower(name.as_name_hash_slice()),
+                                public_key: None,
+                                display_name: Some("Tia".to_string()),
+                                protocol_version: 1,
+                                hops: 1,
+                            },
+                            now,
+                        );
+                        (destination, identity)
+                    };
+                    let (desk, tia_id) = heard_as("desk");
+                    let (laptop, same_id) = heard_as("laptop");
+                    assert_eq!(tia_id, same_id);
+                    runtime
+                        .trust()
+                        .set_person_alias(&tia_id, Some("Tia"), &[])
+                        .unwrap();
+                    let (pim, _) = heard_peer(&runtime, "Pim", now);
+                    let (desk8, laptop8, pim8) = (
+                        short(&desk).to_string(),
+                        short(&laptop).to_string(),
+                        short(&pim).to_string(),
+                    );
+                    let takes = "`.mesh session name` takes the session to label and one label; quote a label with spaces in it.";
+
+                    let bare = out_of(&mut ctx, ".mesh session name").await.unwrap();
+                    assert!(
+                        bare.contains("Usage: .mesh session name <user>/<session>"),
+                        "bare `session name` prints its usage: {bare}"
+                    );
+                    for line in [
+                        format!(".mesh session name Tia/{desk8}"),
+                        format!(".mesh session name Tia/{desk8} box extra"),
+                    ] {
+                        let err = refusal(&mut ctx, &line).await;
+                        assert!(err.starts_with(takes), "{line}: {err}");
+                        assert!(err.contains("Usage: .mesh session name"), "{line}: {err}");
+                    }
+                    assert_eq!(runtime.who_at(&desk).to_string(), format!("Tia / {desk8}"));
+
+                    for _ in 0..2 {
+                        out_of(&mut ctx, &format!(".mesh session name Tia/{desk8} \"box\""))
+                            .await
+                            .unwrap();
+                        assert_eq!(runtime.who_at(&desk).to_string(), "Tia / box");
+                    }
+
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh session name Tia/{laptop8} \"BOX\""),
+                    )
+                    .await;
+                    assert_eq!(err, NAME_TAKEN, "two sessions of one user collide");
+                    assert_eq!(
+                        runtime.who_at(&laptop).to_string(),
+                        format!("Tia / {laptop8}")
+                    );
+                    assert_eq!(runtime.who_at(&desk).to_string(), "Tia / box");
+
+                    out_of(&mut ctx, &format!(".mesh session name Pim/{pim8} \"box\""))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        runtime.who_at(&pim).to_string(),
+                        "Pim / box",
+                        "sessions of two users may share a label"
+                    );
+
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh session name Tia/{laptop8} \"pim\""),
+                    )
+                    .await;
+                    assert_eq!(
+                        err, NAME_TAKEN,
+                        "a session label is not another user's name"
+                    );
+
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh session name Tia/{laptop8} \"Tia\""),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(runtime.who_at(&laptop).to_string(), "Tia / Tia");
+                    let err = refusal(&mut ctx, ".mesh session name Tia \"x\"").await;
+                    assert!(
+                        err.starts_with("'Tia' names a user, not a session;"),
+                        "a bare name still resolves to the user: {err}"
+                    );
+
+                    let cleared = out_of(&mut ctx, ".mesh session name Tia/Tia --clear")
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        cleared,
+                        format!(
+                            "Cleared the label you gave {laptop8}; it shows as Tia / {laptop8}."
+                        )
+                    );
+                    assert_eq!(
+                        runtime.who_at(&laptop).to_string(),
+                        format!("Tia / {laptop8}")
+                    );
+
+                    let named = out_of(&mut ctx, ".mesh people name Pim \"Pam\"")
+                        .await
+                        .unwrap();
+                    assert!(named.contains("is now Pam"), "{named}");
+                    assert_eq!(
+                        runtime.who_at(&pim).to_string(),
+                        "Pam / box",
+                        "people name still names the user and keeps the session label"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// The success line says what was trusted: the one destination, with its
             /// identity merely known from now on; a repeat says the identity is known (not
             /// `now`), and once the identity is trusted for all destinations the tail says

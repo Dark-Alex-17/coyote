@@ -3513,10 +3513,12 @@ async fn receive_announces(
             filed
         };
         if filed && let Some(runtime) = runtime.upgrade() {
-            // Your own sessions on this computer are named from the registry, never a card.
-            let reheard = known.is_some()
-                && (unrouted || !runtime.card_cadence().heard_in_run(&destination))
-                && !instances::session_names(runtime.cache_dir()).contains_key(&destination);
+            // Your own sessions are named from the registry, never a card, so only another
+            // user's session is heard again; that test reads nothing from disk.
+            let reheard = known.as_ref().is_some_and(|row| {
+                !row.identity_hash
+                    .eq_ignore_ascii_case(runtime.fingerprint())
+            }) && (unrouted || !runtime.card_cadence().heard_in_run(&destination));
             let trigger = if reheard {
                 CardTrigger::Reheard
             } else {
