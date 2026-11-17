@@ -4062,20 +4062,30 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             crate::function::Functions::build_global_function_binary(tool_file, None).unwrap();
         }
 
-        /// Like `run_tool`, with the JSON argument the shims insist on.
+        /// Like `run_tool`, with the JSON argument the shims insist on. A
+        /// shim built moments ago can still be open for writing in a child
+        /// forked elsewhere in the process, making exec fail with ETXTBSY;
+        /// that spawn is retried briefly instead of flaking.
         fn run_shim_tool(name: &str, io: ToolIo) -> Value {
-            let result = run_llm_function(
-                name.to_string(),
-                vec!["{}".to_string()],
-                tool_envs(),
-                None,
-                None,
-                io,
-                None,
-            )
-            .unwrap()
-            .output
-            .unwrap_or_default();
+            let mut attempts = 0;
+            let run = loop {
+                match run_llm_function(
+                    name.to_string(),
+                    vec!["{}".to_string()],
+                    tool_envs(),
+                    None,
+                    None,
+                    io.clone(),
+                    None,
+                ) {
+                    Err(err) if err.to_string().contains("Text file busy") && attempts < 10 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    run => break run,
+                }
+            };
+            let result = run.unwrap().output.unwrap_or_default();
             match serde_json::from_str::<Value>(&result) {
                 Ok(error) if error.get("tool_call_error").is_some() => error,
                 _ => json!({"output": result}),
