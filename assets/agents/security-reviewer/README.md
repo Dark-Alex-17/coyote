@@ -52,6 +52,8 @@ The agent ends every review with one sentinel:
 ```
 SECURITY_REVIEW: PASS
 Posture: standard. Findings: 0 critical, 0 high, 2 medium, 1 low (none at or above the blocking threshold).
+Non-blocking findings:
+1. <each non-blocking finding, in the same shape as the FAIL list's non-blocking items>
 ```
 
 ```
@@ -62,6 +64,9 @@ Blocking findings:
 Non-blocking findings:
 1. 🟡 Sensitive data in logs — auth.rs:41 — bearer token logged at debug level — redact before logging
 ```
+
+The lines after the sentinel are machine-read: plain text outside any code fence, each header on
+its own line exactly as shown (never bold), and every counted finding numbered under its header.
 
 A `FAIL` verdict **blocks** completion, exactly like adversary's `DIVERGES`. The caller
 (sisyphus/architect) resumes the SAME coder session with the blocking findings pasted verbatim,
