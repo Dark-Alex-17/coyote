@@ -39,7 +39,6 @@ enabled_skills:
   - task-tracking
   - plan-authoring
   - delegation-protocol
-  - git-master
   - parallel-research
 
 variables:
