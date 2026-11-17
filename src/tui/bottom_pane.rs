@@ -720,10 +720,12 @@ mod tests {
     }
 
     /// `.keys` is the TUI's own command, not the REPL's, so the palette
-    /// built from the REPL's table never offers it, while a prefix of a
-    /// REPL command still finds that command.
+    /// built from the REPL's table does not offer it, while a prefix of a
+    /// REPL command still finds that command. A macro named `keys` takes
+    /// the line from the key help, so the palette lists it as it lists
+    /// every macro.
     #[test]
-    fn the_palette_never_offers_dot_keys() {
+    fn the_palette_offers_dot_keys_only_as_a_macro() {
         for prefix in [CommandPrefix::Dot, CommandPrefix::Both] {
             let ctx = ctx_with(prefix, true);
             for line in [".", ".k", ".ke", ".keys"] {
@@ -732,6 +734,16 @@ mod tests {
             }
             let help = palette_names(&ctx, ".he");
             assert!(help.contains(".help"), "{prefix}: {help:?}");
+
+            let macros = [("keys".to_string(), "my keys".to_string())];
+            let rows: Vec<String> =
+                PaletteState::build(".k", prefix, PaletteSnapshot::from_ctx(&ctx), &macros, None)
+                    .expect("the macro is a row")
+                    .rows
+                    .into_iter()
+                    .map(|row| row.value.trim_end().to_string())
+                    .collect();
+            assert!(rows.contains(&".keys".to_string()), "{prefix}: {rows:?}");
         }
     }
 

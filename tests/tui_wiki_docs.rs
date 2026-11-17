@@ -746,6 +746,7 @@ fn key_scraper_reads_every_context_of_the_key_map() {
         ("Vi normal", "A"),
         ("Key help", "?"),
         ("Key help", "Ctrl+C"),
+        ("Key help", "Ctrl+D"),
         ("Pager", "G"),
         ("Pager", "N"),
         ("Thread picker", "q"),
@@ -1192,7 +1193,7 @@ fn tui_page_quotes_the_code() {
     let idle_status = flat(&const_str(tui, "IDLE_STATUS"));
     let idle_status_with_help = flat(&const_str(tui, "IDLE_STATUS_WITH_HELP"));
     let keys_command = const_str(tui, "KEYS_COMMAND");
-    let welcome_keys = literal_with(production(&cells), "lists the keys.")
+    let welcome_keys = literal_with(production(&cells), "Empty prompt: ")
         .replace("{}{}", &format!(".{keys_command}"));
     let normal = const_str(&src(&["tui", "composer.rs"]), "NORMAL_TAG");
     for gap in ["HOTKEY_IDLE", "REWIND_ESC_GAP"] {

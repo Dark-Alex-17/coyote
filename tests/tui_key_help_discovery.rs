@@ -4,7 +4,7 @@
 //! spelled with the active prefix and names no function key; `?` on a
 //! non-empty composer types a `?`; `.keys foo` and a two-line `.keys`
 //! draft are sent as typed rather than opening the help; and function
-//! keys held with a modifier (Shift+F1, Ctrl+F2, Alt+F3, Ctrl+F5,
+//! keys held with a modifier (Shift+F1, Ctrl+F2, Alt+F4, Ctrl+F5,
 //! Shift+F12) do nothing and leave no escape debris. Each case runs the
 //! binary on a pseudo-terminal, so the file is unix-only, and the cases
 //! run one at a time.
@@ -58,10 +58,7 @@ fn the_welcome_card_and_the_idle_hint_name_the_key_help_and_the_chords() {
     let (_guard, mut pty) = boot("discovery-hints", "");
     let frame = flipped_frame(&mut pty);
     assert!(
-        shows(
-            &frame,
-            "On an empty prompt \"?\" or \".keys\" lists the keys."
-        ),
+        shows(&frame, "Empty prompt: \"?\" or \".keys\" = keys"),
         "the welcome card does not point at the key help:\n{frame}"
     );
     assert!(
@@ -97,10 +94,7 @@ fn the_slash_prefix_spells_the_welcome_pointer_with_slash() {
     let (_guard, mut pty) = boot("discovery-slash", "command_prefix: slash\n");
     let frame = flipped_frame(&mut pty);
     assert!(
-        shows(
-            &frame,
-            "On an empty prompt \"?\" or \"/keys\" lists the keys."
-        ),
+        shows(&frame, "Empty prompt: \"?\" or \"/keys\" = keys"),
         "the welcome card does not spell /keys under the slash prefix:\n{frame}"
     );
     leave(pty);
@@ -135,11 +129,13 @@ fn dot_keys_with_an_argument_or_a_second_line_does_not_open_the_help() {
 #[serial]
 fn function_keys_held_with_a_modifier_do_nothing_either() {
     let (_guard, mut pty) = boot("discovery-modified-fkeys", "");
-    // Shift+F1, Ctrl+F2, Alt+F3, Ctrl+F5 and Shift+F12 as xterm sends them.
+    // Shift+F1, Ctrl+F2, Alt+F4, Ctrl+F5 and Shift+F12 as xterm sends
+    // them. Alt+F3 would be `\x1b[1;3R`, which is also a cursor position
+    // report.
     for key in [
         &b"\x1b[1;2P"[..],
         b"\x1b[1;5Q",
-        b"\x1b[1;3R",
+        b"\x1b[1;3S",
         b"\x1b[15;5~",
         b"\x1b[24;2~",
     ] {
@@ -163,8 +159,9 @@ fn function_keys_held_with_a_modifier_do_nothing_either() {
         shows(&frame, TEXT_HINT),
         "the UI lost its hint row:\n{frame}"
     );
-    assert!(
-        !shows(&frame, "k7q~") && !shows(&frame, ";5"),
+    assert_eq!(
+        composer_row(&frame),
+        "k7q",
         "a modified F-key left escape debris in the composer:\n{frame}"
     );
     leave(pty);

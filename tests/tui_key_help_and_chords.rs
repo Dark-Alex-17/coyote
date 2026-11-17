@@ -3,17 +3,17 @@
 //! anything (F1-F12 on the empty composer open no panel, no roster and no
 //! key help, and type nothing); `.keys` opens the key help, which lists the
 //! Ctrl chords and no function key on any page, scrolls with PageDown, and
-//! closes with `q`, `?` and Ctrl+C as well as Esc; `/keys` opens it under
-//! `command_prefix: slash`, and `?` opens it from vi normal mode; Ctrl+G
-//! closes the roster it opened, and `?` with the roster open does not open
-//! the key help; Ctrl+X opens the todo panel without eating the composer's
-//! text, and Ctrl+E is still the composer's end of line; the plain REPL
-//! does not know `.keys`. F1-F12 also leave the roster, the key help and
-//! the pager as they are; `?` in the history search band opens no help;
-//! under a Select modal Ctrl+X shows the todo panel while Ctrl+G, `?` and
-//! the function keys do nothing; the palette does not offer `.keys`. Each
-//! case runs the binary on a pseudo-terminal, so the file is unix-only,
-//! and the cases run one at a time.
+//! closes with `q`, `?`, Ctrl+C and Ctrl+D as well as Esc; `/keys` opens
+//! it under `command_prefix: slash`, and `?` opens it from vi normal mode;
+//! Ctrl+G closes the roster it opened, and `?` with the roster open does
+//! not open the key help; Ctrl+X opens the todo panel without eating the
+//! composer's text, and Ctrl+E is still the composer's end of line; the
+//! plain REPL does not know `.keys`. F1-F12 also leave the roster, the key
+//! help and the pager as they are; `?` in the history search band opens no
+//! help; under a Select modal Ctrl+X shows the todo panel while Ctrl+G,
+//! `?` and the function keys do nothing; the palette does not offer
+//! `.keys`. Each case runs the binary on a pseudo-terminal, so the file is
+//! unix-only, and the cases run one at a time.
 #![cfg(unix)]
 
 mod common;
@@ -130,25 +130,11 @@ fn function_keys_do_nothing_on_the_empty_composer() {
     pty.send(b"q4z").unwrap();
     let typed = repainted_frame_showing(&mut pty, "q4z", "the composer stopped taking keys");
     assert_eq!(
-        composer_row(&typed, "dryrun:dry-model"),
+        composer_row(&typed),
         "q4z",
         "an F-key left text in the composer:\n{typed}"
     );
     leave(pty);
-}
-
-/// The composer's text in a repainted frame: what sits between the
-/// field's rule and the footer, runs of blanks folded to one space.
-fn composer_row(frame: &str, footer_marker: &str) -> String {
-    let rule = frame
-        .rfind('\u{2500}')
-        .map_or(0, |at| at + '\u{2500}'.len_utf8());
-    let after = &frame[rule..];
-    let footer = after.find(footer_marker).unwrap_or(after.len());
-    after[..footer]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 /// A full repaint of the key help at 30 rows by 100 columns. The page scan
@@ -232,6 +218,11 @@ fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_cl
     repainted_frame_showing(&mut pty, HELP_MARK, "? did not reopen the key help");
     pty.send(b"\x03").unwrap();
     assert_help_closed(&mut pty, "Ctrl+C");
+
+    pty.send(b"?").unwrap();
+    repainted_frame_showing(&mut pty, HELP_MARK, "? did not reopen the key help");
+    pty.send(b"\x04").unwrap();
+    assert_help_closed(&mut pty, "Ctrl+D");
 
     pty.send(b"still here k2w").unwrap();
     wait_for_squeezed(

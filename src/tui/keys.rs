@@ -507,7 +507,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(KeyHelp, "j / k / Up / Down", "Scroll a line"),
         row(KeyHelp, "PgUp / PgDn", "Scroll a page"),
         row(KeyHelp, "Mouse wheel", "Scroll"),
-        row(KeyHelp, "? / q / Esc / Ctrl+C", "Close the help"),
+        row(KeyHelp, "? / q / Esc / Ctrl+C / Ctrl+D", "Close the help"),
     ]
 };
 
@@ -726,7 +726,7 @@ fn help_key(key: KeyEvent, code: KeyCode) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match code {
         KeyCode::Esc => Action::ToggleHelp,
-        KeyCode::Char('c') if ctrl => Action::ToggleHelp,
+        KeyCode::Char('c' | 'd') if ctrl => Action::ToggleHelp,
         _ if ctrl => Action::Nothing,
         KeyCode::Char('?' | 'q') => Action::ToggleHelp,
         KeyCode::Down | KeyCode::Char('j') => Action::HelpScroll(1),
@@ -2765,12 +2765,13 @@ mod tests {
             (H::KeyHelp, "Mouse wheel", vec![]),
             (
                 H::KeyHelp,
-                "? / q / Esc / Ctrl+C",
+                "? / q / Esc / Ctrl+C / Ctrl+D",
                 vec![
                     (letter('?'), RUNNING_HELP, Action::ToggleHelp),
                     (letter('q'), HELP, Action::ToggleHelp),
                     (plain(KeyCode::Esc), RUNNING_HELP, Action::ToggleHelp),
                     (ctrl('c'), HELP, Action::ToggleHelp),
+                    (ctrl('d'), RUNNING_HELP, Action::ToggleHelp),
                 ],
             ),
         ]
@@ -3309,7 +3310,6 @@ mod tests {
             (ctrl('x'), HELP),
             (ctrl('g'), HELP),
             (ctrl('t'), HELP),
-            (ctrl('d'), HELP),
             (ctrl('j'), HELP),
         ];
         for (key, ctx) in cases {

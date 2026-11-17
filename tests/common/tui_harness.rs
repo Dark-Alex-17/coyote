@@ -1304,6 +1304,21 @@ pub fn repainted_frame_showing(pty: &mut Pty, needle: &str, what: &str) -> Strin
     panic!("{what}:\n{frame}");
 }
 
+/// The composer's text in a repainted frame of the dry-run config: what
+/// sits between the field's rule and the footer, runs of blanks folded
+/// to one space.
+pub fn composer_row(frame: &str) -> String {
+    let rule = frame
+        .rfind('\u{2500}')
+        .map_or(0, |at| at + '\u{2500}'.len_utf8());
+    let after = &frame[rule..];
+    let footer = after.find("dryrun:dry-model").unwrap_or(after.len());
+    after[..footer]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The roster band of a repainted frame: from its legend down to the rule
 /// under it.
 pub fn roster_band(frame: &str) -> &str {

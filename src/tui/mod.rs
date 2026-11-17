@@ -1751,7 +1751,8 @@ impl App {
     /// the composer, as any sent line is, and opens the key help in
     /// place of sending it. The plain REPL shares the history file and
     /// does not know `.keys`, so the line is kept in this session's
-    /// history only.
+    /// history only. An enabled macro named `keys` wins: the line is
+    /// left for the REPL, which runs the macro.
     fn take_keys_command(&mut self) -> bool {
         let text = self.composer_text();
         let command = self.config.command_prefix.normalize(text.trim());
@@ -1759,6 +1760,7 @@ impl App {
             .as_deref()
             .and_then(|command| command.strip_prefix('.'))
             != Some(KEYS_COMMAND)
+            || self.macros.iter().any(|(name, _)| name == KEYS_COMMAND)
         {
             return false;
         }
@@ -11133,6 +11135,39 @@ mod tests {
             assert!(harness.app.help.is_some(), "{line}");
             assert!(harness.app.queued.is_empty(), "{line}");
         }
+    }
+
+    /// A macro named `keys` shadows the key help command: `.keys` goes to
+    /// the REPL as a line, sent between turns and held during one, while
+    /// `?` still opens the help.
+    #[test]
+    fn a_keys_macro_takes_the_keys_command_from_the_help() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.macros = vec![(KEYS_COMMAND.to_string(), "my keys".to_string())];
+        harness.type_text(".keys");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Submit(".keys".to_string()))
+        );
+        assert!(harness.app.help.is_none());
+
+        harness.press(KeyCode::Char('?'));
+        assert!(harness.app.help.is_some());
+        harness.press(KeyCode::Char('q'));
+
+        harness.app.begin_turn("work", false);
+        harness.type_text(".keys");
+        assert_eq!(harness.press(KeyCode::Enter), None);
+        assert!(harness.app.help.is_none());
+        assert_eq!(
+            harness
+                .app
+                .queued
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            [".keys"]
+        );
     }
 
     /// Only a draft that is the command alone, under the active prefix,

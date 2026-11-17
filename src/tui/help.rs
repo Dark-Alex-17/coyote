@@ -14,7 +14,8 @@ use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = "Keys";
-const HINT: &str = "j/k scroll  PgUp/PgDn page  q/Esc close";
+/// Fits the 40 columns of the narrowest frame the help is drawn at.
+const HINT: &str = "j/k scroll  PgUp/Dn page  q/?/Esc close";
 /// Columns before a row's keys.
 const INDENT: usize = 2;
 /// Columns between the keys and what they do.

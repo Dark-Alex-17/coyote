@@ -2476,7 +2476,7 @@ fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let welcome = repainted_frame_showing(
         &mut pty,
-        "On an empty prompt \"?\" or \".keys\" lists the keys.",
+        "Empty prompt: \"?\" or \".keys\" = keys",
         "the welcome does not name the key help",
     );
     assert!(
