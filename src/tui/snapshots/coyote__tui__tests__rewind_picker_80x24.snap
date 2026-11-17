@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 4483
 expression: frame
 ---
 "> first question                                                                "
@@ -16,7 +17,7 @@ expression: frame
 "an answer                                                                       "
 "                                                                                "
 "                                                                                "
-"Ctrl+G = tasks  Ctrl+X = todo  ? = keys                                         "
+"Ctrl+G = tasks  Ctrl+X = todo                                                   "
 "Rewind to (Enter = choose  Esc = close)                                         "
 "third question                                                                  "
 "second          +1 line                                                         "

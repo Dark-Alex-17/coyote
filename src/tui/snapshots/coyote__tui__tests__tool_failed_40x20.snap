@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 7495
 expression: "&frame"
 ---
 "> read it                               "
@@ -16,7 +17,7 @@ expression: "&frame"
 "                                        "
 "                                        "
 "                                        "
-"Ctrl+G = tasks  Ctrl+X = todo  ? = keys "
+"? = keys  Ctrl+G = tasks  Ctrl+X = todo "
 "────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "

@@ -82,7 +82,7 @@ fn lines(width: u16) -> Vec<Line<'static>> {
             if context.is_some() {
                 lines.push(Line::default());
             }
-            lines.push(Line::from(Span::styled(row_context.title(), BOLD)));
+            lines.extend(render::plain_lines(row_context.title(), width, BOLD));
             context = Some(*row_context);
         }
         if beside {
@@ -104,7 +104,9 @@ fn lines(width: u16) -> Vec<Line<'static>> {
             }
         } else {
             let indent = " ".repeat(INDENT);
-            lines.push(Line::from(format!("{indent}{keys}")));
+            for keys_line in wrap_keys(keys, columns.saturating_sub(INDENT)) {
+                lines.push(Line::from(format!("{indent}{keys_line}")));
+            }
             let does_width = u16::try_from(columns.saturating_sub(2 * INDENT)).unwrap_or(u16::MAX);
             for line in render::plain_lines(does, does_width, Style::new()) {
                 let mut spans = vec![Span::raw(indent.repeat(2))];
@@ -114,6 +116,34 @@ fn lines(width: u16) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// A keys label broken between its ` / `-separated names to fit `width`,
+/// each broken line keeping its trailing `/` so it reads on. A name wider
+/// than `width` gets a line to itself.
+fn wrap_keys(keys: &str, width: usize) -> Vec<String> {
+    let mut wrapped: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut names = keys.split(" / ").peekable();
+    while let Some(name) = names.next() {
+        let more = if names.peek().is_some() {
+            " /".width()
+        } else {
+            0
+        };
+        if current.is_empty() {
+            current.push_str(name);
+        } else if current.width() + " / ".width() + name.width() + more <= width {
+            current.push_str(" / ");
+            current.push_str(name);
+        } else {
+            current.push_str(" /");
+            wrapped.push(std::mem::take(&mut current));
+            current.push_str(name);
+        }
+    }
+    wrapped.push(current);
+    wrapped
 }
 
 impl Widget for &mut Help {
@@ -165,20 +195,35 @@ mod tests {
         terminal.backend().to_string()
     }
 
-    /// Paging through the help from the top shows every context's title
-    /// and every row's keys, at a wide and a narrow width.
+    /// Paging through the help from the top shows every line of it, and
+    /// the lines hold every context's title and every row's keys whole,
+    /// wrapped between names on a narrow frame but never cut.
     #[test]
     fn paging_through_shows_every_row() {
-        for (width, height) in [(80, 24), (40, 12)] {
+        for (width, height) in [(80, 24), (40, 12), (24, 12)] {
             let mut help = Help::default();
             let mut seen = String::new();
             for _ in 0..200 {
                 seen.push_str(&draw(&mut help, width, height));
                 help.page(1);
             }
+            let text: Vec<String> = lines(width).iter().map(Line::to_string).collect();
+            for line in &text {
+                assert!(line.width() <= usize::from(width), "{width}: {line:?}");
+                assert!(seen.contains(line.trim_end()), "{width}: {line:?}");
+            }
+            let trimmed: Vec<&str> = text.iter().map(|line| line.trim()).collect();
+            let whole = |name: &str| {
+                trimmed
+                    .iter()
+                    .any(|line| line.starts_with(&format!("{name}  ")))
+                    || (0..trimmed.len()).any(|start| {
+                        (start + 1..=trimmed.len()).any(|end| trimmed[start..end].join(" ") == name)
+                    })
+            };
             for row in KEY_HELP {
-                assert!(seen.contains(row.context.title()), "{width}: {row:?}");
-                assert!(seen.contains(row.keys), "{width}: {row:?}");
+                assert!(whole(row.context.title()), "{width}: {row:?}");
+                assert!(whole(row.keys), "{width}: {row:?}");
             }
         }
     }

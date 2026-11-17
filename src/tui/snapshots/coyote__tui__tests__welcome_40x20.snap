@@ -1,7 +1,9 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 4483
 expression: frame
 ---
+"┌──────────────────────────────────────┐"
 "│ coyote X.Y.Z │"
 "│ model: openai:test-model             │"
 "│                                      │"
@@ -13,10 +15,9 @@ expression: frame
 "│ work.                                │"
 "│                                      │"
 "│ Type ".help" for additional help.    │"
-"│ Press "?" or type ".keys" to list    │"
-"│ the keys.                            │"
+"│ Press "?" or ".keys" for the keys.   │"
 "└──────────────────────────────────────┘"
-"Ctrl+G = tasks  Ctrl+X = todo  ? = keys "
+"? = keys  Ctrl+G = tasks  Ctrl+X = todo "
 "────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "

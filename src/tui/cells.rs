@@ -1085,7 +1085,7 @@ pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> V
     text.push((help.into_owned(), plain));
     text.push((
         format!(
-            "Press \"?\" or type \"{}{}\" to list the keys.",
+            "Press \"?\" or \"{}{}\" for the keys.",
             prefix.display(),
             super::KEYS_COMMAND
         ),

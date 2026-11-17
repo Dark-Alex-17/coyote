@@ -349,11 +349,20 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Ctrl+C",
             "Clear the line, or quit when it is empty",
         ),
-        row(Composer, "Ctrl+D", "Quit, on an empty composer"),
+        row(
+            Composer,
+            "Ctrl+D",
+            "Quit on an empty composer; otherwise delete forward",
+        ),
         row(
             ComposerEditing,
-            "Left / Right",
+            "Left / Right / Ctrl+F",
             "Move the cursor a character",
+        ),
+        row(
+            ComposerEditing,
+            "Up / Down / Ctrl+P / Ctrl+N",
+            "Move the cursor a line in a multi-line draft",
         ),
         row(
             ComposerEditing,
@@ -362,17 +371,42 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         ),
         row(
             ComposerEditing,
+            "Alt+[ / Alt+] / Alt+P / Alt+N",
+            "Move the cursor a paragraph",
+        ),
+        row(
+            ComposerEditing,
             "Home / End / Ctrl+E",
             "Start or end of the line",
+        ),
+        row(
+            ComposerEditing,
+            "Alt+< / Alt+>",
+            "Start or end of the draft",
+        ),
+        row(ComposerEditing, "Alt+V / Ctrl+V", "Move the cursor a page"),
+        row(
+            ComposerEditing,
+            "Tab",
+            "Indent with spaces, except on a command line",
         ),
         row(
             ComposerEditing,
             "Backspace / Delete",
             "Delete before or under the cursor",
         ),
-        row(ComposerEditing, "Ctrl+W", "Cut the word before the cursor"),
+        row(
+            ComposerEditing,
+            "Ctrl+W / Alt+Backspace / Alt+H",
+            "Cut the word before the cursor",
+        ),
+        row(
+            ComposerEditing,
+            "Alt+D / Alt+Delete",
+            "Cut the word after the cursor",
+        ),
         row(ComposerEditing, "Ctrl+K", "Cut to the end of the line"),
-        row(ComposerEditing, "Ctrl+Y", "Paste what Ctrl+K or Ctrl+W cut"),
+        row(ComposerEditing, "Ctrl+Y", "Paste what was last cut"),
         row(ComposerEditing, "Ctrl+U", "Undo"),
         row(ComposerEditing, "Shift+Left / Shift+Right", "Select text"),
         row(TurnRunning, "Esc / Ctrl+C", "Interrupt the turn"),
@@ -740,6 +774,12 @@ fn lowercase(code: KeyCode) -> KeyCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CommandPrefix;
+    use crate::tui::composer::Composer;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
+    use ratatui::widgets::Widget;
 
     fn press(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -2238,13 +2278,28 @@ mod tests {
                     (ctrl('c'), IDLE, Action::Quit),
                 ],
             ),
-            (H::Composer, "Ctrl+D", vec![(ctrl('d'), IDLE, Action::Quit)]),
+            (
+                H::Composer,
+                "Ctrl+D",
+                vec![(ctrl('d'), IDLE, Action::Quit), typed(ctrl('d'), TYPING)],
+            ),
             (
                 H::ComposerEditing,
-                "Left / Right",
+                "Left / Right / Ctrl+F",
                 vec![
                     typed(plain(KeyCode::Left), TYPING),
                     typed(plain(KeyCode::Right), MULTI_LINE),
+                    typed(ctrl('f'), TYPING),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Up / Down / Ctrl+P / Ctrl+N",
+                vec![
+                    typed(plain(KeyCode::Up), MULTI_LINE),
+                    typed(plain(KeyCode::Down), MULTI_LINE),
+                    typed(ctrl('p'), MULTI_LINE),
+                    typed(ctrl('n'), MULTI_LINE),
                 ],
             ),
             (
@@ -2259,6 +2314,16 @@ mod tests {
             ),
             (
                 H::ComposerEditing,
+                "Alt+[ / Alt+] / Alt+P / Alt+N",
+                vec![
+                    typed(alt(KeyCode::Char('[')), MULTI_LINE),
+                    typed(alt(KeyCode::Char(']')), MULTI_LINE),
+                    typed(alt(KeyCode::Char('p')), MULTI_LINE),
+                    typed(alt(KeyCode::Char('n')), MULTI_LINE),
+                ],
+            ),
+            (
+                H::ComposerEditing,
                 "Home / End / Ctrl+E",
                 vec![
                     typed(plain(KeyCode::Home), TYPING),
@@ -2268,13 +2333,50 @@ mod tests {
             ),
             (
                 H::ComposerEditing,
+                "Alt+< / Alt+>",
+                vec![
+                    typed(alt(KeyCode::Char('<')), MULTI_LINE),
+                    typed(alt(KeyCode::Char('>')), MULTI_LINE),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Alt+V / Ctrl+V",
+                vec![
+                    typed(alt(KeyCode::Char('v')), MULTI_LINE),
+                    typed(ctrl('v'), MULTI_LINE),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Tab",
+                vec![typed(plain(KeyCode::Tab), TYPING)],
+            ),
+            (
+                H::ComposerEditing,
                 "Backspace / Delete",
                 vec![
                     typed(plain(KeyCode::Backspace), TYPING),
                     typed(plain(KeyCode::Delete), TYPING),
                 ],
             ),
-            (H::ComposerEditing, "Ctrl+W", vec![typed(ctrl('w'), TYPING)]),
+            (
+                H::ComposerEditing,
+                "Ctrl+W / Alt+Backspace / Alt+H",
+                vec![
+                    typed(ctrl('w'), TYPING),
+                    typed(alt(KeyCode::Backspace), TYPING),
+                    typed(alt(KeyCode::Char('h')), TYPING),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Alt+D / Alt+Delete",
+                vec![
+                    typed(alt(KeyCode::Char('d')), TYPING),
+                    typed(alt(KeyCode::Delete), TYPING),
+                ],
+            ),
             (H::ComposerEditing, "Ctrl+K", vec![typed(ctrl('k'), TYPING)]),
             (H::ComposerEditing, "Ctrl+Y", vec![typed(ctrl('y'), IDLE)]),
             (H::ComposerEditing, "Ctrl+U", vec![typed(ctrl('u'), TYPING)]),
@@ -2791,8 +2893,9 @@ mod tests {
 
     /// Each help row names a key that, in a context the row applies to,
     /// does what the row says, and no row documents a key that does
-    /// nothing, except the composer editing rows, whose keys must reach
-    /// the text area as typed.
+    /// nothing. A composer editing key must reach the text area as
+    /// typed; any other row may also hand its key to the text area, as
+    /// Ctrl+D does with a draft, so long as it binds the key somewhere.
     #[test]
     fn every_help_row_replays_through_the_key_map() {
         let swept = swept_contexts();
@@ -2805,6 +2908,12 @@ mod tests {
                 row.keys == "Mouse wheel",
                 "{row:?}: only a mouse wheel row replays no key"
             );
+            if row.context != HelpContext::ComposerEditing && !replays.is_empty() {
+                assert!(
+                    replays.iter().any(|(_, _, action)| !passes_through(action)),
+                    "{row:?} binds no key"
+                );
+            }
             for (key, ctx, expected) in replays {
                 assert!(
                     swept
@@ -2812,10 +2921,8 @@ mod tests {
                         .any(|(swept, applies)| swept == ctx && applies.contains(&row.context)),
                     "{row:?}: {ctx:?} is not a swept context the row applies to"
                 );
-                if row.context == HelpContext::ComposerEditing {
+                if row.context == HelpContext::ComposerEditing || passes_through(expected) {
                     assert_eq!(*expected, Action::ComposerInput(*key), "{row:?}");
-                } else {
-                    assert!(!passes_through(expected), "{row:?} documents {expected:?}");
                 }
                 assert_eq!(map_key(*key, ctx), *expected, "{row:?}: {key:?} in {ctx:?}");
             }
@@ -2841,6 +2948,51 @@ mod tests {
             }
             for key in &replayed {
                 assert!(named.contains(key), "{row:?} replays {key:?}, not named");
+            }
+        }
+    }
+
+    /// A draft primed with something to undo and to paste, its cursor
+    /// inside a word mid-way down, laid out two rows high so a page
+    /// step has somewhere to go.
+    fn primed_composer() -> Composer {
+        let mut composer = Composer::new(Color::Reset, CommandPrefix::Dot);
+        composer.set_text("one two three\n\nfour five six\nseven eight nine\n\nten eleven");
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::Up);
+        composer.move_cursor(ViMotion::Head);
+        composer.move_cursor(ViMotion::WordForward);
+        composer.input(ctrl('k'));
+        composer.move_cursor(ViMotion::Back);
+        let area = Rect::new(0, 0, 20, 3);
+        composer
+            .view(CommandPrefix::Dot, &[], true, false)
+            .render(area, &mut Buffer::empty(area));
+        composer
+    }
+
+    /// Every key a help row hands to the text area edits the draft or
+    /// moves its cursor there, so no row names a key the text area
+    /// ignores. A marker typed after the key shows where the cursor
+    /// went.
+    #[test]
+    fn every_key_the_help_hands_to_the_text_area_changes_the_draft() {
+        let marker = plain(KeyCode::Char('|'));
+        let mut unmoved = primed_composer();
+        unmoved.input(marker);
+        for (context, keys, replays) in help_examples() {
+            for (key, _, action) in replays {
+                if action != Action::ComposerInput(key) {
+                    continue;
+                }
+                let mut composer = primed_composer();
+                composer.input(key);
+                composer.input(marker);
+                assert_ne!(
+                    composer.text(),
+                    unmoved.text(),
+                    "{context:?} {keys:?}: {key:?} left the draft and cursor alone"
+                );
             }
         }
     }

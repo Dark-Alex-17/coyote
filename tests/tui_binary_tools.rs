@@ -30,8 +30,6 @@ use common::pty::{Pty, strip_ansi};
 use common::tui_harness::*;
 use serial_test::serial;
 
-const CTRL_G: &[u8] = b"\x07";
-
 // ---------------------------------------------------------------------------
 // A tool question carrying invisible format characters, a reply in palette
 // grey, a rebuild whose document fails to load, and an MCP conflict on
@@ -2463,9 +2461,10 @@ fn ctrl_g_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless()
     assert_tty_restored(&transcript);
 }
 
-/// The welcome screen names `?`; on the empty composer it opens the key
-/// help over the whole screen, Esc closes it, and the composer then takes
-/// keys, a `?` after text among them.
+/// The welcome screen and the status row name `?`; on the empty composer
+/// it opens the key help over the whole screen, Esc closes it, and the
+/// composer then takes keys, a `?` after text among them, while the
+/// status row stops offering it.
 #[test]
 #[serial]
 fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
@@ -2477,12 +2476,12 @@ fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let welcome = repainted_frame_showing(
         &mut pty,
-        "Press \"?\" or type \".keys\" to list the keys.",
+        "Press \"?\" or \".keys\" for the keys.",
         "the welcome does not name the key help",
     );
     assert!(
-        squeezed(&welcome).contains(&squeezed("Ctrl+G = tasks  Ctrl+X = todo")),
-        "the status row does not name the panel chords:\n{welcome}"
+        squeezed(&welcome).contains(&squeezed("? = keys  Ctrl+G = tasks  Ctrl+X = todo")),
+        "the status row does not name the help key and the panel chords:\n{welcome}"
     );
     pty.send(b"?").unwrap();
     let help = repainted_frame_showing(
@@ -2506,6 +2505,12 @@ fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
         &mut pty,
         "why? h7k",
         "a ? after text did not reach the composer",
+    );
+    let typed = repainted_frame_showing(&mut pty, "why? h7k", "the draft is not on screen");
+    assert!(
+        squeezed(&typed).contains(&squeezed("Ctrl+G = tasks  Ctrl+X = todo"))
+            && !squeezed(&typed).contains(&squeezed("? = keys")),
+        "the status row still offers ? over a draft:\n{typed}"
     );
     pty.send(b"\x03").unwrap();
     pty.read_for(Duration::from_millis(300));

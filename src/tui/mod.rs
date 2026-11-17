@@ -311,8 +311,12 @@ const TYPEAHEAD_LIMIT: usize = 50;
 /// and never reaches the REPL.
 const KEYS_COMMAND: &str = "keys";
 /// The status row between turns, naming the chords of the panels that
-/// nothing else on screen points to, and the key that lists the rest.
-const IDLE_STATUS: &str = "Ctrl+G = tasks  Ctrl+X = todo  ? = keys";
+/// nothing else on screen points to.
+const IDLE_STATUS: &str = "Ctrl+G = tasks  Ctrl+X = todo";
+/// The status row when `?` would open the key help. The key that lists
+/// the rest comes first, so a narrow frame clips the panel chords
+/// before it.
+const IDLE_STATUS_WITH_HELP: &str = "? = keys  Ctrl+G = tasks  Ctrl+X = todo";
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -1733,17 +1737,20 @@ impl App {
         if self.exiting {
             return None;
         }
-        if self.take_keys_command() {
-            return None;
-        }
         self.hold_composer_line().map(Command::Queue)
     }
 
-    /// Takes a `.keys` line out of the composer, as any sent line is, and
-    /// opens the key help in place of sending it.
+    /// Takes a draft that is the `.keys` command and nothing else out of
+    /// the composer, as any sent line is, and opens the key help in
+    /// place of sending it.
     fn take_keys_command(&mut self) -> bool {
-        let word = command_word(&self.composer_text(), self.config.command_prefix);
-        if word.as_deref().and_then(|word| word.strip_prefix('.')) != Some(KEYS_COMMAND) {
+        let text = self.composer_text();
+        let command = self.config.command_prefix.normalize(text.trim());
+        if command
+            .as_deref()
+            .and_then(|command| command.strip_prefix('.'))
+            != Some(KEYS_COMMAND)
+        {
             return false;
         }
         self.take_composer_line();
@@ -1752,8 +1759,12 @@ impl App {
     }
 
     /// Holds the draft for the running turn. A prompt is returned for the
-    /// loop, which offers it to the model; a command only waits.
+    /// loop, which offers it to the model; a command only waits, and
+    /// `.keys` opens the help without waiting.
     fn hold_composer_line(&mut self) -> Option<String> {
+        if self.take_keys_command() {
+            return None;
+        }
         let line = self.take_composer_line()?;
         let command = is_command(&line, self.config.command_prefix);
         self.queued.push(QueuedLine {
@@ -1867,10 +1878,6 @@ impl App {
             TermInput::Key(key) => self.handle_key(key),
             TermInput::Paste(text) => {
                 self.last_keystroke = Some(self.clock.now());
-                // Nothing under the help is in sight to take it.
-                if self.help.is_some() {
-                    return None;
-                }
                 // Terminals deliver a multi-line paste with the line ends
                 // they use themselves (CR, CRLF or LF); the composer and
                 // the field take one shape.
@@ -1880,6 +1887,10 @@ impl App {
                     // pager are out of sight.
                     pager.paste(&text);
                     self.schedule_frame();
+                    return None;
+                }
+                // Nothing under the help is in sight to take it.
+                if self.help.is_some() {
                     return None;
                 }
                 match self.prompts.front_mut() {
@@ -1904,19 +1915,19 @@ impl App {
                 None
             }
             TermInput::Mouse(mouse) => {
-                if let Some(help) = self.help.as_mut() {
+                if let Some(pager) = self.pager.as_mut() {
                     match mouse.kind {
-                        MouseEventKind::ScrollUp => help.scroll(-WHEEL_LINES),
-                        MouseEventKind::ScrollDown => help.scroll(WHEEL_LINES),
+                        MouseEventKind::ScrollUp => pager.scroll(-WHEEL_LINES),
+                        MouseEventKind::ScrollDown => pager.scroll(WHEEL_LINES),
                         _ => return None,
                     }
                     self.schedule_frame();
                     return None;
                 }
-                if let Some(pager) = self.pager.as_mut() {
+                if let Some(help) = self.help.as_mut() {
                     match mouse.kind {
-                        MouseEventKind::ScrollUp => pager.scroll(-WHEEL_LINES),
-                        MouseEventKind::ScrollDown => pager.scroll(WHEEL_LINES),
+                        MouseEventKind::ScrollUp => help.scroll(-WHEEL_LINES),
+                        MouseEventKind::ScrollDown => help.scroll(WHEEL_LINES),
                         _ => return None,
                     }
                     self.schedule_frame();
@@ -2176,7 +2187,7 @@ impl App {
                 None
             }
             Action::OpenPager => {
-                self.pager = Some(Pager::root());
+                self.open_pager(Pager::root());
                 None
             }
             Action::ClosePager => {
@@ -2272,6 +2283,13 @@ impl App {
         }
     }
 
+    /// The pager and the key help each cover the whole screen, and the
+    /// pager's keys come first, so the help never stays open under it.
+    fn open_pager(&mut self, pager: Pager) {
+        self.help = None;
+        self.pager = Some(pager);
+    }
+
     fn take_control_requests(&mut self) -> Vec<ControlRequest> {
         std::mem::take(&mut self.control_requests)
     }
@@ -2326,7 +2344,7 @@ impl App {
                     |cell| matches!(cell, Cell::Job { job_id, .. } if *job_id == task.id),
                 );
                 match row {
-                    Some(index) => self.pager = Some(Pager::root_at(index)),
+                    Some(index) => self.open_pager(Pager::root_at(index)),
                     None => self.push_notice(
                         NoticeKind::ToolWarning,
                         format!("Job {} has no row in this transcript", task.id),
@@ -2367,7 +2385,7 @@ impl App {
         if self.pager.as_ref().is_some_and(Pager::shows_root) {
             cells::release_full_output_caches(self.transcript.cells_for_layout().0);
         }
-        self.pager = Some(Pager::child(session_id.clone(), agent, file.clone()));
+        self.open_pager(Pager::child(session_id.clone(), agent, file.clone()));
         self.read_open_child(session_id, file);
     }
 
@@ -2428,7 +2446,7 @@ impl App {
         };
         match row.session_id {
             Some(session_id) => self.open_child(session_id, row.agent),
-            None => self.pager = Some(Pager::root()),
+            None => self.open_pager(Pager::root()),
         }
     }
 
@@ -3107,7 +3125,18 @@ impl App {
             return Some("Leaving...".to_string());
         }
         let Some(turn) = self.turn.as_ref() else {
-            return self.prompts.is_empty().then(|| IDLE_STATUS.to_string());
+            if !self.prompts.is_empty() {
+                return None;
+            }
+            // The key map's guard: anywhere else `?` is typing.
+            let ctx = self.key_context();
+            let help_opens = ctx.composer_empty && ctx.popup.is_none();
+            let status = if help_opens {
+                IDLE_STATUS_WITH_HELP
+            } else {
+                IDLE_STATUS
+            };
+            return Some(status.to_string());
         };
         let now = self.clock.now();
         let secs = |since: Instant| now.duration_since(since).as_secs();
@@ -3155,16 +3184,20 @@ impl App {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.frame_area = Some(area);
-        if let Some(help) = self.help.as_mut() {
-            frame.render_widget(help, area);
-            return;
-        }
+        debug_assert!(
+            self.help.is_none() || self.pager.is_none(),
+            "the key help is open under the pager"
+        );
         if let Some(pager) = self.pager.as_mut() {
             let generation = self.transcript.generation();
             let (cells, revisions) = self.transcript.cells_for_layout();
             let text = pager.text(cells, revisions, generation, area.width, &mut self.renderer);
             pager.settle(&text, Pager::text_rows(area.height));
             frame.render_widget(PagerView { pager, text: &text }, area);
+            return;
+        }
+        if let Some(help) = self.help.as_mut() {
+            frame.render_widget(help, area);
             return;
         }
         // The roster is read on every frame it is up: the tasks move on
@@ -10782,7 +10815,7 @@ mod tests {
     #[test]
     fn question_mark_opens_the_key_help_and_esc_closes_it() {
         let mut harness = Harness::standalone(80, 24);
-        assert!(harness.draw().contains(IDLE_STATUS));
+        assert!(harness.draw().contains(IDLE_STATUS_WITH_HELP));
         assert_eq!(harness.press(KeyCode::Char('?')), None);
         let frame = harness.draw();
         assert!(frame.contains("Keys"), "{frame}");
@@ -10796,22 +10829,25 @@ mod tests {
         assert_eq!(harness.press(KeyCode::Esc), None);
         assert!(harness.app.help.is_none());
         assert_eq!(harness.app.composer_text(), "");
-        assert!(harness.draw().contains(IDLE_STATUS));
+        assert!(harness.draw().contains(IDLE_STATUS_WITH_HELP));
 
         harness.type_text("why?");
         assert!(harness.app.help.is_none());
         assert_eq!(harness.app.composer_text(), "why?");
     }
 
-    /// Each chord the status row names is a key the help lists.
+    /// Each chord either status row names is a key the help lists.
     #[test]
     fn the_idle_status_names_only_keys_the_help_lists() {
-        let chords: Vec<&str> = IDLE_STATUS
-            .split("  ")
-            .map(|entry| entry.split_once(" = ").expect(entry).0)
-            .collect();
-        assert_eq!(chords, ["Ctrl+G", "Ctrl+X", "?"]);
-        for chord in chords {
+        let chords = |status: &'static str| -> Vec<&'static str> {
+            status
+                .split("  ")
+                .map(|entry| entry.split_once(" = ").expect(entry).0)
+                .collect()
+        };
+        assert_eq!(chords(IDLE_STATUS), ["Ctrl+G", "Ctrl+X"]);
+        assert_eq!(chords(IDLE_STATUS_WITH_HELP), ["?", "Ctrl+G", "Ctrl+X"]);
+        for chord in chords(IDLE_STATUS_WITH_HELP) {
             assert!(
                 keys::KEY_HELP
                     .iter()
@@ -10819,6 +10855,32 @@ mod tests {
                 "{chord} is in no help row"
             );
         }
+    }
+
+    /// The status row offers `?` only where it opens the help: a draft
+    /// or a band open above the composer takes it as typing.
+    #[test]
+    fn the_idle_status_drops_the_help_key_where_it_types() {
+        let mut harness = Harness::standalone(80, 24);
+        assert_eq!(
+            harness.app.status_text().as_deref(),
+            Some(IDLE_STATUS_WITH_HELP)
+        );
+        harness.type_text("draft");
+        assert_eq!(harness.app.status_text().as_deref(), Some(IDLE_STATUS));
+        let frame = harness.draw();
+        assert!(frame.contains(IDLE_STATUS), "{frame}");
+        assert!(!frame.contains("? = keys"), "{frame}");
+        press_ctrl(&mut harness, 'c');
+        assert_eq!(harness.app.composer_text(), "");
+        press_ctrl(&mut harness, 'r');
+        assert!(matches!(harness.app.view, View::HistorySearch(_)));
+        assert_eq!(harness.app.status_text().as_deref(), Some(IDLE_STATUS));
+        harness.press(KeyCode::Esc);
+        assert_eq!(
+            harness.app.status_text().as_deref(),
+            Some(IDLE_STATUS_WITH_HELP)
+        );
     }
 
     /// The wheel scrolls whatever covers the screen: the key help, the
@@ -10902,6 +10964,75 @@ mod tests {
             assert!(harness.app.help.is_some(), "{line}");
             assert!(harness.app.queued.is_empty(), "{line}");
         }
+    }
+
+    /// Only a draft that is the command alone, under the active prefix,
+    /// opens the help; arguments, a second line or the other sigil send
+    /// the line on as typed.
+    #[test]
+    fn the_keys_command_is_the_whole_line_or_nothing() {
+        for (prefix, line) in [
+            (crate::config::CommandPrefix::Dot, ".keys foo"),
+            (crate::config::CommandPrefix::Dot, ".keys\nmore"),
+            (crate::config::CommandPrefix::Dot, "/keys"),
+            (crate::config::CommandPrefix::Slash, ".keys"),
+            (crate::config::CommandPrefix::Slash, "/keys foo"),
+        ] {
+            let config = Arc::new(AppConfig {
+                command_prefix: prefix,
+                ..(*plain_config()).clone()
+            });
+            let mut harness = Harness::new(80, 24, config, FooterInfo::default());
+            harness.app.set_composer_text(line);
+            assert_eq!(
+                harness.press(KeyCode::Enter),
+                Some(Command::Submit(line.to_string())),
+                "{line:?}"
+            );
+            assert!(harness.app.help.is_none(), "{line:?}");
+        }
+    }
+
+    /// A `.keys` draft that Alt+Up would put on the queue opens the help
+    /// instead, and the held line still comes back to edit.
+    #[test]
+    fn alt_up_over_a_keys_draft_opens_the_help_instead_of_holding_it() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("explain", false);
+        harness.type_text("first");
+        assert_eq!(
+            harness.press(KeyCode::Enter),
+            Some(Command::Queue("first".to_string()))
+        );
+        harness.type_text(".keys");
+        let alt_up = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            harness.app.handle_key(alt_up),
+            Some(Command::Unqueue {
+                held: Some("first".to_string()),
+                draft: None,
+            })
+        );
+        assert!(harness.app.help.is_some());
+        assert!(harness.app.queued.is_empty());
+        assert_eq!(harness.app.composer_text(), "first");
+    }
+
+    /// Opening the pager closes the key help, so closing the pager gives
+    /// back the transcript rather than a help left under it.
+    #[test]
+    fn opening_the_pager_closes_the_key_help() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.press(KeyCode::Char('?'));
+        assert!(harness.app.help.is_some());
+        harness.app.open_pager(Pager::root());
+        assert!(harness.app.help.is_none());
+        let frame = harness.draw();
+        assert!(frame.contains("Tab threads"), "{frame}");
+        assert!(!frame.contains("Suspend to the shell"), "{frame}");
+        harness.press(KeyCode::Char('q'));
+        assert!(harness.app.pager.is_none());
+        assert!(harness.draw().contains(IDLE_STATUS_WITH_HELP));
     }
 
     /// A question arriving under the key help closes it, as it closes

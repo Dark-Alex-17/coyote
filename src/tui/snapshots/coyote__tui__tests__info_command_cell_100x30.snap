@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 4779
 expression: "&rendered"
 ---
 "> .info                                                                                             "
@@ -26,7 +27,7 @@ expression: "&rendered"
 "                                                                                                    "
 "                                                                                                    "
 "                                                                                                    "
-"Ctrl+G = tasks  Ctrl+X = todo  ? = keys                                                             "
+"? = keys  Ctrl+G = tasks  Ctrl+X = todo                                                             "
 "────────────────────────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                                           "
 "                                                                                                    "

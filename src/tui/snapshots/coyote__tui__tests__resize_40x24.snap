@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 6522
 expression: "&narrow"
 ---
 "> explain                               "
@@ -20,7 +21,7 @@ expression: "&narrow"
 "                                        "
 "                                        "
 "                                        "
-"Ctrl+G = tasks  Ctrl+X = todo  ? = keys "
+"? = keys  Ctrl+G = tasks  Ctrl+X = todo "
 "────────────────────────────────────────"
 " Type a prompt or a .command; Enter send"
 "                                        "

@@ -1,5 +1,6 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 8281
 expression: "&frame"
 ---
 "                                                                                "
@@ -20,7 +21,7 @@ expression: "&frame"
 "> filler line 9                                                                 "
 "                                                                                "
 "> filler line 10                                       3 new below  End = follow"
-"Ctrl+G = tasks  Ctrl+X = todo  ? = keys                                         "
+"? = keys  Ctrl+G = tasks  Ctrl+X = todo                                         "
 "────────────────────────────────────────────────────────────────────────────────"
 " Type a prompt or a .command; Enter sends                                       "
 "                                                                                "

@@ -462,6 +462,10 @@ pub const PASTE_ON: &[u8] = b"\x1b[?2004h";
 pub const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 pub const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 pub const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+/// The tasks roster's chord.
+pub const CTRL_G: &[u8] = b"\x07";
+/// The todo panel's chord.
+pub const CTRL_X: &[u8] = b"\x18";
 
 /// The UI hides the cursor on every frame and never positions one, so
 /// the only `show` is the leave sequence's: it must come after the last

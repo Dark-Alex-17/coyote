@@ -28,8 +28,6 @@ use common::pty::{Pty, strip_ansi};
 use common::tui_harness::*;
 use serial_test::serial;
 
-const CTRL_G: &[u8] = b"\x07";
-
 /// A config with two openai-compatible clients: `fake` for the root agent
 /// and `kidfake` for the child, each on its own fake model.
 fn write_two_model_config(dir: &Path, boss: &FakeLlm, kid: &FakeLlm, extra: &str) {

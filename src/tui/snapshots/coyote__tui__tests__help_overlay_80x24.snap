@@ -1,8 +1,9 @@
 ---
 source: src/tui/mod.rs
+assertion_line: 10933
 expression: "&frame"
 ---
-"Keys                                                                    1-22/110"
+"Keys                                                                    1-22/119"
 "Anywhere                                                                        "
 "  Ctrl+Z                                  Suspend to the shell                  "
 "  Ctrl+L                                  Redraw the screen                     "

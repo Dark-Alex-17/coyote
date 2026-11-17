@@ -8,8 +8,12 @@
 //! closes the roster it opened, and `?` with the roster open does not open
 //! the key help; Ctrl+X opens the todo panel without eating the composer's
 //! text, and Ctrl+E is still the composer's end of line; the plain REPL
-//! does not know `.keys`. Each case runs the binary on a pseudo-terminal,
-//! so the file is unix-only, and the cases run one at a time.
+//! does not know `.keys`. F1-F12 also leave the roster, the key help and
+//! the pager as they are; `?` in the history search band opens no help;
+//! under a Select modal Ctrl+X shows the todo panel while Ctrl+G, `?` and
+//! the function keys do nothing; the palette does not offer `.keys`. Each
+//! case runs the binary on a pseudo-terminal, so the file is unix-only,
+//! and the cases run one at a time.
 #![cfg(unix)]
 
 mod common;
@@ -20,13 +24,13 @@ use common::pty::{Pty, strip_ansi};
 use common::tui_harness::*;
 use serial_test::serial;
 
-const CTRL_G: &[u8] = b"\x07";
-const CTRL_X: &[u8] = b"\x18";
 const CTRL_E: &[u8] = b"\x05";
 const HOME: &[u8] = b"\x1b[H";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
 /// A row only the key help shows.
 const HELP_MARK: &str = "Suspend to the shell";
+/// What the key help's last row does.
+const LAST_HELP_ROW: &str = "Close the help";
 /// The roster's legend.
 const ROSTER_MARK: &str = "Esc = close";
 
@@ -125,15 +129,26 @@ fn function_keys_do_nothing_on_the_empty_composer() {
     );
     pty.send(b"q4z").unwrap();
     let typed = repainted_frame_showing(&mut pty, "q4z", "the composer stopped taking keys");
-    let line = typed
-        .lines()
-        .find(|l| l.contains("q4z"))
-        .unwrap_or_default();
-    assert!(
-        !line.contains('~') && !line.contains("[1") && !line.contains("OP"),
-        "an F-key typed into the composer: {line:?}"
+    assert_eq!(
+        composer_row(&typed, "dryrun:dry-model"),
+        "q4z",
+        "an F-key left text in the composer:\n{typed}"
     );
     leave(pty);
+}
+
+/// The composer's text in a repainted frame: what sits between the
+/// field's rule and the footer, runs of blanks folded to one space.
+fn composer_row(frame: &str, footer_marker: &str) -> String {
+    let rule = frame
+        .rfind('\u{2500}')
+        .map_or(0, |at| at + '\u{2500}'.len_utf8());
+    let after = &frame[rule..];
+    let footer = after.find(footer_marker).unwrap_or(after.len());
+    after[..footer]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[test]
@@ -144,10 +159,18 @@ fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_cl
     pty.send(b".keys\r").unwrap();
     let first = repainted_frame_showing(&mut pty, HELP_MARK, ".keys did not open the key help");
     let mut pages = vec![first.clone()];
-    for _ in 0..8 {
+    // Page until the help's last row is on screen, or until a PageDown
+    // no longer moves the text.
+    while !squeezed(pages.last().unwrap()).contains(&squeezed(LAST_HELP_ROW)) {
+        assert!(pages.len() < 40, "the key help never reached its end");
         pty.send(PAGE_DOWN).unwrap();
         pty.read_for(Duration::from_millis(200));
-        pages.push(flipped_frame(&mut pty));
+        let page = flipped_frame(&mut pty);
+        let stuck = squeezed(&page) == squeezed(pages.last().unwrap());
+        pages.push(page);
+        if stuck {
+            break;
+        }
     }
     assert_ne!(
         squeezed(&first),
@@ -155,6 +178,10 @@ fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_cl
         "PageDown did not scroll the key help"
     );
     let all = pages.join("\n");
+    assert!(
+        squeezed(&all).contains(&squeezed(LAST_HELP_ROW)),
+        "paging never showed the help's last row:\n{all}"
+    );
     for chord in ["Ctrl+G", "Ctrl+X", "Ctrl+T", "Ctrl+L"] {
         assert!(
             all.contains(chord),
@@ -303,4 +330,170 @@ fn the_plain_repl_does_not_know_dot_keys() {
     pty.send(b".exit\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
+}
+
+// ---------------------------------------------------------------------
+// Function keys over the roster, the key help and the pager; `?` in a
+// band with an empty composer; Ctrl+G and Ctrl+X under a prompt modal;
+// the palette never offering `.keys`.
+// ---------------------------------------------------------------------
+
+const CTRL_R: &[u8] = b"\x12";
+const CTRL_T: &[u8] = b"\x14";
+/// The pager's header for the root thread.
+const PAGER_MARK: &str = "Thread: root thread";
+
+fn send_function_keys(pty: &mut Pty) {
+    for key in FUNCTION_KEYS {
+        pty.send(key).unwrap();
+        pty.read_for(Duration::from_millis(150));
+    }
+    pty.read_for(Duration::from_millis(300));
+}
+
+/// F1-F12 leave whatever is open as it is: the roster stays up and opens
+/// no key help, the key help stays up, and the pager stays up (Ctrl+X in
+/// the pager does nothing either). None of them is taken for an Esc.
+#[test]
+#[serial]
+fn function_keys_leave_the_roster_the_key_help_and_the_pager_as_they_are() {
+    let (_guard, mut pty) = boot("fkeys-over", "");
+
+    pty.send(CTRL_G).unwrap();
+    repainted_frame_showing(&mut pty, ROSTER_MARK, "Ctrl+G did not open the roster");
+    send_function_keys(&mut pty);
+    let frame = flipped_frame(&mut pty);
+    assert!(
+        squeezed(&frame).contains(&squeezed(ROSTER_MARK)),
+        "an F-key closed the roster:\n{frame}"
+    );
+    assert!(
+        !squeezed(&frame).contains(&squeezed(HELP_MARK)),
+        "an F-key over the roster opened the key help:\n{frame}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+
+    pty.send(b".keys\r").unwrap();
+    repainted_frame_showing(&mut pty, HELP_MARK, ".keys did not open the key help");
+    send_function_keys(&mut pty);
+    let frame = flipped_frame(&mut pty);
+    assert!(
+        squeezed(&frame).contains(&squeezed(HELP_MARK)),
+        "an F-key closed the key help:\n{frame}"
+    );
+    pty.send(b"q").unwrap();
+    assert_help_closed(&mut pty, "q");
+
+    pty.send(CTRL_T).unwrap();
+    repainted_frame_showing(&mut pty, PAGER_MARK, "Ctrl+T did not open the pager");
+    send_function_keys(&mut pty);
+    pty.send(CTRL_X).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let frame = flipped_frame(&mut pty);
+    assert!(
+        squeezed(&frame).contains(&squeezed(PAGER_MARK)),
+        "an F-key or Ctrl+X closed the pager:\n{frame}"
+    );
+    assert!(
+        !frame.contains("Todo"),
+        "Ctrl+X in the pager opened the todo panel:\n{frame}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    repainted_frame_showing(&mut pty, "no session", "Esc did not close the pager");
+    leave(pty);
+}
+
+/// `?` with the composer empty but the history search band open is a
+/// search character, not the key help.
+#[test]
+#[serial]
+fn question_mark_in_the_history_search_band_opens_no_help() {
+    let (_guard, mut pty) = boot("search-help", "");
+    pty.send(CTRL_R).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    pty.send(b"?").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let frame = flipped_frame(&mut pty);
+    assert!(
+        !squeezed(&frame).contains(&squeezed(HELP_MARK)),
+        "? in the history search band opened the key help:\n{frame}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    leave(pty);
+}
+
+/// Under a Select modal `?` and F1-F12 leave the modal up and open no key
+/// help, Ctrl+G opens no roster (the modal has the keyboard, as F3 did
+/// nothing there), and Ctrl+X still shows the todo panel beside the
+/// question, as F2 did.
+#[test]
+#[serial]
+fn under_a_select_modal_ctrl_x_shows_the_todo_and_ctrl_g_and_question_mark_do_nothing() {
+    let dir = fresh_config_dir("modal-chords");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config_with_embeddings(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let before = pty.raw().len();
+    pty.send(b".rag new-rag-m3c\r").unwrap();
+    wait_for_the_modal(&mut pty, before, ".rag new-rag-m3c", &["dry-embed-a"]);
+    pty.read_for(HOTKEY_GAP);
+
+    pty.send(b"?").unwrap();
+    send_function_keys(&mut pty);
+    pty.send(CTRL_G).unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let frame = flipped_frame(&mut pty);
+    let flat = squeezed(&frame);
+    assert!(
+        flat.contains("Esc=cancel") && flat.contains("dry-embed-a"),
+        "?, an F-key or Ctrl+G closed the modal:\n{frame}"
+    );
+    assert!(
+        !flat.contains(&squeezed(HELP_MARK)),
+        "? or an F-key under the modal opened the key help:\n{frame}"
+    );
+    assert!(
+        !flat.contains(&squeezed(ROSTER_MARK)),
+        "Ctrl+G under the modal opened the roster:\n{frame}"
+    );
+
+    pty.send(CTRL_X).unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = flipped_frame(&mut pty);
+    assert!(
+        frame.contains("Todo"),
+        "Ctrl+X under the modal did not show the todo panel:\n{frame}"
+    );
+    assert!(
+        squeezed(&frame).contains("Esc=cancel"),
+        "Ctrl+X closed the modal:\n{frame}"
+    );
+    pty.send(CTRL_X).unwrap();
+    pty.read_for(Duration::from_millis(300));
+    esc_cancels_the_modal(&mut pty, ".rag new-rag-m3c");
+    leave(pty);
+}
+
+/// `.keys` belongs to the TUI but the command palette does not offer it.
+#[test]
+#[serial]
+fn the_palette_does_not_offer_dot_keys() {
+    let (_guard, mut pty) = boot("palette-keys", "");
+    pty.send(b".ke").unwrap();
+    pty.read_for(Duration::from_millis(500));
+    let frame = flipped_frame(&mut pty);
+    let offered: Vec<&str> = frame
+        .lines()
+        .filter(|line| line.contains(".keys") && !line.contains("Press"))
+        .collect();
+    assert!(
+        offered.is_empty(),
+        "the palette offers .keys: {offered:?}\n{frame}"
+    );
+    leave(pty);
 }

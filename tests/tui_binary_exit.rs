@@ -24,8 +24,6 @@ use common::pty::strip_ansi;
 use common::tui_harness::*;
 use serial_test::serial;
 
-const CTRL_G: &[u8] = b"\x07";
-
 /// Ctrl+C on an idle empty composer leaves the UI like Ctrl+D does, and
 /// the transcript is printed on the normal screen on that path too.
 #[test]
