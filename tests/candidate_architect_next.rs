@@ -3018,6 +3018,38 @@ fn shipped_candidate_is_pure_ascii_and_the_marker_map_keeps_its_escapes() {
     );
 }
 
+/// The smoke battery's checklist replay fails a walk on the same per-node
+/// headless answer count the engine enforces, so the replay keeps modelling
+/// the engine when that budget changes.
+#[test]
+fn checklist_replay_budget_matches_the_engine_headless_answer_budget() {
+    let engine = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/graph/user_interaction.rs"),
+    )
+    .unwrap();
+    let smoke = fs::read_to_string(candidate_dir().join("scripts/smoke_test.py")).unwrap();
+    let value = |text: &str, pattern: &str| -> Option<String> {
+        fancy_regex::Regex::new(pattern)
+            .unwrap()
+            .captures(text)
+            .unwrap()
+            .map(|c| c[1].to_string())
+    };
+    let engine_budget = value(
+        &engine,
+        r"(?m)^const MAX_HEADLESS_ANSWERS_PER_NODE: usize = (\d+);",
+    );
+    let smoke_budget = value(&smoke, r"(?m)^HEADLESS_ANSWERS_PER_NODE = (\d+)$");
+    assert!(
+        engine_budget.is_some(),
+        "the engine budget constant is gone"
+    );
+    assert_eq!(
+        engine_budget, smoke_budget,
+        "smoke_test.py HEADLESS_ANSWERS_PER_NODE must equal the engine's MAX_HEADLESS_ANSWERS_PER_NODE"
+    );
+}
+
 /// The README's toolchain census block is the live output of the grep it
 /// shows: the same file:line set, no more and no fewer, and the `gates.py`
 /// hits are exactly the lockfile regex plus the two prose lines it cites.
@@ -3061,10 +3093,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4376, 4385],
+        vec![51, 4423, 4432],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4376, 4385] {
+    for line in [4423, 4432] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -5213,6 +5245,7 @@ const FROZEN_SCRIPT_BOUNDS: &[(&str, &str, &str, i64)] = &[
     ("AMEND_GATE1_MAX", "", "2 * (STRIKE_LIMIT + 1)", 8),
     ("AMEND_GATE2_MAX", "", "STRIKE_LIMIT", 3),
     ("AMEND_REWORK_MAX", "", "STRIKE_LIMIT", 3),
+    ("CHECKLIST_ASK_EACH_MAX", "", "8", 8),
     ("CHOICE_OPTIONS_MAX", "", "4", 4),
     ("CHOICE_OPTIONS_MIN", "", "2", 2),
     ("CI_FLAKE_RERUNS", "", "2", 2),

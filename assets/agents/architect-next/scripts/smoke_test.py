@@ -3491,6 +3491,181 @@ CHOICE_KEYS = ("choice_kind", "choice_queue", "choice_index", "choice_answers", 
 check("graph: initial_state seeds the choice queue and STATE_KEYS snapshots it",
       [SEEDS.get(k) for k in CHOICE_KEYS] == ["", [], 0, [], False, {}, False] and all(k in _lib.STATE_KEYS for k in CHOICE_KEYS),
       {k: SEEDS.get(k) for k in CHOICE_KEYS})
+# the engine fails a headless run on the 26th answer one approval node gives (MAX_HEADLESS_ANSWERS_PER_NODE)
+HEADLESS_ANSWERS_PER_NODE = 25
+HEADLESS_CHOICE = "Option 1 (recommended)"
+CL_LONG = [f"[surface-a] practice {i}" for i in range(1, 21)] + [f"[surface-b] practice {i}" for i in range(1, 21)]
+
+
+def checklist_state(items):
+    labels = sorted({it.split("]")[0][1:] for it in items})
+    findings = ["\n".join(f"- {it.split('] ', 1)[1]}" for it in items if it.startswith(f"[{label}]")) for label in labels]
+    return base_state(checklist_labels=labels, checklist_findings=findings, checklist_done=[])
+
+
+def checklist_replay(items, choice=HEADLESS_CHOICE):
+    """Walk checklist_round through graph.yaml's own nodes, every approval answered `choice`, counting asks per node."""
+    s = checklist_state(items)
+    s.update(gates.checklist_round(s))
+    asks, path = {}, ["checklist_round"]
+    while s["_next"] not in ("amend_plan", "checklist_gate", "reseal_gate") and not s["_next"].startswith("end_"):
+        nid = s["_next"]
+        node = NODES.get(nid) or {}
+        path.append(nid)
+        if node.get("type") == "approval":
+            asks[nid] = asks.get(nid, 0) + 1
+            if asks[nid] > HEADLESS_ANSWERS_PER_NODE:
+                return s, asks, f"headless: node {nid} auto-answered {HEADLESS_ANSWERS_PER_NODE} times; ask {asks[nid]} fails"
+            s.update({k: str(v).replace("{{choice}}", choice) for k, v in (node.get("state_updates") or {}).items()})
+            s["_next"] = (node.get("routes") or {}).get(choice) or node.get("on_other")
+        elif node.get("type") == "script" and node.get("script") == f"scripts/{nid}.py":
+            s.update(getattr(gates, nid)(s))
+        else:
+            return s, asks, f"{nid} is not a script or approval node in graph.yaml: {node}"
+        if len(path) > 1000:
+            return s, asks, f"no exit after {len(path)} steps"
+    return s, asks, ""
+
+
+def _long_checklist_headless():
+    s, asks, fault = checklist_replay(CL_LONG)
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (not fault and s["_next"] == "amend_plan" and all(f"- {it}\n" in amendment + "\n" for it in CL_LONG)
+            and s["choice_kind"] == ""), (fault, asks, s["_next"], amendment[:300])
+
+
+guarded("checklist replay: 40 items answered headless through graph.yaml -> no approval node past the engine's answer "
+        "budget, amend_plan with all 40 items accepted", _long_checklist_headless)
+
+
+def _long_checklist_batch():
+    s = checklist_state(CL_LONG)
+    u = gates.checklist_round(s)
+    esc, queue = u["escalation"], u["choice_queue"]
+    return (len(CL_LONG) > _lib.CHECKLIST_ASK_EACH_MAX and len(queue) == 1 and queue[0]["batch"] and queue[0]["items"] == CL_LONG
+            and [o["text"] for o in esc["options"]] == ["Accept all 40 items", gates.CHECKLIST_REVIEW_EACH, "Drop all 40 items"]
+            and [o["recommended"] for o in esc["options"]] == [True, False, False]
+            and all(f"- {it}\n" in esc["question"] for it in CL_LONG) and gates._terminal_prompt(esc) == "ask_choice_3"
+            and u["checklist_done"] == ["surface-a", "surface-b"]), (len(queue), esc["options"], esc["question"][-200:])
+
+
+guarded("checklist_round: more items than CHECKLIST_ASK_EACH_MAX -> one three-option question listing every item", _long_checklist_batch)
+
+
+def checklist_batch_answer(reply):
+    s = checklist_state(CL_LONG)
+    s.update(gates.checklist_round(s))
+    s.update(gates.apply_answer({**s, "last_answer": reply}))
+    s.update(gates.checklist_round(s))
+    return s
+
+
+def _long_checklist_drop():
+    s = checklist_batch_answer("Option 3")
+    return (s["_next"] == "checklist_gate" and "pending_amendments" not in s and s["choice_queue"] == []
+            and "checklist: no items accepted" in s["decisions"]), (s["_next"], s["decisions"][-3:])
+
+
+guarded("checklist batch: drop all -> checklist_gate, nothing to amend", _long_checklist_drop)
+
+
+def _long_checklist_review_each():
+    s = checklist_batch_answer("Option 2")
+    esc, queue = s["escalation"], s["choice_queue"]
+    return (s["_next"] == "escalate_gate" and [q["item"] for q in queue] == CL_LONG and s["choice_index"] == 0
+            and s["choice_answers"] == [] and esc["data"]["index"] == 0 and "[surface-a] practice 1\n" in esc["question"]
+            and [o["text"] for o in esc["options"]] == [gates.CHECKLIST_ACCEPT, gates.CHECKLIST_DROP]
+            and s["checklist_done"] == ["surface-a", "surface-b"]
+            and "checklist: reviewing each of the 40 items" in s["decisions"]), (s["_next"], esc.get("question"), s["decisions"][-3:])
+
+
+guarded("checklist batch: review each -> the per-item queue over the same 40 items, item 1 asked, no new fan-out",
+        _long_checklist_review_each)
+
+
+def _long_checklist_other():
+    s = checklist_batch_answer("only the ones about retries")
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (s["_next"] == "amend_plan"
+            and amendment.startswith("Owner ruling on the 40 best-practice checklist items below: only the ones about retries; "
+                                     "apply it only to the items it accepts:\n")
+            and all(f"- {it}" in amendment for it in CL_LONG) and "Accepted best-practice checklist items" not in amendment
+            and "checklist: 0/40 items accepted, 1 owner ruling(s)" in s["decisions"]), (s["_next"], amendment[:300])
+
+
+guarded("checklist batch: a typed Other answer -> one owner ruling line over the whole list, never an accept",
+        _long_checklist_other)
+
+
+def _long_checklist_empty():
+    s = checklist_state(CL_LONG)
+    s.update(gates.checklist_round(s))
+    s.update({"choice_index": 1, "choice_answers": [{"answer": ""}]})
+    s.update(gates.checklist_round(s))
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (s["_next"] == "amend_plan" and all(f"- {it}" in amendment for it in CL_LONG)
+            and "checklist: empty reply took the recommended accept-all for 40 items" in s["decisions"]
+            and "checklist: 40/40 items accepted, 0 owner ruling(s)" in s["decisions"]), (s["_next"], s["decisions"][-3:])
+
+
+guarded("checklist batch: an empty answer -> the recommended accept-all with its own ledger line, never drop all",
+        _long_checklist_empty)
+
+
+def _long_checklist_empty_reply():
+    s = checklist_batch_answer("")
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (s["_next"] == "amend_plan" and all(f"- {it}" in amendment for it in CL_LONG)
+            and "checklist: 40/40 items accepted, 0 owner ruling(s)" in s["decisions"]), (s["_next"], s["decisions"][-3:])
+
+
+guarded("checklist batch: an empty reply through apply_answer -> every item accepted, never drop all",
+        _long_checklist_empty_reply)
+
+
+def _checklist_bound_plus_one():
+    items = CL_LONG[:_lib.CHECKLIST_ASK_EACH_MAX + 1]
+    u = gates.checklist_round(checklist_state(items))
+    return (len(u["choice_queue"]) == 1 and u["choice_queue"][0]["batch"] and u["choice_queue"][0]["items"] == items
+            and gates._terminal_prompt(u["escalation"]) == "ask_choice_3"), (len(u["choice_queue"]), u["escalation"]["options"])
+
+
+guarded("checklist_round: CHECKLIST_ASK_EACH_MAX + 1 items -> the one batch question", _checklist_bound_plus_one)
+
+
+def _checklist_past_forty():
+    items = CL_LONG + [f"[surface-c] practice {i}" for i in range(1, 6)]
+    s, asks, fault = checklist_replay(items)
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (not fault and len(items) == 45 and s["_next"] == "amend_plan" and all(f"- {it}" in amendment for it in items)
+            and "- [surface-c] practice 5" in amendment), (fault, asks, s["_next"], amendment[-200:])
+
+
+guarded("checklist replay: 45 items answered headless -> all 45 accepted, none cut from the tail", _checklist_past_forty)
+
+
+def _long_checklist_park():
+    s = checklist_state(CL_LONG)
+    s.update(gates.checklist_round(s))
+    s.update(gates.choice_park({**s, "last_answer_text": "which of these matter for the first release?"}))
+    s.update(gates.choice_resume(s))
+    s.update(gates.checklist_round(s))
+    return (s["_next"] == "escalate_gate" and s["choice_queue"][0]["batch"] and s["escalation"]["data"]["index"] == 0
+            and len(s["escalation"]["options"]) == 3), (s["_next"], s.get("escalation"))
+
+
+guarded("checklist batch: parked and resumed without an answer -> the batch question asked again", _long_checklist_park)
+
+
+def _short_checklist_each():
+    items = CL_LONG[:_lib.CHECKLIST_ASK_EACH_MAX]
+    s, asks, fault = checklist_replay(items)
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (not fault and asks == {"ask_choice_2": len(items)} and s["_next"] == "amend_plan"
+            and all(f"- {it}" in amendment for it in items)), (fault, asks, s["_next"])
+
+
+guarded("checklist replay: CHECKLIST_ASK_EACH_MAX items -> one two-option question per item, as before", _short_checklist_each)
 check("graph: end_discussion is an end node whose output is the script-composed discussion message",
       NODES.get("end_discussion", {}).get("type") == "end" and NODES.get("end_discussion", {}).get("output", "").strip() == "{{discussion_message}}",
       NODES.get("end_discussion"))

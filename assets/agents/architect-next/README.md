@@ -123,10 +123,10 @@ environment assignment, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/_lib.py:774:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
+scripts/_lib.py:777:    r"...",   (the EXECUTABLE_RE command-word alternation, elided here)
 scripts/gates.py:51:    r"yarn\.lock$|pnpm-lock\.yaml$|Cargo\.(toml|lock)$|requirements.*\.txt$|poetry\.lock$",
-scripts/gates.py:4376:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
-scripts/gates.py:4385:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
+scripts/gates.py:4423:        "file:line, at most 25 per run so iterate); identifiers that only make sense with the plan open; ...
+scripts/gates.py:4432:        "failing test to make it pass; you still do NOT edit the plan or task files -- report instead.\n\n"
 scripts/mode_matrix.py:176:`make run`
 scripts/mode_matrix.py:273:            ... "local_run_recipe": "`make run`",
 scripts/smoke_test.py:114:CODE_BASE = make_repo(CODE, {..., "CLAUDE.md": "Run `go test ./...` before committing.\n", ...
@@ -136,10 +136,10 @@ scripts/smoke_test.py:1908:   ... "acceptance_criteria": ["`...`"], ...   (a com
 scripts/smoke_test.py:2594:u = AA("probe_gap", "Supply the recipe: make run", ...)
 ```
 
-None of these runs a toolchain: `_lib.py:774` is the alternation of the executable-criterion
+None of these runs a toolchain: `_lib.py:777` is the alternation of the executable-criterion
 classifier (`EXECUTABLE_RE` recognises a command-shaped acceptance criterion; it hardcodes no
 command), `gates.py:51` is the dependency-manifest regex (the hits are `yarn`/`pnpm` inside
-lockfile names), `gates.py:4376` and `:4385` are an English verb in prompt prose, and
+lockfile names), `gates.py:4423` and `:4432` are an English verb in prompt prose, and
 the `mode_matrix.py` and `smoke_test.py` lines are battery fixtures. The wrapper test
 `no_gate_names_a_toolchain_command` keeps it that way with a `make`-less variant of the
 pattern: it matches `\b(cargo|rustc|npm|pnpm|yarn|pytest|mvn|gradle|just)\b|\bgo (test|build|run)\b`
@@ -416,7 +416,11 @@ decides whether it answers the question (recorded as given) or opens a discussio
 counts as a discussion). A typed answer to a checklist item is never taken as an accept: it
 reaches `amend_plan` as its own `Owner ruling on <item>: <answer>; apply only if it accepts
 the item` line, apart from the accepted items, so the round goes to `amend_plan` unless every
-item was dropped. A discussion parks the run: `choice_park` keeps the queue and the
+item was dropped. A round of more than `CHECKLIST_ASK_EACH_MAX` items is asked as one
+question listing every item, with `Accept all <n> items` recommended, `Review each item`
+(the per-item questions) and `Drop all <n> items`; a typed answer to it is one owner ruling
+over the whole list, and an empty reply takes the recommended accept-all, with a ledger line.
+A discussion parks the run: `choice_park` keeps the queue and the
 answers so far, snapshots state.json, sets the exposed `discussion` state key (the question,
 its options with the recommended one marked, the reply, the answers so far and the plan path)
 for the engineer chat lane, carries `discussion_run_id` into the next run, and ends at
