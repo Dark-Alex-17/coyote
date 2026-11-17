@@ -10501,6 +10501,64 @@ mod tests {
 
     #[test]
     #[serial]
+    fn repl_skill_load_inside_an_agent_withholds_an_undeclared_mcp_server_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_mcp_ctx(Some(&[]));
+        let agent_name = agent_name.unwrap();
+
+        run_async(ctx.load_skill_repl("grants-mcp", utils::create_abort_signal())).unwrap();
+
+        let warning = format!(
+            "Skill 'grants-mcp' grants MCP server 'skillsrv', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add skillsrv to {agent_name}'s mcp_servers in the agent definition."
+        );
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        assert!(ctx.skill_mcp_servers().is_empty());
+    }
+
+    /// A server the user enabled on the agent's session stays usable; the
+    /// session does not open any other server a skill grants.
+    #[test]
+    #[serial]
+    fn mcp_server_refusal_honours_only_the_servers_the_session_enables() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, agent_name) = skill_mcp_ctx(Some(&[]));
+        let agent_name = agent_name.unwrap();
+        let mut session = Session::default();
+        session.set_enabled_mcp_servers(Some(vec!["skillsrv".to_string()]));
+        ctx.session = Some(session);
+
+        assert_eq!(ctx.mcp_server_refusal("skillsrv"), None);
+        assert_eq!(
+            ctx.mcp_server_refusal("othersrv"),
+            Some(format!(
+                "MCP server 'othersrv' is not enabled for agent '{agent_name}'. To use it, add othersrv to {agent_name}'s mcp_servers in the agent definition."
+            ))
+        );
+    }
+
+    #[test]
+    fn mcp_meta_server_reads_the_server_from_every_meta_prefix() {
+        for prefix in [
+            "mcp_invoke",
+            "mcp_search",
+            "mcp_describe",
+            "mcp_read",
+            "mcp_prompt",
+        ] {
+            assert_eq!(
+                crate::function::mcp_meta_server(&format!("{prefix}_skillsrv")),
+                Some("skillsrv"),
+                "{prefix}"
+            );
+        }
+        assert_eq!(crate::function::mcp_meta_server("fs_read"), None);
+        assert_eq!(crate::function::mcp_meta_server("mcp_invokeskillsrv"), None);
+    }
+
+    #[test]
+    #[serial]
     fn compression_notices_in_the_repl_go_to_stderr_not_the_warn_log() {
         install_log_collector();
         let warns_before = warn_snapshot().len();

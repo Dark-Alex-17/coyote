@@ -552,6 +552,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("Malformed MCP invoke function name: {tool}"))?
             .to_string();
         if let Some(refusal) = ctx.mcp_server_refusal(&server) {
+            warn!("{refusal}");
             return Ok(json!({
                 "status": "error",
                 "message": refusal,
@@ -2227,6 +2228,32 @@ mod tests {
             );
             assert_eq!(call_tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
+    }
+
+    #[test]
+    fn handle_start_refuses_an_mcp_server_the_agent_does_not_declare() {
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: "job-mcp-agent".into(),
+            mcp_servers: vec!["github".into()],
+            ..Default::default()
+        }));
+        ctx.declared_function_names
+            .insert("mcp_invoke_skillsrv".into());
+
+        let result = run_async(handle_start(
+            &mut ctx,
+            &json!({"tool": "mcp_invoke_skillsrv", "arguments": {"tool": "search"}}),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "status": "error",
+                "message": "MCP server 'skillsrv' is not enabled for agent 'job-mcp-agent'. To use it, add skillsrv to job-mcp-agent's mcp_servers in the agent definition.",
+            })
+        );
     }
 
     #[test]

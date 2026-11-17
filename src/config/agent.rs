@@ -2786,4 +2786,82 @@ nodes: {}
         );
         assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
     }
+
+    /// Skills never widen an agent's `global_tools`, so every read-only tool
+    /// a skill an agent is told to load grants must be declared by that
+    /// agent. Write and exec grants stay withheld on purpose.
+    #[test]
+    fn bundled_agents_declare_the_read_only_tools_of_the_skills_they_are_told_to_load() {
+        const READ_ONLY: [&str; 6] = [
+            "fs_read", "fs_cat", "fs_grep", "fs_glob", "fs_ls", "ast_grep",
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let global_tools = |agent: &str| -> Vec<String> {
+            let dir = root.join("agents").join(agent);
+            let file = ["config.yaml", "graph.yaml"]
+                .into_iter()
+                .map(|name| dir.join(name))
+                .find(|path| path.exists())
+                .unwrap_or_else(|| panic!("{agent} has no definition"));
+            let yaml: serde_yaml::Value =
+                serde_yaml::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            yaml["global_tools"]
+                .as_sequence()
+                .unwrap_or_else(|| panic!("{} declares no global_tools", file.display()))
+                .iter()
+                .map(|entry| entry.as_str().unwrap().to_string())
+                .collect()
+        };
+        let instructed = [
+            (
+                "coder",
+                &["code-review", "frontend-ui-ux", "git-master"][..],
+            ),
+            (
+                "architect",
+                &["task-tracking", "design-session", "plan-authoring"],
+            ),
+            ("oracle", &["plan-authoring"]),
+            ("step-runner", &["handoff-protocol"]),
+            (
+                "sisyphus",
+                &[
+                    "code-review",
+                    "plan-authoring",
+                    "handoff-protocol",
+                    "observability-review",
+                    "frontend-ui-ux",
+                    "git-master",
+                ],
+            ),
+        ];
+        for (agent, skills) in instructed {
+            let declared = global_tools(agent);
+            for entry in &declared {
+                assert!(
+                    root.join("functions/tools").join(entry).exists(),
+                    "{agent}'s global_tools entry {entry} is not a shipped tool"
+                );
+            }
+            for skill in skills {
+                let content =
+                    fs::read_to_string(root.join("skills").join(skill).join("SKILL.md")).unwrap();
+                let granted = super::super::Skill::new(skill, &content)
+                    .enabled_tools()
+                    .unwrap_or_default()
+                    .to_vec();
+                for tool in granted
+                    .iter()
+                    .filter(|tool| READ_ONLY.contains(&tool.as_str()))
+                {
+                    assert!(
+                        declared
+                            .iter()
+                            .any(|entry| entry.split('.').next() == Some(tool)),
+                        "{agent} is told to load {skill}, which needs read-only {tool}, but {tool} is not in its global_tools"
+                    );
+                }
+            }
+        }
+    }
 }
