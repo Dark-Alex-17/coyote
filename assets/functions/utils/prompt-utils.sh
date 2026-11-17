@@ -58,20 +58,27 @@
 # - cyan              Output given text in cyan
 # - white             Output given text in white
 
+# Without a usable TERM (unset in CI, `dumb` under the full-screen UI) tput
+# fails or complains on stderr; the colours stay empty instead.
+_coyote_tput() {
+  [ -n "${TERM:-}" ] || return 0
+  tput "$@" 2>/dev/null || true
+}
+
 # shellcheck disable=SC2034
-red=$(tput setaf 1)
-green=$(tput setaf 2)
-gold=$(tput setaf 3)
-blue=$(tput setaf 4)
-magenta=$(tput setaf 5)
-cyan=$(tput setaf 6)
-white=$(tput setaf 7)
+red=$(_coyote_tput setaf 1)
+green=$(_coyote_tput setaf 2)
+gold=$(_coyote_tput setaf 3)
+blue=$(_coyote_tput setaf 4)
+magenta=$(_coyote_tput setaf 5)
+cyan=$(_coyote_tput setaf 6)
+white=$(_coyote_tput setaf 7)
 
-default=$(tput sgr0)
-gray=$(tput setaf 243)
+default=$(_coyote_tput sgr0)
+gray=$(_coyote_tput setaf 243)
 
-bold=$(tput bold)
-underlined=$(tput smul)
+bold=$(_coyote_tput bold)
+underlined=$(_coyote_tput smul)
 
 error() {
   echo -e "${red}${bold}ERROR:${default}${red} $1${default}"

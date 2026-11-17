@@ -3329,6 +3329,7 @@ mod tests {
     #[test]
     #[serial]
     fn merge_conflict_under_the_tui_asks_through_the_prompter() {
+        let _guard = TestVaultConfigGuard::new("merge-tui");
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let dir = fresh_temp_dir("merge-tui-");
         let remote = dir.join("remote.json");
@@ -3509,6 +3510,7 @@ mod tests {
     #[test]
     #[serial]
     fn merge_conflict_under_the_tui_rename_answer_keeps_both_servers() {
+        let _guard = TestVaultConfigGuard::new("merge-tui-rename");
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
         let dir = fresh_temp_dir("merge-tui-rename-");
         let remote = dir.join("remote.json");
