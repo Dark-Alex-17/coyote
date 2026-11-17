@@ -3612,6 +3612,38 @@ guarded("checklist batch: an empty answer -> the recommended accept-all with its
         _long_checklist_empty)
 
 
+def _long_checklist_empty_reply():
+    s = checklist_batch_answer("")
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (s["_next"] == "amend_plan" and all(f"- {it}" in amendment for it in CL_LONG)
+            and "checklist: 40/40 items accepted, 0 owner ruling(s)" in s["decisions"]), (s["_next"], s["decisions"][-3:])
+
+
+guarded("checklist batch: an empty reply through apply_answer -> every item accepted, never drop all",
+        _long_checklist_empty_reply)
+
+
+def _checklist_bound_plus_one():
+    items = CL_LONG[:_lib.CHECKLIST_ASK_EACH_MAX + 1]
+    u = gates.checklist_round(checklist_state(items))
+    return (len(u["choice_queue"]) == 1 and u["choice_queue"][0]["batch"] and u["choice_queue"][0]["items"] == items
+            and gates._terminal_prompt(u["escalation"]) == "ask_choice_3"), (len(u["choice_queue"]), u["escalation"]["options"])
+
+
+guarded("checklist_round: CHECKLIST_ASK_EACH_MAX + 1 items -> the one batch question", _checklist_bound_plus_one)
+
+
+def _checklist_past_forty():
+    items = CL_LONG + [f"[surface-c] practice {i}" for i in range(1, 6)]
+    s, asks, fault = checklist_replay(items)
+    amendment = (s.get("pending_amendments") or [""])[0]
+    return (not fault and len(items) == 45 and s["_next"] == "amend_plan" and all(f"- {it}" in amendment for it in items)
+            and "- [surface-c] practice 5" in amendment), (fault, asks, s["_next"], amendment[-200:])
+
+
+guarded("checklist replay: 45 items answered headless -> all 45 accepted, none cut from the tail", _checklist_past_forty)
+
+
 def _long_checklist_park():
     s = checklist_state(CL_LONG)
     s.update(gates.checklist_round(s))

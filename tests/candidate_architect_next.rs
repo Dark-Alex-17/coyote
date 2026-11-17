@@ -3018,6 +3018,38 @@ fn shipped_candidate_is_pure_ascii_and_the_marker_map_keeps_its_escapes() {
     );
 }
 
+/// The smoke battery's checklist replay fails a walk on the same per-node
+/// headless answer count the engine enforces, so the replay keeps modelling
+/// the engine when that budget changes.
+#[test]
+fn checklist_replay_budget_matches_the_engine_headless_answer_budget() {
+    let engine = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/graph/user_interaction.rs"),
+    )
+    .unwrap();
+    let smoke = fs::read_to_string(candidate_dir().join("scripts/smoke_test.py")).unwrap();
+    let value = |text: &str, pattern: &str| -> Option<String> {
+        fancy_regex::Regex::new(pattern)
+            .unwrap()
+            .captures(text)
+            .unwrap()
+            .map(|c| c[1].to_string())
+    };
+    let engine_budget = value(
+        &engine,
+        r"(?m)^const MAX_HEADLESS_ANSWERS_PER_NODE: usize = (\d+);",
+    );
+    let smoke_budget = value(&smoke, r"(?m)^HEADLESS_ANSWERS_PER_NODE = (\d+)$");
+    assert!(
+        engine_budget.is_some(),
+        "the engine budget constant is gone"
+    );
+    assert_eq!(
+        engine_budget, smoke_budget,
+        "smoke_test.py HEADLESS_ANSWERS_PER_NODE must equal the engine's MAX_HEADLESS_ANSWERS_PER_NODE"
+    );
+}
+
 /// The README's toolchain census block is the live output of the grep it
 /// shows: the same file:line set, no more and no fewer, and the `gates.py`
 /// hits are exactly the lockfile regex plus the two prose lines it cites.

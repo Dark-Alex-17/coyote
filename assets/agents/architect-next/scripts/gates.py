@@ -769,9 +769,9 @@ def _checklist_each(items):
 def _checklist_batch_answer(state, u, batch):
     """Settle the one question over a long checklist: accept all, drop all, review each, or a typed ruling."""
     items = as_list(batch.get("items"))
-    accept_all, review_each, drop_all = (o["text"] for o in batch["options"])
+    accept_all, drop_all = f"Accept all {len(items)} items", f"Drop all {len(items)} items"
     answer = str(as_dict((as_list(state.get("choice_answers")) or [{}])[0]).get("answer") or "").strip()
-    if answer == review_each:
+    if answer == CHECKLIST_REVIEW_EACH:
         ledger(state, u, f"checklist: reviewing each of the {len(items)} items")
         _start_choices(u, "checklist_accept", _checklist_each(items))
         return _ask_choice(state, u, "Best-practice checklist item")

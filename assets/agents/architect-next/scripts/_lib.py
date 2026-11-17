@@ -37,8 +37,8 @@ AMEND_REWORK_MAX = STRIKE_LIMIT           # owner revisions, re-scopes, plan def
 AMEND_CYCLES_MAX = AMEND_DESIGN_MAX + AMEND_GATE1_MAX + AMEND_GATE2_MAX + AMEND_REWORK_MAX
 CHOICE_OPTIONS_MIN = 2    # a multiple-choice question offers 2-4 options, one recommended
 CHOICE_OPTIONS_MAX = 4
-# checklist items asked one by one; more go out as one batch question, so a headless run never nears the engine's
-# 25 answers per approval node
+# checklist items asked one by one; more go out as one batch question, so a long checklist round alone cannot use up
+# the engine's 25 headless answers per approval node
 CHECKLIST_ASK_EACH_MAX = 8
 DISCUSSION_PARKS_MAX = 3  # times one multiple-choice question may park the run for a discussion
 DRAFT_ROUNDS_MAX = STRIKE_LIMIT  # redrafts of an LLM-drafted brief before asking for a design doc
