@@ -95,7 +95,7 @@ Non-blocking findings:
 1. 🟡|🟢 <class> — <file:line> — <one-line description> — <fix>
 ```
 
-The fences above only mark the templates. Callers read the lines after the sentinel as plain text, so emit them outside any code fence. Put each header (`Blocking findings:`, `Non-blocking findings:`) on its own line exactly as written, never bold or reworded. Number every finding under its header, and list every finding that the Posture line counts. A PASS with no findings ends at the Posture line. Explanatory prose goes above the sentinel. A finding that appears only in that prose is not reported.
+The fences above only mark the templates. Callers read the lines after the sentinel as plain text, so emit them outside any code fence. Put each header (`Blocking findings:`, `Non-blocking findings:`) on its own line exactly as written, never bold or reworded. Number every finding under its header, and list every finding that the Posture line counts. A PASS with no findings ends at the Posture line. An optional `Pre-existing, out of scope:` header always comes last, on its own plain line, with numbered items that the Posture line does not count. Explanatory prose goes above the sentinel. A finding that appears only in that prose is not reported.
 
 Every finding MUST cite file:line and name the concrete attack path or hazard. "This might be insecure" is noise; `🟠 Path traversal — export.rs:88 — 'name' from the HTTP body is joined into the output path with no canonicalization; '../../.ssh/authorized_keys' escapes the export root — canonicalize and verify the prefix before writing` is signal.
 

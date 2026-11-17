@@ -53,7 +53,7 @@ The agent ends every review with one sentinel:
 SECURITY_REVIEW: PASS
 Posture: standard. Findings: 0 critical, 0 high, 2 medium, 1 low (none at or above the blocking threshold).
 Non-blocking findings:
-1. <each counted finding, numbered, in the FAIL list's shape>
+1. <each non-blocking finding, in the same shape as the FAIL list's non-blocking items>
 ```
 
 ```
