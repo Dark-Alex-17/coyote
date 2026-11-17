@@ -3274,7 +3274,8 @@ for kind, ans in (("yellow_findings", "Accept it (recorded)"), ("review_incomple
 
 # a red test gate mid-run: failures a later subtask owns, outside this subtask's changes, are carried, not struck
 CARRY = os.path.join(TMP, "carry-repo")
-CARRY_FILES = ("alpha/alpha.src", "beta/beta.src", "beta/beta_check.src", "gamma/gamma_check.src", "schema/001_base.schema")
+CARRY_FILES = ("alpha/alpha.src", "beta/beta.src", "beta/beta_check.src", "gamma/gamma_check.src", "schema/001_base.schema",
+               "tests/delta_check.src")
 for _p in CARRY_FILES:
     os.makedirs(os.path.join(CARRY, os.path.dirname(_p)), exist_ok=True)
     open(os.path.join(CARRY, _p), "w").write(f"{_p}\n")
@@ -3328,6 +3329,12 @@ check("carried failures: failures outside subtask 1's changes that subtask 2 dec
       _cs["_next"] == "debt_scan" and _cs.get("fix_strikes") == 0 and {"beta/", "gamma/"} <= _cpaths
       and all(f.get("owner") == 2 and f.get("since") == 1 for f in _cf)
       and any("pending, owned by subtask 2" in d for d in _cs["decisions"]), (_cs.get("_next"), _cf, _cs["decisions"][-4:]))
+check("carried failures: the carry reads as carried forward, and the runner's unlocated error line is counted in the "
+      "evidence and the ledger, not blocked",
+      _cs.get("coder_sentinel") == "CODER_FAILED (red gate carried forward)"
+      and all("(+1 unlocated failure line(s), held to the final gate)" in f.get("evidence", "") for f in _cf)
+      and any("pending, owned by subtask 2" in d and "+1 unlocated" in d for d in _cs["decisions"]),
+      (_cs.get("coder_sentinel"), _cf))
 sub_step(_cs, "next_subtask")
 check("carried failures: the next subtask's task text carries them, marked as owned by it",
       "Carried-forward test failures (pending from earlier subtasks):" in (_cs.get("current_task") or "")
@@ -3389,6 +3396,92 @@ check("carried failures: the final review does not start over them; it routes a 
       _fin.get("final_review") is True and _fin["_next"] == "compose_fix" and _fin.get("fix_source") == "review"
       and any("beta/" in i for i in _fin.get("fix_items", [])) and _fin_done["_next"] == "compose_fix"
       and _fin_done["fix_strikes"] == 1, (_fin.get("_next"), _fin.get("fix_items"), _fin_done.get("_next")))
+_mixed = [_owed[0], {"paths": ["gamma/"], "owner": 3, "since": 1, "evidence": "FAIL\texample.test/svc/gamma"}]
+
+
+def carry_complete(verdict, **over):
+    st = dict(dict(project_dir=CARRY, git_root=CARRY, subtasks=CARRY_SUBS, subtask_index=2, fix_strikes=0), **over)
+    return gates.route_coder_result(base_state(coder_result=done.replace("Tests: passed", f"Tests: {verdict}"), **st))
+
+
+_red_base = "red, matches the pre-run baseline (exit 2); accepted pre-existing failures: "
+_mx = carry_complete(_red_base + "example.test/svc/gamma", carried_failures=_mixed)
+_mxb = carry_complete(_red_base + "example.test/svc/beta, example.test/svc/gamma", carried_failures=_mixed)
+_mxn = carry_complete(_red_base + "check_two", carried_failures=_mixed)
+_mxt = carry_complete("red, 2 tests failed", carried_failures=_mixed)
+check("carried failures: mixed owners at subtask 2 with a verdict naming only the later-owned failure carry it on and "
+      "clear the owned one; naming the owned one, or naming nothing in the repo, strikes over the owed one only",
+      _mx["_next"] == "debt_scan" and _mx.get("carried_failures") == [_mixed[1]]
+      and any("beta/ cleared" in d for d in _mx["decisions"])
+      and _mxb["_next"] == "compose_fix" and _mxb["fix_strikes"] == 1 and "beta/" in _mxb.get("last_coder_error", "")
+      and "gamma/" not in _mxb.get("last_coder_error", "") and _mxn["_next"] == "compose_fix",
+      (_mx.get("_next"), _mx.get("carried_failures"), _mxb.get("last_coder_error"), _mxn.get("_next")))
+check("carried failures: a verdict whose prose word matches a top-level directory names nothing and strikes",
+      _mxt["_next"] == "compose_fix" and _mxt["fix_strikes"] == 1 and "beta/" in _mxt.get("last_coder_error", "")
+      and not any("cleared" in d for d in _mxt["decisions"]), (_mxt.get("_next"), _mxt["decisions"][-3:]))
+_fg = carry_complete(_red_base + "check_one", subtask_index=3)
+_fr = carry_complete(_red_base + "check_one", subtask_index=3, final_review=True)
+check("final gate: nothing carried, a baseline-match verdict on a green run base strikes in the last subtask and the "
+      "final review",
+      _fg["_next"] == "compose_fix" and _fg["fix_strikes"] == 1 and _fg.get("fix_source") == "coder_failed"
+      and "must be fully green" in _fg.get("last_coder_error", "") and _fr["_next"] == "compose_fix",
+      (_fg.get("_next"), _fg.get("last_coder_error"), _fr.get("_next")))
+_rb1 = carry_complete(_red_base + "check_one", subtask_index=1, fix_round=0)
+_rb_late = carry_complete(_red_base + "check_one", subtask_index=1, fix_round=1)
+_rbf = carry_complete(_red_base + "check_one", subtask_index=3, run_base_red=_rb1.get("run_base_red"))
+check("final gate: subtask 1's first result on a red pre-run baseline marks the run base red, and the final gate then "
+      "accepts the baseline match with a ledger line",
+      _rb1.get("run_base_red") is True and "run_base_red" not in _rb_late and _rbf["_next"] == "debt_scan"
+      and _rbf.get("fix_strikes") == 0 and any("already red at the run base" in d for d in _rbf["decisions"]),
+      (_rb1.get("run_base_red"), _rbf.get("_next"), _rbf["decisions"][-3:]))
+_cs = carry_start()
+_cs["coder_result"] = carry_red(CARRY_OUT + "\n\n[... 9000 bytes trimmed: output exceeded 64000 bytes; showing the "
+                                            "first 32000 and last 32000 ...]\n\nFAIL\texample.test/svc/delta\t0.1s")
+sub_step(_cs, "route_coder_result")
+check("carried failures: a trimmed tests output is unclassified and blocks, with a ledger line",
+      _cs["_next"] == "compose_fix" and not _cs.get("carried_failures")
+      and any("not classified" in d and "trimmed" in d for d in _cs["decisions"]), _cs["decisions"][-3:])
+_DELTA_OUT = "runner all\n--- FAIL: check_four (0.10s)\n    delta_check.src:7: wrong\nFAIL\texample.test/svc/tests\t0.1s\nFAIL"
+_cs = carry_start(subs=[CARRY_SUBS[0], dict(CARRY_SUBS[1], acceptance_criteria=["all tests pass"]), CARRY_SUBS[2]])
+_cs["coder_result"] = carry_red(_DELTA_OUT)
+sub_step(_cs, "route_coder_result")
+_cd = carry_start(subs=[CARRY_SUBS[0], dict(CARRY_SUBS[1], acceptance_criteria=["everything under tests/ passes"]),
+                        CARRY_SUBS[2]])
+_cd["coder_result"] = carry_red(_DELTA_OUT)
+sub_step(_cd, "route_coder_result")
+check("carried failures: prose naming a directory word declares nothing and blocks; the directory in path form declares it",
+      _cs["_next"] == "compose_fix" and "no later subtask declares it" in _cs.get("last_coder_error", "")
+      and _cd["_next"] == "debt_scan", (_cs.get("last_coder_error"), _cd.get("_next")))
+
+
+def carry_variant(old, new):
+    st = carry_start()
+    assert old in st["coder_result"], old
+    st["coder_result"] = st["coder_result"].replace(old, new, 1)
+    return sub_step(st, "route_coder_result")
+
+
+_fb_ctl = sub_step(carry_start(), "route_coder_result")
+_fb = {"build red": carry_variant("\n\nLast tests output:", "\nExit code: 2\n\nLast tests output:"),
+       "script error": carry_variant("Last script error:\n\n", "Last script error:\nverify_tests crashed\n"),
+       "timed out": carry_variant("Exit code: 2\n\nrunner all", "Exit code: 2\nTIMED OUT after 5 s\n\nrunner all"),
+       "no exit code": carry_variant("Exit code: 2\n\nrunner all", "\nrunner all")}
+check("carried failures: a red build, a script error, a timeout or a missing exit code is never carried",
+      _fb_ctl["_next"] == "debt_scan" and all(v["_next"] != "debt_scan" and not v.get("carried_failures") for v in _fb.values())
+      and _fb["script error"]["_next"] == "escalate_gate" and _fb["script error"]["escalation"]["kind"] == "engine_fault",
+      {k: v.get("_next") for k, v in _fb.items()})
+_late3 = [CARRY_SUBS[0], dict(CARRY_SUBS[1], acceptance_criteria=["the writers set the column"]),
+          dict(CARRY_SUBS[2], acceptance_criteria=["`runner all` passes"])]
+_cs = sub_step(carry_start(subs=_late3), "route_coder_result")
+sub_step(_cs, "next_subtask")
+open(os.path.join(CARRY, "alpha/alpha.src"), "w").write("changed\n")
+_cs["coder_result"] = carry_red("runner all\n--- FAIL: check_two (0.02s)\n    gamma_check.src:12: constraint failed: unique\n"
+                                "FAIL\texample.test/svc/gamma\t0.586s\nFAIL")
+sub_step(_cs, "route_coder_result")
+_cpaths = {p for f in _cs.get("carried_failures") or [] for p in f.get("paths", [])}
+check("carried failures: a carried failure the next red gate no longer reports is ledgered as cleared",
+      _cs["_next"] == "debt_scan" and "gamma/" in _cpaths and not any(p.startswith("beta/") for p in _cpaths)
+      and any("beta/ cleared" in d for d in _cs["decisions"]), (_cs.get("_next"), _cpaths, _cs["decisions"][-4:]))
 carry_git("reset", "-q", "--hard")
 carry_git("clean", "-qfd")
 
