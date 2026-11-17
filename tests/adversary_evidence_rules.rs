@@ -350,6 +350,288 @@ fn red_runs_are_compared_with_a_baseline_on_the_diff_base() {
     assert!(!text.contains("Verification run `sh old.sh`"), "{text}");
 }
 
+/// The saved diff-base run records under the repository's git dir.
+#[cfg(unix)]
+fn saved_base_runs(repo: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(repo.join(".git/coyote-baselines")) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<PathBuf> = entries
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("adversary-"))
+        })
+        .collect();
+    runs.sort();
+    runs
+}
+
+#[cfg(unix)]
+fn line_count(path: &Path) -> usize {
+    fs::read_to_string(path).map_or(0, |s| s.lines().count())
+}
+
+/// A completed diff-base run is saved with its full output and a later run
+/// classifies against it without running the command on the base again; a
+/// planted record is what the comparison reads, an unreadable one is a miss
+/// that is never replaced, and a base run killed by a signal is never saved.
+#[cfg(unix)]
+#[test]
+fn the_diff_base_run_is_saved_and_reused_by_later_runs() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("saved-base");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let counted = dir.0.join("counted-runs.txt");
+    let killed = dir.0.join("killed-runs.txt");
+    fs::write(
+        repo.join("counted.sh"),
+        format!(
+            "echo run >> '{}'\necho 'FAILED tests/t.py::one'\nexit 1\n",
+            counted.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        repo.join("killed.sh"),
+        format!("echo run >> '{}'\nkill -KILL $$\n", killed.display()),
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let head_script = "echo 'FAILED tests/t.py::one'\nexit 1\n";
+    fs::write(repo.join("counted.sh"), head_script).unwrap();
+    fs::write(repo.join("killed.sh"), head_script).unwrap();
+    git(&repo, &["commit", "-q", "-am", "head"]);
+
+    let state = json!({
+        "project_dir": repo.to_string_lossy(),
+        "verification_commands": ["sh counted.sh", "sh killed.sh"],
+        "diff_base": base,
+    });
+    let first = script(&dir.0, "run_checks.py", "saved-1", &state, &[]);
+    assert_eq!(
+        first["exec_results"][0]["baseline"]["status"], "pre-existing",
+        "{first}"
+    );
+    assert_eq!(
+        (line_count(&counted), line_count(&killed)),
+        (1, 1),
+        "{first}"
+    );
+    let runs = saved_base_runs(&repo);
+    assert_eq!(
+        runs.len(),
+        1,
+        "only the completed base run is saved: {runs:?}"
+    );
+    let saved: Value = serde_json::from_str(&fs::read_to_string(&runs[0]).unwrap()).unwrap();
+    assert_eq!(saved["exit"], 1, "{saved}");
+    assert_eq!(saved["output"], "FAILED tests/t.py::one\n", "{saved}");
+
+    let second = script(&dir.0, "run_checks.py", "saved-2", &state, &[]);
+    assert_eq!(line_count(&counted), 1, "the saved base run was run again");
+    assert_eq!(line_count(&killed), 2, "a killed base run must run again");
+    assert_eq!(
+        second["exec_results"][0]["baseline"], first["exec_results"][0]["baseline"],
+        "{second}"
+    );
+    assert_eq!(
+        second["exec_results"][1]["baseline"], first["exec_results"][1]["baseline"],
+        "{second}"
+    );
+    assert_eq!(git(&repo, &["worktree", "list"]).lines().count(), 1);
+
+    let only_counted = json!({
+        "project_dir": repo.to_string_lossy(),
+        "verification_commands": ["sh counted.sh"],
+        "diff_base": base,
+    });
+    let mut planted = saved.clone();
+    planted["output"] = json!("FAILED tests/t.py::other\n");
+    fs::write(&runs[0], planted.to_string()).unwrap();
+    let out = script(&dir.0, "run_checks.py", "saved-planted", &only_counted, &[]);
+    assert_eq!(line_count(&counted), 1, "{out}");
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["status"], "regression",
+        "{out}"
+    );
+    assert!(
+        out["exec_results"][0]["baseline"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("new failing tests: tests/t.py::one"),
+        "{out}"
+    );
+
+    fs::write(&runs[0], "not json").unwrap();
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "saved-unreadable",
+        &only_counted,
+        &[],
+    );
+    assert_eq!(
+        line_count(&counted),
+        2,
+        "an unreadable record is a miss: {out}"
+    );
+    assert_eq!(
+        out["exec_results"][0]["baseline"], first["exec_results"][0]["baseline"],
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(&runs[0]).unwrap(), "not json");
+}
+
+/// A repository whose `check.sh` fails at HEAD and runs `base_script` at the
+/// diff base; returns the repo and the diff-base commit.
+#[cfg(unix)]
+fn repo_with_base_script(dir: &Path, base_script: &str) -> (PathBuf, String) {
+    let repo = dir.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("check.sh"), base_script).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("check.sh"),
+        "echo 'FAILED tests/t.py::one'\nexit 1\n",
+    )
+    .unwrap();
+    git(&repo, &["commit", "-q", "-am", "head"]);
+    (repo, base)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_base_run_that_times_out_is_never_saved() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("saved-base-timeout");
+    let (repo, base) = repo_with_base_script(&dir.0, "exec sleep 30\n");
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "saved-timeout",
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": ["sh check.sh"],
+            "diff_base": base,
+        }),
+        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "3")],
+    );
+    assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"], "the command timed out on the diff base",
+        "{out}"
+    );
+    assert!(saved_base_runs(&repo).is_empty(), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_base_run_whose_output_shows_a_signal_kill_is_never_saved() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("saved-base-killed");
+    let (repo, base) = repo_with_base_script(
+        &dir.0,
+        "echo \"error: test failed, process didn't exit successfully: \\`t\\` (signal: 9, SIGKILL: kill)\"\nexit 1\n",
+    );
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "saved-killed",
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": ["sh check.sh"],
+            "diff_base": base,
+        }),
+        &[],
+    );
+    assert_eq!(out["exec_results"][0]["baseline"]["exit"], 1, "{out}");
+    assert!(saved_base_runs(&repo).is_empty(), "{out}");
+}
+
+/// A git shim first on PATH logs every git call: the first run misses the
+/// saved base runs and adds the diff-base worktree, the second hits for
+/// every command and adds none.
+#[cfg(unix)]
+#[test]
+fn an_all_hit_run_adds_no_diff_base_worktree() {
+    use std::os::unix::fs::PermissionsExt;
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("saved-base-shim");
+    let (repo, base) = repo_with_base_script(&dir.0, "echo 'FAILED tests/t.py::other'\nexit 1\n");
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let bin = dir.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = dir.0.join("git-calls.txt");
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real_git.trim()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let state = json!({
+        "project_dir": repo.to_string_lossy(),
+        "verification_commands": ["sh check.sh"],
+        "diff_base": base,
+    });
+    let worktree_adds = || {
+        fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("worktree add"))
+            .count()
+    };
+    let miss = script(
+        &dir.0,
+        "run_checks.py",
+        "shim-miss",
+        &state,
+        &[("PATH", &path)],
+    );
+    assert_eq!(worktree_adds(), 1, "{miss}");
+    let hit = script(
+        &dir.0,
+        "run_checks.py",
+        "shim-hit",
+        &state,
+        &[("PATH", &path)],
+    );
+    assert_eq!(worktree_adds(), 1, "an all-hit run added a worktree: {hit}");
+    assert_eq!(
+        hit["exec_results"][0]["baseline"], miss["exec_results"][0]["baseline"],
+        "{hit}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn baseline_classification_follows_the_failing_test_ids_and_skips_user_hooks() {
