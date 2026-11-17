@@ -152,7 +152,7 @@ const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
 /// suggests a TCP relay, and how often it looks again until it has.
 const LAN_PEERLESS_GRACE_SECS: u64 = 120;
 /// The idle line for a LAN that stayed silent through `LAN_PEERLESS_GRACE_SECS`.
-const LAN_SILENT_HINT: &str = "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find peers; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
+const LAN_SILENT_HINT: &str = "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -18602,7 +18602,7 @@ mod tests {
         fn the_hint_points_at_the_deployment_page_section() {
             assert_eq!(
                 LAN_SILENT_HINT,
-                "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find peers; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
+                "No other host has been heard on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent."
             );
         }
     }

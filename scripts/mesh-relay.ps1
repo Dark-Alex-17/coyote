@@ -237,7 +237,7 @@ function Test-PublicHost {
 
 # The existing config's stanzas: ServesSessions when an enabled TCPServerInterface listens
 # on $ListenPort, and PublicDials, the enabled TCPClientInterface stanzas that dial a public host.
-function Read-ConfigStanzas {
+function Read-ExistingConfig {
   param([string]$Path)
   $stanzas = New-Object System.Collections.Generic.List[hashtable]
   $current = @{ Type = ''; Enabled = $true; Port = ''; Target = '' }
@@ -268,7 +268,7 @@ function Read-ConfigStanzas {
 
 # An rnsd on this config would never open 127.0.0.1:$ListenPort or would not relay between
 # sessions, so the run stops before registering a task that could only time out.
-function Stop-UnlessConfigServesCoyote {
+function Assert-ConfigServesCoyote {
   param([bool]$ServesSessions, [bool]$Transport)
   $gap = ''
   if (-not $ServesSessions) { $gap = "has no [[Coyote Sessions]] stanza on 127.0.0.1:$ListenPort" }
@@ -367,7 +367,7 @@ function Get-OemEncoding {
 
 function Write-Config {
   if (Test-Path -LiteralPath $script:RnsConfig -PathType Leaf) {
-    $stanzas = Read-ConfigStanzas -Path $script:RnsConfig
+    $stanzas = Read-ExistingConfig -Path $script:RnsConfig
     $transport = Test-ConfigEnablesTransport -Path $script:RnsConfig
     if ($script:RelayHost -and $stanzas.ServesSessions -and $transport -and (Test-ConfigIsOwn -Path $script:RnsConfig)) {
       Add-TeamRelay
@@ -381,7 +381,7 @@ function Write-Config {
     if ($stanzas.PublicDials -gt 0) {
       Write-Info "Note: this config also dials $($stanzas.PublicDials) public Reticulum nodes; your announces reach them (see mesh.display_name_on_public)."
     }
-    Stop-UnlessConfigServesCoyote -ServesSessions $stanzas.ServesSessions -Transport $transport
+    Assert-ConfigServesCoyote -ServesSessions $stanzas.ServesSessions -Transport $transport
     if (Test-ConfigEnablesAutoInterface -Path $script:RnsConfig) { Write-FirewallWarning }
     if ($script:RelayHost) { $script:RelayForHandEdit = $true }
     return
