@@ -3329,17 +3329,22 @@ check("carried failures: failures outside subtask 1's changes that subtask 2 dec
       _cs["_next"] == "debt_scan" and _cs.get("fix_strikes") == 0 and {"beta/", "gamma/"} <= _cpaths
       and all(f.get("owner") == 2 and f.get("since") == 1 for f in _cf)
       and any("pending, owned by subtask 2" in d for d in _cs["decisions"]), (_cs.get("_next"), _cf, _cs["decisions"][-4:]))
-check("carried failures: the carry reads as carried forward, and the runner's unlocated error line is counted in the "
-      "evidence and the ledger, not blocked",
+check("carried failures: the carry reads as carried forward, and the runner's exit banner is no unlocated failure",
       _cs.get("coder_sentinel") == "CODER_FAILED (red gate carried forward)"
-      and all("(+1 unlocated failure line(s), held to the final gate)" in f.get("evidence", "") for f in _cf)
-      and any("pending, owned by subtask 2" in d and "+1 unlocated" in d for d in _cs["decisions"]),
+      and not any("unlocated" in d for d in _cs["decisions"]) and not any("unlocated" in f["evidence"] for f in _cf),
       (_cs.get("coder_sentinel"), _cf))
 sub_step(_cs, "next_subtask")
 check("carried failures: the next subtask's task text carries them, marked as owned by it",
       "Carried-forward test failures (pending from earlier subtasks):" in (_cs.get("current_task") or "")
       and "you own this: it must pass" in (_cs.get("current_task") or "")
       and ["beta/"] in (_cs.get("failure_baseline") or []), _cs.get("current_task"))
+_cp = carry_start()
+_cp["coder_result"] = carry_red(CARRY_OUT + "\npanic: runtime error: invalid memory address or nil pointer dereference")
+sub_step(_cp, "route_coder_result")
+check("carried failures: a failure line naming no repo path (a panic) blocks -> compose_fix, nothing carried",
+      _cp["_next"] == "compose_fix" and _cp.get("fix_strikes") == 1 and not _cp.get("carried_failures")
+      and "blocks: unlocated: 1 failure line(s)" in _cp.get("last_coder_error", ""),
+      (_cp.get("_next"), _cp.get("carried_failures"), _cp.get("last_coder_error")))
 _cs = sub_step(carry_start(edit="beta/beta.src"), "route_coder_result")
 check("carried failures: a failure in a directory this subtask touched blocks -> compose_fix",
       _cs["_next"] == "compose_fix" and _cs.get("fix_strikes") == 1 and not _cs.get("carried_failures")
@@ -3419,6 +3424,15 @@ check("carried failures: mixed owners at subtask 2 with a verdict naming only th
 check("carried failures: a verdict whose prose word matches a top-level directory names nothing and strikes",
       _mxt["_next"] == "compose_fix" and _mxt["fix_strikes"] == 1 and "beta/" in _mxt.get("last_coder_error", "")
       and not any("cleared" in d for d in _mxt["decisions"]), (_mxt.get("_next"), _mxt["decisions"][-3:]))
+_capped = ", ".join(["example.test/svc/gamma"] + [f"check_{i:02}" for i in range(2, 21)]) + ", (+3 more)"
+_cap = carry_complete(_red_base + _capped, carried_failures=_mixed)
+_capl = carry_complete(_red_base + "example.test/svc/gamma\nPre-existing failures: " + _capped, carried_failures=_mixed)
+check("carried failures: a verdict or pre-existing line capped at 20 ids cannot clear an owed failure past the cap; "
+      "it strikes",
+      all(c["_next"] == "compose_fix" and c["fix_strikes"] == 1 and "beta/" in c.get("last_coder_error", "")
+          and "capped" in c.get("last_coder_error", "") and not any("beta/ cleared" in d for d in c["decisions"])
+          for c in (_cap, _capl)),
+      (_cap.get("_next"), _cap.get("last_coder_error"), _capl.get("_next")))
 _fg = carry_complete(_red_base + "check_one", subtask_index=3)
 _fr = carry_complete(_red_base + "check_one", subtask_index=3, final_review=True)
 check("final gate: nothing carried, a baseline-match verdict on a green run base strikes in the last subtask and the "
@@ -3426,14 +3440,26 @@ check("final gate: nothing carried, a baseline-match verdict on a green run base
       _fg["_next"] == "compose_fix" and _fg["fix_strikes"] == 1 and _fg.get("fix_source") == "coder_failed"
       and "must be fully green" in _fg.get("last_coder_error", "") and _fr["_next"] == "compose_fix",
       (_fg.get("_next"), _fg.get("last_coder_error"), _fr.get("_next")))
-_rb1 = carry_complete(_red_base + "check_one", subtask_index=1, fix_round=0)
-_rb_late = carry_complete(_red_base + "check_one", subtask_index=1, fix_round=1)
-_rbf = carry_complete(_red_base + "check_one", subtask_index=3, run_base_red=_rb1.get("run_base_red"))
+_rb1 = carry_complete(_red_base + "example.test/svc/beta", subtask_index=1, fix_round=0)
+_rb_late = carry_complete(_red_base + "example.test/svc/beta", subtask_index=1, fix_round=1)
+_rbs = {"run_base_red": _rb1.get("run_base_red"), "run_base_failures": _rb1.get("run_base_failures")}
+_rbf = carry_complete(_red_base + "example.test/svc/beta", subtask_index=3, **_rbs)
 check("final gate: subtask 1's first result on a red pre-run baseline marks the run base red, and the final gate then "
-      "accepts the baseline match with a ledger line",
-      _rb1.get("run_base_red") is True and "run_base_red" not in _rb_late and _rbf["_next"] == "debt_scan"
-      and _rbf.get("fix_strikes") == 0 and any("already red at the run base" in d for d in _rbf["decisions"]),
-      (_rb1.get("run_base_red"), _rbf.get("_next"), _rbf["decisions"][-3:]))
+      "accepts a match on the run base's failures with a ledger line",
+      _rb1.get("run_base_red") is True and _rb1.get("run_base_failures") == [["beta/"]] and "run_base_red" not in _rb_late
+      and "run_base_failures" not in _rb_late and _rbf["_next"] == "debt_scan" and _rbf.get("fix_strikes") == 0
+      and any("already red at the run base" in d for d in _rbf["decisions"]),
+      (_rb1.get("run_base_red"), _rb1.get("run_base_failures"), _rbf.get("_next"), _rbf["decisions"][-3:]))
+_rb_new = _red_base + "example.test/svc/beta, example.test/svc/gamma"
+_rb2 = carry_complete(_rb_new, subtask_index=2, **_rbs)
+_rbn = carry_complete(_rb_new, subtask_index=3, **_rbs)
+_rbc = carry_complete(_red_base + "example.test/svc/beta, " + _capped, subtask_index=3, **_rbs)
+_rbu = carry_complete(_red_base + "check_one", subtask_index=3, **_rbs)
+check("final gate: on a red run base, a failure the run introduced, a capped verdict or a verdict naming nothing in the "
+      "repo strikes at the last subtask, though mid-run the new failure passed",
+      _rb2["_next"] == "debt_scan" and all(c["_next"] == "compose_fix" and c["fix_strikes"] == 1 for c in (_rbn, _rbc, _rbu))
+      and "gamma/" in _rbn.get("last_coder_error", "") and "capped" in _rbc.get("last_coder_error", ""),
+      (_rb2.get("_next"), _rbn.get("last_coder_error"), _rbc.get("_next"), _rbu.get("_next")))
 _cs = carry_start()
 _cs["coder_result"] = carry_red(CARRY_OUT + "\n\n[... 9000 bytes trimmed: output exceeded 64000 bytes; showing the "
                                             "first 32000 and last 32000 ...]\n\nFAIL\texample.test/svc/delta\t0.1s")

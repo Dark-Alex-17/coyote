@@ -200,6 +200,7 @@ initial_state:
   carried_failures: []
   failure_baseline: []
   run_base_red: false
+  run_base_failures: []
   run_must_not_do: []
   final_rejections_from: null
   current_task: ''
