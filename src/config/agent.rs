@@ -2863,5 +2863,23 @@ nodes: {}
                 }
             }
         }
+
+        // Write and exec grants of those skills that the owner left withheld.
+        let withheld = [
+            ("coder", &["fs_mkdir", "git_command"][..]),
+            ("sisyphus", &["fs_mkdir", "git_command"]),
+            ("oracle", &["fs_write"]),
+        ];
+        for (agent, tools) in withheld {
+            let declared = global_tools(agent);
+            for tool in tools {
+                assert!(
+                    !declared
+                        .iter()
+                        .any(|entry| entry.split('.').next() == Some(tool)),
+                    "{agent} must not declare {tool}: write and exec grants of its skills stay withheld"
+                );
+            }
+        }
     }
 }
