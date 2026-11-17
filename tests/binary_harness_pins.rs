@@ -45,7 +45,7 @@ const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
     concat!("Pty::", "spawn("),
 ];
-const HARNESS_USERS: [&str; 9] = [
+const HARNESS_USERS: [&str; 12] = [
     "editor_setting_usage.rs",
     "theme_setting_usage.rs",
     "tui_binary.rs",
@@ -55,6 +55,9 @@ const HARNESS_USERS: [&str; 9] = [
     "tui_binary_threads.rs",
     "tui_binary_tools.rs",
     "tui_binary_wizards.rs",
+    "tui_key_help_and_chords.rs",
+    "tui_key_help_discovery.rs",
+    "tui_readline_and_text_field_keys.rs",
 ];
 // Files that spawn the binary outside the shared harness's import, as of
 // 2026-11-10: 29 self-contained suites plus the shared harness itself.

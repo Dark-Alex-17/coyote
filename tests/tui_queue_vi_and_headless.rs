@@ -15,7 +15,6 @@ use std::{env, fs, iter, process};
 
 use common::fake_llm::{Chunk, FakeLlm, Reply};
 use common::pty::{Pty, strip_ansi};
-use common::tui_harness::composer_row;
 use serial_test::serial;
 
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
@@ -807,6 +806,20 @@ fn ctrl_r_recalls_an_earlier_prompt_into_the_composer_and_esc_backs_out() {
 fn key(pty: &mut Pty, bytes: &[u8]) {
     pty.send(bytes).unwrap();
     pty.read_for(Duration::from_millis(250));
+}
+
+/// The composer's text in a repainted frame: what sits between the
+/// field's rule and the footer, runs of blanks folded to one space.
+fn composer_row(frame: &str) -> String {
+    let rule = frame
+        .rfind('\u{2500}')
+        .map_or(0, |at| at + '\u{2500}'.len_utf8());
+    let after = &frame[rule..];
+    let footer = after.find("dryrun:dry-model").unwrap_or(after.len());
+    after[..footer]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `keybindings: vi`: Esc leaves insert mode; `0 x` deletes the first
