@@ -482,6 +482,15 @@ impl StatusCard {
         }
         self
     }
+
+    /// The label this session's owner gave it, which goes on the card in place of the
+    /// session name whether or not a snapshot is published.
+    pub(crate) fn with_session_label(mut self, label: Option<&str>) -> Self {
+        if let Some(label) = label.and_then(card_name) {
+            self.session = Some(label);
+        }
+        self
+    }
 }
 
 /// Where the status provider reads the session from: the published snapshot and the live
@@ -497,6 +506,11 @@ pub(crate) trait CardSource: Send + Sync {
     /// The session's name while `mesh.share_session_name` is on, for the card served
     /// before a snapshot is published; `None` while sharing is off.
     fn shared_session(&self) -> Option<String>;
+    /// The label this session's owner gave it, read live, while `mesh.share_session_name`
+    /// is on; `None` while sharing is off or no label is set.
+    fn session_label(&self) -> Option<String> {
+        None
+    }
     fn caps(&self) -> Vec<String>;
 }
 
@@ -530,6 +544,11 @@ impl CardSource for MeshSlot {
 
     fn shared_session(&self) -> Option<String> {
         self.get().and_then(|runtime| runtime.shared_session_name())
+    }
+
+    fn session_label(&self) -> Option<String> {
+        self.get()
+            .and_then(|runtime| runtime.shared_session_label())
     }
 
     fn caps(&self) -> Vec<String> {
@@ -581,6 +600,7 @@ impl StatusHandler {
             source.shared_session().as_deref(),
             snapshot.is_some(),
         )
+        .with_session_label(source.session_label().as_deref())
     }
 }
 

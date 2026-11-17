@@ -1353,6 +1353,7 @@ const UNDISPATCHED_MESH_PATHS: &[(&str, &str)] = &[
     ("src/repl/mesh.rs", "bogus"),
     ("src/repl/mesh.rs", "files undeny"),
     ("src/repl/mesh.rs", "reply"),
+    ("src/repl/mesh.rs", "session rename"),
     ("src/repl/mesh.rs", "undeny"),
     ("tests/mesh_autostart_repl.rs", "access knock"),
     ("tests/mesh_autostart_repl.rs", "access knocks"),
@@ -1375,11 +1376,29 @@ fn is_mesh_group(word: &str) -> bool {
         .any(|(group, _)| *group == word)
 }
 
+/// The word a top-level `.mesh` verb takes before its arguments, read off its usage line:
+/// `name` for a usage starting `.mesh session name`. `None` when the usage goes straight on
+/// to arguments or flags, or `verb` has no top-level row.
+fn mesh_sub_verb(verb: &str) -> Option<&'static str> {
+    crate::repl::mesh::COMMANDS
+        .iter()
+        .find(|row| row.0.is_empty() && row.1 == verb)
+        .and_then(|row| {
+            row.2
+                .strip_prefix(".mesh ")?
+                .strip_prefix(verb)?
+                .strip_prefix(' ')
+        })
+        .and_then(|args| args.split(' ').next())
+        .filter(|word| word.starts_with(|c: char| c.is_ascii_lowercase()))
+}
+
 /// Each `.mesh` or `/mesh` command a string literal spells, as (line offset into the
 /// literal, sigil, path): the sigil stands at a token boundary the way
 /// `CommandPrefix::render_hints` reads one, or after a `\n` or `\t` escape. The path is
-/// one lowercase word, plus the next when the first names a group and a single space
-/// separates them; the words after a top-level verb are its arguments.
+/// one lowercase word, plus the next when a single space separates them and the first
+/// names a group, or a top-level verb whose usage has a word before its arguments and the
+/// next starts with a letter; the other words after a top-level verb are its arguments.
 fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
     let word_len = |text: &str| {
         text.find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
@@ -1411,7 +1430,9 @@ fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
         }
         let mut path = rest[..first].to_string();
         if let Some(tail) = rest[first..].strip_prefix(' ')
-            && is_mesh_group(&path)
+            && (is_mesh_group(&path)
+                || (mesh_sub_verb(&path).is_some()
+                    && tail.starts_with(|c: char| c.is_ascii_lowercase())))
         {
             let second = word_len(tail);
             if second > 0 {
@@ -1424,8 +1445,9 @@ fn mesh_paths(literal: &str) -> Vec<(usize, char, String)> {
     out
 }
 
-/// Whether the `.mesh` table dispatches `path`: a top-level verb, a group, a group and
-/// one of its verbs, or a group and `help`, which lists the group.
+/// Whether the `.mesh` table dispatches `path`: a top-level verb, a top-level verb and the
+/// word its usage starts with, a group, a group and one of its verbs, or a group and
+/// `help`, which lists the group.
 fn mesh_table_dispatches(path: &str) -> bool {
     let has_row = |group: &str, verb: &str| {
         crate::repl::mesh::COMMANDS
@@ -1433,7 +1455,8 @@ fn mesh_table_dispatches(path: &str) -> bool {
             .any(|row| row.0 == group && row.1 == verb)
     };
     match path.split_once(' ') {
-        Some((group, verb)) => is_mesh_group(group) && (verb == "help" || has_row(group, verb)),
+        Some((group, verb)) if is_mesh_group(group) => verb == "help" || has_row(group, verb),
+        Some((verb, sub)) => mesh_sub_verb(verb) == Some(sub),
         None => is_mesh_group(path) || has_row("", path),
     }
 }
@@ -1444,7 +1467,7 @@ fn mesh_path_scanner_reads_paths_at_token_boundaries() {
     let dot = sigil('.');
     let slash = sigil('/');
     let literal = format!(
-        "Run `{dot} people list`, ({slash} status alice)\\n{dot} config\n\"{dot} on\" x{dot} off src{slash} people {dot} Files {dot} undeny docs {dot}"
+        "Run `{dot} people list`, ({slash} status alice)\\n{dot} config\n\"{dot} on\" x{dot} off src{slash} people {dot} Files {dot} undeny docs {dot} session name x {dot} session --help {dot}"
     );
     assert_eq!(
         mesh_paths(&literal),
@@ -1454,6 +1477,8 @@ fn mesh_path_scanner_reads_paths_at_token_boundaries() {
             (0, '.', "config".to_string()),
             (1, '.', "on".to_string()),
             (1, '.', "undeny".to_string()),
+            (1, '.', "session name".to_string()),
+            (1, '.', "session".to_string()),
         ]
     );
 }
@@ -1467,6 +1492,8 @@ fn mesh_table_dispatches_groups_their_verbs_and_top_level_verbs_only() {
         "on",
         "help",
         "access help",
+        "session",
+        "session name",
     ] {
         assert!(mesh_table_dispatches(path), "{path}");
     }
@@ -1476,6 +1503,9 @@ fn mesh_table_dispatches_groups_their_verbs_and_top_level_verbs_only() {
         "people on",
         "rotate",
         "status people",
+        "session rename",
+        "session help",
+        "on yes",
     ] {
         assert!(!mesh_table_dispatches(path), "{path}");
     }

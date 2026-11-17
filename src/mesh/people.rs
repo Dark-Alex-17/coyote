@@ -231,14 +231,16 @@ impl Subject {
 }
 
 /// Two subjects whose names read the same collide, except two sessions of different
-/// people: `<person>/<session>` tells those apart.
+/// people and a person with a session of their own: `<person>/<session>` tells those
+/// apart.
 fn collide(a: &Subject, b: &Subject) -> bool {
     if a == b {
         return false;
     }
     match (a, b) {
+        (Subject::Person(_), Subject::Person(_)) => true,
         (Subject::Session { .. }, Subject::Session { .. }) => a.identity() == b.identity(),
-        _ => true,
+        _ => a.identity() != b.identity(),
     }
 }
 
@@ -379,10 +381,11 @@ impl fmt::Display for Who {
 /// Chooses the name of a user and of a session from what this node holds, read once so a
 /// listing names every row from the same facts. The user is `you` for this node's own
 /// identity, else the owner's alias, else the advertised one, else the short identity
-/// hash; the session is the name one of your own sessions runs under, else the owner's
-/// alias of the session, else the advertised one, else the short destination hash. A
-/// hidden name falls through to the short hash, and a hidden owner's alias never lets the
-/// advertised name through. An empty identity counts as none.
+/// hash; for one of your own sessions the session is the label you gave it, else the name
+/// it runs under, and for any other the owner's alias of the session, else the advertised
+/// one, else the short destination hash. A hidden name falls through to the short hash,
+/// and a hidden owner's alias never lets the advertised name through. An empty identity
+/// counts as none.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Namer {
     people: People,
@@ -425,6 +428,15 @@ impl Namer {
             .and_then(|session| clean_advertised(session))
     }
 
+    /// The label you gave your own session at `destination`, unless another name hides it.
+    pub(crate) fn own_label(&self, destination: &str) -> Option<String> {
+        let identity = self.own_identity.as_deref()?;
+        self.people
+            .session(identity, destination)
+            .filter(|alias| alias.source == AliasSource::Owner && alias.displayable())
+            .map(|alias| alias.text.clone())
+    }
+
     /// The identity `identity` stands for, or this node's own when only one of your own
     /// sessions' destinations is known. A blank identity is no identity.
     fn identity_for<'a>(&'a self, identity: Option<&'a str>, destination: &str) -> Option<&'a str> {
@@ -457,7 +469,11 @@ impl Namer {
     pub(crate) fn session(&self, identity: Option<&str>, destination: &str) -> String {
         let identity = self.identity_for(identity, destination);
         let own = identity.is_none_or(|identity| self.is_you(identity));
-        if own && let Some(session) = self.own_session(destination) {
+        if own
+            && let Some(session) = self
+                .own_label(destination)
+                .or_else(|| self.own_session(destination))
+        {
             return session;
         }
         identity
@@ -909,6 +925,67 @@ mod tests {
         assert!(people.person(&a).unwrap().addressable());
     }
 
+    /// A user and a session of their own may read the same: `<user>/<session>` tells
+    /// them apart, so the label on the session never hides the user's name.
+    #[test]
+    fn a_session_label_never_hides_its_own_users_name() {
+        let (x, d) = (hash(2), hash(12));
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            x.clone(),
+            with_session(person(None, Some("Bob")), &d, Some("Bob"), Some("b")),
+        );
+        let namer = |entries: &BTreeMap<String, PersonEntry>| {
+            Namer::new(People::new(entries, &[]), Some(&hash(1)), HashMap::new())
+        };
+        let labelled = namer(&entries);
+        assert!(labelled.people().person(&x).unwrap().addressable());
+        assert!(labelled.people().session(&x, &d).unwrap().addressable());
+        assert_eq!(labelled.who(Some(&x), &d).to_string(), "Bob / Bob");
+        assert!(!owner_alias_taken(&entries, &x, Some(&d), "bob", &[]));
+
+        set_name(&mut entries, &x, Some(&d), Slot::Alias, None);
+        assert_eq!(namer(&entries).who(Some(&x), &d).to_string(), "Bob / b");
+    }
+
+    /// The label you gave one of your own sessions shows in place of the name it runs
+    /// under, an advertised name never does, and with the label cleared the session's
+    /// own name shows again.
+    #[test]
+    fn an_own_session_label_outranks_its_session_name() {
+        let (me, own_dest) = (hash(1), hash(11));
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            me.clone(),
+            with_session(PersonEntry::default(), &own_dest, Some("build"), None),
+        );
+        let namer = |entries: &BTreeMap<String, PersonEntry>| {
+            let own_sessions = HashMap::from([(own_dest.clone(), "temp".to_string())]);
+            Namer::new(People::new(entries, &["temp"]), Some(&me), own_sessions)
+        };
+        assert_eq!(
+            namer(&entries).who(None, &own_dest).to_string(),
+            "you / build"
+        );
+        assert_eq!(
+            namer(&entries).who(Some(&me), &own_dest).to_string(),
+            "you / build"
+        );
+
+        set_name(&mut entries, &me, Some(&own_dest), Slot::Alias, None);
+        set_name(
+            &mut entries,
+            &me,
+            Some(&own_dest),
+            Slot::Advertised,
+            Some("card".into()),
+        );
+        assert_eq!(
+            namer(&entries).who(None, &own_dest).to_string(),
+            "you / temp"
+        );
+    }
+
     #[test]
     fn a_person_name_reading_as_an_own_session_is_hidden() {
         let a = hash(1);
@@ -920,10 +997,9 @@ mod tests {
         );
         let people = People::new(&entries, &["main"]);
         assert_eq!(people.person(&a).unwrap().status, AliasUse::Hidden);
-        assert_eq!(
-            people.session(&a, &d).unwrap().status,
-            AliasUse::Hidden,
-            "it still collides with the person name"
+        assert!(
+            people.session(&a, &d).unwrap().addressable(),
+            "a session may read as its own user's name"
         );
         let people = People::new(&entries, &["other"]);
         assert!(people.person(&a).unwrap().addressable());
@@ -989,8 +1065,12 @@ mod tests {
             "another person's session"
         );
         assert!(
-            taken(&a, Some(&d2), "alex", &[]),
-            "a session against a person"
+            taken(&b, Some(&d2), "alex", &[]),
+            "a session against another person"
+        );
+        assert!(
+            !taken(&a, Some(&d2), "alex", &[]),
+            "a session against its own person"
         );
         assert!(taken(&b, None, "main", &["Main"]));
         assert!(!taken(&a, Some(&d2), "main", &["Main"]));

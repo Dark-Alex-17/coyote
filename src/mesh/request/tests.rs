@@ -11317,7 +11317,7 @@ pub(crate) mod network {
     /// The same peer with no propagation node known: nothing is tried and nothing is
     /// queued, and the sender gets the unreachable wording it gets for any peer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_peer_that_said_it_left_with_no_propagation_node_reads_unreachable() {
+    async fn a_peer_that_said_it_left_with_no_propagation_node_reads_when_it_left() {
         let pair = NodePair::start_with("request-peer-left-no-node", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
@@ -11337,11 +11337,26 @@ pub(crate) mod network {
             .await
             .unwrap_err();
 
-        assert_eq!(err, SendError::NoPropagationNode);
+        let who = pair
+            .node_a
+            .owner_namer()
+            .who(pair.node_a.identity_at(&b_instance).as_deref(), &b_instance)
+            .to_string();
         assert!(
-            err.to_string().starts_with("That session is unreachable"),
-            "{err}"
+            matches!(&err, SendError::LeftNoPropagationNode { who: named, .. } if *named == who),
+            "{err:?}"
         );
+        assert_eq!(err.class(), "no_propagation_node");
+        let text = err.to_string();
+        let age = text
+            .strip_prefix(&format!("{who} left "))
+            .and_then(|rest| rest.strip_suffix(" ago and no propagation node is known to hold the message, so it was not sent. It is delivered once a propagation node is heard or that session is back; .mesh people list shows both."))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            age.ends_with('s') && age[..age.len() - 1].parse::<u64>().is_ok(),
+            "{text}"
+        );
+        assert!(!err.log_text().contains(&who), "{}", err.log_text());
         assert_eq!(pair.recorder_b.seen_count(), 0, "no link was tried to B");
         pair.stop_node_a().await;
     }

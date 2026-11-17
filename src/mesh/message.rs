@@ -1423,6 +1423,14 @@ pub(crate) enum SendError {
         max: u16,
     },
     NoPropagationNode,
+    /// The peer said it left `age` ago (as `age_text` reads it), so no link was tried,
+    /// and no propagation node is known to hold the message. `who` names it by the
+    /// owner's own names or its hashes.
+    LeftNoPropagationNode {
+        destination: String,
+        who: String,
+        age: String,
+    },
     /// The link came up but the peer did not answer, and no propagation node is known to
     /// hold the message, so nothing was queued.
     NoAnswer(NoAnswer),
@@ -1502,6 +1510,10 @@ impl fmt::Display for SendError {
             Self::NoPropagationNode => write!(
                 f,
                 "That session is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh people list` to see the sessions you have heard."
+            ),
+            Self::LeftNoPropagationNode { who, age, .. } => write!(
+                f,
+                "{who} left {age} and no propagation node is known to hold the message, so it was not sent. It is delivered once a propagation node is heard or that session is back; .mesh people list shows both."
             ),
             Self::NoAnswer(no_answer) => write!(
                 f,
@@ -1621,7 +1633,7 @@ impl SendError {
             Self::Refused(_) | Self::Throttled { .. } | Self::NotTrustedByPeer(_) => "refused",
             Self::Direct(_) => "direct",
             Self::IncompatibleVersion { .. } => "incompatible_version",
-            Self::NoPropagationNode => "no_propagation_node",
+            Self::NoPropagationNode | Self::LeftNoPropagationNode { .. } => "no_propagation_node",
             Self::NoAnswer(_) => "no_answer",
             Self::Propagation(_) => "propagation",
             Self::NotAcknowledged => "not_acknowledged",
@@ -1637,6 +1649,14 @@ impl SendError {
                 Self::NotTrustedByPeer(refusal.clone().named(None)).to_string()
             }
             Self::NoAnswer(no_answer) => Self::NoAnswer(no_answer.clone().named(None)).to_string(),
+            Self::LeftNoPropagationNode {
+                destination, age, ..
+            } => Self::LeftNoPropagationNode {
+                destination: destination.clone(),
+                who: short(destination).to_string(),
+                age: age.clone(),
+            }
+            .to_string(),
             other => other.to_string(),
         }
     }
@@ -2216,7 +2236,17 @@ impl MeshRuntime {
                     Some(RequestError::Timeout { .. }) => {
                         SendError::NoAnswer(self.no_answer(&destination))
                     }
-                    _ => SendError::NoPropagationNode,
+                    _ => match departed {
+                        Some(Departure::Left(at)) => SendError::LeftNoPropagationNode {
+                            who: self
+                                .owner_namer()
+                                .who(self.identity_at(&destination).as_deref(), &destination)
+                                .to_string(),
+                            age: age_text(SystemTime::now(), at),
+                            destination: destination.clone(),
+                        },
+                        _ => SendError::NoPropagationNode,
+                    },
                 })?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
@@ -5149,6 +5179,14 @@ mod tests {
                 "incompatible_version",
             ),
             (SendError::NoPropagationNode, "no_propagation_node"),
+            (
+                SendError::LeftNoPropagationNode {
+                    destination: "d".repeat(32),
+                    who: "Tia / box".to_string(),
+                    age: "8s ago".to_string(),
+                },
+                "no_propagation_node",
+            ),
             (
                 SendError::Propagation(PropagationError::Cancelled),
                 "propagation",

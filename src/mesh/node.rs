@@ -657,7 +657,8 @@ pub(crate) struct AddressName {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum NameTarget {
-    /// A session the instance registry lists as running here, by the destination it serves.
+    /// One of your own sessions, by the destination it serves: one the instance registry
+    /// lists here, or one you labelled.
     Session {
         destination: String,
         identity: String,
@@ -1197,6 +1198,13 @@ impl MeshRuntime {
         instances::by_destination(&self.cache_dir)
     }
 
+    /// Whether `destination` is one of your own sessions that the registry keeps only as
+    /// gone: its process on this computer has stopped, so nothing can answer at it.
+    pub(crate) fn own_session_ended(&self, destination: &str) -> bool {
+        let sessions = self.registered_sessions();
+        sessions.gone.contains_key(destination) && !sessions.running.contains_key(destination)
+    }
+
     /// The questions the other sessions on this cache dir asked and still wait on or
     /// have yet to collect, newest first, each with what the instance registry says of
     /// the session that asked it (`None` once its tombstone is pruned, or when it never
@@ -1328,9 +1336,11 @@ impl MeshRuntime {
     }
 
     /// Every name the human verbs resolve: your running sessions in destination order,
-    /// `you`, then each user's and session's addressable name in hash order. An unnamed
-    /// session names nothing. A user's sessions are the ones `known_sessions` proves, the
-    /// same set `<user>/<session>` picks from, never a row's identity column on its word.
+    /// then the ended ones the registry keeps whose name no running session goes by, `you`,
+    /// then each user's and session's addressable name in hash order, the labels you gave
+    /// your own sessions among them. An unnamed session names nothing. A user's
+    /// sessions are the ones `known_sessions` proves, the same set `<user>/<session>` picks
+    /// from, never a row's identity column on its word.
     pub(crate) fn address_names(&self) -> Vec<AddressName> {
         let mut sessions: Vec<(String, String)> = self
             .own_sessions()
@@ -1338,6 +1348,20 @@ impl MeshRuntime {
             .filter(|(_, session)| !session.trim().is_empty())
             .collect();
         sessions.sort_unstable();
+        let mut ended: Vec<(String, String)> = self
+            .registered_sessions()
+            .gone
+            .into_iter()
+            .map(|(destination, row)| (destination, row.session))
+            .filter(|(destination, session)| {
+                !session.trim().is_empty()
+                    && !sessions.iter().any(|(running, name)| {
+                        running == destination || name.eq_ignore_ascii_case(session)
+                    })
+            })
+            .collect();
+        ended.sort_unstable();
+        sessions.extend(ended);
         let known = self.known_sessions();
         // `you` stands for the same sessions `you/<session>` picks from: the ones running
         // here and every proven session of this identity heard elsewhere.
@@ -1371,11 +1395,15 @@ impl MeshRuntime {
         let mut people: Vec<(&str, Option<&str>, &str)> = namer
             .people()
             .addressable()
-            .filter(|(identity, _, _)| !namer.is_you(identity))
+            .filter(|(identity, destination, _)| destination.is_some() || !namer.is_you(identity))
             .collect();
         people.sort_unstable_by_key(|(identity, destination, _)| (*identity, *destination));
         for (identity, destination, name) in people {
             let target = match destination {
+                Some(destination) if namer.is_you(identity) => NameTarget::Session {
+                    destination: destination.to_string(),
+                    identity: identity.to_string(),
+                },
                 Some(destination) => NameTarget::UserSession {
                     destination: destination.to_string(),
                     identity: identity.to_string(),
@@ -1550,6 +1578,16 @@ impl MeshRuntime {
     pub(crate) fn shared_session_name(&self) -> Option<String> {
         self.share_session_name
             .then(|| self.instance_row.lock().session.clone())
+    }
+
+    /// The label you gave the session this node serves, from any of your sessions on this
+    /// config dir, while `mesh.share_session_name` is on; it goes on the status card in
+    /// place of the session name.
+    pub(crate) fn shared_session_label(&self) -> Option<String> {
+        if !self.share_session_name {
+            return None;
+        }
+        self.namer().own_label(&self.current_destination_hash())
     }
 
     /// The per-peer ceilings the node was started with, for the slot that installs it.
@@ -1886,6 +1924,14 @@ impl MeshRuntime {
         }
         let dest_hex = destination.address_hash.to_hex_string();
         refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
+        // A session of yours whose process stopped without a farewell leaves no mark on
+        // its row, and the shared relay may still hold its path, so only the registry
+        // says that a link would wait out its whole timeout for nothing.
+        if options.foreground && self.own_session_ended(&dest_hex) {
+            return Err(RequestError::LinkNotOpened(
+                "that session of yours has ended, its process on this computer is gone".into(),
+            ));
+        }
         let transport = self
             .transport
             .lock()
@@ -3439,14 +3485,14 @@ async fn receive_announces(
         };
         let app_data = event.app_data.as_slice();
         let destination = announced.destination_hash.clone();
+        let known = peers.get(&destination);
+        let had_left = known.as_ref().is_some_and(|row| row.left_at.is_some());
+        let unrouted = had_left || peers.link_failed(&destination);
         let filed = if event.is_path_response {
             filer
                 .file_path_response(announced, app_data, event.hops, now)
                 .is_some()
         } else {
-            let had_left = peers
-                .get(&destination)
-                .is_some_and(|row| row.left_at.is_some());
             let filed = filer.file(announced, app_data, event.hops, now).is_some();
             if had_left && filed {
                 note_return(&runtime, &destination);
@@ -3454,7 +3500,16 @@ async fn receive_announces(
             filed
         };
         if filed && let Some(runtime) = runtime.upgrade() {
-            runtime.consider_card_fetch(&destination, CardTrigger::Heard);
+            // Your own sessions on this computer are named from the registry, never a card.
+            let reheard = known.is_some()
+                && (unrouted || !runtime.card_cadence().heard_in_run(&destination))
+                && !instances::session_names(runtime.cache_dir()).contains_key(&destination);
+            let trigger = if reheard {
+                CardTrigger::Reheard
+            } else {
+                CardTrigger::Heard
+            };
+            runtime.consider_card_fetch(&destination, trigger);
         }
     }
 }
@@ -16472,10 +16527,10 @@ mod tests {
             assert!(pair.a.runtime.peers().mark_left(&to_b, SystemTime::now()));
             let stale =
                 OutboundPeer::new(PeerKind::Message, "still there?", None, None, None).unwrap();
-            assert_eq!(
-                pair.a.runtime.send_peer(&to_b, &stale).await.unwrap_err(),
-                SendError::NoPropagationNode,
-                "while marked left, no link is tried to B"
+            let err = pair.a.runtime.send_peer(&to_b, &stale).await.unwrap_err();
+            assert!(
+                matches!(&err, SendError::LeftNoPropagationNode { destination, .. } if *destination == to_b),
+                "while marked left, no link is tried to B: {err:?}"
             );
 
             let ask = OutboundPeer::new(PeerKind::Ask, "are you up?", None, None, None).unwrap();
@@ -19675,8 +19730,8 @@ mod tests {
         /// Two sessions on one cache dir each file their row at start, each sees the
         /// other's session by its destination, a re-key moves the row to the fork's id
         /// and destination and keeps the original's as a tombstone, and a stop turns only
-        /// the stopped node's row into one. A tombstone is never a running session, so
-        /// no name resolves to it.
+        /// the stopped node's row into one. A tombstone's name still resolves to it,
+        /// unless a running session goes by the same name.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn start_files_the_row_rekey_moves_it_and_stop_keeps_it_as_gone() {
             let (addr, relay_handle, _) = loopback_relay().await;
@@ -19729,11 +19784,6 @@ mod tests {
                 instances::sessions_by_instance(&a.cache_dir).get(&original_id),
                 Some(&InstanceSession::Gone("temp".to_string()))
             );
-            temp_slot.rename_session("temp-fork");
-            assert_eq!(
-                a.own_sessions().get(&fork_dest).map(String::as_str),
-                Some("temp-fork")
-            );
             let session_names = |runtime: &MeshRuntime| -> Vec<String> {
                 let mut names: Vec<String> = runtime
                     .address_names()
@@ -19744,7 +19794,18 @@ mod tests {
                 names.sort_unstable();
                 names
             };
-            assert_eq!(session_names(&a), ["a", "temp-fork"]);
+            assert_eq!(session_names(&a), ["a", "temp"]);
+            assert!(
+                a.address_names().iter().any(|name| name.name == "temp"
+                    && name.target.destination() == Some(fork_dest.as_str())),
+                "the running session wins the name its tombstone shares"
+            );
+            temp_slot.rename_session("temp-fork");
+            assert_eq!(
+                a.own_sessions().get(&fork_dest).map(String::as_str),
+                Some("temp-fork")
+            );
+            assert_eq!(session_names(&a), ["a", "temp", "temp-fork"]);
 
             assert!(temp_slot.stop().await.unwrap());
             let rows = a.own_sessions();
@@ -19753,7 +19814,11 @@ mod tests {
             let gone = a.registered_sessions().gone;
             assert_eq!(gone[&fork_dest].session, "temp-fork", "{gone:?}");
             assert_eq!(gone[&temp_dest].session, "temp", "{gone:?}");
-            assert_eq!(session_names(&a), ["a"], "a gone session is never a name");
+            assert_eq!(
+                session_names(&a),
+                ["a", "temp", "temp-fork"],
+                "a gone session the registry keeps is still a name"
+            );
 
             a.shutdown().await.unwrap();
             assert!(instances::live(&tmp.path.join("cache")).is_empty());

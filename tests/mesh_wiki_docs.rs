@@ -189,6 +189,26 @@ fn groups_of<'a>(paths: impl IntoIterator<Item = &'a String>) -> Vec<String> {
     groups
 }
 
+/// The `<verb> <sub>` paths the top-level `COMMANDS` rows dispatch: a row whose usage
+/// starts with `.mesh <verb> <sub>`, `<sub>` a lowercase word, takes that word before its
+/// arguments.
+fn sub_verb_paths(commands: &[(String, String, String)]) -> Vec<String> {
+    commands
+        .iter()
+        .filter(|(path, _, _)| !path.contains(' '))
+        .filter_map(|(path, _, usage)| {
+            let sub = usage
+                .strip_prefix(".mesh ")?
+                .strip_prefix(path.as_str())?
+                .strip_prefix(' ')?
+                .split(' ')
+                .next()?;
+            sub.starts_with(|c: char| c.is_ascii_lowercase())
+                .then(|| format!("{path} {sub}"))
+        })
+        .collect()
+}
+
 /// The command path `rest` opens with, as typed after `.mesh `, and its length in bytes:
 /// one word of lowercase letters and dashes, plus the next such word when the first
 /// names one of `groups` and a single space separates them.
@@ -361,7 +381,7 @@ fn every_command_row_in_the_wiki_table_matches_the_repl_commands_table() {
     let commands = repl_commands();
     assert_eq!(
         commands.len(),
-        37,
+        38,
         "parsed {} COMMANDS rows from src/repl/mesh.rs; if the table grew, update this count",
         commands.len()
     );
@@ -397,11 +417,20 @@ fn every_command_row_in_the_wiki_table_matches_the_repl_commands_table() {
 #[test]
 fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
     let Some(wiki) = wiki_dir() else { return };
-    let paths: Vec<String> = repl_commands()
-        .into_iter()
-        .map(|(path, _, _)| path)
-        .collect();
+    let commands = repl_commands();
+    let sub_verbs = sub_verb_paths(&commands);
+    assert_eq!(sub_verbs, ["session name"]);
+    let mut paths: Vec<String> = commands.into_iter().map(|(path, _, _)| path).collect();
     let groups = groups_of(&paths);
+    // A top-level verb that takes a word before its arguments reads two words, as a
+    // group does; only the word its usage names is dispatched.
+    let mut leading_words = groups.clone();
+    leading_words.extend(
+        sub_verbs
+            .iter()
+            .filter_map(|path| path.split_once(' ').map(|(verb, _)| verb.to_string())),
+    );
+    paths.extend(sub_verbs);
     assert!(paths.iter().any(|path| path == "people info"), "{paths:?}");
     assert!(groups.iter().any(|group| group == "people"), "{groups:?}");
     // The page without its ``` fenced blocks.
@@ -444,7 +473,7 @@ fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
                     if !word.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
                         return None;
                     }
-                    let (path, _) = mesh_path_of(rest, &groups)?;
+                    let (path, _) = mesh_path_of(rest, &leading_words)?;
                     (!paths.contains(&path)
                         && !groups.contains(&path)
                         && !group_helps.contains(&path))
@@ -457,7 +486,7 @@ fn every_mesh_path_a_page_spells_is_one_the_repl_dispatches() {
         .iter()
         .flat_map(|page| {
             let label = page.file_name().unwrap().to_string_lossy().to_string();
-            mesh_command_samples(&read(page), &groups)
+            mesh_command_samples(&read(page), &leading_words)
                 .into_iter()
                 .filter(|(_, path, _)| !paths.contains(path) && !groups.contains(path))
                 .filter(|(_, path, _)| !group_helps.contains(path))

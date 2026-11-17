@@ -227,6 +227,7 @@ mod mesh_path {
     pub(super) const ON: (&str, &str) = ("", "on");
     pub(super) const OFF: (&str, &str) = ("", "off");
     pub(super) const STATUS: (&str, &str) = ("", "status");
+    pub(super) const SESSION: (&str, &str) = ("", "session");
     pub(super) const PEOPLE_NAME: (&str, &str) = ("people", "name");
     pub(super) const PEOPLE_INFO: (&str, &str) = ("people", "info");
     pub(super) const PEOPLE_STATUS: (&str, &str) = ("people", "status");
@@ -259,6 +260,7 @@ mod mesh_path {
         ON,
         OFF,
         STATUS,
+        SESSION,
         PEOPLE_NAME,
         PEOPLE_INFO,
         PEOPLE_STATUS,
@@ -7037,6 +7039,39 @@ impl RequestContext {
         })
     }
 
+    /// Sessions for `.mesh session name <TAB>`: your sessions running here that no peer
+    /// row lists, this one included, by session name and described as `you / <session> .
+    /// <dest8>`, then every heard session `.mesh access ask` offers, yours heard over the
+    /// mesh among them. Never a user. Empty while the mesh is off.
+    fn mesh_completion_sessions(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let namer = runtime.namer();
+        let peers = runtime.peers();
+        let mut own: Vec<(String, String)> = runtime
+            .own_sessions()
+            .into_iter()
+            .filter(|(destination, session)| {
+                peers.get(destination).is_none() && !session.trim().is_empty()
+            })
+            .collect();
+        own.sort_unstable();
+        let mut values: Vec<(String, Option<String>)> = own
+            .into_iter()
+            .map(|(destination, session)| {
+                let who = namer.who(None, &destination);
+                (session, Some(format!("{who} . {}", short(&destination))))
+            })
+            .collect();
+        values.extend(collect_destination_rows(
+            &runtime,
+            SystemTime::now(),
+            DestinationFilter::Heard,
+        ));
+        values
+    }
+
     /// Identity records for `.mesh access revoke user <TAB>`: those the verb takes, which is
     /// a record granting every session, or one with a session of theirs trusted. A record
     /// that grants nothing and has no trusted session is a user known but not trusted
@@ -7203,6 +7238,9 @@ impl RequestContext {
                 values
             }
             (mesh_path::PEOPLE_NAME, [_, _]) => super::map_completion_values(vec!["--clear"]),
+            (mesh_path::SESSION, [_]) => super::map_completion_values(vec!["name "]),
+            (mesh_path::SESSION, ["name", _]) => self.mesh_completion_sessions(),
+            (mesh_path::SESSION, ["name", _, _]) => super::map_completion_values(vec!["--clear"]),
             (mesh_path::PEOPLE_STATUS, [_]) | (mesh_path::MESSAGING_SEND, ["--yes", _]) => {
                 self.mesh_completion_destinations(DestinationFilter::TrustedAndHeard)
             }
@@ -39012,6 +39050,61 @@ mod tests {
             completion_values(&fixture.complete(&["people", "name", &fixture.heard_identity, ""])),
             ["--clear"],
             "after the user comes the flag that clears their name"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// `.mesh session` offers its one command; `.mesh session name` offers sessions only:
+    /// your own by name, then the heard sessions `access ask` offers, and never a user.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_session_name_offers_own_then_heard_sessions_then_clear() {
+        let _guard = HelperConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-session-name").await;
+        fixture.started.runtime.rename_session("probe");
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["session", ""])),
+            ["name "]
+        );
+        let sessions = fixture.complete(&["session", "name", ""]);
+        let runtime = &fixture.started.runtime;
+        let own = runtime.own_sessions();
+        let own_dest = runtime.current_destination_hash();
+        assert_eq!(own.len(), 1, "{own:?}");
+        assert_eq!(own[&own_dest], "probe");
+        assert_eq!(
+            sessions[0],
+            (
+                "probe".to_string(),
+                Some(format!("you / probe . {}", short(&own_dest)))
+            ),
+            "your own session first, by its name: {sessions:?}"
+        );
+        let heard: Vec<(String, Option<String>)> = fixture
+            .complete(&["access", "ask", ""])
+            .into_iter()
+            .filter(|(value, _)| !value.starts_with("--"))
+            .collect();
+        assert!(!heard.is_empty());
+        assert_eq!(sessions[1..], heard[..], "then the heard sessions");
+        for identity in [&fixture.trusted_peer_identity, &fixture.heard_identity] {
+            assert!(
+                !sessions.iter().any(|(value, _)| value == identity),
+                "no user is offered: {sessions:?}"
+            );
+        }
+
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "session",
+                "name",
+                &fixture.heard_destination,
+                ""
+            ])),
+            ["--clear"]
         );
 
         fixture.stop().await;

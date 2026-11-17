@@ -5577,8 +5577,8 @@ fn seed_people_trust_file(config_dir: &Path) {
 
 /// Cold start over a seeded trust list, nobody heard: `people info` shows a user with
 /// no name by its short hash and every session of theirs as `<user> / <session>`;
-/// `people name` gives a user and a session a name that every later line uses, an
-/// owner-set session name wins over the advertised one, `--clear` falls back to the
+/// `people name` gives a user a name and `session name` a session a label that every
+/// later line uses, an owner-set label wins over the advertised one, `--clear` falls back to the
 /// short hash, and the naming rules refuse `/`, `you`, `unnamed`, 8+ hex, 65
 /// characters, a name another user or session already has and naming yourself, each
 /// leaving the people section as it was. A user's name where one session is needed is
@@ -5636,7 +5636,7 @@ fn people_names_at_a_cold_prompt_show_everywhere_and_the_naming_rules_refuse_wha
         info.contains(&format!("carol / desk . {CAROL_ONE}")),
         "{info:?}"
     );
-    let named = people_command(&mut session, ".mesh people name carol/desk \"office\"");
+    let named = people_command(&mut session, ".mesh session name carol/desk \"office\"");
     assert!(
         named.contains("carol / desk is now carol / office"),
         "{named:?}"
@@ -5647,8 +5647,8 @@ fn people_names_at_a_cold_prompt_show_everywhere_and_the_naming_rules_refuse_wha
         "{info:?}"
     );
 
-    // A session name, then `--clear` back to the short hash.
-    let named = people_command(&mut session, ".mesh people name maki/1111aaaa \"laptop\"");
+    // A session label, then `--clear` back to the short hash.
+    let named = people_command(&mut session, ".mesh session name maki/1111aaaa \"laptop\"");
     assert!(
         named.contains("Maki / 1111aaaa is now Maki / laptop"),
         "{named:?}"
@@ -5658,9 +5658,9 @@ fn people_names_at_a_cold_prompt_show_everywhere_and_the_naming_rules_refuse_wha
         info.contains(&format!("Maki / laptop . {MAKI_ONE}")),
         "{info:?}"
     );
-    let cleared = people_command(&mut session, ".mesh people name maki/laptop --clear");
+    let cleared = people_command(&mut session, ".mesh session name maki/laptop --clear");
     assert!(
-        cleared.contains("Cleared the name you gave 1111aaaa; it shows as Maki / 1111aaaa."),
+        cleared.contains("Cleared the label you gave 1111aaaa; it shows as Maki / 1111aaaa."),
         "{cleared:?}"
     );
 
@@ -5884,7 +5884,7 @@ fn people_addressing_against_heard_sessions_refuses_a_user_with_two_and_reaches_
 
     let out = people_command(
         &mut mine,
-        &format!(".mesh people name maki/{one} \"laptop\""),
+        &format!(".mesh session name maki/{one} \"laptop\""),
     );
     check(
         out.contains(&format!("Maki / {one} is now Maki / laptop")),
@@ -5928,7 +5928,7 @@ fn people_addressing_against_heard_sessions_refuses_a_user_with_two_and_reaches_
     // session name is unique among its own user's sessions only.
     let out = people_command(
         &mut mine,
-        &format!(".mesh people name carol/{carol_one} \"Laptop\""),
+        &format!(".mesh session name carol/{carol_one} \"Laptop\""),
     );
     check(
         out.contains(&format!("carol / {carol_one} is now carol / Laptop")),
@@ -6131,7 +6131,7 @@ fn people_names_survive_a_cold_restart_and_clear_falls_back_advertised_then_hash
             "re-giving the same name changes nothing",
             &out,
         );
-        let out = people_command(&mut session, ".mesh people name maki/2222bbbb \"tower\"");
+        let out = people_command(&mut session, ".mesh session name maki/2222bbbb \"tower\"");
         check(
             out.contains("Maki / 2222bbbb is now Maki / tower"),
             "naming a session",
@@ -6143,7 +6143,7 @@ fn people_names_survive_a_cold_restart_and_clear_falls_back_advertised_then_hash
         for line in [
             ".mesh people info nobody",
             ".mesh people name nobody \"x\"",
-            ".mesh people name maki/nowhere \"x\"",
+            ".mesh session name maki/nowhere \"x\"",
             ".mesh people status nobody",
         ] {
             let out = people_command(&mut session, line);
@@ -6606,8 +6606,8 @@ fn a_revoked_user_stays_known_and_their_request_to_be_trusted_reads_user_slash_s
         &out,
     );
 
-    // `people name <TAB>` offers the users and sessions by the names the people view
-    // uses; the wait fails the test when no completion naming carol is painted.
+    // `people name <TAB>` offers the users by the names the people view uses; the wait
+    // fails the test when no completion naming carol is painted.
     mine.send(".mesh people name \t").unwrap();
     wait_for(&mut mine, "carol");
     mine.send("\x1b").unwrap();

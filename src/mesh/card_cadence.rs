@@ -39,6 +39,11 @@ pub(crate) enum CardTrigger {
     /// The session announced or answered a path request; only the first time a session
     /// is heard in a run counts, and a card or message it served counts as heard.
     Heard,
+    /// The session was heard again, by an announce or a path response, after this node
+    /// had it as left or with no route, or for the first time in this run while the peer
+    /// table held it from before: asked whether or not it served this node, since it may
+    /// have restarted under new names, once per interval.
+    Reheard,
     /// The session sent this node a status request or a message, so it trusts this
     /// node: asked whether or not it served this node, as after the owner's grant. When
     /// it lifts a stop it is asked at once, since the stopped ask brought no card and the
@@ -160,13 +165,18 @@ impl CardCadence {
     /// that lifted a refusal.
     pub(crate) fn admit(&self, destination: &str, trigger: CardTrigger, served: bool) -> bool {
         let now = self.now();
-        let order = (trigger != CardTrigger::Heard).then(|| self.write_lock.lock());
+        let order = (!matches!(trigger, CardTrigger::Heard | CardTrigger::Reheard))
+            .then(|| self.write_lock.lock());
         let mut state = self.state.lock();
         let lifted = match trigger {
             CardTrigger::Heard => {
                 if !state.heard.insert(destination.to_string()) {
                     return false;
                 }
+                false
+            }
+            CardTrigger::Reheard => {
+                state.heard.insert(destination.to_string());
                 false
             }
             CardTrigger::Granted | CardTrigger::OwnerGranted => state.refused.remove(destination),
@@ -196,7 +206,10 @@ impl CardCadence {
         served: bool,
         now: Instant,
     ) -> bool {
-        let asks_unserved = matches!(trigger, CardTrigger::OwnerGranted | CardTrigger::Contacted);
+        let asks_unserved = matches!(
+            trigger,
+            CardTrigger::OwnerGranted | CardTrigger::Contacted | CardTrigger::Reheard
+        );
         if (!served && !asks_unserved) || state.refused.contains(destination) {
             return false;
         }
@@ -316,6 +329,11 @@ impl CardCadence {
     /// so its announces prompt no fetch of their own.
     pub(crate) fn note_heard(&self, destination: &str) {
         self.state.lock().heard.insert(destination.to_string());
+    }
+
+    /// Whether `destination` has been heard in this run.
+    pub(crate) fn heard_in_run(&self, destination: &str) -> bool {
+        self.state.lock().heard.contains(destination)
     }
 
     /// An admitted fetch sent nothing (no path or no route was known), so the interval
@@ -475,8 +493,9 @@ impl MeshRuntime {
     }
 
     /// Asks the session at `destination` for its card in the background when the cadence
-    /// allows: the peer table holds it, it has not said it left, this node trusts it, and
-    /// `CardCadence::admit` agrees. The fetch waits for one of `STATUS_MAX_CONCURRENCY`
+    /// allows: the peer table holds it, it has not said it left (unless it was just heard
+    /// again, which a path response does without lifting the mark), this node trusts it,
+    /// and `CardCadence::admit` agrees. The fetch waits for one of `STATUS_MAX_CONCURRENCY`
     /// permits, never asks the network for a path and never sends a `/knock` of its own
     /// (a peer that no longer trusts this session files the refused request as a knock,
     /// which is why a refusal stops the cadence); it says nothing above the debug log.
@@ -487,7 +506,7 @@ impl MeshRuntime {
         trigger: CardTrigger,
     ) -> Option<JoinHandle<()>> {
         let peer = self.peers().get(destination)?;
-        if peer.left_at.is_some()
+        if (peer.left_at.is_some() && trigger != CardTrigger::Reheard)
             || self
                 .trust()
                 .authorize(&peer.identity_hash, destination)
@@ -628,6 +647,25 @@ mod tests {
             cadence.admit(&"e".repeat(32), CardTrigger::Granted, true),
             "the interval is per destination"
         );
+    }
+
+    /// A session heard again is asked whether or not it served this node, once per
+    /// interval however often it is heard again, and never past a refusal.
+    #[test]
+    fn a_session_heard_again_is_asked_once_per_interval() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::Reheard, false));
+        assert!(cadence.heard_in_run(D));
+        assert!(
+            !cadence.admit(D, CardTrigger::Reheard, false),
+            "a second re-hear inside the interval asks nothing"
+        );
+        assert!(!cadence.admit(D, CardTrigger::Heard, true));
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(cadence.admit(D, CardTrigger::Reheard, false));
+        cadence.refused(D);
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(!cadence.admit(D, CardTrigger::Reheard, false));
     }
 
     #[test]
@@ -1085,6 +1123,75 @@ mod network {
             assert!(a.runtime.consider_card_fetch(&b_dest, trigger).is_none());
         }
         assert_eq!(status_requests(&a.runtime), 0);
+
+        assert!(slot_a.stop().await.unwrap());
+        assert!(slot_b.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    /// B never served A, so its announces ask nothing; once A has it as left, B's next
+    /// announce asks for its card and A names B's session from it within seconds, with
+    /// nothing typed. Heard again inside the interval, B is asked nothing more; past it, a
+    /// re-hear that leaves the row marked left, as a path response does, still asks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_heard_again_after_it_left_is_named_from_its_card() {
+        let relay = TransportRelay::start_on_with_retries(closed_port().await, 0).await;
+        let a = started_runtime_on("cadence-reheard-a", relay.port).await;
+        let b = started_runtime_on_with("cadence-reheard-b", relay.port, |config| {
+            config.person_name = Some("Beatrice".into());
+        })
+        .await;
+        let slot_a = Arc::new(MeshSlot::default());
+        slot_a.install(a.runtime.clone()).unwrap();
+        let slot_b = Arc::new(MeshSlot::default());
+        slot_b.install(b.runtime.clone()).unwrap();
+        slot_b.rename_session("named-session");
+        let (a_rt, b_rt) = (&a.runtime, &b.runtime);
+        let a_dest = a_rt.current_destination_hash();
+        let b_dest = b_rt.current_destination_hash();
+        wait_for_peer(a_rt, &b_dest).await;
+        wait_for_peer(b_rt, &a_dest).await;
+        a_rt.card_cadence().note_heard(&b_dest);
+        for (slot, runtime, peer) in [(&slot_a, a_rt, &b_dest), (&slot_b, b_rt, &a_dest)] {
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    peer,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(status_requests(a_rt), 0, "B never served A");
+
+        assert!(a_rt.peers().mark_left(&b_dest, SystemTime::now()));
+        b_rt.announce_on_connect().await.unwrap();
+        let started = Instant::now();
+        while a_rt.who_at(&b_dest).to_string() != "Beatrice / named-session" {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "A never named B's session: {}",
+                a_rt.who_at(&b_dest)
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(status_requests(a_rt), 1);
+
+        assert!(a_rt.peers().mark_left(&b_dest, SystemTime::now()));
+        assert!(
+            a_rt.consider_card_fetch(&b_dest, CardTrigger::Reheard)
+                .is_none(),
+            "heard again inside the interval, B is asked nothing more"
+        );
+        assert_eq!(status_requests(a_rt), 1);
+        a_rt.card_cadence().advance(CARD_FETCH_MIN_INTERVAL);
+        a_rt.consider_card_fetch(&b_dest, CardTrigger::Reheard)
+            .expect("a row still marked left is asked once heard again")
+            .await
+            .unwrap();
+        assert_eq!(status_requests(a_rt), 2);
 
         assert!(slot_a.stop().await.unwrap());
         assert!(slot_b.stop().await.unwrap());

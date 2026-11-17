@@ -36,7 +36,7 @@ use crate::mesh::pending::{
     PENDING_QUESTION_MAX_CHARS, PENDING_TTL, PendingRecord, PendingState, access_not_a_question,
     question_not_an_access_request,
 };
-use crate::mesh::people::{AliasSource, Namer, Who, YOU, hash_after, with_hash};
+use crate::mesh::people::{AliasSource, NAME_TAKEN, Namer, Who, YOU, hash_after, with_hash};
 use crate::mesh::shares::{
     ALL_LIST_ROWS, BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer,
     MatchCount, Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict,
@@ -128,6 +128,12 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
         ".mesh status [\"objective\"|clear]",
         "Show your session's status card or set its objective",
     ),
+    (
+        "",
+        "session",
+        ".mesh session name <user>/<session> \"label\" | <user>/<session> --clear",
+        "Give one session the label you call it, or clear it; the user's name is `.mesh people name`",
+    ),
     ("", "help", ".mesh help", "List the mesh commands by group"),
     (
         "people",
@@ -138,8 +144,8 @@ pub(crate) const COMMANDS: &[(&str, &str, &str, &str)] = &[
     (
         "people",
         "name",
-        ".mesh people name <user>[/<session>] \"name\" | <user>[/<session>] --clear",
-        "Give a user or one of their sessions the name you call them, or clear it",
+        ".mesh people name <user> \"name\" | <user> --clear",
+        "Give a user the name you call them, or clear it; `.mesh session name` labels one session",
     ),
     (
         "people",
@@ -393,6 +399,16 @@ pub(crate) async fn run(
         ("", "on") => turn_on(ctx, rest).await,
         ("", "off") => turn_off(ctx, rest).await,
         ("", "status") => status(ctx, rest),
+        ("", "session") => match split_verb(rest) {
+            None | Some(("name", Some("--help"))) => {
+                out_text(&render_verb_help("", "session"));
+                Ok(())
+            }
+            Some(("name", rest)) => session_name(ctx, rest),
+            Some((sub, _)) => bail!(
+                "Unknown .mesh command 'session {sub}': `.mesh session` has one command, `name`. Type `.mesh session` for its usage."
+            ),
+        },
         ("", "help") => match rest {
             Some(group) if is_group(group) => {
                 out_text(&render_group_help(group));
@@ -891,37 +907,109 @@ fn people_subject(
     ))
 }
 
-/// `.mesh people name <who> "name"` gives a user, or one session of theirs, the name you
-/// call them; `--clear` takes it back. The name stays in the people section of your trust
-/// list on this computer: no access decision reads it and nothing sent carries it.
-fn people_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
-    let usage = || NoticeText::from(render_verb_help("people", "name")).render(live_prefix());
+const PEOPLE_NAME_NAMES_USERS: &str = "`.mesh people name` names a user; to label one of their sessions run `.mesh session name <user>/<session> \"label\"`.";
+
+/// The `<who> "name"` or `<who> --clear` a naming verb takes, as the one to name and the
+/// name, `None` for `--clear`. Bare, the verb's usage is printed and nothing is returned.
+fn naming_args(
+    rest: Option<&str>,
+    group: &str,
+    verb: &str,
+    takes: &str,
+) -> Result<Option<(String, Option<String>)>> {
+    let usage = || NoticeText::from(render_verb_help(group, verb)).render(live_prefix());
     let Some(rest) = rest else {
         out_path_text(&usage());
-        return Ok(());
+        return Ok(None);
     };
     let tokens = split_tokens(rest);
     let [who, value] = tokens.as_slice() else {
-        bail!(
-            "`.mesh people name` takes who to name and one name; quote a name with spaces in it. {}",
-            usage()
-        );
+        bail!("{takes} {}", usage());
     };
-    let alias = (value != "--clear").then_some(value.as_str());
+    Ok(Some((
+        who.clone(),
+        (value != "--clear").then(|| value.clone()),
+    )))
+}
+
+/// `.mesh people name <user> "name"` gives a user the name you call them; `--clear` takes
+/// it back. The name stays in the people section of your trust list on this computer: no
+/// access decision reads it and nothing sent carries it. A session is refused: `.mesh
+/// session name` labels those.
+fn people_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some((who, alias)) = naming_args(
+        rest,
+        "people",
+        "name",
+        "`.mesh people name` takes who to name and one name; quote a name with spaces in it.",
+    )?
+    else {
+        return Ok(());
+    };
+    if who.contains('/') {
+        bail!(PEOPLE_NAME_NAMES_USERS);
+    }
     let runtime = live(ctx)?;
-    let subject = people_subject(ctx, &runtime, who)?;
-    let (identity, destination) = match &subject {
-        PeopleSubject::User(identity) => (identity.as_str(), None),
+    let identity = match people_subject(ctx, &runtime, &who)? {
+        PeopleSubject::User(identity) => identity,
+        PeopleSubject::Session { .. } => bail!(PEOPLE_NAME_NAMES_USERS),
+    };
+    if same_hash(&identity, runtime.fingerprint()) {
+        bail!(
+            "That is you: you are always `you`, and `.mesh session name <session> \"label\"` labels one of your sessions; nothing was changed."
+        );
+    }
+    write_name(&runtime, &identity, None, alias.as_deref())
+}
+
+/// `.mesh session name <session> "label"` gives one session, another user's or one of
+/// yours, the label you call it; `--clear` takes it back. Kept as `people name` keeps a
+/// user's name; the label of one of your own sessions shows on every session of yours on
+/// this config dir, and goes on that session's status card.
+fn session_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some((who, alias)) = naming_args(
+        rest,
+        "",
+        "session",
+        "`.mesh session name` takes the session to label and one label; quote a label with spaces in it.",
+    )?
+    else {
+        return Ok(());
+    };
+    let runtime = live(ctx)?;
+    let (identity, destination) = match people_subject(ctx, &runtime, &who)? {
         PeopleSubject::Session {
             identity,
             destination,
-        } => (identity.as_str(), Some(destination.as_str())),
+        } => (identity, destination),
+        PeopleSubject::User(_) => {
+            return Err(QuotingError::wrap(
+                NoticeText::default().frame("'").peer(&who).frame(
+                    "' names a user, not a session; `.mesh people name <user> \"name\"` names the user, and `.mesh session name <user>/<session> \"label\"` labels one of their sessions.",
+                ),
+            ));
+        }
     };
-    if same_hash(identity, runtime.fingerprint()) {
-        bail!(
-            "That is you: your own sessions go by their session names, and you are always `you`; nothing was changed."
-        );
+    if same_hash(&identity, runtime.fingerprint())
+        && let Some(alias) = &alias
+        && runtime.own_sessions().iter().any(|(at, session)| {
+            !same_hash(at, &destination)
+                && session.trim().to_lowercase() == alias.trim().to_lowercase()
+        })
+    {
+        bail!(NAME_TAKEN);
     }
+    write_name(&runtime, &identity, Some(&destination), alias.as_deref())
+}
+
+/// Sets, or with `None` clears, the name of the user `identity` or, given `destination`,
+/// the label of that session of theirs, then says what it reads as now.
+fn write_name(
+    runtime: &MeshRuntime,
+    identity: &str,
+    destination: Option<&str>,
+    alias: Option<&str>,
+) -> Result<()> {
     let before = runtime.namer();
     let shown = |namer: &Namer| match destination {
         None => namer.user(Some(identity)),
@@ -937,6 +1025,16 @@ fn people_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let now = shown(&runtime.namer());
     let hash = short(destination.unwrap_or(identity));
+    let kept = if before.is_you(identity) {
+        "Your sessions on this config dir all show it, and while mesh.share_session_name is on its status card offers it as the session's name."
+    } else {
+        "The name stays on this computer and is never sent to anyone."
+    };
+    let noun = if destination.is_some() {
+        "label"
+    } else {
+        "name"
+    };
     let text = match alias {
         Some(alias) => NoticeText::default()
             .peer(was)
@@ -944,11 +1042,9 @@ fn people_name(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             .peer(now)
             .frame("; type `")
             .peer(alias)
-            .frame(format!(
-                "` in place of its hash ({hash}). The name stays on this computer and is never sent to anyone."
-            )),
+            .frame(format!("` in place of its hash ({hash}). {kept}")),
         None => NoticeText::default()
-            .frame(format!("Cleared the name you gave {hash}; it shows as "))
+            .frame(format!("Cleared the {noun} you gave {hash}; it shows as "))
             .peer(now)
             .frame("."),
     };
@@ -1143,6 +1239,13 @@ async fn peer_status(
             QuotingError::followed_by(err, quote_status_tail(token))
         }
     })?;
+    if runtime.own_session_ended(&destination) {
+        return Err(QuotingError::wrap(
+            NoticeText::default()
+                .peer(runtime.who_at(&destination).to_string())
+                .frame(" ended (its process on this computer is gone), so it cannot answer; .mesh people list shows your running sessions."),
+        ));
+    }
     let Some(peer) =
         peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL, abort_signal).await?
     else {
@@ -8132,7 +8235,8 @@ fn named_hash(kind: HashKind, target: &NameTarget) -> Option<String> {
 
 /// The hash the names spelled `token` agree on, case aside; `None` when no name is
 /// spelled so, which leaves `token` to the hash rules. Names that disagree are refused
-/// with every candidate, as is a name that cannot give `kind` a hash.
+/// with every candidate, as is a name that cannot give `kind` a hash. A user's name
+/// shared with one of their own sessions names the user.
 fn resolve_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<Result<String>> {
     let spelled = token.to_lowercase();
     let matches: Vec<&AddressName> = names
@@ -8142,10 +8246,21 @@ fn resolve_name(token: &str, kind: HashKind, names: &[AddressName]) -> Option<Re
     if matches.is_empty() {
         return None;
     }
+    let users: Vec<&str> = matches
+        .iter()
+        .filter(|name| matches!(name.target, NameTarget::User { .. }))
+        .map(|name| name.target.identity())
+        .collect();
     let usable: Vec<&AddressName> = matches
         .iter()
         .copied()
-        .filter(|name| name_applies(kind, &name.target))
+        .filter(|name| {
+            name_applies(kind, &name.target)
+                && (matches!(name.target, NameTarget::User { .. })
+                    || !users
+                        .iter()
+                        .any(|user| same_hash(user, name.target.identity())))
+        })
         .collect();
     if usable.is_empty() {
         return Some(Err(QuotingError::wrap(not_a_user(token, &matches, names))));
@@ -8469,7 +8584,7 @@ fn unpicked_user(name: &str, sessions: &[String], names: &[AddressName]) -> Noti
         });
     head.frame(format!(" with {count} sessions you have heard: "))
         .then(listed)
-        .frame(". Type the one you mean in its place; `.mesh people name <user>/<session> \"name\"` names a session.")
+        .frame(". Type the one you mean in its place; `.mesh session name <user>/<session> \"label\"` labels a session.")
 }
 
 /// Names spelled `token` that only stand for sessions, given where a user is wanted.
@@ -8700,6 +8815,23 @@ mod name_addressing_tests {
         );
     }
 
+    /// A user and one of their own sessions may share a name; typed bare it names the
+    /// user, so `<user>/<session>` is how the session is typed.
+    #[test]
+    fn a_name_a_user_shares_with_their_session_names_the_user() {
+        let names = vec![
+            user("Bob", &[LAPTOP, MAKI_DESK]),
+            user_session("Bob", LAPTOP),
+        ];
+        assert_eq!(resolved("bob", HashKind::Peer, &names), MAKI);
+        assert_eq!(resolved("bob", HashKind::Identity, &names), MAKI);
+        let text = refusal("bob", HashKind::Destination, &names);
+        assert!(
+            text.starts_with("`Bob` is a user with 2 sessions you have heard: "),
+            "{text}"
+        );
+    }
+
     /// A name your session and another user's session share is refused with both, and a
     /// user with several sessions is refused with each session as `<user>/<session>`.
     #[test]
@@ -8728,7 +8860,7 @@ mod name_addressing_tests {
         assert!(text.contains("`maki/laptop` (22222222)"), "{text}");
         assert!(text.contains("`maki/44444444` (44444444)"), "{text}");
         assert!(
-            text.contains("`.mesh people name <user>/<session> \"name\"`"),
+            text.contains("; `.mesh session name <user>/<session> \"label\"` labels a session."),
             "{text}"
         );
         assert_eq!(
@@ -10707,6 +10839,7 @@ mod help_output_tests {
                 ".mesh on | Join the mesh for this session only; config.yaml is not changed",
                 ".mesh off | Leave the mesh and drop the mesh__* tools",
                 ".mesh status | Show your session's status card or set its objective",
+                ".mesh session | Give one session the label you call it, or clear it; the user's name is `.mesh people name`",
                 ".mesh help | List the mesh commands by group",
                 ".mesh people | See the users and sessions you have heard from, and what one session is doing",
                 ".mesh access | Decide whom you trust, block or forget, and answer requests to be trusted",
@@ -10733,7 +10866,7 @@ mod help_output_tests {
                 "people: See the users and sessions you have heard from, and what one session is doing",
                 "command | what it does",
                 ".mesh people list | List the users and sessions you have heard, you first",
-                ".mesh people name | Give a user or one of their sessions the name you call them, or clear it",
+                ".mesh people name | Give a user the name you call them, or clear it; `.mesh session name` labels one session",
                 ".mesh people info | Show what you know of one user or session, with its hashes",
                 ".mesh people status | Fetch a trusted session's status card",
                 "`.mesh people <command> --help` shows a command's usage.",
@@ -10753,7 +10886,7 @@ mod help_output_tests {
                 "left | The session said it was leaving the mesh, until it announces again or is heard over a link.",
                 "no route | You have no path to it (a relay that restarted has none until the session announces again), its last link failed, or the session has ended; it may have left the mesh, so wait for its next announce and run .mesh people list again.",
                 "hashes | <user hash> / <session hash>, shortened; `.mesh people info <who>` shows them whole.",
-                "addressing | Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh people name <user>/<session> \"name\"` one of their sessions.",
+                "addressing | Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh session name <user>/<session> \"label\"` labels one of their sessions.",
                 "Under the hood: a user is a Reticulum identity (one key pair; its hash is the user hash) and a session is a destination, the address one running instance announces (its hash is the session hash). A name is shown in place of a hash and never sent to identify anyone.",
             ]
         );
@@ -10944,6 +11077,14 @@ mod help_output_tests {
         assert_eq!(
             render_verb_help("", "help"),
             "Usage: .mesh help\n  List the mesh commands by group\n  `.mesh <group>` lists one group's commands and what its words mean; `--help` after any command shows its usage."
+        );
+        assert_eq!(
+            render_verb_help("", "session"),
+            "Usage: .mesh session name <user>/<session> \"label\" | <user>/<session> --clear\n  Give one session the label you call it, or clear it; the user's name is `.mesh people name`\n  The label replaces the session's name in every line you see, and you can type it, or `<user>/<label>`, in place of the hash. A label on one of your own sessions shows on all of them and, while mesh.share_session_name is on, goes on its status card as its session name."
+        );
+        assert_eq!(
+            render_verb_help("people", "name"),
+            "Usage: .mesh people name <user> \"name\" | <user> --clear\n  Give a user the name you call them, or clear it; `.mesh session name` labels one session\n  The name is yours alone: it is never sent, and it replaces the name they advertised in every line you see. Naming someone grants them nothing."
         );
         for (group, verb, _, summary) in COMMANDS {
             let note = verb_help_note(group, verb)
@@ -11666,6 +11807,9 @@ fn verb_help_note(group: &str, verb: &str) -> Option<&'static str> {
         }
         ("", "help") => {
             "`.mesh <group>` lists one group's commands and what its words mean; `--help` after any command shows its usage."
+        }
+        ("", "session") => {
+            "The label replaces the session's name in every line you see, and you can type it, or `<user>/<label>`, in place of the hash. A label on one of your own sessions shows on all of them and, while mesh.share_session_name is on, goes on its status card as its session name."
         }
         ("people", "list") => {
             "Each row is one session, grouped by user; the trust and state columns say whether it may reach you and whether it is still around. `.mesh people help` says what each word in them means."
@@ -12395,7 +12539,7 @@ fn people_meaning(word: &str) -> String {
 }
 
 /// The `people help` row that teaches typing a name in place of a hash.
-const NAME_ADDRESSING_LINE: &str = "Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh people name <user>/<session> \"name\"` one of their sessions.";
+const NAME_ADDRESSING_LINE: &str = "Type a user, a session or <user>/<session> in place of a hash, as in `.mesh people status <user>/<session>` or `.mesh messaging send <session> <text>`; `.mesh people name <user> \"name\"` names a user and `.mesh session name <user>/<session> \"label\"` labels one of their sessions.";
 
 #[cfg(test)]
 mod peers_route_tests {
@@ -23611,11 +23755,98 @@ mod tests {
                     });
                 }
 
+                /// `a` labels its sibling `temp`: every line in `a` reads `you / build`,
+                /// `temp` itself reads the label from the shared trust list once it reloads,
+                /// its status card offers `build` as the session over the snapshot's name,
+                /// and the bare label types it. A label that reads as another of your
+                /// sessions' names is refused, and `--clear` gives back `temp`.
+                #[test]
+                #[serial]
+                fn an_own_session_label_shows_on_every_session_and_on_its_card() {
+                    use crate::mesh::card::{CardSource, StatusHandler};
+                    use crate::mesh::snapshot::MeshSnapshot;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-own-session-label");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let tmp = TempDir::new("repl-mesh-own-session-label");
+                        let a = start_as("a", &tmp, addr.port()).await;
+                        let temp = start_as("temp", &tmp, addr.port()).await;
+                        let temp_slot = Arc::new(MeshSlot::default());
+                        temp_slot.install(temp.clone()).unwrap();
+                        temp_slot.publish(MeshSnapshot {
+                            session: CardSource::shared_session(temp_slot.as_ref()),
+                            ..snapshot_fixture()
+                        });
+                        let card_source: Arc<dyn CardSource> = temp_slot.clone();
+                        let card_session = || {
+                            StatusHandler::new(Arc::downgrade(&card_source))
+                                .card(SystemTime::now())
+                                .session
+                        };
+                        assert_eq!(card_session().as_deref(), Some("temp"));
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(a.clone()).unwrap();
+                        let temp_dest = temp.current_destination_hash();
+                        let dest8 = short(&temp_dest).to_string();
+                        heard_as_you(&a, &temp_dest);
+
+                        let named = out_of(&mut ctx, ".mesh session name temp \"build\"")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            named,
+                            format!(
+                                "you / temp is now you / build; type `build` in place of its hash ({dest8}). Your sessions on this config dir all show it, and while mesh.share_session_name is on its status card offers it as the session's name."
+                            )
+                        );
+                        assert_eq!(a.who_at(&temp_dest).to_string(), "you / build");
+                        let out = out_of(&mut ctx, ".mesh people list").await.unwrap();
+                        let rows = table_rows(&out);
+                        assert!(
+                            rows.iter().any(|row| row[0] == YOU
+                                && row[1] == "build"
+                                && row[6].ends_with(&format!(" / {dest8}"))),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            temp.who_at(&temp_dest).to_string(),
+                            "you / build",
+                            "the sibling reads the label from the shared trust list"
+                        );
+                        assert_eq!(card_session().as_deref(), Some("build"));
+                        assert!(
+                            a.address_names().iter().any(|name| name.name == "build"
+                                && name.target.destination() == Some(temp_dest.as_str())),
+                            "the bare label types the session"
+                        );
+
+                        let err = refusal(&mut ctx, ".mesh session name temp \"A\"").await;
+                        assert_eq!(err, NAME_TAKEN);
+
+                        let cleared = out_of(&mut ctx, ".mesh session name build --clear")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            cleared,
+                            format!("Cleared the label you gave {dest8}; it shows as you / temp.")
+                        );
+                        assert_eq!(temp.who_at(&temp_dest).to_string(), "you / temp");
+                        assert_eq!(card_session().as_deref(), Some("temp"));
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        assert!(temp_slot.stop().await.unwrap());
+                        relay_handle.abort();
+                    });
+                }
+
                 /// Once `temp` stops in order its registry row stays as a tombstone: `a`
                 /// names temp's row `(you, gone)` with `no route` in `.mesh people list`,
                 /// `mesh__peers` marks it `session_gone` and unreachable, the question it
                 /// left open reads `asked by (you, gone: temp)` in `.mesh messaging sent`, and
-                /// the name `temp` no longer resolves.
+                /// the name `temp` still resolves: typed by name or by hash, `.mesh people
+                /// status` says at once that the session ended, with no link to wait out.
                 #[test]
                 #[serial]
                 fn a_cleanly_stopped_own_session_reads_gone_with_no_route() {
@@ -23739,7 +23970,21 @@ mod tests {
                             ),
                             "{out}"
                         );
-                        assert!(!named_temp(&ctx), "a gone session is never a name");
+                        let ended = "you / temp ended (its process on this computer is gone), so it cannot answer; .mesh people list shows your running sessions.";
+                        for line in [
+                            format!(".mesh people status {}", short(&temp_dest)),
+                            ".mesh people status temp".to_string(),
+                        ] {
+                            let asked = std::time::Instant::now();
+                            let err = refusal(&mut ctx, &line).await;
+                            let waited = asked.elapsed();
+                            assert!(waited <= Duration::from_secs(3), "{line} took {waited:?}");
+                            assert_eq!(err, ended, "{line}");
+                        }
+                        assert!(
+                            named_temp(&ctx),
+                            "a gone session the registry keeps is a name"
+                        );
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         relay.stop().await;
@@ -30553,7 +30798,7 @@ mod tests {
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
                     let named = out_of(
                         &mut ctx,
-                        &format!(".mesh people name Tia/{} \"Tia box\"", short(&dest)),
+                        &format!(".mesh session name Tia/{} \"Tia box\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -30576,6 +30821,76 @@ mod tests {
                     .unwrap();
                     assert!(out.contains("updated"), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `people name` names users only: a `<user>/<session>` or a session's hash is
+            /// refused pointing at `session name`, which labels the session and clears the
+            /// label with the lines `people name` prints, and refuses a user in turn.
+            /// `.mesh session`, `--help` and `name --help` print the usage.
+            #[test]
+            #[serial]
+            fn session_name_labels_a_session_and_people_name_names_users_only() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-session-name");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-session-name").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (dest, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    let dest8 = short(&dest).to_string();
+                    let pointer = "`.mesh people name` names a user; to label one of their sessions run `.mesh session name <user>/<session> \"label\"`.";
+
+                    for line in [
+                        format!(".mesh people name Tia/{dest8} \"box\""),
+                        format!(".mesh people name {dest} \"box\""),
+                        format!(".mesh people name Tia/{dest8} --clear"),
+                    ] {
+                        assert_eq!(refusal(&mut ctx, &line).await, pointer, "{line}");
+                    }
+
+                    let usage = render_verb_help("", "session");
+                    for line in [
+                        ".mesh session",
+                        ".mesh session --help",
+                        ".mesh session name --help",
+                    ] {
+                        let out = out_of(&mut ctx, line).await.unwrap();
+                        assert_eq!(out, usage, "{line}");
+                    }
+                    let err = refusal(&mut ctx, ".mesh session rename x").await;
+                    assert_eq!(
+                        err,
+                        "Unknown .mesh command 'session rename': `.mesh session` has one command, `name`. Type `.mesh session` for its usage."
+                    );
+
+                    let named =
+                        out_of(&mut ctx, &format!(".mesh session name Tia/{dest8} \"box\""))
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        named,
+                        format!(
+                            "Tia / {dest8} is now Tia / box; type `box` in place of its hash ({dest8}). The name stays on this computer and is never sent to anyone."
+                        )
+                    );
+                    assert_eq!(started.runtime.who_at(&dest).to_string(), "Tia / box");
+                    let cleared = out_of(&mut ctx, ".mesh session name Tia/box --clear")
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        cleared,
+                        format!("Cleared the label you gave {dest8}; it shows as Tia / {dest8}.")
+                    );
+
+                    let err = refusal(&mut ctx, ".mesh session name Tia \"box\"").await;
+                    assert_eq!(
+                        err,
+                        "'Tia' names a user, not a session; `.mesh people name <user> \"name\"` names the user, and `.mesh session name <user>/<session> \"label\"` labels one of their sessions."
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -32686,7 +33001,7 @@ mod tests {
                     .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh people name Tia/{} \"Tia's desk\"", short(&dest)),
+                        &format!(".mesh session name Tia/{} \"Tia's desk\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -35275,7 +35590,7 @@ mod tests {
                     .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh people name Tia/{} \"Tia's desk\"", short(&dest)),
+                        &format!(".mesh session name Tia/{} \"Tia's desk\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -35563,7 +35878,7 @@ mod tests {
                     .unwrap();
                     out_of(
                         &mut ctx,
-                        &format!(".mesh people name Tia/{} \"Tia's desk\"", short(&dest)),
+                        &format!(".mesh session name Tia/{} \"Tia's desk\"", short(&dest)),
                     )
                     .await
                     .unwrap();
@@ -37704,10 +38019,15 @@ mod tests {
                     .await
                     .unwrap_err()
                     .to_string();
+                    let who = runtime
+                        .owner_namer()
+                        .who(Some(&stub.identity_hex()), &peer)
+                        .to_string();
                     assert!(
-                        err.starts_with(
-                            "That session is unreachable and no propagation node is known yet to hold the message for it."
-                        ),
+                        err.starts_with(&format!("{who} left "))
+                            && err.contains(
+                                " ago and no propagation node is known to hold the message, so it was not sent. It is delivered once a propagation node is heard or that session is back; .mesh people list shows both."
+                            ),
                         "{err}"
                     );
                     let err = run(
