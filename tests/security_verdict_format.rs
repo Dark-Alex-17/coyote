@@ -34,7 +34,8 @@ fn template(text: &str, verdict: &str) -> Vec<String> {
 }
 
 /// Numbered items under a literal header after the last sentinel line: the
-/// contract a caller relies on, with nothing tolerated beyond it.
+/// contract a caller relies on, with nothing tolerated beyond it. Items under
+/// the trailing `Pre-existing, out of scope:` header are not findings.
 fn reported(report: &str) -> Vec<String> {
     let lines: Vec<&str> = report.lines().collect();
     let Some(last) = lines
@@ -54,9 +55,9 @@ fn reported(report: &str) -> Vec<String> {
             in_section = true;
             continue;
         }
-        let numbered = line.split_once(". ").filter(|(n, _)| {
-            !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
-        });
+        let numbered = line
+            .split_once(". ")
+            .filter(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
         if let (true, Some((_, rest))) = (in_section, numbered) {
             items.push(rest.to_string());
         }
@@ -69,7 +70,9 @@ fn assert_pass_template_has_header(rel: &str) {
     let header = block
         .iter()
         .position(|l| l == "Non-blocking findings:")
-        .unwrap_or_else(|| panic!("{rel}: the PASS template has no `Non-blocking findings:` line: {block:?}"));
+        .unwrap_or_else(|| {
+            panic!("{rel}: the PASS template has no `Non-blocking findings:` line: {block:?}")
+        });
     assert!(
         block.get(header + 1).is_some_and(|l| l.starts_with("1. ")),
         "{rel}: the PASS template's header is not followed by a numbered item: {block:?}"
@@ -128,6 +131,7 @@ fn prompt_and_skill_say_the_tail_is_plain_text() {
             "emit them outside any code fence",
             "on its own line exactly as written, never bold or reworded",
             "list every finding that the Posture line counts",
+            "An optional `Pre-existing, out of scope:` header always comes last, on its own plain line, with numbered items that the Posture line does not count.",
             "A finding that appears only in that prose is not reported.",
         ] {
             assert!(text.contains(anchor), "{rel} lost anchor {anchor:?}");
@@ -141,9 +145,9 @@ fn prompt_and_skill_say_the_tail_is_plain_text() {
 
 /// The three report shapes that lost reported findings in a recorded campaign,
 /// reduced to their tails: a bold header, a numbered list straight under the
-/// Posture line, and a list inside a code fence with no header. Each counts a
-/// finding, and none yields one to a caller; the shape the templates now
-/// prescribe does.
+/// Posture line, and the same headerless list inside a code fence. Each counts
+/// a finding, and none yields one to a caller; the shape the templates now
+/// prescribe does, and its trailing out-of-scope items stay uncounted.
 #[test]
 fn recorded_off_contract_shapes_yield_nothing_and_the_prescribed_shape_does() {
     let posture = "Posture: standard. Findings: 0 critical, 1 high, 1 medium, 0 low.";
@@ -151,9 +155,22 @@ fn recorded_off_contract_shapes_yield_nothing_and_the_prescribed_shape_does() {
     let bold = format!("SECURITY_REVIEW: FAIL\n{posture}\n\n**Blocking findings:**\n{item}\n");
     let headerless = format!("SECURITY_REVIEW: PASS\n{posture}\n\n{item}\n");
     let fenced = format!("```\nSECURITY_REVIEW: PASS\n{posture}\n{item}\n```\n");
-    for (shape, report) in [("bold", &bold), ("headerless", &headerless), ("fenced", &fenced)] {
-        assert!(reported(report).is_empty(), "{shape}: the reader is looser than the contract");
+    for (shape, report) in [
+        ("bold", &bold),
+        ("headerless", &headerless),
+        ("headerless inside a fence", &fenced),
+    ] {
+        assert!(
+            reported(report).is_empty(),
+            "{shape}: the reader is looser than the contract"
+        );
     }
-    let prescribed = format!("SECURITY_REVIEW: PASS\n{posture}\nNon-blocking findings:\n{item}\n");
-    assert_eq!(reported(&prescribed).len(), 1);
+    let prescribed = format!(
+        "SECURITY_REVIEW: PASS\n{posture}\nNon-blocking findings:\n{item}\n\
+         Pre-existing, out of scope:\n1. Old weak hash - app/auth.py:12 - predates the change - migrate\n"
+    );
+    assert_eq!(
+        reported(&prescribed),
+        vec![item.trim_start_matches("1. ").to_string()]
+    );
 }

@@ -83,8 +83,10 @@ The fences above only mark the templates. Callers read the lines after the senti
 text, so emit them outside any code fence. Put each header (`Blocking findings:`,
 `Non-blocking findings:`) on its own line exactly as written, never bold or reworded. Number
 every finding under its header, and list every finding that the Posture line counts. A PASS
-with no findings ends at the Posture line. Explanatory prose goes above the sentinel. A finding
-that appears only in that prose is not reported.
+with no findings ends at the Posture line. An optional `Pre-existing, out of scope:` header
+always comes last, on its own plain line, with numbered items that the Posture line does not
+count. Explanatory prose goes above the sentinel. A finding that appears only in that prose is
+not reported.
 
 Every finding MUST cite file:line and articulate the concrete attack path or hazard. A finding
 with no location and no attack path is noise — do not emit it.
