@@ -35,6 +35,7 @@ use crate::function::{
     rag_query::RAG_FUNCTION_PREFIX,
     skill::{SKILL_FUNCTION_PREFIX, report_withheld_tools},
     todo::TODO_FUNCTION_PREFIX,
+    undeclared_mcp_server_error,
     user_interaction::USER_FUNCTION_PREFIX,
 };
 use crate::graph::route::Branch;
@@ -2380,7 +2381,7 @@ impl RequestContext {
         let agent_tools = self
             .agent
             .as_ref()
-            .map(|agent| AgentToolGate::new(agent, &app.mapping_tools));
+            .map(|agent| AgentToolGate::new(agent, app));
         Ok((
             self.skill_registry
                 .effective_role(&role, &policy, agent_tools.as_ref()),
@@ -2908,7 +2909,7 @@ impl RequestContext {
             }
         };
 
-        if !enable && self.skill_registry.loaded_mcp_servers().contains(name) {
+        if !enable && self.skill_mcp_servers().contains(name) {
             println!(
                 "Note: '{name}' is granted by a loaded skill and will keep running until that skill is unloaded."
             );
@@ -4505,7 +4506,7 @@ impl RequestContext {
         } else {
             self.app.config.enabled_mcp_servers.clone()
         };
-        let skill_mcps = self.skill_registry.loaded_mcp_servers();
+        let skill_mcps = self.skill_mcp_servers();
 
         let mut out = String::from("MCP servers:\n");
         for name in &names {
@@ -5079,7 +5080,7 @@ impl RequestContext {
                 } else {
                     self.app.config.enabled_mcp_servers.clone()
                 };
-                let is_enabled = self.skill_registry.loaded_mcp_servers().contains(server)
+                let is_enabled = self.skill_mcp_servers().contains(server)
                     || matches!(&enabled, Some(list) if list.iter().any(|s| s.trim() == "all") || self.mcp_list_covers(list, server));
                 if !is_enabled {
                     bail!(
@@ -5860,6 +5861,35 @@ impl RequestContext {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
+    /// The MCP servers the loaded skills grant. Inside an agent only the ones
+    /// the agent declares in `mcp_servers`: a skill never widens them.
+    pub(crate) fn skill_mcp_servers(&self) -> BTreeSet<String> {
+        let agent_tools = self
+            .agent
+            .as_ref()
+            .map(|agent| AgentToolGate::new(agent, &self.app.config));
+        self.skill_registry.loaded_mcp_servers(agent_tools.as_ref())
+    }
+
+    /// The refusal for using MCP server `server` inside an agent that does not
+    /// declare it. A server the session itself enables stays usable; one only
+    /// a loaded skill grants does not.
+    pub(crate) fn mcp_server_refusal(&self, server: &str) -> Option<String> {
+        let agent = self.agent.as_ref()?;
+        if AgentToolGate::new(agent, &self.app.config).allows_mcp_server(server) {
+            return None;
+        }
+        if let Some(list) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.enabled_mcp_servers())
+            && (list.iter().any(|item| item.trim() == "all") || self.mcp_list_covers(&list, server))
+        {
+            return None;
+        }
+        Some(undeclared_mcp_server_error(server, agent.name()))
+    }
+
     pub fn mcp_prompt_completion(&self, args: &[&str]) -> McpPromptCompletion {
         let app = self.app.config.as_ref();
         let enabled_ids = match &self.app.mcp_config {
@@ -5867,7 +5897,7 @@ impl RequestContext {
                 let mut servers = self
                     .enabled_mcp_servers_for_current_scope(app, true)
                     .unwrap_or_default();
-                servers.extend(self.skill_registry.loaded_mcp_servers());
+                servers.extend(self.skill_mcp_servers());
                 expand_enabled_mcp_server_ids(app, mcp_config, &servers)
             }
             None => vec![],
@@ -5908,7 +5938,7 @@ impl RequestContext {
         )?;
 
         let enabled_mcp_servers = if policy.skills_enabled && app.mcp_server_support {
-            let skill_mcps = self.skill_registry.loaded_mcp_servers();
+            let skill_mcps = self.skill_mcp_servers();
             let has_all = enabled_mcp_servers
                 .as_ref()
                 .map(|v| v.iter().any(|s| s.trim() == "all"))
@@ -6898,7 +6928,7 @@ impl RequestContext {
         let warnings = self
             .agent
             .as_ref()
-            .map(|agent| AgentToolGate::new(agent, &self.app.config.mapping_tools).warnings(&skill))
+            .map(|agent| AgentToolGate::new(agent, &self.app.config).warnings(&skill))
             .unwrap_or_default();
         self.skill_registry.insert(skill)?;
         if let Err(e) = self.refresh_tool_scope(abort_signal).await {
@@ -10337,6 +10367,136 @@ mod tests {
                 "{notice}: {stderr:?}"
             );
         }
+    }
+
+    /// A skill `grants-mcp` granting the MCP server `skillsrv` and, when
+    /// `agent_servers` is set, a plain agent declaring exactly those
+    /// `mcp_servers`, entered.
+    fn skill_mcp_ctx(agent_servers: Option<&[&str]>) -> (RequestContext, Option<String>) {
+        let skill_file = paths::skill_file("grants-mcp");
+        create_dir_all(skill_file.parent().unwrap()).unwrap();
+        write(
+            &skill_file,
+            "---\ndescription: D\nenabled_mcp_servers: skillsrv\n---\nUse the server.\n",
+        )
+        .unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.model = fc_model("agent-model");
+        let app = ctx.app.config.clone();
+        let agent_name = agent_servers.map(|servers| {
+            let agent_name = unique_name("test_skill_mcp_agent");
+            let agent_dir = paths::agent_data_dir(&agent_name);
+            create_dir_all(&agent_dir).unwrap();
+            let mcp_servers: String = servers
+                .iter()
+                .map(|server| format!("  - {server}\n"))
+                .collect();
+            let mcp_block = if servers.is_empty() {
+                String::new()
+            } else {
+                format!("mcp_servers:\n{mcp_servers}")
+            };
+            write(
+                agent_dir.join("config.yaml"),
+                format!("name: {agent_name}\ninstructions: hi\n{mcp_block}"),
+            )
+            .unwrap();
+            run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal()))
+                .unwrap();
+            agent_name
+        });
+        (ctx, agent_name)
+    }
+
+    fn load_grants_mcp(ctx: &mut RequestContext) -> serde_json::Value {
+        let result = run_async(skill::handle_skill_tool(
+            ctx,
+            "skill__load",
+            &json!({"name": "grants-mcp"}),
+        ))
+        .unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        // No MCP config is installed, so the server's meta tools are added
+        // by hand the way a started server's would be.
+        ctx.tool_scope
+            .functions
+            .append_mcp_meta_functions(vec![tools_only_features("skillsrv")]);
+        result
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_withholds_an_undeclared_mcp_server_and_warns() {
+        let _guard = HelperConfigDirGuard::new();
+        crate::testing::install_log_collector();
+        let (mut ctx, agent_name) = skill_mcp_ctx(Some(&[]));
+        let agent_name = agent_name.unwrap();
+
+        let result = load_grants_mcp(&mut ctx);
+
+        let warning = format!(
+            "Skill 'grants-mcp' grants MCP server 'skillsrv', but it is not enabled for agent '{agent_name}' and will not be offered. To use it with this skill, add skillsrv to {agent_name}'s mcp_servers in the agent definition."
+        );
+        assert_eq!(result["warnings"], json!([warning]), "{result}");
+        let logged = crate::testing::warn_snapshot();
+        assert!(logged.contains(&warning), "{logged:?}");
+        assert!(
+            ctx.skill_mcp_servers().is_empty(),
+            "the server must not be started"
+        );
+        let offered = offered_tool_names(&ctx);
+        assert!(
+            !offered.iter().any(|name| name == "mcp_invoke_skillsrv"),
+            "{offered:?}"
+        );
+
+        let refusal = format!(
+            "MCP server 'skillsrv' is not enabled for agent '{agent_name}'. To use it, add skillsrv to {agent_name}'s mcp_servers in the agent definition."
+        );
+        let output = run_async(
+            ToolCall::new(
+                "mcp_invoke_skillsrv".into(),
+                json!({"tool": "anything", "arguments": {}}),
+                Some("id1".into()),
+            )
+            .eval(&mut ctx),
+        )
+        .unwrap();
+        assert_eq!(output, json!({"tool_call_error": refusal}));
+    }
+
+    #[test]
+    #[serial]
+    fn skill_load_inside_an_agent_keeps_a_declared_mcp_server_without_warning() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_mcp_ctx(Some(&["skillsrv"]));
+
+        let result = load_grants_mcp(&mut ctx);
+
+        assert!(result.get("warnings").is_none(), "{result}");
+        assert!(ctx.skill_mcp_servers().contains("skillsrv"));
+        assert_eq!(ctx.mcp_server_refusal("skillsrv"), None);
+        let offered = offered_tool_names(&ctx);
+        assert!(
+            offered.iter().any(|name| name == "mcp_invoke_skillsrv"),
+            "{offered:?}"
+        );
+    }
+
+    /// Outside an agent there is no `mcp_servers` list to hold a skill to,
+    /// so a skill's MCP servers apply as written, as they always have.
+    #[test]
+    #[serial]
+    fn skill_load_without_an_agent_keeps_every_granted_mcp_server() {
+        let _guard = HelperConfigDirGuard::new();
+        let (mut ctx, _) = skill_mcp_ctx(None);
+
+        let result = load_grants_mcp(&mut ctx);
+
+        assert!(result.get("warnings").is_none(), "{result}");
+        assert!(ctx.skill_mcp_servers().contains("skillsrv"));
+        assert_eq!(ctx.mcp_server_refusal("skillsrv"), None);
     }
 
     #[test]

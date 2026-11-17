@@ -191,7 +191,7 @@ async fn handle_load(
     let warnings = ctx
         .agent
         .as_ref()
-        .map(|agent| AgentToolGate::new(agent, &ctx.app.config.mapping_tools).warnings(&skill))
+        .map(|agent| AgentToolGate::new(agent, &ctx.app.config).warnings(&skill))
         .unwrap_or_default();
     if let Err(e) = ctx.skill_registry.insert(skill) {
         return Ok(json!({"error": e.to_string()}));

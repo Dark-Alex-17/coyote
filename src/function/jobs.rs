@@ -551,6 +551,12 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             .strip_prefix(&format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_"))
             .ok_or_else(|| anyhow!("Malformed MCP invoke function name: {tool}"))?
             .to_string();
+        if let Some(refusal) = ctx.mcp_server_refusal(&server) {
+            return Ok(json!({
+                "status": "error",
+                "message": refusal,
+            }));
+        }
         let Some(server_handle) = ctx.tool_scope.mcp_runtime.get(&server) else {
             return Ok(json!({
                 "status": "error",

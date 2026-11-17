@@ -1677,7 +1677,15 @@ impl ToolCall {
 
         let vision = ctx.current_model().supports_vision();
         let mut attachments: Vec<ImageAttachment> = vec![];
+        let mcp_refusal =
+            mcp_meta_server(&cmd_name).and_then(|server| ctx.mcp_server_refusal(server));
         let output = match cmd_name.as_str() {
+            _ if mcp_refusal.is_some() => {
+                let error_msg = mcp_refusal.unwrap_or_default();
+                warn!("{error_msg}");
+                emit_tool_warning(quiet, &error_msg, &error_msg);
+                json!({"tool_call_error": error_msg})
+            }
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
                 Self::search_mcp_tools(ctx, &cmd_name, &json_data)
                     .await
@@ -2681,6 +2689,22 @@ pub(crate) fn undeclared_tool_error(tool: &str, agent: &str) -> String {
     format!(
         "Tool '{tool}' is not enabled for agent '{agent}'. To use it, add {tool} to {agent}'s global_tools in the agent definition."
     )
+}
+
+/// The refusal for an MCP server the active agent does not declare. Skills
+/// never widen an agent's `mcp_servers`, so its tools are not usable.
+pub(crate) fn undeclared_mcp_server_error(server: &str, agent: &str) -> String {
+    format!(
+        "MCP server '{server}' is not enabled for agent '{agent}'. To use it, add {server} to {agent}'s mcp_servers in the agent definition."
+    )
+}
+
+/// The MCP server an MCP meta function (`mcp_invoke_<server>` and its
+/// siblings) addresses.
+pub(crate) fn mcp_meta_server(name: &str) -> Option<&str> {
+    MCP_META_FUNCTION_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix)?.strip_prefix('_'))
 }
 
 /// A spawn failure naming the tool, and for a missing executable the
