@@ -45,7 +45,7 @@ const ENV_HEADING: &str = "# UI and Prompt Related Variables";
 const HEADLESS_HEADING: &str = "## Prompts without a human";
 const IN_PROCESS_LEAD: &str = "- **Also published in-process.**";
 /// The contexts of the keys table.
-const KEY_CONTEXTS: [&str; 13] = [
+const KEY_CONTEXTS: [&str; 14] = [
     "Anywhere",
     "Transcript",
     "Confirm",
@@ -56,6 +56,7 @@ const KEY_CONTEXTS: [&str; 13] = [
     "Popup",
     "Vi insert",
     "Vi normal",
+    "Key help",
     "Pager find",
     "Thread picker",
     "Pager",
@@ -524,6 +525,7 @@ fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'stat
         _ if line.starts_with("_ if ctx.popup == Some(PopupKind::Roster)") => Some("Roster"),
         "}," if current == Some("Roster") => Some("Composer"),
         _ if line.starts_with("fn vi_normal(") => Some("Vi normal"),
+        _ if line.starts_with("fn help_key(") => Some("Key help"),
         _ if line.starts_with("PagerMode::Find =>") => Some("Pager find"),
         _ if line.starts_with("PagerMode::Picker =>") => Some("Thread picker"),
         _ if line.starts_with("PagerMode::Browse =>") => Some("Pager"),
@@ -536,9 +538,13 @@ fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'stat
 }
 
 /// A composer arm's guard that names a popup or vi insert mode moves the
-/// arm to that table context.
+/// arm to that table context; a guard that only asks for no popup keeps
+/// it in the composer.
 fn composer_subcontext(guard: &str) -> &'static str {
-    if guard.contains("ctx.popup") {
+    if guard
+        .replace("ctx.popup.is_none()", "")
+        .contains("ctx.popup")
+    {
         "Popup"
     } else if guard.contains("ViMode::Insert") {
         "Vi insert"
@@ -553,15 +559,10 @@ fn key_name(variant: &str) -> String {
         "Esc" | "Enter" | "Tab" | "Backspace" | "Up" | "Down" | "Left" | "Right" | "Home"
         | "End" | "PageUp" | "PageDown" => variant.to_string(),
         "BackTab" => "Shift+Tab".to_string(),
-        _ => match variant
-            .strip_prefix("F(")
-            .and_then(|rest| rest.strip_suffix(')'))
-        {
-            Some(number) => format!("F{number}"),
-            None => panic!(
-                "keys.rs binds KeyCode::{variant}; extend key_name in tests/tui_wiki_docs.rs"
-            ),
-        },
+        _ if variant.starts_with("F(") => {
+            panic!("keys.rs binds a function key; multiplexers own them")
+        }
+        _ => panic!("keys.rs binds KeyCode::{variant}; extend key_name in tests/tui_wiki_docs.rs"),
     }
 }
 
@@ -733,18 +734,22 @@ fn key_scraper_reads_every_context_of_the_key_map() {
     assert_eq!(contexts, BTreeSet::from(KEY_CONTEXTS));
     for (context, chord) in [
         ("Anywhere", "Ctrl+Z"),
-        ("Transcript", "F2"),
+        ("Transcript", "Ctrl+X"),
         ("Confirm", "a"),
         ("Text field", "Enter"),
         ("List", "1-9"),
         ("Composer", "Shift+Enter"),
         ("Composer", "Alt+Enter"),
         ("Composer", "Ctrl+T"),
+        ("Composer", "Ctrl+G"),
+        ("Composer", "?"),
         ("Composer", "Shift+G"),
         ("Popup", "Shift+Tab"),
         ("Roster", "x"),
         ("Vi insert", "Esc"),
         ("Vi normal", "A"),
+        ("Key help", "?"),
+        ("Key help", "Ctrl+C"),
         ("Pager", "G"),
         ("Pager", "N"),
         ("Thread picker", "q"),
@@ -1188,6 +1193,8 @@ fn tui_page_quotes_the_code() {
     let barriers = string_literals(&fn_body(&cells, "pub(crate) fn kind_name("));
     assert_eq!(barriers.len(), 2);
     let roster_empty = const_str(&src(&["tui", "roster.rs"]), "EMPTY");
+    let idle_status = flat(&const_str(tui, "IDLE_STATUS"));
+    let keys_command = const_str(tui, "KEYS_COMMAND");
     let normal = const_str(&src(&["tui", "composer.rs"]), "NORMAL_TAG");
     for gap in ["HOTKEY_IDLE", "REWIND_ESC_GAP"] {
         assert_eq!(const_expr(tui, gap), "Duration::from_secs(1)", "{gap}");
@@ -1226,6 +1233,8 @@ fn tui_page_quotes_the_code() {
         format!("`{interrupt}`"),
         format!("`{search}`"),
         format!("`{roster_empty}`"),
+        format!("`{idle_status}`"),
+        format!("`.{keys_command}`"),
         format!("`{}`", normal.trim()),
         "1 second".to_string(),
         "within a second".to_string(),

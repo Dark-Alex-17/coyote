@@ -24,6 +24,8 @@ use common::pty::strip_ansi;
 use common::tui_harness::*;
 use serial_test::serial;
 
+const CTRL_G: &[u8] = b"\x07";
+
 /// Ctrl+C on an idle empty composer leaves the UI like Ctrl+D does, and
 /// the transcript is printed on the normal screen on that path too.
 #[test]
@@ -313,8 +315,9 @@ fn leaving_during_a_slow_roster_cancel_is_bounded_and_clean() {
     let _kill = KillOnDrop(pid);
     assert!(alive(pid), "the job died with the interrupted turn");
 
-    pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(&mut pty, "fixture_stubborn", "F3 did not list the job");
+    pty.send(CTRL_G).unwrap();
+    let roster =
+        repainted_frame_showing(&mut pty, "fixture_stubborn", "Ctrl+G did not list the job");
     assert!(
         roster_band(&roster).contains("running"),
         "the job is not running on the roster:\n{roster}"

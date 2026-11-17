@@ -1,5 +1,5 @@
 //! The todo panel: the turn's goal and checklist, shown beside the
-//! transcript on F2. The list is read from the context between turns and
+//! transcript on Ctrl+X. The list is read from the context between turns and
 //! from `TodoUpdated` events while one runs.
 
 use super::{DIM, render};

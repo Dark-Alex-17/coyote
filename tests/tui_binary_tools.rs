@@ -7,9 +7,10 @@
 //! question an agent with documents asks when it starts, and the `.rag`
 //! wizard and macro steps that reach those questions.
 //! After them: the Ctrl+T pager over a tool's whole output with its find
-//! and thread picker, the F3 roster cancelling a background job, and both
-//! with nothing to show. The transcript printed when the UI leaves is
-//! checked in `tui_binary_exit.rs`.
+//! and thread picker, the Ctrl+G roster cancelling a background job, and both
+//! with nothing to show, and the key help that `?` opens from the welcome
+//! screen's hint. The transcript printed when the UI leaves is checked in
+//! `tui_binary_exit.rs`.
 //! Each case runs the binary on a pseudo-terminal under a bash wrapper
 //! that reports the exit code and `stty -a` afterwards, so the file is
 //! unix-only. The cases run one at a time: each spawn forks a session
@@ -28,6 +29,8 @@ use common::fake_llm::{FakeLlm, Reply};
 use common::pty::{Pty, strip_ansi};
 use common::tui_harness::*;
 use serial_test::serial;
+
+const CTRL_G: &[u8] = b"\x07";
 
 // ---------------------------------------------------------------------------
 // A tool question carrying invisible format characters, a reply in palette
@@ -2268,12 +2271,12 @@ impl Drop for Sleepers {
 }
 
 /// A job the model started in the background and the user left running
-/// by interrupting the turn shows on the F3 roster as running; `x` on its
+/// by interrupting the turn shows on the Ctrl+G roster as running; `x` on its
 /// row cancels it, so its process goes away and the row stops saying
 /// running.
 #[test]
 #[serial]
-fn f3_lists_a_job_left_running_and_x_cancels_it() {
+fn ctrl_g_lists_a_job_left_running_and_x_cancels_it() {
     let dir = fresh_config_dir("roster-cancel");
     let _guard = TempDirGuard(dir.clone());
     let job_pid = dir.join("job.pid");
@@ -2312,8 +2315,8 @@ fn f3_lists_a_job_left_running_and_x_cancels_it() {
         .unwrap();
     assert!(alive(pid), "the job died with the interrupted turn");
 
-    pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "F3 did not list the job");
+    pty.send(CTRL_G).unwrap();
+    let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "Ctrl+G did not list the job");
     let band = roster_band(&roster);
     assert!(
         band.contains("fixture_sleep") && band.contains("running"),
@@ -2414,22 +2417,22 @@ fn ctrl_t_and_every_pager_key_on_an_empty_transcript_keep_the_ui_up() {
     assert_tty_restored(&transcript);
 }
 
-/// F3 with no task and no question shows the empty roster; `x` and `o`
+/// Ctrl+G with no task and no question shows the empty roster; `x` and `o`
 /// on it change nothing, Esc closes it and the composer takes keys.
 #[test]
 #[serial]
-fn f3_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
+fn ctrl_g_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
     let dir = fresh_config_dir("roster-empty");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.send(b"\x1bOR").unwrap();
+    pty.send(CTRL_G).unwrap();
     repainted_frame_showing(
         &mut pty,
         "(no tasks and no questions)",
-        "F3 did not show the empty roster",
+        "Ctrl+G did not show the empty roster",
     );
     pty.send(b"x").unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -2451,6 +2454,58 @@ fn f3_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
         &mut pty,
         "typed after the roster h5n",
         "keys did not reach the composer after Esc",
+    );
+    pty.send(b"\x03").unwrap();
+    pty.read_for(Duration::from_millis(300));
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    assert_tty_restored(&transcript);
+}
+
+/// The welcome screen names `?`; on the empty composer it opens the key
+/// help over the whole screen, Esc closes it, and the composer then takes
+/// keys, a `?` after text among them.
+#[test]
+#[serial]
+fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
+    let dir = fresh_config_dir("key-help");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    let mut pty = spawn_tui(&dir, &[]);
+
+    pty.wait_for("no session", PTY_DEADLINE).unwrap();
+    let welcome = repainted_frame_showing(
+        &mut pty,
+        "Press \"?\" or type \".keys\" to list the keys.",
+        "the welcome does not name the key help",
+    );
+    assert!(
+        squeezed(&welcome).contains(&squeezed("Ctrl+G = tasks  Ctrl+X = todo")),
+        "the status row does not name the panel chords:\n{welcome}"
+    );
+    pty.send(b"?").unwrap();
+    let help = repainted_frame_showing(
+        &mut pty,
+        "Suspend to the shell",
+        "? did not open the key help",
+    );
+    assert!(
+        !squeezed(&help).contains("no session"),
+        "the key help does not cover the screen:\n{help}"
+    );
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(400));
+    let closed = repainted_frame_showing(&mut pty, "no session", "Esc did not close the key help");
+    assert!(
+        !squeezed(&closed).contains("Suspend to the shell"),
+        "the key help is still up after Esc:\n{closed}"
+    );
+    pty.send(b"why? h7k").unwrap();
+    wait_for_squeezed(
+        &mut pty,
+        "why? h7k",
+        "a ? after text did not reach the composer",
     );
     pty.send(b"\x03").unwrap();
     pty.read_for(Duration::from_millis(300));

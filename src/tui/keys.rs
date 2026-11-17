@@ -110,6 +110,8 @@ pub(crate) struct KeyContext {
     /// The pager covers the whole screen and takes every key but the
     /// terminal's own.
     pub(crate) pager: Option<PagerMode>,
+    /// The key help covers the whole screen the way the pager does.
+    pub(crate) help: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +176,12 @@ pub(crate) enum Action {
     ViDeleteLine,
     ToggleTodo,
     ToggleRoster,
+    /// Open the key help, or close it when it is open.
+    ToggleHelp,
+    /// Move the key help by this many lines, down when positive.
+    HelpScroll(i32),
+    /// Move the key help by this many pages, down when positive.
+    HelpPage(i32),
     /// Cancel the task on the roster's highlighted row.
     RosterCancel,
     /// Show the highlighted roster row's transcript in the pager.
@@ -215,6 +223,232 @@ pub(crate) enum Action {
     Nothing,
 }
 
+/// Where a row of the key help applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelpContext {
+    Anywhere,
+    /// The view keys, which a question waiting below does not take.
+    Transcript,
+    Composer,
+    /// The text area's own editing keys, which the key map hands on.
+    ComposerEditing,
+    TurnRunning,
+    Question,
+    Bands,
+    Roster,
+    ViNormal,
+    Pager,
+    PagerFind,
+    ThreadPicker,
+    KeyHelp,
+}
+
+impl HelpContext {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            HelpContext::Anywhere => "Anywhere",
+            HelpContext::Transcript => "Transcript, also under a question",
+            HelpContext::Composer => "Composer",
+            HelpContext::ComposerEditing => "Composer and text field editing",
+            HelpContext::TurnRunning => "While a turn runs",
+            HelpContext::Question => "Question",
+            HelpContext::Bands => "Palette, history search and rewind",
+            HelpContext::Roster => "Tasks (the roster)",
+            HelpContext::ViNormal => "Vi normal mode",
+            HelpContext::Pager => "Pager",
+            HelpContext::PagerFind => "Pager find",
+            HelpContext::ThreadPicker => "Thread picker",
+            HelpContext::KeyHelp => "This help",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HelpRow {
+    pub(crate) context: HelpContext,
+    pub(crate) keys: &'static str,
+    pub(crate) does: &'static str,
+}
+
+const fn row(context: HelpContext, keys: &'static str, does: &'static str) -> HelpRow {
+    HelpRow {
+        context,
+        keys,
+        does,
+    }
+}
+
+/// What the key help lists, grouped by context in the order shown. The
+/// unit tests replay every row through `map_key` and sweep the key map
+/// for bindings no row names, so the two cannot drift apart. The mouse
+/// wheel rows are not keys; the app's tests pin them.
+pub(crate) const KEY_HELP: &[HelpRow] = {
+    use HelpContext::*;
+    &[
+        row(Anywhere, "Ctrl+Z", "Suspend to the shell"),
+        row(Anywhere, "Ctrl+L", "Redraw the screen"),
+        row(Transcript, "Ctrl+X", "Show or hide the todo panel"),
+        row(Transcript, "PgUp / PgDn", "Scroll the transcript a page"),
+        row(
+            Transcript,
+            "Shift+Up / Shift+Down",
+            "Scroll the transcript a line",
+        ),
+        row(
+            Transcript,
+            "End",
+            "Jump back to the newest output when scrolled",
+        ),
+        row(Transcript, "Mouse wheel", "Scroll the transcript"),
+        row(
+            Composer,
+            "Enter",
+            "Send the line; on an empty composer, open or close the focused row",
+        ),
+        row(
+            Composer,
+            "Shift+Enter / Alt+Enter / Ctrl+J",
+            "Insert a newline",
+        ),
+        row(
+            Composer,
+            "Up / Down",
+            "Walk the history on a one-line composer",
+        ),
+        row(Composer, "Ctrl+R", "Search the history"),
+        row(
+            Composer,
+            "Alt+Up",
+            "Take the newest queued line back to edit",
+        ),
+        row(
+            Composer,
+            "Ctrl+O",
+            "Edit the line in $VISUAL or $EDITOR, between turns",
+        ),
+        row(Composer, "Ctrl+T", "Open the pager on the whole transcript"),
+        row(Composer, "Ctrl+G", "Show or hide tasks (the roster)"),
+        row(Composer, "?", "Show this help, on an empty composer"),
+        row(
+            Composer,
+            "Ctrl+Up / Ctrl+Down",
+            "Move the focus between transcript rows",
+        ),
+        row(
+            Composer,
+            "Shift+G",
+            "Jump back to the newest output, when scrolled with an empty composer",
+        ),
+        row(
+            Composer,
+            "Esc",
+            "Leave the focused row, or vi insert mode; twice on an empty composer, rewind",
+        ),
+        row(
+            Composer,
+            "Ctrl+C",
+            "Clear the line, or quit when it is empty",
+        ),
+        row(Composer, "Ctrl+D", "Quit, on an empty composer"),
+        row(
+            ComposerEditing,
+            "Left / Right",
+            "Move the cursor a character",
+        ),
+        row(
+            ComposerEditing,
+            "Ctrl+Left / Ctrl+Right / Alt+B / Alt+F",
+            "Move the cursor a word",
+        ),
+        row(
+            ComposerEditing,
+            "Home / End / Ctrl+E",
+            "Start or end of the line",
+        ),
+        row(
+            ComposerEditing,
+            "Backspace / Delete",
+            "Delete before or under the cursor",
+        ),
+        row(ComposerEditing, "Ctrl+W", "Cut the word before the cursor"),
+        row(ComposerEditing, "Ctrl+K", "Cut to the end of the line"),
+        row(ComposerEditing, "Ctrl+Y", "Paste what Ctrl+K or Ctrl+W cut"),
+        row(ComposerEditing, "Ctrl+U", "Undo"),
+        row(ComposerEditing, "Shift+Left / Shift+Right", "Select text"),
+        row(TurnRunning, "Esc / Ctrl+C", "Interrupt the turn"),
+        row(TurnRunning, "Enter", "Hold the line for the running turn"),
+        row(Question, "y / n", "Answer yes or no"),
+        row(
+            Question,
+            "a",
+            "Answer yes for the rest of the session, for a tool",
+        ),
+        row(
+            Question,
+            "Enter",
+            "Send the default, the typed answer or the chosen options",
+        ),
+        row(Question, "Up / Down / j / k", "Move between the options"),
+        row(Question, "Space", "Tick or untick an option"),
+        row(Question, "1-9", "Choose that option"),
+        row(Question, "Esc / Ctrl+C", "Cancel the question"),
+        row(Bands, "Up / Down / Tab / Shift+Tab", "Move the highlight"),
+        row(Bands, "Enter", "Take the highlighted row"),
+        row(Bands, "Backspace", "Delete a history search character"),
+        row(Bands, "Esc / Ctrl+C / Ctrl+D", "Close the band"),
+        row(
+            Roster,
+            "j / k / Up / Down / Tab / Shift+Tab",
+            "Move between the rows",
+        ),
+        row(Roster, "x", "Cancel the highlighted task"),
+        row(Roster, "o", "Show the highlighted task in the pager"),
+        row(Roster, "Enter", "Answer the highlighted question"),
+        row(Roster, "Ctrl+T", "Open the pager on the whole transcript"),
+        row(
+            Roster,
+            "Esc / Ctrl+C / Ctrl+D / Ctrl+G",
+            "Close tasks (the roster)",
+        ),
+        row(ViNormal, "h / j / k / l", "Move the cursor"),
+        row(ViNormal, "w / b", "Next or previous word"),
+        row(ViNormal, "0 / $", "Start or end of the line"),
+        row(ViNormal, "x", "Delete the character under the cursor"),
+        row(ViNormal, "dd", "Delete the line"),
+        row(
+            ViNormal,
+            "i / a / A",
+            "Insert before or after the cursor, or at the line end",
+        ),
+        row(Pager, "j / k / Up / Down", "Scroll a line"),
+        row(Pager, "Space / PgDn / PgUp", "Scroll a page"),
+        row(Pager, "g / Home / G / End", "Top or bottom"),
+        row(Pager, "/", "Find"),
+        row(Pager, "n / N", "Next or previous match"),
+        row(Pager, "Tab", "Pick a thread"),
+        row(Pager, "Mouse wheel", "Scroll"),
+        row(
+            Pager,
+            "q / Esc / Ctrl+C / Ctrl+D / Ctrl+T",
+            "Close the pager",
+        ),
+        row(PagerFind, "Enter", "Search and keep the text for n and N"),
+        row(PagerFind, "Backspace", "Delete a character"),
+        row(PagerFind, "Esc / Ctrl+C", "Cancel the find"),
+        row(ThreadPicker, "j / k / Up / Down", "Move the highlight"),
+        row(ThreadPicker, "Enter", "Open the thread"),
+        row(
+            ThreadPicker,
+            "q / Esc / Tab / Ctrl+C / Ctrl+D",
+            "Back to the pager",
+        ),
+        row(KeyHelp, "j / k / Up / Down", "Scroll a line"),
+        row(KeyHelp, "PgUp / PgDn", "Scroll a page"),
+        row(KeyHelp, "Mouse wheel", "Scroll"),
+        row(KeyHelp, "? / q / Esc / Ctrl+C", "Close the help"),
+    ]
+};
+
 pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -234,8 +468,11 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
     if let Some(mode) = ctx.pager {
         return pager_key(key, code, mode);
     }
+    if ctx.help {
+        return help_key(key, code);
+    }
     match code {
-        KeyCode::F(2) => return Action::ToggleTodo,
+        KeyCode::Char('x') if ctrl => return Action::ToggleTodo,
         KeyCode::PageUp => return Action::ScrollPage(-1),
         KeyCode::PageDown => return Action::ScrollPage(1),
         KeyCode::Up if shift => return Action::ScrollLines(-1),
@@ -300,7 +537,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
         }
         None => match code {
-            KeyCode::F(3) => Action::ToggleRoster,
+            KeyCode::Char('g') if ctrl => Action::ToggleRoster,
             KeyCode::Char('t') if ctrl => Action::OpenPager,
             // A band is the innermost thing open, so the quit chords
             // close it first, as Esc does.
@@ -387,6 +624,12 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter => Action::Submit,
             KeyCode::Up if ctx.single_line && key.modifiers.is_empty() => Action::HistoryPrev,
             KeyCode::Down if ctx.single_line && key.modifiers.is_empty() => Action::HistoryNext,
+            // Only an empty composer with nothing open over it gives `?` to
+            // the help: anywhere else it is typing, vi normal mode's
+            // swallowing included.
+            KeyCode::Char('?') if !ctrl && !alt && ctx.composer_empty && ctx.popup.is_none() => {
+                Action::ToggleHelp
+            }
             KeyCode::Char(_) if !ctrl && ctx.vi == Some(ViMode::Normal) => vi_normal(key.code),
             _ => Action::ComposerInput(key),
         },
@@ -414,6 +657,23 @@ fn vi_normal(code: KeyCode) -> Action {
         KeyCode::Char('A') => Action::ViInsert {
             append: Some(ViMotion::End),
         },
+        _ => Action::Nothing,
+    }
+}
+
+/// The key help's keys: it scrolls and closes, nothing under it is
+/// reached.
+fn help_key(key: KeyEvent, code: KeyCode) -> Action {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match code {
+        KeyCode::Esc => Action::ToggleHelp,
+        KeyCode::Char('c') if ctrl => Action::ToggleHelp,
+        _ if ctrl => Action::Nothing,
+        KeyCode::Char('?' | 'q') => Action::ToggleHelp,
+        KeyCode::Down | KeyCode::Char('j') => Action::HelpScroll(1),
+        KeyCode::Up | KeyCode::Char('k') => Action::HelpScroll(-1),
+        KeyCode::PageDown => Action::HelpPage(1),
+        KeyCode::PageUp => Action::HelpPage(-1),
         _ => Action::Nothing,
     }
 }
@@ -506,6 +766,7 @@ mod tests {
         popup: None,
         vi: None,
         pager: None,
+        help: false,
     };
 
     #[test]
@@ -979,7 +1240,7 @@ mod tests {
         }
     }
 
-    /// The transcript's keys: F2, the page and Shift+arrow scrolls and
+    /// The transcript's keys: Ctrl+X, the page and Shift+arrow scrolls and
     /// the Ctrl+arrow focus walk work whatever the turn is doing; End
     /// goes to the view only while it is scrolled, Shift+G only while
     /// it is scrolled and the composer is empty; Enter goes to a
@@ -1024,8 +1285,9 @@ mod tests {
         let shift = |code: KeyCode| press(code, KeyModifiers::SHIFT);
         let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
         let cases = [
-            (plain(KeyCode::F(2)), IDLE, Action::ToggleTodo),
-            (plain(KeyCode::F(2)), running, Action::ToggleTodo),
+            (ctrl('x'), IDLE, Action::ToggleTodo),
+            (ctrl('x'), running, Action::ToggleTodo),
+            (ctrl('x'), focused_typing, Action::ToggleTodo),
             (plain(KeyCode::PageUp), IDLE, Action::ScrollPage(-1)),
             (plain(KeyCode::PageDown), running, Action::ScrollPage(1)),
             (shift(KeyCode::Up), IDLE, Action::ScrollLines(-1)),
@@ -1112,7 +1374,7 @@ mod tests {
                 ..ctx
             };
             let cases = [
-                (plain(KeyCode::F(2)), ctx, Action::ToggleTodo),
+                (ctrl('x'), ctx, Action::ToggleTodo),
                 (plain(KeyCode::PageUp), ctx, Action::ScrollPage(-1)),
                 (plain(KeyCode::PageDown), ctx, Action::ScrollPage(1)),
                 (shift(KeyCode::Up), ctx, Action::ScrollLines(-1)),
@@ -1436,9 +1698,10 @@ mod tests {
     }
 
     /// Ctrl+T opens the pager over an idle or busy composer, never under a
-    /// question; F3 toggles the roster the same way.
+    /// question; Ctrl+G toggles the roster the same way, and a text field
+    /// takes it as typing.
     #[test]
-    fn ctrl_t_and_f3_open_the_pager_and_the_roster() {
+    fn ctrl_t_and_ctrl_g_open_the_pager_and_the_roster() {
         let running = KeyContext {
             turn_running: true,
             ..IDLE
@@ -1458,16 +1721,34 @@ mod tests {
             }),
             ..IDLE
         };
+        let input = KeyContext {
+            modal: Some(ModalKind::Input),
+            ..IDLE
+        };
+        let select = KeyContext {
+            modal: Some(ModalKind::Select {
+                custom_field_open: false,
+            }),
+            ..IDLE
+        };
+        let vi_normal = KeyContext {
+            vi: Some(ViMode::Normal),
+            ..typing
+        };
         let cases = [
             (ctrl('t'), IDLE, Action::OpenPager),
             (ctrl('t'), running, Action::OpenPager),
             (ctrl('t'), typing, Action::OpenPager),
             (ctrl('t'), roster, Action::OpenPager),
             (ctrl('t'), confirm, Action::Nothing),
-            (plain(KeyCode::F(3)), IDLE, Action::ToggleRoster),
-            (plain(KeyCode::F(3)), running, Action::ToggleRoster),
-            (plain(KeyCode::F(3)), roster, Action::ToggleRoster),
-            (plain(KeyCode::F(3)), confirm, Action::Nothing),
+            (ctrl('g'), IDLE, Action::ToggleRoster),
+            (ctrl('g'), running, Action::ToggleRoster),
+            (ctrl('g'), typing, Action::ToggleRoster),
+            (ctrl('g'), vi_normal, Action::ToggleRoster),
+            (ctrl('g'), roster, Action::ToggleRoster),
+            (ctrl('g'), confirm, Action::Nothing),
+            (ctrl('g'), select, Action::Nothing),
+            (ctrl('g'), input, Action::ModalInput(ctrl('g'))),
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
@@ -1522,6 +1803,7 @@ mod tests {
             (plain(KeyCode::Esc), roster, Action::ClosePopup),
             (plain(KeyCode::Esc), running, Action::ClosePopup),
             (ctrl('c'), running, Action::ClosePopup),
+            (ctrl('x'), roster, Action::ToggleTodo),
             (
                 plain(KeyCode::Char('x')),
                 IDLE,
@@ -1567,7 +1849,8 @@ mod tests {
             (ctrl('c'), browse, Action::ClosePager),
             (ctrl('z'), browse, Action::Suspend),
             (ctrl('l'), browse, Action::ScheduleFrame),
-            (plain(KeyCode::F(2)), browse, Action::Nothing),
+            (ctrl('x'), browse, Action::Nothing),
+            (ctrl('g'), browse, Action::Nothing),
             (plain(KeyCode::Char('/')), browse, Action::PagerFindOpen),
             (
                 plain(KeyCode::Char('n')),
@@ -1598,6 +1881,1089 @@ mod tests {
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    const TYPING: KeyContext = KeyContext {
+        composer_empty: false,
+        ..IDLE
+    };
+    const MULTI_LINE: KeyContext = KeyContext {
+        single_line: false,
+        ..TYPING
+    };
+    const SCROLLED: KeyContext = KeyContext {
+        scrolled: true,
+        ..IDLE
+    };
+    const FOCUSED: KeyContext = KeyContext {
+        focused: true,
+        ..IDLE
+    };
+    const VI_INSERT: KeyContext = KeyContext {
+        vi: Some(ViMode::Insert),
+        ..IDLE
+    };
+    const VI_INSERT_TYPING: KeyContext = KeyContext {
+        vi: Some(ViMode::Insert),
+        ..TYPING
+    };
+    const RUNNING: KeyContext = KeyContext {
+        turn_running: true,
+        ..IDLE
+    };
+    const RUNNING_TYPING: KeyContext = KeyContext {
+        turn_running: true,
+        ..TYPING
+    };
+    const RUNNING_FOCUSED: KeyContext = KeyContext {
+        turn_running: true,
+        ..FOCUSED
+    };
+    const CONFIRM: KeyContext = KeyContext {
+        modal: Some(ModalKind::Confirm {
+            default: false,
+            tool: true,
+        }),
+        ..IDLE
+    };
+    const CONFIRM_NO_TOOL: KeyContext = KeyContext {
+        modal: Some(ModalKind::Confirm {
+            default: true,
+            tool: false,
+        }),
+        ..IDLE
+    };
+    const SCROLLED_CONFIRM: KeyContext = KeyContext {
+        scrolled: true,
+        ..CONFIRM
+    };
+    const INPUT: KeyContext = KeyContext {
+        modal: Some(ModalKind::Input),
+        ..IDLE
+    };
+    const PASSWORD: KeyContext = KeyContext {
+        modal: Some(ModalKind::Password),
+        ..IDLE
+    };
+    const SELECT: KeyContext = KeyContext {
+        modal: Some(ModalKind::Select {
+            custom_field_open: false,
+        }),
+        ..IDLE
+    };
+    const CUSTOM_FIELD: KeyContext = KeyContext {
+        modal: Some(ModalKind::Select {
+            custom_field_open: true,
+        }),
+        ..IDLE
+    };
+    const CHECKBOX: KeyContext = KeyContext {
+        modal: Some(ModalKind::Checkbox),
+        ..IDLE
+    };
+    const PALETTE: KeyContext = KeyContext {
+        popup: Some(PopupKind::Palette),
+        ..TYPING
+    };
+    const RUNNING_PALETTE: KeyContext = KeyContext {
+        turn_running: true,
+        ..PALETTE
+    };
+    const SEARCH: KeyContext = KeyContext {
+        popup: Some(PopupKind::HistorySearch),
+        ..IDLE
+    };
+    const REWIND: KeyContext = KeyContext {
+        popup: Some(PopupKind::Rewind),
+        ..IDLE
+    };
+    const ROSTER: KeyContext = KeyContext {
+        popup: Some(PopupKind::Roster),
+        ..IDLE
+    };
+    const RUNNING_ROSTER: KeyContext = KeyContext {
+        turn_running: true,
+        ..ROSTER
+    };
+    const VI_NORMAL: KeyContext = KeyContext {
+        vi: Some(ViMode::Normal),
+        ..TYPING
+    };
+    const VI_NORMAL_EMPTY: KeyContext = KeyContext {
+        vi: Some(ViMode::Normal),
+        ..IDLE
+    };
+    const VI_NORMAL_SCROLLED: KeyContext = KeyContext {
+        scrolled: true,
+        ..VI_NORMAL_EMPTY
+    };
+    const BROWSE: KeyContext = KeyContext {
+        pager: Some(PagerMode::Browse),
+        ..IDLE
+    };
+    const FIND: KeyContext = KeyContext {
+        pager: Some(PagerMode::Find),
+        ..IDLE
+    };
+    const PICKER: KeyContext = KeyContext {
+        pager: Some(PagerMode::Picker),
+        ..IDLE
+    };
+    const HELP: KeyContext = KeyContext { help: true, ..IDLE };
+    const RUNNING_HELP: KeyContext = KeyContext {
+        help: true,
+        ..RUNNING_TYPING
+    };
+
+    /// The contexts the key help is checked in, each with the help
+    /// contexts whose rows apply there.
+    fn swept_contexts() -> Vec<(KeyContext, Vec<HelpContext>)> {
+        use HelpContext as H;
+        let composer = [H::Anywhere, H::Transcript, H::Composer, H::ComposerEditing];
+        let groups: [(&[KeyContext], Vec<HelpContext>); 9] = [
+            (
+                &[
+                    IDLE,
+                    TYPING,
+                    MULTI_LINE,
+                    SCROLLED,
+                    FOCUSED,
+                    VI_INSERT,
+                    VI_INSERT_TYPING,
+                ],
+                composer.to_vec(),
+            ),
+            (
+                &[RUNNING, RUNNING_TYPING, RUNNING_FOCUSED],
+                [&composer[..], &[H::TurnRunning]].concat(),
+            ),
+            (
+                &[
+                    CONFIRM,
+                    CONFIRM_NO_TOOL,
+                    SCROLLED_CONFIRM,
+                    INPUT,
+                    PASSWORD,
+                    SELECT,
+                    CUSTOM_FIELD,
+                    CHECKBOX,
+                ],
+                vec![H::Anywhere, H::Transcript, H::Question],
+            ),
+            (
+                &[PALETTE, RUNNING_PALETTE, SEARCH, REWIND],
+                [&composer[..], &[H::Bands]].concat(),
+            ),
+            (
+                &[ROSTER, RUNNING_ROSTER],
+                vec![H::Anywhere, H::Transcript, H::Roster],
+            ),
+            (
+                &[VI_NORMAL, VI_NORMAL_EMPTY, VI_NORMAL_SCROLLED],
+                [&composer[..], &[H::ViNormal]].concat(),
+            ),
+            (&[BROWSE], vec![H::Anywhere, H::Pager]),
+            (&[FIND], vec![H::Anywhere, H::PagerFind]),
+            (&[PICKER], vec![H::Anywhere, H::ThreadPicker]),
+        ];
+        let mut swept: Vec<(KeyContext, Vec<HelpContext>)> = groups
+            .into_iter()
+            .flat_map(|(contexts, applies)| contexts.iter().map(move |ctx| (*ctx, applies.clone())))
+            .collect();
+        for ctx in [HELP, RUNNING_HELP] {
+            swept.push((ctx, vec![H::Anywhere, H::KeyHelp]));
+        }
+        swept
+    }
+
+    type Example = (KeyEvent, KeyContext, Action);
+
+    /// Every row of `KEY_HELP` in order, replayed: each key it names in a
+    /// swept context, with the action that key must map to there. A
+    /// composer editing key must reach the text area untouched; a mouse
+    /// wheel row has no key to replay.
+    fn help_examples() -> Vec<(HelpContext, &'static str, Vec<Example>)> {
+        use HelpContext as H;
+        let letter = |c: char| plain(KeyCode::Char(c));
+        let shift = |code: KeyCode| press(code, KeyModifiers::SHIFT);
+        let alt = |code: KeyCode| press(code, KeyModifiers::ALT);
+        let control = |code: KeyCode| press(code, KeyModifiers::CONTROL);
+        let typed = |key: KeyEvent, ctx: KeyContext| (key, ctx, Action::ComposerInput(key));
+        let cancelled = || Action::Answer(PromptAnswer::Cancelled);
+        vec![
+            (
+                H::Anywhere,
+                "Ctrl+Z",
+                vec![
+                    (ctrl('z'), IDLE, Action::Suspend),
+                    (ctrl('z'), BROWSE, Action::Suspend),
+                    (ctrl('z'), HELP, Action::Suspend),
+                ],
+            ),
+            (
+                H::Anywhere,
+                "Ctrl+L",
+                vec![
+                    (ctrl('l'), CONFIRM, Action::ScheduleFrame),
+                    (ctrl('l'), HELP, Action::ScheduleFrame),
+                ],
+            ),
+            (
+                H::Transcript,
+                "Ctrl+X",
+                vec![
+                    (ctrl('x'), TYPING, Action::ToggleTodo),
+                    (ctrl('x'), CONFIRM, Action::ToggleTodo),
+                ],
+            ),
+            (
+                H::Transcript,
+                "PgUp / PgDn",
+                vec![
+                    (plain(KeyCode::PageUp), IDLE, Action::ScrollPage(-1)),
+                    (plain(KeyCode::PageDown), INPUT, Action::ScrollPage(1)),
+                ],
+            ),
+            (
+                H::Transcript,
+                "Shift+Up / Shift+Down",
+                vec![
+                    (shift(KeyCode::Up), IDLE, Action::ScrollLines(-1)),
+                    (shift(KeyCode::Down), CONFIRM, Action::ScrollLines(1)),
+                ],
+            ),
+            (
+                H::Transcript,
+                "End",
+                vec![
+                    (plain(KeyCode::End), SCROLLED, Action::ScrollToBottom),
+                    (
+                        plain(KeyCode::End),
+                        SCROLLED_CONFIRM,
+                        Action::ScrollToBottom,
+                    ),
+                ],
+            ),
+            (H::Transcript, "Mouse wheel", vec![]),
+            (
+                H::Composer,
+                "Enter",
+                vec![
+                    (plain(KeyCode::Enter), TYPING, Action::Submit),
+                    (plain(KeyCode::Enter), FOCUSED, Action::ToggleFocused),
+                ],
+            ),
+            (
+                H::Composer,
+                "Shift+Enter / Alt+Enter / Ctrl+J",
+                vec![
+                    (shift(KeyCode::Enter), TYPING, Action::InsertNewline),
+                    (alt(KeyCode::Enter), TYPING, Action::InsertNewline),
+                    (ctrl('j'), TYPING, Action::InsertNewline),
+                ],
+            ),
+            (
+                H::Composer,
+                "Up / Down",
+                vec![
+                    (plain(KeyCode::Up), IDLE, Action::HistoryPrev),
+                    (plain(KeyCode::Down), IDLE, Action::HistoryNext),
+                ],
+            ),
+            (
+                H::Composer,
+                "Ctrl+R",
+                vec![(ctrl('r'), IDLE, Action::OpenHistorySearch)],
+            ),
+            (
+                H::Composer,
+                "Alt+Up",
+                vec![(alt(KeyCode::Up), IDLE, Action::EditQueued)],
+            ),
+            (
+                H::Composer,
+                "Ctrl+O",
+                vec![(ctrl('o'), IDLE, Action::OpenEditor)],
+            ),
+            (
+                H::Composer,
+                "Ctrl+T",
+                vec![(ctrl('t'), IDLE, Action::OpenPager)],
+            ),
+            (
+                H::Composer,
+                "Ctrl+G",
+                vec![(ctrl('g'), IDLE, Action::ToggleRoster)],
+            ),
+            (
+                H::Composer,
+                "?",
+                vec![
+                    (letter('?'), IDLE, Action::ToggleHelp),
+                    (
+                        shift(KeyCode::Char('?')),
+                        VI_NORMAL_EMPTY,
+                        Action::ToggleHelp,
+                    ),
+                ],
+            ),
+            (
+                H::Composer,
+                "Ctrl+Up / Ctrl+Down",
+                vec![
+                    (control(KeyCode::Up), IDLE, Action::FocusPrev),
+                    (control(KeyCode::Down), IDLE, Action::FocusNext),
+                ],
+            ),
+            (
+                H::Composer,
+                "Shift+G",
+                vec![(shift(KeyCode::Char('G')), SCROLLED, Action::ScrollToBottom)],
+            ),
+            (
+                H::Composer,
+                "Esc",
+                vec![
+                    (plain(KeyCode::Esc), FOCUSED, Action::ClearFocus),
+                    (plain(KeyCode::Esc), VI_INSERT, Action::ViNormal),
+                    (plain(KeyCode::Esc), IDLE, Action::IdleEsc),
+                ],
+            ),
+            (
+                H::Composer,
+                "Ctrl+C",
+                vec![
+                    (ctrl('c'), TYPING, Action::ClearComposer),
+                    (ctrl('c'), IDLE, Action::Quit),
+                ],
+            ),
+            (H::Composer, "Ctrl+D", vec![(ctrl('d'), IDLE, Action::Quit)]),
+            (
+                H::ComposerEditing,
+                "Left / Right",
+                vec![
+                    typed(plain(KeyCode::Left), TYPING),
+                    typed(plain(KeyCode::Right), MULTI_LINE),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Ctrl+Left / Ctrl+Right / Alt+B / Alt+F",
+                vec![
+                    typed(control(KeyCode::Left), TYPING),
+                    typed(control(KeyCode::Right), TYPING),
+                    typed(alt(KeyCode::Char('b')), TYPING),
+                    typed(alt(KeyCode::Char('f')), MULTI_LINE),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Home / End / Ctrl+E",
+                vec![
+                    typed(plain(KeyCode::Home), TYPING),
+                    typed(plain(KeyCode::End), TYPING),
+                    typed(ctrl('e'), MULTI_LINE),
+                ],
+            ),
+            (
+                H::ComposerEditing,
+                "Backspace / Delete",
+                vec![
+                    typed(plain(KeyCode::Backspace), TYPING),
+                    typed(plain(KeyCode::Delete), TYPING),
+                ],
+            ),
+            (H::ComposerEditing, "Ctrl+W", vec![typed(ctrl('w'), TYPING)]),
+            (H::ComposerEditing, "Ctrl+K", vec![typed(ctrl('k'), TYPING)]),
+            (H::ComposerEditing, "Ctrl+Y", vec![typed(ctrl('y'), IDLE)]),
+            (H::ComposerEditing, "Ctrl+U", vec![typed(ctrl('u'), TYPING)]),
+            (
+                H::ComposerEditing,
+                "Shift+Left / Shift+Right",
+                vec![
+                    typed(shift(KeyCode::Left), TYPING),
+                    typed(shift(KeyCode::Right), MULTI_LINE),
+                ],
+            ),
+            (
+                H::TurnRunning,
+                "Esc / Ctrl+C",
+                vec![
+                    (plain(KeyCode::Esc), RUNNING, Action::Interrupt),
+                    (ctrl('c'), RUNNING_TYPING, Action::Interrupt),
+                ],
+            ),
+            (
+                H::TurnRunning,
+                "Enter",
+                vec![(plain(KeyCode::Enter), RUNNING_TYPING, Action::QueueInput)],
+            ),
+            (
+                H::Question,
+                "y / n",
+                vec![
+                    (
+                        letter('y'),
+                        CONFIRM,
+                        Action::Answer(PromptAnswer::Confirmed(true)),
+                    ),
+                    (
+                        letter('n'),
+                        CONFIRM,
+                        Action::Answer(PromptAnswer::Confirmed(false)),
+                    ),
+                ],
+            ),
+            (
+                H::Question,
+                "a",
+                vec![(letter('a'), CONFIRM, Action::AnswerYesForSession)],
+            ),
+            (
+                H::Question,
+                "Enter",
+                vec![
+                    (
+                        plain(KeyCode::Enter),
+                        CONFIRM,
+                        Action::Answer(PromptAnswer::Confirmed(false)),
+                    ),
+                    (
+                        plain(KeyCode::Enter),
+                        CONFIRM_NO_TOOL,
+                        Action::Answer(PromptAnswer::Confirmed(true)),
+                    ),
+                    (plain(KeyCode::Enter), INPUT, Action::SubmitModalInput),
+                    (plain(KeyCode::Enter), SELECT, Action::SubmitModalChoice),
+                ],
+            ),
+            (
+                H::Question,
+                "Up / Down / j / k",
+                vec![
+                    (plain(KeyCode::Up), SELECT, Action::ModalMove(-1)),
+                    (plain(KeyCode::Down), CHECKBOX, Action::ModalMove(1)),
+                    (letter('j'), SELECT, Action::ModalMove(1)),
+                    (letter('k'), CHECKBOX, Action::ModalMove(-1)),
+                ],
+            ),
+            (
+                H::Question,
+                "Space",
+                vec![(letter(' '), CHECKBOX, Action::ModalToggle)],
+            ),
+            (
+                H::Question,
+                "1-9",
+                (1..=9u8)
+                    .map(|n| {
+                        (
+                            letter(char::from(b'0' + n)),
+                            SELECT,
+                            Action::ModalJump(usize::from(n - 1)),
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                H::Question,
+                "Esc / Ctrl+C",
+                vec![
+                    (plain(KeyCode::Esc), PASSWORD, cancelled()),
+                    (ctrl('c'), CUSTOM_FIELD, cancelled()),
+                    (plain(KeyCode::Esc), CONFIRM, cancelled()),
+                ],
+            ),
+            (
+                H::Bands,
+                "Up / Down / Tab / Shift+Tab",
+                vec![
+                    (plain(KeyCode::Up), PALETTE, Action::PaletteMove(-1)),
+                    (plain(KeyCode::Down), SEARCH, Action::PaletteMove(1)),
+                    (plain(KeyCode::Tab), PALETTE, Action::PaletteMove(1)),
+                    (plain(KeyCode::BackTab), REWIND, Action::PaletteMove(-1)),
+                ],
+            ),
+            (
+                H::Bands,
+                "Enter",
+                vec![
+                    (plain(KeyCode::Enter), PALETTE, Action::PaletteAccept),
+                    (plain(KeyCode::Enter), SEARCH, Action::PaletteAccept),
+                ],
+            ),
+            (
+                H::Bands,
+                "Backspace",
+                vec![(plain(KeyCode::Backspace), SEARCH, Action::PopupBackspace)],
+            ),
+            (
+                H::Bands,
+                "Esc / Ctrl+C / Ctrl+D",
+                vec![
+                    (plain(KeyCode::Esc), PALETTE, Action::ClosePopup),
+                    (ctrl('c'), RUNNING_PALETTE, Action::ClosePopup),
+                    (ctrl('d'), REWIND, Action::ClosePopup),
+                ],
+            ),
+            (
+                H::Roster,
+                "j / k / Up / Down / Tab / Shift+Tab",
+                vec![
+                    (letter('j'), ROSTER, Action::PaletteMove(1)),
+                    (letter('k'), ROSTER, Action::PaletteMove(-1)),
+                    (plain(KeyCode::Up), ROSTER, Action::PaletteMove(-1)),
+                    (plain(KeyCode::Down), ROSTER, Action::PaletteMove(1)),
+                    (plain(KeyCode::Tab), ROSTER, Action::PaletteMove(1)),
+                    (plain(KeyCode::BackTab), ROSTER, Action::PaletteMove(-1)),
+                ],
+            ),
+            (
+                H::Roster,
+                "x",
+                vec![(letter('x'), RUNNING_ROSTER, Action::RosterCancel)],
+            ),
+            (
+                H::Roster,
+                "o",
+                vec![(letter('o'), ROSTER, Action::RosterOpen)],
+            ),
+            (
+                H::Roster,
+                "Enter",
+                vec![(plain(KeyCode::Enter), RUNNING_ROSTER, Action::PaletteAccept)],
+            ),
+            (
+                H::Roster,
+                "Ctrl+T",
+                vec![(ctrl('t'), ROSTER, Action::OpenPager)],
+            ),
+            (
+                H::Roster,
+                "Esc / Ctrl+C / Ctrl+D / Ctrl+G",
+                vec![
+                    (plain(KeyCode::Esc), ROSTER, Action::ClosePopup),
+                    (ctrl('c'), RUNNING_ROSTER, Action::ClosePopup),
+                    (ctrl('d'), ROSTER, Action::ClosePopup),
+                    (ctrl('g'), ROSTER, Action::ToggleRoster),
+                ],
+            ),
+            (
+                H::ViNormal,
+                "h / j / k / l",
+                vec![
+                    (letter('h'), VI_NORMAL, Action::ViMotion(ViMotion::Back)),
+                    (letter('j'), VI_NORMAL, Action::ViMotion(ViMotion::Down)),
+                    (letter('k'), VI_NORMAL, Action::ViMotion(ViMotion::Up)),
+                    (letter('l'), VI_NORMAL, Action::ViMotion(ViMotion::Forward)),
+                ],
+            ),
+            (
+                H::ViNormal,
+                "w / b",
+                vec![
+                    (
+                        letter('w'),
+                        VI_NORMAL,
+                        Action::ViMotion(ViMotion::WordForward),
+                    ),
+                    (letter('b'), VI_NORMAL, Action::ViMotion(ViMotion::WordBack)),
+                ],
+            ),
+            (
+                H::ViNormal,
+                "0 / $",
+                vec![
+                    (letter('0'), VI_NORMAL, Action::ViMotion(ViMotion::Head)),
+                    (letter('$'), VI_NORMAL, Action::ViMotion(ViMotion::End)),
+                ],
+            ),
+            (
+                H::ViNormal,
+                "x",
+                vec![(letter('x'), VI_NORMAL, Action::ViDeleteChar)],
+            ),
+            (
+                H::ViNormal,
+                "dd",
+                vec![(letter('d'), VI_NORMAL, Action::ViDeleteLine)],
+            ),
+            (
+                H::ViNormal,
+                "i / a / A",
+                vec![
+                    (letter('i'), VI_NORMAL, Action::ViInsert { append: None }),
+                    (
+                        letter('a'),
+                        VI_NORMAL,
+                        Action::ViInsert {
+                            append: Some(ViMotion::Forward),
+                        },
+                    ),
+                    (
+                        shift(KeyCode::Char('A')),
+                        VI_NORMAL,
+                        Action::ViInsert {
+                            append: Some(ViMotion::End),
+                        },
+                    ),
+                ],
+            ),
+            (
+                H::Pager,
+                "j / k / Up / Down",
+                vec![
+                    (letter('j'), BROWSE, Action::PagerScroll(1)),
+                    (letter('k'), BROWSE, Action::PagerScroll(-1)),
+                    (plain(KeyCode::Up), BROWSE, Action::PagerScroll(-1)),
+                    (plain(KeyCode::Down), BROWSE, Action::PagerScroll(1)),
+                ],
+            ),
+            (
+                H::Pager,
+                "Space / PgDn / PgUp",
+                vec![
+                    (letter(' '), BROWSE, Action::PagerPage(1)),
+                    (plain(KeyCode::PageDown), BROWSE, Action::PagerPage(1)),
+                    (plain(KeyCode::PageUp), BROWSE, Action::PagerPage(-1)),
+                ],
+            ),
+            (
+                H::Pager,
+                "g / Home / G / End",
+                vec![
+                    (letter('g'), BROWSE, Action::PagerTop),
+                    (plain(KeyCode::Home), BROWSE, Action::PagerTop),
+                    (letter('G'), BROWSE, Action::PagerBottom),
+                    (plain(KeyCode::End), BROWSE, Action::PagerBottom),
+                ],
+            ),
+            (
+                H::Pager,
+                "/",
+                vec![(letter('/'), BROWSE, Action::PagerFindOpen)],
+            ),
+            (
+                H::Pager,
+                "n / N",
+                vec![
+                    (letter('n'), BROWSE, Action::PagerFindNext { forward: true }),
+                    (
+                        letter('N'),
+                        BROWSE,
+                        Action::PagerFindNext { forward: false },
+                    ),
+                ],
+            ),
+            (
+                H::Pager,
+                "Tab",
+                vec![(plain(KeyCode::Tab), BROWSE, Action::OpenThreadPicker)],
+            ),
+            (H::Pager, "Mouse wheel", vec![]),
+            (
+                H::Pager,
+                "q / Esc / Ctrl+C / Ctrl+D / Ctrl+T",
+                vec![
+                    (letter('q'), BROWSE, Action::ClosePager),
+                    (plain(KeyCode::Esc), BROWSE, Action::ClosePager),
+                    (ctrl('c'), BROWSE, Action::ClosePager),
+                    (ctrl('d'), BROWSE, Action::ClosePager),
+                    (ctrl('t'), BROWSE, Action::ClosePager),
+                ],
+            ),
+            (
+                H::PagerFind,
+                "Enter",
+                vec![(plain(KeyCode::Enter), FIND, Action::PagerFindSubmit)],
+            ),
+            (
+                H::PagerFind,
+                "Backspace",
+                vec![(plain(KeyCode::Backspace), FIND, Action::PagerFindBackspace)],
+            ),
+            (
+                H::PagerFind,
+                "Esc / Ctrl+C",
+                vec![
+                    (plain(KeyCode::Esc), FIND, Action::PagerFindCancel),
+                    (ctrl('c'), FIND, Action::PagerFindCancel),
+                ],
+            ),
+            (
+                H::ThreadPicker,
+                "j / k / Up / Down",
+                vec![
+                    (letter('j'), PICKER, Action::ThreadPickerMove(1)),
+                    (letter('k'), PICKER, Action::ThreadPickerMove(-1)),
+                    (plain(KeyCode::Up), PICKER, Action::ThreadPickerMove(-1)),
+                    (plain(KeyCode::Down), PICKER, Action::ThreadPickerMove(1)),
+                ],
+            ),
+            (
+                H::ThreadPicker,
+                "Enter",
+                vec![(plain(KeyCode::Enter), PICKER, Action::ThreadPickerChoose)],
+            ),
+            (
+                H::ThreadPicker,
+                "q / Esc / Tab / Ctrl+C / Ctrl+D",
+                vec![
+                    (letter('q'), PICKER, Action::CloseThreadPicker),
+                    (plain(KeyCode::Esc), PICKER, Action::CloseThreadPicker),
+                    (plain(KeyCode::Tab), PICKER, Action::CloseThreadPicker),
+                    (ctrl('c'), PICKER, Action::CloseThreadPicker),
+                    (ctrl('d'), PICKER, Action::CloseThreadPicker),
+                ],
+            ),
+            (
+                H::KeyHelp,
+                "j / k / Up / Down",
+                vec![
+                    (letter('j'), HELP, Action::HelpScroll(1)),
+                    (letter('k'), HELP, Action::HelpScroll(-1)),
+                    (plain(KeyCode::Up), RUNNING_HELP, Action::HelpScroll(-1)),
+                    (plain(KeyCode::Down), HELP, Action::HelpScroll(1)),
+                ],
+            ),
+            (
+                H::KeyHelp,
+                "PgUp / PgDn",
+                vec![
+                    (plain(KeyCode::PageUp), HELP, Action::HelpPage(-1)),
+                    (plain(KeyCode::PageDown), HELP, Action::HelpPage(1)),
+                ],
+            ),
+            (H::KeyHelp, "Mouse wheel", vec![]),
+            (
+                H::KeyHelp,
+                "? / q / Esc / Ctrl+C",
+                vec![
+                    (letter('?'), RUNNING_HELP, Action::ToggleHelp),
+                    (letter('q'), HELP, Action::ToggleHelp),
+                    (plain(KeyCode::Esc), RUNNING_HELP, Action::ToggleHelp),
+                    (ctrl('c'), HELP, Action::ToggleHelp),
+                ],
+            ),
+        ]
+    }
+
+    /// Typing handed on to a field, a filter or the composer, or a key
+    /// swallowed: what an unbound key produces.
+    fn passes_through(action: &Action) -> bool {
+        matches!(
+            action,
+            Action::ComposerInput(_)
+                | Action::ModalInput(_)
+                | Action::PopupChar(_)
+                | Action::PagerFindChar(_)
+                | Action::Nothing
+        )
+    }
+
+    /// Every printable ASCII key and every named key, function keys
+    /// included, plain and under each modifier.
+    fn key_universe() -> Vec<KeyEvent> {
+        let modifiers = [
+            KeyModifiers::NONE,
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ];
+        let mut codes: Vec<KeyCode> = (b' '..=b'~')
+            .map(|byte| KeyCode::Char(char::from(byte)))
+            .collect();
+        codes.extend([
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ]);
+        codes.extend((1..=12).map(KeyCode::F));
+        codes
+            .into_iter()
+            .flat_map(|code| modifiers.map(|modifiers| press(code, modifiers)))
+            .collect()
+    }
+
+    /// The help's own name for a key, as a label token spells it: the
+    /// letter case-folded, Ctrl and Alt kept, and Shift kept only on a
+    /// named key, since on a character it is the case or the symbol.
+    fn normalise(key: KeyEvent) -> (KeyCode, KeyModifiers) {
+        let code = lowercase(key.code);
+        let mut modifiers =
+            key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
+        if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
+            modifiers.remove(KeyModifiers::SHIFT);
+        }
+        (code, modifiers)
+    }
+
+    /// The keys a help row's label names, one token per ` / `-separated
+    /// name; panics on a name it cannot read.
+    fn label_keys(label: &str) -> Vec<(KeyCode, KeyModifiers)> {
+        let mut keys = Vec::new();
+        for token in label.split(" / ") {
+            match token {
+                "1-9" => keys.extend(('1'..='9').map(|c| (KeyCode::Char(c), KeyModifiers::NONE))),
+                "dd" => keys.push((KeyCode::Char('d'), KeyModifiers::NONE)),
+                "Shift+Tab" => keys.push((KeyCode::BackTab, KeyModifiers::NONE)),
+                _ => {
+                    let mut name = token;
+                    let mut modifiers = KeyModifiers::NONE;
+                    loop {
+                        if let Some(rest) = name.strip_prefix("Ctrl+") {
+                            modifiers |= KeyModifiers::CONTROL;
+                            name = rest;
+                        } else if let Some(rest) = name.strip_prefix("Alt+") {
+                            modifiers |= KeyModifiers::ALT;
+                            name = rest;
+                        } else if let Some(rest) = name.strip_prefix("Shift+") {
+                            modifiers |= KeyModifiers::SHIFT;
+                            name = rest;
+                        } else {
+                            break;
+                        }
+                    }
+                    let code = match name {
+                        "Up" => KeyCode::Up,
+                        "Down" => KeyCode::Down,
+                        "Left" => KeyCode::Left,
+                        "Right" => KeyCode::Right,
+                        "Home" => KeyCode::Home,
+                        "End" => KeyCode::End,
+                        "PgUp" => KeyCode::PageUp,
+                        "PgDn" => KeyCode::PageDown,
+                        "Esc" => KeyCode::Esc,
+                        "Enter" => KeyCode::Enter,
+                        "Tab" => KeyCode::Tab,
+                        "Space" => KeyCode::Char(' '),
+                        "Backspace" => KeyCode::Backspace,
+                        "Delete" => KeyCode::Delete,
+                        _ => {
+                            let mut chars = name.chars();
+                            match (chars.next(), chars.next()) {
+                                (Some(c), None) => KeyCode::Char(c),
+                                _ => panic!("{label:?}: no key is called {token:?}"),
+                            }
+                        }
+                    };
+                    keys.push(normalise(press(code, modifiers)));
+                }
+            }
+        }
+        keys
+    }
+
+    /// `key` with each modifier the key map ignores for it in `ctx`
+    /// taken off: Alt+Esc does what Esc does, so the help need not name
+    /// it.
+    fn without_ignored_modifiers(key: KeyEvent, ctx: &KeyContext) -> KeyEvent {
+        let action = map_key(key, ctx);
+        let mut key = key;
+        for modifier in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+        ] {
+            if key.modifiers.contains(modifier) {
+                let bare = press(key.code, key.modifiers - modifier);
+                if map_key(bare, ctx) == action {
+                    key = bare;
+                }
+            }
+        }
+        key
+    }
+
+    /// Each help row names a key that, in a context the row applies to,
+    /// does what the row says, and no row documents a key that does
+    /// nothing, except the composer editing rows, whose keys must reach
+    /// the text area as typed.
+    #[test]
+    fn every_help_row_replays_through_the_key_map() {
+        let swept = swept_contexts();
+        let examples = help_examples();
+        assert_eq!(examples.len(), KEY_HELP.len(), "one replay per help row");
+        for (row, (context, keys, replays)) in KEY_HELP.iter().zip(&examples) {
+            assert_eq!((row.context, row.keys), (*context, *keys), "{row:?}");
+            assert_eq!(
+                replays.is_empty(),
+                row.keys == "Mouse wheel",
+                "{row:?}: only a mouse wheel row replays no key"
+            );
+            for (key, ctx, expected) in replays {
+                assert!(
+                    swept
+                        .iter()
+                        .any(|(swept, applies)| swept == ctx && applies.contains(&row.context)),
+                    "{row:?}: {ctx:?} is not a swept context the row applies to"
+                );
+                if row.context == HelpContext::ComposerEditing {
+                    assert_eq!(*expected, Action::ComposerInput(*key), "{row:?}");
+                } else {
+                    assert!(!passes_through(expected), "{row:?} documents {expected:?}");
+                }
+                assert_eq!(map_key(*key, ctx), *expected, "{row:?}: {key:?} in {ctx:?}");
+            }
+        }
+    }
+
+    /// Each row's label names exactly the keys its replays press: no
+    /// label token goes unreplayed and no replayed key goes unnamed.
+    #[test]
+    fn every_help_label_names_the_keys_its_row_replays() {
+        for (row, (_, _, replays)) in KEY_HELP.iter().zip(help_examples()) {
+            if row.keys == "Mouse wheel" {
+                continue;
+            }
+            let named = label_keys(row.keys);
+            let replayed: Vec<(KeyCode, KeyModifiers)> =
+                replays.iter().map(|(key, _, _)| normalise(*key)).collect();
+            for key in &named {
+                assert!(
+                    replayed.contains(key),
+                    "{row:?} names {key:?}, never replayed"
+                );
+            }
+            for key in &replayed {
+                assert!(named.contains(key), "{row:?} replays {key:?}, not named");
+            }
+        }
+    }
+
+    /// Every binding the key map reaches, in every swept context, is
+    /// that key with that action among the replays of a help row
+    /// applying there; modifiers the key map ignores for the key do not
+    /// count as a different key.
+    #[test]
+    fn every_binding_the_key_map_reaches_has_a_help_row() {
+        let examples = help_examples();
+        let mut missing = Vec::new();
+        for (ctx, applies) in swept_contexts() {
+            let documented: Vec<((KeyCode, KeyModifiers), &Action)> = examples
+                .iter()
+                .filter(|(context, _, _)| applies.contains(context))
+                .flat_map(|(_, _, replays)| {
+                    replays
+                        .iter()
+                        .map(|(key, _, action)| (normalise(*key), action))
+                })
+                .collect();
+            for key in key_universe() {
+                let action = map_key(key, &ctx);
+                if passes_through(&action) {
+                    continue;
+                }
+                let named = normalise(without_ignored_modifiers(key, &ctx));
+                if !documented.contains(&(named, &action)) {
+                    missing.push(format!("{key:?} in {ctx:?} -> {action:?}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "bindings no help row names:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// The help shows one heading per context, so each context's rows
+    /// sit together.
+    #[test]
+    fn help_rows_are_grouped_by_context() {
+        let mut seen: Vec<HelpContext> = Vec::new();
+        for row in KEY_HELP {
+            if seen.last() != Some(&row.context) {
+                assert!(!seen.contains(&row.context), "{row:?} is out of its group");
+                seen.push(row.context);
+            }
+        }
+    }
+
+    /// Terminal multiplexers own the function keys, so none is bound:
+    /// each produces what any unbound key does.
+    #[test]
+    fn function_keys_are_unbound_everywhere() {
+        for (ctx, _) in swept_contexts() {
+            for n in 1..=12 {
+                for modifiers in [
+                    KeyModifiers::NONE,
+                    KeyModifiers::SHIFT,
+                    KeyModifiers::CONTROL,
+                    KeyModifiers::ALT,
+                ] {
+                    let key = press(KeyCode::F(n), modifiers);
+                    let action = map_key(key, &ctx);
+                    assert!(passes_through(&action), "{key:?} in {ctx:?} -> {action:?}");
+                }
+            }
+        }
+    }
+
+    /// `?` opens the help only on an empty composer with nothing over
+    /// it; elsewhere it stays typing, or whatever the context makes of
+    /// an unbound letter.
+    #[test]
+    fn question_mark_opens_the_help_only_on_a_bare_empty_composer() {
+        let mark = plain(KeyCode::Char('?'));
+        let shifted = press(KeyCode::Char('?'), KeyModifiers::SHIFT);
+        let alt_mark = press(KeyCode::Char('?'), KeyModifiers::ALT);
+        let cases = [
+            (mark, IDLE, Action::ToggleHelp),
+            (shifted, IDLE, Action::ToggleHelp),
+            (mark, RUNNING, Action::ToggleHelp),
+            (mark, FOCUSED, Action::ToggleHelp),
+            (mark, VI_INSERT, Action::ToggleHelp),
+            (mark, VI_NORMAL_EMPTY, Action::ToggleHelp),
+            (mark, TYPING, Action::ComposerInput(mark)),
+            (mark, RUNNING_TYPING, Action::ComposerInput(mark)),
+            (alt_mark, IDLE, Action::ComposerInput(alt_mark)),
+            (mark, VI_NORMAL, Action::Nothing),
+            (mark, PALETTE, Action::ComposerInput(mark)),
+            (mark, REWIND, Action::ComposerInput(mark)),
+            (mark, SEARCH, Action::PopupChar('?')),
+            (mark, ROSTER, Action::Nothing),
+            (mark, CONFIRM, Action::Nothing),
+            (mark, INPUT, Action::ModalInput(mark)),
+            (mark, BROWSE, Action::Nothing),
+            (mark, FIND, Action::PagerFindChar('?')),
+            (mark, HELP, Action::ToggleHelp),
+        ];
+        for (key, ctx, expected) in cases {
+            assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// The help covers everything: past suspend and repaint, no key
+    /// reaches the composer, the transcript or a panel under it.
+    #[test]
+    fn the_help_takes_every_key_but_the_terminals() {
+        let cases = [
+            (plain(KeyCode::Char('x')), HELP),
+            (plain(KeyCode::Enter), RUNNING_HELP),
+            (plain(KeyCode::Home), HELP),
+            (ctrl('x'), HELP),
+            (ctrl('g'), HELP),
+            (ctrl('t'), HELP),
+            (ctrl('d'), HELP),
+            (ctrl('j'), HELP),
+        ];
+        for (key, ctx) in cases {
+            assert_eq!(map_key(key, &ctx), Action::Nothing, "{key:?} in {ctx:?}");
         }
     }
 }

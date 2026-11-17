@@ -6,7 +6,7 @@
 //! just another frame. A `!cmd` passthrough or an editor borrows the
 //! terminal: the loop leaves the screen and runs the job synchronously on
 //! its own thread, so nothing is drawn until the job returns.
-//! The roster (F3) and the pager (Ctrl+T) act through a control context,
+//! The roster (Ctrl+G) and the pager (Ctrl+T) act through a control context,
 //! a fork of the context taken each time it comes back idle: it shares
 //! the supervisor, the escalation queue and the child session root with
 //! the context a turn has, so a task can be cancelled or a question
@@ -17,6 +17,7 @@ mod cells;
 mod composer;
 mod dump;
 mod events;
+mod help;
 mod history;
 mod keys;
 mod pager;
@@ -53,6 +54,7 @@ use composer::{Composer, field_background};
 use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
+use help::Help;
 use history::ComposerHistory;
 use keys::{Action, KeyContext, ModalKind, PagerMode, PopupKind, ViMode};
 use pager::{Pager, PagerView, ThreadRow};
@@ -305,6 +307,12 @@ const STATUS_TICK: Duration = Duration::from_secs(1);
 /// loop.
 const TYPEAHEAD_GRACE: Duration = Duration::from_millis(5);
 const TYPEAHEAD_LIMIT: usize = 50;
+/// The UI's own command, spelled without its sigil: it opens the key help
+/// and never reaches the REPL.
+const KEYS_COMMAND: &str = "keys";
+/// The status row between turns, naming the chords of the panels that
+/// nothing else on screen points to, and the key that lists the rest.
+const IDLE_STATUS: &str = "Ctrl+G = tasks  Ctrl+X = todo  ? = keys";
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 
@@ -1260,6 +1268,8 @@ pub(crate) struct App {
     prompt_memory: Arc<PromptMemory>,
     /// Ctrl+T's full-screen view, drawn over everything while open.
     pager: Option<Pager>,
+    /// The key help, drawn over everything while open.
+    help: Option<Help>,
     /// The generation of the newest child read asked for.
     child_reads: u64,
     roster_sources: RosterSources,
@@ -1348,6 +1358,7 @@ impl App {
             config,
             prompt_memory,
             pager: None,
+            help: None,
             roster_sources: RosterSources::default(),
             control: None,
             child_root: None,
@@ -1622,6 +1633,7 @@ impl App {
             },
             vi: self.vi_mode,
             pager: self.pager.as_ref().map(Pager::mode),
+            help: self.help.is_some(),
         }
     }
 
@@ -1711,6 +1723,9 @@ impl App {
     }
 
     fn submit_composer(&mut self) -> Option<Command> {
+        if self.take_keys_command() {
+            return None;
+        }
         self.take_composer_line().map(Command::Submit)
     }
 
@@ -1718,7 +1733,22 @@ impl App {
         if self.exiting {
             return None;
         }
+        if self.take_keys_command() {
+            return None;
+        }
         self.hold_composer_line().map(Command::Queue)
+    }
+
+    /// Takes a `.keys` line out of the composer, as any sent line is, and
+    /// opens the key help in place of sending it.
+    fn take_keys_command(&mut self) -> bool {
+        let word = command_word(&self.composer_text(), self.config.command_prefix);
+        if word.as_deref().and_then(|word| word.strip_prefix('.')) != Some(KEYS_COMMAND) {
+            return false;
+        }
+        self.take_composer_line();
+        self.help = Some(Help::default());
+        true
     }
 
     /// Holds the draft for the running turn. A prompt is returned for the
@@ -1837,6 +1867,10 @@ impl App {
             TermInput::Key(key) => self.handle_key(key),
             TermInput::Paste(text) => {
                 self.last_keystroke = Some(self.clock.now());
+                // Nothing under the help is in sight to take it.
+                if self.help.is_some() {
+                    return None;
+                }
                 // Terminals deliver a multi-line paste with the line ends
                 // they use themselves (CR, CRLF or LF); the composer and
                 // the field take one shape.
@@ -1870,6 +1904,15 @@ impl App {
                 None
             }
             TermInput::Mouse(mouse) => {
+                if let Some(help) = self.help.as_mut() {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => help.scroll(-WHEEL_LINES),
+                        MouseEventKind::ScrollDown => help.scroll(WHEEL_LINES),
+                        _ => return None,
+                    }
+                    self.schedule_frame();
+                    return None;
+                }
                 if let Some(pager) = self.pager.as_mut() {
                     match mouse.kind {
                         MouseEventKind::ScrollUp => pager.scroll(-WHEEL_LINES),
@@ -2103,6 +2146,25 @@ impl App {
                     View::Roster(_) => View::Composer,
                     _ => View::Roster(RosterState::new(self.roster_sources.rows())),
                 };
+                None
+            }
+            Action::ToggleHelp => {
+                self.help = match self.help {
+                    Some(_) => None,
+                    None => Some(Help::default()),
+                };
+                None
+            }
+            Action::HelpScroll(delta) => {
+                if let Some(help) = self.help.as_mut() {
+                    help.scroll(delta);
+                }
+                None
+            }
+            Action::HelpPage(direction) => {
+                if let Some(help) = self.help.as_mut() {
+                    help.page(direction);
+                }
                 None
             }
             Action::RosterCancel => {
@@ -2815,8 +2877,9 @@ impl App {
 
     fn enqueue_prompt(&mut self, req: PromptRequest, reply: mpsc::Sender<PromptAnswer>) {
         self.close_view();
-        // A question is never left waiting behind the pager.
+        // A question is never left waiting behind the pager or the help.
         self.close_pager();
+        self.help = None;
         let becomes_front = self.prompts.is_empty();
         self.prompts.push_back(PendingPrompt::new(req, reply));
         if becomes_front {
@@ -3043,7 +3106,9 @@ impl App {
         if self.exiting {
             return Some("Leaving...".to_string());
         }
-        let turn = self.turn.as_ref()?;
+        let Some(turn) = self.turn.as_ref() else {
+            return self.prompts.is_empty().then(|| IDLE_STATUS.to_string());
+        };
         let now = self.clock.now();
         let secs = |since: Instant| now.duration_since(since).as_secs();
         let state = if let Some(tool) = &turn.tool {
@@ -3090,6 +3155,10 @@ impl App {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.frame_area = Some(area);
+        if let Some(help) = self.help.as_mut() {
+            frame.render_widget(help, area);
+            return;
+        }
         if let Some(pager) = self.pager.as_mut() {
             let generation = self.transcript.generation();
             let (cells, revisions) = self.transcript.cells_for_layout();
@@ -3184,10 +3253,12 @@ impl App {
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
     /// that was just drawn, and so does an open roster for its next read
-    /// unless the pager covers it.
+    /// unless the pager or the help covers it.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
-        if self.turn.is_some() || (self.pager.is_none() && matches!(self.view, View::Roster(_))) {
+        if self.turn.is_some()
+            || (self.pager.is_none() && self.help.is_none() && matches!(self.view, View::Roster(_)))
+        {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }
@@ -6698,9 +6769,9 @@ mod tests {
                 .app
                 .handle_msg(UiMsg::UsageUpdated("12 tokens".to_string()));
             harness.app.handle_msg(UiMsg::TodoUpdated(todo_items()));
-            harness.press(KeyCode::F(2));
+            harness.app.handle_key(ctrl(KeyCode::Char('x')));
             harness.render();
-            harness.press(KeyCode::F(2));
+            harness.app.handle_key(ctrl(KeyCode::Char('x')));
             harness.press(KeyCode::PageUp);
             harness.app.transcript.push(Cell::user("late"));
             harness.render();
@@ -6764,7 +6835,7 @@ mod tests {
     #[test]
     fn the_roster_ticks_only_while_no_pager_covers_it() {
         let mut harness = Harness::standalone(80, 24);
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.render();
         harness.app.frame_drawn();
         assert!(harness.app.frames.due_at().is_some(), "no roster tick");
@@ -8810,7 +8881,7 @@ mod tests {
         );
         assert_eq!(
             row_text(&harness, COMPOSER_RULE_ROW - rows - 1).trim(),
-            "",
+            IDLE_STATUS,
             "the status row sits between the transcript and the band\n{frame}"
         );
 
@@ -9612,7 +9683,7 @@ mod tests {
     }
 
     #[test]
-    fn f2_shows_the_todo_panel_beside_the_transcript_and_hides_it_again() {
+    fn ctrl_x_shows_the_todo_panel_beside_the_transcript_and_hides_it_again() {
         let mut harness = Harness::standalone(80, 24);
         harness.app.begin_turn("plan it", false);
         harness
@@ -9624,7 +9695,7 @@ mod tests {
             .app
             .handle_msg(UiMsg::AssistantText("Working through it.".to_string()));
         harness.app.end_turn(false, &TurnOutcome::default());
-        assert!(harness.press(KeyCode::F(2)).is_none());
+        assert!(harness.app.handle_key(ctrl(KeyCode::Char('x'))).is_none());
         let frame = harness.draw();
         insta::assert_snapshot!("todo_panel_80x24", &frame);
         for text in [
@@ -9636,7 +9707,7 @@ mod tests {
         ] {
             assert!(frame.contains(text), "{text:?} missing:\n{frame}");
         }
-        harness.press(KeyCode::F(2));
+        harness.app.handle_key(ctrl(KeyCode::Char('x')));
         let frame = harness.draw();
         assert!(!frame.contains("Todo"), "{frame}");
         assert!(frame.contains("Working through it."), "{frame}");
@@ -9651,7 +9722,7 @@ mod tests {
             .app
             .handle_msg(UiMsg::AssistantText("Working through it.".to_string()));
         harness.app.end_turn(false, &TurnOutcome::default());
-        harness.press(KeyCode::F(2));
+        harness.app.handle_key(ctrl(KeyCode::Char('x')));
         let frame = harness.draw();
         insta::assert_snapshot!("todo_panel_40x20", &frame);
         assert!(frame.contains("[ ] snapshot it narrow"), "{frame}");
@@ -10706,6 +10777,149 @@ mod tests {
         assert!(harness.draw().contains("Proceed? tui-x7x"));
     }
 
+    /// `?` on an empty composer covers the screen with the key help and
+    /// Esc gives the screen back; typed after text, `?` is just typing.
+    #[test]
+    fn question_mark_opens_the_key_help_and_esc_closes_it() {
+        let mut harness = Harness::standalone(80, 24);
+        assert!(harness.draw().contains(IDLE_STATUS));
+        assert_eq!(harness.press(KeyCode::Char('?')), None);
+        let frame = harness.draw();
+        assert!(frame.contains("Keys"), "{frame}");
+        assert!(frame.contains("Suspend to the shell"), "{frame}");
+        assert!(!frame.contains(IDLE_STATUS), "{frame}");
+        harness.press(KeyCode::PageDown);
+        assert!(!harness.draw().contains("Suspend to the shell"));
+        harness
+            .app
+            .handle_input(TermInput::Paste("pasted".to_string()));
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert!(harness.app.help.is_none());
+        assert_eq!(harness.app.composer_text(), "");
+        assert!(harness.draw().contains(IDLE_STATUS));
+
+        harness.type_text("why?");
+        assert!(harness.app.help.is_none());
+        assert_eq!(harness.app.composer_text(), "why?");
+    }
+
+    /// Each chord the status row names is a key the help lists.
+    #[test]
+    fn the_idle_status_names_only_keys_the_help_lists() {
+        let chords: Vec<&str> = IDLE_STATUS
+            .split("  ")
+            .map(|entry| entry.split_once(" = ").expect(entry).0)
+            .collect();
+        assert_eq!(chords, ["Ctrl+G", "Ctrl+X", "?"]);
+        for chord in chords {
+            assert!(
+                keys::KEY_HELP
+                    .iter()
+                    .any(|row| row.keys.split(" / ").any(|token| token == chord)),
+                "{chord} is in no help row"
+            );
+        }
+    }
+
+    /// The wheel scrolls whatever covers the screen: the key help, the
+    /// pager, or else the transcript.
+    #[test]
+    fn the_wheel_scrolls_the_help_the_pager_and_the_transcript() {
+        let mut harness = Harness::standalone(80, 24);
+        counted_turn(&mut harness, 60);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw();
+        let wheel = |kind: MouseEventKind| {
+            TermInput::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        harness.press(KeyCode::Char('?'));
+        let top = harness.draw();
+        harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
+        let scrolled = harness.draw();
+        assert_ne!(scrolled, top, "the wheel did not move the key help");
+        harness.app.handle_input(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(harness.draw(), top);
+        assert!(!harness.app.transcript.scrolled());
+        harness.press(KeyCode::Esc);
+
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Char('g'));
+        let top = harness.draw();
+        harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
+        assert_ne!(harness.draw(), top, "the wheel did not move the pager");
+        assert!(!harness.app.transcript.scrolled());
+        harness.press(KeyCode::Char('q'));
+
+        harness.app.handle_input(wheel(MouseEventKind::ScrollUp));
+        assert!(harness.app.transcript.scrolled());
+        harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
+        assert!(!harness.app.transcript.scrolled());
+    }
+
+    #[test]
+    fn the_key_help_fills_the_screen_wide_and_narrow() {
+        for (width, height, name) in [
+            (80, 24, "help_overlay_80x24"),
+            (40, 20, "help_overlay_40x20"),
+        ] {
+            let mut harness = Harness::standalone(width, height);
+            harness.press(KeyCode::Char('?'));
+            let frame = harness.draw();
+            assert!(frame.contains("Suspend to the shell"), "{frame}");
+            insta::assert_snapshot!(name, &frame);
+        }
+    }
+
+    /// `.keys` opens the key help under the active prefix, between turns
+    /// and during one, and is never handed on as a line to run or hold.
+    #[test]
+    fn the_keys_command_opens_the_help_instead_of_reaching_the_repl() {
+        for (prefix, line) in [
+            (crate::config::CommandPrefix::Dot, ".keys"),
+            (crate::config::CommandPrefix::Slash, "/keys"),
+        ] {
+            let config = Arc::new(AppConfig {
+                command_prefix: prefix,
+                ..(*plain_config()).clone()
+            });
+            let mut harness = Harness::new(80, 24, config, FooterInfo::default());
+            harness.type_text(line);
+            assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
+            assert!(harness.app.help.is_some(), "{line}");
+            assert_eq!(harness.app.composer_text(), "");
+            harness.press(KeyCode::Char('q'));
+            assert!(harness.app.help.is_none());
+
+            harness.app.begin_turn("work", false);
+            harness.type_text(line);
+            assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
+            assert!(harness.app.help.is_some(), "{line}");
+            assert!(harness.app.queued.is_empty(), "{line}");
+        }
+    }
+
+    /// A question arriving under the key help closes it, as it closes
+    /// the pager.
+    #[test]
+    fn a_question_closes_the_key_help() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.press(KeyCode::Char('?'));
+        assert!(harness.app.help.is_some());
+        let (reply, _answer) = mpsc::channel();
+        harness.app.handle_msg(UiMsg::Prompt {
+            req: Box::new(confirm_request(None)),
+            reply,
+        });
+        assert!(harness.app.help.is_none());
+        assert!(harness.draw().contains("Proceed? tui-x7x"));
+    }
+
     fn supervisor() -> Arc<parking_lot::RwLock<crate::supervisor::Supervisor>> {
         Arc::new(parking_lot::RwLock::new(
             crate::supervisor::Supervisor::new(4, 3).with_max_concurrent_jobs(4),
@@ -10837,7 +11051,7 @@ mod tests {
             harness.app.sync_from_ctx(&mut ctx);
             harness.app.begin_turn("work on", false);
 
-            harness.press(KeyCode::F(3));
+            harness.app.handle_key(ctrl(KeyCode::Char('g')));
             let frame = harness.draw();
             assert!(frame.contains("agent-x7x"), "{frame}");
             assert!(frame.contains("job-x7x"), "{frame}");
@@ -10874,7 +11088,7 @@ mod tests {
             let mut harness = Harness::for_ctx(&ctx);
             harness.app.sync_from_ctx(&mut ctx);
 
-            harness.press(KeyCode::F(3));
+            harness.app.handle_key(ctrl(KeyCode::Char('g')));
             harness.draw();
             harness.press(KeyCode::Char('j'));
             let focused = |harness: &Harness| harness.app.focused_task().map(|task| task.id);
@@ -10918,7 +11132,7 @@ mod tests {
                 session_id: "stale-x7x".to_string(),
             });
 
-            harness.press(KeyCode::F(3));
+            harness.app.handle_key(ctrl(KeyCode::Char('g')));
             harness.draw();
             harness.press(KeyCode::Char('x'));
             let requests = harness.app.take_control_requests();
@@ -11000,7 +11214,7 @@ mod tests {
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
 
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         let frame = harness.draw();
         assert!(frame.contains("Which branch? x7x"), "{frame}");
         assert!(!frame.contains("[select]"), "{frame}");
@@ -11018,7 +11232,7 @@ mod tests {
         assert!(queue.has_pending(), "Esc answered the question");
         assert!(reply.try_recv().is_err());
 
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.draw();
         harness.press(KeyCode::Enter);
         harness.clock.advance(HOTKEY_IDLE);
@@ -11037,7 +11251,7 @@ mod tests {
         let mut reply = escalate(&queue, None);
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.draw();
         harness.press(KeyCode::Enter);
         assert_eq!(
@@ -11060,7 +11274,7 @@ mod tests {
         let reply = escalate(&queue, None);
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.draw();
         harness.press(KeyCode::Enter);
         drop(reply);
@@ -11107,7 +11321,7 @@ mod tests {
         });
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.draw();
         harness.press(KeyCode::Enter);
         assert!(matches!(
@@ -11721,7 +11935,7 @@ mod tests {
         let reply = escalate_as(&queue, "esc_p1d", "Which tag? p1d");
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.draw();
         harness.press(KeyCode::Enter);
         harness.draw();
@@ -11753,7 +11967,7 @@ mod tests {
         drop(dead);
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         let frame = harness.draw();
         assert!(frame.contains("Live asks l2l"), "{frame}");
         assert!(!frame.contains("d2d"), "{frame}");
@@ -11776,7 +11990,7 @@ mod tests {
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
         let first = escalate_as(&queue, "esc_a3a", "First asks a3a");
-        harness.press(KeyCode::F(3));
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
         harness.draw();
         let mut second = escalate_as(&queue, "esc_b3b", "Second asks b3b");
         let frame = harness.draw();

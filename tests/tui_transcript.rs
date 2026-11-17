@@ -17,7 +17,7 @@
 //!   leaves that cell in place;
 //! - the "Thinking for Ns" status row is live while a reasoning delta is
 //!   held;
-//! - `F2` shows and hides the Todo panel;
+//! - `Ctrl+X` shows and hides the Todo panel;
 //! - scrolling up raises the follow chip, `End` and a submitted line
 //!   clear it;
 //! - a tool call is one cell that finishes in place (its start and end
@@ -46,7 +46,7 @@
 //! - a think span whose `</think>` arrives late (after a hold, or only at
 //!   the end of a reasoning-only reply) never shows;
 //! - Esc over a focused row mid-turn interrupts the turn;
-//! - F2, PgUp and End keep working under a tool's Confirm modal and the
+//! - Ctrl+X, PgUp and End keep working under a tool's Confirm modal and the
 //!   Input modal, and leave the question up;
 //! - a folded tool header at forty columns is one row ending in `ok`.
 #![cfg(unix)]
@@ -69,7 +69,7 @@ const PTY_DEADLINE: Duration = Duration::from_secs(20);
 /// (1 s) old; 1200 ms settles it.
 const HOTKEY_GAP: Duration = Duration::from_millis(1200);
 
-const F2: &[u8] = b"\x1bOQ";
+const CTRL_X: &[u8] = b"\x18";
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
 const END: &[u8] = b"\x1b[F";
@@ -1432,7 +1432,7 @@ fn cells_landing_while_scrolled_up_count_on_the_follow_chip_until_end() {
 
 // ---------------------------------------------------------------------
 // todo__* calls take no transcript row of their own; what they set shows
-// up in the Todo panel (F2).
+// up in the Todo panel (Ctrl+X).
 // ---------------------------------------------------------------------
 
 #[test]
@@ -1476,19 +1476,19 @@ fn todo_calls_take_no_transcript_row_and_fill_the_todo_panel() {
     );
 
     pty.read_for(HOTKEY_GAP);
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let panel = repaint(&mut pty);
     assert!(
         panel.contains("Todo"),
-        "F2 did not open the Todo panel:\n{panel}"
+        "Ctrl+X did not open the Todo panel:\n{panel}"
     );
     assert!(
         panel.contains("feedthecatz3r"),
         "the Todo panel does not list the item the todo__add call set:\n{panel}"
     );
 
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(300));
     quit(pty);
 }
@@ -1538,34 +1538,34 @@ fn the_thinking_status_row_is_live_during_a_held_reasoning_delta() {
 }
 
 // ---------------------------------------------------------------------
-// F2 shows the Todo panel and hides it again.
+// Ctrl+X shows the Todo panel and hides it again.
 // ---------------------------------------------------------------------
 
 #[test]
 #[serial]
-fn f2_shows_and_hides_the_todo_panel() {
-    let (_guard, mut pty) = boot("f2", &[]);
+fn ctrl_x_shows_and_hides_the_todo_panel() {
+    let (_guard, mut pty) = boot("ctrl-x", &[]);
 
     let frame = repaint(&mut pty);
     assert!(
         !frame.contains("Todo"),
-        "the Todo panel is open before F2 was pressed:\n{frame}"
+        "the Todo panel is open before Ctrl+X was pressed:\n{frame}"
     );
 
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = repaint(&mut pty);
     assert!(
         frame.contains("Todo"),
-        "F2 did not open the Todo panel:\n{frame}"
+        "Ctrl+X did not open the Todo panel:\n{frame}"
     );
 
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = repaint(&mut pty);
     assert!(
         !frame.contains("Todo"),
-        "a second F2 did not close the Todo panel:\n{frame}"
+        "a second Ctrl+X did not close the Todo panel:\n{frame}"
     );
 
     quit(pty);
@@ -1809,12 +1809,12 @@ fn undo_with_nothing_to_undo_leaves_the_ui_alive() {
 fn tiny_terminal_sizes_clamp_the_welcome_block_and_todo_panel() {
     let (_guard, mut pty) = boot("tiny", &[]);
 
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = repaint(&mut pty);
     assert!(
         frame.contains("Todo"),
-        "F2 did not open the Todo panel:\n{frame}"
+        "Ctrl+X did not open the Todo panel:\n{frame}"
     );
 
     // One distinct digit per size, the first a control resize that is
@@ -2239,7 +2239,7 @@ fn esc_with_a_focused_row_interrupts_the_running_turn_first() {
 
 // ---------------------------------------------------------------------
 // Keys that only move the view belong to the transcript, not the modal:
-// with a tool's Confirm question up, F2 toggles the Todo panel, PgUp
+// with a tool's Confirm question up, Ctrl+X toggles the Todo panel, PgUp
 // raises the follow chip and End clears it, and the question is still
 // there to answer afterwards.
 // ---------------------------------------------------------------------
@@ -2302,20 +2302,20 @@ fn view_keys_work_under_a_tools_confirm_modal() {
         .expect("the tool's confirm question never reached the screen");
     pty.read_for(HOTKEY_GAP);
 
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = repaint(&mut pty);
     assert!(
         frame.contains("Todo"),
-        "F2 under the Confirm modal did not open the Todo panel:\n{frame}"
+        "Ctrl+X under the Confirm modal did not open the Todo panel:\n{frame}"
     );
     pty.read_for(HOTKEY_GAP);
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = repaint(&mut pty);
     assert!(
         !frame.contains("Todo"),
-        "a second F2 under the Confirm modal did not close the Todo panel:\n{frame}"
+        "a second Ctrl+X under the Confirm modal did not close the Todo panel:\n{frame}"
     );
 
     pty.read_for(HOTKEY_GAP);
@@ -2394,15 +2394,15 @@ fn view_keys_work_under_the_input_modal() {
     wait_for_squeezed_after(&mut pty, "Enter = answer", 0, "the Input modal");
     pty.read_for(HOTKEY_GAP);
 
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
     let frame = repaint(&mut pty);
     assert!(
         frame.contains("Todo"),
-        "F2 under the Input modal did not open the Todo panel:\n{frame}"
+        "Ctrl+X under the Input modal did not open the Todo panel:\n{frame}"
     );
     pty.read_for(HOTKEY_GAP);
-    pty.send(F2).unwrap();
+    pty.send(CTRL_X).unwrap();
     pty.read_for(Duration::from_millis(500));
 
     pty.read_for(HOTKEY_GAP);

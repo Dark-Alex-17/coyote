@@ -1064,9 +1064,9 @@ fn folded_verb(name: &str) -> &str {
 }
 
 /// The greeting, boxed and centred in `width`: the wordmark, the model,
-/// the interrupt hint and the help hint spelled with the active command
-/// prefix. Only BOLD and DIM mark it up, so it reads the same under
-/// `NO_COLOR`.
+/// the interrupt hint, and the help and key help hints spelled with the
+/// active command prefix. Only BOLD and DIM mark it up, so it reads the
+/// same under `NO_COLOR`.
 pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> Vec<Line<'static>> {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let plain = Style::new();
@@ -1083,6 +1083,14 @@ pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> V
     );
     text.push((String::new(), plain));
     text.push((help.into_owned(), plain));
+    text.push((
+        format!(
+            "Press \"?\" or type \"{}{}\" to list the keys.",
+            prefix.display(),
+            super::KEYS_COMMAND
+        ),
+        plain,
+    ));
 
     // Two border columns and one space of padding on each side.
     const FRAME: usize = 4;
@@ -1483,6 +1491,7 @@ mod tests {
                 assert!(text.contains("openai:test-model"), "{text}");
                 assert!(text.contains("Tip: Press Ctrl-C"), "{text}");
                 assert!(text.contains(".help"), "{text}");
+                assert!(text.contains("Press \"?\""), "{text}");
             }
         }
     }
@@ -1493,6 +1502,10 @@ mod tests {
         let text: Vec<String> = lines.iter().map(Line::to_string).collect();
         assert!(
             text.iter().any(|line| line.contains("\"/help\"")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("\"/keys\"")),
             "{text:?}"
         );
     }

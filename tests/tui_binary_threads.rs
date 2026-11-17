@@ -1,5 +1,5 @@
 //! Real-process checks of the full-screen UI over a spawned sub-agent: the
-//! F3 roster lists the child while it runs after `.agent` engaged a new
+//! Ctrl+G roster lists the child while it runs after `.agent` engaged a new
 //! supervisor, `x` on its row cancels it, the pager's thread picker lists
 //! the child with its status, a chosen child's transcript is read from its
 //! session file and read again when the child flushes it, a child file that
@@ -27,6 +27,8 @@ use common::fake_llm::{Chunk, FakeLlm, Reply};
 use common::pty::{Pty, strip_ansi};
 use common::tui_harness::*;
 use serial_test::serial;
+
+const CTRL_G: &[u8] = b"\x07";
 
 /// A config with two openai-compatible clients: `fake` for the root agent
 /// and `kidfake` for the child, each on its own fake model.
@@ -404,16 +406,16 @@ fn the_ui_keeps_drawing_while_a_child_agent_runs_a_tool() {
 }
 
 /// After `.agent boss` the roster follows the supervisor the engage
-/// installed: F3 mid-turn lists the spawned kid as running.
+/// installed: Ctrl+G mid-turn lists the spawned kid as running.
 #[test]
 #[serial]
-fn f3_after_dot_agent_engage_lists_the_spawned_child_as_running() {
+fn ctrl_g_after_dot_agent_engage_lists_the_spawned_child_as_running() {
     let scene = scene("thr-roster", kid_mark_then_held, "");
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     engage_and_spawn(&mut pty, &scene);
 
-    pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
+    pty.send(CTRL_G).unwrap();
+    let roster = repainted_frame_showing(&mut pty, "Esc = close", "Ctrl+G did not open the roster");
     let band = roster_band(&roster);
     assert!(
         band.contains("kid") && band.contains("running"),
@@ -433,8 +435,8 @@ fn x_on_a_running_child_agent_row_cancels_it() {
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     engage_and_spawn(&mut pty, &scene);
 
-    pty.send(b"\x1bOR").unwrap();
-    let roster = repainted_frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
+    pty.send(CTRL_G).unwrap();
+    let roster = repainted_frame_showing(&mut pty, "Esc = close", "Ctrl+G did not open the roster");
     assert!(
         roster_band(&roster).contains("kid"),
         "no kid row to cancel:\n{roster}"
@@ -867,7 +869,7 @@ fn a_childs_question_shows_on_the_roster_and_the_answer_reaches_it() {
     }
     pty.read_for(Duration::from_millis(1500));
 
-    pty.send(b"\x1bOR").unwrap();
+    pty.send(CTRL_G).unwrap();
     let (asked, roster) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
         frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains("e5q")
     });
@@ -1212,7 +1214,7 @@ fn crlf_line_endings_show_in_the_pager_as_whole_lines() {
 /// Opens the roster, waits for a question row naming `tag`, and opens it
 /// in its modal. Returns the modal frame.
 fn open_question_row(pty: &mut Pty, tag: &str) -> String {
-    pty.send(b"\x1bOR").unwrap();
+    pty.send(CTRL_G).unwrap();
     let (asked, roster) = frame_until(pty, Duration::from_secs(15), |frame| {
         frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains(tag)
     });
@@ -1293,7 +1295,7 @@ fn answering_a_question_whose_asker_timed_out_says_not_delivered() {
     let roster_open = |frame: &str| frame.rfind("Esc = close").is_some();
     let (mut shown, mut roster) = frame_until(&mut pty, Duration::from_secs(2), roster_open);
     if !shown {
-        pty.send(b"\x1bOR").unwrap();
+        pty.send(CTRL_G).unwrap();
         (shown, roster) = frame_until(&mut pty, Duration::from_secs(10), roster_open);
     }
     assert!(shown, "the roster did not open after the answer:\n{roster}");
@@ -1438,7 +1440,7 @@ fn cancelling_the_parent_drops_the_grandchilds_question() {
     );
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     start_boss_until_the_grandkid_asks(&mut pty, &scene, &gk);
-    pty.send(b"\x1bOR").unwrap();
+    pty.send(CTRL_G).unwrap();
     let (asked, roster) = frame_until(&mut pty, Duration::from_secs(15), |frame| {
         frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains("g7q")
     });
@@ -1482,8 +1484,8 @@ fn a_grandchild_question_after_its_parent_is_cancelled_is_not_listed() {
     );
     let mut pty = spawn_tui(&scene.dir, &scene.log_env());
     start_boss_until_the_grandkid_asks(&mut pty, &scene, &gk);
-    pty.send(b"\x1bOR").unwrap();
-    repainted_frame_showing(&mut pty, "Esc = close", "F3 did not open the roster");
+    pty.send(CTRL_G).unwrap();
+    repainted_frame_showing(&mut pty, "Esc = close", "Ctrl+G did not open the roster");
     cancel_the_kid_from_the_roster(&mut pty);
     fs::write(&gk_gate_holder, "").unwrap();
     let (listed, frame) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
@@ -1613,7 +1615,7 @@ fn a_cancelled_askers_question_leaves_the_roster() {
     }
     pty.read_for(Duration::from_millis(1500));
 
-    pty.send(b"\x1bOR").unwrap();
+    pty.send(CTRL_G).unwrap();
     let (asked, roster) = frame_until(&mut pty, Duration::from_secs(10), |frame| {
         frame.rfind("Esc = close").is_some() && squeezed(roster_band(frame)).contains("d9q")
     });
