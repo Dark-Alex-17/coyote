@@ -10028,12 +10028,15 @@ mod tests {
         assert_eq!(polled, TYPEAHEAD_LIMIT);
     }
 
-    fn fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    /// The text from `signature` to the first column-zero closing brace,
+    /// with CRLF line ends (a Windows checkout) read as LF.
+    fn fn_body(source: &str, signature: &str) -> String {
+        let source = source.replace("\r\n", "\n");
         let start = source
             .find(signature)
             .unwrap_or_else(|| panic!("{signature} not found"));
         let body = &source[start..];
-        &body[..body.find("\n}\n").unwrap()]
+        body[..body.find("\n}\n").unwrap()].to_string()
     }
 
     /// A `(file, function)` pair under `src/` whose body reads the
@@ -10123,8 +10126,15 @@ mod tests {
             if path.starts_with(src.join("tui")) {
                 continue;
             }
-            let text = std::fs::read_to_string(&path).unwrap();
-            let file = path.strip_prefix(root).unwrap().display().to_string();
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let file = path
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('\\', "/");
             readers.extend(classify_readers(&file, &text));
         }
         readers

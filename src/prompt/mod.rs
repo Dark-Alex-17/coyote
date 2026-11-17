@@ -870,7 +870,7 @@ mod tests {
             None
         )));
 
-        let source = include_str!("mod.rs");
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
         let start = source
             .find("fn select(req: &PromptRequest)")
             .expect("no `fn select(req: &PromptRequest)` in prompt/mod.rs");

@@ -1,12 +1,12 @@
 //! Where the bash prompt helper reads its reply from, observed from outside:
-//! on a unix host `COYOTE_PROMPT_REPLY` is opened as given, a Windows pipe
-//! name included, while a Git Bash or Cygwin shell (`OSTYPE` says so before
-//! the helper is sourced) opens the same pipe through its `/proc` view of the
-//! pipe namespace. Every other spelling stays untouched on both, and the
-//! unix FIFO round trip is the one the helper always had. Each case runs the
-//! shipped helper in a real bash with no terminal; the read target shows up
-//! in bash's own error line when the path does not exist, so no Windows is
-//! needed to see which path was opened.
+//! `COYOTE_PROMPT_REPLY` is opened as given whatever `OSTYPE` says, a
+//! Windows pipe name included: Git Bash and Cygwin open `\\.\pipe\<name>`
+//! by that spelling, while their `/proc/sys/Device/NamedPipe` view of the
+//! pipe namespace cannot be opened at all. The unix FIFO round trip is the
+//! one the helper always had. Each case runs the shipped helper in a real
+//! bash with no terminal; the read target shows up in bash's own error line
+//! when the path does not exist, so no Windows is needed to see which path
+//! was opened.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -20,7 +20,6 @@ const HELPER: &str = concat!(
 );
 const FIXTURE_BIN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bin");
 const WINDOWS_PIPE: &str = r"\\.\pipe\coyote-prompt-test-7";
-const PROC_PIPE: &str = "/proc/sys/Device/NamedPipe/coyote-prompt-test-7";
 
 struct TempDirGuard(PathBuf);
 
@@ -107,25 +106,24 @@ fn assert_reads_from(ostype: Option<&str>, reply: &str, path: &str) {
 }
 
 #[test]
-fn a_unix_host_opens_the_reply_path_as_given_even_when_it_looks_like_a_windows_pipe() {
-    assert_reads_from(None, WINDOWS_PIPE, WINDOWS_PIPE);
-    assert_reads_from(Some("darwin24.0"), WINDOWS_PIPE, WINDOWS_PIPE);
-    assert_reads_from(Some("linux-gnu"), WINDOWS_PIPE, WINDOWS_PIPE);
+fn every_ostype_opens_a_windows_pipe_name_as_given() {
+    for ostype in [
+        None,
+        Some("darwin24.0"),
+        Some("linux-gnu"),
+        Some("msys"),
+        Some("cygwin"),
+    ] {
+        assert_reads_from(ostype, WINDOWS_PIPE, WINDOWS_PIPE);
+    }
 }
 
 #[test]
-fn git_bash_and_cygwin_read_a_windows_pipe_through_its_proc_path() {
-    assert_reads_from(Some("msys"), WINDOWS_PIPE, PROC_PIPE);
-    assert_reads_from(Some("cygwin"), WINDOWS_PIPE, PROC_PIPE);
-}
-
-#[test]
-fn git_bash_leaves_a_path_that_is_not_a_windows_pipe_alone() {
+fn git_bash_opens_other_spellings_as_given_too() {
     let dir = scratch_dir("untranslated");
     let missing = dir.0.join("no-such-fifo");
     let missing = missing.to_str().unwrap();
     assert_reads_from(Some("msys"), missing, missing);
-    // The forward-slash spelling is not what Coyote emits and is not rewritten.
     assert_reads_from(
         Some("msys"),
         "//./pipe/coyote-prompt-test-8",
@@ -134,7 +132,7 @@ fn git_bash_leaves_a_path_that_is_not_a_windows_pipe_alone() {
 }
 
 #[test]
-fn the_translation_does_not_rewrite_the_exported_variable() {
+fn sourcing_leaves_the_exported_reply_variable_alone() {
     let out = bash(
         Some("msys"),
         WINDOWS_PIPE,
@@ -282,24 +280,21 @@ fn the_unix_reply_pipe_round_trip_is_unchanged_on_every_ostype() {
     }
 }
 
-/// The pipe-prefix match the way a tool would hit it
-/// from other shell flavours and locales. A tool script may run under
-/// `bash --posix`, the system `/bin/bash` or `sh` (bash in posix mode on
-/// macOS); the helper's promise is the same everywhere: a value that starts
-/// with the literal `\\.\pipe\` is opened through `/proc/sys/Device/NamedPipe`
-/// under Git Bash or Cygwin and every other spelling is opened as given, with
-/// the backslashes of the prefix taken literally rather than as glob escapes.
+/// The reply path the way a tool would hit it from other shell flavours
+/// and locales. A tool script may run under `bash --posix`, the system
+/// `/bin/bash` or `sh` (bash in posix mode on macOS); the helper's promise
+/// is the same everywhere: every spelling, a Windows pipe name included, is
+/// opened as given, backslashes and all.
 mod other_shells {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
 
     const REAL_PIPE: &str = r"\\.\pipe\coyote-prompt-test-9";
-    const REAL_PROC: &str = "/proc/sys/Device/NamedPipe/coyote-prompt-test-9";
 
-    /// Spellings that only match the prefix when its backslashes are read as
-    /// glob escapes (or that carry the prefix somewhere other than the
-    /// start). None of them is a Windows pipe name and none may be rewritten.
-    const NOT_A_PIPE: &[&str] = &[
+    /// Spellings that a glob-escape reading of the backslashes, or a
+    /// prefix match anywhere but the start, would confuse with a pipe name.
+    const LOOKALIKES: &[&str] = &[
+        REAL_PIPE,
         r"\.pipecoyote-prompt-test-9",
         r"\\.\pipe",
         r".pipe\coyote-prompt-test-9",
@@ -380,30 +375,16 @@ mod other_shells {
     }
 
     #[test]
-    fn the_prefix_is_matched_literally_in_every_shell_flavour() {
+    fn every_shell_flavour_opens_the_reply_path_as_given() {
         for (program, args) in shell_flavours() {
             for ostype in ["msys", "cygwin", "darwin24.0", "linux-gnu", ""] {
-                let translating = ostype.starts_with("msys") || ostype.starts_with("cygwin");
                 let script = "v=\"$(confirm 'Go? sh-x7x')\"; echo \"rc=$? v=[$v]\"";
-                let out = shell(program, &args, ostype, REAL_PIPE, script);
-                let expected = if translating { REAL_PROC } else { REAL_PIPE };
-                assert_eq!(
-                    opened_path(&out),
-                    expected,
-                    "{program} {args:?} OSTYPE={ostype:?}: {:?}",
-                    text(&out.stderr)
-                );
-                assert!(
-                    text(&out.stdout).contains("rc=1 v=[]"),
-                    "{program} {args:?}: {:?}",
-                    text(&out.stdout)
-                );
-                for spelling in NOT_A_PIPE {
+                for spelling in LOOKALIKES {
                     let out = shell(program, &args, ostype, spelling, script);
                     assert_eq!(
                         opened_path(&out),
                         *spelling,
-                        "{program} {args:?} OSTYPE={ostype:?} must not rewrite {spelling:?}"
+                        "{program} {args:?} OSTYPE={ostype:?} must open {spelling:?} as given"
                     );
                     assert!(
                         text(&out.stdout).contains("rc=1 v=[]"),
@@ -424,11 +405,9 @@ mod other_shells {
     }
 
     /// Tool scripts commonly run with `set -u` and `pipefail`; sourcing the
-    /// helper under them succeeds in every flavour and still translates.
-    /// (`set -e` is left out only because the fixture `tput` exits 1 on
-    /// colour queries, which the helper's colour setup would trip on.)
+    /// helper under them succeeds in every flavour, twice included.
     #[test]
-    fn sourcing_under_strict_shell_options_still_translates() {
+    fn sourcing_under_strict_shell_options_succeeds() {
         for (program, args) in shell_flavours() {
             for reply in ["", REAL_PIPE, "/no/such/fifo-test-9"] {
                 let out = Command::new(program)
@@ -468,15 +447,15 @@ mod other_shells {
             );
             assert_eq!(
                 opened_path(&out),
-                REAL_PROC,
-                "{program} {args:?}: sourcing twice keeps the translation"
+                REAL_PIPE,
+                "{program} {args:?}: sourcing twice keeps the path as given"
             );
         }
     }
 
     /// Sourcing the helper changes the tool's environment by exactly the
     /// one variable it documents (`_COYOTE_PROMPT_OUT`); `COYOTE_PROMPT_REPLY`
-    /// keeps the Windows spelling and nothing the translation uses leaks.
+    /// keeps the Windows spelling and no helper variable leaks.
     #[test]
     fn sourcing_exports_only_the_documented_variable() {
         let dir = scratch_dir("env-delta");

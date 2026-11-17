@@ -142,19 +142,10 @@ if [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -z
   exec 9>&1 && export _COYOTE_PROMPT_OUT=9
 fi
 
-# The reply path as this shell can open it. On Windows Coyote names a pipe
-# \\.\pipe\<name>, which an msys or cygwin bash cannot open by that spelling;
-# its /proc view of the pipe namespace can.
+# The reply path is opened as given. On Windows Coyote names a pipe
+# \\.\pipe\<name>, which Git Bash and Cygwin open by that spelling; their
+# /proc/sys/Device/NamedPipe view of the pipe namespace cannot be opened.
 _COYOTE_PROMPT_REPLY_PATH="${COYOTE_PROMPT_REPLY:-}"
-_COYOTE_PIPE_PREFIX='\\.\pipe\'
-case "${OSTYPE:-}" in
-  msys* | cygwin*)
-    if [[ "$_COYOTE_PROMPT_REPLY_PATH" == "$_COYOTE_PIPE_PREFIX"* ]]; then
-      _COYOTE_PROMPT_REPLY_PATH="/proc/sys/Device/NamedPipe/${_COYOTE_PROMPT_REPLY_PATH#"$_COYOTE_PIPE_PREFIX"}"
-    fi
-    ;;
-esac
-unset _COYOTE_PIPE_PREFIX
 
 _coyote_prompt_enabled() {
   [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -n "${_COYOTE_PROMPT_OUT:-}" ]]

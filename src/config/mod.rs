@@ -1661,7 +1661,8 @@ clients:
 
     #[test]
     fn config_example_parses_with_dot_command_prefix() {
-        let example = include_str!("../../config.example.yaml");
+        let example = include_str!("../../config.example.yaml").replace("\r\n", "\n");
+        let example = example.as_str();
         assert!(example.contains("command_prefix: dot"));
         assert!(example.contains("\nmemory_round_chains: supersede"));
         assert!(example.contains(

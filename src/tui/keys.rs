@@ -1755,7 +1755,7 @@ mod tests {
     /// The table stays pure: no terminal writes and no std I/O in this file.
     #[test]
     fn the_key_table_does_no_io() {
-        let source = include_str!("keys.rs");
+        let source = include_str!("keys.rs").replace("\r\n", "\n");
         let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
         for needle in [["io", "::"].concat(), ["execute", "!"].concat()] {
             assert!(!production.contains(&needle), "{needle} in keys.rs");

@@ -941,9 +941,9 @@ mod windows_tests {
         assert_eq!(line, Some(reply_line("late", &json!(true))));
     }
 
-    /// The bash helper end to end under Git Bash: the pipe name is
-    /// rewritten to its Cygwin device path, each `read` opens it anew, and
-    /// the second prompt is answered after the first open has gone away.
+    /// The bash helper end to end under Git Bash: the pipe is opened by its
+    /// Windows name, each `read` opens it anew, and the second prompt is
+    /// answered after the first open has gone away.
     /// Request lines are answered from the stdout pump the way the tool
     /// runner answers them; a stall kills the shell so a regression fails
     /// the test instead of holding the run. Both tools are asserted, as
