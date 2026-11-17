@@ -1408,6 +1408,18 @@ u = gates.build_gauntlet_prompt(base_state(**{**_gs, "round_heads": [dict(_r1, v
 check("build_gauntlet: a BLOCKED round on the same inputs is reviewed again, never reused",
       "_next" not in u and len(u.get("round_heads", [])) == 2
       and bool(_r1.get("review_key")) and u["round_heads"][-1].get("review_key") == _r1.get("review_key"), u)
+u = gates.build_gauntlet_prompt(base_state(**{**_gs, "round_heads": [dict(_r1, incomplete=["probe"])]}))
+check("build_gauntlet: a PASS round with incomplete lanes on the same inputs is reviewed again, never reused",
+      "_next" not in u and len(u.get("round_heads", [])) == 2, u)
+_real_tree = gates._worktree_tree
+gates._worktree_tree = lambda root: ""
+try:
+    u = gates.build_gauntlet_prompt(base_state(**{**_gs, "round_heads": [dict(_r1, code_tree="", review_key="")]}))
+finally:
+    gates._worktree_tree = _real_tree
+check("build_gauntlet: no code tree and an empty review key never reuse a PASS round",
+      "_next" not in u and len(u.get("round_heads", [])) == 2
+      and not any("reused" in d for d in u.get("decisions", [])), u)
 prior_round = [{"round": 1, "head": "0" * 40, "lanes_with_findings": ["adversary"]}]
 u = gates.build_gauntlet_prompt(base_state(round_heads=prior_round,
                                            gauntlet_lanes={"code-review": "GREEN", "adversary": "BLOCKED", "security": "GREEN (attention)",
@@ -1716,6 +1728,32 @@ u = gates.observability_gate(base_state(observability_key=_obs_key, observabilit
 os.remove(os.path.join(REPO, "handler_extra.go"))
 check("observability_gate: a changed code tree -> the pass runs again under a new inputs key",
       u["_next"] == "observability_pass" and u.get("observability_pending_key") not in (None, "", _obs_key), u)
+_obs_runs = {}
+for _art in ("", "  \n"):
+    _obs_runs[repr(_art)] = gates.observability_gate(base_state(observability_key=_obs_key, observability_artifact=_art))["_next"]
+check("observability_gate: unchanged inputs but an empty or blank artifact -> the pass runs",
+      set(_obs_runs.values()) == {"observability_pass"}, _obs_runs)
+_obs_new = {}
+for _k, _v in (("diff_stat", " 1 file changed, 9 insertions(+)"), ("current_task", "add a goodbye endpoint")):
+    _o = gates.observability_gate(base_state(observability_key=_obs_key, observability_artifact=_obs_real, **{_k: _v}))
+    _obs_new[_k] = (_o["_next"], _o.get("observability_pending_key") not in (None, "", _obs_key))
+check("observability_gate: same tree but a changed diff stat or task -> the pass runs under a new inputs key",
+      _obs_new == {"diff_stat": ("observability_pass", True), "current_task": ("observability_pass", True)}, _obs_new)
+_real_tree = gates._worktree_tree
+gates._worktree_tree = lambda root: ""
+try:
+    u = gates.observability_gate(base_state(observability_key="", observability_artifact=_obs_real))
+finally:
+    gates._worktree_tree = _real_tree
+check("observability_gate: no code tree and no recorded key -> the pass runs", u["_next"] == "observability_pass", u)
+_brief = dict(observability_artifact=_obs_real, obs_coder_brief="add an error-rate alert", observability_pending_key=_obs_key,
+              last_node_output='{"observability_artifact": "x"}', review_rounds=0)
+_obs_routes = {}
+for _r in (0, gates.RERUN_ONCE):
+    _o = gates.observability_route(base_state(obs_rounds=_r, **_brief))
+    _obs_routes[_r] = (_o["_next"], _o.get("observability_key"))
+check("observability_route: a pass that asks for a coder round records no inputs key, capped or not",
+      _obs_routes == {0: ("compose_fix", ""), gates.RERUN_ONCE: ("whetstone_gate", "")}, _obs_routes)
 os.remove(os.path.join(REPO, "handler.go"))
 open(os.path.join(REPO, "notes.md"), "w").write("docs\n")
 u = gates.observability_gate(base_state())
@@ -1906,6 +1944,9 @@ try:
         _sleeps.clear()
         gates.ci_poll(base_state(git_report="pull/5", ci_polls=_p, ci_started_at=int(time.time())))
         _waits[_p] = _sleeps[0] if _sleeps else None
+    _sleeps.clear()
+    _settled = gates.ci_poll(base_state(**{**u, "git_report": "pull/5"}))
+    _waits["rerun"] = _sleeps[0] if _sleeps else None
     os.environ["SISYPHUS_CI_SLEEP"] = "7"
     _sleeps.clear()
     gates.ci_poll(base_state(git_report="pull/5", ci_polls=1, ci_started_at=int(time.time())))
@@ -1920,6 +1961,10 @@ finally:
 check("ci_poll: the re-poll sleep grows from a short first wait to CI_POLL_SLEEP; SISYPHUS_CI_SLEEP still fixes it",
       _waits[1] is not None and _waits[1] < _waits[2] < gates.CI_POLL_SLEEP
       and _waits[4] == _waits[30] == gates.CI_POLL_SLEEP and _waits["fixed"] == 7, _waits)
+check("ci_poll: the first re-poll after a re-run answer sleeps the full CI_POLL_SLEEP, once",
+      u.get("ci_rerun_settle") is True and u.get("ci_polls") == 1
+      and _waits["rerun"] == gates.CI_POLL_SLEEP and _settled.get("ci_rerun_settle") is False
+      and _settled.get("ci_polls") == 2, (_waits, _settled))
 _esc = gates.ci_route(base_state(ci_status="inconclusive", ci_checks=_u2.get("ci_checks", []),
                                  ci_rerun_ids=u.get("ci_rerun_ids"))).get("escalation", {})
 check("ci_route: a cancelled run already re-run this run -> re-run not offered, leaving the PR in draft recommended",

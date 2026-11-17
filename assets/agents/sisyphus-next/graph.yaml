@@ -355,6 +355,7 @@ initial_state:
   ci_diagnosis: ''
   ci_reruns: {}
   ci_rerun_ids: []
+  ci_rerun_settle: false
   ci_fix_strikes: 0
   flip_ready: false
   pr_ready_confirmed: false
@@ -1855,7 +1856,7 @@ nodes:
   build_gauntlet_prompt:
     id: build_gauntlet_prompt
     type: script
-    description: The gauntlet spawn template field by field (Diff, Rigor/posture, spec, prior decisions, re-review delta, settled lanes, recipe); records the round's HEAD.
+    description: The gauntlet spawn template field by field (Diff, Rigor/posture, spec, prior decisions, re-review delta, settled lanes, recipe); records the round's HEAD; reuses the previous PASS round when the code tree, prompt and verification commands are identical -> route_gauntlet.
     script: scripts/build_gauntlet_prompt.py
     timeout: 60
     fallback: end_failure
@@ -1966,7 +1967,7 @@ nodes:
   observability_gate:
     id: observability_gate
     type: script
-    description: Operational surface from the shared diff signals (agents/.shared/diff_signals.py); none -> one-line note.
+    description: Operational surface from the shared diff signals (agents/.shared/diff_signals.py); none -> one-line note; inputs unchanged since the last real pass -> whetstone_gate with its artifact kept.
     script: scripts/observability_gate.py
     timeout: 60
     fallback: whetstone_gate

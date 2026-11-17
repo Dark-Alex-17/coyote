@@ -2538,9 +2538,11 @@ def apply_answer(state):
                         ledger(state, u, f"ci: cancelled run {run_id} ({', '.join(names)}) re-run call failed")
             _reset_ci_watch(u)
             # a re-run run is never offered again, so a run that stays cancelled cannot loop a headless pick;
-            # ci_polls 1 makes the first re-poll sleep instead of reading the same cancelled state at once
+            # the settle flag makes the first re-poll sleep the full CI_POLL_SLEEP instead of reading the same
+            # cancelled state at once
             u["ci_rerun_ids"] = done
             u["ci_polls"] = 1
+            u["ci_rerun_settle"] = True
             u["_next"] = "ci_poll"
         elif a == "green" and not stop:
             reason = _stated_reason(answer, options)
@@ -4202,7 +4204,7 @@ def observability_route(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + ["Observability: alert-as-code changes recommended but not applied this run: " + tail(brief, 300)]
         u["_next"] = "whetstone_gate"
     # the key vouches for the artifact only after a real pass that asked for no coder round
-    u["observability_key"] = (state.get("observability_pending_key") or "") if passed and u["_next"] == "whetstone_gate" else ""
+    u["observability_key"] = (state.get("observability_pending_key") or "") if passed and not brief and u["_next"] == "whetstone_gate" else ""
     return u
 
 
@@ -4681,7 +4683,7 @@ CI_CAP_KEEP_WAITING = "Keep waiting (one more watch inside the engine cap)"
 
 def _reset_ci_watch(u):
     u.update({"ci_polls": 0, "ci_poll_fails": 0, "ci_started_at": int(time.time()), "ci_status": "", "ci_failing": [],
-              "ci_green_by": ""})
+              "ci_green_by": "", "ci_rerun_settle": False})
 
 
 def _ci_poll_budget(state):
@@ -4725,8 +4727,11 @@ def ci_poll(state):
         return u
     polls = as_int(state.get("ci_polls"))
     started = as_int(state.get("ci_started_at")) or int(time.time())
+    settle = truthy(state.get("ci_rerun_settle"))
+    if settle:
+        u["ci_rerun_settle"] = False
     if polls > 0:
-        wait = CI_POLL_BACKOFF[polls - 1] if polls <= len(CI_POLL_BACKOFF) else CI_POLL_SLEEP
+        wait = CI_POLL_SLEEP if settle or polls > len(CI_POLL_BACKOFF) else CI_POLL_BACKOFF[polls - 1]
         time.sleep(int(os.environ.get("SISYPHUS_CI_SLEEP", wait)))
     u["ci_polls"] = polls + 1
     if time.time() - started > CI_WALL_SECS or polls + 1 > CI_MAX_ROUNDS:
