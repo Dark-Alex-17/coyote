@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _lib  # noqa: E402
 from _lib import (  # noqa: E402
     AMEND_CYCLES_MAX, AMEND_DESIGN_MAX, AMEND_GATE1_MAX, AMEND_GATE2_MAX, AMEND_REWORK_MAX, ARCHIVIST_AVAILABLE,
-    CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
+    CHECKLIST_ASK_EACH_MAX, CHOICE_OPTIONS_MAX, CHOICE_OPTIONS_MIN, CI_FLAKE_RERUNS, CI_MAX_ROUNDS,
     CI_POLL_FAILS, CI_POLL_SLEEP,
     GATE2_AMEND_CHARS,
     CI_WALL_SECS, CODE_VAR, CONFLICT_CYCLES_MAX, CONTINUE_RE, CONVENTIONS_LINE, CORE_TOOLS_REL, DESIGN_ROUNDS_MAX,
@@ -506,6 +506,7 @@ CHOICE_KIND_GATES = {"design_round": "open_questions_gate", "quality_bar": "qual
                      "checklist_accept": "checklist_round", "leak_question": "leak_route"}
 CHECKLIST_ACCEPT = "Accept: add it as a criterion"
 CHECKLIST_DROP = "Drop"
+CHECKLIST_REVIEW_EACH = "Review each item"
 
 
 def _start_choices(u, kind, queue):
@@ -523,9 +524,12 @@ def _ask_choice(state, u, heading, evidence=""):
     s = {**state, **u}
     queue, idx = as_list(s.get("choice_queue")), as_int(s.get("choice_index"))
     item = queue[idx]
+    data = {"multiple_choice": True, "question": item["question"], "index": idx}
+    if item.get("batch"):
+        data["batch"] = True
     return raise_escalation(state, u, escalation(
         s.get("choice_kind"), f"{heading} {idx + 1} of {len(queue)}: {item['question']}", item["options"], evidence=evidence,
-        data={"multiple_choice": True, "question": item["question"], "index": idx}))
+        data=data))
 
 
 def _choice_pick(text, options):
@@ -718,6 +722,8 @@ def checklist_round(state):
     if state.get("choice_kind") == "checklist_accept" and queue:
         if as_int(state.get("choice_index")) < len(queue):
             return _ask_choice(state, u, "Best-practice checklist item")
+        if queue[0].get("batch"):
+            return _checklist_batch_answer(state, u, queue[0])
         accepted = []
         rulings = []
         for item, a in zip(queue, as_list(state.get("choice_answers"))):
@@ -727,21 +733,7 @@ def checklist_round(state):
             elif answer and answer != CHECKLIST_DROP:
                 # typed text may decline the item as easily as accept it, so amend_plan reads it as a ruling
                 rulings.append(f"Owner ruling on {item['item']}: {answer}; apply only if it accepts the item")
-        _end_choices(u)
-        if accepted or rulings:
-            lines = []
-            if accepted:
-                lines.append("Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
-                             "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
-                             + "\n".join(f"- {x}" for x in accepted))
-            lines += rulings
-            queue_amendments(u, "design", ["\n".join(lines)])
-            ledger(state, u, f"checklist: {len(accepted)}/{len(queue)} items accepted, {len(rulings)} owner ruling(s)")
-            u["_next"] = "amend_plan"
-        else:
-            ledger(state, u, "checklist: no items accepted")
-            u["_next"] = "checklist_gate"
-        return u
+        return _checklist_close(state, u, accepted, rulings, len(queue))
     labels = as_list(state.get("checklist_labels"))
     findings = as_list(state.get("checklist_findings"))
     items = []
@@ -755,11 +747,64 @@ def checklist_round(state):
         u["_next"] = "reseal_gate"
         return u
     u["checklist_items"] = items
-    _start_choices(u, "checklist_accept", [
-        {"question": f"{it}\nAccept this as an acceptance criterion (or a long-tail criterion) in the plan?", "item": it,
-         "options": [option(CHECKLIST_ACCEPT, recommended=True, evidence="the checklist reviewer's finding"),
-                     option(CHECKLIST_DROP)]} for it in items[:40]])
+    if len(items) > CHECKLIST_ASK_EACH_MAX:
+        n = len(items)
+        _start_choices(u, "checklist_accept", [{
+            "question": (f"The checklist reviewers returned {n} items:\n" + "\n".join(f"- {it}" for it in items)
+                         + "\nAccept them as acceptance criteria (or long-tail criteria) in the plan?"),
+            "batch": True, "items": items,
+            "options": [option(f"Accept all {n} items", recommended=True, evidence="the checklist reviewers' findings"),
+                        option(CHECKLIST_REVIEW_EACH), option(f"Drop all {n} items")]}])
+        return _ask_choice(state, u, "Best-practice checklist question")
+    _start_choices(u, "checklist_accept", _checklist_each(items))
     return _ask_choice(state, u, "Best-practice checklist item")
+
+
+def _checklist_each(items):
+    return [{"question": f"{it}\nAccept this as an acceptance criterion (or a long-tail criterion) in the plan?", "item": it,
+             "options": [option(CHECKLIST_ACCEPT, recommended=True, evidence="the checklist reviewer's finding"),
+                         option(CHECKLIST_DROP)]} for it in items]
+
+
+def _checklist_batch_answer(state, u, batch):
+    """Settle the one question over a long checklist: accept all, drop all, review each, or a typed ruling."""
+    items = as_list(batch.get("items"))
+    accept_all, review_each, drop_all = (o["text"] for o in batch["options"])
+    answer = str(as_dict((as_list(state.get("choice_answers")) or [{}])[0]).get("answer") or "").strip()
+    if answer == review_each:
+        ledger(state, u, f"checklist: reviewing each of the {len(items)} items")
+        _start_choices(u, "checklist_accept", _checklist_each(items))
+        return _ask_choice(state, u, "Best-practice checklist item")
+    if answer == accept_all:
+        return _checklist_close(state, u, items, [], len(items))
+    if not answer:
+        # an empty reply takes the recommended option, as parse_answer does; it never drops the list
+        ledger(state, u, f"checklist: empty reply took the recommended accept-all for {len(items)} items")
+        return _checklist_close(state, u, items, [], len(items))
+    if answer == drop_all:
+        return _checklist_close(state, u, [], [], len(items))
+    # typed text may accept some items and decline others, so amend_plan reads it as one ruling over the whole list
+    ruling = (f"Owner ruling on the {len(items)} best-practice checklist items below: {answer}; apply it only to the items "
+              "it accepts:\n" + "\n".join(f"- {x}" for x in items))
+    return _checklist_close(state, u, [], [ruling], len(items))
+
+
+def _checklist_close(state, u, accepted, rulings, total):
+    _end_choices(u)
+    if accepted or rulings:
+        lines = []
+        if accepted:
+            lines.append("Accepted best-practice checklist items - write each as a measurable acceptance criterion on the "
+                         "relevant task where possible, otherwise under `## Quality bar -> Long-tail criteria`:\n"
+                         + "\n".join(f"- {x}" for x in accepted))
+        lines += rulings
+        queue_amendments(u, "design", ["\n".join(lines)])
+        ledger(state, u, f"checklist: {len(accepted)}/{total} items accepted, {len(rulings)} owner ruling(s)")
+        u["_next"] = "amend_plan"
+    else:
+        ledger(state, u, "checklist: no items accepted")
+        u["_next"] = "checklist_gate"
+    return u
 
 
 # ====================================================================== 2.3 gates
@@ -3126,6 +3171,8 @@ def ask_owner_poll(state):
     if data.get("multiple_choice"):
         # one remote thread per question, so a reply to an earlier question never lands on the next one
         thread += f"-{as_int(data.get('index'))}"
+        if data.get("batch"):
+            thread += "-batch"
     binary = os.environ.get("ARCHITECT_ASK_OWNER_BIN", "ask_owner")
     cmd = [binary, "--text", esc.get("question", ""), "--id", thread,
            "--wait-minutes", str(OWNER_WAIT_MINUTES), "--poll-minutes", str(OWNER_POLL_MINUTES)]
