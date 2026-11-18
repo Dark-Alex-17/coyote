@@ -101,6 +101,10 @@ trim_output "$output" | jq -Rsc \
   | ($s.baseline_exit_code // 0) as $base_rc
   | ($s.baseline_failure_hash // "") as $base_hash
   | (env.GATE_SIGNAL == "1") as $signal
+  | ($s.baseline_reused_from // "") as $reused
+  | (if $reused == "" then ""
+     else "Baseline reused from " + $reused + ": recorded before this run'"'"'s later commits; the suite was not run again on HEAD."
+     end) as $reuse_line
   | (if $rc == 0 then true
      elif $signal or ($red | not) or $rc != $base_rc then false
      elif ($base | length) > 0 then ($cur | length) > 0 and ($cur - $base) == []
@@ -129,7 +133,8 @@ trim_output "$output" | jq -Rsc \
             else "red, matches the pre-run baseline (exit \($rc)); accepted pre-existing failures: "
               + (if ($cur | length) > 0 then $cur | gate_cap(", ") else "unidentified (\(env.GATE_REASON))" end)
             end),
-          "baseline_report": (if $report == "" then "" else "\n" + $report end),
+          "baseline_report": ((if $report == "" then "" else "\n" + $report end)
+            + (if $reuse_line == "" then "" else "\n" + $reuse_line end)),
           "_next": "self_review"
         }
     else
@@ -150,4 +155,5 @@ trim_output "$output" | jq -Rsc \
           "tests_verdict": ("failed (exit " + ($rc | tostring) + ")"),
           "_next": "fix_loop_gate"
         }
+        + (if $reuse_line == "" then {} else {"baseline_report": ("\n" + $reuse_line)} end)
     end'

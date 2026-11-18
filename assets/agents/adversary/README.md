@@ -55,6 +55,11 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   worktree at the diff base (`diff_base`, resolved by `diff_facts`), and the two outputs are
   compared with the coder agent's `gate_lib.sh` helpers, by the same rule as its verify_tests gate.
   The worktree is added with the user's git hooks disabled and is removed on normal exit.
+  A base run that completed (not timed out, not killed by a signal) is saved with its full output
+  as `$(git rev-parse --git-path coyote-baselines)/adversary-<key>.json`, keyed by the base tree,
+  subdirectory, command, build lock prefix and per-command timeout; later reviews of the same
+  base compare against it without running the command again, and add the worktree only for
+  commands with no saved run. A flaky base keeps the one sample saved; delete the file to retake it.
   `pre-existing` failures are listed under `Pre-existing failures (not blocking):`; `regression`
   and `not-run` (no diff base, deadline spent, worktree or helper failure, the command timed out
   here or on the base) block, and the complaint names the outcome.
