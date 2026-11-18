@@ -1288,7 +1288,7 @@ impl Model {
         now: SystemTime,
     ) {
         match outcome {
-            BodyOutcome::Delivered => {
+            BodyOutcome::Delivered | BodyOutcome::Presence => {
                 self.record(transient);
                 let id = message_id.expect("a delivered body was sealed here");
                 self.delivered.insert(id);

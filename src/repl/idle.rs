@@ -473,12 +473,13 @@ impl DriverLoop {
         };
         match &outcome {
             Ok(report) => debug!(
-                "Propagation sync from {} done: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
+                "Propagation sync from {} done: {} listed, {} wanted, {} received, {} delivered, {} presence, {} duplicates, {} discarded, {} deferred",
                 short(&report.node),
                 report.listed,
                 report.wanted,
                 report.received,
                 report.delivered,
+                report.presence,
                 report.duplicates,
                 report.discarded,
                 report.deferred

@@ -464,7 +464,7 @@ pub(crate) mod network {
         RecordingEnvoy, SHUTDOWN_GRACE, fail_next_announce_of,
     };
     use crate::mesh::notify::Source;
-    use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
+    use crate::mesh::peers::{LeftMark, PEER_TTL, PeerSighting, PeerTable};
     use crate::mesh::pending::{
         CorrelationKind, PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome,
     };
@@ -11274,7 +11274,10 @@ pub(crate) mod network {
         let b_hash = pair.responder.desc.address_hash;
         let b_instance = b_hash.to_hex_string();
         let left_at = SystemTime::now();
-        assert!(pair.node_a.peers().mark_left(&b_instance, left_at));
+        assert_eq!(
+            pair.node_a.peers().mark_left(&b_instance, left_at),
+            LeftMark::Marked
+        );
         let transport = pair.node_a.transport_handle().await.unwrap();
         assert!(transport.expire_path(&b_hash).await, "A held a path to B");
         let message =
@@ -11316,10 +11319,11 @@ pub(crate) mod network {
         let pair = NodePair::start_with("request-peer-left-no-node", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
-        assert!(
+        assert_eq!(
             pair.node_a
                 .peers()
-                .mark_left(&b_instance, SystemTime::now())
+                .mark_left(&b_instance, SystemTime::now()),
+            LeftMark::Marked
         );
         let message =
             OutboundPeer::new(PeerKind::Message, "are you there", None, None, None).unwrap();
@@ -11439,10 +11443,11 @@ pub(crate) mod network {
             pair_with_propagation_node_trusting("request-bulletin-left-direct", trusting_b).await;
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
-        assert!(
+        assert_eq!(
             pair.node_a
                 .peers()
-                .mark_left(&b_instance, SystemTime::now())
+                .mark_left(&b_instance, SystemTime::now()),
+            LeftMark::Marked
         );
         let bulletin = OutboundPeer::new(PeerKind::Bulletin, "news", None, None, None).unwrap();
         pair.recorder_b
@@ -11508,7 +11513,10 @@ pub(crate) mod network {
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let left_at = SystemTime::now();
-        assert!(pair.node_a.peers().mark_left(&b_instance, left_at));
+        assert_eq!(
+            pair.node_a.peers().mark_left(&b_instance, left_at),
+            LeftMark::Marked
+        );
         let request = access_request("acc-left", &["src/x.rs"], "need it");
 
         let outcome = pair
@@ -11540,10 +11548,11 @@ pub(crate) mod network {
         let pair = NodePair::start("request-access-left-no-node").await;
         pair.introduce_b_to_a().await;
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
-        assert!(
+        assert_eq!(
             pair.node_a
                 .peers()
-                .mark_left(&b_instance, SystemTime::now())
+                .mark_left(&b_instance, SystemTime::now()),
+            LeftMark::Marked
         );
         let request = access_request("acc-left-none", &["src/x.rs"], "need it");
 

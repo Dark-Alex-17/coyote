@@ -511,6 +511,7 @@ pub(crate) const LEFT_FOR_ANOTHER_SESSION: &str =
 fn synced_line(report: &FetchReport) -> String {
     let outcomes: Vec<String> = [
         (report.delivered, "delivered", "delivered"),
+        (report.presence, "presence", "presence"),
         (report.duplicates, "duplicate", "duplicates"),
         (report.discarded, "discarded", "discarded"),
         (report.deferred, "deferred", "deferred"),
@@ -576,6 +577,7 @@ mod synced_ask_line_tests {
             wanted: 2,
             received: 2,
             delivered: 1,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 1,
@@ -603,6 +605,7 @@ mod synced_ask_line_tests {
             wanted: 3,
             received: 3,
             delivered: 0,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 3,
@@ -634,6 +637,7 @@ mod synced_ask_line_tests {
             wanted: 2,
             received: 2,
             delivered: 1,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 0,
@@ -654,6 +658,28 @@ mod synced_ask_line_tests {
             synced_line(&with_earlier),
             "synced 2 messages from deadbeef: 1 delivered, 1 left on the propagation node for another session",
             "only what this sync received is counted, not what an earlier one left"
+        );
+    }
+
+    #[test]
+    fn a_fetched_farewell_is_named_presence() {
+        let report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 1,
+            wanted: 1,
+            received: 1,
+            delivered: 0,
+            presence: 1,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 0,
+            deferred_after_ask: 0,
+            acknowledged: 1,
+            left_for_session: 0,
+        };
+        assert_eq!(
+            synced_line(&report),
+            "synced 1 message from deadbeef: 1 presence"
         );
     }
 }
@@ -899,6 +925,7 @@ mod tests {
             wanted: received,
             received,
             delivered,
+            presence: 0,
             duplicates,
             discarded: 0,
             deferred: 0,

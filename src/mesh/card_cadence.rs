@@ -1183,7 +1183,10 @@ mod network {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(status_requests(a_rt), 0, "B never served A");
 
-        assert!(a_rt.peers().mark_left(&b_dest, SystemTime::now()));
+        assert_eq!(
+            a_rt.peers().mark_left(&b_dest, SystemTime::now()),
+            crate::mesh::peers::LeftMark::Marked
+        );
         b_rt.announce_on_connect().await.unwrap();
         let started = Instant::now();
         while a_rt.who_at(&b_dest).to_string() != "Beatrice / named-session" {
@@ -1196,7 +1199,10 @@ mod network {
         }
         assert_eq!(status_requests(a_rt), 1);
 
-        assert!(a_rt.peers().mark_left(&b_dest, SystemTime::now()));
+        assert_eq!(
+            a_rt.peers().mark_left(&b_dest, SystemTime::now()),
+            crate::mesh::peers::LeftMark::Marked
+        );
         assert!(
             a_rt.consider_card_fetch(&b_dest, CardTrigger::Reheard)
                 .is_none(),

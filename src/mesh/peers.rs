@@ -212,6 +212,18 @@ pub(crate) enum PeerChange {
     Refreshed,
 }
 
+/// What `mark_left` made of a farewell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeftMark {
+    Marked,
+    /// The table holds no row for the destination.
+    Unknown,
+    /// The row is marked already; the first farewell's time stands.
+    AlreadyLeft,
+    /// The farewell was sent no later than the latest presence the row holds.
+    HeardSince,
+}
+
 /// Coyote peers seen on the mesh, keyed by destination hash and mirrored to `path` as JSON.
 /// Time is always passed in so expiry is testable without a clock.
 pub(crate) struct PeerTable {
@@ -222,6 +234,11 @@ pub(crate) struct PeerTable {
     /// The rows whose last link attempt failed, until a link to them comes up or they
     /// announce again. Held in memory only: a restart starts with none marked.
     link_failed: Mutex<BTreeSet<String>>,
+    /// When each row was last heard by a path response or a request over a live link,
+    /// which do not move `last_seen`. Held in memory only, so the shared file keeps the
+    /// shape older sessions read; after a restart a row's latest presence is its
+    /// `last_seen` until it is heard again.
+    presence: Mutex<BTreeMap<String, SystemTime>>,
     /// The node this table marks `served_instances` for, set by `claim_served`; until
     /// then nothing is marked.
     own_instance: Mutex<Option<String>>,
@@ -279,6 +296,7 @@ impl PeerTable {
             inner: Mutex::new(inner),
             dirty: AtomicBool::new(false),
             link_failed: Mutex::new(BTreeSet::new()),
+            presence: Mutex::new(BTreeMap::new()),
             own_instance: Mutex::new(None),
             served_previous_run: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -346,6 +364,7 @@ impl PeerTable {
                 .expect("a table over its cap is not empty");
             peers.remove(&oldest);
             self.link_failed.lock().remove(&oldest);
+            self.presence.lock().remove(&oldest);
         }
         self.dirty.store(true, Ordering::Release);
         change
@@ -353,15 +372,34 @@ impl PeerTable {
 
     /// Route facts from an announce the peer sent as a path response: everything `observe`
     /// would set except `last_seen`, which only a plain announce may move. A destination
-    /// without a row is not refreshed; its first announce files normally.
-    pub(crate) fn refresh_route(&self, sighting: PeerSighting) -> bool {
+    /// without a row is not refreshed; its first announce files normally. The response
+    /// counts as presence at `now`.
+    pub(crate) fn refresh_route(&self, sighting: PeerSighting, now: SystemTime) -> bool {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(&sighting.destination_hash) else {
             return false;
         };
+        self.hear(&sighting.destination_hash, now);
         record.follow(sighting);
         self.dirty.store(true, Ordering::Release);
         true
+    }
+
+    /// Notes that `destination_hash` was heard over a live link at `now`. A destination
+    /// the table does not know is left unknown.
+    pub(crate) fn note_presence(&self, destination_hash: &str, now: SystemTime) {
+        let peers = self.inner.lock();
+        if peers.contains_key(destination_hash) {
+            self.hear(destination_hash, now);
+        }
+    }
+
+    /// Callers hold the row lock first, as `sweep` takes them, so a row swept meanwhile
+    /// keeps no entry.
+    fn hear(&self, destination_hash: &str, now: SystemTime) {
+        let mut presence = self.presence.lock();
+        let latest = presence.entry(destination_hash.to_string()).or_insert(now);
+        *latest = (*latest).max(now);
     }
 
     /// A peer the table does not know is left unknown; nothing about it is worth
@@ -428,22 +466,30 @@ impl PeerTable {
     }
 
     /// Marks the row of `destination_hash` as having said it is leaving the mesh, at
-    /// `received_at`: this node's clock when the farewell arrived. A farewell received
-    /// before the row's latest announce is ignored, since the instance has announced
-    /// since, and so is one for a destination the table does not know, and a repeat for a
-    /// row already marked, which keeps the time of the first. `true` when the row was
-    /// marked.
-    pub(crate) fn mark_left(&self, destination_hash: &str, received_at: SystemTime) -> bool {
+    /// `sent_at`: when the farewell was sent, never later than this node received it. A
+    /// farewell sent no later than the row's latest presence (its last announce, path
+    /// response or request over a live link) is refused, since the instance has been
+    /// heard since, and so is one for a destination the table does not know, and a repeat
+    /// for a row already marked, which keeps the time of the first.
+    pub(crate) fn mark_left(&self, destination_hash: &str, sent_at: SystemTime) -> LeftMark {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(destination_hash) else {
-            return false;
+            return LeftMark::Unknown;
         };
-        if record.left_at.is_some() || received_at < record.last_seen {
-            return false;
+        if record.left_at.is_some() {
+            return LeftMark::AlreadyLeft;
         }
-        record.left_at = Some(received_at);
+        let latest = self
+            .presence
+            .lock()
+            .get(destination_hash)
+            .map_or(record.last_seen, |heard| (*heard).max(record.last_seen));
+        if sent_at <= latest {
+            return LeftMark::HeardSince;
+        }
+        record.left_at = Some(sent_at);
         self.dirty.store(true, Ordering::Release);
-        true
+        LeftMark::Marked
     }
 
     /// Lifts the mark `mark_left` set, once the instance was heard from over a live link:
@@ -469,9 +515,11 @@ impl PeerTable {
             .map(|record| record.destination_hash.clone())
             .collect();
         let mut link_failed = self.link_failed.lock();
+        let mut presence = self.presence.lock();
         for hash in &expired {
             peers.remove(hash);
             link_failed.remove(hash);
+            presence.remove(hash);
         }
         if !expired.is_empty() {
             self.dirty.store(true, Ordering::Release);
@@ -772,7 +820,7 @@ mod public_key_tests {
         };
         table.observe(sighting, t0);
 
-        assert!(table.refresh_route(keyless));
+        assert!(table.refresh_route(keyless, t0));
 
         assert_eq!(
             table.get(&destination).unwrap().public_key.as_deref(),
@@ -971,17 +1019,19 @@ mod tests {
             "an unmarked row writes no left_at: {written}"
         );
 
-        assert!(!table.mark_left("unknown", t0));
-        assert!(
-            !table.mark_left("aa", t0 - Duration::from_secs(1)),
+        assert_eq!(table.mark_left("unknown", t0), LeftMark::Unknown);
+        assert_eq!(
+            table.mark_left("aa", t0 - Duration::from_secs(1)),
+            LeftMark::HeardSince,
             "a farewell received before the latest announce is ignored"
         );
         assert_eq!(table.get("aa").unwrap().left_at, None);
 
         let left = t0 + Duration::from_secs(5);
-        assert!(table.mark_left("aa", left));
-        assert!(
-            !table.mark_left("aa", left + Duration::from_secs(1)),
+        assert_eq!(table.mark_left("aa", left), LeftMark::Marked);
+        assert_eq!(
+            table.mark_left("aa", left + Duration::from_secs(1)),
+            LeftMark::AlreadyLeft,
             "a repeated farewell is ignored"
         );
         let row = table.get("aa").unwrap();
@@ -997,8 +1047,9 @@ mod tests {
             None,
             "the next announce clears the mark"
         );
-        assert!(
-            !table.mark_left("aa", left),
+        assert_eq!(
+            table.mark_left("aa", left),
+            LeftMark::HeardSince,
             "the farewell is older than the announce that followed it"
         );
     }
@@ -1017,7 +1068,7 @@ mod tests {
         );
         assert!(!table.clear_left("unknown"));
         let left = t0 + Duration::from_secs(5);
-        assert!(table.mark_left("aa", left));
+        assert_eq!(table.mark_left("aa", left), LeftMark::Marked);
         table.persist_if_dirty().unwrap();
 
         assert!(table.clear_left("aa"));
@@ -1028,6 +1079,85 @@ mod tests {
         table.persist_if_dirty().unwrap();
         let reloaded = PeerTable::load(path, left).unwrap();
         assert_eq!(reloaded.get("aa").unwrap().left_at, None);
+    }
+
+    /// A farewell sent after the row's latest presence marks it at the time it was sent;
+    /// one sent at or before a later announce, path response or request over a live link
+    /// is refused and leaves the row live. A repeat keeps the first time.
+    #[test]
+    fn a_farewell_counts_only_when_sent_after_the_latest_presence() {
+        let (table, _tmp) = table("peers-left-presence");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        table.observe(sighting("aa", None), t0);
+
+        assert_eq!(table.mark_left("aa", at(1)), LeftMark::Marked);
+        assert_eq!(table.get("aa").unwrap().left_at, Some(at(1)));
+        assert_eq!(table.mark_left("aa", at(2)), LeftMark::AlreadyLeft);
+        assert_eq!(
+            table.get("aa").unwrap().left_at,
+            Some(at(1)),
+            "a repeat keeps the first time"
+        );
+
+        table.observe(sighting("aa", None), at(10));
+        assert_eq!(
+            table.mark_left("aa", at(10)),
+            LeftMark::HeardSince,
+            "a farewell sent as the instance announced is not later than the announce"
+        );
+        assert_eq!(table.mark_left("aa", at(9)), LeftMark::HeardSince);
+
+        assert!(table.refresh_route(sighting("aa", None), at(20)));
+        assert_eq!(table.get("aa").unwrap().last_seen, at(10));
+        assert_eq!(
+            table.mark_left("aa", at(15)),
+            LeftMark::HeardSince,
+            "a farewell sent before a later path response is refused"
+        );
+
+        table.note_presence("aa", at(30));
+        assert_eq!(
+            table.mark_left("aa", at(25)),
+            LeftMark::HeardSince,
+            "a farewell sent before a later request over a live link is refused"
+        );
+        table.note_presence("aa", at(28));
+        assert_eq!(
+            table.mark_left("aa", at(29)),
+            LeftMark::HeardSince,
+            "an older presence does not move the latest back"
+        );
+        assert_eq!(table.get("aa").unwrap().left_at, None);
+
+        assert_eq!(table.mark_left("aa", at(31)), LeftMark::Marked);
+        assert_eq!(table.get("aa").unwrap().left_at, Some(at(31)));
+    }
+
+    /// Presence is kept for rows only, and a swept row takes its presence with it, so a
+    /// later row under the same hash starts from its own announce.
+    #[test]
+    fn presence_is_kept_for_known_rows_and_swept_with_them() {
+        let (table, _tmp) = table("peers-presence-swept");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        table.note_presence("unknown", t0);
+        table.observe(sighting("unknown", None), t0 - Duration::from_secs(5));
+        assert_eq!(
+            table.mark_left("unknown", t0 - Duration::from_secs(1)),
+            LeftMark::Marked,
+            "presence noted before the row existed is not kept"
+        );
+
+        table.observe(sighting("aa", None), t0);
+        table.note_presence("aa", t0 + PEER_TTL + Duration::from_secs(60));
+        table.sweep(t0 + PEER_TTL);
+        assert!(table.get("aa").is_none());
+        let later = t0 + PEER_TTL + Duration::from_secs(1);
+        table.observe(sighting("aa", None), later);
+        assert_eq!(
+            table.mark_left("aa", later + Duration::from_secs(1)),
+            LeftMark::Marked
+        );
     }
 
     #[test]
@@ -1270,7 +1400,7 @@ mod tests {
         let mut swept = sighting("gone", Some("Gus"));
         swept.hops = 7;
         assert!(
-            !table.refresh_route(swept),
+            !table.refresh_route(swept, t0),
             "a destination without a row is not refreshed"
         );
         assert!(table.get("gone").is_none(), "nothing is filed for it");
@@ -1284,7 +1414,7 @@ mod tests {
         let mut answer = sighting("aa", Some("Ada again"));
         answer.identity_hash = "id-aa-rotated".to_string();
         answer.hops = 5;
-        assert!(table.refresh_route(answer));
+        assert!(table.refresh_route(answer, t0));
         let row = table.get("aa").unwrap();
         assert_eq!(row.hops, 5, "the hop count follows the path response");
         assert_eq!(row.identity_hash, "id-aa-rotated");

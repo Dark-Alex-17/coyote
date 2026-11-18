@@ -47,7 +47,7 @@ use crate::mesh::message::{
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
-    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
+    LeftMark, PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
     Answered, CorrelationKind, Correlations, InboundKind, InboundRecord, InboundStore,
@@ -3294,15 +3294,18 @@ impl AnnounceFiler<'_> {
     ) -> Option<PeerChange> {
         if self.peers.get(&announced.destination_hash).is_some() {
             let decoded = decode_announce(&announced.destination_hash, app_data, hops)?;
-            let refreshed = self.peers.refresh_route(PeerSighting {
-                destination_hash: announced.destination_hash.clone(),
-                identity_hash: announced.identity_hash.clone(),
-                name_hash: announced.name_hash.clone(),
-                public_key: announced.public_key.clone(),
-                display_name: decoded.display_name,
-                protocol_version: decoded.version,
-                hops,
-            });
+            let refreshed = self.peers.refresh_route(
+                PeerSighting {
+                    destination_hash: announced.destination_hash.clone(),
+                    identity_hash: announced.identity_hash.clone(),
+                    name_hash: announced.name_hash.clone(),
+                    public_key: announced.public_key.clone(),
+                    display_name: decoded.display_name,
+                    protocol_version: decoded.version,
+                    hops,
+                },
+                now,
+            );
             // A row swept away between the gate above and the refresh files as a first
             // sighting, like any announce for a destination the table does not hold.
             if refreshed {
@@ -3551,10 +3554,11 @@ fn note_return(runtime: &Weak<MeshRuntime>, destination: &str) {
 
 /// What a request the trust gate let through tells this node about its sender.
 ///
-/// It lifts the sender's left mark: a request arrives over a live link, so the instance
+/// It counts as the sender's presence, so a farewell it sent earlier is discarded, and it
+/// lifts the sender's left mark: a request arrives over a live link, so the instance
 /// is back as surely as if it had announced, and a reply to it must not be routed as if
-/// it were gone. Its farewell is the one request that does not count, since it is what
-/// set the mark. Held mail never reaches here: a held message can be older than the
+/// it were gone. Its farewell is the one request that does neither, since it is what
+/// sets the mark. Held mail never reaches here: a held message can be older than the
 /// farewell. Requests on concurrent links are not ordered against each other, so one the
 /// instance sent just before its farewell can still be let through after it and lift the
 /// fresh mark; the mark is advisory and the instance was alive a moment ago.
@@ -3571,37 +3575,23 @@ struct AllowedRequestHook {
 impl AllowObserver for AllowedRequestHook {
     fn allowed(&self, destination: &AddressHash, path_hash: PathHash, body: &rmpv::Value) {
         let destination = destination.to_hex_string();
-        self.lift_left_mark(&destination, path_hash, body);
+        let farewell = path_hash == PathHash::of(MESSAGE_PATH)
+            && from_request_body(body)
+                .is_ok_and(|body| is_farewell(body.kind, body.fields.as_ref()));
+        if !farewell {
+            self.peers.note_presence(&destination, SystemTime::now());
+            if self.peers.clear_left(&destination) {
+                debug!(
+                    "Mesh instance {} was heard over a link; no longer marked left",
+                    short(&destination)
+                );
+                note_return(&self.runtime, &destination);
+            }
+        }
         if path_hash == PathHash::of(STATUS_PATH)
             && let Some(runtime) = self.runtime.upgrade()
         {
             runtime.consider_card_fetch(&destination, CardTrigger::Contacted);
-        }
-    }
-}
-
-impl AllowedRequestHook {
-    fn lift_left_mark(&self, destination: &str, path_hash: PathHash, body: &rmpv::Value) {
-        // Most requests come from instances not marked left; they skip the body read.
-        if self
-            .peers
-            .get(destination)
-            .is_none_or(|row| row.left_at.is_none())
-        {
-            return;
-        }
-        if path_hash == PathHash::of(MESSAGE_PATH)
-            && from_request_body(body)
-                .is_ok_and(|body| is_farewell(body.kind, body.fields.as_ref()))
-        {
-            return;
-        }
-        if self.peers.clear_left(destination) {
-            debug!(
-                "Mesh instance {} was heard over a link; no longer marked left",
-                short(destination)
-            );
-            note_return(&self.runtime, destination);
         }
     }
 }
@@ -4921,7 +4911,7 @@ impl MeshSlot {
 
     /// Takes the node out of the slot and shuts it down, letting go of its pending
     /// questions with it: they stay on disk for the next install of that instance.
-    /// First, while the node is still in the slot, every trusted peer it holds a path to
+    /// First, while the node is still in the slot, every trusted peer that has not left
     /// is told it is leaving (`MeshRuntime::send_farewell`), which never takes longer than
     /// `FAREWELL_BUDGET`; `.mesh off`, `.exit session|agent` and the REPL's own exit all
     /// stop through here, so each says goodbye once. An envoy reply that goes out during
@@ -7146,13 +7136,20 @@ impl PeerSurface for MeshSlot {
             return;
         };
         let dest8 = short(&farewell.source_destination).to_string();
-        if !runtime
+        let why_ignored = match runtime
             .peers()
-            .mark_left(&farewell.source_destination, farewell.received_at)
+            .mark_left(&farewell.source_destination, farewell.sent_at)
         {
+            LeftMark::Marked => None,
+            LeftMark::Unknown => Some("no row is held for it"),
+            LeftMark::AlreadyLeft => Some("it is already marked left"),
+            LeftMark::HeardSince => Some("it was heard since it left"),
+        };
+        if let Some(why) = why_ignored {
             debug!(
-                "Mesh farewell {} from instance {dest8} ignored: the peer table holds no row for it, it has announced since, or it is already marked left",
-                farewell.message_id
+                "Mesh farewell {} from instance {dest8} ignored: {}",
+                farewell.message_id,
+                redact_hashes(why)
             );
             return;
         }
@@ -7164,7 +7161,7 @@ impl PeerSurface for MeshSlot {
             identity: farewell.source_identity,
             destination: farewell.source_destination,
             title: None,
-            via: PeerVia::Direct,
+            via: farewell.via,
             presence: Some(PRESENCE_LEAVING),
         });
     }
@@ -16632,7 +16629,9 @@ mod tests {
                     source_identity: identity_b.clone(),
                     source_destination: to_b.clone(),
                     message_id: "repeat".to_string(),
+                    sent_at: SystemTime::now(),
                     received_at: SystemTime::now(),
+                    via: PeerVia::Direct,
                 },
             );
             assert_eq!(
@@ -16750,7 +16749,10 @@ mod tests {
             let to_a = pair.a.runtime.current_destination_hash();
             let to_b = pair.to_b();
             let idle = question_open_with_b(&pair, "q-left-asks");
-            assert!(pair.a.runtime.peers().mark_left(&to_b, SystemTime::now()));
+            assert_eq!(
+                pair.a.runtime.peers().mark_left(&to_b, SystemTime::now()),
+                LeftMark::Marked
+            );
             let stale =
                 OutboundPeer::new(PeerKind::Message, "still there?", None, None, None).unwrap();
             let err = pair.a.runtime.send_peer(&to_b, &stale).await.unwrap_err();
@@ -16800,6 +16802,8 @@ mod tests {
             let farewell = FarewellOutcome {
                 audience: 1,
                 delivered: 1,
+                held: 0,
+                skipped: 0,
             };
             assert_eq!(pair.b.runtime.send_farewell().await, farewell);
             let first = pair.left_at_on_a();
@@ -16829,7 +16833,10 @@ mod tests {
             let to_b = pair.to_b();
             let idle = question_open_with_b(&pair, "q-left-held");
             let left_at = SystemTime::now();
-            assert!(pair.a.runtime.peers().mark_left(&to_b, left_at));
+            assert_eq!(
+                pair.a.runtime.peers().mark_left(&to_b, left_at),
+                LeftMark::Marked
+            );
             let origin_b = pair.b.runtime.destination.lock().await.origin;
             let out = OutboundPeer::new(PeerKind::Message, "held", None, None, None).unwrap();
             let lxmf = peer_lxmf_message(&out, &origin_b);
@@ -16865,11 +16872,102 @@ mod tests {
             pair.relay.stop().await;
         }
 
-        /// A trusted peer whose node went away without a word keeps its path on A for a
-        /// while: A's farewell to it fails at the link, inside the budget, and is not
-        /// handed to the propagation node A has on file, as any other send would be.
+        /// A farewell fetched from a propagation node is presence: it marks B's row left
+        /// at the time B sent it, files nothing, runs no envoy and reports that it came
+        /// store-and-forward. One B sent before A last heard from it over a link is
+        /// discarded and leaves the row live.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_farewell_that_no_link_carries_ends_within_its_budget_and_is_not_stored() {
+        async fn a_fetched_farewell_marks_the_row_left_unless_the_peer_was_heard_since() {
+            let pair = Pair::start("node-farewell-fetched").await;
+            let to_b = pair.to_b();
+            let identity_b = pair.b.runtime.fingerprint().to_string();
+            let envoy = RecordingEnvoy::new(true, false);
+            pair.slot_a
+                .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+            let idle = question_open_with_b(&pair, "q-left-fetched");
+            let origin_b = pair.b.runtime.destination.lock().await.origin;
+            let inner = NullSink;
+            let routing = PeerRouting {
+                trust: &pair.a.runtime.trust,
+                surface: Some(pair.slot_a.clone() as Arc<dyn PeerSurface>),
+                inner: &inner,
+            };
+            let fetched = |timestamp: f64, id: u8| {
+                let farewell = crate::mesh::message::farewell_message().unwrap();
+                let lxmf = peer_lxmf_message(&farewell, &origin_b);
+                InboundMessage {
+                    transient_id: [id; 32],
+                    message_id: [id.wrapping_add(1); 32],
+                    source_identity_hash: identity_b.clone(),
+                    source_delivery_hash: hex_lower(&[0x03; 16]),
+                    timestamp,
+                    title: None,
+                    content: Some(lxmf.content),
+                    fields: lxmf.fields,
+                    stamp_value: None,
+                }
+            };
+            let before_b_asked = unix_now();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            status_round_trip(&pair.slot_b, &pair.slot_a).await;
+            pair.hooks_a.drain();
+
+            routing.deliver(fetched(before_b_asked, 1));
+
+            assert_eq!(
+                pair.left_at_on_a(),
+                None,
+                "a farewell sent before B's latest request over a link is discarded"
+            );
+            let fired_a = pair.hooks_a.drain();
+            assert!(
+                fires_of(&fired_a, HookEvent::MeshBulletinReceived).is_empty(),
+                "{fired_a:?}"
+            );
+
+            let sent = unix_now();
+            routing.deliver(fetched(sent, 3));
+
+            assert_eq!(
+                pair.left_at_on_a(),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(sent)),
+                "the mark carries the time B sent the farewell"
+            );
+            let fired_a = pair.hooks_a.drain();
+            let received = fires_of(&fired_a, HookEvent::MeshBulletinReceived);
+            assert_eq!(received.len(), 1, "{fired_a:?}");
+            assert_eq!(
+                env_value(received[0], "COYOTE_MESH_PRESENCE"),
+                Some("leaving")
+            );
+            assert_eq!(
+                env_value(received[0], "COYOTE_MESH_VIA"),
+                Some("store-and-forward")
+            );
+            assert_eq!(
+                env_value(received[0], "COYOTE_MESH_PEER_DESTINATION"),
+                Some(to_b.as_str())
+            );
+            assert!(
+                fires_of(&fired_a, HookEvent::MeshMessageReceived).is_empty(),
+                "{fired_a:?}"
+            );
+            assert_eq!(pair.slot_a.peer_inbox().len(), 0, "a farewell is not filed");
+            assert!(envoy.job_ids().is_empty(), "a farewell is not the envoy's");
+            assert!(idle.pushed.lock().is_empty(), "a farewell says nothing");
+
+            assert!(pair.slot_a.stop().await.unwrap());
+            assert!(pair.slot_b.stop().await.unwrap());
+            pair.relay.stop().await;
+        }
+
+        /// A trusted peer whose node went away without a word keeps its path on A for a
+        /// while: A's farewell to it fails at the link and is handed once to the
+        /// propagation node A has on file, all inside the budget. A link-only bulletin
+        /// is still not stored.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_farewell_that_no_link_carries_is_handed_to_the_propagation_node_within_its_budget()
+         {
             crate::testing::install_log_collector();
             let pair = Pair::start("node-farewell-silent").await;
             let to_b = pair.to_b();
@@ -16907,16 +17005,22 @@ mod tests {
             let outcome = pair.a.runtime.send_farewell().await;
 
             let took = started.elapsed();
-            assert_eq!(
-                outcome,
-                FarewellOutcome {
-                    audience: 1,
-                    delivered: 0
-                }
-            );
+            // The node on file here is B's own destination, gone with B, so whether the
+            // hand-off reads as held or skipped depends on whether A's old link to it has
+            // closed yet. The held count against a live node is pinned with `PostingNode`.
+            assert_eq!((outcome.audience, outcome.delivered), (1, 0), "{outcome:?}");
+            assert_eq!(outcome.held + outcome.skipped, 1, "{outcome:?}");
             assert!(
                 took < FAREWELL_BUDGET + Duration::from_millis(500),
                 "the fan-out is cut off at its budget: {took:?}"
+            );
+            let dest8 = short(&to_b).to_string();
+            let logs = crate::testing::debug_snapshot();
+            assert!(
+                logs.iter().any(|line| line.contains("Mesh bulletin ")
+                    && line.contains(&dest8)
+                    && line.contains("storing it with propagation node")),
+                "the farewell is handed to the propagation node: {logs:#?}"
             );
             // The same link-only send with a link timeout well inside the budget, so the
             // failed link is seen and the propagation node on file is still not used.
@@ -16938,7 +17042,6 @@ mod tests {
                 .await;
             assert!(matches!(sent, Err(SendError::Direct(_))), "{sent:?}");
             let logs = crate::testing::debug_snapshot();
-            let dest8 = short(&to_b).to_string();
             assert!(
                 logs.iter().any(|line| line.contains(&bulletin.id)
                     && line.contains(&dest8)
@@ -16949,7 +17052,7 @@ mod tests {
                 !logs
                     .iter()
                     .any(|line| line.contains("storing it with propagation node")
-                        && line.contains(&dest8)),
+                        && line.contains(&bulletin.id)),
                 "{logs:#?}"
             );
             assert!(pair.slot_a.stop().await.unwrap());
@@ -19679,6 +19782,93 @@ mod tests {
                 "a peer whose last link failed is not asked for again: waited {waited:?}"
             );
             node.next_received().await;
+
+            assert!(slot.stop().await.unwrap());
+            node.stop().await;
+        }
+
+        /// A trusted peer known only by its stored key, with no path, gets the farewell
+        /// through the propagation node on file: no link is tried and no path request
+        /// is waited on, so the whole leave stays inside its budget.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_farewell_to_a_trusted_peer_without_a_path_is_held_on_a_propagation_node() {
+            use crate::mesh::message::{FAREWELL_BUDGET, FarewellOutcome};
+            use crate::mesh::trust::TrustOptions;
+
+            let mut node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-farewell-no-path");
+            let cache = mesh_cache_dir(&tmp.path.join("cache"));
+            let nodes = PropagationNodeTable::load(
+                cache.join(PROPAGATION_NODE_TABLE_FILE),
+                SystemTime::now(),
+            )
+            .unwrap();
+            nodes.observe(
+                PropagationNode {
+                    destination: node.desc,
+                    stamp_cost: 0,
+                    per_transfer_limit_kb: FETCH_TRANSFER_LIMIT_KB,
+                    propagation_enabled: true,
+                },
+                1,
+                SystemTime::now(),
+            );
+            nodes.persist_if_dirty().unwrap();
+            let peer = TransportIdentity::new_from_rand(OsRng);
+            let desc = SingleInputDestination::new(peer, session_destination_name("away")).desc;
+            let destination = desc.address_hash.to_hex_string();
+            let peers = PeerTable::load(cache.join("peers.json"), SystemTime::now()).unwrap();
+            peers.observe(
+                PeerSighting {
+                    destination_hash: destination.clone(),
+                    identity_hash: desc.identity.address_hash.to_hex_string(),
+                    name_hash: hex_lower(desc.name.as_name_hash_slice()),
+                    public_key: Some(desc.identity.to_hex_string()),
+                    display_name: Some("Away".to_string()),
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            peers.persist_if_dirty().unwrap();
+
+            let runtime = start_on(&tmp, node.port).await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let transport = runtime.transport_handle().await.unwrap();
+            assert!(!transport.has_path(&desc.address_hash).await);
+
+            let started = Instant::now();
+            let outcome = runtime.send_farewell().await;
+            let took = started.elapsed();
+
+            assert_eq!(
+                outcome,
+                FarewellOutcome {
+                    audience: 1,
+                    delivered: 0,
+                    held: 1,
+                    skipped: 0,
+                }
+            );
+            assert!(
+                took < FAREWELL_BUDGET + Duration::from_millis(500),
+                "the farewell waited {took:?}"
+            );
+            node.next_received().await;
+            assert!(
+                !runtime.link_failed(&destination),
+                "no link was tried to the peer"
+            );
 
             assert!(slot.stop().await.unwrap());
             node.stop().await;

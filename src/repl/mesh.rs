@@ -4976,8 +4976,13 @@ fn render_sync(report: &FetchReport) -> String {
     if report.received == 0 {
         return format!("Nothing held for you at propagation node {node}.");
     }
+    let presence = if report.presence > 0 {
+        format!(", {} presence", report.presence)
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "Fetched from propagation node {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
+        "Fetched from propagation node {node}: {} listed, {} wanted, {} received, {} delivered{presence}, {} duplicates, {} discarded, {} deferred",
         report.listed,
         report.wanted,
         report.received,
@@ -5011,6 +5016,7 @@ mod sync_ask_line_tests {
             wanted: 1,
             received: 1,
             delivered: 0,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 1,
@@ -5032,6 +5038,7 @@ mod sync_ask_line_tests {
             wanted: 3,
             received: 3,
             delivered: 0,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 3,
@@ -5060,6 +5067,7 @@ mod sync_ask_line_tests {
             wanted: 2,
             received: 2,
             delivered: 1,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 0,
@@ -21181,6 +21189,7 @@ mod tests {
                 wanted: 6,
                 received: 5,
                 delivered: 2,
+                presence: 0,
                 duplicates: 1,
                 discarded: 1,
                 deferred: 1,
@@ -38649,7 +38658,10 @@ mod tests {
                             kind: CorrelationKind::Ask,
                         })
                         .unwrap();
-                    assert!(runtime.peers().mark_left(&peer, now));
+                    assert_eq!(
+                        runtime.peers().mark_left(&peer, now),
+                        crate::mesh::test_support::LeftMark::Marked
+                    );
                     assert!(runtime.path_known(&peer).await);
 
                     let pending = pending_out(&mut ctx, ".").await.unwrap();
@@ -38836,7 +38848,10 @@ mod tests {
                         runtime_with_peer_and_storing_node("repl-mesh-left-held").await;
                     let runtime = started.runtime.clone();
                     let left_at = SystemTime::now();
-                    assert!(runtime.peers().mark_left(&peer, left_at));
+                    assert_eq!(
+                        runtime.peers().mark_left(&peer, left_at),
+                        crate::mesh::test_support::LeftMark::Marked
+                    );
                     assert!(
                         crate::mesh::test_support::expire_path(&runtime, &peer).await,
                         "the runtime held a path to the peer"
@@ -39130,7 +39145,10 @@ mod tests {
                         .unwrap();
                     let peer = stub.destination_hex();
                     stub.wait_to_be_filed(&runtime.peers(), &peer).await;
-                    assert!(runtime.peers().mark_left(&peer, SystemTime::now()));
+                    assert_eq!(
+                        runtime.peers().mark_left(&peer, SystemTime::now()),
+                        crate::mesh::test_support::LeftMark::Marked
+                    );
 
                     announce_until(&stub, "the announce to lift the left mark", || {
                         runtime.peers().get(&peer).unwrap().left_at.is_none()
@@ -39158,7 +39176,10 @@ mod tests {
                             kind: CorrelationKind::Ask,
                         })
                         .unwrap();
-                    assert!(runtime.peers().mark_left(&peer, now));
+                    assert_eq!(
+                        runtime.peers().mark_left(&peer, now),
+                        crate::mesh::test_support::LeftMark::Marked
+                    );
                     announce_until(&stub, "the is-back line", || !idle.0.lock().is_empty()).await;
                     assert!(runtime.peers().get(&peer).unwrap().left_at.is_none());
                     tokio::time::sleep(Duration::from_millis(1500)).await;

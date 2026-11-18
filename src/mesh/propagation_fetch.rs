@@ -10,6 +10,7 @@
 //! it; if the key is still unknown, the body is neither recorded nor acknowledged, so the
 //! node keeps it for a later fetch, a bounded number of times.
 
+use crate::mesh::message::is_fetched_farewell;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash, lxmf_delivery_hash_of};
 use crate::mesh::request::{
@@ -544,10 +545,10 @@ impl InboundSink for LoggingInboundSink {
     }
 }
 
-/// `received` splits into `delivered`, `duplicates`, `discarded`, `deferred` and the
-/// bodies this fetch left for another reader, which `left_for_session` counts together
-/// with the listed ones an earlier fetch left; `acknowledged` is what round 3 told the
-/// node to delete, every received body but the deferred and left ones.
+/// `received` splits into `delivered`, `presence`, `duplicates`, `discarded`, `deferred`
+/// and the bodies this fetch left for another reader, which `left_for_session` counts
+/// together with the listed ones an earlier fetch left; `acknowledged` is what round 3
+/// told the node to delete, every received body but the deferred and left ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FetchReport {
     pub node: String,
@@ -555,6 +556,8 @@ pub(crate) struct FetchReport {
     pub wanted: usize,
     pub received: usize,
     pub delivered: usize,
+    /// Bodies handed over as presence rather than mail: farewells.
+    pub presence: usize,
     pub duplicates: usize,
     pub discarded: usize,
     pub deferred: usize,
@@ -580,6 +583,7 @@ impl FetchReport {
             wanted: 0,
             received: 0,
             delivered: 0,
+            presence: 0,
             duplicates: 0,
             discarded: 0,
             deferred: 0,
@@ -592,8 +596,9 @@ impl FetchReport {
     /// The bodies this fetch received and left for another reader: what `received` holds
     /// besides the other outcomes, with none of the listed ids an earlier fetch left.
     pub(crate) fn left_received(&self) -> usize {
-        self.received
-            .saturating_sub(self.delivered + self.duplicates + self.discarded + self.deferred)
+        self.received.saturating_sub(
+            self.delivered + self.presence + self.duplicates + self.discarded + self.deferred,
+        )
     }
 }
 
@@ -1285,6 +1290,9 @@ impl fmt::Display for Discard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BodyOutcome {
     Delivered,
+    /// Handed over as presence rather than mail, a farewell: recorded and acknowledged
+    /// as a delivered body is.
+    Presence,
     /// Left on the node for a later fetch: neither recorded nor acknowledged. `asked` when
     /// this fetch asked the mesh for the sender's announce before deferring it.
     Deferred {
@@ -1495,8 +1503,13 @@ impl BodyPipeline<'_> {
                 }
                 store.insert(transient_id, now);
                 store.record_delivered(message.message_id, now);
+                let outcome = if is_fetched_farewell(&message) {
+                    BodyOutcome::Presence
+                } else {
+                    BodyOutcome::Delivered
+                };
                 self.sink.deliver(message);
-                Ok(BodyOutcome::Delivered)
+                Ok(outcome)
             }
             Err(unknown @ Discard::UnknownSource { asked }) => {
                 match store.defer(transient_id, now, asked) {
@@ -1915,8 +1928,13 @@ pub(crate) async fn fetch(
     .await?;
     report.acknowledged = acks.len();
     debug!(
-        "Propagation fetch from {node_short}: round 3 acknowledged {}; delivered {}, duplicates {}, discarded {}, deferred {}",
-        report.acknowledged, report.delivered, report.duplicates, report.discarded, report.deferred
+        "Propagation fetch from {node_short}: round 3 acknowledged {}; delivered {}, presence {}, duplicates {}, discarded {}, deferred {}",
+        report.acknowledged,
+        report.delivered,
+        report.presence,
+        report.duplicates,
+        report.discarded,
+        report.deferred
     );
     Ok(report)
 }
@@ -1956,6 +1974,7 @@ async fn process_bodies(
     for body in bodies {
         match pipeline.process(body, store, SystemTime::now()).await? {
             BodyOutcome::Delivered => report.delivered += 1,
+            BodyOutcome::Presence => report.presence += 1,
             BodyOutcome::Deferred { asked, .. } => {
                 report.deferred += 1;
                 if asked {
@@ -1991,7 +2010,8 @@ mod tests {
     };
     use crate::mesh::knocks::KnockCache;
     use crate::mesh::message::{
-        OutboundPeer, PeerKind, PeerRouting, PeerSurface, left_mesh_hint_when, peer_lxmf_message,
+        OutboundPeer, PeerKind, PeerRouting, PeerSurface, farewell_message, left_mesh_hint_when,
+        peer_lxmf_message, unix_now,
     };
     use crate::mesh::node::MeshSlot;
     use crate::mesh::peers::PeerSighting;
@@ -2487,6 +2507,7 @@ mod tests {
         match outcome {
             BodyOutcome::Discarded(discard) => discard,
             BodyOutcome::Delivered => panic!("expected a discard, the body was delivered"),
+            BodyOutcome::Presence => panic!("expected a discard, the body was presence"),
             BodyOutcome::Deferred { attempts, .. } => {
                 panic!("expected a discard, deferred {attempts}")
             }
@@ -3095,6 +3116,60 @@ mod tests {
         );
         assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
         assert_eq!(inbox.count(), 1);
+    }
+
+    /// A farewell fetched from the node is handed over as presence, not mail: the report
+    /// counts it under `presence`, round 3 acknowledges it, and its id is recorded, so the
+    /// same body served again, in this fetch or the next, is a duplicate.
+    #[tokio::test]
+    async fn a_fetched_farewell_counts_as_presence_and_is_recorded() {
+        let peer = CorePrivateIdentity::new_from_rand(OsRng);
+        let peer_id = transport_identity_of(&peer);
+        let origin = OriginName::of(&session_destination_name("peer"));
+        let mut bench = Bench::new(
+            "fetch-farewell-presence",
+            TrustList::default().identity(&identity_hex(&peer_id), true),
+        );
+        bench.keys.know(&peer_id);
+        let me = bench.me();
+        let farewell = peer_lxmf_message(&farewell_message().unwrap(), &origin);
+        let body = build_signed_message(&peer, &lxmf_delivery_hash(&me), &farewell, unix_now())
+            .unwrap()
+            .pack_propagation_transient_with_rng(&to_core_identity(&me), OsRng)
+            .unwrap()
+            .0;
+        let pipeline = BodyPipeline {
+            recipient: &bench.recipient,
+            delivery: lxmf_delivery_hash(&me),
+            keys: &bench.keys,
+            trust: &bench.trust,
+            sink: &bench.sink,
+            hold: &TakeAll,
+            node: "fake",
+            asked: Mutex::default(),
+            cancel: CancellationToken::new(),
+        };
+        let mut report = FetchReport::new("fake".to_string());
+        report.received = 2;
+
+        let acks = process_bodies(
+            &pipeline,
+            &[body.clone(), body.clone()],
+            &mut bench.store,
+            &Mutex::default(),
+            &mut report,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            (report.presence, report.delivered, report.duplicates),
+            (1, 0, 1)
+        );
+        assert_eq!(report.left_received(), 0);
+        assert_eq!(acks, vec![transient_id_of(&body)]);
+        assert_eq!(bench.sink.count(), 1, "the farewell reaches the sink once");
+        assert_eq!(discarded(bench.process(&body).await), Discard::Duplicate);
     }
 
     /// The hold policy is asked only about a message that passed every check. One it
@@ -4619,6 +4694,7 @@ mod tests {
                     wanted: 2,
                     received: 2,
                     delivered: 0,
+                    presence: 0,
                     duplicates: 0,
                     discarded: 2,
                     deferred: 0,
@@ -4683,7 +4759,7 @@ mod tests {
                 format!("round 2 requested 2 bodies within {FETCH_TRANSFER_LIMIT_KB} kB"),
                 "received 2 bodies (800 bytes)".to_string(),
                 "round 3 acknowledging 2 bodies, leaving 0 deferred on the node".to_string(),
-                "round 3 acknowledged 2; delivered 0, duplicates 0, discarded 2, deferred 0"
+                "round 3 acknowledged 2; delivered 0, presence 0, duplicates 0, discarded 2, deferred 0"
                     .to_string(),
             ];
             let log = debug_snapshot();

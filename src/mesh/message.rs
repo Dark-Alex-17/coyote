@@ -17,7 +17,9 @@ use crate::mesh::notify::NoticeText;
 use crate::mesh::peers::PeerRecord;
 use crate::mesh::pending::sibling_owner;
 use crate::mesh::people::WHO_MAX_CHARS;
-use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
+use crate::mesh::propagation::{
+    OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
+};
 use crate::mesh::propagation_fetch::{HoldPolicy, InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
@@ -1766,12 +1768,16 @@ impl Default for PeerSendOptions {
     }
 }
 
-/// What a farewell's fan-out came to: how many trusted peers it was sent to and how many
-/// acknowledged it within `FAREWELL_BUDGET`.
+/// What a farewell's fan-out came to within `FAREWELL_BUDGET`: how many trusted peers it
+/// was for, how many acknowledged it over a link, how many had it held by the
+/// propagation node, and how many were told nothing, the ones the budget cut off
+/// included.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FarewellOutcome {
     pub audience: usize,
     pub delivered: usize,
+    pub held: usize,
+    pub skipped: usize,
 }
 
 /// Whether a message of `kind` carrying `fields` is a farewell: a bulletin whose
@@ -1785,8 +1791,27 @@ pub(crate) fn is_farewell(kind: PeerKind, fields: Option<&serde_json::Value>) ->
             == Some(PRESENCE_LEAVING)
 }
 
+/// Whether a message fetched from a propagation node is a peer's farewell, which the
+/// fetch counts as presence rather than mail.
+pub(crate) fn is_fetched_farewell(message: &InboundMessage) -> bool {
+    matches!(
+        decode_peer_lxmf(message),
+        PeerLxmf::Peer(peer) if is_farewell(peer.kind, peer.fields.as_ref())
+    )
+}
+
+/// When a farewell stamped `timestamp` (unix seconds) and received at `received_at` was
+/// sent: the stamp, but never later than its arrival, so a sender whose clock runs ahead
+/// cannot post-date its mark. A missing or unreadable stamp reads as the arrival.
+fn farewell_sent_at(timestamp: Option<f64>, received_at: SystemTime) -> SystemTime {
+    timestamp
+        .and_then(|secs| Duration::try_from_secs_f64(secs).ok())
+        .and_then(|since| UNIX_EPOCH.checked_add(since))
+        .map_or(received_at, |sent| sent.min(received_at))
+}
+
 /// The farewell bulletin: fixed words, `fields.presence: leaving`, a fresh id.
-fn farewell_message() -> Result<OutboundPeer, SendError> {
+pub(crate) fn farewell_message() -> Result<OutboundPeer, SendError> {
     OutboundPeer::new(
         PeerKind::Bulletin,
         FAREWELL_CONTENT,
@@ -2247,16 +2272,37 @@ impl MeshRuntime {
                         _ => SendError::NoPropagationNode,
                     },
                 })?;
-        let node_hex = node.destination.address_hash.to_hex_string();
+        self.post_held(&desc, &node, message, &options.propagation, &why_not_direct)
+            .await?;
+        Ok(SendOutcome {
+            id: message.id.clone(),
+            via: PeerVia::StoreAndForward,
+            departed,
+        })
+    }
+
+    /// Hands `message` for `desc` to `node`: the store-and-forward leg of a send no link
+    /// carried, `why_not_direct` saying why for the log.
+    async fn post_held(
+        &self,
+        desc: &DestinationDesc,
+        node: &PropagationNode,
+        message: &OutboundPeer,
+        options: &PropagationOptions,
+        why_not_direct: &str,
+    ) -> Result<(), SendError> {
         debug!(
-            "Mesh {kind} {id} to {dest8} could not be delivered over a link ({why_not_direct}); storing it with propagation node {}",
-            short(&node_hex)
+            "Mesh {} {} to {} could not be delivered over a link ({why_not_direct}); storing it with propagation node {}",
+            message.kind,
+            message.id,
+            short(&desc.address_hash.to_hex_string()),
+            short(&node.destination.address_hash.to_hex_string())
         );
         self.post_to_node(
             &desc.identity,
-            &node,
+            node,
             |origin| peer_lxmf_message(message, origin),
-            &options.propagation,
+            options,
         )
         .await
         .map_err(|err| match err {
@@ -2265,11 +2311,6 @@ impl MeshRuntime {
                 SendError::NotRunning
             }
             other => SendError::Propagation(other),
-        })?;
-        Ok(SendOutcome {
-            id: message.id.clone(),
-            via: PeerVia::StoreAndForward,
-            departed,
         })
     }
 
@@ -2335,20 +2376,34 @@ impl MeshRuntime {
         Some(recipients)
     }
 
-    /// Tells every trusted instance this node holds a path to that it is leaving the mesh:
-    /// one farewell bulletin each, over a link only, the whole fan-out cut off at
-    /// `FAREWELL_BUDGET` so a leave never waits longer on it. A peer the link does not reach
-    /// is told nothing, since a held farewell would arrive after this node's next announce,
-    /// and so is one that has said it left itself. No hook fires: the farewell is presence,
-    /// not a bulletin the owner sent.
+    /// Tells every trusted instance that it is leaving the mesh: one farewell bulletin
+    /// each, the whole fan-out cut off at `FAREWELL_BUDGET` so a leave never waits longer
+    /// on it. An instance this node holds a path to is sent it over a link, and handed to
+    /// the propagation node when the link fails as it would for any message; one without a
+    /// path is handed straight to the propagation node, with no path request waited on.
+    /// Nothing is retried, and an instance that has said it left itself is told nothing.
+    /// No hook fires: the farewell is presence, not a bulletin the owner sent.
     pub(crate) async fn send_farewell(&self) -> FarewellOutcome {
-        let Some(audience) = self.bulletin_audience().await else {
+        let Some(transport) = self.transport_handle().await else {
             return FarewellOutcome::default();
         };
-        let audience: Vec<PeerRecord> = audience
-            .into_iter()
-            .filter(|peer| peer.left_at.is_none())
-            .collect();
+        let trust = self.trust();
+        let mut audience = Vec::new();
+        for peer in self.peers().snapshot() {
+            if peer.left_at.is_some()
+                || trust
+                    .authorize(&peer.identity_hash, &peer.destination_hash)
+                    .decision
+                    != Decision::Allow
+            {
+                continue;
+            }
+            let Ok(hash) = AddressHash::new_from_hex_string(&peer.destination_hash) else {
+                continue;
+            };
+            let has_path = transport.has_path(&hash).await;
+            audience.push((peer, hash, has_path));
+        }
         if audience.is_empty() {
             return FarewellOutcome::default();
         }
@@ -2362,39 +2417,69 @@ impl MeshRuntime {
                 return FarewellOutcome::default();
             }
         };
+        // The link gets half the budget, so a failed one leaves the other half for the
+        // hand-off to the propagation node. The hand-off's own waits are cut to fit that
+        // half too: the default reject window alone is as long as the whole budget.
         let options = PeerSendOptions {
             request: RequestOptions {
-                request_timeout: FAREWELL_BUDGET,
-                link_timeout: FAREWELL_BUDGET,
+                request_timeout: FAREWELL_BUDGET / 2,
+                link_timeout: FAREWELL_BUDGET / 2,
                 path_requested: false,
                 foreground: false,
             },
-            propagation: PropagationOptions::default(),
-            store_and_forward: false,
+            propagation: PropagationOptions {
+                link_timeout: FAREWELL_BUDGET / 2,
+                transfer_timeout: FAREWELL_BUDGET / 2,
+                reject_window: FAREWELL_BUDGET / 4,
+                path_requested: false,
+            },
+            store_and_forward: true,
         };
-        let delivered = AtomicUsize::new(0);
-        let fan_out =
-            stream::iter(&audience).for_each_concurrent(FAREWELL_MAX_CONCURRENCY, |peer| {
-                let (delivered, message) = (&delivered, &message);
+        let (delivered, held) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let fan_out = stream::iter(&audience).for_each_concurrent(
+            FAREWELL_MAX_CONCURRENCY,
+            |(peer, hash, has_path)| {
+                let (delivered, held, message, transport) =
+                    (&delivered, &held, &message, &transport);
                 async move {
-                    if self
-                        .send_peer_inner(&peer.destination_hash, message, options)
-                        .await
-                        .is_ok()
-                    {
-                        delivered.fetch_add(1, Ordering::Relaxed);
-                    }
+                    let via = if *has_path {
+                        self.send_peer_inner(&peer.destination_hash, message, options)
+                            .await
+                            .ok()
+                            .map(|sent| sent.via)
+                    } else {
+                        let desc = match peer.verified_destination() {
+                            Some(desc) => Some(desc),
+                            None => transport.destination_desc(hash).await,
+                        };
+                        self.hold_farewell(desc, message, &options.propagation)
+                            .await
+                    };
+                    match via {
+                        Some(PeerVia::Direct) => delivered.fetch_add(1, Ordering::Relaxed),
+                        Some(PeerVia::StoreAndForward) => held.fetch_add(1, Ordering::Relaxed),
+                        None => 0,
+                    };
                 }
-            });
+            },
+        );
         let finished = tokio::time::timeout(FAREWELL_BUDGET, fan_out).await.is_ok();
+        let (delivered, held) = (
+            delivered.load(Ordering::Relaxed),
+            held.load(Ordering::Relaxed),
+        );
         let outcome = FarewellOutcome {
             audience: audience.len(),
-            delivered: delivered.load(Ordering::Relaxed),
+            delivered,
+            held,
+            skipped: audience.len() - delivered - held,
         };
         debug!(
-            "Mesh farewell {} acknowledged by {} of {} trusted peer(s){}",
+            "Mesh farewell {} delivered to {}, held for {}, skipped {} of {} trusted peer(s){}",
             message.id,
             outcome.delivered,
+            outcome.held,
+            outcome.skipped,
             outcome.audience,
             if finished {
                 ""
@@ -2403,6 +2488,23 @@ impl MeshRuntime {
             }
         );
         outcome
+    }
+
+    /// Hands a farewell for an instance without a path to the propagation node on file,
+    /// addressed by `desc`, the instance's stored key or the description the transport
+    /// still holds. `None` when there is neither, no node is filed, or the post failed.
+    async fn hold_farewell(
+        &self,
+        desc: Option<DestinationDesc>,
+        message: &OutboundPeer,
+        options: &PropagationOptions,
+    ) -> Option<PeerVia> {
+        let desc = desc?;
+        let node = self.propagation_nodes().select_for_posting().ok()?;
+        self.post_held(&desc, &node, message, options, "no path is known")
+            .await
+            .ok()?;
+        Some(PeerVia::StoreAndForward)
     }
 
     async fn report_send(
@@ -2791,16 +2893,19 @@ pub(crate) struct PeerAdmission<'a> {
     pub via: PeerVia,
 }
 
-/// A farewell admitted on a link: the instance at `source_destination` said it is leaving
-/// the mesh. `received_at` is this node's clock when the request arrived, taken before
-/// anything else ran, so an announce the instance sent afterwards is never mistaken for
-/// one it sent before.
+/// A farewell admitted on a link or fetched from a propagation node: the instance at
+/// `source_destination` said it is leaving the mesh. `received_at` is this node's clock
+/// when it arrived, taken before anything else ran. `sent_at` is the time the sender
+/// stamped on it, never later than `received_at`, so a sender whose clock runs ahead
+/// cannot post-date its mark.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Farewell {
     pub source_identity: String,
     pub source_destination: String,
     pub message_id: String,
+    pub sent_at: SystemTime,
     pub received_at: SystemTime,
+    pub via: PeerVia,
 }
 
 /// Where inbound peer messages land. Held weakly by the handler and the runtime: the
@@ -2887,7 +2992,9 @@ impl Handler for PeerMessageHandler {
                 source_identity: identity_hex,
                 source_destination: destination_hex,
                 message_id: body.id,
+                sent_at: farewell_sent_at(body.timestamp, received_at),
                 received_at,
+                via: PeerVia::Direct,
             });
             return reply;
         }
@@ -3053,19 +3160,27 @@ impl InboundSink for PeerRouting<'_> {
             debug!("Propagated {kind} from {id8} dropped: instance {dest8} is not trusted");
             return;
         }
-        if is_farewell(kind, raw.fields.as_ref()) {
-            debug!(
-                "Propagated farewell {} from {id8} (instance {dest8}) dropped: a farewell counts only over a link, since a held one can be older than the instance's latest announce",
-                raw.message_id
-            );
-            return;
-        }
         let Some(surface) = &self.surface else {
             debug!(
                 "Propagated {kind} from {id8} (instance {dest8}) dropped: the session slot is gone"
             );
             return;
         };
+        if is_farewell(kind, raw.fields.as_ref()) {
+            debug!(
+                "Propagated farewell {} from {id8} (instance {dest8}) taken as presence",
+                raw.message_id
+            );
+            surface.note_farewell(Farewell {
+                source_identity: raw.source_identity,
+                source_destination: raw.source_destination,
+                message_id: raw.message_id,
+                sent_at: farewell_sent_at(Some(message.timestamp), now),
+                received_at: now,
+                via: PeerVia::StoreAndForward,
+            });
+            return;
+        }
         let admission = PeerAdmission {
             source_identity: &message.source_identity_hash,
             source_destination: &raw.source_destination,
@@ -5571,12 +5686,12 @@ mod tests {
         );
     }
 
-    /// A farewell from a trusted instance that arrives store-and-forward is dropped: it is
-    /// neither filed, nor offered for admission, nor noted as a departure, since a held
-    /// farewell may be older than the instance's latest announce. A plain bulletin on the
-    /// same route still lands.
+    /// A farewell from a trusted instance that arrives store-and-forward is taken as
+    /// presence: it is noted as a departure at the time it was stamped, through the
+    /// store-and-forward route, and is neither filed nor offered for admission. A plain
+    /// bulletin on the same route still lands.
     #[test]
-    fn a_stored_farewell_is_dropped_and_a_plain_stored_bulletin_still_lands() {
+    fn a_stored_farewell_is_taken_as_presence_and_a_plain_stored_bulletin_still_lands() {
         let identity = hash_of("id-stored-farewell");
         let origin = OriginName([5u8; NAME_HASH_LEN]);
         let destination = destination_address(
@@ -5607,8 +5722,20 @@ mod tests {
 
         assert!(surface.delivered.lock().is_empty());
         assert!(surface.filed.lock().is_empty());
-        assert!(surface.farewells.lock().is_empty());
-        assert_eq!(surface.offered(), 0, "a dropped farewell is not counted");
+        let farewells = surface.farewells.lock().clone();
+        assert_eq!(farewells.len(), 1, "{farewells:?}");
+        assert_eq!(farewells[0].source_destination, destination);
+        assert_eq!(farewells[0].message_id, farewell.id);
+        assert_eq!(farewells[0].via, PeerVia::StoreAndForward);
+        assert_eq!(
+            farewells[0].sent_at,
+            UNIX_EPOCH + Duration::from_secs(1_700_000_000)
+        );
+        assert_eq!(
+            surface.offered(),
+            0,
+            "a farewell is not offered for admission"
+        );
         assert!(inner.messages.lock().is_empty());
 
         let bulletin = peer_lxmf_message(&outbound(PeerKind::Bulletin, "news"), &origin);
