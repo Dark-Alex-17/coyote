@@ -20,7 +20,7 @@ expression: frame
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"Ctrl+G = tasks  Ctrl+X = todo                                                   "
+"Alt+T = tasks  Ctrl+X = todo                                                    "
 "────────────────────────────────────────────────────────────────────────────────"
 ".info tools                                                                     "
 "                                                                                "

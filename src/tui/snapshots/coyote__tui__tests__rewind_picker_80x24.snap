@@ -16,7 +16,7 @@ expression: frame
 "an answer                                                                       "
 "                                                                                "
 "                                                                                "
-"Ctrl+G = tasks  Ctrl+X = todo                                                   "
+"Alt+T = tasks  Ctrl+X = todo                                                    "
 "Rewind to (Enter = choose  Esc = close)                                         "
 "third question                                                                  "
 "second          +1 line                                                         "

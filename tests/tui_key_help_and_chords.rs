@@ -2,16 +2,16 @@
 //! from the keys contract rather than the dispatcher: no function key does
 //! anything (F1-F12 on the empty composer open no panel, no roster and no
 //! key help, and type nothing); `.keys` opens the key help, which lists the
-//! Ctrl chords and no function key on any page, scrolls with PageDown, and
+//! chords and no function key on any page, scrolls with PageDown, and
 //! closes with `q`, `?`, Ctrl+C and Ctrl+D as well as Esc; `/keys` opens
 //! it under `command_prefix: slash`, and `?` opens it from vi normal mode;
-//! Ctrl+G closes the roster it opened, and `?` with the roster open does
+//! Alt+T closes the roster it opened, and `?` with the roster open does
 //! not open the key help; Ctrl+X opens the todo panel without eating the
 //! composer's text, and Ctrl+E is still the composer's end of line; the
 //! plain REPL does not know `.keys`. F1-F12 also leave the roster, the key
 //! help and the pager as they are; `?` in the history search band opens no
-//! help; under a Select modal Ctrl+X shows the todo panel while Ctrl+G,
-//! `?` and the function keys do nothing; the palette does not offer
+//! help; under a Select modal Ctrl+X shows the todo panel while Alt+T,
+//! Ctrl+G, `?` and the function keys do nothing; the palette does not offer
 //! `.keys`. Each case runs the binary on a pseudo-terminal, so the file is
 //! unix-only, and the cases run one at a time.
 #![cfg(unix)]
@@ -185,7 +185,7 @@ fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_cl
         "paging never showed the help's last row:\n{all}"
     );
     for chord in [
-        "Ctrl+G", "Ctrl+X", "Ctrl+T", "Ctrl+L", "Ctrl+R", "Ctrl+O", "Ctrl+Z",
+        "Alt+T", "Ctrl+X", "Ctrl+T", "Ctrl+L", "Ctrl+R", "Ctrl+O", "Ctrl+Z",
     ] {
         assert!(
             all.contains(chord),
@@ -263,10 +263,10 @@ fn question_mark_in_vi_normal_mode_opens_the_key_help() {
 
 #[test]
 #[serial]
-fn ctrl_g_toggles_the_roster_and_question_mark_over_it_opens_no_help() {
+fn alt_t_toggles_the_roster_and_question_mark_over_it_opens_no_help() {
     let (_guard, mut pty) = boot("roster-toggle", "");
-    pty.send(CTRL_G).unwrap();
-    repainted_frame_showing(&mut pty, ROSTER_MARK, "Ctrl+G did not open the roster");
+    pty.send(ALT_T).unwrap();
+    repainted_frame_showing(&mut pty, ROSTER_MARK, "Alt+T did not open the roster");
 
     pty.send(b"?").unwrap();
     pty.read_for(Duration::from_millis(400));
@@ -276,12 +276,12 @@ fn ctrl_g_toggles_the_roster_and_question_mark_over_it_opens_no_help() {
         "? over the open roster opened the key help:\n{frame}"
     );
 
-    pty.send(CTRL_G).unwrap();
+    pty.send(ALT_T).unwrap();
     pty.read_for(Duration::from_millis(400));
     let frame = flipped_frame(&mut pty);
     assert!(
         !squeezed(&frame).contains(&squeezed(ROSTER_MARK)),
-        "a second Ctrl+G did not close the roster:\n{frame}"
+        "a second Alt+T did not close the roster:\n{frame}"
     );
     leave(pty);
 }
@@ -353,7 +353,7 @@ fn the_plain_repl_does_not_know_dot_keys() {
 
 // ---------------------------------------------------------------------
 // Function keys over the roster, the key help and the pager; `?` in a
-// band with an empty composer; Ctrl+G and Ctrl+X under a prompt modal;
+// band with an empty composer; Alt+T and Ctrl+X under a prompt modal;
 // the palette never offering `.keys`.
 // ---------------------------------------------------------------------
 
@@ -378,8 +378,8 @@ fn send_function_keys(pty: &mut Pty) {
 fn function_keys_leave_the_roster_the_key_help_and_the_pager_as_they_are() {
     let (_guard, mut pty) = boot("fkeys-over", "");
 
-    pty.send(CTRL_G).unwrap();
-    repainted_frame_showing(&mut pty, ROSTER_MARK, "Ctrl+G did not open the roster");
+    pty.send(ALT_T).unwrap();
+    repainted_frame_showing(&mut pty, ROSTER_MARK, "Alt+T did not open the roster");
     send_function_keys(&mut pty);
     let frame = flipped_frame(&mut pty);
     assert!(
@@ -449,11 +449,12 @@ fn question_mark_in_the_history_search_band_opens_no_help() {
 }
 
 /// Under a Select modal `?` and F1-F12 leave the modal up and open no key
-/// help, Ctrl+G opens no roster (the modal has the keyboard), and Ctrl+X
-/// still shows the todo panel beside the question.
+/// help, Alt+T opens no roster (the modal has the keyboard), the unbound
+/// Ctrl+G does nothing either, and Ctrl+X still shows the todo panel
+/// beside the question.
 #[test]
 #[serial]
-fn under_a_select_modal_ctrl_x_shows_the_todo_and_ctrl_g_and_question_mark_do_nothing() {
+fn under_a_select_modal_ctrl_x_shows_the_todo_and_alt_t_and_question_mark_do_nothing() {
     let dir = fresh_config_dir("modal-chords");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
@@ -467,13 +468,14 @@ fn under_a_select_modal_ctrl_x_shows_the_todo_and_ctrl_g_and_question_mark_do_no
 
     pty.send(b"?").unwrap();
     send_function_keys(&mut pty);
-    pty.send(CTRL_G).unwrap();
+    pty.send(ALT_T).unwrap();
+    pty.send(b"\x07").unwrap();
     pty.read_for(Duration::from_millis(400));
     let frame = flipped_frame(&mut pty);
     let flat = squeezed(&frame);
     assert!(
         flat.contains("Esc=cancel") && flat.contains("dry-embed-a"),
-        "?, an F-key or Ctrl+G closed the modal:\n{frame}"
+        "?, an F-key, Alt+T or Ctrl+G closed the modal:\n{frame}"
     );
     assert!(
         !flat.contains(&squeezed(HELP_MARK)),
@@ -481,7 +483,7 @@ fn under_a_select_modal_ctrl_x_shows_the_todo_and_ctrl_g_and_question_mark_do_no
     );
     assert!(
         !flat.contains(&squeezed(ROSTER_MARK)),
-        "Ctrl+G under the modal opened the roster:\n{frame}"
+        "Alt+T or Ctrl+G under the modal opened the roster:\n{frame}"
     );
 
     pty.send(CTRL_X).unwrap();

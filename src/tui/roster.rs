@@ -1,7 +1,7 @@
 //! The roster, which the UI calls tasks: one row per task the supervisor
 //! runs (spawned agents and background jobs) and one per question an agent
 //! is waiting on the user to answer, as a band over the composer on
-//! Ctrl+G. The rows are read every frame it is up from the supervisor and
+//! Alt+T. The rows are read every frame it is up from the supervisor and
 //! escalation queue the context held when it was last back in the UI's
 //! hands, so they follow a turn that is running.
 

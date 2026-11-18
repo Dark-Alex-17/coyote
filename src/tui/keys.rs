@@ -347,7 +347,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Edit the line in $VISUAL or $EDITOR, between turns",
         ),
         row(Composer, "Ctrl+T", "Open the pager on the whole transcript"),
-        row(Composer, "Ctrl+G", "Show or hide tasks (the roster)"),
+        row(Composer, "Alt+T", "Show or hide tasks (the roster)"),
         row(Composer, "?", "Show this help, on an empty composer"),
         row(
             Composer,
@@ -469,7 +469,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(Roster, "Ctrl+T", "Open the pager on the whole transcript"),
         row(
             Roster,
-            "Esc / Ctrl+C / Ctrl+D / Ctrl+G",
+            "Esc / Ctrl+C / Ctrl+D / Alt+T",
             "Close tasks (the roster)",
         ),
         row(ViNormal, "h / j / k / l", "Move the cursor"),
@@ -599,7 +599,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             }
         }
         None => match code {
-            KeyCode::Char('g') if ctrl => Action::ToggleRoster,
+            KeyCode::Char('t') if alt && !ctrl => Action::ToggleRoster,
             KeyCode::Char('t') if ctrl => Action::OpenPager,
             // A band is the innermost thing open, so the quit chords
             // close it first, as Esc does.
@@ -1763,10 +1763,11 @@ mod tests {
     }
 
     /// Ctrl+T opens the pager over an idle or busy composer, never under a
-    /// question; Ctrl+G toggles the roster the same way, and a text field
-    /// takes it as typing.
+    /// question; Alt+T toggles the roster the same way, and a text field
+    /// takes it as typing. Ctrl+G is bound to nothing: the text area it
+    /// falls through to ignores it.
     #[test]
-    fn ctrl_t_and_ctrl_g_open_the_pager_and_the_roster() {
+    fn ctrl_t_and_alt_t_open_the_pager_and_the_roster() {
         let running = KeyContext {
             turn_running: true,
             ..IDLE
@@ -1800,17 +1801,26 @@ mod tests {
             vi: Some(ViMode::Normal),
             ..typing
         };
+        let alt_t = press(KeyCode::Char('t'), KeyModifiers::ALT);
         let cases = [
             (ctrl('t'), IDLE, Action::OpenPager),
             (ctrl('t'), running, Action::OpenPager),
             (ctrl('t'), typing, Action::OpenPager),
             (ctrl('t'), roster, Action::OpenPager),
             (ctrl('t'), confirm, Action::Nothing),
-            (ctrl('g'), IDLE, Action::ToggleRoster),
-            (ctrl('g'), running, Action::ToggleRoster),
-            (ctrl('g'), typing, Action::ToggleRoster),
-            (ctrl('g'), vi_normal, Action::ToggleRoster),
-            (ctrl('g'), roster, Action::ToggleRoster),
+            (alt_t, IDLE, Action::ToggleRoster),
+            (alt_t, running, Action::ToggleRoster),
+            (alt_t, typing, Action::ToggleRoster),
+            (alt_t, vi_normal, Action::ToggleRoster),
+            (alt_t, roster, Action::ToggleRoster),
+            (alt_t, confirm, Action::Nothing),
+            (alt_t, select, Action::Nothing),
+            (alt_t, input, Action::ModalInput(alt_t)),
+            (ctrl('g'), IDLE, Action::ComposerInput(ctrl('g'))),
+            (ctrl('g'), running, Action::ComposerInput(ctrl('g'))),
+            (ctrl('g'), typing, Action::ComposerInput(ctrl('g'))),
+            (ctrl('g'), vi_normal, Action::ComposerInput(ctrl('g'))),
+            (ctrl('g'), roster, Action::Nothing),
             (ctrl('g'), confirm, Action::Nothing),
             (ctrl('g'), select, Action::Nothing),
             (ctrl('g'), input, Action::ModalInput(ctrl('g'))),
@@ -1916,6 +1926,11 @@ mod tests {
             (ctrl('l'), browse, Action::ScheduleFrame),
             (ctrl('x'), browse, Action::Nothing),
             (ctrl('g'), browse, Action::Nothing),
+            (
+                press(KeyCode::Char('t'), KeyModifiers::ALT),
+                browse,
+                Action::Nothing,
+            ),
             (plain(KeyCode::Char('/')), browse, Action::PagerFindOpen),
             (
                 plain(KeyCode::Char('n')),
@@ -2258,8 +2273,12 @@ mod tests {
             ),
             (
                 H::Composer,
-                "Ctrl+G",
-                vec![(ctrl('g'), IDLE, Action::ToggleRoster)],
+                "Alt+T",
+                vec![(
+                    press(KeyCode::Char('t'), KeyModifiers::ALT),
+                    IDLE,
+                    Action::ToggleRoster,
+                )],
             ),
             (
                 H::Composer,
@@ -2568,12 +2587,16 @@ mod tests {
             ),
             (
                 H::Roster,
-                "Esc / Ctrl+C / Ctrl+D / Ctrl+G",
+                "Esc / Ctrl+C / Ctrl+D / Alt+T",
                 vec![
                     (plain(KeyCode::Esc), ROSTER, Action::ClosePopup),
                     (ctrl('c'), RUNNING_ROSTER, Action::ClosePopup),
                     (ctrl('d'), ROSTER, Action::ClosePopup),
-                    (ctrl('g'), ROSTER, Action::ToggleRoster),
+                    (
+                        press(KeyCode::Char('t'), KeyModifiers::ALT),
+                        ROSTER,
+                        Action::ToggleRoster,
+                    ),
                 ],
             ),
             (
@@ -3309,6 +3332,7 @@ mod tests {
             (plain(KeyCode::Home), HELP),
             (ctrl('x'), HELP),
             (ctrl('g'), HELP),
+            (press(KeyCode::Char('t'), KeyModifiers::ALT), HELP),
             (ctrl('t'), HELP),
             (ctrl('j'), HELP),
         ];

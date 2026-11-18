@@ -6,7 +6,7 @@
 //! just another frame. A `!cmd` passthrough or an editor borrows the
 //! terminal: the loop leaves the screen and runs the job synchronously on
 //! its own thread, so nothing is drawn until the job returns.
-//! The roster (Ctrl+G) and the pager (Ctrl+T) act through a control context,
+//! The roster (Alt+T) and the pager (Ctrl+T) act through a control context,
 //! a fork of the context taken each time it comes back idle: it shares
 //! the supervisor, the escalation queue and the child session root with
 //! the context a turn has, so a task can be cancelled or a question
@@ -312,11 +312,11 @@ const TYPEAHEAD_LIMIT: usize = 50;
 const KEYS_COMMAND: &str = "keys";
 /// The status row between turns, naming the chords of the panels that
 /// nothing else on screen points to.
-const IDLE_STATUS: &str = "Ctrl+G = tasks  Ctrl+X = todo";
+const IDLE_STATUS: &str = "Alt+T = tasks  Ctrl+X = todo";
 /// The status row when `?` would open the key help. The key that lists
 /// the rest comes first, so a narrow frame clips the panel chords
 /// before it.
-const IDLE_STATUS_WITH_HELP: &str = "? = keys  Ctrl+G = tasks  Ctrl+X = todo";
+const IDLE_STATUS_WITH_HELP: &str = "? = keys  Alt+T = tasks  Ctrl+X = todo";
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const IDLE_HINT: Style = DIM.add_modifier(Modifier::ITALIC);
@@ -6970,7 +6970,7 @@ mod tests {
     #[test]
     fn the_roster_ticks_only_while_no_pager_covers_it() {
         let mut harness = Harness::standalone(80, 24);
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.render();
         harness.app.frame_drawn();
         assert!(harness.app.frames.due_at().is_some(), "no roster tick");
@@ -6979,6 +6979,16 @@ mod tests {
         harness.render();
         harness.app.frame_drawn();
         assert_eq!(harness.app.frames.due_at(), None);
+    }
+
+    /// Ctrl+G is bound to nothing: no roster, and the draft stays as typed.
+    #[test]
+    fn ctrl_g_neither_opens_the_roster_nor_types() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        assert!(!matches!(harness.app.view, View::Roster(_)));
+        assert_eq!(harness.app.composer_text(), "draft");
     }
 
     #[test]
@@ -7395,6 +7405,10 @@ mod tests {
 
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
     }
 
     fn narrate(harness: &mut Harness, call_id: &str, line: &str) {
@@ -10980,8 +10994,8 @@ mod tests {
                 .map(|entry| entry.split_once(" = ").expect(entry).0)
                 .collect()
         };
-        assert_eq!(chords(IDLE_STATUS), ["Ctrl+G", "Ctrl+X"]);
-        assert_eq!(chords(IDLE_STATUS_WITH_HELP), ["?", "Ctrl+G", "Ctrl+X"]);
+        assert_eq!(chords(IDLE_STATUS), ["Alt+T", "Ctrl+X"]);
+        assert_eq!(chords(IDLE_STATUS_WITH_HELP), ["?", "Alt+T", "Ctrl+X"]);
         for chord in chords(IDLE_STATUS_WITH_HELP) {
             assert!(
                 keys::KEY_HELP
@@ -11396,7 +11410,7 @@ mod tests {
             harness.app.sync_from_ctx(&mut ctx);
             harness.app.begin_turn("work on", false);
 
-            harness.app.handle_key(ctrl(KeyCode::Char('g')));
+            harness.app.handle_key(alt(KeyCode::Char('t')));
             let frame = harness.draw();
             assert!(frame.contains("agent-x7x"), "{frame}");
             assert!(frame.contains("job-x7x"), "{frame}");
@@ -11433,7 +11447,7 @@ mod tests {
             let mut harness = Harness::for_ctx(&ctx);
             harness.app.sync_from_ctx(&mut ctx);
 
-            harness.app.handle_key(ctrl(KeyCode::Char('g')));
+            harness.app.handle_key(alt(KeyCode::Char('t')));
             harness.draw();
             harness.press(KeyCode::Char('j'));
             let focused = |harness: &Harness| harness.app.focused_task().map(|task| task.id);
@@ -11477,7 +11491,7 @@ mod tests {
                 session_id: "stale-x7x".to_string(),
             });
 
-            harness.app.handle_key(ctrl(KeyCode::Char('g')));
+            harness.app.handle_key(alt(KeyCode::Char('t')));
             harness.draw();
             harness.press(KeyCode::Char('x'));
             let requests = harness.app.take_control_requests();
@@ -11559,7 +11573,7 @@ mod tests {
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
 
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         let frame = harness.draw();
         assert!(frame.contains("Which branch? x7x"), "{frame}");
         assert!(!frame.contains("[select]"), "{frame}");
@@ -11577,7 +11591,7 @@ mod tests {
         assert!(queue.has_pending(), "Esc answered the question");
         assert!(reply.try_recv().is_err());
 
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.draw();
         harness.press(KeyCode::Enter);
         harness.clock.advance(HOTKEY_IDLE);
@@ -11596,7 +11610,7 @@ mod tests {
         let mut reply = escalate(&queue, None);
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.draw();
         harness.press(KeyCode::Enter);
         assert_eq!(
@@ -11619,7 +11633,7 @@ mod tests {
         let reply = escalate(&queue, None);
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.draw();
         harness.press(KeyCode::Enter);
         drop(reply);
@@ -11666,7 +11680,7 @@ mod tests {
         });
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.draw();
         harness.press(KeyCode::Enter);
         assert!(matches!(
@@ -12280,7 +12294,7 @@ mod tests {
         let reply = escalate_as(&queue, "esc_p1d", "Which tag? p1d");
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.draw();
         harness.press(KeyCode::Enter);
         harness.draw();
@@ -12312,7 +12326,7 @@ mod tests {
         drop(dead);
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         let frame = harness.draw();
         assert!(frame.contains("Live asks l2l"), "{frame}");
         assert!(!frame.contains("d2d"), "{frame}");
@@ -12335,7 +12349,7 @@ mod tests {
         let mut harness = Harness::for_ctx(&ctx);
         harness.app.sync_from_ctx(&mut ctx);
         let first = escalate_as(&queue, "esc_a3a", "First asks a3a");
-        harness.app.handle_key(ctrl(KeyCode::Char('g')));
+        harness.app.handle_key(alt(KeyCode::Char('t')));
         harness.draw();
         let mut second = escalate_as(&queue, "esc_b3b", "Second asks b3b");
         let frame = harness.draw();

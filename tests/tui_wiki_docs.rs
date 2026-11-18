@@ -737,7 +737,7 @@ fn key_scraper_reads_every_context_of_the_key_map() {
         ("Composer", "Shift+Enter"),
         ("Composer", "Alt+Enter"),
         ("Composer", "Ctrl+T"),
-        ("Composer", "Ctrl+G"),
+        ("Composer", "Alt+T"),
         ("Composer", "?"),
         ("Composer", "Shift+G"),
         ("Popup", "Shift+Tab"),

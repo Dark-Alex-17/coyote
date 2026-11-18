@@ -313,9 +313,9 @@ fn leaving_during_a_slow_roster_cancel_is_bounded_and_clean() {
     let _kill = KillOnDrop(pid);
     assert!(alive(pid), "the job died with the interrupted turn");
 
-    pty.send(CTRL_G).unwrap();
+    pty.send(ALT_T).unwrap();
     let roster =
-        repainted_frame_showing(&mut pty, "fixture_stubborn", "Ctrl+G did not list the job");
+        repainted_frame_showing(&mut pty, "fixture_stubborn", "Alt+T did not list the job");
     assert!(
         roster_band(&roster).contains("running"),
         "the job is not running on the roster:\n{roster}"

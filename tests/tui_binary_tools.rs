@@ -7,7 +7,7 @@
 //! question an agent with documents asks when it starts, and the `.rag`
 //! wizard and macro steps that reach those questions.
 //! After them: the Ctrl+T pager over a tool's whole output with its find
-//! and thread picker, the Ctrl+G roster cancelling a background job, and both
+//! and thread picker, the Alt+T roster cancelling a background job, and both
 //! with nothing to show, and the key help that `?` opens from the welcome
 //! screen's hint. The transcript printed when the UI leaves is checked in
 //! `tui_binary_exit.rs`.
@@ -2269,12 +2269,12 @@ impl Drop for Sleepers {
 }
 
 /// A job the model started in the background and the user left running
-/// by interrupting the turn shows on the Ctrl+G roster as running; `x` on its
+/// by interrupting the turn shows on the Alt+T roster as running; `x` on its
 /// row cancels it, so its process goes away and the row stops saying
 /// running.
 #[test]
 #[serial]
-fn ctrl_g_lists_a_job_left_running_and_x_cancels_it() {
+fn alt_t_lists_a_job_left_running_and_x_cancels_it() {
     let dir = fresh_config_dir("roster-cancel");
     let _guard = TempDirGuard(dir.clone());
     let job_pid = dir.join("job.pid");
@@ -2313,8 +2313,8 @@ fn ctrl_g_lists_a_job_left_running_and_x_cancels_it() {
         .unwrap();
     assert!(alive(pid), "the job died with the interrupted turn");
 
-    pty.send(CTRL_G).unwrap();
-    let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "Ctrl+G did not list the job");
+    pty.send(ALT_T).unwrap();
+    let roster = repainted_frame_showing(&mut pty, "fixture_sleep", "Alt+T did not list the job");
     let band = roster_band(&roster);
     assert!(
         band.contains("fixture_sleep") && band.contains("running"),
@@ -2415,22 +2415,22 @@ fn ctrl_t_and_every_pager_key_on_an_empty_transcript_keep_the_ui_up() {
     assert_tty_restored(&transcript);
 }
 
-/// Ctrl+G with no task and no question shows the empty roster; `x` and `o`
+/// Alt+T with no task and no question shows the empty roster; `x` and `o`
 /// on it change nothing, Esc closes it and the composer takes keys.
 #[test]
 #[serial]
-fn ctrl_g_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
+fn alt_t_with_nothing_running_shows_the_empty_roster_and_x_and_o_are_harmless() {
     let dir = fresh_config_dir("roster-empty");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
-    pty.send(CTRL_G).unwrap();
+    pty.send(ALT_T).unwrap();
     repainted_frame_showing(
         &mut pty,
         "(no tasks and no questions)",
-        "Ctrl+G did not show the empty roster",
+        "Alt+T did not show the empty roster",
     );
     pty.send(b"x").unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -2480,7 +2480,7 @@ fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
         "the welcome does not name the key help",
     );
     assert!(
-        squeezed(&welcome).contains(&squeezed("? = keys  Ctrl+G = tasks  Ctrl+X = todo")),
+        squeezed(&welcome).contains(&squeezed("? = keys  Alt+T = tasks  Ctrl+X = todo")),
         "the status row does not name the help key and the panel chords:\n{welcome}"
     );
     pty.send(b"?").unwrap();
@@ -2508,7 +2508,7 @@ fn question_mark_opens_the_key_help_the_welcome_names_and_esc_closes_it() {
     );
     let typed = repainted_frame_showing(&mut pty, "why? h7k", "the draft is not on screen");
     assert!(
-        squeezed(&typed).contains(&squeezed("Ctrl+G = tasks  Ctrl+X = todo"))
+        squeezed(&typed).contains(&squeezed("Alt+T = tasks  Ctrl+X = todo"))
             && !squeezed(&typed).contains(&squeezed("? = keys")),
         "the status row still offers ? over a draft:\n{typed}"
     );

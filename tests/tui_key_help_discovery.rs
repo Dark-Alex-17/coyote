@@ -1,5 +1,5 @@
 //! Real-process checks of how the TUI points at its keys: the idle status
-//! row names `? = keys  Ctrl+G = tasks  Ctrl+X = todo` and drops the `?`
+//! row names `? = keys  Alt+T = tasks  Ctrl+X = todo` and drops the `?`
 //! part once the composer holds text; the welcome card's key help line is
 //! spelled with the active prefix and names no function key; `?` on a
 //! non-empty composer types a `?`; `.keys foo` and a two-line `.keys`
@@ -22,8 +22,8 @@ use serial_test::serial;
 const HELP_MARK: &str = "Suspend to the shell";
 /// The roster's legend.
 const ROSTER_MARK: &str = "Esc = close";
-const IDLE_HINT: &str = "? = keys  Ctrl+G = tasks  Ctrl+X = todo";
-const TEXT_HINT: &str = "Ctrl+G = tasks  Ctrl+X = todo";
+const IDLE_HINT: &str = "? = keys  Alt+T = tasks  Ctrl+X = todo";
+const TEXT_HINT: &str = "Alt+T = tasks  Ctrl+X = todo";
 
 fn boot(scenario: &str, extra: &str) -> (TempDirGuard, Pty) {
     let dir = fresh_config_dir(scenario);
