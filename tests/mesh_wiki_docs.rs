@@ -8069,8 +8069,7 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
         "Mesh-Configuration.md does not say {needle:?}"
     );
     let commands = flat(&read(wiki.join("Mesh-Commands.md")));
-    let idle =
-        "(duplicates, discarded, deferred and left-on-the-node counts are added when non-zero)";
+    let idle = "(presence, duplicates, discarded, deferred and left-on-the-node counts are added when non-zero";
     assert!(
         commands.contains(idle),
         "Mesh-Commands.md does not say the idle sync line counts what it left: {idle}"
