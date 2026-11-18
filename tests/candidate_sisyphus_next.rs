@@ -3418,10 +3418,12 @@ const FROZEN_COUNTER_SEEDS: &[&str] = &[
     "pr_review_started_at",
     "pr_review_watch_polls",
     "publish_retries",
+    "push_fix_retries",
     "reask_rounds",
     "rejected_cap_resets",
     "rejected_rounds",
     "review_rounds",
+    "review_rounds_posted",
     "sizing_extensions",
     "sizing_rounds",
     "strikeout_rounds",
@@ -6137,5 +6139,217 @@ fn assess_states_a_sizing_verdict_and_no_longer_defaults_unsure_sizing_up() {
     assert!(
         plan.contains("{{sizing_note}}"),
         "plan_subtasks must read the sizing note"
+    );
+}
+
+/// The research fan-out: `research_dispatch` routes to a pass-through script
+/// whose static `next` starts its explore map and the librarian map in one
+/// super-step, and all three maps join at `synthesize_context`. No map caps
+/// its concurrency below the engine default.
+#[test]
+fn research_fanouts_start_explore_and_librarian_maps_together() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let nodes = &shipped["nodes"];
+    for (fanout, explore) in [
+        ("research_fanout_team", "explore_fanout_team"),
+        ("research_fanout_solo", "explore_fanout_solo"),
+    ] {
+        let node = &nodes[fanout];
+        assert_eq!(node["type"].as_str(), Some("script"), "{fanout}");
+        let next: Vec<&str> = node["next"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("{fanout} must fan out with a next list: {node:?}"))
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(next, [explore, "librarian_fanout"], "{fanout}");
+    }
+    for map in [
+        "explore_fanout_team",
+        "explore_fanout_solo",
+        "librarian_fanout",
+    ] {
+        assert_eq!(nodes[map]["type"].as_str(), Some("map"), "{map}");
+        assert_eq!(
+            nodes[map]["next"].as_str(),
+            Some("synthesize_context"),
+            "{map}"
+        );
+        assert!(
+            nodes[map].get("max_concurrency").is_none(),
+            "{map} keeps the engine's default concurrency"
+        );
+    }
+}
+
+/// One run of the lifted research fan-out on the real binary (which
+/// `run_coder` hands the coder the floor `render_coder_prompt` computes, so
+/// a later coder round can reuse a test baseline from an earlier commit.
+#[test]
+fn run_coder_passes_the_baseline_floor_to_the_coder() {
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let node = &shipped["nodes"]["run_coder"];
+    assert_eq!(
+        node["inputs"]["baseline_floor"].as_str(),
+        Some("{{coder_baseline_floor}}"),
+        "{node:?}"
+    );
+    assert_eq!(
+        shipped["initial_state"]["coder_baseline_floor"].as_str(),
+        Some("")
+    );
+}
+
+/// One run of the lifted research fan-out on the real binary (which
+/// validates the graph first): the solo pass-through, the shipped explore
+/// and librarian maps with their shipped fault scripts, and stub lanes in
+/// place of the agents. One explore slice dies and falls back to its fault
+/// finding; the librarian lane's finding is unaffected, the branch-local
+/// `finding` writes stay inside the maps, and `synthesize_context` runs once
+/// with both collected lists.
+#[test]
+fn a_dead_explore_slice_leaves_the_parallel_librarian_lane_intact() {
+    let Some(_python) = python3() else { return };
+    let text = fs::read_to_string(candidate_dir().join("graph.yaml")).unwrap();
+    let shipped: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+    let scratch = scratch_dir("researchfanout");
+    let dir = scratch.0.clone();
+    write_dry_run_config(&dir);
+
+    let agents = dir.join("agents");
+    copy_tree(&agents_dir().join(".shared"), &agents.join(".shared"));
+    let agent = agents.join("probe-research");
+    copy_tree(&candidate_dir().join("scripts"), &agent.join("scripts"));
+    let dump = dir.join("dump.json");
+    let visits = dir.join("synthesize-visits.txt");
+    let state_reader = "import json, os, sys\n\
+                        sys.dont_write_bytecode = True\n\
+                        path = os.environ.get('GRAPH_STATE_FILE')\n\
+                        state = json.load(open(path)) if path else json.loads(os.environ.get('GRAPH_STATE', '{}'))\n";
+    fs::write(
+        agent.join("scripts").join("probe_slice.py"),
+        format!(
+            "{state_reader}if state.get('slice') == 'dies':\n    sys.exit('probe: slice died')\n\
+             print(json.dumps({{'finding': 'explore ' + state['slice']}}))\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        agent.join("scripts").join("probe_question.py"),
+        format!(
+            "{state_reader}print(json.dumps({{'finding': 'librarian ' + state['question']}}))\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        agent.join("scripts").join("probe_synthesize.py"),
+        format!(
+            "{state_reader}open({:?}, 'a').write('visit\\n')\n\
+             keys = ('explore_findings', 'librarian_findings', 'finding')\n\
+             open({:?}, 'w').write(json.dumps({{k: state.get(k) for k in keys}}))\n\
+             print('{{}}')\n",
+            visits.display(),
+            dump.display()
+        ),
+    )
+    .unwrap();
+
+    let mut nodes = serde_yaml::Mapping::new();
+    for id in [
+        "research_fanout_solo",
+        "explore_fanout_solo",
+        "explore_fault",
+        "librarian_fanout",
+        "librarian_fault",
+    ] {
+        nodes.insert(id.into(), shipped["nodes"][id].clone());
+    }
+    for (id, script, fallback) in [
+        (
+            "explore_slice_solo",
+            "scripts/probe_slice.py",
+            "explore_fault",
+        ),
+        (
+            "librarian_question",
+            "scripts/probe_question.py",
+            "librarian_fault",
+        ),
+    ] {
+        let mut lane = serde_yaml::Mapping::new();
+        lane.insert("id".into(), id.into());
+        lane.insert("type".into(), "script".into());
+        lane.insert("script".into(), script.into());
+        lane.insert("fallback".into(), fallback.into());
+        nodes.insert(id.into(), serde_yaml::Value::Mapping(lane));
+    }
+    let mut synthesize = serde_yaml::Mapping::new();
+    synthesize.insert("id".into(), "synthesize_context".into());
+    synthesize.insert("type".into(), "script".into());
+    synthesize.insert("script".into(), "scripts/probe_synthesize.py".into());
+    synthesize.insert("next".into(), "done".into());
+    nodes.insert(
+        "synthesize_context".into(),
+        serde_yaml::Value::Mapping(synthesize),
+    );
+    end_nodes(&mut nodes);
+
+    let mut initial = serde_yaml::Mapping::new();
+    let list =
+        |items: &[&str]| serde_yaml::Value::Sequence(items.iter().map(|s| (*s).into()).collect());
+    initial.insert("explore_slices".into(), list(&["a", "dies"]));
+    initial.insert("librarian_questions".into(), list(&["q1"]));
+    initial.insert("explore_findings".into(), list(&[]));
+    initial.insert("librarian_findings".into(), list(&[]));
+    for key in [
+        "finding",
+        "last_script_error",
+        "current_task",
+        "project_dir",
+    ] {
+        initial.insert(key.into(), "".into());
+    }
+    let mut graph = serde_yaml::Mapping::new();
+    graph.insert("name".into(), "probe_research".into());
+    graph.insert("start".into(), "research_fanout_solo".into());
+    graph.insert("initial_state".into(), serde_yaml::Value::Mapping(initial));
+    graph.insert("nodes".into(), serde_yaml::Value::Mapping(nodes));
+    fs::write(
+        agent.join("graph.yaml"),
+        serde_yaml::to_string(&serde_yaml::Value::Mapping(graph)).unwrap(),
+    )
+    .unwrap();
+
+    let (dumped, output) = run_lifted_graph(&dir, "probe-research", &dump, "researchfanout");
+    let report = transcript(&output);
+    let explore: Vec<&str> = dumped["explore_findings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no explore_findings: {dumped}\n{report}"))
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(explore.len(), 2, "{dumped}\n{report}");
+    assert_eq!(explore[0], "explore a", "{dumped}");
+    assert!(
+        explore[1].starts_with("PIPELINE-FAULT: explore slice failed")
+            && explore[1].ends_with("slice: dies"),
+        "the dead slice falls back to its fault finding: {dumped}"
+    );
+    assert_eq!(
+        dumped["librarian_findings"],
+        json!(["librarian q1"]),
+        "{dumped}\n{report}"
+    );
+    assert_eq!(
+        dumped["finding"],
+        json!(""),
+        "the lanes' finding writes stay inside their maps: {dumped}"
+    );
+    assert_eq!(
+        fs::read_to_string(&visits).unwrap(),
+        "visit\n",
+        "synthesize_context runs once after both maps: {report}"
     );
 }

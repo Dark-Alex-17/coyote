@@ -1361,8 +1361,13 @@ def research_dispatch(state):
     u["explore_slices"] = slices
     u["librarian_questions"] = [q for q in as_list(u.get("librarian_questions", state.get("librarian_questions")))
                                if isinstance(q, str) and q.strip()]
-    u["_next"] = "explore_fanout_team" if truthy(state.get("team_mode")) and len(slices) > 1 else "explore_fanout_solo"
+    u["_next"] = "research_fanout_team" if truthy(state.get("team_mode")) and len(slices) > 1 else "research_fanout_solo"
     return u
+
+
+def research_fanout(state):
+    """Writes nothing and names no `_next`: the node's static fan-out starts the explore and librarian maps together."""
+    return {}
 
 
 def explore_fault(state):
@@ -2497,6 +2502,7 @@ def apply_answer(state):
             u["_next"] = "ci_poll"
         elif a == "fix" and not stop:
             u["fix_source"] = "ci"
+            u["ci_fix_active"] = True
             u["_next"] = "compose_fix"
         elif _watch_started(state):
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
@@ -2788,6 +2794,8 @@ def render_coder_prompt(state):
                   fix, "", "### Your previous result", tail(state.get("coder_result") or "", 4000)]
     prompt = "\n".join(parts)
     u["coder_prompt"] = prompt
+    # While carried failures are pending, an earlier record would list them as failures that were already there.
+    u["coder_baseline_floor"] = "" if _carried(state) else state.get("run_base_sha") or state.get("base_sha") or ""
     write_artifact(state.get("run_dir", ""), f"coder-prompt-{as_int(state.get('fix_round'))}.md", prompt)
     u["_next"] = "check_inbox_pre" if truthy(state.get("parallel_mode")) else "run_coder"
     return u
@@ -4239,11 +4247,11 @@ def pr_gate(state):
                          "text": _review_update_text(state, pending)}
         u["_next"] = "git_ops"
         return u
-    if _review_mode(state) and truthy(state.get("ci_owner")) and truthy(state.get("flip_ready")):
+    if (_review_mode(state) and truthy(state.get("ci_owner")) and truthy(state.get("flip_ready"))) or _ci_fix_push(state):
         u["git_task"] = {"kind": "push_fix", "return_to": "ci_gate", "commit": True, "push": True,
                          "open_pr": False, "draft": False, "flip_ready": False,
-                         "text": f"Commit the CI fix and push the CURRENT branch (the PR head of {_pr_label(state)}). "
-                                 "Do NOT open a PR and do NOT change draft state."}
+                         "text": _push_fix_text(state)}
+        u["push_fix_retries"] = 0
         u["_next"] = "git_ops"
         return u
     asks = _publish_asks(state)
@@ -4280,6 +4288,33 @@ def _publish_asks(state):
             "new_branch": truthy(actions.get("new_branch")) and not truthy(state.get("parallel_mode"))}
 
 
+def _ci_fix_push(state):
+    """A CI fix round on the PR this run published and watches: it only needs a push to that PR's head. The flag
+    outlives the gauntlet or observability rounds inside the fix, which overwrite fix_source."""
+    return (truthy(state.get("ci_fix_active")) and truthy(state.get("ci_owner")) and truthy(state.get("pr_published"))
+            and bool(str(state.get("pr_ref") or "").strip()))
+
+
+def _push_fix_text(state):
+    rounds = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict)]
+    unposted = rounds[as_int(state.get("review_rounds_posted")):]
+    checks = _ci_failing_checks(state)
+    text = (f"Commit the CI fix and push the CURRENT branch (the PR head of {_pr_label(state)}). "
+            "Do NOT open a PR and do NOT change draft state. Leave the PR description alone.")
+    if unposted:
+        text += (" Post one '## Review round N @ <full head SHA>' comment for each review round the PR does not carry "
+                 "yet: " + ", ".join(f"round {r.get('round')} @ {r.get('head') or '(unknown head)'}" for r in unposted)
+                 + ".")
+    text += (" Then post ONE '## Update @ <full head SHA>' comment naming the CI failure this push fixes: "
+             + (", ".join(checks) if checks else "the failing CI checks") + ".")
+    return text
+
+
+def _retry_text(what, failed, guard):
+    return (f"The {what} check after your last round failed. Fix exactly these, then report again:\n"
+            + "\n".join(f"- {n}: {d}" for n, _, d in failed) + "\n\n" + guard)
+
+
 def _review_update_text(state, pending):
     fixed = [f"- {_item_ref(p)}: {p.get('text', '')}" for p in pending if p.get("action") == "fix"]
     skipped = [f"- {_item_ref(p)}: {p.get('reason', '')}" for p in pending if p.get("action") != "fix"]
@@ -4314,6 +4349,25 @@ def ci_gate(state):
         u["_next"] = "pr_review_resolve"
         return u
     if task.get("kind") == "push_fix":
+        rows = _push_fix_checks(state)
+        failed = [r for r in rows if not r[1]]
+        tries = as_int(state.get("push_fix_retries"))
+        if failed and tries < RERUN_ONCE:
+            u["push_fix_retries"] = tries + 1
+            u["git_task"] = {**task, "text": _retry_text("push", failed, "do not open a PR; do not change draft state; "
+                                                                         "do not post the comments again")}
+            ledger(state, u, f"push_fix: check failed ({', '.join(n for n, _, _ in failed)}) -> one more git_ops round")
+            u["_next"] = "git_ops"
+            return u
+        if failed:
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"CI fix push check failed: {n}: {d}" for n, _, d in failed]
+            ledger(state, u, f"push_fix: check still failing after {tries} retry ({', '.join(n for n, _, _ in failed)}); "
+                             "recorded as follow-ups, the CI watch goes on")
+        else:
+            ledger(state, u, f"push_fix: every check passed ({', '.join(n for n, _, _ in rows)})")
+            u["review_rounds_posted"] = len([r for r in as_list(state.get("round_heads")) if isinstance(r, dict)])
+        u["ci_fix_active"] = False
         _reset_ci_watch(u)
         u["ci_rerun_ids"] = []
         u["_next"] = "ci_poll"
@@ -4326,16 +4380,15 @@ def ci_gate(state):
         u["_next"] = "final_report"
         return u
     if task.get("kind") == "publish":
+        u["ci_fix_active"] = False
         rows = _publish_checks(state)
         failed = [r for r in rows if not r[1]]
         tries = as_int(state.get("publish_retries"))
         if failed and tries < RERUN_ONCE:
             u["publish_retries"] = tries + 1
             # the first round already branched and commented, so the retry names only what is still wrong
-            u["git_task"] = {**task, "text": "The publish check after your last round failed. Fix exactly these, then "
-                                             "report again:\n" + "\n".join(f"- {n}: {d}" for n, _, d in failed)
-                                             + "\n\ndo not create another branch; do not post the review-round "
-                                               "comments again"}
+            u["git_task"] = {**task, "text": _retry_text("publish", failed, "do not create another branch; do not post "
+                                                                            "the review-round comments again")}
             ledger(state, u, f"publish: check failed ({', '.join(n for n, _, _ in failed)}) -> one more git_ops round")
             u["_next"] = "git_ops"
             return u
@@ -4347,6 +4400,9 @@ def ci_gate(state):
                              "recorded as follow-ups, the run goes on")
         elif rows:
             ledger(state, u, f"publish: every check passed ({', '.join(n for n, _, _ in rows)})")
+            # a later CI fix on this PR then goes out as a plain push that posts only the rounds after these
+            u["pr_published"] = bool(task.get("open_pr"))
+            u["review_rounds_posted"] = len([r for r in as_list(state.get("round_heads")) if isinstance(r, dict)])
     owns = task.get("open_pr") and not truthy(state.get("delegated"))
     u["ci_owner"] = bool(owns)
     linked = owns and re.search(r"github\.com/[^\s]+/pull/\d+|#\d+", state.get("git_report") or "")
@@ -4391,14 +4447,7 @@ def _publish_checks(state):
     branch = git_out(root, "branch", "--show-current", default="")
     rows = []
     if asks["commit"]:
-        code, err, listing = _uncommitted_paths(state, root)
-        if code:
-            detail = f"git status failed: {err}"
-        elif listing:
-            detail = "uncommitted: " + listing
-        else:
-            detail = "nothing left uncommitted"
-        rows.append(("clean worktree", code == 0 and not listing, detail))
+        rows.append(_clean_worktree_row(state, root))
     if asks["new_branch"]:
         start = str(state.get("start_branch") or "")
         default = git_out(root, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", default="")
@@ -4407,10 +4456,7 @@ def _publish_checks(state):
         rows.append(("new branch", ok, f"current {branch or '(detached HEAD)'}, run started on {start or '(unknown)'}, "
                                        f"remote default {default or '(unknown)'}"))
     if asks["push"]:
-        upstream = git_out(root, "rev-parse", "--verify", "--quiet", "@{upstream}", default="")
-        head = git_out(root, "rev-parse", "HEAD", default="")
-        rows.append(("pushed", bool(upstream) and upstream == head,
-                     f"upstream {upstream or '(none)'}, HEAD {head or '(none)'}"))
+        rows.append(_pushed_row(root))
     if asks["open_pr"]:
         pr = _pr_view(state)
         problems = ["gh pr view failed"] if pr is None else [
@@ -4420,6 +4466,35 @@ def _publish_checks(state):
                              ("empty body", not str(pr.get("body") or "").strip())) if bad]
         rows.append(("draft PR", not problems, "; ".join(problems) or f"{pr.get('url') or 'PR'} is a draft on {branch}"))
     return rows
+
+
+def _clean_worktree_row(state, root):
+    code, err, listing = _uncommitted_paths(state, root)
+    if code:
+        detail = f"git status failed: {err}"
+    elif listing:
+        detail = "uncommitted: " + listing
+    else:
+        detail = "nothing left uncommitted"
+    return "clean worktree", code == 0 and not listing, detail
+
+
+def _pushed_row(root):
+    upstream = git_out(root, "rev-parse", "--verify", "--quiet", "@{upstream}", default="")
+    head = git_out(root, "rev-parse", "HEAD", default="")
+    return "pushed", bool(upstream) and upstream == head, f"upstream {upstream or '(none)'}, HEAD {head or '(none)'}"
+
+
+def _push_fix_checks(state):
+    """(name, ok, detail) rows for the state a push_fix task must leave: everything committed, HEAD pushed, and the
+    run's PR still headed by the current branch."""
+    root = state.get("git_root") or state.get("project_dir") or "."
+    branch = git_out(root, "branch", "--show-current", default="")
+    pr = _pr_view(state, str(state.get("pr_ref") or "").strip())
+    head = None if pr is None else pr.get("headRefName")
+    return [_clean_worktree_row(state, root), _pushed_row(root),
+            ("PR head", bool(branch) and head == branch,
+             "the PR could not be read" if pr is None else f"PR head {head!r}, current branch {branch or '(detached HEAD)'!r}")]
 
 
 def _pr_view(state, ref=""):
@@ -4927,12 +5002,18 @@ def _rerun_failed(root, run_id):
         return False
 
 
+def _ci_failing_checks(state):
+    """The failing check names: the diagnosis's list, else the names the last CI read reported."""
+    return ([c for c in as_list(state.get("failing_checks")) if isinstance(c, str)]
+            or [n for n, _ in as_list(state.get("ci_failing"))])
+
+
 def ci_apply(state):
     u = {}
     harvest_anomalies(state, u, "ci_diagnose")
     note_script_error(state, u, "ci_diagnose")
     verdict = state.get("ci_verdict") or "unsure"
-    checks = [c for c in as_list(state.get("failing_checks")) if isinstance(c, str)] or [n for n, _ in as_list(state.get("ci_failing"))]
+    checks = _ci_failing_checks(state)
     reruns = dict(as_dict(state.get("ci_reruns")))
     if verdict == "flake":
         exhausted = [c for c in checks if as_int(reruns.get(c)) >= CI_FLAKE_RERUNS]
@@ -4978,6 +5059,7 @@ def ci_apply(state):
                 [option("Resume with one more coder fix round"), option("Leave the PR in draft and report", recommended=True)],
                 evidence=tail(state.get("ci_evidence", ""), 2000)))
         u["fix_source"] = "ci"
+        u["ci_fix_active"] = True
         u["_next"] = "compose_fix"
         return u
     if verdict == "infra":
@@ -5626,7 +5708,8 @@ GATES = {
     "intake": intake, "assess_fault": assess_fault, "route_intent": route_intent,
     "draft_route": draft_route, "draft_fault": draft_fault,
     "record_subtasks": record_subtasks, "next_subtask": next_subtask,
-    "research_dispatch": research_dispatch, "explore_fault": explore_fault, "librarian_fault": librarian_fault,
+    "research_dispatch": research_dispatch, "research_fanout": research_fanout,
+    "explore_fault": explore_fault, "librarian_fault": librarian_fault,
     "write_context_pack": write_context_pack, "oracle_gate": oracle_gate, "merge_oracle": merge_oracle,
     "design_gate": design_gate, "escalate_gate": escalate_gate, "ladder_route": ladder_route,
     "consult_route": consult_route, "ask_dispatch": ask_dispatch, "ask_owner_poll": ask_owner_poll,

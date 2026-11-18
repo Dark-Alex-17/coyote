@@ -49,7 +49,8 @@ BOUNDED = {
     "interpret_route": "one interpretation per question (reply_interpreted), then parse_answer's B14 re-ask",
     "choice_park": "DISCUSSION_PARKS_MAX parks per question (kind + question text), then a matched re-ask",
     "ci_poll": "B15 elapsed-time limit + CI_MAX_ROUNDS per watch + poll fails<=3; POLL_VISIT_BUDGET per run in every mode",
-    "ci_gate": "publish_retries<=RERUN_ONCE git_ops re-runs after a failed publish check",
+    "ci_gate": "publish_retries<=RERUN_ONCE git_ops re-runs after a failed publish check / push_fix_retries<=RERUN_ONCE "
+               "after a failed CI fix push check",
     "ci_apply": "B15 flake reruns<=2 per check + fix strikes<=3",
     "pr_review_poll": "B16 REVIEW_MAX_POLLS per run + REVIEW_WALL_SECS + poll fails<=3",
     "pr_review_route": "B16 REVIEW_MAX_ROUNDS fix rounds + REVIEW_CI_POLL_BUDGET",

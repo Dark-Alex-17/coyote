@@ -46,6 +46,13 @@ subdirectory project_dir names, added with core.hooksPath pointed at an
 empty directory so the user's git hooks do not run. The worktree is removed
 on normal exit. A record that timed out here gets a not-run baseline without
 a base run, so it does not spend the shared deadline.
+A base run that completed (neither timed out nor killed by a signal) is saved
+with its full output and exit code as `adversary-<key>.json` under
+`git rev-parse --git-path coyote-baselines`, keyed by the diff base's tree,
+the subdirectory, the command, the lock prefix and the per-command timeout.
+A later run with the same key compares against the saved output instead of
+running the command again, and the worktree is only added when some red
+command has no saved run. An unreadable record counts as absent.
 The two full outputs are compared with the coder agent's own gate_lib.sh
 helpers through bash, by the rule its verify_tests gate applies: the failure
 is pre-existing only when the base run is red (and did not time out) with
@@ -84,6 +91,7 @@ declaration error and fails closed the same way as a malformed
 `verification_commands`: PIPELINE-FAULT, nothing executed.
 """
 
+import hashlib
 import json
 import os
 import shlex
@@ -110,6 +118,7 @@ GATE_LIB = os.path.join(
 )
 GIT_CLEANUP_TIMEOUT_SECS = 20
 GATE_CALL_MIN_TIMEOUT_SECS = 10
+BASE_RUN_FORMAT = 1
 
 
 def acquire_stack_lock():
@@ -387,8 +396,79 @@ def remove_worktree(top, path):
     cleanup_git(top, ["worktree", "prune"])
 
 
+# A saved base run freezes one sample of a flaky base: later rounds compare
+# against that sample instead of drawing a new one, the same trade-off the
+# coder's stored test baseline makes.
+def base_run_store(proj, diff_base, subdir, prefix, deadline):
+    """(records dir, base tree, subdir, prefix) for saved diff-base runs, or None when git
+    cannot name them."""
+    try:
+        tree = git_text(["rev-parse", f"{diff_base}^{{tree}}"], proj, left(deadline))
+        records = git_text(["rev-parse", "--git-path", "coyote-baselines"], proj, left(deadline))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return None
+    if not tree or not records:
+        return None
+    return os.path.join(proj, records), tree, subdir, prefix
+
+
+def base_run_path(saved_runs, cmd):
+    records, tree, subdir, prefix = saved_runs
+    parts = [BASE_RUN_FORMAT, tree, subdir, cmd, prefix, PER_COMMAND_TIMEOUT_SECS]
+    key = hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(records, f"adversary-{key}.json")
+
+
+def load_base_run(saved_runs, cmd):
+    """The saved (exit, output) of `cmd` at the diff base; None when absent or unreadable."""
+    if saved_runs is None:
+        return None
+    try:
+        with open(base_run_path(saved_runs, cmd), encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(saved, dict) or saved.get("version") != BASE_RUN_FORMAT:
+        return None
+    code, output = saved.get("exit"), saved.get("output")
+    if type(code) is not int or not isinstance(output, str):
+        return None
+    return code, output
+
+
+def save_base_run(saved_runs, cmd, base, base_path, deadline):
+    """Keep a completed base run for later rounds. A timed-out or signal-killed run is
+    never kept, and an existing record is never replaced: the first writer wins."""
+    code = base["exit"]
+    if saved_runs is None or code < 0 or code >= 128:
+        return
+    try:
+        if gate_killed(base_path, left(deadline)):
+            return
+        with open(base_path, encoding="utf-8", newline="") as f:
+            output = f.read()
+    except (GateUnavailable, OSError):
+        return
+    records = saved_runs[0]
+    record = {"version": BASE_RUN_FORMAT, "cmd": cmd, "exit": code, "output": output}
+    try:
+        os.makedirs(records, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=records, prefix=".adversary-")
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        os.link(tmp, base_run_path(saved_runs, cmd))
+    except OSError:
+        pass
+    finally:
+        os.unlink(tmp)
+
+
 def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
-    """Give every red record a `baseline` from one run at the diff base."""
+    """Give every red record a `baseline` from one run at the diff base, reusing a saved
+    run of the same command on the same base tree instead of running it again."""
     reds = [i for i, r in enumerate(results) if not r.get("skipped") and r.get("exit") != 0]
     for i in reds:
         if results[i]["exit"] == -1:
@@ -413,6 +493,33 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
         for i in reds:
             results[i]["baseline"] = not_run(f"the project's git repository could not be read: {e}")
         return
+
+    def compare(i, base, base_path):
+        try:
+            results[i]["baseline"] = classify(results[i], outputs[i], base, base_path, deadline)
+        except GateUnavailable as e:
+            results[i]["baseline"] = dict(not_run(f"baseline comparison unavailable: {e}"), exit=base["exit"])
+
+    saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
+    misses = []
+    for i in reds:
+        saved = load_base_run(saved_runs, results[i]["cmd"])
+        if saved is None:
+            misses.append(i)
+            continue
+        if left(deadline) <= 0:
+            results[i]["baseline"] = not_run("the deadline was spent before this command's baseline run")
+            continue
+        base_path = os.path.join(work, f"base-{i}.txt")
+        try:
+            with open(base_path, "w", encoding="utf-8", newline="") as f:
+                f.write(saved[1])
+        except OSError as e:
+            results[i]["baseline"] = not_run(f"the saved diff-base run could not be written out: {e}")
+            continue
+        compare(i, {"exit": saved[0]}, base_path)
+    if not misses:
+        return
     tree = os.path.join(work, "base")
     hooks = os.path.join(work, "no-hooks")
     try:
@@ -424,11 +531,11 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
                 left(deadline),
             )
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            for i in reds:
+            for i in misses:
                 results[i]["baseline"] = not_run(f"the diff-base worktree could not be created: {e}")
             return
         base_proj = os.path.join(tree, subdir)
-        for i in reds:
+        for i in misses:
             remaining = left(deadline)
             if remaining <= 0:
                 results[i]["baseline"] = not_run("the deadline was spent before this command's baseline run")
@@ -441,12 +548,8 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
             if base["exit"] == -1:
                 results[i]["baseline"] = not_run("the command timed out on the diff base")
                 continue
-            try:
-                results[i]["baseline"] = classify(results[i], outputs[i], base, base_path, deadline)
-            except GateUnavailable as e:
-                results[i]["baseline"] = dict(
-                    not_run(f"baseline comparison unavailable: {e}"), exit=base["exit"]
-                )
+            save_base_run(saved_runs, results[i]["cmd"], base, base_path, deadline)
+            compare(i, base, base_path)
     finally:
         remove_worktree(top, tree)
 

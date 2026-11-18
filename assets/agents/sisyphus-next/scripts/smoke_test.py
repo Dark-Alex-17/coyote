@@ -303,11 +303,11 @@ check("next_subtask: trivial skips research -> compose_brief", u["_next"] == "co
 
 # ---------------------------------------------------------------- research
 u = gates.research_dispatch(base_state(explore_slices=["a", "b"], team_mode=True))
-check("research_dispatch: team mode -> team map", u["_next"] == "explore_fanout_team")
+check("research_dispatch: team mode -> team fan-out", u["_next"] == "research_fanout_team")
 u = gates.research_dispatch(base_state(explore_slices=["a"], team_mode=True))
-check("research_dispatch: single slice never a team", u["_next"] == "explore_fanout_solo")
+check("research_dispatch: single slice never a team", u["_next"] == "research_fanout_solo")
 u = gates.research_dispatch(base_state(explore_slices=[], last_script_error="llm died"))
-check("research_dispatch: fail-open degraded single slice", u["_next"] == "explore_fanout_solo" and len(u["explore_slices"]) == 1 and u["last_script_error"] == "")
+check("research_dispatch: fail-open degraded single slice", u["_next"] == "research_fanout_solo" and len(u["explore_slices"]) == 1 and u["last_script_error"] == "")
 u = gates.research_dispatch(base_state(explore_slices=[], last_node_output="llm node 'plan_research' failed: rate limit"))
 check("research_dispatch: llm fallback reason (last_node_output) ledgered + reset", u["last_node_output"] == "" and any("rate limit" in d for d in u["decisions"]))
 u = gates.research_dispatch(base_state(explore_slices=["a"], last_node_output='{"explore_slices": ["a"]}'))
@@ -2449,10 +2449,13 @@ _t = u["git_task"]
 check("pr_tracking review: pr_gate after the flip with no review items -> push_fix, never a publish",
       u["_next"] == "git_ops" and _t["kind"] == "push_fix" and _t["return_to"] == "ci_gate" and _t["commit"] and _t["push"]
       and not _t["open_pr"] and not _t["draft"] and not _t["flip_ready"] and "DRAFT PR" not in _t["text"]
-      and _t["text"] == "Commit the CI fix and push the CURRENT branch (the PR head of PR #7). Do NOT open a PR and do NOT change draft state.")
+      and _t["text"] == "Commit the CI fix and push the CURRENT branch (the PR head of PR #7). Do NOT open a PR and do NOT "
+                        "change draft state. Leave the PR description alone. Then post ONE '## Update @ <full head SHA>' "
+                        "comment naming the CI failure this push fixes: the failing CI checks.")
 check("pr_tracking review: pr_gate before the flip -> the normal publish task",
       gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, flip_ready=False))["git_task"]["kind"] == "publish")
-u = gates.ci_gate(rs(git_task=_t, ci_polls=9, ci_poll_fails=2, ci_started_at=1))
+# the fixture repo has no upstream, so the push check fails; with its retry spent the watch starts anyway
+u = gates.ci_gate(rs(git_task=_t, ci_polls=9, ci_poll_fails=2, ci_started_at=1, push_fix_retries=RERUN_ONCE))
 check("pr_tracking review: ci_gate push_fix -> ci_poll with reset budgets",
       u["_next"] == "ci_poll" and u["ci_polls"] == 0 and u["ci_poll_fails"] == 0 and u["ci_started_at"] >= _now and "ci_owner" not in u)
 _SEAM_LOG = os.path.join(TMP, "run-seams.txt")
@@ -3167,7 +3170,8 @@ check("pr_tracking ci: ci_route and ci_apply timeouts cover CI_LOG_RUNS_MAX GH_C
 _stale = {"ci_status": "red", "ci_failing": [["build", ""]]}
 _starts = {
     "pr_review_resolve": gates.pr_review_resolve(rs(pr_review_pending=[], **_stale)),
-    "ci_gate push_fix": gates.ci_gate(rs(git_task={"kind": "push_fix", "return_to": "ci_gate"}, **_stale)),
+    "ci_gate push_fix": gates.ci_gate(rs(git_task={"kind": "push_fix", "return_to": "ci_gate"},
+                                         push_fix_retries=RERUN_ONCE, **_stale)),
     "the first watch start": gates.ci_gate(base_state(
         pr_tracking="review", git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True}, delegated=False,
         git_report="opened https://github.com/o/r/pull/7", **_stale)),
@@ -5210,7 +5214,8 @@ _ue = gates.escalate_gate(base_state(escalation=[{"kind": "clarify"}], escalatio
 check("escalation fault: escalate_gate faults a list-typed escalation before the ladder or the ask",
       _ue["_next"] == "end_blocked" and _ue.get("failure_reason", "").startswith("escalate_gate:")
       and "standing_rulings" not in _ue, _ue)
-_wp = gates.ci_gate(base_state(git_task={"kind": "push_fix"}, ci_green_by="inconclusive", ci_rerun_ids=["41"]))
+_wp = gates.ci_gate(base_state(git_task={"kind": "push_fix"}, ci_green_by="inconclusive", ci_rerun_ids=["41"],
+                               push_fix_retries=RERUN_ONCE))
 _ws = gates.ci_gate(base_state(git_task={"kind": "publish", "return_to": "ci_gate", "open_pr": True},
                                git_report="opened https://github.com/o/r/pull/9", ci_green_by="no_checks",
                                ci_rerun_ids=["41"]))
@@ -5224,6 +5229,142 @@ check("report: before publishing the CI line says not yet watched, never that no
 u = gates.apply_answer(base_state(escalation=_rc, last_answer=_RC_CONTINUE, rejected_cap_resets=1))
 _ns = gates.next_subtask(base_state(subtasks=_hsubs, subtask_index=0, rejected_cap_resets=2, run_dir=_edir))
 check("rejected cap: continue counts a reset and next_subtask clears the count", u.get("rejected_cap_resets") == 2 and _ns.get("rejected_cap_resets") == 0, (u.get("rejected_cap_resets"), _ns))
+
+# ---------------------------------------------------------------- research fan-out
+with open(os.path.join(HERE, "..", "graph.yaml")) as fh:
+    _graph_text = fh.read()
+
+
+def node_block(node):
+    return _graph_text.split(f"\n  {node}:\n")[1].split("\n\n")[0]
+
+
+check("research fan-out: the pass-through gate writes nothing and leaves routing to its static next",
+      gates.research_fanout(base_state(explore_slices=["a", "b"], team_mode=True)) == {})
+check("research fan-out: each pass-through starts its explore map and the librarian map in one super-step",
+      "\n    next: [explore_fanout_team, librarian_fanout]" in node_block("research_fanout_team")
+      and "\n    next: [explore_fanout_solo, librarian_fanout]" in node_block("research_fanout_solo"))
+check("research fan-out: both explore maps and the librarian map join at synthesize_context",
+      all("\n    next: synthesize_context" in node_block(n)
+          for n in ("explore_fanout_team", "explore_fanout_solo", "librarian_fanout")))
+
+# ---------------------------------------------------------------- CI fix push on the run's own PR
+_heads = [{"round": 1, "head": "a" * 40}, {"round": 2, "head": "b" * 40}]
+_ci_fix = dict(git_actions={"commit": True, "push": True, "open_pr": True}, fix_source="ci", ci_fix_active=True,
+               ci_owner=True, pr_ref="9",
+               pr_published=True, review_rounds_posted=1, round_heads=_heads,
+               ci_failing=[["build", "https://github.com/o/r/actions/runs/1/job/2"]])
+u = gates.pr_gate(base_state(**_ci_fix))
+_t = u.get("git_task") or {}
+check("ci fix push: a CI fix round on the PR this run published -> push_fix in ci mode, never a publish",
+      u.get("_next") == "git_ops" and _t.get("kind") == "push_fix" and _t.get("return_to") == "ci_gate"
+      and _t.get("commit") and _t.get("push") and not _t.get("open_pr") and not _t.get("draft")
+      and not _t.get("flip_ready") and u.get("push_fix_retries") == 0, u)
+_txt = _t.get("text", "")
+check("ci fix push: the task posts only the review rounds not yet on the PR and one update naming the fixed check",
+      f"round 2 @ {'b' * 40}" in _txt and "round 1 @" not in _txt
+      and "'## Update @ <full head SHA>' comment naming the CI failure this push fixes: build." in _txt
+      and "Do NOT open a PR and do NOT change draft state. Leave the PR description alone." in _txt
+      and "DRAFT PR" not in _txt and "new feature branch" not in _txt, _txt)
+u = gates.pr_gate(base_state(**{**_ci_fix, "pr_tracking": "review", "flip_ready": False}))
+check("ci fix push: review mode before the flip sends the same push_fix", u["git_task"]["kind"] == "push_fix", u)
+for _k, _v in (("pr_published", False), ("ci_fix_active", False), ("ci_owner", False), ("pr_ref", "")):
+    u = gates.pr_gate(base_state(**{**_ci_fix, _k: _v}))
+    check(f"ci fix push: {_k}={_v!r} keeps the full publish task", u["git_task"]["kind"] == "publish", u["git_task"])
+u = gates.pr_gate(rs(git_actions={"commit": True, "push": True, "open_pr": True}, pr_review_pending=[],
+                     round_heads=[{"round": 1, "head": "c" * 40}], review_rounds_posted=0))
+check("ci fix push: the review-mode push_fix after the flip also asks for the review rounds not yet posted",
+      f"round 1 @ {'c' * 40}" in u["git_task"]["text"], u["git_task"])
+
+_DRAFT_ON_FEAT = ("echo '{\"url\": \"https://github.com/o/r/pull/9\", \"isDraft\": true, "
+                  "\"headRefName\": \"feat/void-invoices\", \"body\": \"Voids invoices.\"}'")
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _DRAFT_ON_FEAT
+u = gates.ci_gate(dict(pub, round_heads=_heads))
+check("ci fix push: a publish whose checks all pass records the PR as published with every review round posted",
+      u.get("pr_published") is True and u.get("review_rounds_posted") == 2 and u.get("_next") == "ci_poll", u)
+_pf = {"kind": "push_fix", "return_to": "ci_gate", "commit": True, "push": True, "open_pr": False,
+       "text": "Commit the CI fix and push the CURRENT branch."}
+_pfs = base_state(project_dir=PUB_REPO, git_root=PUB_REPO, git_task=_pf, ci_owner=True, pr_ref="9", round_heads=_heads,
+                  review_rounds_posted=1, ci_polls=9, ci_poll_fails=2)
+u = gates.ci_gate(_pfs)
+check("ci fix push: clean tree, upstream at HEAD and the PR on the current branch -> ci_poll with every round posted",
+      u.get("_next") == "ci_poll" and u.get("review_rounds_posted") == 2 and u.get("ci_polls") == 0
+      and u.get("ci_poll_fails") == 0 and not u.get("follow_ups")
+      and "push_fix: every check passed (clean worktree, pushed, PR head)" in u.get("decisions", []), u)
+open(os.path.join(PUB_REPO, "ci-fix.txt"), "w").write("unpushed fix\n")
+u = gates.ci_gate(base_state(**{**pub, "git_task": {"kind": "publish", "return_to": "ci_gate", "open_pr": True},
+                                "round_heads": _heads, "publish_retries": 1}))
+check("ci fix push: a publish whose checks still fail records no published PR", "pr_published" not in u, u)
+u = gates.ci_gate(_pfs)
+_retry = str(_lib.as_dict(u.get("git_task")).get("text") or "")
+check("ci fix push: a dirty tree after the push -> exactly one more git_ops round naming only the failed check",
+      u.get("_next") == "git_ops" and u.get("push_fix_retries") == 1 and "- clean worktree:" in _retry
+      and "ci-fix.txt" in _retry and "- pushed:" not in _retry and "- PR head:" not in _retry
+      and _retry.endswith("do not open a PR; do not change draft state; do not post the comments again")
+      and "ci_polls" not in u and "review_rounds_posted" not in u, u)
+u = gates.ci_gate(dict(_pfs, push_fix_retries=RERUN_ONCE))
+check("ci fix push: the check failing again -> a follow-up and the CI watch with reset budgets",
+      u.get("_next") == "ci_poll" and u.get("ci_polls") == 0
+      and any(f.startswith("CI fix push check failed: clean worktree: uncommitted:") for f in u.get("follow_ups", [])), u)
+os.unlink(os.path.join(PUB_REPO, "ci-fix.txt"))
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = ("echo '{\"url\": \"u\", \"isDraft\": false, \"headRefName\": \"main\", "
+                                         "\"body\": \"b\"}'")
+u = gates.ci_gate(_pfs)
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
+_ok = u.get("_next") == "git_ops" and "- PR head: PR head 'main', current branch 'feat/void-invoices'" in str(_lib.as_dict(u.get("git_task")).get("text"))
+check("ci fix push: a PR headed by another branch fails the PR head check", _ok, u)
+
+check("ci fix push: a push whose check still fails after the retry leaves review_rounds_posted alone",
+      "review_rounds_posted" not in gates.ci_gate(dict(_pfs, push_fix_retries=RERUN_ONCE)))
+
+# ---------------------------------------------------------------- CI fix flag across the fix cycle
+_cs = base_state(**{**_ci_fix, "ci_fix_active": False, "ci_verdict": "real", "ci_fix_strikes": 0,
+                    "failing_checks": ["build"], "intent": "implementation", "spec_text": "AC"})
+u = gates.ci_apply(_cs)
+check("ci fix flag: a real CI verdict starts a CI fix and marks it active",
+      u.get("_next") == "compose_fix" and u.get("ci_fix_active") is True, u)
+_cs.update(u)
+u = gates.apply_answer(base_state(escalation={"kind": "ci_exhausted"}, last_answer="Resume with one more coder fix round"))
+check("ci fix flag: the owner's fix answer on a CI escalation marks the CI fix active",
+      u.get("_next") == "compose_fix" and u.get("ci_fix_active") is True, u)
+u = gates.pr_gate(base_state(**{**_cs, "fix_source": "review"}))
+check("ci fix flag: a gauntlet BLOCKED inside the CI fix (fix_source review) still sends push_fix",
+      (u.get("git_task") or {}).get("kind") == "push_fix", u.get("git_task"))
+u = gates.pr_gate(base_state(**{**_cs, "fix_source": "observability"}))
+check("ci fix flag: an observability coder round inside the CI fix still sends push_fix",
+      (u.get("git_task") or {}).get("kind") == "push_fix", u.get("git_task"))
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _DRAFT_ON_FEAT
+check("ci fix flag: ci_gate after the push_fix clears the flag",
+      gates.ci_gate(dict(_pfs, ci_fix_active=True)).get("ci_fix_active") is False)
+os.environ["SISYPHUS_GH_PR_VIEW_CMD"] = _PR_VIEW_DEFAULT
+
+# ---------------------------------------------------------------- a CI fix still passes the gauntlet and observability
+u = gates.compose_fix(_cs)
+check("ci fix route: compose_fix hands the CI fix to the coder", u.get("_next") == "render_coder_prompt", u)
+_cs.update(u)
+u = gates.review_gate(_cs)
+check("ci fix route: the coder's CI fix goes to the gauntlet", u.get("_next") == "build_gauntlet_prompt", u)
+_cs.update(u)
+u = gates.build_gauntlet_prompt(_cs)
+check("ci fix route: build_gauntlet_prompt spawns a review round for the CI fix",
+      "_next" not in u and len(u.get("round_heads") or []) == len(_heads) + 1 and bool(u.get("gauntlet_prompt"))
+      and "\n    next: run_gauntlet" in node_block("build_gauntlet_prompt"), u)
+_cs.update(u)
+u = gates.route_gauntlet(dict(_cs, gauntlet_result=passed))
+check("ci fix route: a passing gauntlet goes to observability_gate, not pr_gate", u.get("_next") == "observability_gate", u)
+_cs.update(u)
+u = gates.observability_gate(_cs)
+check("ci fix route: observability_gate runs before pr_gate", u.get("_next") in ("observability_pass", "whetstone_gate"), u)
+
+# ---------------------------------------------------------------- coder baseline floor
+_rcp = dict(coder_brief={"goal": "g"}, run_base_sha="r" * 40, base_sha="b" * 40)
+check("baseline floor: run_base_sha wins", gates.render_coder_prompt(base_state(**_rcp))["coder_baseline_floor"] == "r" * 40)
+check("baseline floor: base_sha when the run base is unknown",
+      gates.render_coder_prompt(base_state(**{**_rcp, "run_base_sha": ""}))["coder_baseline_floor"] == "b" * 40)
+check("baseline floor: empty while carried test failures are pending",
+      gates.render_coder_prompt(base_state(**_rcp, carried_failures=[{"paths": ["t/x"]}]))["coder_baseline_floor"] == "")
+_floor_input = "\n      baseline_floor: '{{coder_baseline_floor}}'"
+check("baseline floor: run_coder passes it as the coder's baseline_floor", _floor_input in node_block("run_coder"))
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")
