@@ -478,7 +478,9 @@ mod tests {
 
     /// A drain thread the scheduler has not run yet is waited for:
     /// output written before `finish` lands in the cell even when the
-    /// first read comes after the quiet gap would have expired.
+    /// first read comes after the quiet gap would have expired. The delay
+    /// is twice the gap, which proves the point, and stays well inside
+    /// `SETTLE_LIMIT` so a loaded host still reads before the bound.
     #[test]
     #[serial]
     fn finish_waits_for_a_drain_thread_that_has_not_read_yet() {
@@ -488,7 +490,7 @@ mod tests {
             move |text| {
                 let _ = tx.send(text);
             },
-            QUIET_GAP * 3,
+            QUIET_GAP * 2,
         )
         .unwrap();
         write_fd1(b"slow-drain-r6x\n");
