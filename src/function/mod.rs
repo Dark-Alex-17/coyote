@@ -2661,18 +2661,16 @@ fn merge_attachment_report(value: Value, attached_images: Vec<Value>, notes: Vec
     Value::Object(object)
 }
 
-/// The active agent a script tool runs under. `script` marks a function from
-/// the agent's own functions script, which runs as the agent-named binary with
-/// the function name as its first argument; any other tool runs as itself.
 #[derive(Debug, Clone)]
 pub struct ToolAgent {
     pub name: String,
+    /// A function of the agent's own tools script: it runs as the agent-named
+    /// binary with the function name as its first argument.
     pub script: bool,
 }
 
-/// The directories a script tool run prepends to PATH. Inside an agent only
-/// its own bin dir, which holds its functions script and the global tools it
-/// declares in `global_tools`; outside an agent the global functions bin.
+/// Inside an agent only its own bin dir, so a tool missing from its
+/// `global_tools` cannot be reached through PATH.
 pub(crate) fn tool_bin_dirs(agent: Option<&ToolAgent>) -> Vec<PathBuf> {
     match agent {
         Some(agent) => {
@@ -2683,32 +2681,26 @@ pub(crate) fn tool_bin_dirs(agent: Option<&ToolAgent>) -> Vec<PathBuf> {
     }
 }
 
-/// The refusal for a script tool the active agent does not declare. Skills
-/// never widen an agent's `global_tools`, so such a tool is not runnable.
 pub(crate) fn undeclared_tool_error(tool: &str, agent: &str) -> String {
     format!(
         "Tool '{tool}' is not enabled for agent '{agent}'. To use it, add {tool} to {agent}'s global_tools in the agent definition."
     )
 }
 
-/// The refusal for an MCP server the active agent does not declare. Skills
-/// never widen an agent's `mcp_servers`, so its tools are not usable.
 pub(crate) fn undeclared_mcp_server_error(server: &str, agent: &str) -> String {
     format!(
         "MCP server '{server}' is not enabled for agent '{agent}'. To use it, add {server} to {agent}'s mcp_servers in the agent definition."
     )
 }
 
-/// The MCP server an MCP meta function (`mcp_invoke_<server>` and its
-/// siblings) addresses.
 pub(crate) fn mcp_meta_server(name: &str) -> Option<&str> {
     MCP_META_FUNCTION_PREFIXES
         .iter()
         .find_map(|prefix| name.strip_prefix(prefix)?.strip_prefix('_'))
 }
 
-/// A spawn failure naming the tool, and for a missing executable the
-/// directories that were searched ahead of the inherited PATH.
+/// spawn() reports NotFound both for a missing executable and for a script
+/// whose shebang interpreter is missing, so the message cannot tell which.
 pub(crate) fn spawn_error(
     display_name: &str,
     executable: &str,
@@ -2724,7 +2716,7 @@ pub(crate) fn spawn_error(
         .collect::<Vec<_>>()
         .join(", ");
     anyhow!(
-        "Unable to run {display_name}: no '{executable}' executable in [{searched}] or PATH, {err}"
+        "Unable to run {display_name}: '{executable}' failed to start; the executable or its interpreter may be missing (searched [{searched}] and PATH), {err}"
     )
 }
 
@@ -5885,11 +5877,8 @@ mod tests {
         assert_eq!(output.attachments[0].source, png.display().to_string());
     }
 
-    /// A global tool `grantedglob` built into both the global functions bin
-    /// and the agent's bin dir, so a refusal cannot be a missing binary, and
-    /// offered through the shared tool scope the way a skill grants it. With
-    /// `declared` the agent lists it in its own tools. The guards keep the
-    /// config dir and environment in place.
+    /// `grantedglob` is built into both bin dirs, so a refusal can never be a
+    /// missing binary.
     #[cfg(unix)]
     fn skill_granted_tool_ctx(
         declared: bool,
@@ -5942,7 +5931,6 @@ mod tests {
         Some((ctx, (guard, functions_env)))
     }
 
-    /// Runs `grantedglob` through `eval_output`.
     #[cfg(unix)]
     fn eval_granted_tool(ctx: &mut RequestContext) -> ToolOutput {
         // A freshly written script can still be open for writing in a forked
@@ -5997,7 +5985,7 @@ mod tests {
         let message = spawn_error("fs_glob", "fs_glob", &dirs, &missing).to_string();
         assert!(
             message.starts_with(
-                "Unable to run fs_glob: no 'fs_glob' executable in [/agents/a/bin, /functions/bin] or PATH"
+                "Unable to run fs_glob: 'fs_glob' failed to start; the executable or its interpreter may be missing (searched [/agents/a/bin, /functions/bin] and PATH)"
             ),
             "{message}"
         );
@@ -6033,12 +6021,56 @@ mod tests {
 
         assert!(
             err.starts_with(&format!(
-                "Unable to run grantedmissing: no 'grantedmissing' executable in [{}] or PATH",
+                "Unable to run grantedmissing: 'grantedmissing' failed to start; the executable or its interpreter may be missing (searched [{}] and PATH)",
                 agent_bin.display()
             )),
             "{err}"
         );
         assert!(!err.contains("pattern"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_reports_a_missing_interpreter_as_a_failed_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("missing-interpreter-tool");
+        let _functions_env = crate::testing::EnvVarGuard::unset(get_env_name("functions_dir"));
+        let agent_name = "missing-interpreter-agent";
+        let agent_bin = paths::agent_bin_dir(agent_name);
+        fs::create_dir_all(&agent_bin).unwrap();
+        let tool = agent_bin.join("orphaned");
+        fs::write(&tool, "#!/nonexistent/interpreter\n").unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut attempts = 0;
+        let err = loop {
+            let err = run_llm_function(
+                "orphaned".into(),
+                vec!["{}".into()],
+                HashMap::new(),
+                Some(ToolAgent {
+                    name: agent_name.into(),
+                    script: false,
+                }),
+                None,
+                true,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            if !err.contains("Text file busy") || attempts >= 10 {
+                break err;
+            }
+            attempts += 1;
+            thread::sleep(Duration::from_millis(50));
+        };
+
+        assert!(
+            err.starts_with("Unable to run orphaned: 'orphaned' failed to start; the executable or its interpreter may be missing"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
