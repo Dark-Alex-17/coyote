@@ -272,6 +272,7 @@ STATE_KEYS = (
     "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions", "autonomous_digest",
     "decisions", "follow_ups", "parked", "escalation", "coder_result", "git_report",
     "ci_status", "ci_rerun_ids", "anomalies_log",
+    "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests", "probe_adoption",
 )
 
 

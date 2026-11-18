@@ -1966,7 +1966,8 @@ def _gauntlet_header(text):
 
 # The gauntlet writes its sections after the lane table in a fixed order:
 # `## Lane selection` (model-written lane reasons, free to carry a column-0
-# heading of their own), then `## Blockers`. A section is read only below the
+# heading of their own), then `## Blockers` and, last, the optional
+# `## Probe-written tests`. A section is read only below the
 # first `## Lane selection` heading after the table, from the LAST exact
 # heading of its title, so a look-alike inside the lane reasons sits above
 # the real one and never stands in for it.
@@ -1981,6 +1982,15 @@ def _gauntlet_section(header_lines, start, title):
             break
         body.append(line)
     return body, heads[-1] + 1
+
+
+def _sections_start(header):
+    header_lines = header.splitlines()
+    first = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
+    rows = len(_lane_rows(header))
+    start = first + rows if rows else 0
+    selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
+    return next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
 
 
 _GAUNTLET_VERDICT_RE = re.compile(r"^GAUNTLET:[ \t]*(PASS|BLOCKED)[ \t]*$", re.M)
@@ -2100,19 +2110,27 @@ def _parse_gauntlet(text, adversary_lane=False):
         blockers += [l.strip() for l in text.splitlines() if l.strip().startswith("debris: Implementation debris")]
     else:
         lanes = {lane: status for lane, (status, _) in _lane_cells(header).items()}
-        first = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
-        rows = len(_lane_rows(header))
-        start = first + rows if rows else 0
-        selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
-        start = next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
-        section, _ = _gauntlet_section(header_lines, start, "Blockers")
+        section, _ = _gauntlet_section(header_lines, _sections_start(header), "Blockers")
         blockers = [l[2:].strip() for l in section or [] if l.startswith(("- ", "* "))]
         # The gauntlet writes debris hits only into its Blockers section, so the
         # same line in a lane reason or a lane report is not a blocker.
         blockers += [l.rstrip() for l in section or [] if l.startswith("debris: Implementation debris")]
     plan_root = bool(re.search(r"(?i)plan (itself )?is the root cause|impossible or contradictory criterion|criterion (is|cannot be) (impossible|unverifiable)", text))
-    probe_files = re.findall(TEST_FILE_RE, text) if not adversary_lane and _probe_verdict(text) == "PASS" else []
+    probe_files = (re.findall(TEST_FILE_RE, _without_probe_section(text))
+                   if not adversary_lane and _probe_verdict(text) == "PASS" else [])
     return verdict, incomplete, lanes, blockers, plan_root, probe_files
+
+
+def _without_probe_section(text):
+    """The reply without the gauntlet's `## Probe-written tests` section, the last one of its header: the probe lane's
+    own report names the files this run adopts."""
+    header = _gauntlet_header(text)
+    lines = header.splitlines(keepends=True)
+    section, body_start = _gauntlet_section([l.rstrip("\r\n") for l in lines], _sections_start(header),
+                                            "Probe-written tests")
+    if section is None:
+        return text
+    return text[:sum(len(l) for l in lines[:body_start - 1])] + text[len(header):]
 
 
 CONFORMANCE_ONE_MORE = "One more fix round (state reason)"

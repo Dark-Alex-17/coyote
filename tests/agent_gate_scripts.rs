@@ -2703,20 +2703,48 @@ fn debt_scan_repo(dir: &Path) -> (PathBuf, String) {
 
 /// git in `repo` with the host's global and system config shut out and a
 /// fixed identity, so commits work on any machine. Returns trimmed stdout.
-#[cfg(unix)]
 fn scratch_git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
         .arg(repo)
         .args(["-c", "user.name=t", "-c", "user.email=t@t"])
         .args(["-c", "commit.gpgsign=false"])
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("spawn git");
+        .args(args);
+    let out = hermetic_git_env(&mut cmd).output().expect("spawn git");
     assert!(out.status.success(), "git {args:?}: {out:?}");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Variables that would point a scratch-repo git call, direct or made by a
+/// script, at the caller's own repository, or inject the caller's settings.
+const GIT_REPO_VARS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_SYSTEM",
+];
+
+/// `cmd` with the caller's repository variables removed and the host's global
+/// and system git config shut out.
+fn hermetic_git_env(cmd: &mut Command) -> &mut Command {
+    for key in GIT_REPO_VARS {
+        cmd.env_remove(key);
+    }
+    for (key, _) in env::vars_os() {
+        let name = key.to_string_lossy();
+        if name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_") {
+            cmd.env_remove(&key);
+        }
+    }
+    cmd.env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    )
+    .env("GIT_CONFIG_NOSYSTEM", "1")
 }
 
 /// Runs the engine-built sisyphus `debt_scan` tool with `args`. The tool
@@ -3522,6 +3550,173 @@ fn gauntlet_bookkeeping_note_names_the_configured_dirs_in_every_lane() {
         gauntlet["initial_state"]["bookkeeping_note"],
         serde_yaml::Value::from("")
     );
+}
+
+/// Runs one review-gauntlet script on `state` the way the engine does, its
+/// git calls kept off the caller's repository and config.
+fn gauntlet_script(script: &str, state: &Value, extra_env: &[(&str, &Path)]) -> Value {
+    let mut cmd = Command::new("python3");
+    cmd.arg(asset(&format!("review-gauntlet/scripts/{script}")))
+        .env("GRAPH_STATE", state.to_string())
+        .env_remove("GRAPH_STATE_FILE")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .envs(extra_env.iter().copied());
+    let (code, stdout, stderr) = run(hermetic_git_env(&mut cmd).output().expect("spawn python3"));
+    assert_eq!(code, 0, "{script}: stdout: {stdout}\nstderr: {stderr}");
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{script}: {e}: {stdout}"))
+}
+
+/// signals.py records the worktree tree before the lanes, and verdict_gate.py
+/// names what changed after them in a `## Probe-written tests` section last
+/// in the header when the probe lane ran: a bare path only for an added file
+/// the probe report names, `other:` for a file another lane wrote. With no
+/// probe lane, or nothing changed, the report is byte-identical to one
+/// without the key; a missing or bogus before-tree is `- unavailable:`. The
+/// scripts never move HEAD or stage anything.
+#[test]
+fn gauntlet_probe_written_tests_section_names_what_the_lanes_changed() {
+    if which::which("python3").is_err() || which::which("git").is_err() {
+        eprintln!("skipping: python3 or git not available");
+        return;
+    }
+    let dir = fixture_dir("gauntlet-probe-written");
+    let repo = dir.0.join("repo");
+    fs::create_dir_all(repo.join("plans")).unwrap();
+    fs::write(repo.join("README.md"), "# demo\n").unwrap();
+    fs::write(repo.join("old.txt"), "old\n").unwrap();
+    fs::write(repo.join("plans/status.md"), "status\n").unwrap();
+    scratch_git(&repo, &["init", "-q"]);
+    scratch_git(&repo, &["add", "."]);
+    scratch_git(&repo, &["commit", "-qm", "base"]);
+    let head = scratch_git(&repo, &["rev-parse", "HEAD"]);
+
+    let project = repo.to_string_lossy().to_string();
+    let signals = gauntlet_script(
+        "signals.py",
+        &serde_json::json!({"project_dir": project, "diff_spec": "worktree"}),
+        &[],
+    );
+    let before = str_field(&signals, "review_tree_before").to_string();
+    assert!(!before.is_empty(), "{signals}");
+    assert_eq!(str_field(&signals, "review_tree_error"), "", "{signals}");
+
+    let gate = |extra: Value| -> (String, String) {
+        let mut state = serde_json::json!({
+            "project_dir": project,
+            "debris_exclude": "plans",
+            "code_review_results": ["**Verdict: MERGE-READY**\n"],
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            state[k] = v.clone();
+        }
+        let out = gauntlet_script("verdict_gate.py", &state, &[]);
+        (
+            str_field(&out, "gauntlet_verdict").to_string(),
+            str_field(&out, "gauntlet_report").to_string(),
+        )
+    };
+    let probe =
+        serde_json::json!(["Wrote tests/new_check.txt to pin the contract.\nUSAGE_PROBE: PASS\n"]);
+
+    let (_, unchanged) =
+        gate(serde_json::json!({"review_tree_before": before, "probe_results": probe}));
+    let (_, without_key) = gate(serde_json::json!({"probe_results": probe}));
+    assert_eq!(unchanged, without_key);
+    assert!(!unchanged.contains("## Probe-written tests"), "{unchanged}");
+
+    for d in ["tests", "lint"] {
+        fs::create_dir_all(repo.join(d)).unwrap();
+    }
+    fs::write(repo.join("tests/new_check.txt"), "probe\n").unwrap();
+    fs::write(
+        repo.join("lint/other_lane.txt"),
+        "written by another lane\n",
+    )
+    .unwrap();
+    fs::write(repo.join("README.md"), "# demo\nmore\n").unwrap();
+    fs::remove_file(repo.join("old.txt")).unwrap();
+    fs::write(repo.join("plans/status.md"), "status changed\n").unwrap();
+
+    let (verdict, written) =
+        gate(serde_json::json!({"review_tree_before": before, "probe_results": probe}));
+    assert_eq!(
+        verdict, "PASS",
+        "the section never changes the verdict: {written}"
+    );
+    let header = &written[..written
+        .find("\n\n## Full lane reports")
+        .expect("report boundary")];
+    assert!(
+        header.ends_with(
+            "\n\n## Probe-written tests\n- other: README.md\n- other: lint/other_lane.txt\n\
+             - deleted: old.txt\n- tests/new_check.txt"
+        ),
+        "{written}"
+    );
+
+    let (_, no_probe) = gate(serde_json::json!({"review_tree_before": before}));
+    let (_, no_probe_no_key) = gate(serde_json::json!({}));
+    assert_eq!(no_probe, no_probe_no_key);
+    assert!(!no_probe.contains("## Probe-written tests"), "{no_probe}");
+
+    let (_, unavailable) = gate(serde_json::json!({
+        "review_tree_before": "",
+        "review_tree_error": "the worktree tree before the lanes could not be recorded: boom",
+        "probe_results": probe,
+    }));
+    assert!(
+        unavailable.contains(
+            "\n\n## Probe-written tests\n- unavailable: the worktree tree before the lanes could not be \
+             recorded: boom\n\n## Full lane reports\n"
+        ),
+        "{unavailable}"
+    );
+
+    let (verdict, bogus) = gate(serde_json::json!({
+        "review_tree_before": "0123456789abcdef0123456789abcdef01234567",
+        "probe_results": probe,
+    }));
+    assert_eq!(verdict, "PASS", "{bogus}");
+    assert!(
+        bogus.contains("\n\n## Probe-written tests\n- unavailable: git diff-tree failed: "),
+        "{bogus}"
+    );
+
+    assert_eq!(scratch_git(&repo, &["rev-parse", "HEAD"]), head);
+    assert_eq!(scratch_git(&repo, &["diff", "--cached", "--name-only"]), "");
+    let status = scratch_git(&repo, &["status", "--porcelain"]);
+    assert!(
+        ["M README.md", "D old.txt", "?? lint/", "?? tests/"]
+            .iter()
+            .all(|entry| status.contains(entry)),
+        "{status}"
+    );
+
+    let plain = dir.0.join("plain");
+    fs::create_dir_all(&plain).unwrap();
+    let ceiling = dir.0.canonicalize().unwrap();
+    let outside = gauntlet_script(
+        "signals.py",
+        &serde_json::json!({"project_dir": plain.to_string_lossy(), "diff_spec": "worktree"}),
+        &[("GIT_CEILING_DIRECTORIES", ceiling.as_path())],
+    );
+    assert_eq!(str_field(&outside, "review_tree_before"), "", "{outside}");
+    assert_eq!(
+        str_field(&outside, "review_tree_error"),
+        "the worktree tree before the lanes was not recorded: diff signals unavailable",
+        "{outside}"
+    );
+
+    let graph: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(asset("review-gauntlet/graph.yaml")).unwrap())
+            .unwrap();
+    for key in ["review_tree_before", "review_tree_error"] {
+        assert_eq!(
+            graph["initial_state"][key],
+            serde_yaml::Value::from(""),
+            "{key}"
+        );
+    }
 }
 
 /// facts.py excludes a file by its generated header in any comment syntax,

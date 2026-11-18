@@ -162,6 +162,12 @@ initial_state:
   sizing_reason: ''
   subtask_estimate: 0
   proposed_breakdown: []
+  pipeline_size: ''
+  pipeline_size_reason: ''
+  size_escalations: []
+  full_gauntlet_due: false
+  probe_tests: []
+  probe_adoption: {}
   assess_faulted: false
   intent_statement: ''
   clarifying_questions: []
@@ -607,6 +613,15 @@ nodes:
       proposed_breakdown one short line per estimated subtask (compound and
       plan_shaped only; [] otherwise).
 
+      Size the pipeline (pipeline_size, exactly one of the two values `small`
+      or `standard`) by what the work needs from the run:
+      small for one contained change where a research fan-out over the
+      codebase adds nothing and a proportionate review suffices; standard
+      otherwise. Compound and plan_shaped work, and architecture_scale work,
+      is always standard. Unsure: standard. pipeline_size_reason is ONE line
+      naming the evidence. Any failure later in the run turns small into
+      standard, so small is never a way to skip checks the work needs.
+
       Oracle triggers (needs_oracle=true, oracle_question set): "how should I",
       "what's wrong with / why does X keep", technology or pattern choices, how
       to structure, review requests, tradeoffs, anything spanning 3+ files or
@@ -692,6 +707,8 @@ nodes:
         proposed_breakdown:
           type: array
           items: { type: string }
+        pipeline_size: { type: string }
+        pipeline_size_reason: { type: string }
         clarifying_questions:
           type: array
           items:
@@ -841,7 +858,7 @@ nodes:
   next_subtask:
     id: next_subtask
     type: script
-    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish. A broken or stale list or index heals from the sealed subtasks.json (ledgered) or ends in end_blocked with a failure_reason.
+    description: Pop the next subtask (B3, list-bounded); after the last one of several, start the one final whole-task review; then finish. A broken or stale list or index heals from the sealed subtasks.json (ledgered) or ends in end_blocked with a failure_reason. A trivial task goes to compose_brief, a small pipeline skips the research fan-out to oracle_gate, a standard one goes to plan_research.
     script: scripts/next_subtask.py
     timeout: 60
     fallback: end_failure
@@ -2086,7 +2103,7 @@ nodes:
   pr_gate:
     id: pr_gate
     type: script
-    description: Commit/push/PR only when the brief asked for it; parallel mode drains the inbox before the final push.
+    description: First, once per run, one review round over the tests the last passing round's probe lane wrote (they become part of the reviewed change); then commit/push/PR only when the brief asked for it, naming the adopted tests; parallel mode drains the inbox before the final push.
     script: scripts/pr_gate.py
     fallback: end_failure
 
@@ -2140,6 +2157,9 @@ nodes:
         ONLY your own task branch; no merging, no branch switching - integration
         belongs to the parent. Leave the worktree removable:
         everything committed and pushed, no untracked scratch files.
+      - Files the task block names as adopted probe-written tests are part of
+        the reviewed change: commit them with the task's work, never remove
+        them as scratch files.
       Report every command you ran with its exit code, the HEAD SHA, and the PR
       URL/number when one exists. An honest failure with the verbatim error is
       the correct deliverable.

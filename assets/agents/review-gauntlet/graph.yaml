@@ -85,6 +85,9 @@ initial_state:
   signals_summary: ''
   signals_error: ''
   bookkeeping_note: ''
+  # the worktree tree before the lanes, from signals.py; verdict_gate.py diffs it to name the files the probe lane wrote
+  review_tree_before: ''
+  review_tree_error: ''
   touches_auth: false
   touches_deps: false
   touches_exec: false
@@ -212,9 +215,9 @@ nodes:
   signals:
     id: signals
     type: script
-    description: Deterministic diff signals — file list, attack-surface and consumer-surface indicators. Pure git; no LLM judgment.
+    description: Deterministic diff signals -- file list, attack-surface and consumer-surface indicators, plus the worktree tree before the lanes run. Pure git; no LLM judgment. The diff signals keep their 120s envelope (90s per git call) and the before-tree shares one 40s deadline across its git calls, so the node timeout is 160s.
     script: scripts/signals.py
-    timeout: 120
+    timeout: 160
     next: debris_lint
 
   debris_lint:
@@ -518,9 +521,9 @@ nodes:
   verdict_gate:
     id: verdict_gate
     type: script
-    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane. Lanes retry_gate gave up on, and any pipeline-level fault, are named on a GAUNTLET_REVIEW_INCOMPLETE machine line so a caller can tell an incomplete review from a failed one.
+    description: Deterministic sentinel parser and gate. A missing sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks with an environment note; the code-review critical count is read from render.py's summary line (raw 🔴 count if absent) and blocks regardless of the lane's own verdict line; a code-review verdict line that records the nested graph's own pipeline fault blocks as a degraded lane. Lanes retry_gate gave up on, and any pipeline-level fault, are named on a GAUNTLET_REVIEW_INCOMPLETE machine line so a caller can tell an incomplete review from a failed one. When the probe lane ran, the after-tree and its diff against the before-tree each share one 40s deadline across their git calls; with the 60s parse envelope the node timeout is 140s.
     script: scripts/verdict_gate.py
-    timeout: 60
+    timeout: 140
     next: done
 
   done:

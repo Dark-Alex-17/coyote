@@ -228,6 +228,7 @@ out["bookkeeping_note"] = bookkeeping_note(state.get("debris_exclude"))
 # before the git work so a failed diff still starts the clock.
 if not state.get("gauntlet_started_at"):
     out["gauntlet_started_at"] = time.time()
+
 try:
     sig = diff_signals(spec)
     files = sig.pop("files")
@@ -250,6 +251,23 @@ except Exception as e:  # noqa: BLE001 — degraded signals must not sink the ga
         "local-run recipe exists), plus caller context and forced lanes."
     )
     out["signals_summary"] = "signals unavailable"
+
+# The worktree as the lanes find it: verdict_gate compares it with the tree
+# they leave, so it can name the files the probe lane wrote. Recorded only
+# after the diff spec was accepted, so a refused spec never reaches git here.
+if out.get("signals_error"):
+    out["review_tree_before"] = ""
+    out["review_tree_error"] = "the worktree tree before the lanes was not recorded: diff signals unavailable"
+else:
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from review_tree import worktree_tree
+
+        out["review_tree_before"] = worktree_tree(proj)
+        out["review_tree_error"] = ""
+    except Exception as e:  # noqa: BLE001 - recorded; verdict_gate reports it when the probe lane ran
+        out["review_tree_before"] = ""
+        out["review_tree_error"] = f"the worktree tree before the lanes could not be recorded: {str(e)[:300]}"
 
 # Delta signals for narrowing. Computed only when the primary signals
 # succeeded (unavailable primary signals already force the widest selection,
