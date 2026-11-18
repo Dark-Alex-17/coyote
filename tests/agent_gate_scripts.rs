@@ -3701,10 +3701,9 @@ fn gauntlet_probe_written_tests_section_names_what_the_lanes_changed() {
         &[("GIT_CEILING_DIRECTORIES", ceiling.as_path())],
     );
     assert_eq!(str_field(&outside, "review_tree_before"), "", "{outside}");
-    assert!(
-        str_field(&outside, "review_tree_error").starts_with(
-            "the worktree tree before the lanes could not be recorded: git rev-parse failed: "
-        ),
+    assert_eq!(
+        str_field(&outside, "review_tree_error"),
+        "the worktree tree before the lanes was not recorded: diff signals unavailable",
         "{outside}"
     );
 
