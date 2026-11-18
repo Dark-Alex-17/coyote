@@ -8,28 +8,23 @@ use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashSet};
 
-/// The tools and MCP servers an active agent provides. A skill loaded inside
-/// an agent only brings into reach what the agent already provides; it never
-/// widens the agent's `global_tools` or `mcp_servers`.
+/// Holds a skill's grants to what the active agent declares: a skill must never
+/// give the model tools or MCP servers the agent definition does not.
 pub struct AgentToolGate<'a> {
     agent_name: &'a str,
-    provided: HashSet<String>,
+    declared_tools: HashSet<String>,
     mapping_tools: &'a IndexMap<String, String>,
-    /// The agent's MCP server ids with aliases expanded; `None` when the
-    /// agent declares `all`.
-    mcp_servers: Option<BTreeSet<String>>,
+    /// `None` when the agent declares `all`.
+    declared_mcp_servers: Option<BTreeSet<String>>,
     mapping_mcp_servers: &'a IndexMap<String, String>,
 }
 
 impl<'a> AgentToolGate<'a> {
     pub fn new(agent: &'a Agent, app: &'a AppConfig) -> Self {
-        let mut mcp_servers = Some(BTreeSet::new());
-        for entry in agent.mcp_server_names().iter().map(|entry| entry.trim()) {
-            if entry == "all" {
-                mcp_servers = None;
-                break;
-            }
-            if let Some(servers) = mcp_servers.as_mut() {
+        let names = agent.mcp_server_names();
+        let declared_mcp_servers = (!names.iter().any(|entry| entry.trim() == "all")).then(|| {
+            let mut servers = BTreeSet::new();
+            for entry in names.iter().map(|entry| entry.trim()) {
                 let members = expand_mcp_server_alias(&app.mapping_mcp_servers, entry);
                 if members.is_empty() {
                     servers.insert(entry.to_string());
@@ -37,24 +32,22 @@ impl<'a> AgentToolGate<'a> {
                     servers.extend(members);
                 }
             }
-        }
+            servers
+        });
         Self {
             agent_name: agent.name(),
-            provided: agent
+            declared_tools: agent
                 .functions()
                 .declarations()
                 .iter()
                 .map(|declaration| declaration.name.clone())
                 .collect(),
             mapping_tools: &app.mapping_tools,
-            mcp_servers,
+            declared_mcp_servers,
             mapping_mcp_servers: &app.mapping_mcp_servers,
         }
     }
 
-    /// Splits a skill's granted entries into the tool names the agent
-    /// provides and the ones it does not. A `mapping_tools` alias expands to
-    /// its members and `all` to every tool the agent provides.
     pub fn partition(&self, granted: &[String]) -> (Vec<String>, Vec<String>) {
         let mut allowed = vec![];
         let mut denied = vec![];
@@ -63,9 +56,9 @@ impl<'a> AgentToolGate<'a> {
                 continue;
             }
             if entry == "all" {
-                let mut provided: Vec<String> = self.provided.iter().cloned().collect();
-                provided.sort();
-                allowed.extend(provided);
+                let mut declared: Vec<String> = self.declared_tools.iter().cloned().collect();
+                declared.sort();
+                allowed.extend(declared);
                 continue;
             }
             let members: Vec<&str> = match self.mapping_tools.get(entry) {
@@ -73,7 +66,7 @@ impl<'a> AgentToolGate<'a> {
                 None => vec![entry],
             };
             for tool in members.into_iter().filter(|tool| !tool.is_empty()) {
-                let bucket = if self.provided.contains(tool) {
+                let bucket = if self.declared_tools.contains(tool) {
                     &mut allowed
                 } else {
                     &mut denied
@@ -86,16 +79,12 @@ impl<'a> AgentToolGate<'a> {
         (allowed, denied)
     }
 
-    /// Whether the agent declares the MCP server `server`.
     pub fn allows_mcp_server(&self, server: &str) -> bool {
-        self.mcp_servers
+        self.declared_mcp_servers
             .as_ref()
             .is_none_or(|servers| servers.contains(server))
     }
 
-    /// Splits a skill's granted MCP server entries into the servers the agent
-    /// declares and the ones it does not. An alias expands to its members and
-    /// `all` to every server the agent declares.
     pub fn partition_mcp_servers(&self, granted: &[String]) -> (Vec<String>, Vec<String>) {
         let mut allowed = vec![];
         let mut denied = vec![];
@@ -104,7 +93,7 @@ impl<'a> AgentToolGate<'a> {
                 continue;
             }
             if entry == "all" {
-                match &self.mcp_servers {
+                match &self.declared_mcp_servers {
                     Some(servers) => allowed.extend(servers.iter().cloned()),
                     None => allowed.push(entry.to_string()),
                 }
@@ -128,7 +117,6 @@ impl<'a> AgentToolGate<'a> {
         (allowed, denied)
     }
 
-    /// One warning per granted tool or MCP server the agent does not provide.
     pub fn warnings(&self, skill: &Skill) -> Vec<String> {
         let (_, denied) = self.partition(skill.enabled_tools().unwrap_or_default());
         let (_, denied_servers) =
@@ -189,9 +177,7 @@ impl SkillRegistry {
         self.loaded.values()
     }
 
-    /// The MCP servers the loaded skills grant. Inside an agent, `agent_tools`
-    /// keeps them to the servers the agent declares.
-    pub fn loaded_mcp_servers(&self, agent_tools: Option<&AgentToolGate>) -> BTreeSet<String> {
+    pub fn loaded_mcp_servers(&self, agent_gate: Option<&AgentToolGate>) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         for skill in self.loaded.values() {
             if let Some(servers) = skill.enabled_mcp_servers() {
@@ -203,7 +189,7 @@ impl SkillRegistry {
                 }
             }
         }
-        match agent_tools {
+        match agent_gate {
             Some(gate) => {
                 let granted: Vec<String> = out.into_iter().collect();
                 gate.partition_mcp_servers(&granted).0.into_iter().collect()
@@ -220,14 +206,11 @@ impl SkillRegistry {
         self.loaded.retain(|_, skill| !skill.auto_unload());
     }
 
-    /// The base role with every loaded skill composed in. Inside an agent,
-    /// `agent_tools` keeps a skill's granted tools to the ones the agent
-    /// provides; with no agent the grants apply as written.
     pub fn effective_role(
         &self,
         base: &Role,
         policy: &SkillPolicy,
-        agent_tools: Option<&AgentToolGate>,
+        agent_gate: Option<&AgentToolGate>,
     ) -> Role {
         if !policy.skills_enabled || self.loaded.is_empty() {
             return base.clone();
@@ -249,13 +232,13 @@ impl SkillRegistry {
                 continue;
             }
             if let Some(skill_tools) = skill.enabled_tools() {
-                match agent_tools {
+                match agent_gate {
                     Some(gate) => tools.extend(gate.partition(skill_tools).0),
                     None => tools.extend(skill_tools.iter().cloned()),
                 }
             }
             if let Some(servers) = skill.enabled_mcp_servers() {
-                match agent_tools {
+                match agent_gate {
                     Some(gate) => mcps.extend(gate.partition_mcp_servers(servers).0),
                     None => mcps.extend(servers.iter().cloned()),
                 }

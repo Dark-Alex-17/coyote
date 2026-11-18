@@ -1752,7 +1752,7 @@ mod tests {
             let err = err.to_string();
             assert!(
                 err.starts_with(&format!(
-                    "Unable to run jobmissing: no 'jobmissing' executable in [{}] or PATH",
+                    "Unable to run jobmissing: 'jobmissing' failed to start; the executable or its interpreter may be missing (searched [{}] and PATH)",
                     agent_bin.display()
                 )),
                 "{err}"

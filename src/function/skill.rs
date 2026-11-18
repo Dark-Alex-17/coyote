@@ -222,8 +222,6 @@ async fn handle_load(
     Ok(result)
 }
 
-/// Reports each tool a skill grants but the active agent does not provide:
-/// always to the log, and to stderr when a person is watching this context.
 pub(crate) fn report_withheld_tools(warnings: &[String], to_stderr: bool) {
     for warning in warnings {
         warn!("{warning}");
