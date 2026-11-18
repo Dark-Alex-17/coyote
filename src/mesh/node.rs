@@ -1586,13 +1586,15 @@ impl MeshRuntime {
         self.about.as_deref()
     }
 
-    /// The configured `mesh.person_name`, carried on the status card and nowhere else.
+    /// The configured `mesh.person_name`, carried on the status card and, through it, on
+    /// the envoy's brief, and nowhere else.
     pub(crate) fn person_name(&self) -> Option<&str> {
         self.person_name.as_deref()
     }
 
     /// The name the session this node serves goes by, while `mesh.share_session_name` is
-    /// on; the status card is the only place it goes.
+    /// on; it goes on the status card and, through it, on the envoy's brief, and nowhere
+    /// else.
     pub(crate) fn shared_session_name(&self) -> Option<String> {
         self.share_session_name
             .then(|| self.instance_row.lock().session.clone())
@@ -3787,6 +3789,9 @@ struct LocalWatch {
     /// The dial failure last logged for the row, so a client redialing into the same
     /// failure logs it once; cleared on `Connected`.
     logged_dial_failure: Option<String>,
+    /// Whether the row's loss was told, so a drop before the first connect, which tells
+    /// nothing, is not followed by a line saying the rnsd is back.
+    lost_told: bool,
 }
 
 impl LocalWatch {
@@ -3810,6 +3815,7 @@ impl LocalWatch {
             endpoint: endpoint.clone(),
             events,
             logged_dial_failure: None,
+            lost_told: false,
         })
     }
 }
@@ -3912,8 +3918,8 @@ fn reconcile_tcp_after_lag(
 /// told once, and its redials are not told at all. The watcher holds
 /// no peer-controlled state: a fixed list from the node's own config, two flags, a
 /// stream count and a greeting budget per client and one dial failure for the rnsd. Ends
-/// when the node or its slot is gone. Every `LAN_PEERLESS_GRACE_SECS` until it is told,
-/// the watcher also asks `lan_silent_hint_due` whether to print `LAN_SILENT_HINT`.
+/// when the node or its slot is gone. Every `LAN_PEERLESS_GRACE_SECS` until its
+/// `LanSilentHint` settles, the watcher also asks it whether to print `LAN_SILENT_HINT`.
 async fn watch_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -3934,12 +3940,12 @@ async fn watch_interfaces(
     };
     let grace = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
     let mut lan_silent_ticks = interval_at(tokio::time::Instant::now() + grace, grace);
-    let mut lan_silent_told = false;
+    let mut lan_silent = LanSilentHint::default();
     loop {
         let mut transitions = Vec::new();
         tokio::select! {
             () = cancel.cancelled() => return,
-            _ = lan_silent_ticks.tick(), if !lan_silent_told => {
+            _ = lan_silent_ticks.tick(), if !lan_silent.settled() => {
                 let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
                     return;
                 };
@@ -3947,12 +3953,11 @@ async fn watch_interfaces(
                 let kinds: Vec<&str> = runtime.interface_states().iter().map(|status| status.kind).collect();
                 let any_peer_heard = runtime.peers().snapshot().iter().any(|peer| peer.last_seen >= joined_at);
                 let elapsed = joined_at.elapsed().unwrap_or_default();
-                if lan_silent_hint_due(elapsed, &kinds, any_peer_heard, lan_silent_told) {
-                    lan_silent_told = true;
+                if let Some(hint) = lan_silent.tick(elapsed, &kinds, any_peer_heard) {
                     info!("Mesh heard no other host on the LAN within {LAN_PEERLESS_GRACE_SECS}s; suggested a TCP relay");
                     slot.push_idle(IdleNotify {
                         source: Source::Relay,
-                        text: LAN_SILENT_HINT.into(),
+                        text: hint.into(),
                         origin: Origin::Local,
                         model_note: None,
                     });
@@ -4076,22 +4081,49 @@ fn reconnect_line(label: &str, greeting: &ReconnectGreeting) -> String {
     }
 }
 
-/// Whether `LAN_SILENT_HINT` is due: not told yet, up `LAN_PEERLESS_GRACE_SECS`, joined
-/// through a `lan` or `local` interface with no `private` relay configured, and no peer
-/// heard in this run. Neither the in-process AutoInterface nor the shared-instance client
-/// reports AutoInterface peer counts, so a heard peer is what tells the LAN works; the
-/// LAN may also simply be empty while the mesh works, which a heard peer shows too.
-fn lan_silent_hint_due(
-    elapsed: Duration,
-    kinds: &[&str],
-    any_peer_heard: bool,
-    already_told: bool,
-) -> bool {
-    !already_told
-        && !any_peer_heard
-        && elapsed >= Duration::from_secs(LAN_PEERLESS_GRACE_SECS)
+/// Whether `LAN_SILENT_HINT` is due on a node that has heard no peer yet: up
+/// `LAN_PEERLESS_GRACE_SECS` and joined through a `lan` or `local` interface with no
+/// `private` relay configured.
+fn lan_silent_hint_due(elapsed: Duration, kinds: &[&str]) -> bool {
+    elapsed >= Duration::from_secs(LAN_PEERLESS_GRACE_SECS)
         && kinds.iter().any(|kind| matches!(*kind, "lan" | "local"))
         && !kinds.contains(&"private")
+}
+
+/// Whether `LAN_SILENT_HINT` is still to be told. It settles for good once it is told or
+/// once any peer has been heard in this run: neither the in-process AutoInterface nor the
+/// shared-instance client reports AutoInterface peer counts, so a heard peer is what
+/// tells the LAN works, and a peer row swept hours later does not make the LAN silent.
+#[derive(Default)]
+struct LanSilentHint {
+    settled: bool,
+}
+
+impl LanSilentHint {
+    fn settled(&self) -> bool {
+        self.settled
+    }
+
+    /// The hint, the one time it is due.
+    fn tick(
+        &mut self,
+        elapsed: Duration,
+        kinds: &[&str],
+        any_peer_heard_now: bool,
+    ) -> Option<&'static str> {
+        if self.settled {
+            return None;
+        }
+        if any_peer_heard_now {
+            self.settled = true;
+            return None;
+        }
+        if !lan_silent_hint_due(elapsed, kinds) {
+            return None;
+        }
+        self.settled = true;
+        Some(LAN_SILENT_HINT)
+    }
 }
 
 /// Folds one state event of the attached `local` rnsd's client into its row. `Connected`
@@ -4127,6 +4159,7 @@ fn follow_local_event(
         label,
         endpoint,
         logged_dial_failure,
+        lost_told,
         ..
     } = watch;
     let index = *index;
@@ -4186,25 +4219,34 @@ fn follow_local_event(
         // Guard for future variants.
         other => debug!("Mesh interface {label} reported {other:?}"),
     }
-    local_rnsd_line(endpoint, &before?, &row()?)
+    local_rnsd_line(endpoint, &before?, &row()?, lost_told)
 }
 
 /// The idle line for the `local` rnsd's row moving from `before` to `after`: one when a
-/// connected row was lost and one when a lost row is back, none for the first connect
-/// or anything the redials do to a row that is still lost or connecting.
+/// connected row was lost and one when a lost row is back after that loss was told
+/// (`lost_told`), none for the first connect or anything the redials do to a row that
+/// is still lost or connecting.
 fn local_rnsd_line(
     endpoint: &LocalEndpoint,
     before: &InterfaceState,
     after: &InterfaceState,
+    lost_told: &mut bool,
 ) -> Option<String> {
     match (before, after) {
-        (InterfaceState::Connected, InterfaceState::Disconnected { .. }) => Some(format!(
-            "Lost the local rnsd ({endpoint}); redialing every {} s. Other sessions read \"no route\" until it is back.",
-            LOCAL_RECONNECT_WAIT.as_secs()
-        )),
-        (InterfaceState::Disconnected { .. }, InterfaceState::Connected) => Some(format!(
-            "Back on the local rnsd ({endpoint}); this session announced again, and routes return as other sessions announce or when you address one."
-        )),
+        (InterfaceState::Connected, InterfaceState::Disconnected { .. }) => {
+            *lost_told = true;
+            Some(format!(
+                "Lost the local rnsd ({endpoint}); redialing every {} s. Other sessions read \"no route\" until it is back.",
+                LOCAL_RECONNECT_WAIT.as_secs()
+            ))
+        }
+        (InterfaceState::Disconnected { .. }, InterfaceState::Connected)
+            if std::mem::take(lost_told) =>
+        {
+            Some(format!(
+                "Back on the local rnsd ({endpoint}); this session announced again, and routes return as other sessions announce or when you address one."
+            ))
+        }
         _ => None,
     }
 }
@@ -6431,6 +6473,12 @@ impl MeshSlot {
         self.get()
             .and_then(|runtime| runtime.peers().get(destination))
             .and_then(|peer| peer.display_name)
+    }
+
+    /// `MeshRuntime::identity_at`; `None` while the mesh is off.
+    pub(crate) fn identity_at(&self, destination: &str) -> Option<String> {
+        self.get()
+            .and_then(|runtime| runtime.identity_at(destination))
     }
 
     /// `sender` for the summary lines, `None` for a message that names no session, which
@@ -18658,11 +18706,8 @@ mod tests {
                 &["lan", "local"],
                 &["local", "public"],
             ] {
-                assert!(lan_silent_hint_due(GRACE, kinds, false, false), "{kinds:?}");
-                assert!(
-                    lan_silent_hint_due(GRACE * 3, kinds, false, false),
-                    "{kinds:?}"
-                );
+                assert!(lan_silent_hint_due(GRACE, kinds), "{kinds:?}");
+                assert!(lan_silent_hint_due(GRACE * 3, kinds), "{kinds:?}");
             }
         }
 
@@ -18670,16 +18715,9 @@ mod tests {
         fn the_hint_is_not_due_before_the_grace() {
             assert!(!lan_silent_hint_due(
                 GRACE - Duration::from_millis(1),
-                &["lan"],
-                false,
-                false
+                &["lan"]
             ));
-            assert!(!lan_silent_hint_due(
-                Duration::ZERO,
-                &["local"],
-                false,
-                false
-            ));
+            assert!(!lan_silent_hint_due(Duration::ZERO, &["local"]));
         }
 
         #[test]
@@ -18690,23 +18728,35 @@ mod tests {
                 &["public"],
                 &[],
             ] {
-                assert!(
-                    !lan_silent_hint_due(GRACE, kinds, false, false),
-                    "{kinds:?}"
-                );
+                assert!(!lan_silent_hint_due(GRACE, kinds), "{kinds:?}");
             }
         }
 
         #[test]
         fn a_heard_peer_keeps_the_hint_away() {
-            assert!(!lan_silent_hint_due(GRACE, &["lan"], true, false));
-            assert!(!lan_silent_hint_due(GRACE, &["local"], true, false));
+            for kinds in [&["lan"][..], &["local"]] {
+                assert_eq!(LanSilentHint::default().tick(GRACE, kinds, true), None);
+            }
         }
 
         #[test]
         fn the_hint_is_printed_once() {
-            assert!(!lan_silent_hint_due(GRACE, &["lan"], false, true));
-            assert!(!lan_silent_hint_due(GRACE * 10, &["local"], false, true));
+            let mut hint = LanSilentHint::default();
+            assert_eq!(hint.tick(GRACE, &["lan"], false), Some(LAN_SILENT_HINT));
+            assert!(hint.settled());
+            assert_eq!(hint.tick(GRACE * 10, &["local"], false), None);
+        }
+
+        /// The ticks before the grace leave it open; a peer heard once settles it, so
+        /// that peer's row swept from the table later does not bring the hint back.
+        #[test]
+        fn a_peer_heard_once_keeps_the_hint_away_after_its_row_is_swept() {
+            let mut hint = LanSilentHint::default();
+            assert_eq!(hint.tick(GRACE / 2, &["lan"], false), None);
+            assert!(!hint.settled());
+            assert_eq!(hint.tick(GRACE, &["lan"], true), None);
+            assert!(hint.settled());
+            assert_eq!(hint.tick(GRACE * 90, &["lan"], false), None);
         }
 
         #[test]
@@ -21591,6 +21641,7 @@ mod tests {
             endpoint: LocalEndpoint::Tcp("127.0.0.1:37428".parse().unwrap()),
             events,
             logged_dial_failure: None,
+            lost_told: false,
         });
         let row = |runtime: &MeshRuntime| runtime.interface_states()[0].state.clone();
         let refused = || {
@@ -21674,7 +21725,8 @@ mod tests {
     }
 
     /// Losing the `local` rnsd and having it back are told once each, in order; the first
-    /// connect, the redial attempt and its dial failures in between tell nothing.
+    /// connect, the redial attempt and its dial failures in between tell nothing, and so
+    /// does a drop while the row was still connecting and the connect after it.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_local_rnsd_lost_and_back_is_told_once_per_transition() {
@@ -21687,12 +21739,16 @@ mod tests {
             endpoint: LocalEndpoint::Abstract("@rns/default".to_string()),
             events,
             logged_dial_failure: None,
+            lost_told: false,
         });
         runtime.mark_interface_state(0, InterfaceState::Connecting { dial_failure: None });
         let refused = || SharedInstanceEvent::DialFailed {
             reason: DialFailureKind::Refused,
         };
         let sequence = [
+            SharedInstanceEvent::DisconnectedWithReason {
+                reason: DisconnectReason::Reset,
+            },
             SharedInstanceEvent::Connected,
             SharedInstanceEvent::DisconnectedWithReason {
                 reason: DisconnectReason::Reset,
@@ -21716,11 +21772,11 @@ mod tests {
             lines,
             vec![
                 (
-                    1,
+                    2,
                     "Lost the local rnsd (@rns/default); redialing every 2 s. Other sessions read \"no route\" until it is back.".to_string()
                 ),
                 (
-                    6,
+                    7,
                     "Back on the local rnsd (@rns/default); this session announced again, and routes return as other sessions announce or when you address one.".to_string()
                 ),
             ]
@@ -21738,12 +21794,32 @@ mod tests {
         };
         let connecting = InterfaceState::Connecting { dial_failure: None };
         let connected = InterfaceState::Connected;
-        assert!(local_rnsd_line(&endpoint, &connected, &lost).is_some());
-        assert!(local_rnsd_line(&endpoint, &lost, &connected).is_some());
-        assert_eq!(local_rnsd_line(&endpoint, &connecting, &connected), None);
-        assert_eq!(local_rnsd_line(&endpoint, &lost, &lost), None);
-        assert_eq!(local_rnsd_line(&endpoint, &connected, &connected), None);
-        assert_eq!(local_rnsd_line(&endpoint, &lost, &connecting), None);
+        let mut told = false;
+        assert_eq!(
+            local_rnsd_line(&endpoint, &lost, &connected, &mut told),
+            None
+        );
+        assert!(local_rnsd_line(&endpoint, &connected, &lost, &mut told).is_some());
+        assert!(told);
+        assert_eq!(local_rnsd_line(&endpoint, &lost, &lost, &mut told), None);
+        assert_eq!(
+            local_rnsd_line(&endpoint, &lost, &connecting, &mut told),
+            None
+        );
+        assert!(local_rnsd_line(&endpoint, &lost, &connected, &mut told).is_some());
+        assert!(!told);
+        assert_eq!(
+            local_rnsd_line(&endpoint, &lost, &connected, &mut told),
+            None
+        );
+        assert_eq!(
+            local_rnsd_line(&endpoint, &connecting, &connected, &mut told),
+            None
+        );
+        assert_eq!(
+            local_rnsd_line(&endpoint, &connected, &connected, &mut told),
+            None
+        );
     }
 
     #[test]

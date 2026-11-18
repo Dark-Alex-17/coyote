@@ -29,7 +29,8 @@ pub(crate) enum Source {
     Propagation,
     /// Access requests from trusted peers asking to read paths this node does not share.
     Access,
-    /// Advice on reaching peers through a relay when the node's own network carries none.
+    /// Advice on reaching peers through a relay when the node's own network carries none,
+    /// and the lines for losing the local rnsd and having it back.
     Relay,
 }
 

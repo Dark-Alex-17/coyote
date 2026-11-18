@@ -1284,9 +1284,12 @@ async fn peer_status(
     let card = tokio::select! {
         outcome = runtime.request_status(route) => outcome.map_err(|err| match err {
             StatusError::Transport(RequestError::LinkDropped) => link_dropped_failure(
-                "The answer from",
+                NoticeText::from("The answer from"),
                 &with_hash(&who, &destination),
-                &format!(".mesh people status {}", typed_session(token, &destination)),
+                NoticeText::from(format!(
+                    ".mesh people status {}",
+                    typed_session(token, &destination)
+                )),
             ),
             err => quoted_status_failure(err, &who),
         })?,
@@ -2640,20 +2643,7 @@ async fn message(
         Ok(outcome) => outcome,
         Err(err) => {
             ctx.app.mesh.correlations().abandon(&out.id);
-            if matches!(
-                err.downcast_ref::<SendError>(),
-                Some(SendError::Direct(RequestError::LinkDropped))
-            ) {
-                return Err(link_dropped_failure(
-                    "The message to",
-                    &with_hash(&name, &destination),
-                    &format!(
-                        ".mesh messaging send {} <text>",
-                        typed_session(target, &destination)
-                    ),
-                ));
-            }
-            return Err(quoted_send_failure(err, &name));
+            return Err(message_send_failure(err, &name, &destination, target));
         }
     };
     ctx.app.mesh.remember_sent_thread(&out.id);
@@ -2839,6 +2829,16 @@ fn quoted_access_failure(err: AccessError, destination: &str, who: &str) -> anyh
         AccessError::NoAnswer(no_answer) => {
             return quoted_peer_side(&err, no_answer, no_answer.clone().named(Some(who)).notice());
         }
+        AccessError::Direct(RequestError::LinkDropped) => {
+            return answer_dropped_failure(
+                "access request",
+                &with_hash(who, destination),
+                &format!(
+                    "If it did, its decision arrives as an idle line and .mesh messaging inbox lists it; run .mesh files request {} <path> again only if none comes.",
+                    short(destination)
+                ),
+            );
+        }
         AccessError::Throttled { destination } => ("", short(destination).to_string()),
         AccessError::UnknownDestination { .. } => ("Session ", "The session".to_string()),
         _ => return anyhow!(err.to_string()),
@@ -2864,13 +2864,51 @@ fn quoted_fetch_failure(err: FileFetchError, who: &str) -> anyhow::Error {
 /// A request whose answer the link dropped under, as the REPL shows it, in place of the
 /// transport's account, which stays in the log. `what` names what was cut off and leads
 /// into `named`, the session's `<user> / <session>` name with its short hash; `retry` is
-/// the command that asks again, spelled with the session as the user typed it.
-fn link_dropped_failure(what: &str, named: &str, retry: &str) -> anyhow::Error {
+/// the command that asks again, spelled with the session as the user typed it. A path or
+/// prefix the user typed goes into `what` and `retry` as a quoted run.
+fn link_dropped_failure(what: NoticeText, named: &str, retry: NoticeText) -> anyhow::Error {
+    QuotingError::wrap(
+        what.frame(" ")
+            .peer(named)
+            .frame(" stopped partway: the link to that session dropped. Nothing was kept; run ")
+            .then(retry)
+            .frame(" again once .mesh people list shows it reachable."),
+    )
+}
+
+/// A message or access request whose answer the link dropped under. Unlike a fetch, the
+/// session had already acted on it, so the line says it may have arrived and `check` says
+/// how to find out before sending it again.
+fn answer_dropped_failure(what: &str, named: &str, check: &str) -> anyhow::Error {
     QuotingError::wrap(NoticeText::from_template(
-        "{what} {named} stopped partway: the link to that session dropped. Nothing was kept; run {retry} again once .mesh people list shows it reachable.",
-        &[("what", what), ("retry", retry)],
+        "The answer to your {what} for {named} stopped partway: the link to that session dropped, so the {what} may have arrived. {check}",
+        &[("what", what), ("check", check)],
         &[("named", named)],
     ))
+}
+
+/// A `.mesh messaging send` failure as the REPL shows it: `name` is the session's name
+/// here and `target` the session as the user typed it.
+fn message_send_failure(
+    err: anyhow::Error,
+    name: &str,
+    destination: &str,
+    target: &str,
+) -> anyhow::Error {
+    if matches!(
+        err.downcast_ref::<SendError>(),
+        Some(SendError::Direct(RequestError::LinkDropped))
+    ) {
+        return answer_dropped_failure(
+            "message",
+            &with_hash(name, destination),
+            &format!(
+                "Check with that session (or wait for its reply) before you run .mesh messaging send {} <text> again.",
+                typed_session(target, destination)
+            ),
+        );
+    }
+    quoted_send_failure(err, name)
 }
 
 #[cfg(test)]
@@ -2885,10 +2923,11 @@ mod peer_side_refusal_tests {
     #[test]
     fn a_fetch_the_link_dropped_under_says_what_stopped_and_how_to_ask_again() {
         let destination = "51".repeat(16);
-        let err = link_dropped_failure(
-            "The transfer of `notes.md` from",
+        let err = fetch_link_dropped_failure(
             &with_hash("Maki / m", &destination),
-            ".mesh files fetch m notes.md",
+            "m",
+            "notes.md",
+            "notes.md",
         );
         let text = err.to_string();
         assert_eq!(
@@ -2902,6 +2941,69 @@ mod peer_side_refusal_tests {
         )
         .to_string();
         assert!(!fallback.contains("resource"), "{fallback}");
+    }
+
+    /// The path in a cut-off fetch is the user's text, so a path that reads like a REPL
+    /// command keeps its dot under the slash prefix while the hints are slashed.
+    #[test]
+    fn a_fetch_the_link_dropped_under_keeps_the_typed_path_under_slash() {
+        let err = fetch_link_dropped_failure("Maki / m (51515151)", "m", ".session", ".session");
+        let slash = command_error_text(&MeshVerbError::wrap(err), CommandPrefix::Slash);
+        assert_eq!(
+            slash,
+            "Error: The transfer of `.session` from Maki / m (51515151) stopped partway: the link to that session dropped. Nothing was kept; run /mesh files fetch m .session again once /mesh people list shows it reachable."
+        );
+    }
+
+    /// A message whose answer the link dropped under may already be with the session, so
+    /// the line says so and asks for a check before a resend rather than saying nothing
+    /// was kept; any other send failure reads as it did.
+    #[test]
+    fn a_send_the_link_dropped_under_says_the_message_may_have_arrived() {
+        let destination = "51".repeat(16);
+        let text = message_send_failure(
+            anyhow::Error::new(SendError::Direct(RequestError::LinkDropped)),
+            "Maki / m",
+            &destination,
+            "m",
+        )
+        .to_string();
+        assert_eq!(
+            text,
+            "The answer to your message for Maki / m (51515151) stopped partway: the link to that session dropped, so the message may have arrived. Check with that session (or wait for its reply) before you run .mesh messaging send m <text> again."
+        );
+        let closed = message_send_failure(
+            anyhow::Error::new(SendError::Direct(RequestError::LinkClosed)),
+            "Maki / m",
+            &destination,
+            "m",
+        )
+        .to_string();
+        assert_eq!(
+            closed,
+            quoted_send_failure(
+                anyhow::Error::new(SendError::Direct(RequestError::LinkClosed)),
+                "Maki / m"
+            )
+            .to_string()
+        );
+    }
+
+    /// An access request cut off the same way may have been filed, so the line points at
+    /// the decision's idle line before a second request.
+    #[test]
+    fn an_access_request_the_link_dropped_under_says_it_may_have_arrived() {
+        let destination = "51".repeat(16);
+        let text = quoted_access_failure(
+            AccessError::Direct(RequestError::LinkDropped),
+            &destination,
+            "Maki / m",
+        )
+        .to_string();
+        assert_eq!(
+            text,
+            "The answer to your access request for Maki / m (51515151) stopped partway: the link to that session dropped, so the access request may have arrived. If it did, its decision arrives as an idle line and .mesh messaging inbox lists it; run .mesh files request 51515151 <path> again only if none comes."
+        );
     }
 
     /// A listing's hint spells the session as it was typed when that was its name, and by
@@ -4278,14 +4380,11 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             return Err(undelivered_refusal(&named, peer, &shown, &args.path, &err));
         }
         Err(FileFetchError::Transport(RequestError::LinkDropped)) => {
-            return Err(link_dropped_failure(
-                &format!("The transfer of `{shown}` from"),
+            return Err(fetch_link_dropped_failure(
                 &named,
-                &format!(
-                    ".mesh files fetch {} {}",
-                    typed_session(&args.destination, &destination),
-                    args.path
-                ),
+                &typed_session(&args.destination, &destination),
+                &shown,
+                &args.path,
             ));
         }
         Err(err) => return Err(quoted_fetch_failure(err, &who)),
@@ -4301,6 +4400,22 @@ fn invalid_path_refusal(peer: &str, shown: &str, rule: &str) -> anyhow::Error {
         &[("rule", rule), ("peer", peer)],
         &[("shown", shown)],
     ))
+}
+
+/// `session` is the session as the user typed it, for the retry.
+fn fetch_link_dropped_failure(
+    named: &str,
+    session: &str,
+    shown: &str,
+    path: &str,
+) -> anyhow::Error {
+    link_dropped_failure(
+        NoticeText::from("The transfer of `")
+            .peer(shown)
+            .frame("` from"),
+        named,
+        NoticeText::from(format!(".mesh files fetch {session} ")).peer(path),
+    )
 }
 
 fn too_large_refusal(named: &str, shown: &str, limit: u64) -> anyhow::Error {
@@ -4348,6 +4463,10 @@ mod fetch_path_refusal_tests {
             (
                 too_large_refusal(named, path, 1024),
                 "Ann / laptop (1a2b3c4d) serves files of at most 1024 bytes and `.vault/key` is larger. Ask the user of Ann / laptop (1a2b3c4d) for a smaller copy, or for the file another way.".to_string(),
+            ),
+            (
+                fetch_link_dropped_failure(named, "laptop", path, path),
+                "The transfer of `.vault/key` from Ann / laptop (1a2b3c4d) stopped partway: the link to that session dropped. Nothing was kept; run .mesh files fetch laptop .vault/key again once .mesh people list shows it reachable.".to_string(),
             ),
         ];
         for err in [
@@ -6508,7 +6627,12 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     None if holder.kind == "allow" => " (every trusted session)".to_string(),
                     None => String::new(),
                     Some(hash) if is_canonical_peer(hash) => {
-                        format!(" (only {})", rule_peer_name(&namer, hash))
+                        format!(
+                            " (only {})",
+                            rule_peer_name(&namer, hash, &|hash: &str| {
+                                ctx.app.mesh.identity_at(hash)
+                            })
+                        )
                     }
                     Some(text) => {
                         format!(" (scoped to no user or session: `{}`)", shown_pattern(text))
@@ -6710,14 +6834,21 @@ async fn list_remote(
             )));
         }
         Err(FileFetchError::Transport(RequestError::LinkDropped)) => {
-            let mut retry = format!(".mesh files list {}", typed_session(token, &destination));
+            let mut retry = NoticeText::from(format!(
+                ".mesh files list {}",
+                typed_session(token, &destination)
+            ));
             if let Some(prefix) = prefix {
-                retry.push_str(&format!(" --prefix {prefix}"));
+                retry = retry.frame(" --prefix ").peer(shown_pattern(prefix));
             }
             if let Some(cursor) = cursor {
-                retry.push_str(&format!(" --next {cursor}"));
+                retry = retry.frame(format!(" --next {cursor}"));
             }
-            return Err(link_dropped_failure("The listing from", &named, &retry));
+            return Err(link_dropped_failure(
+                NoticeText::from("The listing from"),
+                &named,
+                retry,
+            ));
         }
         Err(err) => return Err(quoted_fetch_failure(err, &who)),
     };
@@ -6836,6 +6967,7 @@ fn shares(ctx: &RequestContext, args: &MutationArgs) -> Result<()> {
             &peer_ref,
             peer.as_deref(),
             &ctx.app.mesh.namer(),
+            &|hash: &str| ctx.app.mesh.identity_at(hash),
             ctx.command_prefix(),
         )
     };
@@ -7311,16 +7443,30 @@ fn listed_paths(paths: &[String]) -> String {
 
 /// A share rule's peer as the listings name it: a user hash by the user's name, a session
 /// hash by `<user> / <session>` once its user or its own name is known, and the short
-/// hash when no name is.
-fn rule_peer_name(namer: &Namer, hash: &str) -> String {
+/// hash when no name is. `identity_at` is the identity the peer table heard a session
+/// under, so a session with no name of its own reads by its named user.
+fn rule_peer_name(
+    namer: &Namer,
+    hash: &str,
+    identity_at: &dyn Fn(&str) -> Option<String>,
+) -> String {
     let people = namer.people();
-    if namer.is_you(hash) || people.person(hash).is_some_and(|alias| alias.displayable()) {
+    let named = |identity: &str| {
+        namer.is_you(identity)
+            || people
+                .person(identity)
+                .is_some_and(|alias| alias.displayable())
+    };
+    if named(hash) {
         return namer.user(Some(hash));
     }
     match people.identity_of_session(hash) {
         Some(identity) => namer.who(Some(identity), hash).to_string(),
         None if namer.own_session(hash).is_some() => namer.who(None, hash).to_string(),
-        None => short(hash).to_string(),
+        None => match identity_at(hash).filter(|identity| named(identity)) {
+            Some(identity) => namer.who(Some(&identity), hash).to_string(),
+            None => short(hash).to_string(),
+        },
     }
 }
 
@@ -7331,6 +7477,7 @@ fn render_share_rules(
     peer: &PeerRef<'_>,
     scoped_to: Option<&str>,
     namer: &Namer,
+    identity_at: &dyn Fn(&str) -> Option<String>,
     prefix: CommandPrefix,
 ) -> String {
     let locations = set.locations();
@@ -7357,7 +7504,7 @@ fn render_share_rules(
                     let note = match &peer {
                         None => "every trusted session".to_string(),
                         Some(hash) if is_canonical_peer(hash) => {
-                            format!("only {}", rule_peer_name(namer, hash))
+                            format!("only {}", rule_peer_name(namer, hash, identity_at))
                         }
                         Some(text) => format!(
                             "scoped to no user or session (`{}` is not a user or session hash)",
@@ -16601,6 +16748,7 @@ mod tests {
             &peer,
             None,
             &Namer::default(),
+            &|_: &str| None,
             CommandPrefix::Dot,
         );
         assert_eq!(fx.placeholders(&text), SHARES_SNAPSHOT);
@@ -16652,6 +16800,7 @@ mod tests {
             &PeerRef::unscoped(),
             None,
             &namer,
+            &|_: &str| None,
             CommandPrefix::Dot,
         );
 
@@ -16659,6 +16808,55 @@ mod tests {
         assert!(text.contains("only Maki / m "), "{text}");
         assert!(
             text.contains(&format!("only {} ", short(&unnamed))),
+            "{text}"
+        );
+    }
+
+    /// A rule scoped to a session nobody named, heard under a named user, reads as that
+    /// user's session; one heard under an unnamed user keeps the short hash.
+    #[test]
+    fn a_scoped_allow_for_an_unnamed_session_of_a_named_user_names_the_user() {
+        use crate::mesh::people::{People, PersonEntry};
+        let bob = "b0".repeat(16);
+        let bob_session = "5b".repeat(16);
+        let stranger = "e7".repeat(16);
+        let stranger_session = "e8".repeat(16);
+        let fx = ShareSnapshot::new(
+            "repl-mesh-shares-heard-session",
+            &format!(
+                "version: 1\nallow:\n- pattern: a.md\n  peer: {bob_session}\n- pattern: b.md\n  peer: {stranger_session}\n"
+            ),
+            &[],
+        );
+        let entries = BTreeMap::from([(
+            bob.clone(),
+            PersonEntry {
+                alias: Some("Bob".to_string()),
+                ..PersonEntry::default()
+            },
+        )]);
+        let namer = Namer::new(People::new(&entries, &[]), None, Default::default());
+        let heard = |hash: &str| match hash {
+            hash if hash == bob_session => Some(bob.clone()),
+            hash if hash == stranger_session => Some(stranger.clone()),
+            _ => None,
+        };
+
+        let text = render_share_rules(
+            &fx.set(),
+            &PeerRef::unscoped(),
+            None,
+            &namer,
+            &heard,
+            CommandPrefix::Dot,
+        );
+
+        assert!(
+            text.contains(&format!("only Bob / {} ", short(&bob_session))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("only {} ", short(&stranger_session))),
             "{text}"
         );
     }
@@ -24082,6 +24280,52 @@ mod tests {
 
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         assert!(temp_slot.stop().await.unwrap());
+                        relay_handle.abort();
+                    });
+                }
+
+                /// Labelling the session the REPL serves rebuilds its envoy's brief at
+                /// once, so the brief's Session line carries the new label before the next
+                /// turn republishes the snapshot.
+                #[test]
+                #[serial]
+                fn labelling_this_session_rebuilds_the_brief_under_the_label() {
+                    use crate::mesh::brief::SESSION_LABEL;
+                    use crate::mesh::card::CardSource;
+                    use crate::mesh::snapshot::MeshSnapshot;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-own-label-brief");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let (addr, relay_handle, _) = loopback_relay().await;
+                        let tmp = TempDir::new("repl-mesh-own-label-brief");
+                        let a = start_as("a", &tmp, addr.port()).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(a.clone()).unwrap();
+                        ctx.app.mesh.publish(MeshSnapshot {
+                            session: CardSource::shared_session(ctx.app.mesh.as_ref()),
+                            ..snapshot_fixture()
+                        });
+                        ctx.app.mesh.reassemble_brief();
+                        let session_line = |ctx: &RequestContext, label: &str| {
+                            let text = ctx
+                                .app
+                                .mesh
+                                .brief()
+                                .map(|brief| brief.text.clone())
+                                .unwrap_or_default();
+                            let line = format!("{SESSION_LABEL}: {label}");
+                            assert!(text.lines().any(|at| at == line), "{text}");
+                        };
+                        session_line(&ctx, "a");
+
+                        out_of(&mut ctx, ".mesh session name a \"x\"")
+                            .await
+                            .unwrap();
+
+                        session_line(&ctx, "x");
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
                         relay_handle.abort();
                     });
                 }
@@ -43188,6 +43432,7 @@ mod tests {
                                 },
                                 Some(&hash),
                                 &Namer::default(),
+                                &|_: &str| None,
                                 CommandPrefix::Slash,
                             );
                             assert_eq!(

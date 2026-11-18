@@ -20,6 +20,10 @@ pub(crate) const BRIEF_TODO_ITEM_MAX_CHARS: usize = 200;
 /// Characters of the whole brief as served; the cut falls on a character boundary, so a
 /// brief near the cap may end mid-section.
 pub(crate) const BRIEF_MAX_CHARS: usize = 6_000;
+/// The labels of the brief's lines naming the session the envoy speaks for and its
+/// user; the envoy's prompt refers to those lines by these labels.
+pub(crate) const SESSION_LABEL: &str = "Session";
+pub(crate) const USER_LABEL: &str = "User";
 
 /// A model-written summary of this session, safe to hand a trusted peer. `covered_messages`
 /// is the session's message count when it was generated, compressed messages included,
@@ -123,10 +127,10 @@ fn render_card(card: &StatusCard) -> Option<String> {
         lines.push(format!("Name: {name}"));
     }
     if let Some(session) = &card.session {
-        lines.push(format!("Session: {session}"));
+        lines.push(format!("{SESSION_LABEL}: {session}"));
     }
     if let Some(person) = &card.person_name {
-        lines.push(format!("User: {person}"));
+        lines.push(format!("{USER_LABEL}: {person}"));
     }
     if let Some(objective) = &card.objective {
         lines.push(format!("Objective: {objective}"));

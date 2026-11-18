@@ -672,15 +672,7 @@ impl MeshRuntime {
                         departed: None,
                     });
                 }
-                Err(
-                    err @ (RequestError::Timeout { .. }
-                    | RequestError::RequestIncomplete { .. }
-                    | RequestError::LinkActivationTimeout { .. }
-                    | RequestError::LinkFailed(_)
-                    | RequestError::LinkDropped
-                    | RequestError::LinkNotOpened(_)
-                    | RequestError::LinkClosed),
-                ) => err,
+                Err(err) if err.falls_back_to_store() => err,
                 Err(err) if err.is_access_refusal() => {
                     debug!(
                         "Mesh access request {id} to {dest8} was refused: the peer has not trusted this instance"
@@ -1811,6 +1803,7 @@ mod no_answer_tests {
                 after,
             },
             RequestError::ResponseIncomplete { path, after },
+            RequestError::LinkDropped,
         ] {
             let remedy = request_remedy(&err);
             let text = AccessError::Direct(err).to_string();

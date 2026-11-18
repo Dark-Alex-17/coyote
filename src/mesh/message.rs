@@ -1889,9 +1889,13 @@ fn recipient_outcome(sent: Result<SendOutcome, SendError>) -> RecipientOutcome {
         Err(err @ SendError::Throttled { .. }) => RecipientOutcome::Throttled {
             reason: err.to_string(),
         },
-        Err(SendError::Direct(wait)) if wait.is_retryable_wait() => RecipientOutcome::RetryLater {
-            reason: SendError::Direct(wait).to_string(),
-        },
+        Err(SendError::Direct(wait))
+            if wait.is_retryable_wait() || wait == RequestError::LinkDropped =>
+        {
+            RecipientOutcome::RetryLater {
+                reason: SendError::Direct(wait).to_string(),
+            }
+        }
         Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
             RecipientOutcome::Refused {
                 reason: err.to_string(),
@@ -1907,9 +1911,9 @@ fn recipient_outcome(sent: Result<SendOutcome, SendError>) -> RecipientOutcome {
 mod recipient_outcome_tests {
     use super::*;
 
-    /// Every wait that ran out short of the peer's silence and was not stored is the
-    /// retry in a broadcast row too, with the single send's sentence, and is never
-    /// counted unreachable.
+    /// Every wait that ran out short of the peer's silence and was not stored, and an
+    /// answer cut off on its way back, is the retry in a broadcast row too, with the
+    /// single send's sentence, and is never counted unreachable.
     #[test]
     fn a_wait_short_of_silence_is_a_retry_row_with_the_single_send_text() {
         let (path, after) = ("/message".to_string(), Duration::from_secs(15));
@@ -1923,6 +1927,7 @@ mod recipient_outcome_tests {
                 after,
             },
             RequestError::ResponseIncomplete { path, after },
+            RequestError::LinkDropped,
         ] {
             let single = SendError::Direct(wait.clone()).to_string();
 
@@ -2050,9 +2055,10 @@ impl MeshRuntime {
     /// Only the peer-unreachable errors and a silent peer fall back to store-and-forward:
     /// a refusal of any code means the peer heard and said no, and storing a message it
     /// has refused would deliver it behind its back. A wait that ran out on this node's
-    /// side, or with the peer's answer still arriving, is reported with the retry and
-    /// not stored. A message whose upload ran out before the peer had all of it is
-    /// stored: the peer never read it, so the stored copy cannot land twice. Posts to
+    /// side, or with the peer's answer still arriving, is reported with the retry and not
+    /// stored. A message whose upload ran out before the peer had all of it is stored:
+    /// the peer never read it, so the stored copy cannot land twice. An answer cut off by
+    /// a dropped link is a link failure and is stored too. Posts to
     /// the propagation node queue behind `posting`, since `propagate` needs one caller
     /// per node at a time. A peer that said it left the mesh is not tried over a link at
     /// all while the send may be stored: its farewell holds until it is back. The
@@ -2168,15 +2174,7 @@ impl MeshRuntime {
                         debug!("Mesh {kind} {id} to {dest8} was answered but not acknowledged");
                         return Err(SendError::NotAcknowledged);
                     }
-                    Err(
-                        err @ (RequestError::Timeout { .. }
-                        | RequestError::RequestIncomplete { .. }
-                        | RequestError::LinkActivationTimeout { .. }
-                        | RequestError::LinkFailed(_)
-                        | RequestError::LinkDropped
-                        | RequestError::LinkNotOpened(_)
-                        | RequestError::LinkClosed),
-                    ) => err,
+                    Err(err) if err.falls_back_to_store() => err,
                     Err(RequestError::Refused(RefusalCode::NoAccess)) => {
                         debug!(
                             "Mesh {kind} {id} to {dest8} was refused: the peer has not trusted this instance"
@@ -3423,6 +3421,7 @@ mod no_answer_tests {
                 after,
             },
             RequestError::ResponseIncomplete { path, after },
+            RequestError::LinkDropped,
         ] {
             let remedy = request_remedy(&err);
             let text = SendError::Direct(err).to_string();

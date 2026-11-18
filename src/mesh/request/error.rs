@@ -89,6 +89,24 @@ impl RequestError {
         matches!(self, Self::Refused(RefusalCode::NoAccess))
     }
 
+    /// `true` for the link failures and the silent peer that send a direct attempt to the
+    /// propagation node. `LinkDropped` is one: an answer cut off on its way back is a link
+    /// failure, and storing the message keeps it from being lost at the price of a copy
+    /// the peer may already hold. A wait that ran out on this side or with the answer
+    /// still arriving is not.
+    pub(crate) fn falls_back_to_store(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout { .. }
+                | Self::RequestIncomplete { .. }
+                | Self::LinkActivationTimeout { .. }
+                | Self::LinkFailed(_)
+                | Self::LinkDropped
+                | Self::LinkNotOpened(_)
+                | Self::LinkClosed
+        )
+    }
+
     /// `true` for a wait that ran out for a reason other than the peer's silence: the link
     /// never came up, this node's own side was slow, the request or an answer was still
     /// in transfer. None of these says anything about the peer's trust, and a retry is the
@@ -611,5 +629,23 @@ mod no_answer_tests {
             );
         }
         assert!(!RequestError::Timeout { path, after }.is_retryable_wait());
+    }
+
+    /// A link that failed, before or after the peer answered, reaches the propagation
+    /// node; an answer still arriving when the wait ran out does not.
+    #[test]
+    fn a_failed_link_falls_back_to_store_and_an_answer_still_arriving_does_not() {
+        let (path, after) = ("/message".to_string(), Duration::from_secs(15));
+        assert!(RequestError::LinkDropped.falls_back_to_store());
+        assert!(
+            !RequestError::ResponseIncomplete {
+                path: path.clone(),
+                after
+            }
+            .falls_back_to_store()
+        );
+        assert!(RequestError::LinkClosed.falls_back_to_store());
+        assert!(RequestError::LinkFailed("reset".to_string()).falls_back_to_store());
+        assert!(RequestError::Timeout { path, after }.falls_back_to_store());
     }
 }
