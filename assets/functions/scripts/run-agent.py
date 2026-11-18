@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Usage: ./{agent_name}.py <agent-func> <agent-data>
 
