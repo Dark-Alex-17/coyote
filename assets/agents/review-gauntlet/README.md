@@ -189,6 +189,25 @@ still appear under `## Blockers` and must be fixed as usual.
 | probe | `USAGE_PROBE: PASS \| FAIL \| INCONCLUSIVE` (whole line only; the last such line wins -- a sentinel quoted inside the body is not read; a sentinel followed by text on the same line is treated as missing and re-runs the lane) | FAIL; INCONCLUSIVE (environment note); missing sentinel |
 | debris | none -- `debris_lint.py` findings read directly from state | any non-ASCII-punctuation or planning-artefact hit on an added line; a crashed lint (PIPELINE-FAULT, `GAUNTLET_REVIEW_INCOMPLETE: debris`) |
 
+Probe-written tests: `signals.py` records the worktree's tree before the lanes run
+(`review_tree_before`; untracked, non-ignored files included, written through a temporary
+copy of the index so the real one is never touched; both scripts share
+`scripts/review_tree.py` for this, and each tree computation shares one 40 s deadline
+across its git calls). When the probe lane ran, `verdict_gate.py`
+compares it with the tree after the lanes and ends the report header, just above
+`## Full lane reports`, with a `## Probe-written tests` section, the `debris_exclude`
+directories left out:
+
+- `- <path>` only for a path added during the review that the probe report names;
+- `- other: <path>` for every other changed path (a tracked file edited, or an added
+  file the probe report does not name, such as one another lane wrote);
+- `- deleted: <path>` per removed path;
+- `- unavailable: <reason>` when either tree could not be computed, and as the last line
+  when more than 50 items would be listed.
+
+When no probe lane ran nothing is written. The section is optional output: it never
+changes the verdict, and a caller that does not read it sees the report it always did.
+
 ## Spawning it
 
 ```

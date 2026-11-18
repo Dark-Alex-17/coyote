@@ -69,6 +69,14 @@ re-reads, no judgment. The gate's hard rules:
   - the gate itself must never crash into a silent pass: any internal
     error emits GAUNTLET: BLOCKED naming the error, with the pipeline
     marked incomplete.
+
+When signals.py recorded the worktree tree before the lanes and the probe
+lane ran, the paths that differ from the tree after them end the header in a
+`## Probe-written tests` section: a bare `- <path>` only for an added path the
+probe report names, `- other:` and `- deleted:` for the rest, and
+`- unavailable: <reason>` when either tree could not be computed or the list
+is capped. Without a probe lane nothing is written, so the report is the same
+as before the trees were recorded. The section never affects the verdict.
 """
 
 import json
@@ -203,6 +211,53 @@ def adversary_divergence_blockers(report):
         heads = "; ".join(clip(c, ADVERSARY_OVERFLOW_HEAD_CHARS) for c in rest)
         out.append(f"adversary: DIVERGES -- {len(rest)} more complaint(s): {heads}")
     return out
+
+
+PROBE_TREE_ITEMS_MAX = 50
+
+
+def tree_change_lines(state, probe_report):
+    """The `## Probe-written tests` lines for a review the probe lane ran in.
+
+    `- <path>` only for a path added during the review that the probe
+    report names; `- deleted: <path>` per removed path; `- other: <path>`
+    for every other change, so a file another lane wrote is never taken
+    for a probe test. One `- unavailable:` line when either tree could not
+    be computed, and one more past PROBE_TREE_ITEMS_MAX listed items. []
+    when no probe lane ran, nothing changed, or signals recorded no
+    before-tree key."""
+    if probe_report is None or "review_tree_before" not in state:
+        return []
+    before = state.get("review_tree_before") or ""
+    try:
+        if not before:
+            raise RuntimeError(
+                state.get("review_tree_error") or "the worktree tree before the lanes was not recorded"
+            )
+        from review_tree import tree_changes, worktree_tree
+
+        proj = state.get("project_dir") or "."
+        try:
+            import debris
+
+            excludes = debris.parse_excludes(state.get("debris_exclude"))
+        except Exception:  # noqa: BLE001 - the debris row reports a bad value or a missing module
+            excludes = []
+        changes = tree_changes(proj, before, worktree_tree(proj), excludes)
+    except Exception as e:  # noqa: BLE001 - reported in the section, never a crash
+        return [f"- unavailable: {one_line(e)}"]
+    lines = []
+    for status, path in changes:
+        if status == "D":
+            lines.append(f"- deleted: {one_line(path)}")
+        elif status == "A" and path in probe_report:
+            lines.append(f"- {one_line(path)}")
+        else:
+            lines.append(f"- other: {one_line(path)}")
+    if len(lines) > PROBE_TREE_ITEMS_MAX:
+        rest = len(lines) - PROBE_TREE_ITEMS_MAX
+        lines = lines[:PROBE_TREE_ITEMS_MAX] + [f"- unavailable: {rest} more changed paths not listed"]
+    return lines
 
 
 def main():
@@ -572,6 +627,8 @@ def main():
         else ""
     )
 
+    probe_lines = tree_change_lines(state, pb)
+
     # Above `## Full lane reports` every interpolated value goes through
     # report_text, so no state-sourced text can start a header line of its own.
     md = "\n".join(
@@ -601,6 +658,8 @@ def main():
         md += "\n\n## Review incomplete\n" + "\n".join(
             f"- {one_line(x)}" for x in incomplete_lines
         )
+    if probe_lines:
+        md += "\n\n## Probe-written tests\n" + "\n".join(one_line(line) for line in probe_lines)
     md += "\n\n## Full lane reports\n"
     for lane, rep in reports:
         md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"
