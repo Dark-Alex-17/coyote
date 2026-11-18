@@ -595,57 +595,90 @@ config_enables_autointerface() {
   [[ "$in_auto" -eq 1 && "$enabled" -eq 1 ]]
 }
 
-config_enables_transport() {
-  grep -qiE '^[[:space:]]*enable_transport[[:space:]]*=[[:space:]]*(true|yes)' "$RNS_CONFIG"
-}
+# The values ConfigObj's as_bool reads as true, which is how rnsd reads enabled and
+# enable_transport; bash 3.2 has no case-insensitive regex match, hence the classes.
+TRUE_VALUE='([Yy][Ee][Ss]|[Tt][Rr][Uu][Ee]|[Oo][Nn]|1)([[:space:]#]|$)'
 
-# True for a target_host outside loopback and the RFC1918 ranges. A name other than
-# localhost counts as public: what it resolves to is not this script's to guess.
+# True for a target_host outside loopback, RFC1918, CGNAT (100.64/10), IPv4 link-local
+# and IPv6 ULA and link-local. A name other than localhost counts as public: what it
+# resolves to is not this script's to guess.
 public_host() {
   local a b
   if [[ "$1" == "localhost" || "$1" == "::1" ]]; then return 1; fi
+  if [[ "$1" =~ ^[Ff][CcDd][0-9A-Fa-f]{2}: || "$1" =~ ^[Ff][Ee][89AaBb][0-9A-Fa-f]: ]]; then return 1; fi
   if [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
     a=$((10#${BASH_REMATCH[1]}))
     b=$((10#${BASH_REMATCH[2]}))
     if [[ "$a" -eq 10 || "$a" -eq 127 ]]; then return 1; fi
     if [[ "$a" -eq 172 && "$b" -ge 16 && "$b" -le 31 ]]; then return 1; fi
     if [[ "$a" -eq 192 && "$b" -eq 168 ]]; then return 1; fi
+    if [[ "$a" -eq 100 && "$b" -ge 64 && "$b" -le 127 ]]; then return 1; fi
+    if [[ "$a" -eq 169 && "$b" -eq 254 ]]; then return 1; fi
   fi
   return 0
 }
 
+# True for a listen_ip that still binds 127.0.0.1; empty means rnsd's default, 0.0.0.0.
+loopback_listen_ip() {
+  case "$1" in
+    ""|127.0.0.1|0.0.0.0|localhost|::|::1) return 0;;
+    *) return 1;;
+  esac
+}
+
 # Folds one interface stanza into CONFIG_SERVES_SESSIONS and CONFIG_PUBLIC_DIALS: $1 its
-# type, $2 0 when it is switched off, $3 its listen_port, $4 its target_host.
+# type, $2 1 when it is switched on, $3 its port (port over listen_port, as in RNS
+# TCPInterface.py), $4 its target_host, $5 its listen_ip, $6 its device.
 tally_stanza() {
-  if [[ "$2" -eq 0 ]]; then return 0; fi
-  if [[ "$1" == "TCPServerInterface" && "$3" == "$LISTEN_PORT" ]]; then CONFIG_SERVES_SESSIONS=1; fi
+  if [[ "$2" -ne 1 ]]; then return 0; fi
+  if [[ "$1" == "TCPServerInterface" && "$3" == "$LISTEN_PORT" && -z "$6" ]] && loopback_listen_ip "$5"; then
+    CONFIG_SERVES_SESSIONS=1
+  fi
   if [[ "$1" == "TCPClientInterface" && -n "$4" ]] && public_host "$4"; then
     CONFIG_PUBLIC_DIALS=$((CONFIG_PUBLIC_DIALS + 1))
   fi
 }
 
-# Reads the existing config's stanzas: CONFIG_SERVES_SESSIONS is 1 when an enabled
-# TCPServerInterface listens on $LISTEN_PORT, and CONFIG_PUBLIC_DIALS counts the enabled
-# TCPClientInterface stanzas that dial a public host.
+# Reads the existing config as rnsd would: CONFIG_SERVES_SESSIONS is 1 when an enabled
+# TCPServerInterface listens on 127.0.0.1:$LISTEN_PORT, CONFIG_TRANSPORT is 1 when the
+# [reticulum] section turns enable_transport on, and CONFIG_PUBLIC_DIALS counts the
+# enabled TCPClientInterface stanzas that dial a public host. rnsd brings a stanza up only
+# when enabled or interface_enabled is true, so a stanza without either stays off.
 scan_existing_config() {
-  local line type="" enabled=1 port="" host=""
+  local line section="" type="" enabled=0 listen_port="" port="" host="" ip="" device=""
+  local true_key="^[[:space:]]*(interface_)?enabled[[:space:]]*=[[:space:]]*$TRUE_VALUE"
+  local transport_key="^[[:space:]]*enable_transport[[:space:]]*=[[:space:]]*$TRUE_VALUE"
   CONFIG_SERVES_SESSIONS=0
+  CONFIG_TRANSPORT=0
   CONFIG_PUBLIC_DIALS=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ "$line" =~ ^[[:space:]]*\[ ]]; then
-      tally_stanza "$type" "$enabled" "$port" "$host"
-      type=""; enabled=1; port=""; host=""
+      tally_stanza "$type" "$enabled" "${port:-$listen_port}" "$host" "$ip" "$device"
+      type=""; enabled=0; listen_port=""; port=""; host=""; ip=""; device=""
+      if [[ "$line" =~ ^[[:space:]]*\[\[ ]]; then
+        section="$section/"
+      elif [[ "$line" =~ ^[[:space:]]*\[([^]]*)\] ]]; then
+        section="${BASH_REMATCH[1]}"
+      fi
+    elif [[ "$section" == "reticulum" && "$line" =~ $transport_key ]]; then
+      CONFIG_TRANSPORT=1
     elif [[ "$line" =~ ^[[:space:]]*type[[:space:]]*=[[:space:]]*([A-Za-z]+) ]]; then
       type="${BASH_REMATCH[1]}"
-    elif [[ "$line" =~ ^[[:space:]]*(interface_)?enabled[[:space:]]*=[[:space:]]*([Nn]o|[Ff]alse|0) ]]; then
-      enabled=0
+    elif [[ "$line" =~ $true_key ]]; then
+      enabled=1
     elif [[ "$line" =~ ^[[:space:]]*listen_port[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+      listen_port="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*port[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
       port="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^[[:space:]]*target_host[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
       host="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*listen_ip[[:space:]]*=[[:space:]]*([^[:space:]#]+) ]]; then
+      ip="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ ^[[:space:]]*device[[:space:]]*= ]]; then
+      device=1
     fi
   done < "$RNS_CONFIG"
-  tally_stanza "$type" "$enabled" "$port" "$host"
+  tally_stanza "$type" "$enabled" "${port:-$listen_port}" "$host" "$ip" "$device"
 }
 
 # An rnsd on this config would never open 127.0.0.1:$LISTEN_PORT or would not relay
@@ -653,7 +686,7 @@ scan_existing_config() {
 stop_unless_config_serves_coyote() {
   local gap=""
   if [[ "$CONFIG_SERVES_SESSIONS" -eq 0 ]]; then gap="has no [[Coyote Sessions]] stanza on 127.0.0.1:$LISTEN_PORT"; fi
-  if ! config_enables_transport; then
+  if [[ "$CONFIG_TRANSPORT" -eq 0 ]]; then
     if [[ -n "$gap" ]]; then gap="$gap and enable_transport is off"; else gap="has enable_transport off"; fi
   fi
   if [[ -z "$gap" ]]; then return 0; fi
@@ -738,7 +771,7 @@ add_team_relay() {
 write_config() {
   if [[ -f "$RNS_CONFIG" ]]; then
     scan_existing_config
-    if [[ -n "$RELAY_HOST" && "$RNS_DIR_SYSTEM" -eq 0 && "$CONFIG_SERVES_SESSIONS" -eq 1 ]] && config_enables_transport && config_is_own; then
+    if [[ -n "$RELAY_HOST" && "$RNS_DIR_SYSTEM" -eq 0 && "$CONFIG_SERVES_SESSIONS" -eq 1 && "$CONFIG_TRANSPORT" -eq 1 ]] && config_is_own; then
       add_team_relay
       return 0
     fi
@@ -748,7 +781,9 @@ write_config() {
     interfaces_text
     echo
     if [[ "$CONFIG_PUBLIC_DIALS" -gt 0 ]]; then
-      log "Note: this config also dials $CONFIG_PUBLIC_DIALS public Reticulum nodes; your announces reach them (see mesh.display_name_on_public)."
+      local nodes="nodes"
+      if [[ "$CONFIG_PUBLIC_DIALS" -eq 1 ]]; then nodes="node"; fi
+      log "Note: this config also dials $CONFIG_PUBLIC_DIALS public Reticulum $nodes; your announces reach them (see mesh.display_name_on_public)."
     fi
     stop_unless_config_serves_coyote
     if config_enables_autointerface; then firewall_warning; fi

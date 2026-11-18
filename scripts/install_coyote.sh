@@ -107,9 +107,17 @@ run_mesh_relay() {
     fi
   fi
 
-  local rc=0
-  BIN_DIR="$BIN_DIR" bash "$relay" || rc=$?
-  if [[ "$rc" -ne 0 ]]; then MESH_FAILURE="mesh setup exited with code ${rc}"; fi
+  # The relay's stderr is also kept in a file: its exit 2 means either no way to install
+  # rnsd or an existing Reticulum config that cannot serve Coyote, and only its own
+  # sentence tells them apart.
+  local rc=0 errors="$WORKDIR/mesh-relay.err"
+  { BIN_DIR="$BIN_DIR" bash "$relay" 2>&1 1>&3 3>&- | tee "$errors" >&2; } 3>&1 || rc=${PIPESTATUS[0]}
+  if [[ "$rc" -eq 2 ]] && grep -q 'so this rnsd would not serve Coyote' "$errors"; then
+    MESH_CONFIG_GAP=1
+    MESH_FAILURE="mesh setup stopped at your existing Reticulum config: that config needs the settings above (or move it aside)"
+  elif [[ "$rc" -ne 0 ]]; then
+    MESH_FAILURE="mesh setup exited with code ${rc}"
+  fi
   return "$rc"
 }
 
@@ -118,6 +126,7 @@ main() {
   BIN_DIR="${BIN_DIR:-}"
   WITH_MESH=""
   MESH_FAILURE=""
+  MESH_CONFIG_GAP=0
   MESH_RC=0
 
   while [[ $# -gt 0 ]]; do
@@ -343,7 +352,9 @@ main() {
   # Root is never prompted: rnsd, its config and its service belong to the user.
   if [[ -n "$WITH_MESH" ]]; then
     run_mesh_relay || MESH_RC=$?
-    if [[ "$MESH_RC" -ne 0 ]]; then
+    if [[ "$MESH_CONFIG_GAP" -eq 1 ]]; then
+      echo "[coyote-install] Error: ${MESH_FAILURE}; coyote itself is installed." >&2
+    elif [[ "$MESH_RC" -ne 0 ]]; then
       RETRY_AS=""
       if [[ "$(id -u)" -eq 0 ]]; then RETRY_AS=" as your normal user"; fi
       echo "[coyote-install] Error: ${MESH_FAILURE}; coyote itself is installed. Retry with: curl -fsSL ${MESH_RELAY_URL} | bash${RETRY_AS}" >&2
@@ -357,7 +368,7 @@ main() {
         y|Y|yes|YES|Yes)
           if ! run_mesh_relay; then
             log "${MESH_FAILURE}; coyote itself is installed."
-            mesh_pointer
+            if [[ "$MESH_CONFIG_GAP" -eq 0 ]]; then mesh_pointer; fi
           fi;;
         *) mesh_pointer;;
       esac

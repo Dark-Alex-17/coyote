@@ -240,9 +240,10 @@ fn shimmed_path(home: &Home, os: &str) -> std::ffi::OsString {
 
 const SHIM_ENTRIES: [&str; 3] = ["shim", "shim/launchctl", "shim/uname"];
 
-/// A hand-written config that can serve Coyote sessions: transport on and a listener on
-/// 4242, with no header of the script's own, so the script proceeds without writing to it.
-const SERVES_COYOTE: &str = "[reticulum]\nenable_transport = True\n\n[interfaces]\n  [[Loop]]\n    type = TCPServerInterface\n    listen_ip = 127.0.0.1\n    listen_port = 4242\n";
+/// A hand-written config that can serve Coyote sessions: transport on and an enabled
+/// listener on 4242 (rnsd leaves a stanza without `enabled` down), with no header of the
+/// script's own, so the script proceeds without writing to it.
+const SERVES_COYOTE: &str = "[reticulum]\nenable_transport = True\n\n[interfaces]\n  [[Loop]]\n    type = TCPServerInterface\n    enabled = Yes\n    listen_ip = 127.0.0.1\n    listen_port = 4242\n";
 
 /// The line a macOS run prints after bootstrapping the agent.
 const FIREWALL_POINTER: &str = "If macOS asks whether Python may accept incoming connections, allow it, or the LAN interface stays silent (AutoInterface: 'No multicast echoes received'); System Settings > Network > Firewall > Options. Nodes using only the loopback relay are unaffected.";
@@ -519,8 +520,10 @@ fn an_existing_config_is_told_to_carry_the_shared_instance_keys_and_the_4242_lis
 /// A config like the one an older Reticulum install leaves behind: transport off, no
 /// listener on 4242, an AutoInterface and a run of `TCPClientInterface` stanzas. Three of
 /// the enabled ones dial public hosts (a name, a routable address, 172.32/16 just past the
-/// RFC1918 block); the disabled one, `localhost`, loopback and the three RFC1918 ranges do not count.
-const STALE_CONFIG: &str = "[reticulum]\n  enable_transport = no\n  share_instance = Yes\n\n[logging]\n  loglevel = 4\n\n[interfaces]\n  [[Default Interface]]\n    type = AutoInterface\n    enabled = Yes\n\n  [[RNS Testnet Dublin]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = dublin.connect.reticulum.network\n    target_port = 4965\n\n  [[Routable]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 203.0.113.7\n    target_port = 4242\n\n  [[Past RFC1918]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 172.32.0.5\n    target_port = 4242\n\n  [[Switched Off]]\n    type = TCPClientInterface\n    enabled = no\n    target_host = 198.51.100.1\n    target_port = 4242\n\n  [[Home]]\n    type = TCPClientInterface\n    interface_enabled = True\n    target_host = 192.168.1.20\n    target_port = 4242\n\n  [[Office]]\n    type = TCPClientInterface\n    target_host = 10.1.2.3\n    target_port = 4242\n\n  [[Docker]]\n    type = TCPClientInterface\n    target_host = 172.20.0.5\n    target_port = 4242\n\n  [[Here]]\n    type = TCPClientInterface\n    target_host = localhost\n    target_port = 4242\n\n  [[Loopback]]\n    type = TCPClientInterface\n    target_host = 127.0.0.1\n    target_port = 4243\n";
+/// RFC1918 block); the disabled one, the one without an `enabled` key, `localhost`,
+/// loopback, the three RFC1918 ranges, CGNAT, IPv4 link-local and the IPv6 ULA and
+/// link-local ranges do not count.
+const STALE_CONFIG: &str = "[reticulum]\n  enable_transport = no\n  share_instance = Yes\n\n[logging]\n  loglevel = 4\n\n[interfaces]\n  [[Default Interface]]\n    type = AutoInterface\n    enabled = Yes\n\n  [[RNS Testnet Dublin]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = dublin.connect.reticulum.network\n    target_port = 4965\n\n  [[Routable]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 203.0.113.7\n    target_port = 4242\n\n  [[Past RFC1918]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 172.32.0.5\n    target_port = 4242\n\n  [[Switched Off]]\n    type = TCPClientInterface\n    enabled = no\n    target_host = 198.51.100.1\n    target_port = 4242\n\n  [[Never Switched On]]\n    type = TCPClientInterface\n    target_host = 198.51.100.2\n    target_port = 4242\n\n  [[Home]]\n    type = TCPClientInterface\n    interface_enabled = True\n    target_host = 192.168.1.20\n    target_port = 4242\n\n  [[Office]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 10.1.2.3\n    target_port = 4242\n\n  [[Docker]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 172.20.0.5\n    target_port = 4242\n\n  [[Here]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = localhost\n    target_port = 4242\n\n  [[Loopback]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 127.0.0.1\n    target_port = 4243\n\n  [[Carrier NAT]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 100.64.0.1\n    target_port = 4242\n\n  [[Carrier NAT Top]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 100.127.255.254\n    target_port = 4242\n\n  [[IPv4 Link Local]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 169.254.10.20\n    target_port = 4242\n\n  [[IPv6 ULA]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = fd00:1234::5\n    target_port = 4242\n\n  [[IPv6 Link Local]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = fe80::1\n    target_port = 4242\n";
 
 const PUBLIC_DIALS_NOTE: &str = "Note: this config also dials 3 public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).";
 
@@ -595,7 +598,9 @@ fn a_config_that_cannot_serve_coyote_stops_with_exit_2_before_any_service_step()
 }
 
 /// One gap at a time: a config with the listener but transport off, and one with transport
-/// on but no listener, each stop with exit 2 and name only what is missing.
+/// on but no listener rnsd would open on 127.0.0.1:4242 (another port, switched off, never
+/// switched on, bound to a LAN address or to a device), each stop with exit 2 and name only
+/// what is missing. Transport counts only in the `[reticulum]` section.
 #[test]
 fn a_config_missing_one_of_the_listener_or_transport_names_only_that_gap() {
     let bash = bash_or_skip!();
@@ -615,11 +620,32 @@ fn a_config_missing_one_of_the_listener_or_transport_names_only_that_gap() {
             "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
         ),
         (
-            SERVES_COYOTE.replace(
-                "type = TCPServerInterface",
-                "type = TCPServerInterface\n    enabled = No",
-            ),
+            SERVES_COYOTE.replace("enabled = Yes", "enabled = No"),
             "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
+        ),
+        (
+            SERVES_COYOTE.replace("    enabled = Yes\n", ""),
+            "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
+        ),
+        (
+            SERVES_COYOTE.replace("listen_ip = 127.0.0.1", "listen_ip = 192.168.1.5"),
+            "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
+        ),
+        (
+            SERVES_COYOTE.replace("listen_ip = 127.0.0.1", "device = eth0"),
+            "has no [[Coyote Sessions]] stanza on 127.0.0.1:4242,",
+        ),
+        (
+            SERVES_COYOTE.replace(
+                "enable_transport = True",
+                "share_instance = Yes\n\n[logging]\nenable_transport = True",
+            ),
+            "has enable_transport off,",
+        ),
+        (
+            SERVES_COYOTE.replace("enable_transport = True\n", "")
+                + "    enable_transport = True\n",
+            "has enable_transport off,",
         ),
     ] {
         fs::write(&config, &text).unwrap();
@@ -638,8 +664,41 @@ fn a_config_missing_one_of_the_listener_or_transport_names_only_that_gap() {
     }
 }
 
+/// The spellings rnsd reads as the same listener and transport serve Coyote: any true value
+/// ConfigObj accepts, in any case, for `enabled`, `interface_enabled` and `enable_transport`;
+/// `port` in place of `listen_port` (it wins when both are set); and a listen_ip that still
+/// binds loopback.
+#[test]
+fn a_config_rnsd_reads_as_the_same_listener_and_transport_serves_coyote() {
+    let bash = bash_or_skip!();
+    let home = Home::new("serves-variants");
+    home.seed_rnsd();
+    let config = home.reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+
+    for text in [
+        SERVES_COYOTE.replace("listen_port = 4242", "port = 4242"),
+        SERVES_COYOTE.replace("listen_port = 4242", "listen_port = 4965\n    port = 4242"),
+        SERVES_COYOTE.replace("enable_transport = True", "enable_transport = On"),
+        SERVES_COYOTE.replace("enable_transport = True", "enable_transport = 1 # relay"),
+        SERVES_COYOTE.replace("enabled = Yes", "interface_enabled = TRUE"),
+        SERVES_COYOTE.replace("enabled = Yes", "enabled = on"),
+        SERVES_COYOTE.replace("listen_ip = 127.0.0.1", "listen_ip = 0.0.0.0"),
+        SERVES_COYOTE.replace("    listen_ip = 127.0.0.1\n", ""),
+    ] {
+        fs::write(&config, &text).unwrap();
+        let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
+        assert_eq!(code, 0, "{text}\nstdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains("Next: start coyote and run `.mesh on`"),
+            "{text}\n{out}"
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+    }
+}
+
 /// A config that serves Coyote proceeds as before, and still counts the public hosts it
-/// dials; with none, the note is not printed.
+/// dials, in the singular for one; with none, the note is not printed.
 #[test]
 fn a_config_that_serves_coyote_proceeds_and_counts_the_public_nodes_it_dials() {
     let bash = bash_or_skip!();
@@ -659,6 +718,17 @@ fn a_config_that_serves_coyote_proceeds_and_counts_the_public_nodes_it_dials() {
         "{out}"
     );
     assert_eq!(fs::read_to_string(&config).unwrap(), dialing);
+
+    let one = format!(
+        "{SERVES_COYOTE}  [[Routable]]\n    type = TCPClientInterface\n    enabled = yes\n    target_host = 203.0.113.7\n    target_port = 4242\n"
+    );
+    fs::write(&config, &one).unwrap();
+    let (code, out, err) = run(&mut home.relay(&bash, &["--no-service"]));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains("Note: this config also dials 1 public Reticulum node; your announces reach them (see mesh.display_name_on_public)."),
+        "{out}"
+    );
 
     fs::write(&config, SERVES_COYOTE).unwrap();
     let (code, out, _) = run(&mut home.relay(&bash, &["--no-service"]));
@@ -1695,7 +1765,7 @@ fn an_rnsd_on_path_is_linked_into_bin_dir_and_no_installer_runs() {
     let config = home.reticulum_config();
     fs::write(
         &config,
-        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[Loop]]\n    type = TCPServerInterface\n    listen_ip = 127.0.0.1\n    listen_port = 4242\n",
+        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[Loop]]\n    type = TCPServerInterface\n    enabled = Yes\n    listen_ip = 127.0.0.1\n    listen_port = 4242\n",
     )
     .unwrap();
     let before = fs::read(&config).unwrap();

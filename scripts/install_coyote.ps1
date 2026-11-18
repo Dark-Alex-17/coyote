@@ -86,18 +86,43 @@ function Invoke-MeshRelay {
     }
   }
 
+  # The relay's errors are also kept: its exit 2 means either no way to install rnsd or an
+  # existing Reticulum config that cannot serve Coyote, and only its own sentence tells
+  # them apart.
   $rc = 0
+  $errors = New-Object System.Collections.Generic.List[string]
   try {
     if ($isWin) {
-      & $relay -BinDir $BinDir
+      # mesh-relay.ps1 runs in this session and writes its errors to [Console]::Error.
+      $consoleError = [Console]::Error
+      $captured = New-Object System.IO.StringWriter
+      [Console]::SetError($captured)
+      try {
+        & $relay -BinDir $BinDir
+      } finally {
+        [Console]::SetError($consoleError)
+        $consoleError.Write($captured.ToString())
+        $errors.Add($captured.ToString())
+      }
     } else {
       $env:BIN_DIR = $BinDir
-      & bash $relay
+      & bash $relay 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+          [Console]::Error.WriteLine("$_")
+          $errors.Add("$_")
+        } else {
+          $_
+        }
+      }
     }
     $rc = $LASTEXITCODE
   } catch {
     $script:MeshFailure = "mesh setup failed: $_"
     $rc = 1
+  }
+  if ($rc -eq 2 -and ($errors -join "`n").Contains('so this rnsd would not serve Coyote')) {
+    $script:MeshConfigGap = $true
+    $script:MeshFailure = 'mesh setup stopped at your existing Reticulum config: that config needs the settings above (or move it aside)'
   }
   if ($rc -ne 0 -and -not $script:MeshFailure) { $script:MeshFailure = "mesh setup exited with code $rc" }
   $script:MeshRc = $rc
@@ -116,6 +141,7 @@ if ($isWin) {
   $isAdmin = ((& id -u | Out-String).Trim() -eq '0')
 }
 $script:MeshFailure = ''
+$script:MeshConfigGap = $false
 $script:MeshRc = 0
 $script:MeshExplicitRc = 0
 
@@ -315,8 +341,12 @@ try {
     Invoke-MeshRelay
     $script:MeshExplicitRc = $script:MeshRc
     if ($script:MeshExplicitRc -ne 0) {
-      $retryAs = if ($isAdmin) { ' as your normal user' } else { '' }
-      [Console]::Error.WriteLine("[coyote-install] Error: $script:MeshFailure; coyote itself is installed. Retry with: $(Get-MeshCommand)$retryAs")
+      if ($script:MeshConfigGap) {
+        [Console]::Error.WriteLine("[coyote-install] Error: $script:MeshFailure; coyote itself is installed.")
+      } else {
+        $retryAs = if ($isAdmin) { ' as your normal user' } else { '' }
+        [Console]::Error.WriteLine("[coyote-install] Error: $script:MeshFailure; coyote itself is installed. Retry with: $(Get-MeshCommand)$retryAs")
+      }
     }
   } elseif (-not (Test-Path -LiteralPath (Join-Path $BinDir $rnsdName))) {
     if ($isAdmin) {
@@ -327,7 +357,7 @@ try {
         Invoke-MeshRelay
         if ($script:MeshRc -ne 0) {
           Write-Info "$script:MeshFailure; coyote itself is installed."
-          Write-MeshPointer
+          if (-not $script:MeshConfigGap) { Write-MeshPointer }
         }
       } else {
         Write-MeshPointer

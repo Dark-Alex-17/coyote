@@ -206,10 +206,10 @@ struct Tools {
 }
 
 impl Tools {
-    const BASE: [&'static str; 24] = [
+    const BASE: [&'static str; 25] = [
         "sh", "bash", "id", "mktemp", "mkdir", "rm", "rmdir", "dirname", "basename", "chmod", "mv",
         "cp", "ln", "cat", "head", "grep", "sleep", "tar", "gzip", "install", "find", "tr", "sed",
-        "sort",
+        "sort", "tee",
     ];
 
     fn new(home: &Home) -> Self {
@@ -574,6 +574,38 @@ fn with_the_flag_and_no_sibling_a_failed_relay_is_an_error_on_stderr_and_exit_3(
         "the relay's exit code is named:\n{err}"
     );
     assert!(out.contains("Done. Try: coyote --help"), "{out}");
+
+    // Exit 2 with the relay's own sentence: the existing Reticulum config needs editing,
+    // so the installer says so and offers no plain retry.
+    tools.serve_relay(&config_gap_relay());
+    let (code, out, err) = run(&mut home.install(&bash, &copy, &["--with-mesh"], &tools));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains(CONFIG_GAP_SENTENCE),
+        "the relay's error reaches stderr:\n{err}"
+    );
+    assert!(
+        err.contains("[coyote-install] Error: mesh setup stopped at your existing Reticulum config: that config needs the settings above (or move it aside); coyote itself is installed."),
+        "{err}"
+    );
+    assert!(!err.contains("Retry with"), "{err}");
+
+    // Exit 2 without it (no way to install rnsd, an unsupported OS) keeps the retry.
+    tools.serve_relay("echo 'no way to install rnsd' >&2\nexit 2\n");
+    let (code, out, err) = run(&mut home.install(&bash, &copy, &["--with-mesh"], &tools));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains("mesh setup exited with code 2") && err.contains("Retry with: curl -fsSL "),
+        "{err}"
+    );
+}
+
+/// The explanation the relay prints before its exit 2 on a config that cannot serve Coyote.
+const CONFIG_GAP_SENTENCE: &str = "[coyote-mesh] Error: Your Reticulum config at /home/me/.reticulum/config has enable_transport off, so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again.";
+
+/// A relay stub that stops the way the real one does on such a config.
+fn config_gap_relay() -> String {
+    format!("echo '{CONFIG_GAP_SENTENCE}' >&2\nexit 2\n")
 }
 
 #[test]
@@ -904,6 +936,21 @@ fn the_powershell_installer_points_fetches_and_exits_3_the_same_way_as_the_bash_
         err.trim_end().ends_with("as your normal user"),
         "the retry hint is addressed to the normal user:\n{err}"
     );
+
+    // -WithMesh with the relay stopping on a config that cannot serve Coyote: exit 3, the
+    // relay's sentence passes through and the installer offers no plain retry.
+    let home = Home::new("pwsh-config-gap");
+    let tools = Tools::new(&home);
+    tools.serve_relay(&config_gap_relay());
+    let driver = PwshDriver::new(&home, &tools);
+    let (code, out, err) = driver.run(&pwsh, &home, &["-WithMesh"]);
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains(CONFIG_GAP_SENTENCE), "{err}");
+    assert!(
+        err.contains("[coyote-install] Error: mesh setup stopped at your existing Reticulum config: that config needs the settings above (or move it aside); coyote itself is installed."),
+        "{err}"
+    );
+    assert!(!err.contains("Retry with"), "{err}");
 
     // An rnsd already in BinDir: an upgrade, so no pointer.
     let home = Home::new("pwsh-upgrade");

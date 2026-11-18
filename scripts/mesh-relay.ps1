@@ -49,6 +49,12 @@ $TaskName = 'Coyote rnsd'
 $ListenPort = 4242
 # The override exists for the test harness; operators get the documented 30 s.
 $ReadyTimeoutSeconds = if ($env:COYOTE_MESH_READY_TIMEOUT) { [int]$env:COYOTE_MESH_READY_TIMEOUT } else { 30 }
+# How long a stopped task's rnsd gets to let go of 127.0.0.1:4242 before the restart is
+# given up on; the harness shortens it.
+$StopWaitSeconds = 10
+# The values ConfigObj's as_bool reads as true, which is how rnsd reads enabled and
+# enable_transport. PowerShell's -match is case-insensitive.
+$TrueValue = '(yes|true|on|1)(\s|#|$)'
 
 function Write-Usage {
   Write-Output 'coyote mesh relay setup (Windows): install rnsd, write its config, run it as a Scheduled Task'
@@ -215,55 +221,74 @@ function Test-ConfigEnablesAutoInterface {
   return ($inAuto -and $enabled)
 }
 
-function Test-ConfigEnablesTransport {
-  param([string]$Path)
-  return [bool](Select-String -LiteralPath $Path -Pattern '^\s*enable_transport\s*=\s*(true|yes)' -Quiet)
-}
-
-# True for a target_host outside loopback and the RFC1918 ranges. A name other than
-# localhost counts as public: what it resolves to is not this script's to guess.
+# True for a target_host outside loopback, RFC1918, CGNAT (100.64/10), IPv4 link-local
+# and IPv6 ULA and link-local. A name other than localhost counts as public: what it
+# resolves to is not this script's to guess.
 function Test-PublicHost {
   param([string]$Target)
   if ($Target -eq 'localhost' -or $Target -eq '::1') { return $false }
+  if ($Target -match '^f[cd][0-9a-f]{2}:' -or $Target -match '^fe[89ab][0-9a-f]:') { return $false }
   if ($Target -match '^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$') {
     $a = [int]$Matches[1]
     $b = [int]$Matches[2]
     if ($a -eq 10 -or $a -eq 127) { return $false }
     if ($a -eq 172 -and $b -ge 16 -and $b -le 31) { return $false }
     if ($a -eq 192 -and $b -eq 168) { return $false }
+    if ($a -eq 100 -and $b -ge 64 -and $b -le 127) { return $false }
+    if ($a -eq 169 -and $b -eq 254) { return $false }
   }
   return $true
 }
 
-# The existing config's stanzas: ServesSessions when an enabled TCPServerInterface listens
-# on $ListenPort, and PublicDials, the enabled TCPClientInterface stanzas that dial a public host.
+# The existing config read as rnsd would: ServesSessions when an enabled TCPServerInterface
+# listens on 127.0.0.1:$ListenPort, Transport when the [reticulum] section turns
+# enable_transport on, and PublicDials, the enabled TCPClientInterface stanzas that dial a
+# public host. rnsd brings a stanza up only when enabled or interface_enabled is true, so a
+# stanza without either stays off; port wins over listen_port, as in RNS TCPInterface.py.
 function Read-ExistingConfig {
   param([string]$Path)
   $stanzas = New-Object System.Collections.Generic.List[hashtable]
-  $current = @{ Type = ''; Enabled = $true; Port = ''; Target = '' }
+  $section = ''
+  $transport = $false
+  $current = @{ Type = ''; Enabled = $false; ListenPort = ''; Port = ''; Target = ''; ListenIp = ''; Device = $false }
   foreach ($line in [IO.File]::ReadAllLines($Path)) {
     if ($line -match '^\s*\[') {
       $stanzas.Add($current)
-      $current = @{ Type = ''; Enabled = $true; Port = ''; Target = '' }
+      $current = @{ Type = ''; Enabled = $false; ListenPort = ''; Port = ''; Target = ''; ListenIp = ''; Device = $false }
+      if ($line -match '^\s*\[\[') {
+        $section += '/'
+      } elseif ($line -match '^\s*\[([^\]]*)\]') {
+        $section = $Matches[1]
+      }
+    } elseif ($section -ceq 'reticulum' -and $line -cmatch "^\s*enable_transport\s*=\s*(?i:$TrueValue)") {
+      $transport = $true
     } elseif ($line -match '^\s*type\s*=\s*([A-Za-z]+)') {
       $current.Type = $Matches[1]
-    } elseif ($line -match '^\s*(interface_)?enabled\s*=\s*(no|false|0)\b') {
-      $current.Enabled = $false
+    } elseif ($line -cmatch "^\s*(interface_)?enabled\s*=\s*(?i:$TrueValue)") {
+      $current.Enabled = $true
     } elseif ($line -match '^\s*listen_port\s*=\s*(\d+)') {
+      $current.ListenPort = $Matches[1]
+    } elseif ($line -match '^\s*port\s*=\s*(\d+)') {
       $current.Port = $Matches[1]
     } elseif ($line -match '^\s*target_host\s*=\s*([^\s#]+)') {
       $current.Target = $Matches[1]
+    } elseif ($line -match '^\s*listen_ip\s*=\s*([^\s#]+)') {
+      $current.ListenIp = $Matches[1]
+    } elseif ($line -match '^\s*device\s*=') {
+      $current.Device = $true
     }
   }
   $stanzas.Add($current)
   $serves = $false
   $public = 0
+  $loopbackIps = @('', '127.0.0.1', '0.0.0.0', 'localhost', '::', '::1')
   foreach ($stanza in $stanzas) {
     if (-not $stanza.Enabled) { continue }
-    if ($stanza.Type -eq 'TCPServerInterface' -and $stanza.Port -eq "$ListenPort") { $serves = $true }
+    $port = if ($stanza.Port) { $stanza.Port } else { $stanza.ListenPort }
+    if ($stanza.Type -eq 'TCPServerInterface' -and $port -eq "$ListenPort" -and -not $stanza.Device -and $loopbackIps -ccontains $stanza.ListenIp) { $serves = $true }
     if ($stanza.Type -eq 'TCPClientInterface' -and $stanza.Target -and (Test-PublicHost -Target $stanza.Target)) { $public++ }
   }
-  return @{ ServesSessions = $serves; PublicDials = $public }
+  return @{ ServesSessions = $serves; Transport = $transport; PublicDials = $public }
 }
 
 # An rnsd on this config would never open 127.0.0.1:$ListenPort or would not relay between
@@ -368,8 +393,7 @@ function Get-OemEncoding {
 function Write-Config {
   if (Test-Path -LiteralPath $script:RnsConfig -PathType Leaf) {
     $stanzas = Read-ExistingConfig -Path $script:RnsConfig
-    $transport = Test-ConfigEnablesTransport -Path $script:RnsConfig
-    if ($script:RelayHost -and $stanzas.ServesSessions -and $transport -and (Test-ConfigIsOwn -Path $script:RnsConfig)) {
+    if ($script:RelayHost -and $stanzas.ServesSessions -and $stanzas.Transport -and (Test-ConfigIsOwn -Path $script:RnsConfig)) {
       Add-TeamRelay
       return
     }
@@ -379,9 +403,10 @@ function Write-Config {
     Write-Output (Get-InterfaceText)
     Write-Output ''
     if ($stanzas.PublicDials -gt 0) {
-      Write-Info "Note: this config also dials $($stanzas.PublicDials) public Reticulum nodes; your announces reach them (see mesh.display_name_on_public)."
+      $nodes = if ($stanzas.PublicDials -eq 1) { 'node' } else { 'nodes' }
+      Write-Info "Note: this config also dials $($stanzas.PublicDials) public Reticulum $nodes; your announces reach them (see mesh.display_name_on_public)."
     }
-    Assert-ConfigServesCoyote -ServesSessions $stanzas.ServesSessions -Transport $transport
+    Assert-ConfigServesCoyote -ServesSessions $stanzas.ServesSessions -Transport $stanzas.Transport
     if (Test-ConfigEnablesAutoInterface -Path $script:RnsConfig) { Write-FirewallWarning }
     if ($script:RelayHost) { $script:RelayForHandEdit = $true }
     return
@@ -739,6 +764,16 @@ function Wait-Ready {
   exit 3
 }
 
+# True once 127.0.0.1:$ListenPort is closed, polled for up to $StopWaitSeconds.
+function Wait-LoopbackPortClosed {
+  $deadline = [DateTime]::UtcNow.AddSeconds($StopWaitSeconds)
+  do {
+    if (-not (Test-LoopbackPort)) { return $true }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTime]::UtcNow -lt $deadline)
+  return $false
+}
+
 # Wrapped in a function so tests can replace it: the static call throws off-Windows.
 function Get-CurrentUserName {
   return [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -800,7 +835,8 @@ function Install-Service {
       Write-Info "Scheduled Task '$TaskName' already registered"
     } else {
       # The stored definition is updated like the unit/plist on the other platforms; a
-      # running task keeps the old definition until it is restarted, which stays the user's call.
+      # running task keeps the old definition until it is restarted, which stays the user's
+      # call unless -Relay added a stanza and the restart for it applies the definition too.
       $changed = $true
       Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
       Write-Info "Updated Scheduled Task '$TaskName'"
@@ -811,13 +847,19 @@ function Install-Service {
     $existing = Get-ScheduledTask -TaskName $TaskName
   }
   if ($existing.State -eq 'Running') {
-    if ($changed) {
-      Write-Info "Note: the service definition changed; apply it with: Stop-ScheduledTask -TaskName '$TaskName'; Start-ScheduledTask -TaskName '$TaskName'"
-    } elseif ($script:RelayAdded) {
+    if ($script:RelayAdded) {
       Write-Info "Restarting '$TaskName' so it dials the new [[Team Relay]]..."
       Stop-ScheduledTask -TaskName $TaskName
+      # Stopping the task ends cmd.exe; the rnsd it started can outlive it and keep the port.
+      if (-not (Wait-LoopbackPortClosed)) {
+        Write-Info "rnsd is still running from before: 127.0.0.1:$ListenPort stayed open for $StopWaitSeconds s after Stop-ScheduledTask, so '$TaskName' was not started again. Stop that rnsd with: Stop-Process -Id (Get-NetTCPConnection -LocalPort $ListenPort -State Listen).OwningProcess, then run: Start-ScheduledTask -TaskName '$TaskName'"
+        Write-Info "Logs: $script:LogFile"
+        return
+      }
       Start-ScheduledTask -TaskName $TaskName
       $script:RnsdReload = 'restarted'
+    } elseif ($changed) {
+      Write-Info "Note: the service definition changed; apply it with: Stop-ScheduledTask -TaskName '$TaskName'; Start-ScheduledTask -TaskName '$TaskName'"
     } else {
       Write-Info "'$TaskName' is already running; not restarted"
     }

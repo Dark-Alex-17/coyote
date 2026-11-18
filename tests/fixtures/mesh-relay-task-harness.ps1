@@ -35,6 +35,12 @@ $script:RnsDir = Join-Path $root '.reticulum'
 $script:LogFile = Join-Path (Join-Path $root 'logs') 'rnsd.log'
 $script:RelayAdded = $false
 $script:RnsdReload = ''
+$script:RelayHost = 'relay.example'
+$script:RelayPort = '4242'
+$script:RelayForHandEdit = $false
+$script:RnsConfig = Join-Path $script:RnsDir 'config'
+$script:StopWaitSeconds = 1
+$script:PortStaysOpen = $false
 $testUser = 'TESTHOST\tester'
 
 function Add-Call([string]$Line) {
@@ -47,6 +53,12 @@ function Get-CurrentUserName {
 
 function Wait-Ready {
   Add-Call 'Wait-Ready'
+}
+
+# The port probe answers from the scenario, never from a real listener on this host.
+function Test-LoopbackPort {
+  Add-Call 'Test-LoopbackPort'
+  return $script:PortStaysOpen
 }
 
 # PSScriptAnalyzer wants SupportsShouldProcess on New-/Set-/Register-/Start- verbs and,
@@ -179,10 +191,20 @@ switch ($Scenario) {
     $script:RelayAdded = $true
   }
   'changed-arguments-running' { Initialize-Store 'Running' '/c stale' 'MSFT_TaskLogonTrigger' }
+  'changed-arguments-running-relay-added' {
+    Initialize-Store 'Running' '/c stale' 'MSFT_TaskLogonTrigger'
+    $script:RelayAdded = $true
+  }
+  'unchanged-running-relay-added-port-stays-open' {
+    Initialize-Store 'Running' $desiredArguments 'MSFT_TaskLogonTrigger'
+    $script:RelayAdded = $true
+    $script:PortStaysOpen = $true
+  }
   'changed-trigger-running' { Initialize-Store 'Running' $desiredArguments 'MSFT_TaskDailyTrigger' }
   'stale-ready' { Initialize-Store 'Ready' '/c stale' 'MSFT_TaskLogonTrigger' }
   default { throw "unknown scenario '$Scenario'" }
 }
 
 Install-Service
+if ($script:RelayAdded) { Write-NextStep }
 exit 0

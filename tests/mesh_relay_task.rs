@@ -247,6 +247,58 @@ fn a_running_task_is_restarted_once_after_the_relay_stanza_was_added() {
     assert_eq!(run.state(), "Running", "{out}");
 }
 
+/// A changed definition and an added `[[Team Relay]]` stanza: the definition is stored and
+/// the running task is restarted once, which applies both, and the closing line says so.
+#[test]
+fn a_running_task_whose_definition_changed_is_restarted_when_the_relay_stanza_was_added() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "changed-arguments-running-relay-added");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    assert_eq!(
+        run.call_count("Set-ScheduledTask -Action -Trigger -Principal -Settings"),
+        1,
+        "{out}"
+    );
+    assert_eq!(run.call_count("Stop-ScheduledTask"), 1, "{out}");
+    assert_eq!(run.call_count("Start-ScheduledTask"), 1, "{out}");
+    assert_eq!(run.call_count("Wait-Ready"), 1, "{out}");
+    assert!(!run.stdout.contains(CHANGED_NOTE), "{out}");
+    let added = format!(
+        "Added [[Team Relay]] -> relay.example:4242 to {} and restarted 'Coyote rnsd'.",
+        run.dir.join(".reticulum").join("config").display()
+    );
+    assert!(run.stdout.contains(&added), "{out}");
+    assert_eq!(run.state(), "Running", "{out}");
+    run.assert_store_holds_the_desired_shape();
+}
+
+/// The rnsd a stopped task started can outlive cmd.exe and keep 127.0.0.1:4242: the task
+/// is not started on top of it, the user is told how to stop it, and nothing claims a
+/// restart.
+#[test]
+fn a_relay_restart_whose_old_rnsd_keeps_the_port_says_so_and_claims_no_restart() {
+    let pwsh = pwsh_or_skip!();
+    let run = Scenario::run(&pwsh, "unchanged-running-relay-added-port-stays-open");
+    let out = run.transcript();
+    assert_eq!(run.code, 0, "{out}");
+    assert_eq!(run.call_count("Stop-ScheduledTask"), 1, "{out}");
+    assert_eq!(run.call_count("Start-ScheduledTask"), 0, "{out}");
+    assert_eq!(run.call_count("Wait-Ready"), 0, "{out}");
+    assert!(run.call_count("Test-LoopbackPort") >= 1, "{out}");
+    assert!(
+        run.stdout.contains("rnsd is still running from before")
+            && run.stdout.contains("Stop-Process -Id (Get-NetTCPConnection -LocalPort 4242 -State Listen).OwningProcess")
+            && run.stdout.contains("then run: Start-ScheduledTask -TaskName 'Coyote rnsd'"),
+        "{out}"
+    );
+    assert!(!run.stdout.contains("restarted"), "{out}");
+    assert!(
+        run.stdout.contains("Restart rnsd so it dials the relay: "),
+        "{out}"
+    );
+}
+
 /// A changed action and a changed trigger are both stored with one full
 /// `Set-ScheduledTask`, the running instance is left alone and the restart pair is
 /// printed. The trigger case is what an action-only compare could not see.

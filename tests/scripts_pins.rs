@@ -70,8 +70,9 @@ fn relay_scripts_default_to_the_dockerfile_rns_version() {
                 let found = found.unwrap().as_str();
                 let is_the_spec = line.contains(&spec) && found == version;
                 let is_loopback = found == "127.0.0" && line.contains("127.0.0.1");
+                let is_any_address = found == "0.0.0" && line.contains("0.0.0.0");
                 assert!(
-                    is_the_spec || is_loopback,
+                    is_the_spec || is_loopback || is_any_address,
                     "{name}:{} carries the version literal {found:?} outside the `{spec}` constant; a bump would leave it stale: {line}",
                     line_no + 1
                 );
@@ -161,14 +162,18 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
         );
     }
     let relay_branch = ps1
-        .split("} elseif ($script:RelayAdded) {")
+        .split("    if ($script:RelayAdded) {")
         .nth(1)
-        .and_then(|rest| rest.split("} else {").next())
+        .and_then(|rest| rest.split("} elseif ($changed) {").next())
         .expect("mesh-relay.ps1 restarts a running task after adding the [[Team Relay]] stanza");
-    let stop_lines: Vec<&str> = ps1
+    assert!(
+        relay_branch.contains("Stop-ScheduledTask -TaskName $TaskName"),
+        "the [[Team Relay]] restart branch was not found: {relay_branch}"
+    );
+    let outside_relay_branch = ps1.replacen(relay_branch, "", 1);
+    let stop_lines: Vec<&str> = outside_relay_branch
         .lines()
         .filter(|line| line.contains("Stop-ScheduledTask"))
-        .filter(|line| !relay_branch.lines().any(|branch| branch == *line))
         .collect();
     assert!(
         !stop_lines.is_empty()
@@ -1263,7 +1268,7 @@ fn relay_scripts_stop_on_a_config_that_cannot_serve_coyote_and_edit_only_their_o
             "has enable_transport off",
             ", so this rnsd would not serve Coyote. Add the settings above (or move the file aside and run this script again), then run it again.",
             "Note: this config also dials ",
-            " public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).",
+            " public Reticulum $nodes; your announces reach them (see mesh.display_name_on_public).",
             "Added [[Team Relay]] -> ",
             "Next: add the [[Team Relay]] stanza above to ",
         ] {
@@ -1286,6 +1291,7 @@ fn relay_scripts_stop_on_a_config_that_cannot_serve_coyote_and_edit_only_their_o
     }
     for needle in [
         "Stop-ScheduledTask -TaskName $TaskName",
+        "rnsd is still running from before",
         "Would add [[Team Relay]] -> ",
     ] {
         assert!(ps1.contains(needle), "mesh-relay.ps1 lacks {needle:?}");

@@ -316,6 +316,9 @@ jobs:
         "${relay[@]}" --no-service --relay relay.example:4242
         [ "$(grep -c '^  \[\[Team Relay\]\]$' "$cfg")" -eq 1 ]
         grep -q 'target_host = relay.example' "$cfg"
+        relayed=$(shasum -a 256 "$cfg")
+        "${relay[@]}" --no-service --relay relay.example:4242
+        [ "$(shasum -a 256 "$cfg")" = "$relayed" ]
         echo "::endgroup::"
 
         echo "::group::an existing config that cannot serve Coyote is printed around, never touched, and stops with exit 2"
@@ -329,7 +332,36 @@ jobs:
         cmp "$RUNNER_TEMP/expected-config" "$home2/.reticulum/config"
         grep -q '\[\[Team Relay\]\]' <<<"$out"
         grep -q 'target_host = relay.example' <<<"$out"
-        grep -q 'so this rnsd would not serve Coyote' <<<"$out"
+        grep -qF "Error: Your Reticulum config at $home2/.reticulum/config has no [[Coyote Sessions]] stanza on 127.0.0.1:4242 and enable_transport is off, so this rnsd would not serve Coyote." <<<"$out"
+        echo "::endgroup::"
+
+        echo "::group::a stale config that dials public nodes is told so before the exit 2"
+        home4="$RUNNER_TEMP/mesh-home-stale"
+        mkdir -p "$home4/.reticulum"
+        printf '%s\n' '[reticulum]' 'enable_transport = no' '[interfaces]' \
+          '  [[Dublin]]' '    type = TCPClientInterface' '    enabled = yes' '    target_host = dublin.connect.reticulum.network' '    target_port = 4965' \
+          '  [[Routable]]' '    type = TCPClientInterface' '    enabled = yes' '    target_host = 203.0.113.7' '    target_port = 4242' \
+          '  [[Home]]' '    type = TCPClientInterface' '    enabled = yes' '    target_host = 192.168.1.20' '    target_port = 4242' \
+          > "$home4/.reticulum/config"
+        rc=0; out=$(HOME="$home4" "${relay[@]}" --no-service 2>&1) || rc=$?
+        printf '%s\n' "$out"
+        [ "$rc" -eq 2 ]
+        grep -qF 'Note: this config also dials 2 public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).' <<<"$out"
+        grep -qF "Error: Your Reticulum config at $home4/.reticulum/config has no [[Coyote Sessions]] stanza on 127.0.0.1:4242 and enable_transport is off, so this rnsd would not serve Coyote." <<<"$out"
+        echo "::endgroup::"
+
+        echo "::group::--relay on a foreign config that serves Coyote writes nothing and says where the stanza goes"
+        home5="$RUNNER_TEMP/mesh-home-foreign"
+        mkdir -p "$home5/.reticulum"
+        printf '%s\n' '[reticulum]' 'enable_transport = True' '[interfaces]' \
+          '  [[Loop]]' '    type = TCPServerInterface' '    enabled = Yes' '    listen_ip = 127.0.0.1' '    listen_port = 4242' \
+          > "$home5/.reticulum/config"
+        foreign=$(shasum -a 256 "$home5/.reticulum/config")
+        out=$(HOME="$home5" "${relay[@]}" --no-service --relay relay.example:4242)
+        printf '%s\n' "$out"
+        grep -qF "Next: add the [[Team Relay]] stanza above to $home5/.reticulum/config, then " <<<"$out"
+        if grep -qF '.mesh on' <<<"$out"; then echo "::error::a foreign config was told to run .mesh on"; exit 1; fi
+        [ "$(shasum -a 256 "$home5/.reticulum/config")" = "$foreign" ]
         echo "::endgroup::"
 
         echo "::group::a config under ~/.config/reticulum is the one rnsd reads"
@@ -386,7 +418,7 @@ jobs:
         $ErrorActionPreference = 'Stop'
         $relay = 'scripts/mesh-relay.ps1'
         function Invoke-Relay([int]$Expect, [string[]]$Flags) {
-          $out = @(& pwsh -NoProfile -File $relay @Flags)
+          $out = @(& pwsh -NoProfile -File $relay @Flags 2>&1 | ForEach-Object { "$_" })
           if ($LASTEXITCODE -ne $Expect) {
             $out | Write-Output
             throw "expected exit $Expect, got $LASTEXITCODE for: $($Flags -join ' ')"
@@ -448,6 +480,9 @@ jobs:
         $relayed = Get-Content -Raw -LiteralPath $cfg
         if (([regex]::Matches($relayed, '(?m)^  \[\[Team Relay\]\]\r?$')).Count -ne 1) { throw 'the written config does not hold one [[Team Relay]] stanza' }
         if ($relayed -notmatch 'target_host = relay\.example') { throw 'the [[Team Relay]] stanza lacks target_host = relay.example' }
+        $relayedHash = (Get-FileHash -Algorithm SHA256 $cfg).Hash
+        Invoke-Relay 0 @('-NoService', '-AllowRoot', '-Relay', 'relay.example:4242') | Write-Output
+        if ((Get-FileHash -Algorithm SHA256 $cfg).Hash -ne $relayedHash) { throw 'the same -Relay again changed the config' }
         Write-Output '::endgroup::'
 
         Write-Output '::group::an existing config that cannot serve Coyote is printed around, never touched, and stops with exit 2'
@@ -468,6 +503,51 @@ jobs:
         $joined = $out -join "`n"
         if ($joined -notmatch '\[\[Team Relay\]\]') { throw 'stanzas lack [[Team Relay]]' }
         if ($joined -notmatch 'target_host = relay\.example') { throw 'stanzas lack target_host = relay.example' }
+        if (-not $joined.Contains("Error: Your Reticulum config at $cfg2 has no [[Coyote Sessions]] stanza on 127.0.0.1:4242 and enable_transport is off, so this rnsd would not serve Coyote.")) { throw 'the exit 2 is not explained' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::a stale config that dials public nodes is told so before the exit 2'
+        $home4 = Join-Path $env:RUNNER_TEMP 'mesh-home-stale'
+        New-Item -ItemType Directory -Force -Path (Join-Path $home4 '.reticulum') | Out-Null
+        $cfg4 = Join-Path $home4 '.reticulum\config'
+        Set-Content -Path $cfg4 -Value @(
+          '[reticulum]', 'enable_transport = no', '[interfaces]',
+          '  [[Dublin]]', '    type = TCPClientInterface', '    enabled = yes', '    target_host = dublin.connect.reticulum.network', '    target_port = 4965',
+          '  [[Routable]]', '    type = TCPClientInterface', '    enabled = yes', '    target_host = 203.0.113.7', '    target_port = 4242',
+          '  [[Home]]', '    type = TCPClientInterface', '    enabled = yes', '    target_host = 192.168.1.20', '    target_port = 4242'
+        )
+        $env:USERPROFILE = $home4
+        try {
+          $out = Invoke-Relay 2 @('-NoService', '-AllowRoot')
+        } finally {
+          $env:USERPROFILE = $mainHome
+        }
+        $out | Write-Output
+        $joined = $out -join "`n"
+        if (-not $joined.Contains('Note: this config also dials 2 public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).')) { throw 'the public-nodes Note is missing' }
+        if (-not $joined.Contains("Error: Your Reticulum config at $cfg4 has no [[Coyote Sessions]] stanza on 127.0.0.1:4242 and enable_transport is off, so this rnsd would not serve Coyote.")) { throw 'the exit 2 is not explained' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::-Relay on a foreign config that serves Coyote writes nothing and says where the stanza goes'
+        $home5 = Join-Path $env:RUNNER_TEMP 'mesh-home-foreign'
+        New-Item -ItemType Directory -Force -Path (Join-Path $home5 '.reticulum') | Out-Null
+        $cfg5 = Join-Path $home5 '.reticulum\config'
+        Set-Content -Path $cfg5 -Value @(
+          '[reticulum]', 'enable_transport = True', '[interfaces]',
+          '  [[Loop]]', '    type = TCPServerInterface', '    enabled = Yes', '    listen_ip = 127.0.0.1', '    listen_port = 4242'
+        )
+        $before5 = (Get-FileHash -Algorithm SHA256 $cfg5).Hash
+        $env:USERPROFILE = $home5
+        try {
+          $out = Invoke-Relay 0 @('-NoService', '-AllowRoot', '-Relay', 'relay.example:4242')
+        } finally {
+          $env:USERPROFILE = $mainHome
+        }
+        $out | Write-Output
+        $joined = $out -join "`n"
+        if (-not $joined.Contains("Next: add the [[Team Relay]] stanza above to $cfg5, then ")) { throw 'the closing line does not say where the stanza goes' }
+        if ($joined.Contains('.mesh on')) { throw 'a foreign config was told to run .mesh on' }
+        if ((Get-FileHash -Algorithm SHA256 $cfg5).Hash -ne $before5) { throw 'a foreign config was modified' }
         Write-Output '::endgroup::'
 
         Write-Output '::group::a config under %USERPROFILE%\.config\reticulum is the one rnsd reads'
