@@ -2669,8 +2669,8 @@ pub struct ToolAgent {
     pub script: bool,
 }
 
-/// Inside an agent only its own bin dir, so a tool missing from its
-/// `global_tools` cannot be reached through PATH.
+/// Inside an agent the global functions bin is not prepended, so a global
+/// tool the agent does not declare is not found there.
 pub(crate) fn tool_bin_dirs(agent: Option<&ToolAgent>) -> Vec<PathBuf> {
     match agent {
         Some(agent) => {
@@ -5976,7 +5976,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_error_names_the_missing_executable_and_searched_dirs() {
+    fn spawn_error_names_a_failed_start_and_the_searched_dirs() {
         let dirs = [
             PathBuf::from("/agents/a/bin"),
             PathBuf::from("/functions/bin"),
@@ -6044,6 +6044,8 @@ mod tests {
         fs::write(&tool, "#!/nonexistent/interpreter\n").unwrap();
         fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
 
+        // A freshly written script can still be open for writing in a forked
+        // child elsewhere in the process, making exec fail with ETXTBSY.
         let mut attempts = 0;
         let err = loop {
             let err = run_llm_function(

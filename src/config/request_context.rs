@@ -5869,8 +5869,8 @@ impl RequestContext {
         self.skill_registry.loaded_mcp_servers(agent_gate.as_ref())
     }
 
-    /// A server the user enabled on the session stays usable; only what skills
-    /// grant is held to the agent's declaration.
+    /// A server the user enabled on the session stays usable even when the
+    /// agent does not declare it; anything else (in practice a skill grant) is refused.
     pub(crate) fn mcp_server_refusal(&self, server: &str) -> Option<String> {
         let agent = self.agent.as_ref()?;
         if AgentToolGate::new(agent, &self.app.config).allows_mcp_server(server) {
