@@ -319,10 +319,13 @@ fn accept_clients(
         if shared.delivery.lock().unwrap().closed {
             return;
         }
-        if let Err(err) = win::connect(&pipe) {
-            debug!("Prompt reply client left before it was accepted: {err}");
-            continue;
-        }
+        let arrival = match win::connect(&pipe) {
+            Ok(arrival) => arrival,
+            Err(err) => {
+                debug!("Prompt reply pipe instance failed while listening: {err}");
+                continue;
+            }
+        };
         if shared.delivery.lock().unwrap().closed {
             return;
         }
@@ -334,7 +337,13 @@ fn accept_clients(
         if delivery.closed {
             return;
         }
-        delivery.clients.push_back(pipe);
+        match arrival {
+            win::Arrival::Present => delivery.clients.push_back(pipe),
+            // Opened and closed before the accept (Git Bash probing the
+            // path): nothing to serve, and the instance must be
+            // disconnected before it is released.
+            win::Arrival::Gone => win::disconnect(&pipe),
+        }
         #[cfg(test)]
         {
             delivery.accepted += 1;
@@ -445,8 +454,8 @@ mod win {
     use std::ptr;
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, GENERIC_READ, INVALID_HANDLE_VALUE,
-        LocalFree,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GENERIC_READ,
+        INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -652,19 +661,29 @@ mod win {
         }
     }
 
+    /// A client that reached a listening instance.
+    pub(super) enum Arrival {
+        /// Connected and still holding its end.
+        Present,
+        /// Opened the instance and closed it again before the accept.
+        Gone,
+    }
+
     /// Blocks until a client opens `pipe`. A client that opened it between
-    /// creation and this call counts as connected.
-    pub(super) fn connect(pipe: &OwnedHandle) -> io::Result<()> {
+    /// creation and this call counts as connected (`ERROR_PIPE_CONNECTED`),
+    /// and one that also closed it already arrived all the same
+    /// (`ERROR_NO_DATA`).
+    pub(super) fn connect(pipe: &OwnedHandle) -> io::Result<Arrival> {
         // SAFETY: `pipe` is a live named-pipe server handle; a null
         // OVERLAPPED selects the blocking form.
         if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), ptr::null_mut()) } != 0 {
-            return Ok(());
+            return Ok(Arrival::Present);
         }
         let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
-            Ok(())
-        } else {
-            Err(err)
+        match err.raw_os_error() {
+            Some(code) if code == ERROR_PIPE_CONNECTED as i32 => Ok(Arrival::Present),
+            Some(code) if code == ERROR_NO_DATA as i32 => Ok(Arrival::Gone),
+            _ => Err(err),
         }
     }
 
