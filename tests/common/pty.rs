@@ -431,14 +431,16 @@ pub fn open_pair(
         ws_ypixel: 0,
     };
     // SAFETY: both out-pointers are valid ints, `size` is a valid
-    // winsize; name and termios may be null.
+    // winsize; name and termios may be null. `size` goes as a raw
+    // pointer: the parameter is `*const` on Linux and `*mut` on the BSDs,
+    // and a raw `*mut` fits both.
     let rc = unsafe {
         libc::openpty(
             &mut master,
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            &raw mut size,
         )
     };
     if rc != 0 {
