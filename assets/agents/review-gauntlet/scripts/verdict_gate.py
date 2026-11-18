@@ -659,7 +659,7 @@ def main():
             f"- {one_line(x)}" for x in incomplete_lines
         )
     if probe_lines:
-        md += "\n\n## Probe-written tests\n" + "\n".join(probe_lines)
+        md += "\n\n## Probe-written tests\n" + "\n".join(one_line(line) for line in probe_lines)
     md += "\n\n## Full lane reports\n"
     for lane, rep in reports:
         md += f"\n<details><summary>{lane}</summary>\n\n{rep}\n\n</details>\n"
