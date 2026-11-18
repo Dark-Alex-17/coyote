@@ -118,6 +118,34 @@ fn every_ostype_opens_a_windows_pipe_name_as_given() {
     }
 }
 
+/// Under Git Bash or Cygwin a refused open of a Windows pipe is retried
+/// quietly before the helper gives up: one open error reaches stderr, not
+/// one per attempt, the retries take their nine 50 ms pauses, and the
+/// helper still fails closed. Other shells open once.
+#[test]
+fn git_bash_retries_a_refused_pipe_open_quietly() {
+    for ostype in ["msys", "cygwin", "darwin24.0"] {
+        let started = std::time::Instant::now();
+        let out = bash(
+            Some(ostype),
+            WINDOWS_PIPE,
+            "v=\"$(confirm 'Go? retry-x7x')\"; echo \"rc=$? v=[$v]\"",
+        );
+        if ostype != "darwin24.0" {
+            let retried = started.elapsed() >= std::time::Duration::from_millis(450);
+            assert!(retried, "OSTYPE={ostype}: the open was not retried");
+        }
+        let stderr = text(&out.stderr);
+        assert_eq!(
+            stderr.matches(": No such file or directory").count(),
+            1,
+            "OSTYPE={ostype}: {stderr:?}"
+        );
+        let stdout = text(&out.stdout);
+        assert!(stdout.contains("rc=1 v=[]"), "OSTYPE={ostype}: {stdout:?}");
+    }
+}
+
 #[test]
 fn git_bash_opens_other_spellings_as_given_too() {
     let dir = scratch_dir("untranslated");

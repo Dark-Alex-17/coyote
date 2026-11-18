@@ -147,6 +147,27 @@ fi
 # /proc/sys/Device/NamedPipe view of the pipe namespace cannot be opened.
 _COYOTE_PROMPT_REPLY_PATH="${COYOTE_PROMPT_REPLY:-}"
 
+# Reads one reply line into the caller's `reply`. Under Git Bash or Cygwin
+# an open of a Windows pipe can be refused as busy for a moment while
+# Coyote puts its next instance up, so it is retried briefly and quietly;
+# the last attempt reports its error as any other open does.
+_coyote_read_reply() {
+  case "${OSTYPE:-}" in
+    msys* | cygwin*)
+      if [[ "$_COYOTE_PROMPT_REPLY_PATH" == '\\.\pipe\'* ]]; then
+        declare attempt
+        for attempt in 1 2 3 4 5 6 7 8 9; do
+          if { IFS= read -r reply; } 2>/dev/null <"$_COYOTE_PROMPT_REPLY_PATH"; then
+            return 0
+          fi
+          sleep 0.05
+        done
+      fi
+      ;;
+  esac
+  IFS= read -r reply <"$_COYOTE_PROMPT_REPLY_PATH"
+}
+
 _coyote_prompt_enabled() {
   [[ -n "${COYOTE_PROMPT_REPLY:-}" && "$COYOTE_PROMPT_REPLY" != /dev/fd/9 && -n "${_COYOTE_PROMPT_OUT:-}" ]]
 }
@@ -227,7 +248,7 @@ _coyote_prompt() {
 
   declare reply
   while :; do
-    if ! IFS= read -r reply <"$_COYOTE_PROMPT_REPLY_PATH"; then
+    if ! _coyote_read_reply; then
       show_error "prompt reply channel closed"
       return 1
     fi

@@ -122,16 +122,26 @@ impl Server {
 
 /// The parent's end of the reply pipe: a named pipe the child opens by the
 /// path in `env_value`. The helpers open that path afresh per prompt, and
-/// bash's `read <"$path"` even per line, so a delivery thread accepts one
-/// client after another and hands each the queued lines; a line leaves the
-/// queue only once a client has read it, so a client that closes early
-/// leaves it for the next one, the way an unread line stays in a unix pipe.
+/// bash's `read <"$path"` even per line (Git Bash may open it once more to
+/// probe it first), so the pipe takes one client after another. Acceptor
+/// threads each keep an instance listening and queue every client that
+/// connects; a delivery thread hands the queued lines to those clients in
+/// order. A line leaves the queue only once a client has read it, so a
+/// client that closes early leaves it for the next one, the way an unread
+/// line stays in a unix pipe.
 #[cfg(windows)]
 pub(crate) struct Server {
     name: Vec<u16>,
     path: String,
     shared: Arc<Shared>,
 }
+
+/// How many instances listen at once. With one, a client that connects
+/// and leaves at once (Git Bash probing the path) takes the only instance,
+/// and an open that follows before its replacement exists is refused as
+/// busy; with two, one always listens while the other is replaced.
+#[cfg(windows)]
+const ACCEPTORS: usize = 2;
 
 #[cfg(windows)]
 struct Shared {
@@ -140,9 +150,34 @@ struct Shared {
 }
 
 #[cfg(windows)]
+impl Shared {
+    fn new() -> Self {
+        Self {
+            delivery: Mutex::new(Delivery {
+                lines: VecDeque::new(),
+                clients: VecDeque::new(),
+                acceptors: 0,
+                closed: false,
+                #[cfg(test)]
+                accepted: 0,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+}
+
+#[cfg(windows)]
 struct Delivery {
     lines: VecDeque<String>,
+    /// Connected clients not served yet, oldest first.
+    clients: VecDeque<OwnedHandle>,
+    /// Acceptor threads still able to keep an instance listening.
+    acceptors: usize,
     closed: bool,
+    /// Clients accepted so far, each counted once the instance replacing
+    /// the one it took is listening.
+    #[cfg(test)]
+    accepted: usize,
 }
 
 #[cfg(windows)]
@@ -157,20 +192,10 @@ impl Server {
             uuid::Uuid::new_v4().simple()
         );
         let name = win::wide(&path);
-        let descriptor = win::OwnerOnlyDescriptor::new()?;
+        let descriptor = Arc::new(win::OwnerOnlyDescriptor::new()?);
         let first = win::create_instance(&name, true, &descriptor)?;
-        let shared = Arc::new(Shared {
-            delivery: Mutex::new(Delivery {
-                lines: VecDeque::new(),
-                closed: false,
-            }),
-            wake: Condvar::new(),
-        });
-        let thread_name = name.clone();
-        let thread_shared = Arc::clone(&shared);
-        std::thread::Builder::new()
-            .name("prompt-reply".into())
-            .spawn(move || deliver_lines(&thread_name, &descriptor, Some(first), &thread_shared))?;
+        let shared = Arc::new(Shared::new());
+        start_threads(&name, descriptor, Some(first), &shared)?;
         Ok(Self { name, path, shared })
     }
 
@@ -197,11 +222,12 @@ impl Server {
     }
 }
 
-/// Ends the delivery thread without joining it: a client that connected
-/// but never reads would otherwise hold the drop hostage. Lines still
-/// queued are lost; the tool they were for is gone. A stalled client holds
-/// the thread only for the tool's lifetime: the tool's death closes the
-/// client handle, which fails the flush the thread is parked in.
+/// Ends the threads without joining them: a client that connected but
+/// never reads would otherwise hold the drop hostage. Lines still queued
+/// are lost; the tool they were for is gone. A stalled client holds the
+/// delivery thread only for the tool's lifetime: the tool's death closes
+/// the client handle, which fails the flush the thread is parked in. Each
+/// acceptor is parked on its own listening instance, so each gets a wake.
 #[cfg(windows)]
 impl Drop for Server {
     fn drop(&mut self) {
@@ -215,67 +241,160 @@ impl Drop for Server {
         }
         drop(delivery);
         self.shared.wake.notify_all();
-        win::wake(&self.name);
+        for _ in 0..ACCEPTORS {
+            win::wake(&self.name);
+        }
     }
 }
 
-/// The delivery thread: listen, serve the connected client until it goes
-/// away, listen again. A fresh listening instance is created as soon as a
-/// client connects, because a bash helper reopens the path for its next
-/// line before the server has noticed that the previous open went away.
-/// `listener` is that instance, or `None` when none is listening ahead.
+/// Starts the delivery thread and the acceptors. The first acceptor takes
+/// `listener`, or claims the name afresh when there is none; the others
+/// start only once it holds an instance, so the name is always claimed by
+/// a first instance rather than joined.
 #[cfg(windows)]
-fn deliver_lines(
+fn start_threads(
+    name: &[u16],
+    descriptor: Arc<win::OwnerOnlyDescriptor>,
+    listener: Option<OwnedHandle>,
+    shared: &Arc<Shared>,
+) -> std::io::Result<()> {
+    shared.delivery.lock().unwrap().acceptors = 1;
+    let delivery_shared = Arc::clone(shared);
+    std::thread::Builder::new()
+        .name("prompt-reply".into())
+        .spawn(move || deliver_lines(&delivery_shared))?;
+    let name = name.to_vec();
+    let shared = Arc::clone(shared);
+    std::thread::Builder::new()
+        .name("prompt-accept".into())
+        .spawn(move || {
+            let first = match listener {
+                Some(pipe) => pipe,
+                None => match win::reclaim_instance(&name, &descriptor) {
+                    Ok(pipe) => pipe,
+                    Err(err) => return acceptor_gone(&name, &shared, &err),
+                },
+            };
+            for _ in 1..ACCEPTORS {
+                shared.delivery.lock().unwrap().acceptors += 1;
+                let (thread_name, thread_descriptor, thread_shared) =
+                    (name.clone(), Arc::clone(&descriptor), Arc::clone(&shared));
+                let spawned = std::thread::Builder::new()
+                    .name("prompt-accept".into())
+                    .spawn(move || {
+                        accept_clients(&thread_name, &thread_descriptor, None, &thread_shared)
+                    });
+                if let Err(err) = spawned {
+                    acceptor_gone(&name, &shared, &err);
+                }
+            }
+            accept_clients(&name, &descriptor, Some(first), &shared);
+        })?;
+    Ok(())
+}
+
+/// One acceptor: keep an instance listening, and when a client connects,
+/// put a replacement up before queueing the client, so an open that comes
+/// right after finds one listening. `listener` is the instance to start
+/// with; without one a new instance joins the pipe the other acceptors
+/// already hold.
+#[cfg(windows)]
+fn accept_clients(
     name: &[u16],
     descriptor: &win::OwnerOnlyDescriptor,
-    mut listener: Option<OwnedHandle>,
+    listener: Option<OwnedHandle>,
     shared: &Shared,
 ) {
+    let mut listener = listener;
     loop {
-        // With no listener ahead, no server instance of ours is alive, so
-        // the replacement claims the name again rather than joining a pipe
-        // somebody else created under it meanwhile. A client may still
-        // hold the previous instance open for a moment, which keeps the
-        // name alive and defers the claim until it lets go.
         let pipe = match listener.take() {
             Some(pipe) => pipe,
-            None => match win::reclaim_instance(name, descriptor) {
+            None => match next_instance(name, descriptor) {
                 Ok(pipe) => pipe,
-                Err(err) => {
-                    let mut delivery = shared.delivery.lock().unwrap();
-                    // A server that is already closing has nothing to
-                    // deliver, so a failed reclaim on its way out is noise.
-                    if !delivery.closed {
-                        warn!(
-                            "Unable to recreate the prompt reply pipe {}: {err}",
-                            String::from_utf16_lossy(&name[..name.len().saturating_sub(1)])
-                        );
-                    }
-                    delivery.closed = true;
-                    return;
-                }
+                Err(err) => return acceptor_gone(name, shared, &err),
             },
         };
         // A wake issued before this instance existed found nothing to
         // connect to, so the flag has to be re-read now that it does.
         if shared.delivery.lock().unwrap().closed {
-            win::disconnect(&pipe);
             return;
         }
         if let Err(err) = win::connect(&pipe) {
             debug!("Prompt reply client left before it was accepted: {err}");
-            win::disconnect(&pipe);
             continue;
         }
         if shared.delivery.lock().unwrap().closed {
-            win::disconnect(&pipe);
             return;
         }
-        listener = match win::create_instance(name, false, descriptor) {
-            Ok(next) => Some(next),
-            Err(err) => {
-                debug!("Unable to create the next prompt reply pipe instance: {err}");
-                None
+        match next_instance(name, descriptor) {
+            Ok(next) => listener = Some(next),
+            Err(err) => debug!("Unable to create the next prompt reply pipe instance: {err}"),
+        }
+        let mut delivery = shared.delivery.lock().unwrap();
+        if delivery.closed {
+            return;
+        }
+        delivery.clients.push_back(pipe);
+        #[cfg(test)]
+        {
+            delivery.accepted += 1;
+        }
+        drop(delivery);
+        shared.wake.notify_all();
+    }
+}
+
+/// A further instance of the pipe the acceptors hold. When joining it
+/// fails, the name is claimed afresh as a first instance instead; a client
+/// still holding a previous instance keeps the name alive, which only
+/// defers that claim until it lets go.
+#[cfg(windows)]
+fn next_instance(
+    name: &[u16],
+    descriptor: &win::OwnerOnlyDescriptor,
+) -> std::io::Result<OwnedHandle> {
+    win::create_instance(name, false, descriptor)
+        .or_else(|_| win::reclaim_instance(name, descriptor))
+}
+
+/// An acceptor that cannot keep an instance up stops; once none is left
+/// the channel is closed, so `reply` warns instead of queueing lines no
+/// client can reach.
+#[cfg(windows)]
+fn acceptor_gone(name: &[u16], shared: &Shared, err: &std::io::Error) {
+    let mut delivery = shared.delivery.lock().unwrap();
+    delivery.acceptors = delivery.acceptors.saturating_sub(1);
+    // A server that is already closing has nothing to deliver, so a failed
+    // instance on its way out is noise.
+    if delivery.closed {
+        return;
+    }
+    warn!(
+        "Unable to recreate the prompt reply pipe {}: {err}",
+        String::from_utf16_lossy(&name[..name.len().saturating_sub(1)])
+    );
+    if delivery.acceptors == 0 {
+        delivery.closed = true;
+        drop(delivery);
+        shared.wake.notify_all();
+    }
+}
+
+/// The delivery thread: serve the oldest queued client until it goes
+/// away, then the next one.
+#[cfg(windows)]
+fn deliver_lines(shared: &Shared) {
+    loop {
+        let pipe = {
+            let mut delivery = shared.delivery.lock().unwrap();
+            loop {
+                if delivery.closed {
+                    return;
+                }
+                if let Some(pipe) = delivery.clients.pop_front() {
+                    break pipe;
+                }
+                delivery = shared.wake.wait(delivery).unwrap();
             }
         };
         let closed = serve(&pipe, shared);
@@ -367,6 +486,9 @@ mod win {
     // SAFETY: the descriptor is an opaque heap buffer that is only read
     // after construction; nothing ties it to the thread that built it.
     unsafe impl Send for OwnerOnlyDescriptor {}
+    // SAFETY: after construction the buffer is only read, by the pipe
+    // calls the acceptors make, and concurrent reads of it are sound.
+    unsafe impl Sync for OwnerOnlyDescriptor {}
 
     impl OwnerOnlyDescriptor {
         pub(super) fn new() -> io::Result<Self> {
@@ -887,12 +1009,12 @@ mod windows_tests {
         }
     }
 
-    /// The replacement instance once no instance is listening ahead: a
-    /// client still holding the previous instance keeps the name alive,
-    /// so claiming it afresh is denied until that client lets go. The
-    /// thread outwaits it instead of giving the channel up, and the next
-    /// client still gets its line. The scenario is built by hand: the
-    /// instance ahead is only ever missing when its creation failed.
+    /// The first instance claimed afresh: a client still holding a
+    /// previous instance keeps the name alive, so claiming it is denied
+    /// until that client lets go. The acceptor outwaits it instead of
+    /// giving the channel up, and the next client still gets its line.
+    /// The scenario is built by hand: the server always starts with an
+    /// instance in hand.
     #[test]
     fn a_lingering_client_only_delays_the_replacement_instance() {
         let path = format!(
@@ -900,20 +1022,12 @@ mod windows_tests {
             uuid::Uuid::new_v4().simple()
         );
         let name = win::wide(&path);
-        let descriptor = win::OwnerOnlyDescriptor::new().unwrap();
+        let descriptor = Arc::new(win::OwnerOnlyDescriptor::new().unwrap());
         let previous = win::create_instance(&name, true, &descriptor).unwrap();
         let lingering = File::open(&path).unwrap();
         drop(previous);
-        let shared = Arc::new(Shared {
-            delivery: Mutex::new(Delivery {
-                lines: VecDeque::new(),
-                closed: false,
-            }),
-            wake: Condvar::new(),
-        });
-        let thread_name = name.clone();
-        let thread_shared = Arc::clone(&shared);
-        thread::spawn(move || deliver_lines(&thread_name, &descriptor, None, &thread_shared));
+        let shared = Arc::new(Shared::new());
+        start_threads(&name, descriptor, None, &shared).unwrap();
         let server = Server {
             name,
             path: path.clone(),
@@ -939,6 +1053,35 @@ mod windows_tests {
         thread::spawn(move || tx.send(read_line_bytewise(&mut next)).unwrap());
         let line = rx.recv_timeout(WAIT).unwrap().unwrap();
         assert_eq!(line, Some(reply_line("late", &json!(true))));
+    }
+
+    /// Git Bash may open the path once to probe it and close it again
+    /// before it opens it to read, so clients that come and go with no
+    /// line queued must never use the listening instances up: every open
+    /// that follows still finds one, and a line written afterwards reaches
+    /// the client that waits for it. Each open waits until the previous
+    /// client is accepted (which is counted only once its replacement
+    /// listens), so the sequence is the same on every run; a server that
+    /// stops listening while it waits for a line refuses the third open.
+    #[test]
+    fn clients_that_open_and_leave_at_once_never_find_the_pipe_busy() {
+        let server = Server::open().unwrap();
+        let path = server.env_value();
+        for round in 1..=20 {
+            let probe = File::open(&path)
+                .unwrap_or_else(|err| panic!("open {round} found no listening instance: {err}"));
+            drop(probe);
+            let deadline = Instant::now() + WAIT;
+            while server.shared.delivery.lock().unwrap().accepted < round {
+                assert!(Instant::now() < deadline, "open {round} was never accepted");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let rx = read_one_line(&path);
+        thread::sleep(Duration::from_millis(200));
+        server.reply("after-probes", &json!(true));
+        let line = rx.recv_timeout(WAIT).unwrap().unwrap();
+        assert_eq!(line, Some(reply_line("after-probes", &json!(true))));
     }
 
     /// The bash helper end to end under Git Bash: the pipe is opened by its
