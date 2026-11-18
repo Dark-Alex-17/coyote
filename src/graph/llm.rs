@@ -202,13 +202,13 @@ async fn run(
     }
 
     let composed_role = {
-        let agent_tools = parent_ctx
+        let agent_gate = parent_ctx
             .agent
             .as_ref()
             .map(|agent| AgentToolGate::new(agent, &parent_ctx.app.config));
         parent_ctx
             .skill_registry
-            .effective_role(&role, &policy, agent_tools.as_ref())
+            .effective_role(&role, &policy, agent_gate.as_ref())
     };
 
     let saved_role = parent_ctx.role.clone();

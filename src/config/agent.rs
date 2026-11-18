@@ -2787,11 +2787,6 @@ nodes: {}
         assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
     }
 
-    /// Skills never widen an agent's `global_tools` or `mcp_servers`. For
-    /// every skill a bundled agent is told to load or lists in its
-    /// `enabled_skills`, each granted tool and MCP server must be declared
-    /// by the agent, except the write and exec grants the owner keeps
-    /// withheld on purpose, which must stay undeclared.
     #[test]
     fn bundled_agents_declare_what_their_skills_grant_except_the_withheld_write_and_exec_tools() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
@@ -2815,7 +2810,7 @@ nodes: {}
                 })
                 .unwrap_or_default()
         };
-        // (agent, skills its prompts tell it to load, grants the owner keeps withheld)
+        // (agent, skills its prompts tell it to load, write and exec grants the owner keeps withheld)
         let agents = [
             (
                 "coder",

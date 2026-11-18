@@ -2378,13 +2378,13 @@ impl RequestContext {
             prompt_split = Some(split);
         }
 
-        let agent_tools = self
+        let agent_gate = self
             .agent
             .as_ref()
             .map(|agent| AgentToolGate::new(agent, app));
         Ok((
             self.skill_registry
-                .effective_role(&role, &policy, agent_tools.as_ref()),
+                .effective_role(&role, &policy, agent_gate.as_ref()),
             prompt_split,
         ))
     }
@@ -5861,19 +5861,16 @@ impl RequestContext {
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
-    /// The MCP servers the loaded skills grant. Inside an agent only the ones
-    /// the agent declares in `mcp_servers`: a skill never widens them.
     pub(crate) fn skill_mcp_servers(&self) -> BTreeSet<String> {
-        let agent_tools = self
+        let agent_gate = self
             .agent
             .as_ref()
             .map(|agent| AgentToolGate::new(agent, &self.app.config));
-        self.skill_registry.loaded_mcp_servers(agent_tools.as_ref())
+        self.skill_registry.loaded_mcp_servers(agent_gate.as_ref())
     }
 
-    /// The refusal for using MCP server `server` inside an agent that does not
-    /// declare it. A server the session itself enables stays usable; one only
-    /// a loaded skill grants does not.
+    /// A server the user enabled on the session stays usable even when the
+    /// agent does not declare it; anything else (in practice a skill grant) is refused.
     pub(crate) fn mcp_server_refusal(&self, server: &str) -> Option<String> {
         let agent = self.agent.as_ref()?;
         if AgentToolGate::new(agent, &self.app.config).allows_mcp_server(server) {
@@ -10370,9 +10367,7 @@ mod tests {
         }
     }
 
-    /// A skill `grants-mcp` granting the MCP server `skillsrv` and, when
-    /// `agent_servers` is set, a plain agent declaring exactly those
-    /// `mcp_servers`, entered.
+    /// `None` runs without an agent.
     fn skill_mcp_ctx(agent_servers: Option<&[&str]>) -> (RequestContext, Option<String>) {
         let skill_file = paths::skill_file("grants-mcp");
         create_dir_all(skill_file.parent().unwrap()).unwrap();
@@ -10418,8 +10413,7 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(result["status"], "ok", "{result}");
-        // No MCP config is installed, so the server's meta tools are added
-        // by hand the way a started server's would be.
+        // No MCP config here, so add the meta tools a started server would have.
         ctx.tool_scope
             .functions
             .append_mcp_meta_functions(vec![tools_only_features("skillsrv")]);
@@ -10485,8 +10479,6 @@ mod tests {
         );
     }
 
-    /// Outside an agent there is no `mcp_servers` list to hold a skill to,
-    /// so a skill's MCP servers apply as written, as they always have.
     #[test]
     #[serial]
     fn skill_load_without_an_agent_keeps_every_granted_mcp_server() {
@@ -10518,8 +10510,6 @@ mod tests {
         assert!(ctx.skill_mcp_servers().is_empty());
     }
 
-    /// A server the user enabled on the agent's session stays usable; the
-    /// session does not open any other server a skill grants.
     #[test]
     #[serial]
     fn mcp_server_refusal_honours_only_the_servers_the_session_enables() {
@@ -13537,10 +13527,8 @@ mod tests {
         assert!(!names.contains(&"skill__unload"));
     }
 
-    /// Installs global tool stubs for `fs_read` and `execute_command`, a skill
-    /// `grants-exec` granting both, and, when `agent_tools` is set, a plain
-    /// agent whose `global_tools` lists only those tools, then enters it.
-    fn skill_grant_ctx(agent_tools: Option<&[&str]>) -> (RequestContext, Option<String>) {
+    /// `None` runs without an agent.
+    fn skill_grant_ctx(agent_global_tools: Option<&[&str]>) -> (RequestContext, Option<String>) {
         write_global_tool_stubs(&["fs_read", "execute_command"]);
         let skill_file = paths::skill_file("grants-exec");
         create_dir_all(skill_file.parent().unwrap()).unwrap();
@@ -13553,7 +13541,7 @@ mod tests {
         let mut ctx = create_test_ctx();
         ctx.model = fc_model("agent-model");
         let app = ctx.app.config.clone();
-        let agent_name = agent_tools.map(|tools| {
+        let agent_name = agent_global_tools.map(|tools| {
             let agent_name = unique_name("test_skill_grant_agent");
             let agent_dir = paths::agent_data_dir(&agent_name);
             create_dir_all(&agent_dir).unwrap();
@@ -13668,8 +13656,6 @@ mod tests {
         }
     }
 
-    /// Outside an agent there is no `global_tools` list to hold a skill to,
-    /// so a skill's grants apply as written, as they always have.
     #[test]
     #[serial]
     fn skill_load_without_an_agent_offers_every_granted_global_tool() {
