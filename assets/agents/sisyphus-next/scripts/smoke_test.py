@@ -12,6 +12,7 @@ Usage: smoke_test.py   (exit 1 on any failure; prints one line per check)
 """
 
 import ast
+import contextlib
 import json
 import os
 import re
@@ -5365,6 +5366,460 @@ check("baseline floor: empty while carried test failures are pending",
       gates.render_coder_prompt(base_state(**_rcp, carried_failures=[{"paths": ["t/x"]}]))["coder_baseline_floor"] == "")
 _floor_input = "\n      baseline_floor: '{{coder_baseline_floor}}'"
 check("baseline floor: run_coder passes it as the coder's baseline_floor", _floor_input in node_block("run_coder"))
+
+# ---------------------------------------------------------------- pipeline size: small or standard, escalated by red gates
+@contextlib.contextmanager
+def scenario(name):
+    """One row's setup and check: an exception in either is that row's FAIL, so the battery runs to its tally even on
+    gates that predate the row."""
+    try:
+        yield name
+    except Exception as exc:
+        check(name, False, f"crashed: {type(exc).__name__}: {exc}")
+
+
+with scenario("route_intent: no pipeline size from assess -> standard (fail-safe), ledgered") as name:
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple"))
+    check(name, u.get("pipeline_size") == "standard" and "fail-safe" in u.get("pipeline_size_reason", "")
+          and "pipeline: no valid size from assess (missing) -> standard (fail-safe)" in u["decisions"], u.get("decisions"))
+with scenario("route_intent: an unknown pipeline size -> standard (fail-safe)") as name:
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="medium"))
+    check(name, u.get("pipeline_size") == "standard"
+          and "pipeline: no valid size from assess (medium) -> standard (fail-safe)" in u["decisions"], u.get("decisions"))
+with scenario("route_intent: small with compound sizing or architecture_scale -> standard (invalid classification)") as name:
+    u = gates.route_intent(base_state(intent="implementation", sizing="compound", pipeline_size="small"))
+    _ua = gates.route_intent(base_state(intent="implementation", sizing="simple", architecture_scale=True,
+                                        pipeline_size="small"))
+    check(name, u.get("pipeline_size") == "standard" and _ua.get("pipeline_size") == "standard"
+          and "pipeline: small contradicts sizing compound -> standard (invalid classification)" in u["decisions"]
+          and "pipeline: small contradicts architecture_scale -> standard (invalid classification)" in _ua["decisions"],
+          (u.get("decisions"), _ua.get("decisions")))
+with scenario("route_intent: a small simple task -> small, its reason ledgered") as name:
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="small",
+                                      pipeline_size_reason="one guard in one function"))
+    check(name, u.get("pipeline_size") == "small" and "pipeline: small (one guard in one function)" in u["decisions"],
+          u.get("decisions"))
+_long_reason = "the period bounds in two modules need checking " * 8
+with scenario("route_intent: a long size reason -> ledgered whole on one line, never trimmed") as name:
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="standard",
+                                      pipeline_size_reason=_long_reason))
+    check(name, f"pipeline: standard ({_long_reason.strip()})" in u.get("decisions", []), u.get("decisions"))
+_esc1 = [{"why": "coder strike 1/3 (CODER_FAILED)", "at": "subtask 1, review round 0"}]
+with scenario("route_intent: assess says small after an escalation -> standard kept, never downgraded") as name:
+    u = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="small",
+                                      size_escalations=_esc1))
+    check(name, u.get("pipeline_size") == "standard"
+          and any(d.startswith("pipeline: standard kept (escalated earlier") for d in u["decisions"]), u.get("decisions"))
+
+with scenario("resume: an escalated standard is restored and kept when the re-entry's assess says small") as name:
+    _pst = gates.intake({"initial_prompt": "add a guard", "project_dir": REPO})
+    _lib.snapshot(_pst, {"pipeline_size": "standard", "pipeline_size_reason": "one guard", "size_escalations": _esc1,
+                         "probe_tests": [{"path": "tests/a.test.ts", "round": 1}]}, "coder")
+    _pre = gates.intake({"initial_prompt": f"Fix the failure\nSisyphus run id: {_pst['run_id']}", "project_dir": REPO})
+    u = gates.route_intent(base_state(**{**_pre, "intent": "implementation", "resume_action": "answer",
+                                         "pipeline_size": "small"}))
+    check(name, _pre.get("size_escalations") == _esc1 and _pre.get("probe_tests") == [{"path": "tests/a.test.ts", "round": 1}]
+          and u.get("pipeline_size") == "standard", (_pre.get("size_escalations"), u.get("decisions")))
+
+
+def escalated_once(u, why):
+    lines = [d for d in u.get("decisions", []) if d.startswith("pipeline: escalated small -> standard: ")]
+    return (u.get("pipeline_size") == "standard" and len(u.get("size_escalations") or []) == 1
+            and u.get("full_gauntlet_due") is True and len(lines) == 1 and why in lines[0])
+
+
+with scenario("route_intent: a resume fix round on a small pipeline -> standard, escalated once") as name:
+    u = gates.route_intent(base_state(intent="implementation", resume_mode=True, resume_action="fix", pipeline_size="small"))
+    check(name, u["_next"] == "compose_fix" and escalated_once(u, "resume fix round"), u.get("decisions"))
+with scenario("route_coder_result: a coder strike on a small pipeline -> standard, escalated once, "
+              "no second escalation") as name:
+    u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\nboom", fix_strikes=0, pipeline_size="small"))
+    _u2 = gates.route_coder_result(base_state(**{**u, "coder_result": "CODER_FAILED\nboom", "decisions": []}))
+    check(name, u["_next"] == "compose_fix" and escalated_once(u, "coder strike 1/") and "size_escalations" not in _u2
+          and not any(d.startswith("pipeline:") for d in _u2.get("decisions", [])),
+          (u.get("decisions"), _u2.get("decisions")))
+with scenario("route_coder_result: a red test gate carried forward on a small pipeline -> standard, escalated once") as name:
+    _cs = carry_start()
+    _cs["pipeline_size"] = "small"
+    sub_step(_cs, "route_coder_result")
+    check(name, _cs["_next"] == "debt_scan" and escalated_once(_cs, "red test gate carried forward"), _cs["decisions"][-3:])
+DIVERGES_REPLY = ("GAUNTLET: BLOCKED\n\n| lane | status | detail |\n|------|--------|--------|\n"
+                  "| code-review | GREEN | MERGE-READY |\n| adversary | BLOCKED | DIVERGES |\n\n## Lane selection\n"
+                  "- adversary: plan present\n\n## Blockers\n- adversary: DIVERGES -- complaint 1: AC2 unmet\n")
+with scenario("route_gauntlet: BLOCKED with an adversary DIVERGES blocker on a small pipeline -> standard, "
+              "escalated once") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=DIVERGES_REPLY, round_heads=[{"round": 1, "head": "h"}],
+                                        pipeline_size="small"))
+    check(name, u["_next"] == "triage_findings" and escalated_once(u, "review round 1 BLOCKED: adversary: DIVERGES"),
+          u.get("decisions"))
+with scenario("route_gauntlet: an incomplete review on a small pipeline -> standard, escalated once, "
+              "review_incomplete asked") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result="GAUNTLET: BLOCKED\nGAUNTLET_REVIEW_INCOMPLETE: security\n",
+                                        round_heads=[{"round": 1}], pipeline_size="small"))
+    check(name, u["escalation"]["kind"] == "review_incomplete" and escalated_once(u, "review round 1 incomplete (security)"),
+          u.get("decisions"))
+with scenario("route_gauntlet: PASS with a GREEN (attention) lane on a small pipeline -> stays small") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=passed, round_heads=[{"round": 1, "head": "h"}],
+                                        pipeline_size="small"))
+    check(name, u["_next"] == "observability_gate" and "pipeline_size" not in u and "size_escalations" not in u,
+          u.get("decisions"))
+with scenario("ci_apply: a real CI failure on a small pipeline -> standard, escalated once, fix round") as name:
+    u = gates.ci_apply(base_state(ci_verdict="real", failing_checks=["unit"], ci_fix_strikes=0, pipeline_size="small"))
+    check(name, u["_next"] == "compose_fix" and escalated_once(u, "real CI failure (unit)"), u.get("decisions"))
+with scenario("scope_check: a scope breach on a small pipeline -> standard, escalated once") as name:
+    u = gates.scope_check(base_state(parallel_mode=True, own_scope=["src/a/"], roster_scope={"TASK-002": ["src/b/"]},
+                                     expected_files=["src/b/x.go"], pipeline_size="small"))
+    check(name, u["_next"] == "send_breach_notice" and escalated_once(u, "scope breach: src/b/x.go"), u.get("decisions"))
+with scenario("pr_review_apply: a PR review fix round on a small pipeline -> standard, escalated once") as name:
+    u = gates._start_review_round(base_state(pipeline_size="small"), {},
+                                  [{"id": "c1", "kind": "comment", "text": "rename x"}], [])
+    check(name, u["_next"] == "compose_fix" and escalated_once(u, "PR review fix round 1"), u.get("decisions"))
+
+_psubs = [{"title": f"p{i}", "outcome": f"o{i}", "acceptance_criteria": ["c"]} for i in range(2)]
+with scenario("next_subtask: small -> oracle_gate without research, standard -> plan_research, "
+              "trivial -> compose_brief") as name:
+    u = gates.next_subtask(base_state(subtasks=_psubs, subtask_index=0, intent="implementation", pipeline_size="small",
+                                      pipeline_size_reason="one guard"))
+    _std = gates.next_subtask(base_state(subtasks=_psubs, subtask_index=0, intent="implementation",
+                                         pipeline_size="standard"))
+    _triv = gates.next_subtask(base_state(subtasks=_psubs, subtask_index=0, intent="trivial", pipeline_size="small"))
+    check(name, u["_next"] == "oracle_gate" and "research: skipped (pipeline small: one guard)" in u["decisions"]
+          and u["context_pack"] == gates.RESEARCH_SKIPPED_PACK and _std["_next"] == "plan_research"
+          and _triv["_next"] == "compose_brief", (u.get("_next"), _std.get("_next"), _triv.get("_next")))
+_sticky = dict(pipeline_size="standard", pipeline_size_reason="r", size_escalations=_esc1,
+               probe_tests=[{"path": "t", "round": 1}], probe_adoption={"round": 1, "paths": ["t"]})
+with scenario("next_subtask: the next subtask and the final review reset keep the pipeline size, escalations and "
+              "probe tests") as name:
+    _n2 = gates.next_subtask(base_state(subtasks=_psubs, subtask_index=1, intent="implementation", **_sticky))
+    _fr = gates.next_subtask(base_state(subtasks=_psubs, subtask_index=2, intent="implementation", **_sticky))
+    check(name, _n2["_next"] == "plan_research" and _fr["_next"] == "review_gate"
+          and not any(k in d for d in (_n2, _fr) for k in _sticky), (sorted(_n2), sorted(_fr)))
+with scenario("strikeout: a subtask that skipped research says so to the oracle") as name:
+    u = gates.strikeout(base_state(context_pack=gates.RESEARCH_SKIPPED_PACK + "\n\n## Oracle direction\n\nx",
+                                   last_coder_error="e"))
+    check(name, "Research was skipped for this subtask (pipeline small)." in u["diagnosis"], u.get("diagnosis"))
+
+with scenario("build_gauntlet: small omits the local-run recipe (no probe context), standard keeps it") as name:
+    u = gates.build_gauntlet_prompt(base_state(local_run_recipe="./serve --local", consumer_surface=True,
+                                               pipeline_size="small"))
+    _us = gates.build_gauntlet_prompt(base_state(local_run_recipe="./serve --local", consumer_surface=True,
+                                                 pipeline_size="standard"))
+    check(name, "Local-run recipe" not in u["gauntlet_prompt"] and "Local-run recipe / usage suites:" in _us["gauntlet_prompt"]
+          and "gauntlet: proportionate review (pipeline small): no probe context" in u["decisions"], u["gauntlet_prompt"])
+_fg = dict(round_heads=prior_round, gauntlet_lanes={"code-review": "GREEN"}, local_run_recipe="./serve --local",
+           pipeline_size="standard")
+with scenario("build_gauntlet: the round after an escalation has the recipe and no delta or Settled lanes, "
+              "then clears the debt") as name:
+    _ctl = gates.build_gauntlet_prompt(base_state(**_fg))
+    u = gates.build_gauntlet_prompt(base_state(**_fg, full_gauntlet_due=True))
+    check(name, "Settled lanes: code-review" in _ctl["gauntlet_prompt"].splitlines()
+          and "Local-run recipe / usage suites:" in u["gauntlet_prompt"] and "Settled lanes:" not in u["gauntlet_prompt"]
+          and "Re-review delta:" not in u["gauntlet_prompt"] and u.get("full_gauntlet_due") is False
+          and any("runs the full gauntlet after the pipeline escalation" in d for d in u["decisions"]), u["gauntlet_prompt"])
+
+PROBE_PASS = passed + "\n## Probe-written tests\n- tests/new.test.ts\n- other: README.md\n- deleted: tests/old.test.ts\n"
+_OTHERS = [{"round": 2, "paths": ["README.md"], "kind": "other"},
+           {"round": 2, "paths": ["tests/old.test.ts"], "kind": "deleted"}]
+with scenario("route_gauntlet: the Probe-written tests section -> the round's probe_written and probe_tests; "
+              "other and deleted items are attention and recorded NOT adopted") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=PROBE_PASS, round_heads=[{"round": 2, "head": "h"}]))
+    check(name, u["round_heads"][-1].get("probe_written") == ["tests/new.test.ts"]
+          and u.get("probe_tests") == [{"path": "tests/new.test.ts", "round": 2}]
+          and "deleted file(s) in review round 2: tests/old.test.ts" in u["gauntlet_attention"]
+          and "files changed during review round 2 and NOT adopted as probe-written tests: README.md"
+          in u["gauntlet_attention"]
+          and any(d.startswith("probe tests: 1 other file(s) changed during round 2, NOT adopted") for d in u["decisions"])
+          and u.get("probe_adoption") == {"not_adopted": _OTHERS}
+          and "check X" in u["gauntlet_attention"], (u["round_heads"], u.get("gauntlet_attention")))
+with scenario("route_gauntlet: an `other:` file the probe lane wrote in an earlier round -> its own test edited "
+              "again, recorded as written, never NOT adopted") as name:
+    _reedit = passed + "\n## Probe-written tests\n- other: tests/new.test.ts\n"
+    u = gates.route_gauntlet(base_state(gauntlet_result=_reedit, round_heads=[{"round": 1, "head": "h"}],
+                                        probe_tests=[{"path": "tests/new.test.ts", "round": 1}]))
+    check(name, (u.get("round_heads") or [{}])[-1].get("probe_written") == ["tests/new.test.ts"]
+          and "not_adopted" not in (u.get("probe_adoption") or {})
+          and "NOT adopted" not in (u.get("gauntlet_attention") or ""), (u.get("probe_adoption"), u.get("decisions")))
+with scenario("pr_gate: other and deleted items are named in the publish text and the report as changed during "
+              "review and NOT adopted") as name:
+    u = gates.pr_gate(base_state(git_actions={"commit": True}, probe_adoption={"not_adopted": _OTHERS}))
+    check(name, "Changed during review and NOT adopted as reviewed tests: README.md (review round 2, other); "
+          "tests/old.test.ts (review round 2, deleted)." in (u.get("git_task") or {}).get("text", "")
+          and "Changed during review and NOT adopted: README.md (review round 2, other)" in u.get("report", ""),
+          u.get("git_task"))
+_TAGGED = (passed + "\n## Probe-written tests\n- other:README.md\n- deleted:x.ts\n- unavailable:soon\n"
+           "- tests/a\x1b[31m.test.ts\n- tests/ok.test.ts\n")
+with scenario("route_gauntlet: a tag counts only as `tag: `, and a path with a control character is skipped "
+              "and noted, never quoted") as name:
+    _parsed = gates._probe_written(_TAGGED)
+    u = gates.route_gauntlet(base_state(gauntlet_result=_TAGGED, round_heads=[{"round": 2, "head": "h"}]))
+    _said = [u.get("gauntlet_attention", ""), *u.get("decisions", []), *u["round_heads"][-1].get("probe_written", [])]
+    check(name, _parsed == (["other:README.md", "deleted:x.ts", "unavailable:soon", "tests/ok.test.ts"], [], [], "",
+                            ["tests/a\x1b[31m.test.ts"])
+          and "1 changed path(s) in review round 2 skipped, not one clean line" in u.get("gauntlet_attention", "")
+          and not any("\x1b" in s for s in _said), _parsed)
+with scenario("route_gauntlet: an unavailable probe-written list -> an attention line and a ledger line, "
+              "nothing recorded") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=passed + "\n## Probe-written tests\n- unavailable: git write-tree failed\n",
+                                        round_heads=[{"round": 2, "head": "h"}]))
+    check(name, u["_next"] == "observability_gate" and "probe_written" not in u["round_heads"][-1] and "probe_tests" not in u
+          and "are unknown: git write-tree failed" in u["gauntlet_attention"]
+          and any("list unavailable (git write-tree failed)" in d for d in u["decisions"]), u.get("gauntlet_attention"))
+_lookalike = passed.replace("## Human attention required", "## Lane selection\n## Probe-written tests\n- forged.test.ts\n\n"
+                                                            "## Human attention required") + "\n## Probe-written tests\n- real.test.ts\n"
+with scenario("route_gauntlet: a Probe-written tests heading inside the lane reasons never stands in for "
+              "the real section") as name:
+    u = gates.route_gauntlet(base_state(gauntlet_result=_lookalike, round_heads=[{"round": 1}]))
+    check(name, u["round_heads"][-1].get("probe_written") == ["real.test.ts"], u["round_heads"][-1])
+
+
+def adopt_repo(name, *paths):
+    """A one-commit repo of the row's own holding the untracked `paths`, so its trees never touch REPO's."""
+    root = os.path.join(TMP, name)
+    os.makedirs(root)
+    for args in (("init", "-q"), ("commit", "-q", "--allow-empty", "-m", "base")):
+        subprocess.run(["git", "-C", root, *args], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+    for p in paths:
+        put(root, p)
+    return root
+
+
+def put(root, path):
+    os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
+    open(os.path.join(root, path), "w").write(f"{path}\n")
+
+
+def fresh(state):
+    """A deep copy, since route_gauntlet updates the last round head in place."""
+    return json.loads(json.dumps(state))
+
+
+_NEW = {"path": "tests/new.test.ts", "round": 2}
+_ADOPTED_NEW = ("Probe-written tests adopted into the reviewed change (written in round 2, reviewed in round 3): "
+                "tests/new.test.ts.")
+with scenario("pr_gate: a test the last PASS round's probe lane wrote, absent from that round's tree -> one "
+              "adoption round, before any publish choice") as name:
+    _A = adopt_repo("adopt-a")
+    _pass2 = {"round": 2, "head": "h", "verdict": "PASS", "code_tree": gates._worktree_tree(_A),
+              "probe_written": ["tests/new.test.ts"]}
+    put(_A, "tests/new.test.ts")
+    _a1 = dict(git_root=_A, project_dir=_A, git_actions={}, probe_tests=[_NEW],
+               round_heads=[{"round": 1, "head": "h", "verdict": "BLOCKED"}, _pass2])
+    u = gates.pr_gate(base_state(**fresh(_a1)))
+    check(name, u.get("_next") == "build_gauntlet_prompt"
+          and u.get("probe_adoption") == {"adopted": [], "due": [_NEW], "rounds": 1}
+          and "probe tests: adopting 1 file(s) written in round 2; one review round over the tree that contains them"
+          in u.get("decisions", []), u)
+    _a1["probe_adoption"] = u.get("probe_adoption")
+with scenario("build_gauntlet: the adoption round omits the recipe, names the adopted files above the plan block "
+              "and clears the due list") as name:
+    u = gates.build_gauntlet_prompt(base_state(**fresh(_a1), local_run_recipe="./serve --local", consumer_surface=True))
+    _gp = u["gauntlet_prompt"].splitlines()
+    check(name, "Local-run recipe / usage suites:" not in _gp and u["round_heads"][-1].get("adoption") is True
+          and u["round_heads"][-1].get("adoption_due") == [_NEW] and u.get("probe_adoption", {}).get("due") == []
+          and any(l.startswith("Probe-written tests adopted into the change under review (written in review round 2")
+                  and l.endswith(": tests/new.test.ts") for l in _gp[:5]), _gp)
+    _a1.update(probe_adoption=u.get("probe_adoption"), round_heads=u["round_heads"])
+with scenario("route_gauntlet: the adoption round passes -> pr_gate") as name:
+    u = gates.route_gauntlet(base_state(**{**fresh(_a1), "gauntlet_result": passed}))
+    check(name, u.get("_next") == "pr_gate" and "probe tests: adoption round 3 passed" in u.get("decisions", []),
+          u.get("decisions"))
+    _a_pass = {**fresh(_a1), "round_heads": u["round_heads"]}
+with scenario("pr_gate: after the adoption round passes the test is adopted, reviewed in that round; the publish "
+              "text and the report name it") as name:
+    u = gates.pr_gate(base_state(**{**fresh(_a_pass), "git_actions": {"commit": True}}))
+    check(name, u.get("_next") == "git_ops"
+          and (u.get("probe_adoption") or {}).get("adopted") == [{**_NEW, "reviewed_in": 3}]
+          and _ADOPTED_NEW + " Commit them with the task's work." in u["git_task"]["text"]
+          and "Probe-written tests adopted: tests/new.test.ts (written in round 2, reviewed in round 3)" in u["report"],
+          u.get("git_task"))
+    _a_done = {**fresh(_a_pass), "probe_adoption": u.get("probe_adoption")}
+with scenario("pr_gate: the review_update text ends with the adopted-tests sentence while an adopted test is "
+              "uncommitted") as name:
+    u = gates.pr_gate(rs(**{**fresh(_a_done), "git_actions": {"commit": True, "push": True, "open_pr": True},
+                            "pr_review_pending": _round["pr_review_pending"]}))
+    _txt = (u.get("git_task") or {}).get("text", "")
+    check(name, (u.get("git_task") or {}).get("kind") == "review_update"
+          and _txt == gates._review_update_text(rs(), _round["pr_review_pending"]) + "\n\n" + _ADOPTED_NEW
+          + " Commit them with the task's work.", _txt)
+with scenario("route_gauntlet: a BLOCKED adoption round -> triage like any BLOCKED round") as name:
+    u = gates.route_gauntlet(base_state(**{**fresh(_a1), "gauntlet_result": DIVERGES_REPLY, "pipeline_size": "standard"}))
+    check(name, u["_next"] == "triage_findings" and "probe_adoption" not in u, u.get("_next"))
+    _blk = {**fresh(_a1), "round_heads": u["round_heads"]}
+with scenario("a BLOCKED adoption round, its fix, then a normal round with the recipe whose PASS goes to "
+              "observability_gate") as name:
+    u = gates.build_gauntlet_prompt(base_state(**fresh(_blk), local_run_recipe="./serve --local", consumer_surface=True))
+    _r4 = u["round_heads"][-1]
+    _g4 = gates.route_gauntlet(base_state(**{**fresh(_blk), "round_heads": u["round_heads"], "gauntlet_result": passed}))
+    check(name, _r4.get("round") == 4 and "adoption" not in _r4
+          and "Local-run recipe / usage suites:" in u["gauntlet_prompt"]
+          and "Probe-written tests adopted" not in u["gauntlet_prompt"] and _g4.get("_next") == "observability_gate",
+          (_r4, _g4.get("_next")))
+with scenario("apply: NEEDS-HUMAN accepted on an adoption round -> adoption NOT completed, never retried, later "
+              "rounds normal") as name:
+    _nh = {**fresh(_a1), "gauntlet_incomplete": ["security"]}
+    _nh["round_heads"][-1].update(verdict="BLOCKED", incomplete=["security"])
+    u = aa("review_incomplete", "Accept NEEDS-HUMAN: proceed without the incomplete review", **_nh)
+    _nh["probe_adoption"] = u.get("probe_adoption")
+    _pg = gates.pr_gate(base_state(**fresh(_nh)))
+    _bg = gates.build_gauntlet_prompt(base_state(**fresh(_nh)))
+    check(name, u.get("_next") == "observability_gate"
+          and (u.get("probe_adoption") or {}).get("not_completed") == [{"round": 3, "paths": [_NEW]}]
+          and _pg.get("_next") == "final_report" and "adoption" not in _bg["round_heads"][-1]
+          and "Probe-written tests adoption NOT completed: tests/new.test.ts (adoption round 3 accepted NEEDS-HUMAN"
+          in gates._assemble_report(base_state(**fresh(_nh)), {}), (u.get("probe_adoption"), _pg.get("_next")))
+with scenario("pr_gate: tests a BLOCKED round's probe lane wrote, in the later PASS round's tree -> adopted, "
+              "reviewed in that round, no extra round") as name:
+    _B = adopt_repo("adopt-b", "tests/b.test.ts")
+    _bt = {"path": "tests/b.test.ts", "round": 1}
+    _bs = dict(git_root=_B, project_dir=_B, git_actions={}, probe_tests=[_bt],
+               round_heads=[{"round": 1, "verdict": "BLOCKED", "probe_written": ["tests/b.test.ts"]},
+                            {"round": 2, "verdict": "PASS", "code_tree": gates._worktree_tree(_B)}])
+    u = gates.pr_gate(base_state(**_bs))
+    check(name, u.get("_next") == "final_report" and u.get("probe_adoption") == {"adopted": [{**_bt, "reviewed_in": 2}]}
+          and "Probe-written tests adopted: tests/b.test.ts (written in round 1, reviewed in round 2)"
+          in gates._assemble_report(base_state(**{**_bs, **u}), {}), u.get("probe_adoption"))
+with scenario("pr_gate: a CI fix round's probe lane writes a new test -> its own adoption round; after it passes "
+              "the push_fix text names both adopted tests") as name:
+    _t4 = gates._worktree_tree(_A)
+    put(_A, "tests/ci.test.ts")
+    _ci = {"path": "tests/ci.test.ts", "round": 4}
+    _cs = {**fresh(_a_done), "probe_tests": [_NEW, _ci], "pr_review_pending": [],
+           "git_actions": {"commit": True, "push": True, "open_pr": True},
+           "round_heads": fresh(_a_done)["round_heads"] + [
+               {"round": 4, "head": "h", "verdict": "PASS", "code_tree": _t4, "probe_written": [_ci["path"]]}]}
+    u = gates.pr_gate(rs(**fresh(_cs)))
+    _started = (u.get("_next") == "build_gauntlet_prompt"
+                and (u.get("probe_adoption") or {}).get("due") == [_ci] and u["probe_adoption"].get("rounds") == 2)
+    _cs["probe_adoption"] = u["probe_adoption"]
+    _b5 = gates.build_gauntlet_prompt(base_state(**fresh(_cs)))
+    _cs.update(probe_adoption=_b5["probe_adoption"], round_heads=_b5["round_heads"])
+    _g5 = gates.route_gauntlet(base_state(**{**fresh(_cs), "gauntlet_result": passed}))
+    _cs["round_heads"] = _g5["round_heads"]
+    _p5 = gates.pr_gate(rs(**fresh(_cs)))
+    _txt = (_p5.get("git_task") or {}).get("text", "")
+    check(name, _started and _g5.get("_next") == "pr_gate" and (_p5.get("git_task") or {}).get("kind") == "push_fix"
+          and _txt.startswith("Commit the CI fix and push the CURRENT branch")
+          and _txt.endswith("\n\n" + _ADOPTED_NEW + " Probe-written tests adopted into the reviewed change (written in "
+                            "round 4, reviewed in round 5): tests/ci.test.ts. Commit them with the task's work."),
+          (u.get("probe_adoption"), _txt))
+with scenario("pr_gate: a pending test past the run's adoption-round limit -> NOT adopted, visibly, and settled") as name:
+    _C = adopt_repo("adopt-c")
+    _late = {"path": "tests/late.test.ts", "round": 6}
+    _ls = dict(git_root=_C, project_dir=_C, git_actions={}, probe_tests=[_late],
+               probe_adoption={"rounds": getattr(gates, "ADOPTION_ROUNDS_MAX", 0)},
+               round_heads=[{"round": 6, "verdict": "PASS", "code_tree": gates._worktree_tree(_C)}])
+    put(_C, "tests/late.test.ts")
+    u = gates.pr_gate(base_state(**_ls))
+    _u2 = gates.pr_gate(base_state(**{**_ls, **u, "decisions": []}))
+    _why = f"the run's limit of {RERUN_ONCE + 1} adoption rounds was reached"
+    check(name, getattr(gates, "ADOPTION_ROUNDS_MAX", None) == RERUN_ONCE + 1 and u.get("_next") == "final_report"
+          and (u.get("probe_adoption") or {}).get("not_adopted") == [
+              {"round": "6", "paths": ["tests/late.test.ts"], "kind": "probe", "why": _why}]
+          and "NOT adopted" in u.get("gauntlet_attention", "") and "probe_adoption" not in _u2
+          and _u2.get("_next") == "final_report"
+          and f"Probe-written tests NOT adopted: tests/late.test.ts (written in round 6; {_why})"
+          in gates._assemble_report(base_state(**{**_ls, **u}), {}), (u.get("probe_adoption"), _u2.get("decisions")))
+
+
+def commit_all(root):
+    for args in (("add", "-A"), ("commit", "-q", "-m", "publish")):
+        subprocess.run(["git", "-C", root, *args], check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+with scenario("ci_gate: after git_ops committed the adopted test the clean-worktree row is ok, no publish retry "
+              "starts, and the publish text stops naming it") as name:
+    _D = adopt_repo("adopt-d", "tests/d.test.ts")
+    _ds = dict(git_root=_D, project_dir=_D, git_actions={"commit": True},
+               probe_tests=[{"path": "tests/d.test.ts", "round": 1}],
+               round_heads=[{"round": 1, "verdict": "PASS", "code_tree": gates._worktree_tree(_D)}])
+    _pd = gates.pr_gate(base_state(**_ds))
+    _asked = "reviewed in round 1): tests/d.test.ts." in _pd["git_task"]["text"]
+    commit_all(_D)
+    _ds["probe_adoption"] = _pd["probe_adoption"]
+    _rows = gates._publish_checks(base_state(**_ds))
+    u = gates.ci_gate(base_state(**{**_ds, "git_task": _pd["git_task"]}))
+    check(name, _asked and ("clean worktree", True, "nothing left uncommitted") in _rows
+          and "publish_retries" not in u and u.get("_next") != "git_ops"
+          and gates._adoption_publish_text(base_state(**_ds), {}) == "", (_rows, u.get("_next")))
+with scenario("pr_gate: a tree change after the last passing review -> noted in the ledger and attention, "
+              "never blocking") as name:
+    _tree = gates._worktree_tree(REPO)
+    open(os.path.join(REPO, "late_edit.txt"), "w").write("after the review\n")
+    try:
+        u = gates.pr_gate(base_state(git_actions={}, round_heads=[{"round": 1, "verdict": "PASS", "code_tree": _tree}]))
+    finally:
+        os.remove(os.path.join(REPO, "late_edit.txt"))
+    _same = gates.pr_gate(base_state(git_actions={}, round_heads=[{"round": 1, "verdict": "PASS", "code_tree": _tree}]))
+    check(name, bool(_tree) and u["_next"] == "final_report"
+          and "worktree changed after the last passing review (round 1): late_edit.txt" in u.get("gauntlet_attention", "")
+          and any(d.startswith("publish: worktree changed after the last passing review") for d in u["decisions"])
+          and "gauntlet_attention" not in _same, (u.get("gauntlet_attention"), _same.get("gauntlet_attention")))
+with scenario("report: the pipeline line follows the intent line, then one line per escalation and "
+              "the adopted tests") as name:
+    _rep = gates._assemble_report(base_state(intent="implementation", sizing="simple", pipeline_size="standard",
+                                             pipeline_size_reason="one guard", size_escalations=_esc1,
+                                             probe_adoption={"adopted": [{**_NEW, "reviewed_in": 3}]}), {})
+    _rl = _rep.splitlines()
+    _at = next(i for i, l in enumerate(_rl) if l.startswith("Intent:"))
+    _plain = gates._assemble_report(base_state(intent="implementation", sizing="simple", pipeline_size="small",
+                                               pipeline_size_reason="one guard"), {}).splitlines()
+    check(name, _rl[_at + 1] == "Pipeline: standard (escalated; assess: small - one guard)"
+          and "Pipeline: small (one guard)" in _plain
+          and _rl[_at + 2] == "- escalated to standard: coder strike 1/3 (CODER_FAILED) (subtask 1, review round 0)"
+          and _rl[_at + 3] == "Probe-written tests adopted: tests/new.test.ts (written in round 2, reviewed in round 3)",
+          _rl[_at:_at + 5])
+
+with scenario("route_intent: a re-assess that settles the same way writes no second pipeline ledger line; a "
+              "changed reason writes one") as name:
+    _s1 = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="small",
+                                        pipeline_size_reason="one guard"))
+    _s2 = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="small",
+                                        pipeline_size_reason="one guard", decisions=_s1["decisions"]))
+    _s3 = gates.route_intent(base_state(intent="implementation", sizing="simple", pipeline_size="small",
+                                        pipeline_size_reason="two guards", decisions=_s1["decisions"]))
+    _pl = lambda u: [d for d in u.get("decisions", _s1["decisions"]) if d.startswith("pipeline: ")]  # noqa: E731
+    check(name, len(_pl(_s1)) == 1 and _pl(_s2) == _pl(_s1) and _pl(_s3)[-1] == "pipeline: small (two guards)",
+          (_pl(_s2), _pl(_s3)))
+with scenario("resume: an owed full gauntlet survives the re-entry") as name:
+    _fst = gates.intake({"initial_prompt": "add a guard", "project_dir": REPO})
+    _lib.snapshot(_fst, {"full_gauntlet_due": True, "size_escalations": _esc1}, "coder")
+    _fre = gates.intake({"initial_prompt": f"Fix the failure\nSisyphus run id: {_fst['run_id']}", "project_dir": REPO})
+    check(name, _fre.get("full_gauntlet_due") is True and _fre.get("size_escalations") == _esc1,
+          _fre.get("full_gauntlet_due"))
+with scenario("route_coder_result: a crashed verification gate on a small pipeline counts a strike -> standard, "
+              "escalated once") as name:
+    u = gates.route_coder_result(base_state(coder_result="CODER_FAILED\n\nLast script error:\nscript 'verify_build' "
+                                                         "failed: exit 2\n\nLast build output:\n",
+                                            fix_strikes=0, pipeline_size="small"))
+    check(name, u.get("_next") == "escalate_gate" and (u.get("escalation") or {}).get("kind") == "engine_fault"
+          and escalated_once(u, "coder strike 1/"), u.get("decisions"))
+_AUTH = dict(local_run_recipe="./serve --local", consumer_surface=True,
+             brief="Rotate the session secret in src/auth/secrets.py and reload config/credentials.yml",
+             current_task="Rotate the session secret in src/auth/secrets.py and reload config/credentials.yml",
+             spec_text="Rotate the session secret in src/auth/secrets.py; config/credentials.yml still loads")
+with scenario("build_gauntlet: on a change naming auth and secret files, small differs from standard only by the "
+              "recipe section (no forced lanes, no security directive)") as name:
+    _sm = gates.build_gauntlet_prompt(base_state(**_AUTH, pipeline_size="small"))["gauntlet_prompt"].splitlines()
+    _st = gates.build_gauntlet_prompt(base_state(**_AUTH, pipeline_size="standard"))["gauntlet_prompt"].splitlines()
+    _cut = _st.index("Local-run recipe / usage suites:") if "Local-run recipe / usage suites:" in _st else 0
+    check(name, _cut > 0 and _sm == _st[:_cut] and "src/auth/secrets.py" in "\n".join(_sm), (_sm, _st))
+with scenario("graph.yaml: assess's schema has pipeline_size and pipeline_size_reason as plain strings, its "
+              "instructions name both values, and initial_state seeds the size and probe-test keys") as name:
+    _gy = open(os.path.join(HERE, "..", "graph.yaml")).read()
+    _assess = re.search(r"(?ms)^  assess:\n(.*?)(?=^  \w+:\n)", _gy).group(1)
+    _schema = _assess.split("    output_schema:\n")[1]
+    _init = _gy.split("\ninitial_state:\n")[1].split("\nnodes:\n")[0]
+    check(name, re.search(r"(?m)^        pipeline_size: \{ type: string \}$", _schema)
+          and re.search(r"(?m)^        pipeline_size_reason: \{ type: string \}$", _schema)
+          and "exactly one of the two values `small`\n      or `standard`" in _assess
+          and all(re.search(rf"(?m)^  {k}: {re.escape(v)}$", _init)
+                  for k, v in (("pipeline_size", "''"), ("pipeline_size_reason", "''"), ("size_escalations", "[]"),
+                               ("full_gauntlet_due", "false"), ("probe_tests", "[]"), ("probe_adoption", "{}"))),
+          _schema[:400])
 
 failed = [n for n, ok, _ in RESULTS if not ok]
 print(f"\n{len(RESULTS) - len(failed)}/{len(RESULTS)} checks passed")

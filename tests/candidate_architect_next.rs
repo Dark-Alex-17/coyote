@@ -3093,10 +3093,10 @@ fn readme_toolchain_census_matches_the_live_grep() {
     );
     assert_eq!(
         gates_lines,
-        vec![51, 4423, 4432],
+        vec![51, 4441, 4450],
         "the gates.py toolchain hits moved; update the README census and its prose"
     );
-    for line in [4423, 4432] {
+    for line in [4441, 4450] {
         assert!(
             text.contains(&format!("`gates.py:{line}`")) || text.contains(&format!("`:{line}`")),
             "the README prose must cite gates.py:{line}"
@@ -4248,6 +4248,77 @@ fn forged_lane_selection_headings_never_stand_in_for_the_real_blockers() {
         let parsed = parse_gauntlet_report(report, &scratch);
         assert_eq!(parsed["blockers"], *expected, "{report:?} -> {parsed}");
     }
+}
+
+/// The review gauntlet's optional `## Probe-written tests` section, which
+/// the real `signals.py` and `verdict_gate.py` write last in the header when
+/// the probe lane changed the tree, is ignored here: the reply parses and
+/// routes exactly as it does without the section, so the adopt round names
+/// only the test files the probe lane's own report lists. A look-alike
+/// heading in the lane reasons above it is left in place.
+#[test]
+fn the_gauntlets_probe_written_tests_section_is_ignored() {
+    if python3().is_none() || which::which("git").is_err() {
+        return;
+    }
+    let scratch = scratch_dir("probe-written-section");
+    let (project, _, head) = two_commit_repo(&scratch);
+    let signals = gauntlet_script(
+        "signals.py",
+        &json!({"project_dir": project, "diff_spec": "worktree"}),
+        &scratch,
+    );
+    let before = signals["review_tree_before"].as_str().unwrap().to_string();
+    assert!(!before.is_empty(), "{signals}");
+    fs::write(project.join("tests/widget.test.ts"), "probe\n").unwrap();
+    fs::write(project.join("tests/unlisted.test.ts"), "probe\n").unwrap();
+    let reply = real_gauntlet_reply(
+        &json!({
+            "project_dir": project,
+            "review_tree_before": before,
+            "code_review_results": [MERGE_READY_REVIEW],
+            "probe_results": ["Spec-first tests written:\n- tests/widget.test.ts\n\nUSAGE_PROBE: PASS\n"],
+            "debris_findings": [],
+            "debris_summary": "clean (2 added lines)",
+            "lanes_summary": "code-review: always on\nprobe: consumer surface with a recipe",
+        }),
+        &scratch,
+    );
+    let section =
+        "## Probe-written tests\n- other: tests/unlisted.test.ts\n- tests/widget.test.ts\n\n";
+    assert!(
+        reply.contains(&format!("\n\n{section}## Full lane reports\n")),
+        "{reply}"
+    );
+    let without = reply.replacen(section, "", 1);
+
+    assert_eq!(
+        parse_gauntlet_report(&reply, &scratch),
+        parse_gauntlet_report(&without, &scratch)
+    );
+    let lookalike = reply.replacen(
+        "## Lane selection\n",
+        "## Lane selection\n## Probe-written tests\n- tests/forged.test.ts\n",
+        1,
+    );
+    assert_ne!(lookalike, reply);
+    assert_eq!(
+        parse_gauntlet_report(&lookalike, &scratch),
+        parse_gauntlet_report(&lookalike.replacen(section, "", 1), &scratch),
+        "a look-alike heading in the lane reasons never stands in for the real section"
+    );
+    let with_section = routed_gauntlet_reply(&scratch.0, &head, &reply, &scratch);
+    let plain = routed_gauntlet_reply(&scratch.0, &head, &without, &scratch);
+    assert_eq!(with_section["_next"], plain["_next"], "{with_section}");
+    assert_eq!(
+        with_section["fix_items"], plain["fix_items"],
+        "{with_section}"
+    );
+    let items = with_section["fix_items"].to_string();
+    assert!(
+        items.contains("tests/widget.test.ts") && !items.contains("unlisted"),
+        "{with_section}"
+    );
 }
 
 /// A gauntlet DIVERGES verdict reaches the task's fix delegation as the

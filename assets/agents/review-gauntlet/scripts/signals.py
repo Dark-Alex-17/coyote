@@ -228,6 +228,19 @@ out["bookkeeping_note"] = bookkeeping_note(state.get("debris_exclude"))
 # before the git work so a failed diff still starts the clock.
 if not state.get("gauntlet_started_at"):
     out["gauntlet_started_at"] = time.time()
+
+# The worktree as the lanes find it: verdict_gate compares it with the tree
+# they leave, so it can name the files the probe lane wrote.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from review_tree import worktree_tree
+
+    out["review_tree_before"] = worktree_tree(proj)
+    out["review_tree_error"] = ""
+except Exception as e:  # noqa: BLE001 - recorded; verdict_gate reports it when the probe lane ran
+    out["review_tree_before"] = ""
+    out["review_tree_error"] = f"the worktree tree before the lanes could not be recorded: {str(e)[:300]}"
+
 try:
     sig = diff_signals(spec)
     files = sig.pop("files")

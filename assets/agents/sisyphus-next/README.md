@@ -109,12 +109,12 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:3070:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:3215:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:3216:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
-scripts/smoke_test.py:3422:             "make: *** [check] Error 1")
-scripts/smoke_test.py:3427:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
-scripts/smoke_test.py:3428:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
+scripts/gates.py:3155:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:3216:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:3217:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:3423:             "make: *** [check] Error 1")
+scripts/smoke_test.py:3428:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
+scripts/smoke_test.py:3429:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
 ```
 
 The lone `gates.py` hit is the English verb `make` in one prompt sentence; the five
@@ -345,6 +345,47 @@ whole-task coder brief carrying every scope guard the subtasks collected) throug
 `review_gate`; only that review goes on to the observability pass and publishing, so every
 parent acceptance criterion is still enforced. A single-subtask run is reviewed against the
 task's criteria once, as before.
+
+## Pipeline size and probe-written tests
+
+`assess` sizes the pipeline as `pipeline_size` (`small` or `standard`) with a one-line
+`pipeline_size_reason`; `route_intent` ledgers it, and the report prints it as a `Pipeline:`
+line under the intent (after an escalation, `Pipeline: standard (escalated; assess: small - <reason>)`).
+The schema leaves the value a plain string, so `_settle_size` is the one place that enforces
+it, and a re-assess that settles the same way writes no second ledger line. The gates never
+pick small themselves: a missing or unknown size is
+standard (fail-safe), and small next to compound or plan-shaped sizing or `architecture_scale`
+is standard (invalid classification). A small subtask skips the research fan-out
+(`next_subtask` goes straight to `oracle_gate`), and its review prompt carries no local-run
+recipe, so the gauntlet's own rules select a proportionate set of lanes without the probe.
+Any red gate turns small into standard once, through `_escalate_size`: a coder strike, a red
+test gate carried forward, a coder round whose verification gate crashed, a BLOCKED or
+incomplete review round (an adversary DIVERGES
+included), a real CI failure, a scope breach, a resume fix round or a PR review fix round. The
+escalation is ledgered and listed in the report, and the next review round runs the full
+gauntlet: the recipe is back and the re-review delta and settled lanes are left out. That debt
+(`full_gauntlet_due`) and the escalated size survive subtasks, the final review and re-entry,
+and the size is never lowered again.
+
+When the gauntlet reports `## Probe-written tests`, `route_gauntlet` keeps the bare `- <path>`
+items with the round (`probe_written`, `probe_tests`). Only `tag: ` with the colon and space
+is a tag. `other:` and `deleted:` items are human-attention lines and are recorded as changed
+during review and NOT adopted, in the report and the publish text; an unavailable list, or a
+path that is not one line free of control characters (skipped, never quoted), is an attention
+line too.
+
+At the top of `pr_gate` each probe-written path is settled against the last passing round's
+`code_tree`: one still in the worktree and unchanged since that tree was reviewed by that round
+and is adopted with no extra round; the ones that differ get one adoption round over the tree
+that contains them (no recipe, so it cannot write tests again; one prompt line names them).
+Only a round that started as an adoption round goes from PASS straight back to `pr_gate`; a
+BLOCKED one is triaged like any other and later rounds are normal. An adoption round accepted
+NEEDS-HUMAN leaves those files listed as adoption NOT completed. A CI or PR-review fix round
+whose probe lane writes new files gets its own adoption round, up to
+`ADOPTION_ROUNDS_MAX` (`RERUN_ONCE + 1`) a run; past that, and for a file that is gone or a tree
+that cannot be compared, the files are listed as NOT adopted. The publish, review-update and
+push-fix tasks name the adopted files not committed yet for `git_ops`, and `pr_gate` notes,
+without blocking, any path that changed after the last passing review.
 
 ## Verify
 

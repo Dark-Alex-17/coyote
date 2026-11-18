@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -312,7 +313,9 @@ def intake(state):
                   "task_number", "review_rounds", "round_heads", "rejected_findings", "deferred_findings",
                   "skipped_reviews", "debt_left_behind", "debt_scan_failures", "debris_exemptions", "design_decisions",
                   "autonomous_digest", "decisions", "follow_ups", "parked", "escalation",
-                  "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria"):
+                  "coder_result", "anomalies_log", "gauntlet_lanes", "start_branch", "publish_criteria",
+                  "pipeline_size", "pipeline_size_reason", "size_escalations", "full_gauntlet_due", "probe_tests",
+                  "probe_adoption"):
             if prior.get(k) is not None:
                 u[k] = prior[k]
         idx = u.get("subtask_index")
@@ -391,6 +394,8 @@ def assess_fault(state):
         "assess_faulted": True,
         "intent": "ambiguous",
         "sizing": "n/a",
+        "pipeline_size": "standard",
+        "pipeline_size_reason": "assess failed; standard (fail-safe)",
         "intent_statement": "intake classification failed; asking instead of guessing",
         "clarifying_questions": [{
             "question": f"The intake classifier failed ({err[:200]}). How should this message be handled?",
@@ -424,6 +429,11 @@ CLARIFY_STOP = "Stop: the request stays ambiguous"
 
 def _one_line(text, n=200):
     return tail(" ".join(str(text or "").split()), n)
+
+
+def _whole_line(text):
+    """The text on one line, never trimmed: a stated reason is a decision and is ledgered whole."""
+    return " ".join(str(text or "").split())
 
 
 def _sizing_verdict(state, u, reason, planned=None):
@@ -698,6 +708,53 @@ def _not_a_step_run(state):
     return "" if os.path.isdir(steps) else f"there is no step plans directory at {steps}"
 
 
+def _settle_size(state, u, sizing):
+    """The run's pipeline size from assess's verdict. Gates never pick small themselves: a missing or unknown size, or
+    a small one the sizing contradicts, is standard, and a size an escalation raised never comes back down. A re-assess
+    that settles the way the last `pipeline:` decision already says writes no second ledger line."""
+    line = _settled_size(state, u, sizing)
+    last = next((d for d in reversed(as_list(u.get("decisions", state.get("decisions"))))
+                 if isinstance(d, str) and d.startswith("pipeline: ")), None)
+    if line and line != last:
+        ledger(state, u, line)
+
+
+def _settled_size(state, u, sizing):
+    size = str(state.get("pipeline_size") or "").strip().lower()
+    raised = as_list(state.get("size_escalations"))
+    if raised:
+        u["pipeline_size"] = "standard"
+        if size == "standard":
+            return ""
+        return (f"pipeline: standard kept (escalated earlier in the run: {as_dict(raised[-1]).get('why')}); "
+                f"assess's {size or 'missing'} size is not applied")
+    if size not in ("small", "standard"):
+        u["pipeline_size"] = "standard"
+        u["pipeline_size_reason"] = f"no valid size from assess ({size or 'missing'}); standard (fail-safe)"
+        return f"pipeline: no valid size from assess ({size or 'missing'}) -> standard (fail-safe)"
+    contradicts = [what for what, hit in ((f"sizing {sizing}", sizing in ("compound", "plan_shaped")),
+                                          ("architecture_scale", truthy(state.get("architecture_scale")))) if hit]
+    if size == "small" and contradicts:
+        what = " and ".join(contradicts)
+        u["pipeline_size"] = "standard"
+        u["pipeline_size_reason"] = f"small contradicts {what}; standard (invalid classification)"
+        return f"pipeline: small contradicts {what} -> standard (invalid classification)"
+    u["pipeline_size"] = size
+    return f"pipeline: {size} ({_whole_line(state.get('pipeline_size_reason')) or 'no reason given'})"
+
+
+def _escalate_size(state, u, why):
+    """A red gate turns a small pipeline standard, once, and owes the next review round the full gauntlet."""
+    if u.get("pipeline_size", state.get("pipeline_size")) != "small":
+        return
+    at = "final review" if truthy(state.get("final_review")) else f"subtask {as_int(state.get('task_number')) or 1}"
+    u["pipeline_size"] = "standard"
+    u["size_escalations"] = list(as_list(state.get("size_escalations"))) + [
+        {"why": why, "at": f"{at}, review round {len(as_list(state.get('round_heads')))}"}]
+    u["full_gauntlet_due"] = True
+    ledger(state, u, f"pipeline: escalated small -> standard: {why}; the next review round runs the full gauntlet")
+
+
 def _route_intent(state, u):
     intent = state.get("intent") or "ambiguous"
     sizing = state.get("sizing") or "simple"
@@ -706,6 +763,7 @@ def _route_intent(state, u):
     u["assess_oracle_question"] = state.get("oracle_question") or ""
 
     if truthy(state.get("resume_mode")):
+        _settle_size(state, u, sizing)
         action = state.get("resume_action") or "fix"
         if action == "git_ops":
             u["git_task"] = {"kind": "instruction", "text": state.get("brief", ""), "return_to": "final_report"}
@@ -713,6 +771,7 @@ def _route_intent(state, u):
         elif action == "answer":
             u["_next"] = "research_answer"
         else:
+            _escalate_size(state, u, "resume fix round")
             u["fix_source"] = "resume"
             u["_next"] = "compose_fix"
         return u
@@ -731,6 +790,7 @@ def _route_intent(state, u):
             ledger(state, u, f"route: the reclassified brief carries no implementation size ({sizing!r}) -> compound")
             sizing = u["sizing"] = "compound"
 
+    _settle_size(state, u, sizing)
     questions = as_list(state.get("clarifying_questions"))
     # past the cap the user chose to go on from a stated reading: assess's remaining questions no longer hold the run
     past_cap = as_int(state.get("clarify_extensions")) > 0
@@ -1165,6 +1225,11 @@ def _seal_subtasks(state, subtasks):
     write_artifact(state.get("run_dir", ""), SEALED_SUBTASKS, json.dumps(subtasks, indent=1, default=str))
 
 
+# The context pack of a small pipeline's subtask, which gets no research fan-out
+RESEARCH_SKIPPED_PACK = ("Research was skipped (pipeline small): no reference snippets were gathered. Name the files "
+                         "the coder should read first; it reads the code itself.")
+
+
 def next_subtask(state):
     u = {}
     subtasks = _checked_subtasks(state, u)
@@ -1219,7 +1284,15 @@ def next_subtask(state):
     # What the worktree held when the subtask started (uncommitted earlier subtasks included): the read-only check,
     # the subtask's own file list and the strikeout restore compare against it.
     u.update({"subtask_head": head, "subtask_tree": _worktree_tree(root), "subtask_started_at": int(time.time())})
-    u["_next"] = "compose_brief" if state.get("intent") == "trivial" else "plan_research"
+    if state.get("intent") == "trivial":
+        u["_next"] = "compose_brief"
+    elif state.get("pipeline_size") == "small":
+        u["context_pack"] = RESEARCH_SKIPPED_PACK
+        ledger(state, u, f"research: skipped (pipeline small: "
+                         f"{_whole_line(state.get('pipeline_size_reason')) or 'no reason given'})")
+        u["_next"] = "oracle_gate"
+    else:
+        u["_next"] = "plan_research"
     snapshot(state, u, f"subtask {idx + 1}")
     return u
 
@@ -2440,6 +2513,14 @@ def apply_answer(state):
             lanes = as_list(state.get("gauntlet_incomplete")) or ["pipeline"]
             u["skipped_reviews"] = list(as_list(state.get("skipped_reviews"))) + [
                 f"round {len(as_list(state.get('round_heads')))}: {', '.join(lanes)} (NEEDS-HUMAN accepted)"]
+            last = next((r for r in reversed(as_list(state.get("round_heads"))) if isinstance(r, dict)), {})
+            if last.get("adoption"):
+                due = [d for d in as_list(last.get("adoption_due")) if isinstance(d, dict)]
+                adoption = as_dict(state.get("probe_adoption"))
+                u["probe_adoption"] = {**adoption, "not_completed": list(as_list(adoption.get("not_completed")))
+                                       + [{"round": last.get("round"), "paths": due}]}
+                ledger(state, u, f"probe tests: adoption round {last.get('round')} accepted NEEDS-HUMAN; the "
+                                 f"adoption of {_paths_of(due)} is NOT completed")
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
         else:
             u["failure_reason"] = "aborted at the user's request: the review could not be completed"
@@ -2703,6 +2784,7 @@ def scope_check(state):
                 owners = {f: [t for t, paths in roster.items() if any(_in_scope(f, p) for p in paths)] for f in outside}
                 breach = "; ".join(f"{f} (owned by {', '.join(o) or 'nobody declared'})" for f, o in owners.items())
                 u["scope_breach"] = breach
+                _escalate_size(state, u, f"scope breach: {_one_line(breach)}")
                 esc = escalation(
                     "scope_breach",
                     f"Scope breach: correct implementation needs files outside this task's declared scope: {breach}. "
@@ -2942,6 +3024,7 @@ def route_coder_result(state):
             u.update({"fix_strikes": strikes, "coder_sentinel": "CODER_COMPLETE", "last_coder_error": unpassed[0]})
             ledger(state, u, f"coder: CODER_COMPLETE with tests not passed ({unpassed[1]}); "
                              f"strike {strikes}/{STRIKE_LIMIT}")
+            _escalate_size(state, u, f"coder strike {strikes}/{STRIKE_LIMIT} (CODER_COMPLETE with tests not passed)")
             _strike_next(u, strikes)
             snapshot(state, u, "coder")
             return u
@@ -3004,6 +3087,7 @@ def route_coder_result(state):
             for f in pending:
                 ledger(state, u, f"coder: red test gate at {', '.join(f['paths'])} is pending, owned by subtask "
                                  f"{f['owner']}; carried forward ({f['evidence']})")
+            _escalate_size(state, u, f"red test gate carried forward ({len(pending)} failure(s))")
             u["_next"] = "debt_scan"
             snapshot(state, u, "coder")
             return u
@@ -3017,6 +3101,7 @@ def route_coder_result(state):
             err += "\n\n" + _classification_note(classified)
         u["last_coder_error"] = err
         ledger(state, u, f"coder: {u['coder_sentinel']} strike {strikes}/{STRIKE_LIMIT}")
+        _escalate_size(state, u, f"coder strike {strikes}/{STRIKE_LIMIT} ({u['coder_sentinel']})")
         # an empty value renders as a blank line; the body must not run on into the next section header
         m = re.search(r"Last script error:[ \t]*\n(.*?)(?=\n[ \t]*\n|\nLast |\Z)", result, re.S)
         if m and m.group(1).strip() and m.group(1).strip() != "null":
@@ -3112,6 +3197,8 @@ def strikeout(state):
         code, out, err = git(root, "stash", "push", "-u", "-m", f"sisyphus-next strikeout {state.get('run_id', '')}")
         stash = out.strip() or err.strip()
     attempts = f"{STRIKE_LIMIT} consecutive failed fix attempts. Last error:\n{state.get('last_coder_error') or ''}"
+    if str(state.get("context_pack") or "").startswith(RESEARCH_SKIPPED_PACK):
+        attempts = "Research was skipped for this subtask (pipeline small).\n" + attempts
     u["diagnosis"] = ((state.get("diagnosis") or "") + "\n\n" + attempts).strip()
     ledger(state, u, f"strikeout: stopped after {STRIKE_LIMIT} strikes; "
                      + (f"broken attempt stashed ({stash[:80]})" if stash else "worktree was clean"))
@@ -3740,6 +3827,16 @@ def build_gauntlet_prompt(state):
              f"Project: {state.get('project_dir')}",
              f"Diff: {diff}",
              f"Rigor: {state.get('quality_rigor') or 'production'}   Security posture: {_posture(state)}"]
+    adoption = as_dict(state.get("probe_adoption"))
+    due = [d for d in as_list(adoption.get("due")) if isinstance(d, dict)]
+    adopting = bool(due)
+    if adopting:
+        # above the plan block, so the gauntlet never reads it as an acceptance criterion
+        lines.append(f"Probe-written tests adopted into the change under review (written in review round "
+                     f"{_rounds_of(due)}; review them as part of the change): {_paths_of(due)}")
+    full = truthy(state.get("full_gauntlet_due"))
+    if full:
+        u["full_gauntlet_due"] = False
     dropped = 0
     if _subtask_phase(state):
         files = state.get("subtask_changed_files")
@@ -3790,14 +3887,22 @@ def build_gauntlet_prompt(state):
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
         last = rounds[-1] if isinstance(rounds[-1], dict) else {}
         dirty = _code_tree_dirty(state, root)
-        if last.get("head") and last["head"] != head and not dirty:
+        if full:
+            ledger(state, u, f"gauntlet: round {n} runs the full gauntlet after the pipeline escalation: no re-review "
+                             "delta or settled lanes")
+        elif last.get("head") and last["head"] != head and not dirty:
             lines += [f"Re-review delta: {last['head']}..HEAD"]
             green = [l for l, v in as_dict(state.get("gauntlet_lanes")).items()
                      if l != "debris" and str(v).strip() == "GREEN" and l not in as_list(last.get("lanes_with_findings"))]
             if green:
                 lines += [f"Settled lanes: {', '.join(green)}"]
     recipe = (state.get("local_run_recipe") or "").strip()
-    if recipe or truthy(state.get("consumer_surface")):
+    if adopting:
+        ledger(state, u, f"gauntlet: round {n} reviews the adopted probe-written tests: no probe context, so the round "
+                         "cannot write tests again")
+    elif state.get("pipeline_size") == "small":
+        ledger(state, u, "gauntlet: proportionate review (pipeline small): no probe context")
+    elif recipe or truthy(state.get("consumer_surface")):
         note = recipe or "discover them"
         if PROBE_HOUSE_NOTE and truthy(state.get("consumer_surface")):
             note += f"\n{PROBE_HOUSE_NOTE}"
@@ -3814,7 +3919,11 @@ def build_gauntlet_prompt(state):
                          "and it passed")
         u["_next"] = "route_gauntlet"
         return u
-    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": tree, "review_key": key, "started": now_iso()}]
+    u["round_heads"] = rounds + [{"round": n, "head": head, "code_tree": tree, "review_key": key, "started": now_iso(),
+                                  **({"adoption": True, "adoption_due": due} if adopting else {})}]
+    if adopting:
+        # only this round reviews them as an adoption round; a BLOCKED one leaves later rounds normal
+        u["probe_adoption"] = {**adoption, "due": []}
     ledger(state, u, f"gauntlet: round {n} spawned @ {head or '(no git)'}")
     snapshot(state, u, f"gauntlet round {n}")
     return u
@@ -3838,7 +3947,8 @@ def _has_verdict(header):
 # The gauntlet writes its sections after the lane table in a fixed order:
 # `## Lane selection` (lane reasons, model-written and free to carry a
 # column-0 heading of its own), then the optional `## Pipeline notes`,
-# `## Blockers` and `## Human attention required`. A section is read only
+# `## Blockers`, `## Human attention required` and, last, `## Probe-written
+# tests`. A section is read only
 # below the first `## Lane selection` heading after the table, from the
 # LAST exact level-2 heading of its title, up to the next column-0 `## `
 # heading, so a look-alike inside the lane reasons always sits above the
@@ -3859,6 +3969,16 @@ def _gauntlet_section(header_lines, start, title):
     return body, heads[-1] + 1
 
 
+def _sections_start(header_lines):
+    """The line below the first `## Lane selection` heading after the lane table, where the sections are read from."""
+    first_row = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
+    table_end = next((i for i in range(first_row, len(header_lines)) if not header_lines[i].startswith("|")),
+                     len(header_lines))
+    start = table_end if table_end > first_row else 0
+    selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
+    return next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
+
+
 def _parse_gauntlet(text):
     header = _gauntlet_header(text)
     verdict = "BLOCKED"
@@ -3871,21 +3991,16 @@ def _parse_gauntlet(text):
     details = {}
     header_lines = header.splitlines()
     first_row = next((i for i, l in enumerate(header_lines) if l.startswith("|")), len(header_lines))
-    table_end = first_row
     for line in header_lines[first_row:]:
         if not line.startswith("|"):
             break
-        table_end += 1
         cells = [c.strip() for c in line.strip("|").split("|")]
         lane = cells[0].lower()
         if len(cells) >= 2 and lane in GAUNTLET_LANES and lane not in lanes:
             lanes[lane] = cells[1]
             if len(cells) >= 3 and cells[2]:
                 details[lane] = cells[2]
-    start = table_end if table_end > first_row else 0
-    selection = re.compile(r"##[ \t]+Lane selection[ \t]*")
-    start = next((i + 1 for i in range(start, len(header_lines)) if selection.fullmatch(header_lines[i])), start)
-    section, start = _gauntlet_section(header_lines, start, "Blockers")
+    section, start = _gauntlet_section(header_lines, _sections_start(header_lines), "Blockers")
     blockers = [l[2:].strip() for l in section or [] if l.startswith(("- ", "* "))]
     # The gauntlet writes debris hits only as items of its Blockers section,
     # so an unbulleted debris line counts only inside that section; the same
@@ -3897,15 +4012,79 @@ def _parse_gauntlet(text):
     return verdict, incomplete, lanes, details, blockers, attention
 
 
+def _probe_written(text):
+    """The optional `## Probe-written tests` section of a gauntlet reply: (paths the probe lane added, other paths
+    changed during the review, paths deleted during it, why the list is unavailable or "", items skipped as unsafe to
+    quote). A tag counts only as `tag: `, so a path that merely starts with a tag word is a path."""
+    header_lines = _gauntlet_header(text).splitlines()
+    section, _ = _gauntlet_section(header_lines, _sections_start(header_lines), "Probe-written tests")
+    items = [l[2:].strip() for l in section or [] if l.startswith("- ") and l[2:].strip()]
+    tagged = [(m.group(1), m.group(2).strip()) if (m := re.match(r"(deleted|other|unavailable): (.*)", i))
+              else ("", i) for i in items]
+    unavailable = "; ".join(v or "no reason given" for tag, v in tagged if tag == "unavailable")
+    paths = [(tag, v) for tag, v in tagged if tag != "unavailable" and v]
+    unsafe = [v for _, v in paths if not _quotable_path(v)]
+    kept = [(tag, v) for tag, v in paths if _quotable_path(v)]
+    return ([v for tag, v in kept if not tag], [v for tag, v in kept if tag == "other"],
+            [v for tag, v in kept if tag == "deleted"], unavailable, unsafe)
+
+
+def _quotable_path(path):
+    """A path that can go into a prompt or a publish text as it is: one line with no control or format character."""
+    return not any(unicodedata.category(c).startswith("C") for c in path)
+
+
+def _note_probe_written(state, u, n, written, other, deleted, unavailable, unsafe):
+    """Keep the files the probe lane wrote in round n. Any other change, a deletion, an item unsafe to quote, or a
+    list the gauntlet could not compute is a human-attention line; other changes and deletions are also recorded as
+    not adopted, for the report and the publish text."""
+    if written:
+        known = as_list(state.get("probe_tests"))
+        u["probe_tests"] = known + [{"path": p, "round": n} for p in written if {"path": p, "round": n} not in known]
+        ledger(state, u, f"probe tests: the probe lane wrote {len(written)} file(s) in round {n}: {', '.join(written)}")
+    notes = []
+    entries = []
+    if other:
+        notes.append(f"- files changed during review round {n} and NOT adopted as probe-written tests: "
+                     f"{', '.join(other)}")
+        ledger(state, u, f"probe tests: {len(other)} other file(s) changed during round {n}, NOT adopted: "
+                         f"{', '.join(other)}")
+        entries.append({"round": n, "paths": other, "kind": "other"})
+    if deleted:
+        notes.append(f"- the probe lane deleted file(s) in review round {n}: {', '.join(deleted)}")
+        ledger(state, u, f"probe tests: the probe lane deleted {len(deleted)} file(s) in round {n}: {', '.join(deleted)}")
+        entries.append({"round": n, "paths": deleted, "kind": "deleted"})
+    if unsafe:
+        shown = ", ".join(ascii(p)[:80] for p in unsafe[:5])
+        notes.append(f"- {len(unsafe)} changed path(s) in review round {n} skipped, not one clean line: {shown}")
+        ledger(state, u, f"probe tests: round {n}: {len(unsafe)} path(s) with control characters skipped: {shown}")
+    if unavailable:
+        notes.append(f"- the files the probe lane wrote in review round {n} are unknown: {unavailable}")
+        ledger(state, u, f"probe tests: round {n} list unavailable ({unavailable}); the files the probe lane wrote "
+                         "are unknown")
+    if entries:
+        adoption = as_dict(u.get("probe_adoption", state.get("probe_adoption")))
+        u["probe_adoption"] = {**adoption, "not_adopted": list(as_list(adoption.get("not_adopted"))) + entries}
+    if notes:
+        u["gauntlet_attention"] = "\n".join(x for x in [u.get("gauntlet_attention", ""), *notes] if x)
+
+
 def route_gauntlet(state):
     u = {}
     note_script_error(state, u, "run_gauntlet")
     text = state.get("gauntlet_result") or ""
+    written, other, deleted, unavailable, unsafe = [], [], [], "", []
     if not text or text.startswith("Agent node failed") or not _has_verdict(_gauntlet_header(text)):
         verdict, incomplete, lanes, details, blockers, attention = "BLOCKED", ["pipeline"], {}, {}, [], ""
     else:
         verdict, incomplete, lanes, details, blockers, attention = _parse_gauntlet(text)
+        written, other, deleted, unavailable, unsafe = _probe_written(text)
+        # a changed file the probe lane wrote in an earlier round is its own test edited again
+        earlier = {str(as_dict(t).get("path")) for t in as_list(state.get("probe_tests"))}
+        written += [p for p in other if p in earlier and p not in written]
+        other = [p for p in other if p not in earlier]
     rounds = as_list(state.get("round_heads"))
+    n = (rounds[-1].get("round") if rounds and isinstance(rounds[-1], dict) else None) or len(rounds)
     if rounds and isinstance(rounds[-1], dict):
         lane_blockers = {}
         for b in blockers:
@@ -3913,15 +4092,27 @@ def route_gauntlet(state):
         rounds[-1].update({"verdict": verdict, "lanes": lanes, "lane_details": details, "incomplete": incomplete,
                            "lane_blockers": lane_blockers,
                            "lanes_with_findings": [l for l, v in lanes.items() if v not in ("GREEN", "GREEN (attention)", "SKIPPED", "")]})
+        if written:
+            rounds[-1]["probe_written"] = written
     merged_lanes = dict(as_dict(state.get("gauntlet_lanes")))
     merged_lanes.update(lanes)
     u.update({"gauntlet_verdict": verdict, "gauntlet_incomplete": incomplete, "gauntlet_lanes": merged_lanes,
               "gauntlet_blockers": blockers, "gauntlet_attention": attention, "round_heads": rounds})
     ledger(state, u, f"gauntlet: round {len(rounds)} -> {verdict}" + (f" incomplete={incomplete}" if incomplete else ""))
+    _note_probe_written(state, u, n, written, other, deleted, unavailable, unsafe)
+    adoption_round = bool(rounds) and isinstance(rounds[-1], dict) and bool(rounds[-1].get("adoption"))
     if verdict == "PASS":
-        u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+        if adoption_round:
+            # observability and whetstone already ran for this code; the round only had to review the adopted
+            # tests, and pr_gate reads them as adopted because this round's tree holds them unchanged
+            ledger(state, u, f"probe tests: adoption round {n} passed")
+            u["_next"] = "pr_gate"
+        else:
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
     else:
         real = [b for b in blockers if not review_fault(b)]
+        _escalate_size(state, u, f"review round {n} BLOCKED: {real[0][:160]}" if real else
+                       f"review round {n} incomplete ({', '.join(incomplete or ['pipeline'])})")
         if real:
             u["gauntlet_blockers"] = real
             u["_next"] = "triage_findings"
@@ -4229,11 +4420,155 @@ def whetstone_gate(state):
 
 
 # ====================================================================== 2.7
+ADOPTION_ROUNDS_MAX = RERUN_ONCE + 1
+
+
+def _paths_of(entries):
+    return ", ".join(str(as_dict(e).get("path")) for e in entries)
+
+
+def _rounds_of(entries):
+    return ", ".join(str(r) for r in dict.fromkeys(as_dict(e).get("round") for e in entries))
+
+
+def _start_probe_adoption(state, u):
+    """Settle the tests the probe lane wrote against the last passing review round; True when an adoption round over
+    the ones it did not review starts.
+
+    A test still in the worktree and unchanged since that round's tree was reviewed by it, so it is adopted with no
+    extra round. One that differs needs a review round over the tree that holds it, at most ADOPTION_ROUNDS_MAX a
+    run. Past that limit, and for a test that is gone or a tree that cannot be compared, it is recorded as not
+    adopted; a test whose adoption round was accepted NEEDS-HUMAN stays not completed. Either way it is settled and
+    never asked about again."""
+    adoption = as_dict(state.get("probe_adoption"))
+    settled = {str(p) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") == "probe"
+               for p in as_list(as_dict(s).get("paths"))}
+    settled |= {str(as_dict(d).get("path")) for s in as_list(adoption.get("not_completed"))
+                for d in as_list(as_dict(s).get("paths"))}
+    latest = {}
+    for t in as_list(state.get("probe_tests")):
+        path = as_dict(t).get("path")
+        if isinstance(path, str) and _quotable_path(path) and path not in settled:
+            latest[path] = as_dict(t).get("round")
+    if not latest:
+        return False
+    passed = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict) and r.get("verdict") == "PASS"]
+    last = passed[-1] if passed else {}
+    root = state.get("git_root") or state.get("project_dir") or "."
+    reviewed, tree = last.get("code_tree") or "", _worktree_tree(root)
+    code, out, _ = git(root, "diff-tree", "-r", "-z", "--name-only", reviewed, tree) if reviewed and tree else (1, "", "")
+    changed = set(_nul_names(out))
+    adopted = {str(as_dict(a).get("path")): as_dict(a) for a in as_list(adoption.get("adopted"))}
+    newly, pending, gone, unknown = [], [], [], []
+    for path, written in latest.items():
+        entry = {"path": path, "round": written}
+        if not os.path.isfile(os.path.join(root, path)):
+            gone.append(entry)
+        elif code:
+            unknown.append(entry)
+        elif path in changed:
+            pending.append(entry)
+        elif as_dict(adopted.get(path)).get("round") != written:
+            adopted[path] = {**entry, "reviewed_in": last.get("round")}
+            newly.append(adopted[path])
+    rounds = as_int(adoption.get("rounds"))
+    capped = pending if rounds >= ADOPTION_ROUNDS_MAX else []
+    skipped = [(gone, "no longer in the worktree"),
+               (unknown, "the worktree could not be compared with the last passing review"),
+               (capped, f"the run's limit of {ADOPTION_ROUNDS_MAX} adoption rounds was reached")]
+    skipped = [(entries, why) for entries, why in skipped if entries]
+    start = bool(pending) and not capped
+    if not (newly or skipped or start):
+        return False
+    update = {**adoption, "adopted": list(adopted.values())}
+    if newly:
+        ledger(state, u, f"probe tests: adopted {_paths_of(newly)}, unchanged since review round {last.get('round')} "
+                         "reviewed them")
+    attention = [u.get("gauntlet_attention", state.get("gauntlet_attention")) or ""]
+    for entries, why in skipped:
+        update["not_adopted"] = list(as_list(update.get("not_adopted"))) + [
+            {"round": _rounds_of(entries), "paths": [e["path"] for e in entries], "kind": "probe", "why": why}]
+        line = f"probe tests NOT adopted: {_paths_of(entries)} (written in round {_rounds_of(entries)}): {why}"
+        ledger(state, u, line)
+        attention.append(f"- {line}")
+    u["gauntlet_attention"] = "\n".join(x for x in attention if x)
+    if start:
+        update.update({"due": pending, "rounds": rounds + 1})
+        ledger(state, u, f"probe tests: adopting {len(pending)} file(s) written in round {_rounds_of(pending)}; one "
+                         "review round over the tree that contains them")
+        u["_next"] = "build_gauntlet_prompt"
+    u["probe_adoption"] = update
+    return start
+
+
+def _adopted_groups(adoption):
+    """The adopted tests as (written round, reviewed round, paths), in adoption order."""
+    groups = {}
+    for a in as_list(adoption.get("adopted")):
+        a = as_dict(a)
+        groups.setdefault((a.get("round"), a.get("reviewed_in")), []).append(str(a.get("path")))
+    return [(r, rv, ", ".join(paths)) for (r, rv), paths in groups.items()]
+
+
+def _adoption_publish_text(state, u):
+    """The publish sentences on files the review itself changed: the adopted probe-written tests not committed yet,
+    and the other changes that were NOT adopted. "" when neither applies."""
+    adoption = as_dict(u.get("probe_adoption", state.get("probe_adoption")))
+    root = state.get("git_root") or state.get("project_dir") or "."
+    text = ""
+    paths = [str(as_dict(a).get("path")) for a in as_list(adoption.get("adopted"))]
+    if paths:
+        code, out, _ = git(root, "status", "--porcelain", "-z", "--untracked-files=all", "--", *_literal(paths))
+        dirty = {e[3:] for e in out.split("\0") if len(e) > 3}
+        unpublished = {"adopted": [a for a in as_list(adoption.get("adopted"))
+                                   if code or str(as_dict(a).get("path")) in dirty]}
+        groups = _adopted_groups(unpublished)
+        if groups:
+            text += "\n\n" + " ".join(f"Probe-written tests adopted into the reviewed change (written in round {r}, "
+                                      f"reviewed in round {rv}): {p}." for r, rv, p in groups)
+            text += " Commit them with the task's work."
+    other = [as_dict(s) for s in as_list(adoption.get("not_adopted")) if as_dict(s).get("kind") in ("other", "deleted")]
+    if other:
+        text += ("\n\nChanged during review and NOT adopted as reviewed tests: "
+                 + "; ".join(f"{', '.join(str(p) for p in as_list(s.get('paths')))} (review round {s.get('round')}, "
+                             f"{s.get('kind')})" for s in other) + ".")
+    return text
+
+
+def _note_tree_after_review(state, u):
+    """Name the paths that changed after the last passing review round. Advisory: the run goes on either way."""
+    passed = [r for r in as_list(state.get("round_heads")) if isinstance(r, dict) and r.get("verdict") == "PASS"]
+    reviewed = passed[-1].get("code_tree") if passed else ""
+    if not reviewed:
+        return
+    root = state.get("git_root") or state.get("project_dir") or "."
+    tree = _worktree_tree(root)
+    if not tree:
+        ledger(state, u, "publish: the worktree tree could not be computed, so it was not compared with the last "
+                         "reviewed tree")
+        return
+    exclude = _plans_exclude(state, root)
+    paths = _nul_names(git_out(root, "diff-tree", "-r", "-z", "--name-only", reviewed, tree,
+                               *(["--", ".", *exclude] if exclude else [])))
+    if not paths:
+        return
+    shown = ", ".join(paths[:10]) + (f" (and {len(paths) - 10} more)" if len(paths) > 10 else "")
+    line = f"worktree changed after the last passing review (round {passed[-1].get('round')}): {shown}"
+    attention = u.get("gauntlet_attention", state.get("gauntlet_attention")) or ""
+    if line in attention:
+        return
+    ledger(state, u, f"publish: {line}; advisory, the run goes on")
+    u["gauntlet_attention"] = "\n".join(x for x in [attention, f"- {line}"] if x)
+
+
 def pr_gate(state):
     u = {}
     note_script_error(state, u, "run_whetstone")
     if (state.get("whetstone_result") or "").startswith("Agent node failed"):
         u["whetstone_note"] = "whetstone errored; noted and finished without it"
+    if _start_probe_adoption(state, u):
+        return u
+    _note_tree_after_review(state, u)
     actions = as_dict(state.get("git_actions"))
     wanted = any(truthy(actions.get(k)) for k in ("commit", "push", "open_pr"))
     if not wanted:
@@ -4244,13 +4579,13 @@ def pr_gate(state):
     if _review_mode(state) and truthy(state.get("ci_owner")) and pending:
         u["git_task"] = {"kind": "review_update", "return_to": "ci_gate", "commit": True, "push": True,
                          "open_pr": False, "draft": False, "flip_ready": False,
-                         "text": _review_update_text(state, pending)}
+                         "text": _review_update_text(state, pending) + _adoption_publish_text(state, u)}
         u["_next"] = "git_ops"
         return u
     if (_review_mode(state) and truthy(state.get("ci_owner")) and truthy(state.get("flip_ready"))) or _ci_fix_push(state):
         u["git_task"] = {"kind": "push_fix", "return_to": "ci_gate", "commit": True, "push": True,
                          "open_pr": False, "draft": False, "flip_ready": False,
-                         "text": _push_fix_text(state)}
+                         "text": _push_fix_text(state) + _adoption_publish_text(state, u)}
         u["push_fix_retries"] = 0
         u["_next"] = "git_ops"
         return u
@@ -4267,6 +4602,7 @@ def pr_gate(state):
     if reqs:
         text += ("\n\nRequirements this publish must meet (the PR body included; a script checks the git and PR state "
                  "afterwards):\n" + "\n".join(f"- {c}" for c in reqs))
+    text += _adoption_publish_text(state, u)
     if asks["commit"]:
         code, _, listing = _uncommitted_paths(state, state.get("git_root") or state.get("project_dir") or ".")
         if code == 0 and listing:
@@ -5046,6 +5382,7 @@ def ci_apply(state):
     if verdict == "real":
         strikes = as_int(state.get("ci_fix_strikes")) + 1
         u["ci_fix_strikes"] = strikes
+        _escalate_size(state, u, f"real CI failure ({', '.join(checks) or 'checks not named'})")
         if strikes > STRIKE_LIMIT:
             if _watch_started(state):
                 u["pr_review_status"] = "ci_red"
@@ -5528,6 +5865,7 @@ def _start_review_round(state, u, fixes, noaction):
             "action": "skip"} for n in noaction])
     u["pr_review_queue"] = []
     ledger(state, u, f"review-watch: {_pr_label(state)} {len(fixes)} new item(s) -> fix round {rounds}/{REVIEW_MAX_ROUNDS}")
+    _escalate_size(state, u, f"PR review fix round {rounds}")
     # Each review fix round gets fresh gauntlet budgets; REVIEW_MAX_ROUNDS bounds the total.
     u.update({"review_rounds": 0, "lane_block_streak": {}, "fix_strikes": 0, "obs_rounds": 0, "debris_reruns": 0})
     ledger(state, u, f"review-watch: {_pr_label(state)} gauntlet budgets reset for review round {rounds}")
@@ -5590,7 +5928,29 @@ def _assemble_report(state, u, pre_publish=False):
              f"Sisyphus run id: {g('run_id')}", f"Run directory: {g('run_dir')}",
              f"Project: {g('project_dir')}", f"Base SHA: {g('base_sha')}   HEAD SHA: {head}",
              f"Intent: {g('intent')}  sizing: {g('sizing')}  review cadence: {var(state, 'review_cadence', 'task')}"
-             f"  escalation policy: {var(state, 'escalation_policy', 'interactive')}", ""]
+             f"  escalation policy: {var(state, 'escalation_policy', 'interactive')}",
+             f"Pipeline: standard (escalated; assess: small - {g('pipeline_size_reason', 'no reason recorded')})"
+             if as_list(g("size_escalations", [])) else
+             f"Pipeline: {g('pipeline_size', 'standard')} ({g('pipeline_size_reason', 'no reason recorded')})"]
+    lines += [f"- escalated to standard: {as_dict(e).get('why')} ({as_dict(e).get('at')})"
+              for e in as_list(g("size_escalations", []))]
+    adoption = as_dict(g("probe_adoption", {}))
+    lines += [f"Probe-written tests adopted: {p} (written in round {r}, reviewed in round {rv})"
+              for r, rv, p in _adopted_groups(adoption)]
+    lines += [f"Probe-written tests adoption NOT completed: {_paths_of(as_list(s.get('paths')))} (adoption round "
+              f"{s.get('round')} accepted NEEDS-HUMAN; no review round over them passed)"
+              for s in map(as_dict, as_list(adoption.get("not_completed")))]
+    if due := [d for d in as_list(adoption.get("due")) if isinstance(d, dict)]:
+        lines.append(f"Probe-written tests adoption NOT completed: {_paths_of(due)} (written in round "
+                     f"{_rounds_of(due)}; no review round over them ran)")
+    for s in map(as_dict, as_list(adoption.get("not_adopted"))):
+        paths = ", ".join(str(p) for p in as_list(s.get("paths")))
+        if s.get("kind") == "probe":
+            lines.append(f"Probe-written tests NOT adopted: {paths} (written in round {s.get('round')}; {s.get('why')})")
+        else:
+            lines.append(f"Changed during review and NOT adopted: {paths} (review round {s.get('round')}, "
+                         f"{s.get('kind')})")
+    lines.append("")
     subs = as_list(g("subtasks", []))
     if len(subs) > 1:
         lines += ["## Subtasks (A11)"] + [f"- {i}. {s.get('title', '') if isinstance(s, dict) else s}" for i, s in enumerate(subs, 1)] + [""]
