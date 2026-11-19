@@ -34,8 +34,10 @@ static HRULE_RE: LazyLock<Regex> =
 static TABLE_SEPARATOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$").unwrap());
 static TABLE_ROW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\|.*\|\s*$").unwrap());
-static TABLE_CELL_BREAK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)(`[^`\n]+`)|<br\s*/?>").unwrap());
+static TABLE_CELL_TOKEN_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(`[^`\n]+`)|<br\s*/?>|<(/?)(ul|ol|li)\b([^>]*)>").unwrap());
+static OL_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)\bstart\s*=\s*["']?(\d+)"#).unwrap());
 
 static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static IMAGE_RE: LazyLock<Regex> =
@@ -123,27 +125,111 @@ fn parse_table_row(line: &str) -> Vec<String> {
     cells.into_iter().map(|c| c.trim().to_string()).collect()
 }
 
-/// Splits a table cell on HTML line breaks (`<br>`, `<br/>`, `<br />`), leaving
-/// any that appear inside inline code spans untouched.
-fn split_cell_lines(cell: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
-    let mut line_start = 0;
-    for caps in TABLE_CELL_BREAK_RE.captures_iter(cell).flatten() {
+enum HtmlList {
+    Unordered,
+    Ordered(u64),
+}
+
+#[derive(Default)]
+struct CellLines {
+    lines: Vec<String>,
+    prefix: String,
+    text: String,
+}
+
+impl CellLines {
+    fn end_line(&mut self, keep_empty: bool) {
+        let text = self.text.trim();
+        if !text.is_empty() {
+            self.lines.push(format!("{}{text}", self.prefix));
+        } else if keep_empty {
+            self.lines.push(String::new());
+        }
+        self.prefix.clear();
+        self.text.clear();
+    }
+}
+
+/// Splits a table cell into display lines. `<br>` variants end a line, and
+/// `<ul>`/`<ol>`/`<li>` markup becomes one markdown list item per line so it
+/// renders like a list outside a table. Markup inside inline code spans is
+/// left untouched.
+fn split_cell_lines(cell: &str) -> Vec<String> {
+    let mut out = CellLines::default();
+    let mut lists: Vec<HtmlList> = Vec::new();
+    let mut item_indent: Option<String> = None;
+    let mut after_br = false;
+    let mut last_end = 0;
+
+    for caps in TABLE_CELL_TOKEN_RE.captures_iter(cell).flatten() {
+        let Some(token) = caps.get(0) else { continue };
+        out.text.push_str(&cell[last_end..token.start()]);
+        last_end = token.end();
+
         if caps.get(1).is_some() {
+            out.text.push_str(token.as_str());
             continue;
         }
-        let Some(br) = caps.get(0) else { continue };
-        lines.push(cell[line_start..br.start()].trim());
-        line_start = br.end();
+        let Some(tag) = caps.get(3) else {
+            out.end_line(true);
+            out.prefix = item_indent.clone().unwrap_or_default();
+            after_br = true;
+            continue;
+        };
+
+        after_br = false;
+        out.end_line(false);
+        item_indent = None;
+        let closing = caps.get(2).is_some_and(|m| !m.as_str().is_empty());
+        match (tag.as_str().to_ascii_lowercase().as_str(), closing) {
+            ("ul", false) => lists.push(HtmlList::Unordered),
+            ("ol", false) => {
+                let start = caps
+                    .get(4)
+                    .and_then(|attrs| OL_START_RE.captures(attrs.as_str()).ok().flatten())
+                    .and_then(|c| c.get(1)?.as_str().parse().ok())
+                    .unwrap_or(1);
+                lists.push(HtmlList::Ordered(start));
+            }
+            ("ul" | "ol", true) => {
+                lists.pop();
+            }
+            ("li", false) => {
+                let indent = "  ".repeat(lists.len().saturating_sub(1));
+                let marker = match lists.last_mut() {
+                    Some(HtmlList::Ordered(n)) => {
+                        *n += 1;
+                        format!("{}.", *n - 1)
+                    }
+                    _ => "-".to_string(),
+                };
+                out.prefix = format!("{indent}{marker} ");
+                item_indent = Some(" ".repeat(out.prefix.len()));
+            }
+            _ => {}
+        }
     }
-    lines.push(cell[line_start..].trim());
-    lines
+    out.text.push_str(&cell[last_end..]);
+    let keep_empty = out.lines.is_empty() || after_br;
+    out.end_line(keep_empty);
+    out.lines
+}
+
+/// Styles one line of a table cell: list items get the same markers they get
+/// outside a table, everything else gets inline styling only.
+fn style_cell_line(line: &str, styles: &MarkdownStyles) -> String {
+    match detect_line_kind(line) {
+        kind @ (LineKind::BulletItem | LineKind::NumberedItem | LineKind::TaskItem(_)) => {
+            render_markdown_line(line, kind, styles, None)
+        }
+        _ => apply_inline(line, styles),
+    }
 }
 
 fn style_cell(cell: &str, style_line: impl Fn(&str) -> String) -> String {
     split_cell_lines(cell)
-        .into_iter()
-        .map(style_line)
+        .iter()
+        .map(|line| style_line(line))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -885,7 +971,7 @@ impl MarkdownRender {
             .iter()
             .map(|c| {
                 style_cell(c, |line| {
-                    apply_base_style(&apply_inline(line, &self.styles), heading_color, true)
+                    apply_base_style(&style_cell_line(line, &self.styles), heading_color, true)
                 })
             })
             .collect();
@@ -900,7 +986,7 @@ impl MarkdownRender {
         for row in rows {
             let styled_row: Vec<String> = row
                 .iter()
-                .map(|c| style_cell(c, |line| apply_inline(line, &self.styles)))
+                .map(|c| style_cell(c, |line| style_cell_line(line, &self.styles)))
                 .collect();
             table.add_row(styled_row);
         }
@@ -1849,6 +1935,78 @@ std::error::Error>> {
             split_cell_lines("use `<br>` here<br>next"),
             vec!["use `<br>` here", "next"]
         );
+    }
+
+    #[test]
+    fn split_cell_lines_keeps_blank_lines_from_br() {
+        assert_eq!(split_cell_lines("a<br><br>b"), vec!["a", "", "b"]);
+        assert_eq!(split_cell_lines("a<br>"), vec!["a", ""]);
+        assert_eq!(split_cell_lines(""), vec![""]);
+    }
+
+    #[test]
+    fn split_cell_lines_turns_html_unordered_list_into_items() {
+        assert_eq!(
+            split_cell_lines("Repos:<ul><li>one</li><li>two</li></ul>done"),
+            vec!["Repos:", "- one", "- two", "done"]
+        );
+    }
+
+    #[test]
+    fn split_cell_lines_numbers_html_ordered_list_items() {
+        assert_eq!(
+            split_cell_lines("<OL><LI>first<LI>second</OL>"),
+            vec!["1. first", "2. second"]
+        );
+        assert_eq!(
+            split_cell_lines(r#"<ol start="3"><li>c</li><li>d</li></ol>"#),
+            vec!["3. c", "4. d"]
+        );
+    }
+
+    #[test]
+    fn split_cell_lines_indents_nested_html_lists() {
+        assert_eq!(
+            split_cell_lines("<ul><li>a<ol><li>b</li></ol></li><li>c</li></ul>"),
+            vec!["- a", "  1. b", "- c"]
+        );
+    }
+
+    #[test]
+    fn split_cell_lines_indents_br_continuation_inside_list_item() {
+        assert_eq!(
+            split_cell_lines("<ul><li>a<br>more</li></ul>"),
+            vec!["- a", "  more"]
+        );
+    }
+
+    #[test]
+    fn split_cell_lines_ignores_list_tags_in_code_and_lookalike_tags() {
+        assert_eq!(
+            split_cell_lines("`<li>` and <link> stay"),
+            vec!["`<li>` and <link> stay"]
+        );
+    }
+
+    #[test]
+    fn render_table_styles_list_items_in_cells() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["H".into()];
+        let alignments = vec![CellAlignment::Left];
+        let rows = vec![vec![
+            "- alpha<br>* beta<br>2. gamma<br>- [x] delta<br><ul><li>epsilon</li></ul>".into(),
+        ]];
+
+        let output = strip_ansi(&render.render_table(header, alignments, rows));
+
+        for expected in ["• alpha", "• beta", "2. gamma", "[✓] delta", "• epsilon"] {
+            assert!(
+                output.contains(expected),
+                "{expected:?} in output: {output:?}"
+            );
+        }
+        assert!(!output.contains("<li>"), "no literal list tags: {output:?}");
     }
 
     #[test]
