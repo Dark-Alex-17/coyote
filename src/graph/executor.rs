@@ -16,6 +16,7 @@ use super::{
 use crate::config::{
     AgentVariable, AgentVariables, RenderMode, RequestContext, child_sessions_enabled,
 };
+use crate::events::Origin;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::supervisor::mailbox::{Inbox, PeerAssignment, PeerRegistry, graph_agent_id};
 use crate::utils::{AbortSignal, TaskCancelGuard, wait_abort_signal, wait_user_interrupt};
@@ -90,6 +91,7 @@ impl GraphExecutor {
             &self.graph.name,
             self.graph.settings.log_state_snapshots,
             is_nested,
+            Arc::clone(&ctx.ui),
         );
         let result = self.run(&mut logger, ctx, abort_signal).await;
         if let Err(e) = &result {
@@ -279,6 +281,7 @@ impl GraphExecutor {
                 );
                 let branch_state = state.fork_for_branch_state();
                 let mut branch_ctx = ctx.fork_for_branch();
+                let ui = Arc::clone(&branch_ctx.ui);
                 let mut peer_id: Option<String> = None;
                 if let Some(assignment) = peer_assignments.remove(node_id) {
                     peer_id = Some(assignment.0.clone());
@@ -319,6 +322,7 @@ impl GraphExecutor {
                         .expect("semaphore should not be closed");
                     if abort_clone.aborted() {
                         narrate_node_failed(
+                            ui.as_ref(),
                             silent,
                             &node,
                             Duration::default(),
@@ -355,6 +359,7 @@ impl GraphExecutor {
                                 Some(targets.join(", "))
                             };
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -366,6 +371,7 @@ impl GraphExecutor {
                         }
                         Ok(StepResult::FellBack(target)) => {
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -377,6 +383,7 @@ impl GraphExecutor {
                         }
                         Ok(StepResult::End(_)) => {
                             narrate_node_complete(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -388,6 +395,7 @@ impl GraphExecutor {
                         }
                         Err(e) => {
                             narrate_node_failed(
+                                ui.as_ref(),
                                 silent,
                                 &node,
                                 elapsed,
@@ -629,17 +637,13 @@ impl NodeHookEmitter {
     }
 
     fn dispatch(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        hooks::fire_resolved(
+        let base_envs = hooks::base_envs_parts(
             event,
-            resolved.to_vec(),
-            hooks::base_envs_parts(
-                event,
-                self.session_name.as_deref(),
-                self.agent_name.as_deref(),
-            ),
-            extras,
-            None,
+            self.session_name.as_deref(),
+            self.agent_name.as_deref(),
         );
+        hooks::publish_hook_event(event, &base_envs, extras, None, Origin::detached());
+        hooks::fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
     }
 
     fn completed(&self, elapsed: Duration, route: Option<&str>) {
@@ -1943,7 +1947,7 @@ nodes:
         );
     }
 
-    /// Usage probe (spec AC3): the key is written only when the failing
+    /// The key is written only when the failing
     /// script node HAS a `fallback`. Without one the failure must still
     /// propagate as a hard error — recording must never turn a crash into a
     /// silent continue.
@@ -1983,7 +1987,7 @@ nodes:
         assert!(chain.contains("boom"), "{chain}");
     }
 
-    /// Usage probe (spec AC3): the 8 KiB cap must land on a char boundary.
+    /// The 8 KiB cap must land on a char boundary.
     /// stderr made of 3-byte characters guarantees most candidate cut points
     /// fall inside a character; both cuts (end of head, start of tail) must
     /// land on whole characters and the recorded value must stay within one
@@ -2056,7 +2060,7 @@ nodes:
         );
     }
 
-    /// Usage probe (AC3): "capped at 8 KiB" is a closed bound — a message of
+    /// "Capped at 8 KiB" is a closed bound: a message of
     /// exactly `SCRIPT_FALLBACK_ERROR_MAX_BYTES` is stored verbatim, one byte
     /// more keeps the head ¼ and tail ¾ verbatim around a marker naming the
     /// single dropped byte.
@@ -2095,7 +2099,7 @@ nodes:
             .unwrap_or_else(|e| panic!("cannot read shipped script {}: {e}", path.display()))
     }
 
-    /// Usage probe (spec AC3 + AC5 end to end): the SHIPPED coder
+    /// End to end: the SHIPPED coder
     /// `fix_loop_gate.sh` reached over a `verify_build` fallback edge must
     /// read the engine-recorded error, re-run `verify_build` once, and on the
     /// second crash end the run as `end_failure` with the "crashed again"
@@ -2186,7 +2190,7 @@ nodes:
         );
     }
 
-    /// Usage probe (spec AC6 end to end): the SHIPPED step-runner gate does
+    /// End to end: the SHIPPED step-runner gate does
     /// the same dance with `verify_format_lint` as its retry target.
     #[tokio::test]
     async fn usage_probe_shipped_step_runner_gate_retries_format_lint_once_after_crash() {
@@ -2274,7 +2278,7 @@ nodes:
         );
     }
 
-    /// Usage probe (self_review fallback end to end): when the review node
+    /// self_review fallback end to end: when the review node
     /// dies, the engine routes to the SHIPPED `self_review_fault.sh`, which
     /// lifts the implementer's `Design: ASK -- <question>` lines out of
     /// `design_trail` (label stripped, de-duplicated), marks `review_notes`,
@@ -2411,6 +2415,7 @@ nodes:
     /// the distinct routes prove one branch's metadata never leaks into a
     /// sibling's events.
     #[tokio::test]
+    #[serial]
     async fn parallel_super_step_branches_fire_per_node_metadata() {
         if !cmd_available("bash") {
             eprintln!("skipping: bash not available");
@@ -2685,6 +2690,42 @@ nodes:
                 .any(|message| message.contains("t037_mal_empty")
                     && message.contains("empty command")),
             "expected a debug log for the skipped hook: {debugs:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn completed_publishes_bus_twin_without_resolved_hooks() {
+        let ctx = ctx_with_global_hooks(Default::default());
+        let node_id = "node-bus-probe-x7x";
+        let _sink = hooks::test_sink::install();
+        let bus = crate::events::RecordingSink::install();
+
+        NodeHookEmitter::resolve(&ctx, node_id, "llm")
+            .completed(Duration::from_millis(5), Some("next"));
+
+        let published = bus.drain_hooks_with_env("COYOTE_NODE_ID", node_id);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let crate::events::Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::GraphNodeCompleted);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_NODE_TYPE".to_string(), "llm".to_string())));
+        assert!(envs.contains(&("COYOTE_NODE_ROUTE".to_string(), "next".to_string())));
+        assert!(envs.contains(&("COYOTE_NODE_DURATION_MS".to_string(), "5".to_string())));
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_NODE_ID").map(String::as_str) != Some(node_id)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
         );
     }
 
@@ -3790,8 +3831,8 @@ nodes:
         );
         let events = ctx.notification_queue.drain();
         assert_eq!(events.len(), 1, "queued notification must survive the run");
-        assert_eq!(events[0].id, "job_bg");
-        assert_eq!(events[0].event, "job_completed");
+        assert_eq!(events[0].id(), Some("job_bg"));
+        assert_eq!(events[0].event(), "job_completed");
     }
 
     use crate::testing::TestConfigDirGuard;

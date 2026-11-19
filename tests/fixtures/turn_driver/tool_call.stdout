@@ -1,0 +1,6 @@
+>> Call the fixture tool with text hello
+Call fixture_echo {"text":"hello"}
+fixture stdout: hello
+fixture done
+<rule>
+

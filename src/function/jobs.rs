@@ -1,13 +1,15 @@
 use super::agents::{self, AGENT_FUNCTION_PREFIX};
 use super::memory::MEMORY_FUNCTION_PREFIX;
+use super::prompt_channel::{self, Classified, LineAssembler, Server, ToolPrompter};
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
 use crate::config::{
-    McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
+    McpRuntime, RequestContext, UiKind, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
+use crate::events::{self, Event, Origin};
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::{
@@ -32,6 +34,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use std::{env, fs};
 use tokio::io::AsyncReadExt;
@@ -44,7 +47,7 @@ pub const DEFAULT_MAX_CONCURRENT_JOBS: usize = 5;
 
 const JOB_RESULT_TAIL_CAP_CHARS: usize = 50_000;
 
-const JOB_KILL_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const JOB_KILL_GRACE: Duration = Duration::from_secs(5);
 
 const JOB_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
@@ -91,10 +94,6 @@ impl JobHookSnapshot {
             (HookEvent::JobFailed, self.failed)
         };
 
-        if resolved.is_empty() {
-            return;
-        }
-
         let base_envs = hooks::base_envs_parts(
             event,
             self.session_name.as_deref(),
@@ -107,6 +106,11 @@ impl JobHookSnapshot {
 
         if let Some(error) = error {
             extras.push(("COYOTE_JOB_ERROR", error));
+        }
+
+        hooks::publish_hook_event(event, &base_envs, &extras, None, Origin::detached());
+        if resolved.is_empty() {
+            return;
         }
 
         hooks::fire_resolved(event, resolved, base_envs, &extras, None);
@@ -196,6 +200,21 @@ pub struct JobEnvSnapshot {
     envs: HashMap<String, String>,
     output_file: PathBuf,
     timeout_secs: u64,
+    prompter: Option<ToolPrompter>,
+    prompt_reply: Option<Server>,
+    job_id: String,
+}
+
+/// What the stdout pump of a process job needs to answer a request line.
+struct JobPrompt {
+    job_id: String,
+    tool: String,
+    prompter: ToolPrompter,
+    /// Shared with the blocking task that writes the reply.
+    reply: Arc<Server>,
+    /// Set once the job process is reaped; request lines read after that
+    /// come from a surviving descendant and are answered null.
+    exited: Arc<AtomicBool>,
 }
 
 /// The complete context an MCP job task owns. The runtime holds ONLY the
@@ -513,17 +532,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         }));
     }
 
-    let supervisor = match ctx.supervisor.as_ref() {
-        Some(sup) => Arc::clone(sup),
-        None => {
-            let max_jobs = effective_max_concurrent_jobs(ctx.agent.as_ref(), &ctx.app.config);
-            let sup = Arc::new(RwLock::new(
-                Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
-            ));
-            ctx.supervisor = Some(Arc::clone(&sup));
-            sup
-        }
-    };
+    let supervisor = ctx.ensure_supervisor();
 
     {
         let sup = supervisor.read();
@@ -598,7 +607,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             result
         })
     } else {
-        let snapshot = build_env_snapshot(ctx, &tool, &arguments)?;
+        let snapshot = build_env_snapshot(ctx, &job_id, &tool, &arguments)?;
         let task_state = Arc::clone(&state);
         let task_buf = Arc::clone(&output_buf);
         let task_notifications = Arc::clone(&ctx.notification_queue);
@@ -1097,6 +1106,9 @@ async fn handle_cancel(ctx: &RequestContext, args: &Value) -> Result<Value> {
 
     handle.abort_signal.set_ctrlc();
     kill_job_with_grace(&mut handle).await;
+    events::bus().publish(Event::JobCancelled {
+        job_id: id.to_string(),
+    });
 
     let tool = handle.tool.clone();
     let (tail, total_written) = {
@@ -1161,6 +1173,7 @@ pub async fn reap_jobs(
         if let Some(mut handle) = handle {
             handle.abort_signal.set_ctrlc();
             kill_job_with_grace(&mut handle).await;
+            events::bus().publish(Event::JobCancelled { job_id: id.clone() });
             warn!(
                 "Reaped background job '{id}' ({}): left unreclaimed at graph node exit",
                 handle.tool
@@ -1206,6 +1219,7 @@ fn handle_list(ctx: &RequestContext) -> Result<Value> {
 /// assembly, resolved eagerly so the detached task owns everything it needs.
 fn build_env_snapshot(
     ctx: &RequestContext,
+    job_id: &str,
     tool: &str,
     arguments: &Value,
 ) -> Result<JobEnvSnapshot> {
@@ -1249,6 +1263,18 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
+    envs.entry(UiKind::ENV.to_string())
+        .or_insert_with(|| ctx.ui_kind().as_str().to_string());
+    let prompt_reply = match Server::open() {
+        Ok(server) => {
+            envs.insert(prompt_channel::REPLY_ENV.into(), server.env_value());
+            Some(server)
+        }
+        Err(err) => {
+            warn!("Prompt reply channel unavailable for '{tool}': {err}");
+            None
+        }
+    };
 
     cmd_args.push(arguments.to_string());
 
@@ -1278,16 +1304,79 @@ fn build_env_snapshot(
         envs,
         output_file,
         timeout_secs,
+        prompter: Some(ToolPrompter::new(
+            Arc::clone(&ctx.prompter),
+            Arc::clone(&ctx.prompt_memory),
+            Origin::from(ctx),
+        )),
+        prompt_reply,
+        job_id: job_id.to_string(),
     })
 }
 
-async fn pump_into_ring(mut reader: impl AsyncReadExt + Unpin, output_buf: Arc<Mutex<RingBuf>>) {
+/// With `prompt`, request lines are answered instead of buffered; the
+/// prompter may block on a human, so it runs off the async worker.
+async fn pump_into_ring(
+    mut reader: impl AsyncReadExt + Unpin,
+    output_buf: Arc<Mutex<RingBuf>>,
+    prompt: Option<JobPrompt>,
+) {
     let mut chunk = [0u8; 1024];
+    let Some(prompt) = prompt else {
+        loop {
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output_buf.lock().push(&chunk[..n]),
+            }
+        }
+        return;
+    };
+    let mut lines = LineAssembler::default();
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => output_buf.lock().push(&chunk[..n]),
+            Ok(n) => {
+                for classified in lines.feed(&chunk[..n]) {
+                    match classified {
+                        Classified::Output(bytes) => output_buf.lock().push(&bytes),
+                        Classified::Prompt(line) => {
+                            if prompt.exited.load(Ordering::Acquire) {
+                                output_buf.lock().push(&line);
+                                prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
+                                continue;
+                            }
+                            let Some(parsed) = prompt.prompter.parse_line(
+                                &line,
+                                &prompt.tool,
+                                None,
+                                Some(prompt.job_id.clone()),
+                            ) else {
+                                output_buf.lock().push(&line);
+                                prompt_channel::reject_line(&prompt.reply, &prompt.tool, &line);
+                                continue;
+                            };
+                            let id = parsed.req.id.clone();
+                            let prompter = prompt.prompter.clone();
+                            let reply = Arc::clone(&prompt.reply);
+                            let served = tokio::task::spawn_blocking(move || {
+                                prompt_channel::handle_prompt_line(&prompter, &reply, parsed)
+                            })
+                            .await;
+                            if let Err(err) = served {
+                                warn!(
+                                    "Prompt from job '{}' was not answered: {err}",
+                                    prompt.job_id
+                                );
+                                prompt.reply.reply(&id, &Value::Null);
+                            }
+                        }
+                    }
+                }
+            }
         }
+    }
+    if let Some(tail) = lines.finish() {
+        output_buf.lock().push(&tail);
     }
 }
 
@@ -1311,11 +1400,35 @@ fn drain_output_file(path: &Path, offset: &Mutex<u64>, output_buf: &Mutex<RingBu
     }
 }
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn into_inner(mut self) -> tokio::task::JoinHandle<()> {
+        self.0
+            .take()
+            .expect("AbortOnDrop holds its handle until consumed")
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+/// Marks the job as finished however the task exits, including a
+/// cancel/abort dropping the future mid-await, so the pump stops prompting.
+struct ExitedOnDrop(Arc<AtomicBool>);
+
+impl Drop for ExitedOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -1331,7 +1444,7 @@ async fn drain_pump(mut pump: tokio::task::JoinHandle<()>) {
 }
 
 async fn run_process_job(
-    snapshot: JobEnvSnapshot,
+    mut snapshot: JobEnvSnapshot,
     state: Arc<Mutex<JobState>>,
     output_buf: Arc<Mutex<RingBuf>>,
 ) -> Result<JobResult> {
@@ -1353,10 +1466,20 @@ async fn run_process_job(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    command.env_remove(prompt_channel::OUT_FD_ENV);
+    let mut prompt_reply = snapshot.prompt_reply.take();
+    match prompt_reply.as_ref() {
+        Some(server) => server.configure(command.as_std_mut()),
+        None => {
+            command.env_remove(prompt_channel::REPLY_ENV);
+        }
+    }
+    let spawned_child = command.spawn();
+    if let Some(server) = prompt_reply.as_mut() {
+        server.spawned();
+    }
+    let mut child =
+        spawned_child.map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
     debug!(
         "Spawned job process '{}' pid {:?}",
         snapshot.display_name,
@@ -1377,10 +1500,31 @@ async fn run_process_job(
         .stderr
         .take()
         .ok_or_else(|| anyhow!("Failed to capture stderr"))?;
-    let stdout_pump = tokio::spawn(pump_into_ring(stdout, Arc::clone(&output_buf)));
-    let stderr_pump = tokio::spawn(pump_into_ring(stderr, Arc::clone(&output_buf)));
+    let job_exited = Arc::new(AtomicBool::new(false));
+    let _exited_guard = ExitedOnDrop(Arc::clone(&job_exited));
+    let job_prompt = snapshot
+        .prompter
+        .clone()
+        .zip(prompt_reply)
+        .map(|(prompter, reply)| JobPrompt {
+            job_id: snapshot.job_id.clone(),
+            tool: snapshot.display_name.clone(),
+            prompter,
+            reply: Arc::new(reply),
+            exited: Arc::clone(&job_exited),
+        });
+    let stdout_pump = AbortOnDrop::new(tokio::spawn(pump_into_ring(
+        stdout,
+        Arc::clone(&output_buf),
+        job_prompt,
+    )));
+    let stderr_pump = AbortOnDrop::new(tokio::spawn(pump_into_ring(
+        stderr,
+        Arc::clone(&output_buf),
+        None,
+    )));
     let file_offset = Arc::new(Mutex::new(0u64));
-    let file_tailer = AbortOnDrop(tokio::spawn({
+    let file_tailer = AbortOnDrop::new(tokio::spawn({
         let path = snapshot.output_file.clone();
         let offset = Arc::clone(&file_offset);
         let output_buf = Arc::clone(&output_buf);
@@ -1401,10 +1545,11 @@ async fn run_process_job(
                     snapshot.display_name,
                     spawned.elapsed()
                 );
+                job_exited.store(true, Ordering::Release);
                 kill_expired_job(&mut child, &state).await;
                 state.lock().pgid = None;
-                drain_pump(stdout_pump).await;
-                drain_pump(stderr_pump).await;
+                drain_pump(stdout_pump.into_inner()).await;
+                drain_pump(stderr_pump.into_inner()).await;
                 drop(file_tailer);
                 drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
                 let output_bytes_captured = output_buf.lock().total_written();
@@ -1426,8 +1571,8 @@ async fn run_process_job(
     let status = match wait_result {
         Ok(status) => status,
         Err(err) => {
-            stdout_pump.abort();
-            stderr_pump.abort();
+            drop(stdout_pump);
+            drop(stderr_pump);
             bail!("Unable to run {}, {err}", snapshot.display_name);
         }
     };
@@ -1439,8 +1584,9 @@ async fn run_process_job(
     // pid-reuse guard: the child is reaped, so a later group kill against
     // this pgid could hit an innocent recycled pid.
     state.lock().pgid = None;
-    drain_pump(stdout_pump).await;
-    drain_pump(stderr_pump).await;
+    job_exited.store(true, Ordering::Release);
+    drain_pump(stdout_pump.into_inner()).await;
+    drain_pump(stderr_pump.into_inner()).await;
     drop(file_tailer);
     drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
     let output_bytes_captured = output_buf.lock().total_written();
@@ -1676,6 +1822,9 @@ mod tests {
             envs,
             output_file,
             timeout_secs,
+            prompter: None,
+            prompt_reply: None,
+            job_id: String::new(),
         }
     }
 
@@ -2049,6 +2198,68 @@ mod tests {
         });
     }
 
+    fn cancelled_job_ids(recording: &crate::events::RecordingSink, marker: &str) -> Vec<String> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::JobCancelled { job_id } if job_id.contains(marker) => Some(job_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn handle_cancel_publishes_job_cancelled() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(make_running_job("job-cancel-x7x"))
+                .unwrap();
+            let recording = crate::events::RecordingSink::install();
+
+            let result = handle_cancel(&ctx, &json!({"id": "job-cancel-x7x"}))
+                .await
+                .unwrap();
+
+            assert_eq!(result["status"], "cancelled");
+            assert_eq!(
+                cancelled_job_ids(&recording, "x7x"),
+                vec!["job-cancel-x7x".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reap_jobs_publishes_job_cancelled_for_reaped_ids_only() {
+        run_async(async {
+            let ctx = ctx_with_job_supervisor(4);
+            ctx.supervisor
+                .as_ref()
+                .unwrap()
+                .write()
+                .register(make_running_job("job-reap-x7x"))
+                .unwrap();
+            let recording = crate::events::RecordingSink::install();
+
+            reap_jobs(
+                ctx.supervisor.as_ref(),
+                &["job-reap-x7x".to_string(), "missing-x7x".to_string()],
+            )
+            .await;
+
+            assert_eq!(
+                cancelled_job_ids(&recording, "x7x"),
+                vec!["job-reap-x7x".to_string()]
+            );
+        });
+    }
+
     #[test]
     fn job_runtime_carries_the_servers_tool_filter() {
         run_async(async {
@@ -2182,12 +2393,13 @@ mod tests {
 
             let events = ctx.notification_queue.drain();
             assert_eq!(events.len(), 1);
-            assert_eq!(events[0].event, "job_completed");
-            assert_eq!(events[0].id, job_id);
-            assert_eq!(events[0].tool_or_agent, "echo");
-            assert_eq!(events[0].status, "success");
+            assert_eq!(events[0].event(), "job_completed");
+            assert_eq!(events[0].id(), Some(job_id.as_str()));
+            let value = events[0].to_value();
+            assert_eq!(value["tool_or_agent"], "echo");
+            assert_eq!(value["status"], "success");
             assert_eq!(
-                events[0].next_action,
+                value["next_action"],
                 format!("job__collect --id {job_id} for output")
             );
         });
@@ -2220,8 +2432,8 @@ mod tests {
 
             let events = ctx.notification_queue.drain();
             assert_eq!(events.len(), 1);
-            assert_eq!(events[0].event, "job_failed");
-            assert_eq!(events[0].status, "failed");
+            assert_eq!(events[0].event(), "job_failed");
+            assert_eq!(events[0].to_value()["status"], "failed");
         });
     }
 
@@ -3790,6 +4002,53 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn fire_terminal_publishes_bus_twin_without_resolved_hooks() {
+        let ctx = plain_ctx();
+        let job_id = "job-bus-probe-x7x";
+        let _guard = hooks::test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+
+        JobHookSnapshot::resolve(&ctx, job_id, "echo").fire_terminal(true, None);
+        JobHookSnapshot::resolve(&ctx, job_id, "echo").fire_terminal(false, Some("boom".into()));
+
+        let published = sink.drain_hooks_with_env("COYOTE_JOB_ID", job_id);
+        assert_eq!(published.len(), 2, "{published:?}");
+        let expected = [
+            (HookEvent::JobCompleted, None),
+            (HookEvent::JobFailed, Some(("COYOTE_JOB_ERROR", "boom"))),
+        ];
+        for (published, (expected_event, expected_error)) in published.iter().zip(expected) {
+            let crate::events::Event::Hook {
+                event,
+                envs,
+                payload,
+                origin,
+            } = published
+            else {
+                panic!("expected Event::Hook, got {published:?}");
+            };
+            assert_eq!(*event, expected_event);
+            assert_eq!(*origin, Origin::detached());
+            assert_eq!(*payload, None);
+            assert!(envs.contains(&("COYOTE_TOOL_NAME".to_string(), "echo".to_string())));
+            let error = envs
+                .iter()
+                .find(|(key, _)| key == "COYOTE_JOB_ERROR")
+                .map(|(key, value)| (key.as_str(), value.as_str()));
+            assert_eq!(error, expected_error, "{expected_event:?}");
+        }
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| capture
+                .envs
+                .get("COYOTE_JOB_ID")
+                .map(String::as_str)
+                != Some(job_id)),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn job_hooks_fire_for_mcp_jobs() {
         run_async(async {
             let marker = "job-hooks-mcp-x7x";
@@ -4006,7 +4265,7 @@ mod tests {
                 .notification_queue
                 .drain()
                 .into_iter()
-                .map(|n| n.id)
+                .map(|n| n.id().unwrap().to_string())
                 .collect();
             assert_eq!(left, vec!["job_other"]);
         });

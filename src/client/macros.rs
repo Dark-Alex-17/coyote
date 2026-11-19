@@ -95,10 +95,10 @@ macro_rules! register_client {
             client_types
         }
 
-        pub async fn create_client_config(client: &str, vault: &$crate::vault::Vault) -> anyhow::Result<(String, serde_json::Value)> {
+        pub async fn create_client_config(client: &str, vault: &$crate::vault::Vault, prompter: &dyn $crate::prompt::Prompter) -> anyhow::Result<(String, serde_json::Value)> {
             $(
                 if client == $client::NAME && client != $crate::client::OpenAICompatibleClient::NAME {
-                    return $client::create_client_config(vault).await
+                    return $client::create_client_config(vault, prompter).await
                 }
             )+
             if let Some(ret) = create_openai_compatible_client_config(client).await? {
@@ -231,8 +231,9 @@ macro_rules! create_client_config {
     ($prompts:expr) => {
         pub async fn create_client_config(
             vault: &$crate::vault::Vault,
+            prompter: &dyn $crate::prompt::Prompter,
         ) -> anyhow::Result<(String, serde_json::Value)> {
-            $crate::client::create_config(&$prompts, Self::NAME, vault).await
+            $crate::client::create_config(&$prompts, Self::NAME, vault, prompter).await
         }
     };
 }
@@ -240,7 +241,7 @@ macro_rules! create_client_config {
 #[macro_export]
 macro_rules! create_oauth_supported_client_config {
     () => {
-        pub async fn create_client_config(vault: &$crate::vault::Vault) -> anyhow::Result<(String, serde_json::Value)> {
+        pub async fn create_client_config(vault: &$crate::vault::Vault, prompter: &dyn $crate::prompt::Prompter) -> anyhow::Result<(String, serde_json::Value)> {
         let mut config = serde_json::json!({ "type": Self::NAME });
 
         let auth_method = inquire::Select::new(
@@ -251,7 +252,7 @@ macro_rules! create_oauth_supported_client_config {
 
         if auth_method == "API Key" {
             let env_name = format!("{}_API_KEY", Self::NAME).to_ascii_uppercase();
-            vault.add_secret(&env_name)?;
+            vault.add_secret(&env_name, prompter)?;
             config["api_key"] = format!("{{{{{env_name}}}}}").into();
         } else {
             config["auth"] = "oauth".into();

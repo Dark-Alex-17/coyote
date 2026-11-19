@@ -407,12 +407,14 @@ pub fn repl_history_dir() -> PathBuf {
 }
 
 pub fn repl_history_file(session: &Option<Session>) -> PathBuf {
-    let history_key = if let Some(session) = &session {
-        format!("session_{}", session.name().replace('/', "_"))
-    } else {
-        "default".to_string()
-    };
+    repl_history_file_for(session.as_ref().map(Session::name))
+}
 
+pub fn repl_history_file_for(session_name: Option<&str>) -> PathBuf {
+    let history_key = match session_name {
+        Some(name) => format!("session_{}", name.replace('/', "_")),
+        None => "default".to_string(),
+    };
     repl_history_dir().join(history_key)
 }
 

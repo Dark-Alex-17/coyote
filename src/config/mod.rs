@@ -27,6 +27,8 @@ mod skill_policy;
 mod skill_registry;
 pub(crate) mod todo;
 mod tool_scope;
+pub(crate) mod ui_kind;
+mod ui_mode;
 mod update;
 
 #[cfg(test)]
@@ -47,6 +49,7 @@ pub use self::bundles::list_installed_bundles;
 pub use self::command_prefix::CommandPrefix;
 use self::conflict::{InstallMode, StickyMode};
 pub use self::input::{Input, vision_unsupported_message};
+pub(crate) use self::install_remote::{CLI_CONFLICT_REMEDY, InstallIo, REPL_CONFLICT_REMEDY};
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
     update_bundle,
@@ -83,6 +86,9 @@ pub use self::tool_scope::{
     McpPromptCompletion, McpRuntime, flatten_prompt_messages, resolve_prompt_args,
     sanitize_display_text,
 };
+pub(crate) use self::tool_scope::{escape_display_text, is_format_char};
+pub(crate) use self::ui_kind::UiKind;
+pub use self::ui_mode::UiMode;
 pub use self::update::run_self_update;
 use crate::client::{
     self, ClientConfig, MODELS_YAML, MessageContentToolCalls, Model, ModelType,
@@ -91,6 +97,7 @@ use crate::client::{
 };
 use crate::function::{FunctionDeclaration, Functions};
 use crate::hooks::HooksMap;
+use crate::prompt::Prompter;
 use crate::rag::Rag;
 use crate::sandbox::SANDBOX_ENV_FLAG;
 use crate::utils::*;
@@ -253,6 +260,8 @@ pub struct Config {
     pub save: bool,
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
+    pub ui: UiMode,
+    pub tui_dump_on_exit: bool,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -358,6 +367,8 @@ impl Default for Config {
             save: false,
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
+            ui: UiMode::default(),
+            tui_dump_on_exit: true,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -443,14 +454,16 @@ impl Default for Config {
     }
 }
 
-pub fn install_builtins() -> Result<()> {
+/// Skip mode never reaches the prompter; it is threaded through because
+/// the installers share their conflict path with the prompting modes.
+pub fn install_builtins(prompter: &dyn Prompter) -> Result<()> {
     hooks::sweep_stale_payload_files();
     Functions::install_builtin_global_tools(false)?;
-    Agent::install_builtin_agents(InstallMode::Skip)?;
+    Agent::install_builtin_agents(InstallMode::Skip, prompter)?;
     Macro::install_macros(false)?;
     Skill::install_builtin_skills(false)?;
-    hooks::install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None)?;
-    Role::install_builtin_role_hooks(InstallMode::Skip, &mut StickyMode::None)?;
+    hooks::install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None, prompter)?;
+    Role::install_builtin_role_hooks(InstallMode::Skip, &mut StickyMode::None, prompter)?;
     Ok(())
 }
 
@@ -538,7 +551,16 @@ impl InstallFilter {
     }
 }
 
-pub fn install_assets(category: AssetCategory) -> Result<()> {
+/// Reinstalls one bundled category over the user's copies. The overwrite
+/// is confirmed first unless `assume_yes`; a run with nowhere to ask is
+/// refused before anything is written, and `remedy` names what the caller
+/// offers instead of the question (the CLI has `--yes`, the REPL nothing).
+pub fn install_assets(
+    category: AssetCategory,
+    prompter: &dyn Prompter,
+    assume_yes: bool,
+    remedy: &str,
+) -> Result<()> {
     let (label, target) = match category {
         AssetCategory::Agents => ("agents", paths::agents_data_dir()),
         AssetCategory::Macros => ("macros", paths::macros_dir()),
@@ -548,21 +570,25 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
         AssetCategory::McpConfig => ("MCP config", paths::mcp_config_file()),
     };
 
-    if !confirm_asset_overwrite(category, label, &target)? {
+    if !assume_yes && !confirm_asset_overwrite(category, label, &target, prompter, remedy)? {
         println!("Aborted. No files were changed.");
         return Ok(());
     }
 
     match category {
-        AssetCategory::Agents => Agent::install_builtin_agents(InstallMode::Force)?,
+        AssetCategory::Agents => Agent::install_builtin_agents(InstallMode::Force, prompter)?,
         AssetCategory::Macros => Macro::install_macros(true)?,
         AssetCategory::Functions => Functions::install_builtin_global_tools(true)?,
         AssetCategory::Skills => Skill::install_builtin_skills(true)?,
         AssetCategory::Hooks => {
-            let mut sticky = StickyMode::None;
-            hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky)?;
-            Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky)?;
-            Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky)?;
+            let mut sticky = if assume_yes {
+                StickyMode::KeepAll
+            } else {
+                StickyMode::None
+            };
+            hooks::install_builtin_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
+            Role::install_builtin_role_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
+            Agent::install_builtin_agent_hooks(InstallMode::Prompt, &mut sticky, prompter)?;
         }
         AssetCategory::McpConfig => Functions::install_mcp_config()?,
     }
@@ -572,9 +598,18 @@ pub fn install_assets(category: AssetCategory) -> Result<()> {
     Ok(())
 }
 
-fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) -> Result<bool> {
-    if !*IS_STDOUT_TERMINAL {
-        return Ok(true);
+fn confirm_asset_overwrite(
+    category: AssetCategory,
+    label: &str,
+    target: &Path,
+    prompter: &dyn Prompter,
+    remedy: &str,
+) -> Result<bool> {
+    if !conflict::menu_can_use_terminal() {
+        return Err(conflict::refuse_non_interactive(
+            format_args!("reinstall bundled {label}"),
+            remedy,
+        ));
     }
     let body = match category {
         AssetCategory::McpConfig => format!(
@@ -589,7 +624,8 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
              scripts in {}, the roles hooks directory, and each bundled \
              agent's hooks directory. Where a local copy differs from the \
              bundled version you are asked per file whether to keep or \
-             replace it; non-interactive runs keep local files.",
+             replace it. Without a terminal the refresh is refused unless \
+             --yes is given, and with --yes every edited hook is kept.",
             target.display()
         ),
         _ => format!(
@@ -600,10 +636,8 @@ fn confirm_asset_overwrite(category: AssetCategory, label: &str, target: &Path) 
             target.display()
         ),
     };
-    let prompt = format!("{} {body}\nContinue? [y/N] ", warning_text("WARNING:"));
-    let answer = read_single_key(&['y', 'Y', 'n', 'N'], 'n', &prompt)?;
-
-    Ok(matches!(answer, 'y' | 'Y'))
+    println!("{} {body}", warning_text("WARNING:"));
+    crate::prompt::confirm_with_help(prompter, "Continue?", false, &body)
 }
 
 pub fn default_sessions_dir() -> PathBuf {
@@ -806,9 +840,9 @@ impl Config {
                     if inspection {
                         return Ok(Self::default());
                     }
-                    if *IS_STDOUT_TERMINAL {
-                        create_config_file(&config_path).await?;
-                    }
+                    // Without a terminal the wizard refuses in the shared
+                    // shape before writing anything.
+                    create_config_file(&config_path).await?;
                     Self::load_from_file(&config_path)?
                 }
             }
@@ -996,12 +1030,21 @@ bitflags::bitflags! {
     }
 }
 
+impl StateFlags {
+    /// What the user has entered: a role, session, RAG or agent. The
+    /// other flags are capabilities that are on or off regardless.
+    pub const CONTEXT: Self = Self::ROLE
+        .union(Self::SESSION_EMPTY)
+        .union(Self::SESSION)
+        .union(Self::RAG)
+        .union(Self::AGENT);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssertState {
     True(StateFlags),
     False(StateFlags),
     TrueFalse(StateFlags, StateFlags),
-    Equal(StateFlags),
 }
 
 impl AssertState {
@@ -1009,8 +1052,10 @@ impl AssertState {
         AssertState::False(StateFlags::empty())
     }
 
+    /// No role, session, RAG or agent is active. Capability flags such as
+    /// `FUNCTION_CALLING` describe the config, not the context, and are ignored.
     pub fn bare() -> Self {
-        AssertState::Equal(StateFlags::empty())
+        AssertState::False(StateFlags::CONTEXT)
     }
 
     pub fn assert(self, flags: StateFlags) -> bool {
@@ -1021,12 +1066,21 @@ impl AssertState {
                 (true_flags & flags != StateFlags::empty())
                     && (false_flags & flags == StateFlags::empty())
             }
-            AssertState::Equal(check_flags) => check_flags == flags,
         }
     }
 }
 
 pub async fn create_config_file(config_path: &Path) -> Result<()> {
+    if !conflict::menu_can_use_terminal() {
+        return Err(conflict::refuse_non_interactive(
+            format_args!("create the config file at '{}'", config_path.display()),
+            ".",
+        ));
+    }
+    debug_assert!(
+        !crate::tui::active(),
+        "the first-run wizard draws inquire widgets straight on the terminal and never runs under the UI"
+    );
     let ans = Confirm::new("No config file, create a new one?")
         .with_default(true)
         .prompt()?;
@@ -1038,19 +1092,20 @@ pub async fn create_config_file(config_path: &Path) -> Result<()> {
         return create_config_file_sandbox(config_path).await;
     }
 
-    let provider_choice = prompt_provider_choice()?;
+    let prompter = crate::prompt::InquirePrompter::default();
+    let provider_choice = prompt_provider_choice(&prompter)?;
     let mut vault = match &provider_choice {
         None => Vault::default_local(),
         Some(provider) => Vault::from_provider(provider.clone()),
     };
-    create_vault_password_file(&mut vault)?;
+    create_vault_password_file(&mut vault, &prompter, &mut |note| println!("{note}"))?;
     if provider_choice.is_some() {
         vault.validate_round_trip()?;
     }
 
     let client = Select::new("API Provider (required):", list_client_types()).prompt()?;
 
-    let (model, clients_config) = create_client_config(client, &vault).await?;
+    let (model, clients_config) = create_client_config(client, &vault, &prompter).await?;
     let secrets = match &provider_choice {
         None => json!({
             "vault_password_file": vault.local_password_file()?.display().to_string()
@@ -1572,6 +1627,33 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_ui() {
+        assert!(CONFIG_TEMPLATE.contains(
+            "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
+        ));
+        assert!(CONFIG_TEMPLATE.contains(
+            "tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
+        ));
+        assert!(CONFIG_TEMPLATE.contains(
+            "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
+        ));
+        assert!(CONFIG_TEMPLATE.contains(
+            "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
+        ));
+        assert!(!CONFIG_TEMPLATE.to_ascii_lowercase().contains("light_theme"));
+        let example = include_str!("../../config.example.yaml");
+        for (label, text) in [
+            ("config-template.yaml", CONFIG_TEMPLATE),
+            ("config.example.yaml", example),
+        ] {
+            assert!(
+                !text.contains("COYOTE_UI"),
+                "{label} names COYOTE_UI, which coyote does not read"
+            );
+        }
+    }
+
+    #[test]
     fn config_template_documents_child_sessions() {
         assert!(CONFIG_TEMPLATE.contains("\nchild_sessions: null"));
         assert!(CONFIG_TEMPLATE.contains("# ---- Child Sessions ----"));
@@ -1600,12 +1682,29 @@ clients:
 
     #[test]
     fn config_example_parses_with_dot_command_prefix() {
-        let example = include_str!("../../config.example.yaml");
+        let example = include_str!("../../config.example.yaml").replace("\r\n", "\n");
+        let example = example.as_str();
         assert!(example.contains("command_prefix: dot"));
         assert!(example.contains("\nmemory_round_chains: supersede"));
+        assert!(example.contains(
+            "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
+        ));
+        assert!(example.contains(
+            "\ntui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
+        ));
+        assert!(example.contains(
+            "\neditor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR\n"
+        ));
+        assert!(example.contains(
+            "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
+        ));
+        assert!(!example.to_ascii_lowercase().contains("light_theme"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.command_prefix, CommandPrefix::Dot);
         assert_eq!(cfg.memory_round_chains, RoundChains::Supersede);
+        assert_eq!(cfg.ui, UiMode::Repl);
+        assert!(cfg.tui_dump_on_exit);
+        assert_eq!(cfg.theme, None);
     }
 
     #[test]
@@ -1809,12 +1908,47 @@ hooks:
     }
 
     #[test]
-    fn assert_state_bare_only_empty() {
+    fn assert_state_bare_rejects_any_context() {
         let bare = AssertState::bare();
 
         assert!(bare.assert(StateFlags::empty()));
-        assert!(!bare.assert(StateFlags::ROLE));
-        assert!(!bare.assert(StateFlags::SESSION));
+        for flag in [
+            StateFlags::ROLE,
+            StateFlags::SESSION_EMPTY,
+            StateFlags::SESSION,
+            StateFlags::AGENT,
+            StateFlags::RAG,
+        ] {
+            assert!(!bare.assert(flag), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn assert_state_bare_ignores_capability_flags() {
+        let bare = AssertState::bare();
+        let capabilities =
+            StateFlags::FUNCTION_CALLING | StateFlags::AUTO_CONTINUE | StateFlags::SKILLS_ENABLED;
+
+        assert!(bare.assert(capabilities));
+        for flag in [
+            StateFlags::ROLE,
+            StateFlags::SESSION,
+            StateFlags::AGENT,
+            StateFlags::RAG,
+        ] {
+            assert!(!bare.assert(capabilities | flag), "{flag:?}");
+        }
+    }
+
+    /// A new flag must be classed as context or capability, or `bare()`
+    /// silently ignores it.
+    #[test]
+    fn assert_state_flags_split_into_context_and_capabilities() {
+        let capabilities =
+            StateFlags::FUNCTION_CALLING | StateFlags::AUTO_CONTINUE | StateFlags::SKILLS_ENABLED;
+
+        assert_eq!(StateFlags::CONTEXT | capabilities, StateFlags::all());
+        assert!(StateFlags::CONTEXT.intersection(capabilities).is_empty());
     }
 
     #[test]
@@ -1868,16 +2002,6 @@ hooks:
         assert!(!state.assert(StateFlags::empty()));
         assert!(!state.assert(StateFlags::SESSION));
         assert!(!state.assert(StateFlags::ROLE | StateFlags::SESSION));
-    }
-
-    #[test]
-    fn assert_state_equal_exact_match() {
-        let state = AssertState::Equal(StateFlags::ROLE | StateFlags::SESSION);
-
-        assert!(state.assert(StateFlags::ROLE | StateFlags::SESSION));
-        assert!(!state.assert(StateFlags::ROLE));
-        assert!(!state.assert(StateFlags::SESSION));
-        assert!(!state.assert(StateFlags::empty()));
     }
 
     #[tokio::test]
@@ -2072,12 +2196,14 @@ hooks:
         // Drives the exact three installers `install_assets(Hooks)` runs,
         // threading one sticky scope through all of them.
         let refresh = |sticky: &mut StickyMode| {
-            hooks::install_builtin_hooks(InstallMode::Prompt, sticky).unwrap();
+            hooks::install_builtin_hooks(InstallMode::Prompt, sticky, &prompt_script::Scripted)
+                .unwrap();
             role::install_and_reconcile_role_hooks(
                 &role_dir,
                 &shipped,
                 InstallMode::Prompt,
                 sticky,
+                &prompt_script::Scripted,
             )
             .unwrap();
             agent::install_and_reconcile_agent_hooks(
@@ -2085,6 +2211,7 @@ hooks:
                 &shipped,
                 InstallMode::Prompt,
                 sticky,
+                &prompt_script::Scripted,
             )
             .unwrap();
         };
@@ -2151,21 +2278,165 @@ hooks:
         use crate::config::conflict::prompt_script;
 
         let _guard = TestConfigDirGuard::new("install-builtins-startup");
-        install_builtins().unwrap();
+        install_builtins(&prompt_script::Scripted).unwrap();
         let notify = paths::hooks_dir().join("notify.sh");
         fs::write(&notify, "# local edit").unwrap();
 
         // A forced terminal with no scripted answers: any prompt would panic
         // and the counter would move.
         let script = prompt_script::install(&[]);
-        install_builtins().unwrap();
+        install_builtins(&prompt_script::Scripted).unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
         drop(script);
 
         let _script = prompt_script::install_non_interactive();
-        install_builtins().unwrap();
+        install_builtins(&prompt_script::Scripted).unwrap();
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
+    }
+
+    /// `--install-builtins hooks --yes` on a terminal starts the hook
+    /// installers in keep-all mode: no conflict menu, local edits kept.
+    #[test]
+    #[serial_test::serial]
+    fn with_yes_a_hooks_reinstall_asks_nothing_and_keeps_a_local_edit() {
+        use crate::config::conflict::prompt_script;
+        use crate::prompt::ScriptedPrompter;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-hooks-yes");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        install_builtins(&prompt_script::Scripted).unwrap();
+        let notify = paths::hooks_dir().join("notify.sh");
+        fs::write(&notify, "# local edit").unwrap();
+
+        let _script = prompt_script::install(&[]);
+        let prompter = ScriptedPrompter::refusing();
+
+        install_assets(AssetCategory::Hooks, &prompter, true, ".").unwrap();
+
+        assert!(prompter.requests().is_empty());
+        assert_eq!(read_to_string(&notify).unwrap(), "# local edit");
+    }
+
+    /// Under the full-screen UI the overwrite warning is followed by a
+    /// Confirm through the prompter, defaulting to no, instead of a raw
+    /// keypress read.
+    #[test]
+    #[serial_test::serial]
+    fn confirm_asset_overwrite_under_the_tui_asks_through_the_prompter() {
+        use crate::prompt::{PromptAction, PromptAnswer, ScriptedPrompter};
+
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+
+        let proceed = confirm_asset_overwrite(
+            AssetCategory::Macros,
+            "macros",
+            Path::new("/tmp/coyote-macros"),
+            &prompter,
+            ".",
+        )
+        .unwrap();
+
+        assert!(proceed);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Continue?");
+        assert_eq!(requests[0].default, Some(json!(false)));
+        assert_eq!(
+            requests[0].help.as_deref(),
+            Some(
+                "Reinstalling bundled macros overwrites every bundled macros in \
+                 /tmp/coyote-macros with this build's packaged versions. Local changes to bundled \
+                 macros will be lost; macros you created yourself are left \
+                 untouched."
+            )
+        );
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let proceed = confirm_asset_overwrite(
+            AssetCategory::Hooks,
+            "hooks",
+            Path::new("/tmp/coyote-hooks"),
+            &prompter,
+            ".",
+        )
+        .unwrap();
+        assert!(!proceed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn without_a_terminal_a_builtin_reinstall_is_refused_and_writes_nothing() {
+        use crate::config::conflict::prompt_script;
+        use crate::prompt::ScriptedPrompter;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-no-tty");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+
+        let err =
+            install_assets(AssetCategory::Macros, &prompter, false, " or pass --yes.").unwrap_err();
+
+        assert!(
+            err.to_string().starts_with(
+                "Refusing to reinstall bundled macros non-interactively. \
+                 Re-run in a terminal or pass --yes."
+            ),
+            "{err}"
+        );
+        assert!(prompter.requests().is_empty());
+        assert!(!paths::macros_dir().exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn with_yes_a_macros_reinstall_asks_nothing_and_overwrites_a_local_edit() {
+        use crate::config::conflict::prompt_script;
+        use crate::prompt::ScriptedPrompter;
+
+        let _guard = TestConfigDirGuard::new("install-builtins-yes");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let prompter = ScriptedPrompter::refusing();
+        let edited = paths::macros_dir().join("record-miss.yaml");
+        fs::create_dir_all(paths::macros_dir()).unwrap();
+        fs::write(&edited, "name: local-edit\n").unwrap();
+
+        install_assets(AssetCategory::Macros, &prompter, true, " or pass --yes.").unwrap();
+
+        assert!(prompter.requests().is_empty());
+        assert_eq!(
+            fs::read_to_string(&edited).unwrap(),
+            include_str!("../../assets/macros/record-miss.yaml"),
+            "the local edit survived a --yes macros reinstall"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn without_a_terminal_create_config_file_refuses_before_writing() {
+        use crate::config::conflict::prompt_script;
+
+        let _guard = TestConfigDirGuard::new("create-config-no-tty");
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let config_path = _guard.path.join("config.yaml");
+
+        let err = create_config_file(&config_path).await.unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Refusing to create the config file at '{}' non-interactively. \
+                 Re-run in a terminal.",
+                config_path.display()
+            )
+        );
+        assert!(!config_path.exists());
+        assert_eq!(fs::read_dir(&_guard.path).unwrap().count(), 0);
     }
 }

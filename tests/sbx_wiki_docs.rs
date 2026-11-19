@@ -644,9 +644,9 @@ fn inbound_anchors_resolve_to_page_headings() {
     assert!(from_sidebar > 0, "{SIDEBAR} links into {PAGE}");
 }
 
-// ---- usage-probe additions -------------------------------------------------
+// ---- page claims ----------------------------------------------------------
 //
-// Spec-first pins for the page claims the tests above leave unpinned: the
+// Pins for the page claims the tests above leave unpinned: the
 // base kit's dockerfile and yaml, the three built-in kits, the launch order
 // behind "What `--sandbox` actually does", the refusal and log sentences the
 // discovery section quotes, and the page's own voice rules.
@@ -2036,7 +2036,7 @@ fn usage_probe_env_page_describes_the_override_as_a_workload_kit() {
     );
 }
 
-// ---- usage-probe pins over the whole wiki -----------------------------------
+// ---- pins over the whole wiki -----------------------------------------------
 
 /// Every `const CAP_*` value in `kit.rs` that names a capability a mixin kit
 /// may declare: all of them except the workload-only `CAP_SBX`.

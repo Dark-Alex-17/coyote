@@ -3,36 +3,72 @@ use super::bundles::{
     hash_file,
 };
 use crate::config::builtin_manifest::is_builtin_manifest_name;
-use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
+use crate::config::conflict::{self, ConflictAction, NonInteractive, StickyMode, resolve_conflict};
 use crate::config::{
     AssetCategory, BUNDLE_MANIFEST_FILE, CommandPrefix, InstallFilter, paths,
     set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
+use crate::prompt::{
+    NeedsHuman, PromptCancelled, Prompter, select_closed, select_closed_or_cancel,
+};
 use crate::utils;
-use crate::utils::IS_STDOUT_TERMINAL;
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, Select};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 use std::{fs, iter};
 
-#[cfg(test)]
-fn install_remote(git_url: &str, filter: Option<InstallFilter>, force: bool) -> Result<()> {
-    install_remote_with_prefix(git_url, filter, force, CommandPrefix::default())
+/// What follows "Re-run in a terminal" when an install or update
+/// conflict has nowhere to ask its question, under the CLI, whose
+/// `--install` takes `--install-force` and whose `--update-bundle`
+/// takes `--yes`.
+pub(crate) const CLI_CONFLICT_REMEDY: &str =
+    ", with --install-force (installs), or with --yes (updates).";
+/// The same under the REPL, whose `.install` takes `--force` for a
+/// remote install and offers no flag for a bundle update.
+pub(crate) const REPL_CONFLICT_REMEDY: &str = ", with --force (installs).";
+
+/// How an install or update talks to its user: the prefix its hints are
+/// rendered with, the prompter its menus ask through, and what a
+/// conflict refusal names as the way around the missing terminal.
+#[derive(Clone, Copy)]
+pub(crate) struct InstallIo<'a> {
+    pub(crate) prefix: CommandPrefix,
+    pub(crate) prompter: &'a dyn Prompter,
+    /// [`CLI_CONFLICT_REMEDY`] or [`REPL_CONFLICT_REMEDY`].
+    pub(crate) remedy: &'static str,
+    /// The flag that forces a remote install where this caller reads it:
+    /// `--install-force` on the CLI, `--force` in the REPL.
+    pub(crate) force_flag: &'static str,
 }
 
-fn install_remote_with_prefix(
+#[cfg(test)]
+fn install_remote(
     git_url: &str,
     filter: Option<InstallFilter>,
     force: bool,
-    prefix: CommandPrefix,
+    prompter: &dyn Prompter,
+) -> Result<()> {
+    let io = InstallIo {
+        prefix: CommandPrefix::default(),
+        prompter,
+        remedy: CLI_CONFLICT_REMEDY,
+        force_flag: "--install-force",
+    };
+    install_remote_with_io(git_url, filter, force, io)
+}
+
+fn install_remote_with_io(
+    git_url: &str,
+    filter: Option<InstallFilter>,
+    force: bool,
+    io: InstallIo<'_>,
 ) -> Result<()> {
     let (url, reference) = parse_url_with_ref(git_url)?;
     let temp = clone_to_temp(&url, reference.as_deref())?;
@@ -58,6 +94,7 @@ fn install_remote_with_prefix(
         layout.manifest.as_ref(),
         temp.head_sha(),
         false,
+        io.prompter,
     )?;
 
     let plan = plan_changes(&layout)?;
@@ -70,15 +107,23 @@ fn install_remote_with_prefix(
         } else {
             StickyMode::None
         };
-        apply_plan(&plan, sticky, &mut store, &bundle)?;
+        apply_plan(&plan, sticky, &mut store, &bundle, io)?;
     }
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
-        let report = merge_mcp_json(local, remote_mcp, local_mcp, force, &HashSet::new(), false)?;
+        let report = merge_mcp_json(
+            local,
+            remote_mcp,
+            local_mcp,
+            force,
+            &HashSet::new(),
+            false,
+            io,
+        )?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
-        handle_missing_secrets(&report.missing_secrets, prefix)?;
+        handle_missing_secrets(&report.missing_secrets, io)?;
     }
 
     Ok(())
@@ -233,7 +278,7 @@ pub fn install_or_update(
     git_host: Option<&str>,
     filter: Option<InstallFilter>,
     force: bool,
-    prefix: CommandPrefix,
+    io: InstallIo<'_>,
 ) -> Result<()> {
     if let Some(host) = git_host {
         if !is_repo_shorthand(value) {
@@ -245,7 +290,7 @@ pub fn install_or_update(
 
         let url = expand_repo_shorthand(value, Some(host))?;
         println!("Resolved '{value}' to '{url}'");
-        return install_remote_with_prefix(&url, filter, force, prefix);
+        return install_remote_with_io(&url, filter, force, io);
     }
 
     let store = BundleStore::load()?;
@@ -273,15 +318,18 @@ pub fn install_or_update(
         }
         InstallTarget::InstalledBundle => {
             if filter.is_some() || force {
-                bail!("--filter/--install-force only apply to remote installs, not bundle updates");
+                bail!(
+                    "--filter/{} only apply to remote installs, not bundle updates",
+                    io.force_flag
+                );
             }
-            update_bundle_with_prefix(value, false, prefix)
+            update_bundle_with_io(value, false, io)
         }
-        InstallTarget::RemoteSource => install_remote_with_prefix(value, filter, force, prefix),
+        InstallTarget::RemoteSource => install_remote_with_io(value, filter, force, io),
         InstallTarget::Shorthand => {
             let url = expand_repo_shorthand(value, None)?;
             println!("Resolved '{value}' to '{url}'");
-            install_remote_with_prefix(&url, filter, force, prefix)
+            install_remote_with_io(&url, filter, force, io)
         }
         InstallTarget::Unknown => {
             let hint = "a remote source must be a git URL, an <owner>/<repo> shorthand \
@@ -300,8 +348,8 @@ pub fn install_or_update(
     }
 }
 
-pub fn install_or_update_from_repl_args(args: &str, prefix: CommandPrefix) -> Result<()> {
-    let command = prefix.render_hints(".install");
+pub fn install_or_update_from_repl_args(args: &str, io: InstallIo<'_>) -> Result<()> {
+    let command = io.prefix.render_hints(".install");
     let tokens = shell_words::split(args)
         .with_context(|| format!("failed to parse '{command}' args: {args}"))?;
 
@@ -318,17 +366,26 @@ pub fn install_or_update_from_repl_args(args: &str, prefix: CommandPrefix) -> Re
         parsed.git_host.as_deref(),
         parsed.filter,
         parsed.force,
-        prefix,
+        io,
     )
 }
 
 /// The whole remote is always processed, including categories a filtered
 /// install excluded, because filtered installs merge into a single record.
-pub fn update_bundle(spec: &str, assume_yes: bool) -> Result<()> {
-    update_bundle_with_prefix(spec, assume_yes, CommandPrefix::default())
+pub fn update_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -> Result<()> {
+    update_bundle_with_io(
+        spec,
+        assume_yes,
+        InstallIo {
+            prefix: CommandPrefix::default(),
+            prompter,
+            remedy: CLI_CONFLICT_REMEDY,
+            force_flag: "--install-force",
+        },
+    )
 }
 
-fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix) -> Result<()> {
+fn update_bundle_with_io(spec: &str, assume_yes: bool, io: InstallIo<'_>) -> Result<()> {
     let (name, ref_override) = parse_url_with_ref(spec)?;
 
     let mut store = BundleStore::load()?;
@@ -374,6 +431,7 @@ fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix
         layout.manifest.as_ref(),
         temp.head_sha(),
         true,
+        io.prompter,
     )?;
 
     let plan = plan_changes(&layout)?;
@@ -386,18 +444,20 @@ fn update_bundle_with_prefix(spec: &str, assume_yes: bool, prefix: CommandPrefix
         } else {
             StickyMode::None
         };
-        apply_plan(&plan, sticky, &mut store, &bundle)?;
+        apply_plan(&plan, sticky, &mut store, &bundle, io)?;
     }
 
-    handle_obsolete_files(&mut store, &bundle, &plan, assume_yes)?;
+    handle_obsolete_files(&mut store, &bundle, &plan, assume_yes, io.prompter)?;
 
     if let Some((remote_mcp, local_mcp)) = &plan.mcp_json {
         let local = local_mcp.exists().then_some(local_mcp.as_path());
         let auto_take = owned_unmodified_mcp_keys(&store, &bundle, local)?;
-        let report = merge_mcp_json(local, remote_mcp, local_mcp, false, &auto_take, assume_yes)?;
+        let report = merge_mcp_json(
+            local, remote_mcp, local_mcp, false, &auto_take, assume_yes, io,
+        )?;
         record_mcp_merge(&mut store, &bundle, &report)?;
         print_mcp_merge_report(&report);
-        handle_missing_secrets(&report.missing_secrets, prefix)?;
+        handle_missing_secrets(&report.missing_secrets, io)?;
     }
 
     let version = layout
@@ -492,6 +552,7 @@ fn handle_obsolete_files(
     bundle: &str,
     plan: &InstallPlan,
     assume_yes: bool,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
     let planned: HashSet<String> = plan
         .files
@@ -529,7 +590,7 @@ fn handle_obsolete_files(
         let action = match (modified, agent_definition_conflict(&path, &planned)) {
             (false, _) => ObsoleteAction::Delete,
             (true, true) => ObsoleteAction::Backup,
-            (true, false) => resolve_obsolete(&path, &mut sticky)?,
+            (true, false) => resolve_obsolete(&path, &mut sticky, prompter, &mut print_note)?,
         };
         apply_obsolete_action(store, bundle, &path, &full, &config_dir, action, modified)?;
     }
@@ -552,34 +613,102 @@ fn agent_definition_conflict(path: &str, planned: &HashSet<String>) -> bool {
     planned.contains(&format!("agents/{agent}/{counterpart}"))
 }
 
-fn resolve_obsolete(path: &str, sticky: &mut Option<ObsoleteAction>) -> Result<ObsoleteAction> {
+fn resolve_obsolete(
+    path: &str,
+    sticky: &mut Option<ObsoleteAction>,
+    prompter: &dyn Prompter,
+    note: &mut dyn FnMut(&str),
+) -> Result<ObsoleteAction> {
     if let Some(action) = *sticky {
         return Ok(action);
     }
 
-    if !*IS_STDOUT_TERMINAL {
+    // No terminal, an Esc or nobody there to answer keeps the file:
+    // apply_plan has already written the update, so refusing here would
+    // leave it half done. A Ctrl-C still stops the update at this point,
+    // because the user asked for that.
+    if !conflict::menu_can_use_terminal() {
         return Ok(ObsoleteAction::Keep);
     }
 
     let prompt = format!(
         "Obsolete file {path} is no longer shipped by the bundle and has local modifications"
     );
-    let choice = Select::new(&prompt, vec!["keep", "delete", "keep-all", "delete-all"])
-        .prompt()
+    let choice = select_keep_or_delete(prompter, &prompt)
         .with_context(|| "failed to read obsolete-file choice")?;
 
-    match choice {
-        "keep" => Ok(ObsoleteAction::Keep),
-        "delete" => Ok(ObsoleteAction::Delete),
-        "keep-all" => {
+    Ok(keep_or_delete_choice(
+        choice,
+        sticky,
+        "Kept the obsolete files",
+        note,
+    ))
+}
+
+/// The note sink the menu loops hand to [`resolve_obsolete`] and
+/// [`resolve_uninstall_action`]: one line on stdout.
+fn print_note(note: &str) {
+    println!("{note}");
+}
+
+/// Why a conflict menu produced no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoAnswer {
+    Cancelled,
+    NobodyToAsk,
+}
+
+impl NoAnswer {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Cancelled => "the question was cancelled",
+            Self::NobodyToAsk => "nobody could be asked",
+        }
+    }
+}
+
+/// The keep-or-delete menu's answer, or why there is none.
+fn select_keep_or_delete(
+    prompter: &dyn Prompter,
+    prompt: &str,
+) -> Result<Result<String, NoAnswer>> {
+    let options = ["keep", "delete", "keep-all", "delete-all"]
+        .map(str::to_string)
+        .to_vec();
+    match select_closed_or_cancel(prompter, prompt, options) {
+        Ok(Some(answer)) => Ok(Ok(answer)),
+        Ok(None) => Ok(Err(NoAnswer::Cancelled)),
+        Err(err) if NeedsHuman::caused(&err) => Ok(Err(NoAnswer::NobodyToAsk)),
+        Err(err) => Err(err),
+    }
+}
+
+/// The action behind a [`select_keep_or_delete`] answer. No answer is the
+/// keep-everything answer: it sticks for the rest of the loop and
+/// `kept_note`, completed with the reason, goes to `note` once.
+fn keep_or_delete_choice(
+    choice: Result<String, NoAnswer>,
+    sticky: &mut Option<ObsoleteAction>,
+    kept_note: &str,
+    note: &mut dyn FnMut(&str),
+) -> ObsoleteAction {
+    match choice.as_deref() {
+        Ok("keep") => ObsoleteAction::Keep,
+        Ok("delete") => ObsoleteAction::Delete,
+        Ok("keep-all") => {
             *sticky = Some(ObsoleteAction::Keep);
-            Ok(ObsoleteAction::Keep)
+            ObsoleteAction::Keep
         }
-        "delete-all" => {
+        Ok("delete-all") => {
             *sticky = Some(ObsoleteAction::Delete);
-            Ok(ObsoleteAction::Delete)
+            ObsoleteAction::Delete
         }
-        _ => unreachable!("inquire::Select returned an unexpected option"),
+        Err(why) => {
+            note(&format!("{kept_note}: {}.", why.reason()));
+            *sticky = Some(ObsoleteAction::Keep);
+            ObsoleteAction::Keep
+        }
+        Ok(_) => unreachable!("select_closed_or_cancel only hands back an offered option"),
     }
 }
 
@@ -649,13 +778,13 @@ struct UninstallMcpSummary {
 }
 
 /// Kept and failed items stay in the record, so a re-run offers them again.
-pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
+pub fn uninstall_bundle(spec: &str, assume_yes: bool, prompter: &dyn Prompter) -> Result<()> {
     let mut store = BundleStore::load()?;
     let name = match store.get(spec) {
         Some(_) => spec.to_string(),
         None => match store.find_by_source(spec) {
             Some((name, _)) => name.to_string(),
-            None => match select_uninstall_candidate(&store, spec)? {
+            None => match select_uninstall_candidate(&store, spec, prompter)? {
                 Some(name) => name,
                 None => {
                     let installed = store.bundle_names();
@@ -674,33 +803,43 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
     let record = store.get(&name).expect("resolved above").clone();
 
     if !assume_yes {
-        if !*IS_STDOUT_TERMINAL {
-            bail!(
-                "refusing to uninstall bundle '{name}' non-interactively; \
-                 re-run with --yes to confirm"
-            );
+        if !conflict::menu_can_use_terminal() {
+            return Err(conflict::refuse_non_interactive(
+                format_args!("uninstall bundle '{name}'"),
+                " or pass --yes.",
+            ));
         }
-        println!(
+        let ownership = format!(
             "Bundle '{name}' owns {} file(s) and {} mcp.json server(s).",
             record.files.len(),
             record.mcp_servers.len()
         );
-        let proceed = Confirm::new(&format!("Uninstall bundle '{name}'?"))
-            .with_default(false)
-            .prompt()
-            .with_context(|| "failed to read uninstall confirmation")?;
+        println!("{ownership}");
+        let proceed = crate::prompt::confirm_with_help(
+            prompter,
+            format!("Uninstall bundle '{name}'?"),
+            false,
+            &ownership,
+        )
+        .with_context(|| "failed to read uninstall confirmation")?;
         if !proceed {
             println!("Uninstall of '{name}' aborted; nothing was changed.");
             return Ok(());
         }
     }
 
+    let mut question = UninstallQuestion {
+        assume_yes,
+        sticky: None,
+        prompter,
+        note: &mut print_note,
+    };
     let files = uninstall_owned_files(
         &mut store,
         &name,
         &record.files,
         &paths::config_dir(),
-        assume_yes,
+        &mut question,
     )?;
 
     if files.tools_seen {
@@ -710,12 +849,19 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
         );
     }
 
+    // A delete-all answer was given about owned files and must not
+    // delete mcp.json servers it never mentioned; keep-all is the safe
+    // answer and stays.
+    if question.sticky == Some(ObsoleteAction::Delete) {
+        question.sticky = None;
+    }
+
     let mcp = uninstall_mcp_entries(
         &mut store,
         &name,
         &record.mcp_servers,
         &paths::mcp_config_file(),
-        assume_yes,
+        &mut question,
     )?;
 
     let empty = store
@@ -764,7 +910,11 @@ pub fn uninstall_bundle(spec: &str, assume_yes: bool) -> Result<()> {
 
 /// Never auto-picks between multiple matches: ambiguity is resolved by an
 /// interactive prompt, and non-interactive runs bail even under --yes.
-fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<String>> {
+fn select_uninstall_candidate(
+    store: &BundleStore,
+    spec: &str,
+    prompter: &dyn Prompter,
+) -> Result<Option<String>> {
     if !is_repo_shorthand(spec) {
         return Ok(None);
     }
@@ -785,25 +935,27 @@ fn select_uninstall_candidate(store: &BundleStore, spec: &str) -> Result<Option<
                 .map(|(name, source)| format!("{name} ({source})"))
                 .collect();
 
-            if !*IS_STDOUT_TERMINAL {
-                bail!(
-                    "'{spec}' matches multiple installed bundles: {}; re-run with the \
-                     exact bundle name or source URL",
-                    described.join(", ")
-                );
+            if !conflict::menu_can_use_terminal() {
+                return Err(conflict::refuse_non_interactive(
+                    format_args!(
+                        "pick between the bundles matching '{spec}' ({})",
+                        described.join(", ")
+                    ),
+                    " or pass the exact bundle name or source URL.",
+                ));
             }
 
-            let picked = Select::new(
+            let picked = select_closed(
+                prompter,
                 &format!("Multiple bundles match '{spec}'; which one should be uninstalled?"),
                 described.clone(),
             )
-            .prompt()
             .with_context(|| "failed to read uninstall selection")?;
 
             let index = described
                 .iter()
                 .position(|option| option == &picked)
-                .expect("selection came from the presented options");
+                .expect("select_closed only hands back an offered option");
 
             Ok(Some(candidates[index].0.clone()))
         }
@@ -846,10 +998,9 @@ fn uninstall_owned_files(
     bundle: &str,
     files: &[FileRecord],
     config_dir: &Path,
-    assume_yes: bool,
+    question: &mut UninstallQuestion<'_>,
 ) -> Result<UninstallFileSummary> {
     let mut summary = UninstallFileSummary::default();
-    let mut sticky: Option<ObsoleteAction> = None;
     for file in files {
         if !is_safe_relative_path(&file.path) {
             eprintln!(
@@ -879,7 +1030,7 @@ fn uninstall_owned_files(
         }
 
         let prompt = format!("File {} was modified locally after install", file.path);
-        let action = resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?;
+        let action = question.resolve(&prompt)?;
         apply_uninstall_file_action(
             store,
             bundle,
@@ -963,12 +1114,36 @@ fn prune_empty_dirs(full: &Path, config_dir: &Path) {
     }
 }
 
+/// The keep-or-delete question an uninstall asks about every modified
+/// item, owned files and mcp.json entries alike: one keep-all answer
+/// settles the whole run and the kept note is printed once.
+struct UninstallQuestion<'a> {
+    assume_yes: bool,
+    sticky: Option<ObsoleteAction>,
+    prompter: &'a dyn Prompter,
+    note: &'a mut dyn FnMut(&str),
+}
+
+impl UninstallQuestion<'_> {
+    fn resolve(&mut self, prompt: &str) -> Result<ObsoleteAction> {
+        resolve_uninstall_action(
+            prompt,
+            self.assume_yes,
+            &mut self.sticky,
+            self.prompter,
+            self.note,
+        )
+    }
+}
+
 fn resolve_uninstall_action(
     prompt: &str,
     assume_yes: bool,
     sticky: &mut Option<ObsoleteAction>,
+    prompter: &dyn Prompter,
+    note: &mut dyn FnMut(&str),
 ) -> Result<ObsoleteAction> {
-    if assume_yes || !*IS_STDOUT_TERMINAL {
+    if assume_yes || !conflict::menu_can_use_terminal() {
         return Ok(ObsoleteAction::Keep);
     }
 
@@ -976,22 +1151,14 @@ fn resolve_uninstall_action(
         return Ok(action);
     }
 
-    let choice = Select::new(prompt, vec!["keep", "delete", "keep-all", "delete-all"])
-        .prompt()
+    let choice = select_keep_or_delete(prompter, prompt)
         .with_context(|| "failed to read uninstall choice")?;
-    match choice {
-        "keep" => Ok(ObsoleteAction::Keep),
-        "delete" => Ok(ObsoleteAction::Delete),
-        "keep-all" => {
-            *sticky = Some(ObsoleteAction::Keep);
-            Ok(ObsoleteAction::Keep)
-        }
-        "delete-all" => {
-            *sticky = Some(ObsoleteAction::Delete);
-            Ok(ObsoleteAction::Delete)
-        }
-        _ => unreachable!("inquire::Select returned an unexpected option"),
-    }
+    Ok(keep_or_delete_choice(
+        choice,
+        sticky,
+        "Kept the locally modified items",
+        note,
+    ))
 }
 
 /// mcp.json is written before any ownership record is dropped: a failed write
@@ -1002,7 +1169,7 @@ fn uninstall_mcp_entries(
     bundle: &str,
     servers: &[McpServerRecord],
     mcp_path: &Path,
-    assume_yes: bool,
+    question: &mut UninstallQuestion<'_>,
 ) -> Result<UninstallMcpSummary> {
     let mut summary = UninstallMcpSummary::default();
     if servers.is_empty() {
@@ -1040,7 +1207,6 @@ fn uninstall_mcp_entries(
 
     let mut changed = false;
     let mut released = Vec::new();
-    let mut sticky: Option<ObsoleteAction> = None;
     for server in servers {
         let key = server.effective_key().to_string();
         if server.action == McpAction::Replaced {
@@ -1067,7 +1233,7 @@ fn uninstall_mcp_entries(
                 "was modified locally after install"
             };
             let prompt = format!("MCP server '{key}' {reason}");
-            resolve_uninstall_action(&prompt, assume_yes, &mut sticky)?
+            question.resolve(&prompt)?
         };
         match action {
             ObsoleteAction::Keep => {
@@ -1381,8 +1547,9 @@ fn register_bundle(
     manifest: Option<&BundleManifest>,
     commit: &str,
     preserve_versions: bool,
+    prompter: &dyn Prompter,
 ) -> Result<String> {
-    let resolved = store.resolve_bundle_name(url, manifest.map(|m| m.name.as_str()))?;
+    let resolved = store.resolve_bundle_name(url, manifest.map(|m| m.name.as_str()), prompter)?;
     let version = manifest
         .and_then(|m| m.version.clone())
         .unwrap_or_else(|| commit.chars().take(7).collect());
@@ -1923,6 +2090,7 @@ fn apply_plan(
     initial_mode: StickyMode,
     store: &mut BundleStore,
     bundle: &str,
+    io: InstallIo<'_>,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport {
         new_count: 0,
@@ -1952,7 +2120,8 @@ fn apply_plan(
                 &planned.dst,
                 planned.top_category.label(),
                 &mut sticky,
-                NonInteractive::Bail,
+                NonInteractive::Bail { remedy: io.remedy },
+                io.prompter,
             )? {
                 ConflictAction::Keep => report.kept_count += 1,
                 ConflictAction::Replace => {
@@ -2077,6 +2246,7 @@ struct McpMergeReport {
     missing_secrets: Vec<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum McpConflictAction {
     KeepLocal,
     TakeRemote,
@@ -2090,6 +2260,7 @@ fn merge_mcp_json(
     force: bool,
     auto_take: &HashSet<String>,
     assume_yes: bool,
+    io: InstallIo<'_>,
 ) -> Result<McpMergeReport> {
     let remote_content = fs::read_to_string(remote)
         .with_context(|| format!("failed to read remote mcp.json at {}", remote.display()))?;
@@ -2120,6 +2291,7 @@ fn merge_mcp_json(
         missing_secrets: Vec::new(),
     };
     let mut to_validate: Vec<String> = Vec::new();
+    let mut unanswered = false;
 
     for (name, remote_server) in remote_config.mcp_servers {
         if let Some(local_server) = merged.mcp_servers.get(&name) {
@@ -2129,7 +2301,14 @@ fn merge_mcp_json(
             let action = if auto_take.contains(&name) {
                 McpConflictAction::TakeRemote
             } else {
-                resolve_mcp_conflict(&name, force, assume_yes)?
+                resolve_mcp_conflict(
+                    &name,
+                    force,
+                    assume_yes,
+                    io,
+                    &mut unanswered,
+                    &mut print_note,
+                )?
             };
             match action {
                 McpConflictAction::KeepLocal => report.kept_local.push(name),
@@ -2197,22 +2376,36 @@ fn merge_mcp_json(
     Ok(report)
 }
 
-fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<McpConflictAction> {
+/// The answer to an MCP server the remote and the local mcp.json both
+/// define differently. No answer (the question closed, or nobody to ask
+/// it) keeps the local server, and `note` gets one line saying so; that
+/// sticks through `unanswered`, so later conflicts of the same merge keep
+/// theirs without asking or noting again. A run with no terminal at all
+/// is refused before the question.
+fn resolve_mcp_conflict(
+    name: &str,
+    force: bool,
+    assume_yes: bool,
+    io: InstallIo<'_>,
+    unanswered: &mut bool,
+    note: &mut dyn FnMut(&str),
+) -> Result<McpConflictAction> {
     if force {
         return Ok(McpConflictAction::TakeRemote);
     }
-    if assume_yes {
+    if assume_yes || *unanswered {
         return Ok(McpConflictAction::KeepLocal);
     }
-    if !*IS_STDOUT_TERMINAL {
-        bail!(
-            "MCP server '{name}' already exists locally. Refusing to merge non-interactively. \
-             Re-run in a terminal, with --install-force (installs), or with --yes (updates)."
-        );
+    if !conflict::menu_can_use_terminal() {
+        return Err(conflict::refuse_non_interactive(
+            format_args!("merge the already-installed MCP server '{name}'"),
+            io.remedy,
+        ));
     }
     let rename_label = format!("rename remote as \"{name}-remote\"");
     let prompt = format!("Conflict on MCP server '{name}'");
-    let choice = Select::new(
+    let choice = match select_closed_or_cancel(
+        io.prompter,
         &prompt,
         vec![
             "keep local".to_string(),
@@ -2220,9 +2413,18 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
             rename_label.clone(),
             "abort merge".to_string(),
         ],
-    )
-    .prompt()
-    .with_context(|| "failed to read MCP conflict choice")?;
+    ) {
+        Ok(Some(choice)) => choice,
+        Ok(None) => {
+            *unanswered = true;
+            return Ok(keep_local_unanswered(name, NoAnswer::Cancelled, note));
+        }
+        Err(err) if NeedsHuman::caused(&err) => {
+            *unanswered = true;
+            return Ok(keep_local_unanswered(name, NoAnswer::NobodyToAsk, note));
+        }
+        Err(err) => return Err(err).with_context(|| "failed to read MCP conflict choice"),
+    };
 
     if choice == "keep local" {
         Ok(McpConflictAction::KeepLocal)
@@ -2233,8 +2435,20 @@ fn resolve_mcp_conflict(name: &str, force: bool, assume_yes: bool) -> Result<Mcp
     } else if choice == "abort merge" {
         bail!("Aborted MCP merge by user.")
     } else {
-        unreachable!("inquire::Select returned an unexpected option")
+        unreachable!("select_closed_or_cancel only hands back an offered option")
     }
+}
+
+fn keep_local_unanswered(
+    name: &str,
+    why: NoAnswer,
+    note: &mut dyn FnMut(&str),
+) -> McpConflictAction {
+    note(&format!(
+        "Kept the local MCP server '{name}': {}.",
+        why.reason()
+    ));
+    McpConflictAction::KeepLocal
 }
 
 fn unique_renamed_key(name: &str, existing: &IndexMap<String, McpServer>) -> String {
@@ -2297,55 +2511,114 @@ fn print_mcp_merge_report(report: &McpMergeReport) {
     }
 }
 
-fn handle_missing_secrets(missing: &[String], prefix: CommandPrefix) -> Result<()> {
+fn handle_missing_secrets(missing: &[String], io: InstallIo<'_>) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let (added, deferred) = if *IS_STDOUT_TERMINAL {
+    let (added, deferred) = partition_missing_secrets(missing, io.prompter)?;
+    print_secret_summary(&added, &deferred, io.prefix);
+    Ok(())
+}
+
+/// Offers each missing secret to the vault where a question can be shown;
+/// otherwise every secret is deferred to the summary instead.
+fn partition_missing_secrets(
+    missing: &[String],
+    prompter: &dyn Prompter,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if conflict::menu_can_use_terminal() {
         println!(
             "\nThe merged mcp.json references {} secret(s) not yet in the vault.",
             missing.len()
         );
-        prompt_for_each_secret(missing)?
-    } else {
-        (Vec::new(), missing.to_vec())
-    };
-
-    print_secret_summary(&added, &deferred, prefix);
-    Ok(())
+        return prompt_for_each_secret(missing, prompter);
+    }
+    Ok((Vec::new(), missing.to_vec()))
 }
 
-fn prompt_for_each_secret(missing: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+fn prompt_for_each_secret(
+    missing: &[String],
+    prompter: &dyn Prompter,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut vault = Vault::init_bare()?;
     let mut password_file_ensured = false;
     let mut added = Vec::new();
     let mut deferred = Vec::new();
 
-    for name in missing {
-        let proceed = Confirm::new(&format!("Add {{{{ {name} }}}} to vault now?"))
-            .with_default(false)
-            .prompt()
-            .with_context(|| format!("failed to read confirmation for secret '{name}'"))?;
-        if !proceed {
-            deferred.push(name.clone());
-            continue;
-        }
-        if !password_file_ensured {
-            create_vault_password_file(&mut vault)
-                .context("Failed to initialize the vault password file")?;
-            password_file_ensured = true;
-        }
-
-        match vault.add_secret(name) {
-            Ok(()) => added.push(name.clone()),
-            Err(e) => {
-                eprintln!("Failed to add '{name}' to vault: {e:#}");
-                deferred.push(name.clone());
+    for (index, name) in missing.iter().enumerate() {
+        match offer_secret(&mut vault, name, prompter, &mut password_file_ensured)? {
+            SecretOffer::Added => added.push(name.clone()),
+            SecretOffer::Deferred => deferred.push(name.clone()),
+            SecretOffer::Unanswered => {
+                deferred.extend(missing[index..].iter().cloned());
+                break;
             }
         }
     }
 
     Ok((added, deferred))
+}
+
+/// What offering one missing secret to the vault came to.
+enum SecretOffer {
+    Added,
+    /// Declined, or the vault would not take it: this secret waits for
+    /// the summary and the next one is offered.
+    Deferred,
+    /// Cancelled, or nobody to answer, at any of its questions (the
+    /// offer, the password file wizard, the value): this and every later
+    /// secret are deferred, the way answering no to each would, and what
+    /// was added so far is still reported.
+    Unanswered,
+}
+
+fn offer_secret(
+    vault: &mut Vault,
+    name: &str,
+    prompter: &dyn Prompter,
+    password_file_ensured: &mut bool,
+) -> Result<SecretOffer> {
+    let proceed = match crate::prompt::confirm_or_cancel(
+        prompter,
+        format!("Add {{{{ {name} }}}} to the vault now?"),
+        false,
+    ) {
+        Ok(Some(proceed)) => proceed,
+        Ok(None) => return Ok(SecretOffer::Unanswered),
+        Err(err) if left_unanswered(&err) => return Ok(SecretOffer::Unanswered),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read confirmation for secret '{name}'"));
+        }
+    };
+    if !proceed {
+        return Ok(SecretOffer::Deferred);
+    }
+    if !*password_file_ensured {
+        match create_vault_password_file(vault, prompter, &mut print_note) {
+            Ok(()) => *password_file_ensured = true,
+            Err(err) if left_unanswered(&err) => return Ok(SecretOffer::Unanswered),
+            Err(err) => {
+                return Err(err.context("Failed to initialize the vault password file"));
+            }
+        }
+    }
+    match vault.add_secret(name, prompter) {
+        Ok(()) => Ok(SecretOffer::Added),
+        Err(err) if left_unanswered(&err) => Ok(SecretOffer::Unanswered),
+        Err(err) if PromptCancelled::interrupted(&err) => Err(err),
+        Err(err) => {
+            eprintln!("Failed to add '{name}' to vault: {err:#}");
+            Ok(SecretOffer::Deferred)
+        }
+    }
+}
+
+/// Whether `err` is a question that got no answer: cancelled, or asked
+/// on a run with no human to ask. An interrupt is not one of them; it
+/// stops the install.
+fn left_unanswered(err: &anyhow::Error) -> bool {
+    (PromptCancelled::caused(err) && !PromptCancelled::interrupted(err)) || NeedsHuman::caused(err)
 }
 
 fn print_secret_summary(added: &[String], deferred: &[String], prefix: CommandPrefix) {
@@ -2378,10 +2651,23 @@ mod tests {
     use super::*;
     use crate::config;
     use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
     use crate::sandbox::SANDBOX_ENV_FLAG;
+    use crate::testing::EnvVarGuard;
     use crate::utils::get_env_name;
     use serial_test::serial;
     use std::env;
+
+    fn dot_io(prompter: &dyn Prompter) -> InstallIo<'_> {
+        InstallIo {
+            prefix: CommandPrefix::Dot,
+            prompter,
+            remedy: CLI_CONFLICT_REMEDY,
+            force_flag: "--install-force",
+        }
+    }
 
     #[test]
     fn safe_relative_path_accepts_plain_portable_components() {
@@ -2433,6 +2719,7 @@ mod tests {
     /// The shared config dir guard plus a config file pinned to an empty
     /// `config.yaml` inside it, which the vault tests load.
     struct TestVaultConfigGuard {
+        path: PathBuf,
         _config_file_env: crate::testing::EnvVarGuard,
         _config: crate::testing::TestConfigDirGuard,
     }
@@ -2443,6 +2730,7 @@ mod tests {
             let config_path = config.path.join("config.yaml");
             fs::write(&config_path, "{}").unwrap();
             Self {
+                path: config.path.clone(),
                 _config_file_env: crate::testing::EnvVarGuard::set(
                     get_env_name("config_file"),
                     &config_path,
@@ -2949,7 +3237,16 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        let report = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
 
         assert_eq!(report.added, vec!["alpha", "beta"]);
         assert!(report.kept_local.is_empty());
@@ -2979,6 +3276,7 @@ mod tests {
             true,
             &HashSet::new(),
             false,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
 
@@ -2993,13 +3291,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn merge_non_tty_conflict_aborts_without_force() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping merge_non_tty_conflict_aborts_without_force: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let dir = fresh_temp_dir("merge-non-tty-");
         let remote = dir.join("remote.json");
         let target = dir.join("target.json");
@@ -3016,14 +3311,264 @@ mod tests {
             false,
             &HashSet::new(),
             false,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
 
         assert!(
-            err.to_string()
-                .contains("Refusing to merge non-interactively"),
+            err.to_string().contains(
+                "Refusing to merge the already-installed MCP server 'alpha' \
+                 non-interactively. Re-run in a terminal"
+            ),
             "got: {err}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Under the full-screen UI the conflict is a closed select through
+    /// the prompter, whatever stdout is; "keep local" leaves the local
+    /// server in place.
+    #[test]
+    #[serial]
+    fn merge_conflict_under_the_tui_asks_through_the_prompter() {
+        let _guard = TestVaultConfigGuard::new("merge-tui");
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = fresh_temp_dir("merge-tui-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(
+            &target,
+            r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL"}}}"#,
+        );
+        write_mcp(&remote, FIXTURE_REMOTE);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("keep local".into())]);
+
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&prompter),
+        )
+        .unwrap();
+
+        assert_eq!(report.kept_local, vec!["alpha"]);
+        assert_eq!(report.added, vec!["beta"]);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Conflict on MCP server 'alpha'");
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            [
+                "keep local",
+                "take remote",
+                "rename remote as \"alpha-remote\"",
+                "abort merge",
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .matches("LOCAL")
+                .count(),
+            1,
+            "the local server was rewritten"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Closing the MCP conflict menu keeps the local server, says so
+    /// once, and asks nothing more.
+    #[test]
+    #[serial]
+    fn cancelling_the_mcp_conflict_question_keeps_the_local_server() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut notes = Vec::new();
+
+        let action = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&prompter),
+            &mut false,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, McpConflictAction::KeepLocal);
+        assert_eq!(
+            notes,
+            ["Kept the local MCP server 'alpha': the question was cancelled."]
+        );
+        assert_eq!(prompter.requests().len(), 1);
+    }
+
+    /// Ctrl-C at the MCP conflict menu is not a cancel: the merge stops
+    /// with an error instead of keeping the local server and carrying on.
+    #[test]
+    #[serial]
+    fn interrupting_the_mcp_conflict_question_aborts_the_merge() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let mut unanswered = false;
+        let mut notes = Vec::new();
+
+        let err = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&prompter),
+            &mut unanswered,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert!(!unanswered);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// An unanswered MCP conflict question sticks for the rest of the
+    /// merge: the next conflicting server keeps its local copy without a
+    /// second question or a second note.
+    #[test]
+    #[serial]
+    fn an_unanswered_mcp_conflict_keeps_every_later_conflict_local_without_asking() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut unanswered = false;
+        let mut notes = Vec::new();
+
+        for name in ["alpha", "beta"] {
+            let action = resolve_mcp_conflict(
+                name,
+                false,
+                false,
+                dot_io(&prompter),
+                &mut unanswered,
+                &mut |note| notes.push(note.to_string()),
+            )
+            .unwrap();
+            assert_eq!(action, McpConflictAction::KeepLocal, "{name}");
+        }
+
+        assert_eq!(
+            notes,
+            ["Kept the local MCP server 'alpha': the question was cancelled."]
+        );
+        assert_eq!(prompter.requests().len(), 1);
+
+        let _guard = TestVaultConfigGuard::new("merge-sticky-cancel");
+        let dir = fresh_temp_dir("merge-sticky-cancel-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(
+            &target,
+            r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL-A"}, "beta": {"type": "stdio", "command": "LOCAL-B"}}}"#,
+        );
+        write_mcp(&remote, FIXTURE_REMOTE);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&prompter),
+        )
+        .unwrap();
+
+        assert_eq!(report.kept_local, vec!["alpha", "beta"]);
+        assert_eq!(prompter.requests().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// With a terminal but no human to answer, the MCP conflict menu's
+    /// refusal is the keep-local answer with its own note; a run with no
+    /// terminal at all is still refused before the question.
+    #[test]
+    #[serial]
+    fn a_headless_mcp_conflict_question_keeps_the_local_server() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let script = conflict::prompt_script::install(&[]);
+        let mut notes = Vec::new();
+
+        let action = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&HeadlessPrompter),
+            &mut false,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, McpConflictAction::KeepLocal);
+        assert_eq!(
+            notes,
+            ["Kept the local MCP server 'alpha': nobody could be asked."]
+        );
+
+        drop(script);
+        let _script = conflict::prompt_script::install_non_interactive();
+        let err = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&HeadlessPrompter),
+            &mut false,
+            &mut |_| unreachable!("a refusal before the question leaves no note"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to merge the already-installed MCP server 'alpha' non-interactively. \
+             Re-run in a terminal, with --install-force (installs), or with --yes (updates)."
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn merge_conflict_under_the_tui_rename_answer_keeps_both_servers() {
+        let _guard = TestVaultConfigGuard::new("merge-tui-rename");
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = fresh_temp_dir("merge-tui-rename-");
+        let remote = dir.join("remote.json");
+        let target = dir.join("target.json");
+        write_mcp(
+            &target,
+            r#"{"mcpServers": {"alpha": {"type": "stdio", "command": "LOCAL"}}}"#,
+        );
+        write_mcp(&remote, FIXTURE_REMOTE);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "rename remote as \"alpha-remote\"".into(),
+        )]);
+
+        let report = merge_mcp_json(
+            Some(&target),
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&prompter),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.renamed,
+            vec![("alpha".to_string(), "alpha-remote".to_string())]
+        );
+        let written = fs::read_to_string(&target).unwrap();
+        assert!(written.contains("LOCAL"), "got: {written}");
+        assert!(written.contains("alpha-remote"), "got: {written}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3034,8 +3579,16 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, r#"{"mcpServers": {"broken": {"type": "stdio"}}}"#);
 
-        let err =
-            merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap_err();
+        let err = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("missing a \"command\" field"),
@@ -3062,7 +3615,16 @@ mod tests {
             r#"{"mcpServers": {"x": {"type":"stdio","command":"echo","env":{"K":"{{COYOTE_TEST_MERGE_SECRET}}"}}}}"#,
         );
 
-        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        let report = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
 
         assert_eq!(report.missing_secrets, vec!["COYOTE_TEST_MERGE_SECRET"]);
         let _ = fs::remove_dir_all(&dir);
@@ -3077,7 +3639,16 @@ mod tests {
         let target = dir.join("target.json");
         write_mcp(&remote, FIXTURE_REMOTE);
 
-        merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
         let after_first = fs::read(&target).unwrap();
 
         let report = merge_mcp_json(
@@ -3087,6 +3658,7 @@ mod tests {
             false,
             &HashSet::new(),
             false,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap();
         assert!(report.added.is_empty(), "got: {:?}", report.added);
@@ -3098,23 +3670,464 @@ mod tests {
 
     #[test]
     fn handle_missing_secrets_noop_on_empty_input() {
-        assert!(handle_missing_secrets(&[], CommandPrefix::Dot).is_ok());
+        assert!(handle_missing_secrets(&[], dot_io(&ScriptedPrompter::refusing())).is_ok());
     }
 
     #[test]
+    #[serial]
     fn handle_missing_secrets_defers_all_in_non_tty() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping handle_missing_secrets_defers_all_in_non_tty: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let missing = vec![
             "COYOTE_TEST_STEP4_A".to_string(),
             "COYOTE_TEST_STEP4_B".to_string(),
         ];
 
-        assert!(handle_missing_secrets(&missing, CommandPrefix::Dot).is_ok());
+        assert!(handle_missing_secrets(&missing, dot_io(&ScriptedPrompter::refusing())).is_ok());
+    }
+
+    /// Under the full-screen UI each missing secret is offered as a
+    /// Confirm through the prompter, defaulting to no; declining every
+    /// one defers them all and leaves the vault untouched.
+    #[test]
+    #[serial]
+    fn handle_missing_secrets_under_the_tui_asks_per_secret_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let guard = TestVaultConfigGuard::new("secrets-tui");
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec!["TUI_SECRET_A".to_string(), "TUI_SECRET_B".to_string()];
+        let declined = || {
+            ScriptedPrompter::new(vec![
+                PromptAnswer::Confirmed(false),
+                PromptAnswer::Confirmed(false),
+            ])
+        };
+        let prompter = declined();
+
+        let (added, deferred) = partition_missing_secrets(&missing, &prompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        for (request, name) in requests.iter().zip(&missing) {
+            assert_eq!(request.action, PromptAction::Confirm);
+            assert_eq!(
+                request.question,
+                format!("Add {{{{ {name} }}}} to the vault now?")
+            );
+            assert_eq!(request.default, Some(serde_json::json!(false)));
+        }
+        assert!(
+            !password_file.exists(),
+            "declining every secret must not touch the vault"
+        );
+        assert!(handle_missing_secrets(&missing, dot_io(&declined())).is_ok());
+    }
+
+    /// With a terminal but no human to answer, every secret is deferred
+    /// and the vault is untouched, the same as declining each.
+    #[test]
+    #[serial]
+    fn a_headless_missing_secret_question_defers_every_secret() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-headless");
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "HEADLESS_SECRET_A".to_string(),
+            "HEADLESS_SECRET_B".to_string(),
+        ];
+
+        let (added, deferred) = partition_missing_secrets(&missing, &HeadlessPrompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        assert!(
+            !password_file.exists(),
+            "a run with no human must not touch the vault"
+        );
+    }
+
+    /// Accepting every secret creates the password file once, on the
+    /// first accepted secret, and stores each value: the first secret
+    /// costs the create-file confirm, its path and the vault password;
+    /// the second only its own confirm and value.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn accepting_every_missing_secret_creates_the_password_file_once_and_stores_each() {
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-accept");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "ACCEPT_SECRET_ONE".to_string(),
+            "ACCEPT_SECRET_TWO".to_string(),
+        ];
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Text(password_file.display().to_string()),
+            PromptAnswer::Text("vault-password-9q".to_string()),
+            PromptAnswer::Text("secret-one".to_string()),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Text("secret-two".to_string()),
+        ]);
+
+        let (added, deferred) = prompt_for_each_secret(&missing, &prompter).unwrap();
+
+        assert_eq!(added, missing);
+        assert!(deferred.is_empty(), "got: {deferred:?}");
+        let requests = prompter.requests();
+        let asked: Vec<(PromptAction, &str)> = requests
+            .iter()
+            .map(|req| (req.action, req.question.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    PromptAction::Confirm,
+                    "Add {{ ACCEPT_SECRET_ONE }} to the vault now?"
+                ),
+                (
+                    PromptAction::Confirm,
+                    "No password file configured. Do you want to create one now?"
+                ),
+                (
+                    PromptAction::Input,
+                    "Enter the path to the password file to create:"
+                ),
+                (
+                    PromptAction::Password,
+                    "Enter a password to encrypt all vault secrets:"
+                ),
+                (PromptAction::Password, "Enter the secret value:"),
+                (
+                    PromptAction::Confirm,
+                    "Add {{ ACCEPT_SECRET_TWO }} to the vault now?"
+                ),
+                (PromptAction::Password, "Enter the secret value:"),
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&password_file).unwrap(),
+            "vault-password-9q"
+        );
+        let vault = Vault::init_bare().unwrap();
+        assert_eq!(
+            vault.get_secret("ACCEPT_SECRET_ONE", false).unwrap(),
+            "secret-one"
+        );
+        assert_eq!(
+            vault.get_secret("ACCEPT_SECRET_TWO", false).unwrap(),
+            "secret-two"
+        );
+    }
+
+    /// Closing the vault question defers that secret and every later one
+    /// without asking again, and the vault is never touched.
+    #[test]
+    #[serial]
+    fn cancelling_the_vault_question_defers_this_and_every_later_secret() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-cancel");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "CANCEL_SECRET_ONE".to_string(),
+            "CANCEL_SECRET_TWO".to_string(),
+        ];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+
+        let (added, deferred) = prompt_for_each_secret(&missing, &prompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(
+            requests[0].question,
+            "Add {{ CANCEL_SECRET_ONE }} to the vault now?"
+        );
+        assert!(
+            !password_file.exists(),
+            "a cancelled question must not touch the vault"
+        );
+    }
+
+    /// Esc inside the vault wizard a first accepted secret opens (here on
+    /// the password file path) is the same answer as Esc on the offer:
+    /// that secret and every later one are deferred, nothing more is
+    /// asked, and no password file is written.
+    #[test]
+    #[serial]
+    fn cancelling_inside_the_vault_wizard_defers_this_and_every_later_secret() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-cancel-inside");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "INSIDE_SECRET_ONE".to_string(),
+            "INSIDE_SECRET_TWO".to_string(),
+        ];
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Cancelled,
+        ]);
+
+        let (added, deferred) = prompt_for_each_secret(&missing, &prompter).unwrap();
+
+        assert!(added.is_empty(), "got: {added:?}");
+        assert_eq!(deferred, missing);
+        let asked: Vec<String> = prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "Add {{ INSIDE_SECRET_ONE }} to the vault now?",
+                "No password file configured. Do you want to create one now?",
+                "Enter the path to the password file to create:",
+            ]
+        );
+        assert!(
+            !password_file.exists(),
+            "a cancelled wizard must not write the password file"
+        );
+    }
+
+    /// Ctrl-C is not a cancel, at the vault offer or inside the wizard it
+    /// opens: the install stops with an error instead of deferring the
+    /// secrets, and nothing more is asked.
+    #[test]
+    #[serial]
+    fn interrupting_the_vault_questions_aborts_the_install() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-interrupt");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "INTERRUPT_SECRET_ONE".to_string(),
+            "INTERRUPT_SECRET_TWO".to_string(),
+        ];
+
+        for answers in [
+            vec![PromptAnswer::Interrupted],
+            vec![
+                PromptAnswer::Confirmed(true),
+                PromptAnswer::Confirmed(true),
+                PromptAnswer::Interrupted,
+            ],
+        ] {
+            let asked = answers.len();
+            let prompter = ScriptedPrompter::new(answers);
+
+            let err = prompt_for_each_secret(&missing, &prompter).unwrap_err();
+
+            assert!(PromptCancelled::interrupted(&err), "{err:#}");
+            assert_eq!(prompter.requests().len(), asked);
+            assert!(!password_file.exists());
+        }
+
+        // With a password file in place the offer goes straight to the
+        // secret's value, and Ctrl-C there ends the install too.
+        fs::write(&password_file, "pw\n").unwrap();
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Interrupted,
+        ]);
+
+        let err = prompt_for_each_secret(&missing, &prompter).unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert_eq!(prompter.requests().len(), 2);
+    }
+
+    /// Under the full-screen UI a modified obsolete file is a closed
+    /// select through the prompter, and the sticky answers still stick.
+    #[test]
+    #[serial]
+    fn resolve_obsolete_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Selected("delete".into()),
+            PromptAnswer::Selected("keep-all".into()),
+        ]);
+
+        let action =
+            resolve_obsolete("macros/old.yaml", &mut sticky, &prompter, &mut |_| {}).unwrap();
+        assert_eq!(action, ObsoleteAction::Delete);
+        assert_eq!(sticky, None);
+
+        let action =
+            resolve_obsolete("macros/older.yaml", &mut sticky, &prompter, &mut |_| {}).unwrap();
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(
+            requests[0].question,
+            "Obsolete file macros/old.yaml is no longer shipped by the bundle and has local modifications"
+        );
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            ["keep", "delete", "keep-all", "delete-all"]
+        );
+    }
+
+    /// Under the full-screen UI with no human to answer, the obsolete
+    /// file is kept, and so is every later one; the note says nobody
+    /// could be asked.
+    #[test]
+    #[serial]
+    fn resolve_obsolete_with_no_human_keeps_the_file() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+        let mut notes = Vec::new();
+
+        let action = resolve_obsolete(
+            "macros/old.yaml",
+            &mut sticky,
+            &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(notes, ["Kept the obsolete files: nobody could be asked."]);
+    }
+
+    /// On a terminal with no human to answer (a headless run), the
+    /// obsolete file is kept like a cancelled question keeps it, and the
+    /// note says who was missing.
+    #[test]
+    #[serial]
+    fn a_headless_obsolete_file_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let mut notes = Vec::new();
+
+        let action = resolve_obsolete(
+            "macros/old.yaml",
+            &mut sticky,
+            &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(notes, ["Kept the obsolete files: nobody could be asked."]);
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_obsolete_with_a_forced_non_tty_keeps_without_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install_non_interactive();
+        let mut sticky = None;
+
+        let action = resolve_obsolete(
+            "macros/old.yaml",
+            &mut sticky,
+            &ScriptedPrompter::refusing(),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, None);
+    }
+
+    /// Closing the obsolete-file question keeps the file and keeps every
+    /// later one without asking again; the note says so once.
+    #[test]
+    #[serial]
+    fn cancelling_the_obsolete_file_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut notes = Vec::new();
+        let mut note = |note: &str| notes.push(note.to_string());
+
+        let first = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter, &mut note).unwrap();
+        let second =
+            resolve_obsolete("macros/older.yaml", &mut sticky, &prompter, &mut note).unwrap();
+
+        assert_eq!(first, ObsoleteAction::Keep);
+        assert_eq!(second, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the obsolete files: the question was cancelled."]
+        );
+        assert_eq!(prompter.requests().len(), 1);
+    }
+
+    /// Ctrl-C at the obsolete-file question stops the update with an
+    /// error; nothing is kept on its behalf and no note is written.
+    #[test]
+    #[serial]
+    fn interrupting_the_obsolete_file_question_aborts_the_update() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let mut notes = Vec::new();
+
+        let err = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter, &mut |note| {
+            notes.push(note.to_string())
+        })
+        .unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert_eq!(sticky, None);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     fn write_manifest(root: &Path, yaml: &str) {
@@ -3515,7 +4528,13 @@ mod tests {
         );
         let sha = init_bundle_repo(&repo);
 
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("my-bundle").unwrap();
@@ -3569,7 +4588,13 @@ mod tests {
         let _guard = TestVaultConfigGuard::new("prov-hooks-dirs");
         let (src_root, repo) = hooks_fixture_bundle("prov-hooks-dirs-src-");
 
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let top = paths::hooks_dir().join("notify-me.sh");
         let role = paths::roles_dir().join("hooks/role-hook.sh");
@@ -3610,7 +4635,13 @@ mod tests {
         let _guard = TestVaultConfigGuard::new("prov-hooks-filter");
         let (src_root, repo) = hooks_fixture_bundle("prov-hooks-filter-src-");
 
-        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Hooks), false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            Some(InstallFilter::Hooks),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(paths::hooks_dir().join("notify-me.sh").is_file());
         assert!(!paths::roles_dir().join("hooks/role-hook.sh").exists());
@@ -3634,7 +4665,13 @@ mod tests {
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         let sha = init_bundle_repo(&repo);
 
-        install_remote(&format!("{}#{sha}", repo.display()), None, false).unwrap();
+        install_remote(
+            &format!("{}#{sha}", repo.display()),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("plain-bundle").unwrap();
@@ -3647,12 +4684,8 @@ mod tests {
     #[test]
     #[serial]
     fn apply_plan_records_files_written_before_a_mid_run_abort() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping apply_plan_records_files_written_before_a_mid_run_abort: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-abort");
         let src_dir = fresh_temp_dir("prov-abort-src-");
         let src_new = src_dir.join("new.yaml");
@@ -3687,7 +4720,14 @@ mod tests {
             mcp_json: None,
         };
 
-        let err = apply_plan(&plan, StickyMode::None, &mut store, "aborty").unwrap_err();
+        let err = apply_plan(
+            &plan,
+            StickyMode::None,
+            &mut store,
+            "aborty",
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("Refusing to overwrite"),
@@ -3739,7 +4779,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::KeepAll, &mut store, "beta").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::KeepAll,
+            &mut store,
+            "beta",
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "alpha content");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -3772,8 +4819,20 @@ mod tests {
         );
         init_bundle_repo(&beta);
 
-        install_remote(alpha.to_str().unwrap(), None, false).unwrap();
-        install_remote(beta.to_str().unwrap(), None, true).unwrap();
+        install_remote(
+            alpha.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
+        install_remote(
+            beta.to_str().unwrap(),
+            None,
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let alpha_record = store.get("alpha").unwrap();
@@ -3800,9 +4859,21 @@ mod tests {
         write_src(&repo, "skills/myskill/SKILL.md", "# skill\n");
         let first_sha = init_bundle_repo(&repo);
 
-        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Macros), false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            Some(InstallFilter::Macros),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let second_sha = commit_file(&repo, "extra.txt", "two");
-        install_remote(repo.to_str().unwrap(), Some(InstallFilter::Skills), false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            Some(InstallFilter::Skills),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         assert_eq!(store.bundle_names(), vec!["combo"]);
@@ -3856,15 +4927,17 @@ mod tests {
     #[test]
     #[serial]
     fn builtin_asset_install_writes_no_provenance() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping builtin_asset_install_writes_no_provenance: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-builtin");
 
-        config::install_assets(config::AssetCategory::Macros).unwrap();
+        config::install_assets(
+            config::AssetCategory::Macros,
+            &ScriptedPrompter::refusing(),
+            true,
+            ".",
+        )
+        .unwrap();
 
         assert!(fs::read_dir(paths::macros_dir()).unwrap().next().is_some());
         assert!(!paths::installed_bundles_file().exists());
@@ -3873,12 +4946,8 @@ mod tests {
     #[test]
     #[serial]
     fn builtin_hooks_category_installs_example_scripts() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping builtin_hooks_category_installs_example_scripts: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("prov-hooks");
         let hooks_key = get_env_name("hooks_dir");
         let previous_hooks = env::var_os(&hooks_key);
@@ -3889,7 +4958,12 @@ mod tests {
 
         // Capture outcomes before restoring the env var so a failed assertion
         // cannot leave the hooks-dir override pointing at a deleted temp dir.
-        let result = config::install_assets(AssetCategory::Hooks);
+        let result = config::install_assets(
+            AssetCategory::Hooks,
+            &ScriptedPrompter::refusing(),
+            true,
+            ".",
+        );
         let installed = (
             hooks_dir.join("notify.sh").is_file(),
             hooks_dir.join("log-events.sh").is_file(),
@@ -3913,22 +4987,24 @@ mod tests {
     fn update_silently_refreshes_owned_unmodified_files() {
         use crate::config::bundles::hash_bytes;
 
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_silently_refreshes_owned_unmodified_files: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-refresh");
         let src_root = fresh_temp_dir("upd-refresh-src-");
         let repo = src_root.join("bundle");
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: refresh-bundle\n");
         write_src(&repo, "macros/hello.yaml", "v1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         commit_file(&repo, "macros/hello.yaml", "v2\n");
 
-        update_bundle("refresh-bundle", false).unwrap();
+        update_bundle("refresh-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let installed = paths::macros_dir().join("hello.yaml");
         assert_eq!(fs::read_to_string(&installed).unwrap(), "v2\n");
@@ -3943,13 +5019,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_with_yes_keeps_modified_files_and_updates_the_rest() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_with_yes_keeps_modified_files_and_updates_the_rest: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-yes");
         let src_root = fresh_temp_dir("upd-yes-src-");
         let repo = src_root.join("bundle");
@@ -3957,18 +5028,24 @@ mod tests {
         write_src(&repo, "macros/edited.yaml", "v1\n");
         write_src(&repo, "macros/pristine.yaml", "v1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         fs::write(paths::macros_dir().join("edited.yaml"), "local\n").unwrap();
         commit_file(&repo, "macros/edited.yaml", "v2\n");
         commit_file(&repo, "macros/pristine.yaml", "v2\n");
 
-        let err = update_bundle("yes-bundle", false).unwrap_err();
+        let err = update_bundle("yes-bundle", false, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(
             format!("{err:#}").contains("Refusing to overwrite"),
             "err: {err:#}"
         );
 
-        update_bundle("yes-bundle", true).unwrap();
+        update_bundle("yes-bundle", true, &ScriptedPrompter::refusing()).unwrap();
 
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("edited.yaml")).unwrap(),
@@ -3984,13 +5061,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_takes_remote_for_owned_unmodified_mcp_entries() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_takes_remote_for_owned_unmodified_mcp_entries: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-mcp-auto");
         let src_root = fresh_temp_dir("upd-mcp-auto-src-");
         let repo = src_root.join("bundle");
@@ -4001,14 +5073,20 @@ mod tests {
             r#"{"mcpServers": {"srv": {"type": "stdio", "command": "echo"}}}"#,
         );
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         commit_file(
             &repo,
             "functions/mcp.json",
             r#"{"mcpServers": {"srv": {"type": "stdio", "command": "printf"}}}"#,
         );
 
-        update_bundle("mcp-auto-bundle", false).unwrap();
+        update_bundle("mcp-auto-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let merged = fs::read_to_string(paths::mcp_config_file()).unwrap();
         assert!(merged.contains("printf"), "merged mcp.json: {merged}");
@@ -4051,7 +5129,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::KeepAll, &mut store, "omc").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::KeepAll,
+            &mut store,
+            "omc",
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "local edit");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4098,7 +5183,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::ReplaceAll, &mut store, "omc").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::ReplaceAll,
+            &mut store,
+            "omc",
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "upstream content");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4112,24 +5204,27 @@ mod tests {
     #[test]
     #[serial]
     fn update_bails_non_interactively_on_unowned_conflict() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_bails_non_interactively_on_unowned_conflict: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-unowned");
         let src_root = fresh_temp_dir("upd-unowned-src-");
         let repo = src_root.join("bundle");
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: unowned-bundle\n");
         write_src(&repo, "macros/a.yaml", "a\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         commit_file(&repo, "macros/user.yaml", "upstream\n");
         fs::create_dir_all(paths::macros_dir()).unwrap();
         fs::write(paths::macros_dir().join("user.yaml"), "local\n").unwrap();
 
-        let err = update_bundle("unowned-bundle", false).unwrap_err();
+        let err =
+            update_bundle("unowned-bundle", false, &ScriptedPrompter::refusing()).unwrap_err();
 
         assert!(
             err.to_string().contains("Refusing to overwrite"),
@@ -4178,7 +5273,14 @@ mod tests {
             mcp_json: None,
         };
 
-        apply_plan(&plan, StickyMode::ReplaceAll, &mut store, "beta").unwrap();
+        apply_plan(
+            &plan,
+            StickyMode::ReplaceAll,
+            &mut store,
+            "beta",
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "beta content");
         let reloaded = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4199,11 +5301,17 @@ mod tests {
         write_src(&repo, "macros/keep.yaml", "k\n");
         write_src(&repo, "macros/gone.yaml", "g\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
         commit_file(&repo, "macros/keep.yaml", "k2\n");
 
-        update_bundle("obs-del", false).unwrap();
+        update_bundle("obs-del", false, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(!paths::macros_dir().join("gone.yaml").exists());
         let store = BundleStore::load().unwrap();
@@ -4215,13 +5323,8 @@ mod tests {
     #[test]
     #[serial]
     fn update_keeps_modified_obsolete_files_non_interactively() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping update_keeps_modified_obsolete_files_non_interactively: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-obsolete-keep");
         let src_root = fresh_temp_dir("upd-obsolete-keep-src-");
         let repo = src_root.join("bundle");
@@ -4229,12 +5332,18 @@ mod tests {
         write_src(&repo, "macros/keep.yaml", "k\n");
         write_src(&repo, "macros/gone.yaml", "g\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         fs::write(paths::macros_dir().join("gone.yaml"), "g-local\n").unwrap();
         fs::remove_file(repo.join("macros/gone.yaml")).unwrap();
         commit_file(&repo, "macros/keep.yaml", "k2\n");
 
-        update_bundle("obs-keep", false).unwrap();
+        update_bundle("obs-keep", false, &ScriptedPrompter::refusing()).unwrap();
 
         assert_eq!(
             fs::read_to_string(paths::macros_dir().join("gone.yaml")).unwrap(),
@@ -4308,7 +5417,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(store.get("omc").unwrap().files.is_empty());
         let _ = fs::remove_dir_all(&dir);
@@ -4339,7 +5455,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(store.get("omc").unwrap().files.len(), 2);
         let _ = fs::remove_dir_all(&dir);
@@ -4372,7 +5495,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         assert!(store.get("omc").unwrap().files.is_empty());
@@ -4381,13 +5511,8 @@ mod tests {
     #[test]
     #[serial]
     fn handle_obsolete_keeps_modified_files_non_interactively() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping handle_obsolete_keeps_modified_files_non_interactively: \
-                 requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("upd-obsolete-mod");
         let dir = paths::config_dir();
         let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
@@ -4412,7 +5537,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "local edits");
         assert_eq!(store.get("omc").unwrap().files.len(), 1);
@@ -4451,7 +5583,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         assert_eq!(
@@ -4494,7 +5633,14 @@ mod tests {
             mcp_json: None,
         };
 
-        handle_obsolete_files(&mut store, "omc", &plan, false).unwrap();
+        handle_obsolete_files(
+            &mut store,
+            "omc",
+            &plan,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(!dst.exists());
         assert!(!dir.join("agents/foo/config.yaml.bak").exists());
@@ -4546,7 +5692,13 @@ mod tests {
         );
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let installed_at = BundleStore::load()
             .unwrap()
             .get("meta-bundle")
@@ -4562,7 +5714,7 @@ mod tests {
              homepage: https://example.com/new\n",
         );
 
-        update_bundle("meta-bundle", false).unwrap();
+        update_bundle("meta-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("meta-bundle").unwrap();
@@ -4580,7 +5732,7 @@ mod tests {
     fn update_unknown_bundle_lists_installed_names() {
         let _guard = TestVaultConfigGuard::new("upd-unknown-name");
 
-        let err = update_bundle("nope", false).unwrap_err();
+        let err = update_bundle("nope", false, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("upd-unknown-src-");
@@ -4588,9 +5740,15 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: known-bundle\n");
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
-        let err = update_bundle("nope", false).unwrap_err();
+        let err = update_bundle("nope", false, &ScriptedPrompter::refusing()).unwrap_err();
 
         assert!(
             err.to_string().contains("installed bundles: known-bundle"),
@@ -4608,11 +5766,17 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: pin-bundle\n");
         write_src(&repo, "macros/one.yaml", "1\n");
         let pinned = init_bundle_repo(&repo);
-        install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
+        install_remote(
+            &format!("{}#{pinned}", repo.display()),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let newer = commit_file(&repo, "macros/two.yaml", "2\n");
         assert_ne!(pinned, newer);
 
-        update_bundle("pin-bundle", false).unwrap();
+        update_bundle("pin-bundle", false, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("pin-bundle").unwrap();
@@ -4631,10 +5795,21 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: move-bundle\n");
         write_src(&repo, "macros/one.yaml", "1\n");
         let pinned = init_bundle_repo(&repo);
-        install_remote(&format!("{}#{pinned}", repo.display()), None, false).unwrap();
+        install_remote(
+            &format!("{}#{pinned}", repo.display()),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
         let newer = commit_file(&repo, "macros/two.yaml", "2\n");
 
-        update_bundle(&format!("move-bundle#{newer}"), false).unwrap();
+        update_bundle(
+            &format!("move-bundle#{newer}"),
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let store = BundleStore::load().unwrap();
         let record = store.get("move-bundle").unwrap();
@@ -4712,7 +5887,14 @@ mod tests {
     fn install_or_update_redirects_categories_to_install_builtins() {
         let _guard = TestVaultConfigGuard::new("iou-category");
 
-        let err = install_or_update("agents", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "agents",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -4725,8 +5907,14 @@ mod tests {
     fn install_or_update_unknown_name_lists_installed_bundles() {
         let _guard = TestVaultConfigGuard::new("iou-unknown");
 
-        let err =
-            install_or_update("not-a-bundle", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "not-a-bundle",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let src_root = fresh_temp_dir("iou-unknown-src-");
@@ -4734,10 +5922,22 @@ mod tests {
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: known-bundle\n");
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
-        let err =
-            install_or_update("not-a-bundle", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "not-a-bundle",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("no bundle named 'not-a-bundle'"),
@@ -4770,7 +5970,14 @@ mod tests {
             )
             .unwrap();
 
-        let err = install_or_update("agents", None, None, false, CommandPrefix::Dot).unwrap_err();
+        let err = install_or_update(
+            "agents",
+            None,
+            None,
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap_err();
 
         assert!(
             err.to_string().contains("--install-builtins agents"),
@@ -4784,33 +5991,49 @@ mod tests {
 
     #[test]
     #[serial]
-    fn install_or_update_rejects_remote_flags_for_updates() {
+    fn install_or_update_rejects_remote_flags_for_updates_naming_the_callers_force_flag() {
         let _guard = TestVaultConfigGuard::new("iou-flags");
         let src_root = fresh_temp_dir("iou-flags-src-");
         let repo = src_root.join("bundle");
         write_src(&repo, BUNDLE_MANIFEST_FILE, "name: flag-bundle\n");
         write_src(&repo, "macros/m.yaml", "a: 1\n");
         init_bundle_repo(&repo);
-        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+        install_remote(
+            repo.to_str().unwrap(),
+            None,
+            false,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         let err = install_or_update(
             "flag-bundle",
             None,
             Some(InstallFilter::Macros),
             false,
-            CommandPrefix::Dot,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("only apply to remote installs"),
-            "got: {err}"
+        assert_eq!(
+            err.to_string(),
+            "--filter/--install-force only apply to remote installs, not bundle updates"
         );
 
-        let err =
-            install_or_update("flag-bundle", None, None, true, CommandPrefix::Dot).unwrap_err();
-        assert!(
-            err.to_string().contains("only apply to remote installs"),
-            "got: {err}"
+        let err = install_or_update(
+            "flag-bundle",
+            None,
+            None,
+            true,
+            InstallIo {
+                remedy: REPL_CONFLICT_REMEDY,
+                force_flag: "--force",
+                ..dot_io(&ScriptedPrompter::refusing())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--filter/--force only apply to remote installs, not bundle updates"
         );
         let _ = fs::remove_dir_all(&src_root);
     }
@@ -4874,7 +6097,7 @@ mod tests {
             Some("git.x.com"),
             None,
             false,
-            CommandPrefix::Dot,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
         assert!(
@@ -4887,7 +6110,7 @@ mod tests {
             Some("git.x.com"),
             None,
             false,
-            CommandPrefix::Dot,
+            dot_io(&ScriptedPrompter::refusing()),
         )
         .unwrap_err();
         assert!(
@@ -4946,9 +6169,17 @@ mod tests {
 
     #[test]
     fn repl_install_usage_follows_command_prefix() {
-        let err = install_or_update_from_repl_args("", CommandPrefix::Slash)
-            .unwrap_err()
-            .to_string();
+        let err = install_or_update_from_repl_args(
+            "",
+            InstallIo {
+                prefix: CommandPrefix::Slash,
+                prompter: &ScriptedPrompter::refusing(),
+                remedy: REPL_CONFLICT_REMEDY,
+                force_flag: "--force",
+            },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("Usage: /install"), "got: {err}");
     }
 
@@ -4973,7 +6204,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        uninstall_bundle("someuser/omc", true).unwrap();
+        uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         assert!(store.get("omc").is_none());
@@ -4982,12 +6213,8 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_shorthand_with_multiple_matches_bails_non_interactively() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping uninstall_shorthand_with_multiple_matches_bails_non_interactively: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
         let _guard = TestVaultConfigGuard::new("uninst-short-multi");
         let mut store = BundleStore::load().unwrap();
         store
@@ -5001,14 +6228,19 @@ mod tests {
             .unwrap();
         drop(store);
 
-        let err = uninstall_bundle("someuser/omc", true).unwrap_err();
+        let err =
+            uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap_err();
 
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("matches multiple installed bundles"),
-            "got: {err}"
+            message.starts_with("Refusing to pick between the bundles matching 'someuser/omc' ("),
+            "got: {message}"
         );
-        assert!(err.to_string().contains("omc-fork"), "got: {err}");
+        assert!(message.contains("omc-fork"), "got: {message}");
+        assert!(
+            message.ends_with("Re-run in a terminal or pass the exact bundle name or source URL."),
+            "got: {message}"
+        );
         let store = BundleStore::load().unwrap();
         assert!(store.get("omc").is_some());
         assert!(store.get("omc-fork").is_some());
@@ -5030,7 +6262,7 @@ mod tests {
             .unwrap();
         drop(store);
 
-        uninstall_bundle("someuser/omc", true).unwrap();
+        uninstall_bundle("someuser/omc", true, &ScriptedPrompter::refusing()).unwrap();
 
         let store = BundleStore::load().unwrap();
         assert!(store.get("someuser/omc").is_none());
@@ -5043,6 +6275,17 @@ mod tests {
             category: "macros".to_string(),
             sha256: hash_bytes(contents.as_bytes()),
             action: FileAction::New,
+        }
+    }
+
+    /// The uninstall question under `--yes`: never asked, so no prompter
+    /// is reached and `note` stays silent.
+    fn yes_to_all(note: &mut dyn FnMut(&str)) -> UninstallQuestion<'_> {
+        UninstallQuestion {
+            assume_yes: true,
+            sticky: None,
+            prompter: &HeadlessPrompter,
+            note,
         }
     }
 
@@ -5070,7 +6313,7 @@ mod tests {
             .record_file("gone", owned_file_record("macros/hello.yaml", "hi\n"))
             .unwrap();
 
-        uninstall_bundle("gone", true).unwrap();
+        uninstall_bundle("gone", true, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(!dst.exists());
         assert!(
@@ -5098,7 +6341,7 @@ mod tests {
             )
             .unwrap();
 
-        uninstall_bundle("mods", true).unwrap();
+        uninstall_bundle("mods", true, &ScriptedPrompter::refusing()).unwrap();
 
         assert_eq!(fs::read_to_string(&dst).unwrap(), "user edit\n");
         let store = BundleStore::load().unwrap();
@@ -5151,7 +6394,14 @@ mod tests {
             .unwrap();
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &dir,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(
             summary,
@@ -5178,7 +6428,14 @@ mod tests {
             .unwrap();
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &dir,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.deleted, 1);
         assert!(!dir.join("macros/owned.yaml").exists());
@@ -5228,7 +6485,14 @@ mod tests {
         }
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &dir,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
         drop(restore);
 
         assert_eq!(summary.failed, 1);
@@ -5269,7 +6533,14 @@ mod tests {
             .unwrap();
         let files = store.get("omc").unwrap().files.clone();
 
-        let summary = uninstall_owned_files(&mut store, "omc", &files, &config_dir, true).unwrap();
+        let summary = uninstall_owned_files(
+            &mut store,
+            "omc",
+            &files,
+            &config_dir,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.failed, 2);
         assert_eq!(summary.deleted, 0);
@@ -5299,7 +6570,14 @@ mod tests {
         );
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.kept, vec!["srv"]);
         assert!(summary.removed.is_empty());
@@ -5340,7 +6618,14 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.removed, vec!["srv"]);
         assert!(summary.kept.is_empty());
@@ -5382,7 +6667,14 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.removed, vec!["srv"]);
         let raw = fs::read_to_string(&mcp).unwrap();
@@ -5428,7 +6720,14 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.removed, vec!["srv"]);
         assert_eq!(summary.secrets, vec!["OMC_ORG", "OMC_TOKEN"]);
@@ -5459,7 +6758,14 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.kept, vec!["srv"]);
         assert!(summary.removed.is_empty());
@@ -5490,7 +6796,14 @@ mod tests {
             .unwrap();
         let servers = store.get("omc").unwrap().mcp_servers.clone();
 
-        let summary = uninstall_mcp_entries(&mut store, "omc", &servers, &mcp, true).unwrap();
+        let summary = uninstall_mcp_entries(
+            &mut store,
+            "omc",
+            &servers,
+            &mcp,
+            &mut yes_to_all(&mut |_| {}),
+        )
+        .unwrap();
 
         assert_eq!(summary.kept, vec!["srv"]);
         let written: McpServersConfig =
@@ -5505,20 +6818,25 @@ mod tests {
     fn uninstall_unknown_name_lists_installed_and_url_spelling_resolves() {
         let _guard = TestVaultConfigGuard::new("uninst-unknown");
 
-        let err = uninstall_bundle("nope", true).unwrap_err();
+        let err = uninstall_bundle("nope", true, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(err.to_string().contains("none are installed"), "got: {err}");
 
         let mut store = BundleStore::load().unwrap();
         store
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
-        let err = uninstall_bundle("nope", true).unwrap_err();
+        let err = uninstall_bundle("nope", true, &ScriptedPrompter::refusing()).unwrap_err();
         assert!(
             err.to_string().contains("installed bundles: omc"),
             "got: {err}"
         );
 
-        uninstall_bundle("git@github.com:x/omc.git", true).unwrap();
+        uninstall_bundle(
+            "git@github.com:x/omc.git",
+            true,
+            &ScriptedPrompter::refusing(),
+        )
+        .unwrap();
 
         assert!(BundleStore::load().unwrap().get("omc").is_none());
     }
@@ -5526,22 +6844,448 @@ mod tests {
     #[test]
     #[serial]
     fn uninstall_refuses_non_interactive_without_yes() {
-        if *IS_STDOUT_TERMINAL {
-            eprintln!(
-                "Skipping uninstall_refuses_non_interactive_without_yes: requires non-TTY stdout"
-            );
-            return;
-        }
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install_non_interactive();
         let _guard = TestVaultConfigGuard::new("uninst-non-tty");
         let mut store = BundleStore::load().unwrap();
         store
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
 
-        let err = uninstall_bundle("omc", false).unwrap_err();
+        let err = uninstall_bundle("omc", false, &ScriptedPrompter::refusing()).unwrap_err();
 
-        assert!(err.to_string().contains("--yes"), "got: {err}");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Refusing to uninstall bundle 'omc'"),
+            "got: {message}"
+        );
+        let (_, remedy) = message
+            .split_once("Re-run in a terminal")
+            .unwrap_or_else(|| panic!("got: {message}"));
+        assert_eq!(remedy, " or pass --yes.", "got: {message}");
         assert!(BundleStore::load().unwrap().get("omc").is_some());
+    }
+
+    /// Under the full-screen UI the uninstall confirmation is a Confirm
+    /// through the prompter, defaulting to no.
+    #[test]
+    #[serial]
+    fn uninstall_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _guard = TestVaultConfigGuard::new("uninst-tui");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        drop(store);
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        uninstall_bundle("omc", false, &prompter).unwrap();
+        assert!(BundleStore::load().unwrap().get("omc").is_some());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Uninstall bundle 'omc'?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+        assert_eq!(
+            requests[0].help.as_deref(),
+            Some("Bundle 'omc' owns 0 file(s) and 0 mcp.json server(s).")
+        );
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+        uninstall_bundle("omc", false, &prompter).unwrap();
+        assert!(BundleStore::load().unwrap().get("omc").is_none());
+    }
+
+    /// Under the full-screen UI an ambiguous shorthand is a closed select
+    /// over the described candidates, through the prompter.
+    #[test]
+    #[serial]
+    fn uninstall_candidate_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let _guard = TestVaultConfigGuard::new("uninst-candidate-tui");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        store
+            .upsert_bundle(
+                "omc-fork",
+                test_metadata("https://git.somedomain.com/someuser/omc"),
+            )
+            .unwrap();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "omc-fork (https://git.somedomain.com/someuser/omc)".into(),
+        )]);
+
+        let picked = select_uninstall_candidate(&store, "someuser/omc", &prompter).unwrap();
+
+        assert_eq!(picked.as_deref(), Some("omc-fork"));
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(
+            requests[0].question,
+            "Multiple bundles match 'someuser/omc'; which one should be uninstalled?"
+        );
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            [
+                "omc (https://github.com/someuser/omc)",
+                "omc-fork (https://git.somedomain.com/someuser/omc)",
+            ]
+        );
+
+        let err =
+            select_uninstall_candidate(&store, "someuser/omc", &HeadlessPrompter).unwrap_err();
+        assert!(NeedsHuman::caused(&err), "{err:#}");
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("other".into())]);
+        let err = select_uninstall_candidate(&store, "someuser/omc", &prompter).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("'other' is not one of the offered options"),
+            "got: {err:#}"
+        );
+    }
+
+    /// Under the full-screen UI a locally modified file is a closed select
+    /// through the prompter; --yes still keeps it without asking.
+    #[test]
+    #[serial]
+    fn resolve_uninstall_action_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Selected("delete".into()),
+            PromptAnswer::Selected("delete-all".into()),
+        ]);
+
+        let action = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(action, ObsoleteAction::Delete);
+        assert_eq!(sticky, None);
+
+        let action = resolve_uninstall_action(
+            "File macros/b.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(action, ObsoleteAction::Delete);
+        assert_eq!(sticky, Some(ObsoleteAction::Delete));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(
+            requests[0].question,
+            "File macros/a.yaml was modified locally after install"
+        );
+        assert!(requests[0].closed);
+        assert_eq!(
+            requests[0].options,
+            ["keep", "delete", "keep-all", "delete-all"]
+        );
+
+        let action = resolve_uninstall_action(
+            "File macros/c.yaml was modified locally after install",
+            true,
+            &mut None,
+            &ScriptedPrompter::refusing(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(action, ObsoleteAction::Keep);
+    }
+
+    /// Under the full-screen UI with no human to answer, the modified
+    /// item is kept, and so is every later one; the note says nobody
+    /// could be asked.
+    #[test]
+    #[serial]
+    fn resolve_uninstall_action_with_no_human_keeps_the_file() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let mut sticky = None;
+        let mut notes = Vec::new();
+
+        let action = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: nobody could be asked."]
+        );
+    }
+
+    /// On a terminal with no human to answer (a headless run), the
+    /// modified item is kept like a cancelled question keeps it, and the
+    /// note says who was missing.
+    #[test]
+    #[serial]
+    fn a_headless_uninstall_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let mut notes = Vec::new();
+
+        let action = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &HeadlessPrompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(action, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: nobody could be asked."]
+        );
+    }
+
+    /// A headless uninstall of a bundle with a modified file and a
+    /// modified mcp.json server keeps both and says so once: the first
+    /// unanswerable question settles the whole run.
+    #[test]
+    #[serial]
+    fn a_headless_uninstall_prints_the_kept_note_once() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let dir = fresh_temp_dir("uninst-headless-once-");
+        let mut store = BundleStore::load_from(dir.join("installed-bundles.yaml")).unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        write_src(&dir, "macros/edited.yaml", "user edit");
+        store
+            .record_file("omc", owned_file_record("macros/edited.yaml", "original"))
+            .unwrap();
+        let mcp = dir.join("mcp.json");
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "edited"}}}"#,
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record(
+                    "srv",
+                    McpAction::Added,
+                    Some(hash_bytes(b"original")),
+                )],
+            )
+            .unwrap();
+        let record = store.get("omc").unwrap().clone();
+        let mut notes = Vec::new();
+        let mut question = UninstallQuestion {
+            assume_yes: false,
+            sticky: None,
+            prompter: &HeadlessPrompter,
+            note: &mut |note| notes.push(note.to_string()),
+        };
+
+        let files =
+            uninstall_owned_files(&mut store, "omc", &record.files, &dir, &mut question).unwrap();
+        let servers =
+            uninstall_mcp_entries(&mut store, "omc", &record.mcp_servers, &mcp, &mut question)
+                .unwrap();
+
+        assert_eq!(files.kept, 1);
+        assert_eq!(servers.kept, vec!["srv"]);
+        assert_eq!(question.sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: nobody could be asked."]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A delete-all answer about the owned files does not carry into the
+    /// mcp.json loop: the modified server is asked about on its own and
+    /// a keep there keeps it.
+    #[test]
+    #[serial]
+    fn delete_all_on_the_files_loop_does_not_carry_into_the_mcp_loop() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("uninst-delete-all-files-only");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
+            .unwrap();
+        let edited = guard.path.join("macros/edited.yaml");
+        write_src(&guard.path, "macros/edited.yaml", "user edit");
+        store
+            .record_file("omc", owned_file_record("macros/edited.yaml", "original"))
+            .unwrap();
+        let mcp = paths::mcp_config_file();
+        write_mcp(
+            &mcp,
+            r#"{"mcpServers": {"srv": {"type": "stdio", "command": "edited"}}}"#,
+        );
+        store
+            .record_mcp_servers(
+                "omc",
+                vec![mcp_server_record(
+                    "srv",
+                    McpAction::Added,
+                    Some(hash_bytes(b"original")),
+                )],
+            )
+            .unwrap();
+        drop(store);
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Selected("delete-all".into()),
+            PromptAnswer::Selected("keep".into()),
+        ]);
+
+        uninstall_bundle("omc", false, &prompter).unwrap();
+
+        assert!(!edited.exists(), "delete-all must delete the owned file");
+        let servers: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(
+            servers["mcpServers"]["srv"].is_object(),
+            "keep must leave the server in mcp.json: {servers}"
+        );
+        let store = BundleStore::load().unwrap();
+        let record = store.get("omc").unwrap();
+        assert!(record.files.is_empty());
+        assert_eq!(record.mcp_servers.len(), 1);
+        let requests = prompter.requests();
+        let asked: Vec<(PromptAction, &str)> = requests
+            .iter()
+            .map(|req| (req.action, req.question.as_str()))
+            .collect();
+        assert_eq!(
+            asked,
+            vec![
+                (PromptAction::Confirm, "Uninstall bundle 'omc'?"),
+                (
+                    PromptAction::Select,
+                    "File macros/edited.yaml was modified locally after install"
+                ),
+                (
+                    PromptAction::Select,
+                    "MCP server 'srv' was modified locally after install"
+                ),
+            ]
+        );
+    }
+
+    /// Closing the uninstall question keeps the modified file and keeps
+    /// every later one without asking again; the note says so once.
+    #[test]
+    #[serial]
+    fn cancelling_the_uninstall_question_keeps_the_file() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let mut notes = Vec::new();
+        let mut note = |note: &str| notes.push(note.to_string());
+
+        let first = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+            &mut note,
+        )
+        .unwrap();
+        let second = resolve_uninstall_action(
+            "File macros/b.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+            &mut note,
+        )
+        .unwrap();
+
+        assert_eq!(first, ObsoleteAction::Keep);
+        assert_eq!(second, ObsoleteAction::Keep);
+        assert_eq!(sticky, Some(ObsoleteAction::Keep));
+        assert_eq!(prompter.requests().len(), 1);
+        assert_eq!(
+            notes,
+            ["Kept the locally modified items: the question was cancelled."]
+        );
+    }
+
+    /// Ctrl-C at the uninstall question stops the uninstall with an error
+    /// instead of keeping the file and moving on.
+    #[test]
+    #[serial]
+    fn interrupting_the_uninstall_question_aborts_the_uninstall() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let mut notes = Vec::new();
+
+        let err = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert_eq!(sticky, None);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn select_uninstall_candidate_with_a_forced_non_tty_bails_without_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install_non_interactive();
+        let _guard = TestVaultConfigGuard::new("uninst-candidate-non-tty");
+        let mut store = BundleStore::load().unwrap();
+        store
+            .upsert_bundle("omc", test_metadata("https://github.com/someuser/omc"))
+            .unwrap();
+        store
+            .upsert_bundle(
+                "omc-fork",
+                test_metadata("https://git.somedomain.com/someuser/omc"),
+            )
+            .unwrap();
+
+        let err = select_uninstall_candidate(&store, "someuser/omc", &ScriptedPrompter::refusing())
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with("Refusing to pick between the bundles matching 'someuser/omc' ("),
+            "got: {message}"
+        );
+        assert!(
+            message.ends_with("non-interactively. Re-run in a terminal or pass the exact bundle name or source URL."),
+            "got: {message}"
+        );
     }
 
     #[test]
@@ -5557,7 +7301,16 @@ mod tests {
             .upsert_bundle("omc", test_metadata("https://github.com/x/omc"))
             .unwrap();
 
-        let report = merge_mcp_json(None, &remote, &target, false, &HashSet::new(), false).unwrap();
+        let report = merge_mcp_json(
+            None,
+            &remote,
+            &target,
+            false,
+            &HashSet::new(),
+            false,
+            dot_io(&ScriptedPrompter::refusing()),
+        )
+        .unwrap();
         record_mcp_merge(&mut store, "omc", &report).unwrap();
 
         let written: McpServersConfig =

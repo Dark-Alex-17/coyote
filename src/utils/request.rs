@@ -73,7 +73,7 @@ pub async fn fetch_with_loaders(
     allow_media: bool,
 ) -> Result<(String, String)> {
     if let Some(loader_command) = loaders.get(URL_LOADER) {
-        let contents = run_loader_command(path, URL_LOADER, loader_command)?;
+        let contents = run_loader_command(path, URL_LOADER, loader_command).await?;
         return Ok((contents, DEFAULT_EXTENSION.into()));
     }
     let client = match *CLIENT {
@@ -149,11 +149,15 @@ pub async fn fetch_with_loaders(
                     size += chunk.len();
                     save_file.write_all(&chunk).await?;
                 }
+                // Flushed and closed before the loader opens the file: a
+                // buffered tail would otherwise be missing from what it reads.
+                save_file.flush().await?;
+                drop(save_file);
                 let contents = if size == 0 {
                     println!("{}", warning_text(&format!("No content at '{path}'")));
                     String::new()
                 } else {
-                    run_loader_command(&save_path, &extension, loader_command)?
+                    run_loader_command(&save_path, &extension, loader_command).await?
                 };
                 (contents, DEFAULT_EXTENSION.into())
             }
@@ -679,5 +683,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len() as u64, TEST_CAP);
+    }
+
+    /// A one-shot HTTP server on localhost that sends `body` in many small
+    /// writes, so the download is written to its temp file in many chunks.
+    #[cfg(unix)]
+    fn serve_once_in_pieces(content_type: &'static str, body: Vec<u8>) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/doc.xyz", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            for piece in body.chunks(4096) {
+                stream.write_all(piece).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        url
+    }
+
+    /// The loader opens the downloaded file after the last chunk has been
+    /// flushed and the file closed: a loader that measures the file sees
+    /// every byte of a download that arrived in many pieces.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_loader_sees_the_whole_download() {
+        let body: Vec<u8> = (0..300 * 1024).map(|i| b'a' + (i % 26) as u8).collect();
+        let url = serve_once_in_pieces("application/x-measured", body.clone());
+        let loaders = HashMap::from([(
+            "x-measured".to_string(),
+            "sh -c 'wc -c < \"$1\"' loader".to_string(),
+        )]);
+        let (contents, extension) = fetch_with_loaders(&loaders, &url, false).await.unwrap();
+        assert_eq!(extension, DEFAULT_EXTENSION);
+        assert_eq!(contents.trim(), body.len().to_string());
     }
 }

@@ -14,7 +14,11 @@ mod splitter;
 use self::graph::{KnowledgeGraph, extract_entities};
 use self::provider::RagProvider;
 use self::providers::{DuckDbProvider, QdrantProvider, YamlProvider};
+use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::hooks::RagSyncHooks;
+use crate::prompt::{
+    Prompter, confirm, confirm_with_help, input, reask, required_input, select_closed,
+};
 use crate::sandbox::mcp_credentials;
 use crate::vault::{Vault, interpolate_secrets};
 
@@ -23,7 +27,6 @@ use bm25::{Language, SearchEngine, SearchEngineBuilder};
 use gman::SecretError;
 use hnsw_rs::prelude::*;
 use indexmap::{IndexMap, IndexSet};
-use inquire::{Confirm, Select, Text, required, validator::Validation};
 use parking_lot::RwLock;
 use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
@@ -134,9 +137,23 @@ pub struct GraphRagConfig {
     pub graph_hops: Option<usize>,
 }
 
+/// What the run lends a knowledge base build or refresh beyond its
+/// config: the signal that aborts it, the hooks it fires and the prompter
+/// for any setting left open.
+pub struct RagInitRun<'a> {
+    pub abort_signal: AbortSignal,
+    pub sync_hooks: RagSyncHooks,
+    pub prompter: &'a dyn Prompter,
+}
+
 impl Rag {
     fn create_embeddings_client(&self, model: Model) -> Result<Box<dyn Client>> {
         init_client(&self.app_config, model)
+    }
+
+    /// The refusal for a knowledge base nothing can ask about.
+    pub(crate) fn refuse_init(name: &str) -> anyhow::Error {
+        refuse_non_interactive(format_args!("initialize RAG knowledge base '{name}'"), ".")
     }
 
     pub async fn init_with_config(
@@ -145,21 +162,25 @@ impl Rag {
         save_path: &Path,
         doc_paths: &[String],
         config: &RagInitConfig,
-        abort_signal: AbortSignal,
-        sync_hooks: RagSyncHooks,
+        run: RagInitRun<'_>,
     ) -> Result<Self> {
+        let RagInitRun {
+            abort_signal,
+            sync_hooks,
+            prompter,
+        } = run;
         if doc_paths.is_empty() {
             bail!("Cannot build RAG knowledge base '{name}' with no documents");
         }
         println!("⚙ Initializing RAG...");
-        let mut data = Self::resolve_init_data(app, config)?;
+        let mut data = Self::resolve_init_data(app, name, config, prompter)?;
         data.driver = config.driver.clone().unwrap_or_else(|| "yaml".to_string());
         let mut rag = Self::create(app, name, save_path, data).await?;
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         sync_hooks.fire_started(&rag.name, &rag.path);
         let synced = abortable_run_with_spinner_rx(
-            rag.sync_documents(doc_paths, true, false, loaders, Some(spinner)),
+            rag.sync_documents(doc_paths, true, false, loaders, Some(spinner), prompter),
             spinner_rx,
             abort_signal,
             UserInterrupt::Owned,
@@ -182,7 +203,12 @@ impl Rag {
         Ok(rag)
     }
 
-    fn resolve_init_data(app: &AppConfig, config: &RagInitConfig) -> Result<RagData> {
+    fn resolve_init_data(
+        app: &AppConfig,
+        name: &str,
+        config: &RagInitConfig,
+        prompter: &dyn Prompter,
+    ) -> Result<RagData> {
         let embedding_model_id = config
             .embedding_model
             .clone()
@@ -193,17 +219,17 @@ impl Rag {
                 value
             }
             None => {
-                if !*IS_STDOUT_TERMINAL {
-                    bail!(
-                        "RAG knowledge base needs an embedding model. Set `embedding_model` \
-                         on the rag node, or run the agent interactively once."
-                    );
+                if !menu_can_use_terminal() {
+                    return Err(refuse_non_interactive(
+                        format_args!("choose an embedding model for RAG knowledge base '{name}'"),
+                        ". Set `embedding_model` on the rag node, or run the agent interactively once.",
+                    ));
                 }
                 let models = list_models(app, ModelType::Embedding);
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }
-                select_embedding_model(&models)?
+                select_embedding_model(&models, prompter)?
             }
         };
         let embedding_model =
@@ -215,13 +241,13 @@ impl Rag {
                 value
             }
             None => {
-                if !*IS_STDOUT_TERMINAL {
-                    bail!(
-                        "RAG knowledge base needs a chunk_size. Set `chunk_size` on the \
-                         rag node, or run the agent interactively once."
-                    );
+                if !menu_can_use_terminal() {
+                    return Err(refuse_non_interactive(
+                        format_args!("choose a chunk_size for RAG knowledge base '{name}'"),
+                        ". Set `chunk_size` on the rag node, or run the agent interactively once.",
+                    ));
                 }
-                set_chunk_size(&embedding_model)?
+                set_chunk_size(&embedding_model, prompter)?
             }
         };
         let chunk_overlap = match config.chunk_overlap.or(app.rag_chunk_overlap) {
@@ -230,13 +256,13 @@ impl Rag {
                 value
             }
             None => {
-                if !*IS_STDOUT_TERMINAL {
-                    bail!(
-                        "RAG knowledge base needs a chunk_overlap. Set `chunk_overlap` on \
-                         the rag node, or run the agent interactively once."
-                    );
+                if !menu_can_use_terminal() {
+                    return Err(refuse_non_interactive(
+                        format_args!("choose a chunk_overlap for RAG knowledge base '{name}'"),
+                        ". Set `chunk_overlap` on the rag node, or run the agent interactively once.",
+                    ));
                 }
-                set_chunk_overlay(chunk_size / 20)?
+                set_chunk_overlay(chunk_size / 20, prompter)?
             }
         };
 
@@ -275,17 +301,21 @@ impl Rag {
         name: &str,
         save_path: &Path,
         doc_paths: &[String],
-        abort_signal: AbortSignal,
         prompt_for_driver: bool,
-        sync_hooks: RagSyncHooks,
+        run: RagInitRun<'_>,
     ) -> Result<Self> {
-        if !*IS_STDOUT_TERMINAL {
-            bail!("Failed to init rag in non-interactive mode");
+        let RagInitRun {
+            abort_signal,
+            sync_hooks,
+            prompter,
+        } = run;
+        if !menu_can_use_terminal() {
+            return Err(Self::refuse_init(name));
         }
         println!("⚙ Initializing RAG...");
-        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app)?;
+        let (embedding_model, chunk_size, chunk_overlap) = Self::create_config(app, prompter)?;
         let driver = if prompt_for_driver {
-            select_rag_driver()?
+            select_rag_driver(prompter)?
         } else {
             "yaml".to_string()
         };
@@ -293,10 +323,10 @@ impl Rag {
         let top_k = app.rag_top_k;
         let extractor_model = match app.rag_extractor_model.clone() {
             Some(model) => Some(model),
-            None => select_extractor_model(app)?,
+            None => select_extractor_model(&list_models(app, ModelType::Chat), prompter)?,
         };
         let graph_hops = if extractor_model.is_some() {
-            set_graph_hops(app.rag_graph_hops)?
+            set_graph_hops(app.rag_graph_hops, prompter)?
         } else {
             app.rag_graph_hops
         };
@@ -318,13 +348,13 @@ impl Rag {
         let mut rag = Self::create(app, name, save_path, data).await?;
         let mut paths = doc_paths.to_vec();
         if paths.is_empty() {
-            paths = add_documents()?;
+            paths = add_documents(prompter)?;
         };
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         sync_hooks.fire_started(&rag.name, &rag.path);
         let synced = abortable_run_with_spinner_rx(
-            rag.sync_documents(&paths, true, false, loaders, Some(spinner)),
+            rag.sync_documents(&paths, true, false, loaders, Some(spinner), prompter),
             spinner_rx,
             abort_signal,
             UserInterrupt::Owned,
@@ -411,44 +441,28 @@ impl Rag {
         vault: &Vault,
         name: &str,
         save_path: &Path,
+        prompter: &dyn Prompter,
     ) -> Result<Self> {
-        if !*IS_STDOUT_TERMINAL {
-            bail!("Cannot run attach wizard in non-interactive mode");
+        if !menu_can_use_terminal() {
+            return Err(refuse_non_interactive(
+                format_args!("run the attach wizard for RAG '{name}'"),
+                ".",
+            ));
         }
         // Checked before any prompt or secret is created, so a name that
         // collides with another RAG's kit is refused at once.
         check_rag_kit_slot(save_path, name)?;
         println!("⚙ Attaching to external RAG...");
 
-        let driver = Select::new("Select driver:", vec!["qdrant"]).prompt()?;
+        let driver = select_closed(prompter, "Select driver:", vec!["qdrant".to_string()])?;
+        let host = ask_qdrant_host(prompter)?;
 
-        let host = Text::new("Host (e.g. qdrant.company.com:6333):")
-            .with_validator(required!("This field is required"))
-            .with_validator(|input: &str| {
-                Ok(if input.contains('[') || input.contains(']') {
-                    Validation::Invalid(
-                        "Bracketed IPv6 literals are not supported; use a hostname.".into(),
-                    )
-                } else {
-                    Validation::Valid
-                })
-            })
-            .prompt()?;
-
-        let api_key_entry: Option<(String, String)> = {
-            let needs_key = Confirm::new("Does this instance require an API key?")
-                .with_default(true)
-                .prompt()?;
-            if needs_key {
-                let secret_name = Text::new("Vault secret name for API key:")
-                    .with_default("QDRANT_API_KEY")
-                    .with_validator(required!("This field is required"))
-                    .prompt()?;
-                let resolved = resolve_or_create_api_key_secret(vault, &secret_name)?;
+        let api_key_entry: Option<(String, String)> = match ask_api_key_secret_name(prompter)? {
+            Some(secret_name) => {
+                let resolved = resolve_or_create_api_key_secret(vault, &secret_name, prompter)?;
                 Some((secret_name, resolved))
-            } else {
-                None
             }
+            None => None,
         };
 
         println!("⚙ Connecting to {host}...");
@@ -465,28 +479,12 @@ impl Rag {
             collections.len()
         );
 
-        let collection = Select::new("Select collection:", collections).prompt()?;
+        let collection = choose_collection(prompter, collections)?;
 
         let sample_id = QdrantProvider::sample_point_id(&host, &collection, api_key).await?;
 
-        // `None` means the scroll came back with no points at all: the collection
-        // is empty. Attaching is not necessarily wrong — another tool may be about
-        // to fill it — but accepting it silently yields a RAG that answers every
-        // query with nothing and never explains why, and none of the checks below
-        // can tell that apart from a misconfiguration. Ask, defaulting to no, so it
-        // cannot happen by accident. (`attach` already refuses to run
-        // non-interactively, so there is no unattended path through this prompt.)
         if sample_id.is_none() {
-            println!(
-                "⚠️  Collection '{collection}' contains no points. Queries will return \
-                 nothing until something writes to it."
-            );
-            let attach_anyway = Confirm::new("Attach to this empty collection anyway?")
-                .with_default(false)
-                .prompt()?;
-            if !attach_anyway {
-                bail!("Collection '{collection}' is empty; nothing to attach to.");
-            }
+            confirm_empty_collection(prompter, &collection)?;
         }
 
         println!("ℹ  This collection must store document text in a 'page_content' payload field.");
@@ -515,7 +513,7 @@ impl Rag {
         if models.is_empty() {
             bail!("No available embedding model");
         }
-        let embedding_model_id = select_embedding_model(&models)?;
+        let embedding_model_id = select_embedding_model(&models, prompter)?;
 
         let mut driver_config = IndexMap::new();
         driver_config.insert("host".to_string(), host.clone());
@@ -524,8 +522,9 @@ impl Rag {
             driver_config.insert("api_key".to_string(), format!("{{{{{secret_name}}}}}"));
         }
 
+        let (header_name, value_format) = driver_auth_header(&driver);
         let data = RagData {
-            driver: driver.to_string(),
+            driver,
             attached: true,
             driver_config,
             embedding_model: embedding_model_id,
@@ -557,7 +556,6 @@ impl Rag {
         println!("✓ Attached '{name}' → collection '{collection}' on {host}.");
 
         let env_var = api_key_entry.as_ref().map(|_| rag_env_var_name(name));
-        let (header_name, value_format) = driver_auth_header(driver);
         generate_rag_kit(
             save_path,
             &host,
@@ -668,9 +666,13 @@ impl Rag {
         refresh: bool,
         force_reingest: bool,
         app: &AppConfig,
-        abort_signal: AbortSignal,
-        sync_hooks: RagSyncHooks,
+        run: RagInitRun<'_>,
     ) -> Result<()> {
+        let RagInitRun {
+            abort_signal,
+            sync_hooks,
+            prompter,
+        } = run;
         let loaders = app.document_loaders.clone();
         let (spinner, spinner_rx) = Spinner::create("");
         sync_hooks.fire_started(&self.name, &self.path);
@@ -681,6 +683,7 @@ impl Rag {
                 force_reingest,
                 loaders,
                 Some(spinner),
+                prompter,
             ),
             spinner_rx,
             abort_signal,
@@ -704,7 +707,10 @@ impl Rag {
         Ok(())
     }
 
-    pub fn create_config(app: &AppConfig) -> Result<(Model, usize, usize)> {
+    pub fn create_config(
+        app: &AppConfig,
+        prompter: &dyn Prompter,
+    ) -> Result<(Model, usize, usize)> {
         let embedding_model_id = app.rag_embedding_model.clone();
         let chunk_size = app.rag_chunk_size;
         let chunk_overlap = app.rag_chunk_overlap;
@@ -718,7 +724,7 @@ impl Rag {
                 if models.is_empty() {
                     bail!("No available embedding model");
                 }
-                select_embedding_model(&models)?
+                select_embedding_model(&models, prompter)?
             }
         };
         let embedding_model =
@@ -729,7 +735,7 @@ impl Rag {
                 println!("Set chunk size: {value}");
                 value
             }
-            None => set_chunk_size(&embedding_model)?,
+            None => set_chunk_size(&embedding_model, prompter)?,
         };
         let chunk_overlap = match chunk_overlap {
             Some(value) => {
@@ -738,7 +744,7 @@ impl Rag {
             }
             None => {
                 let value = chunk_size / 20;
-                set_chunk_overlay(value)?
+                set_chunk_overlay(value, prompter)?
             }
         };
 
@@ -985,6 +991,7 @@ impl Rag {
         force_reingest: bool,
         loaders: HashMap<String, String>,
         spinner: Option<Spinner>,
+        prompter: &dyn Prompter,
     ) -> Result<()> {
         debug_assert!(
             !force_reingest || refresh,
@@ -1073,7 +1080,7 @@ impl Rag {
         for protocol_path in protocol_paths {
             index += 1;
             println!("Load {protocol_path} [{index}/{total}]");
-            match load_protocol_path(&loaders, &protocol_path) {
+            match load_protocol_path(&loaders, &protocol_path).await {
                 Ok(v) => loaded_documents.extend(v),
                 Err(err) => handle_error(err, &mut has_error),
             }
@@ -1089,14 +1096,12 @@ impl Rag {
 
         if has_error {
             let mut aborted = true;
-            if *IS_STDOUT_TERMINAL && total > 0 {
-                let ans = Confirm::new("Some documents failed to load. Continue?")
-                    .with_default(false)
-                    .prompt()?;
+            if menu_can_use_terminal() {
+                let ans = confirm(prompter, "Some documents failed to load. Continue?", false)?;
                 aborted = !ans;
             }
             if aborted {
-                bail!("Aborted");
+                bail!("Aborted: some documents failed to load");
             }
         }
 
@@ -1972,21 +1977,121 @@ fn driver_auth_header(driver: &str) -> (&'static str, &'static str) {
     }
 }
 
-fn select_embedding_model(models: &[&Model]) -> Result<String> {
+/// Offers each option by its display line and hands back the value of
+/// the one chosen.
+fn select_option(
+    prompter: &dyn Prompter,
+    question: &str,
+    options: Vec<SelectOption>,
+) -> Result<String> {
+    let displays = options.iter().map(ToString::to_string).collect();
+    let chosen = select_closed(prompter, question, displays)?;
+    let value = options
+        .into_iter()
+        .find(|option| option.display == chosen)
+        .map(|option| option.value)
+        .expect("select_closed only hands back an offered option");
+    Ok(value)
+}
+
+/// Asks `label` until the answer parses as a count; a rejected one is
+/// asked again with `reason` in front of the label.
+fn count_input(
+    prompter: &dyn Prompter,
+    label: &str,
+    default: usize,
+    help: Option<&str>,
+    reason: &str,
+) -> Result<usize> {
+    let default = default.to_string();
+    let mut question = label.to_string();
+    loop {
+        let answer = input(prompter, &question, Some(&default), help)?;
+        match answer.parse::<usize>() {
+            Ok(value) => return Ok(value),
+            Err(_) => question = reask(reason, label),
+        }
+    }
+}
+
+/// The Qdrant host, asked until it is non-empty and names a host rather
+/// than a bracketed IPv6 literal.
+fn ask_qdrant_host(prompter: &dyn Prompter) -> Result<String> {
+    let label = "Host (e.g. qdrant.company.com:6333):";
+    let mut question = label.to_string();
+    loop {
+        let answer = required_input(prompter, &question, None, None)?;
+        if !answer.contains('[') && !answer.contains(']') {
+            return Ok(answer);
+        }
+        question = reask(
+            "Bracketed IPv6 literals are not supported; use a hostname.",
+            label,
+        );
+    }
+}
+
+/// The vault secret name for the instance's API key, or `None` when the
+/// instance needs no key.
+fn ask_api_key_secret_name(prompter: &dyn Prompter) -> Result<Option<String>> {
+    let needs_key = confirm(prompter, "Does this instance require an API key?", true)?;
+    if !needs_key {
+        return Ok(None);
+    }
+    required_input(
+        prompter,
+        "Vault secret name for API key:",
+        Some("QDRANT_API_KEY"),
+        None,
+    )
+    .map(Some)
+}
+
+/// The collection to attach to, asked once the instance has answered.
+fn choose_collection(prompter: &dyn Prompter, collections: Vec<String>) -> Result<String> {
+    select_closed(prompter, "Select collection:", collections)
+}
+
+/// Whether to attach to a collection the scroll found empty; declining is
+/// fatal.
+///
+/// Attaching is not necessarily wrong (another tool may be about to fill
+/// it), but accepting silently yields a RAG that answers every query with
+/// nothing and never explains why, and none of the later checks can tell
+/// that apart from a misconfiguration. Asked defaulting to no, so it
+/// cannot happen by accident; `attach` already refuses to run
+/// non-interactively, so there is no unattended path through this prompt.
+fn confirm_empty_collection(prompter: &dyn Prompter, collection: &str) -> Result<()> {
+    let warning = format!(
+        "Collection '{collection}' contains no points. Queries will return \
+         nothing until something writes to it."
+    );
+    println!("⚠️  {warning}");
+    let attach_anyway = confirm_with_help(
+        prompter,
+        "Attach to this empty collection anyway?",
+        false,
+        &warning,
+    )?;
+    if !attach_anyway {
+        bail!("Collection '{collection}' is empty; nothing to attach to.");
+    }
+    Ok(())
+}
+
+fn select_embedding_model(models: &[&Model], prompter: &dyn Prompter) -> Result<String> {
     let max_width = models.iter().map(|v| v.id().len()).max().unwrap_or(0);
     let models: Vec<_> = models
         .iter()
         .map(|v| SelectOption::new(v.id(), v.description(), max_width))
         .collect();
-    let result = Select::new("Select embedding model:", models)
-        .with_formatter(&|opt| opt.value.value.clone())
-        .prompt()?;
-    Ok(result.value)
+    select_option(prompter, "Select embedding model:", models)
 }
 
-pub(crate) fn select_rag_driver() -> Result<String> {
+pub(crate) fn select_rag_driver(prompter: &dyn Prompter) -> Result<String> {
     #[cfg(target_env = "musl")]
     {
+        let _ = prompter;
         println!(
             "Note: the duckdb RAG driver is only available in GNU builds of coyote \
              (musl builds are statically linked and cannot load DuckDB extensions). \
@@ -1997,12 +2102,10 @@ pub(crate) fn select_rag_driver() -> Result<String> {
     #[cfg(not(target_env = "musl"))]
     {
         let options = vec![
-            "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)",
-            "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.",
+            "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)".to_string(), // debris-exempt: inquire label kept verbatim
+            "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search.".to_string(), // debris-exempt: inquire label kept verbatim
         ];
-        let sel = Select::new("RAG storage driver:", options)
-            .with_starting_cursor(0)
-            .prompt()?;
+        let sel = select_closed(prompter, "RAG storage driver:", options)?;
         if sel.starts_with("duckdb") {
             println!(
                 "Note: several Coyote processes can query a duckdb RAG at the same time, \
@@ -2019,8 +2122,7 @@ pub(crate) fn select_rag_driver() -> Result<String> {
 
 const EXTRACTOR_SKIP: &str = "Skip";
 
-fn select_extractor_model(app: &AppConfig) -> Result<Option<String>> {
-    let models = list_models(app, ModelType::Chat);
+fn select_extractor_model(models: &[&Model], prompter: &dyn Prompter) -> Result<Option<String>> {
     if models.is_empty() {
         return Ok(None);
     }
@@ -2040,13 +2142,15 @@ fn select_extractor_model(app: &AppConfig) -> Result<Option<String>> {
             .iter()
             .map(|v| SelectOption::new(v.id(), v.description(), pad)),
     );
-    let result = Select::new("Extractor model for graph-based RAG (optional):", options)
-        .with_formatter(&|opt| opt.value.value.clone())
-        .prompt()?;
-    Ok(if result.value == EXTRACTOR_SKIP {
+    let chosen = select_option(
+        prompter,
+        "Extractor model for graph-based RAG (optional):",
+        options,
+    )?;
+    Ok(if chosen == EXTRACTOR_SKIP {
         None
     } else {
-        Some(result.value)
+        Some(chosen)
     })
 }
 
@@ -2073,62 +2177,48 @@ impl fmt::Display for SelectOption {
     }
 }
 
-fn set_chunk_size(model: &Model) -> Result<usize> {
-    let default_value = model.default_chunk_size().to_string();
+fn set_chunk_size(model: &Model, prompter: &dyn Prompter) -> Result<usize> {
     let help_message = model
         .max_tokens_per_chunk()
         .map(|v| format!("The model's max_tokens is {v}"));
-
-    let mut text = Text::new("Set chunk size:")
-        .with_default(&default_value)
-        .with_validator(move |text: &str| {
-            let out = match text.parse::<usize>() {
-                Ok(_) => Validation::Valid,
-                Err(_) => Validation::Invalid("Must be a integer".into()),
-            };
-            Ok(out)
-        });
-    if let Some(help_message) = &help_message {
-        text = text.with_help_message(help_message);
-    }
-    let value = text.prompt()?;
-    value.parse().map_err(|_| anyhow!("Invalid chunk_size"))
+    count_input(
+        prompter,
+        "Set chunk size:",
+        model.default_chunk_size(),
+        help_message.as_deref(),
+        "Must be an integer.",
+    )
 }
 
-fn set_graph_hops(default_value: usize) -> Result<usize> {
-    let value = Text::new("Set graph expansion hops:")
-        .with_default(&default_value.to_string())
-        .with_help_message("Number of hops to expand from matched entities (0 = seed nodes only, 1 = direct neighbors, 2 = neighbors of neighbors)")
-        .with_validator(move |text: &str| {
-            let out = match text.parse::<usize>() {
-                Ok(_) => Validation::Valid,
-                _ => Validation::Invalid("Must be a non-negative integer".into()),
-            };
-            Ok(out)
-        })
-        .prompt()?;
-    value.parse().map_err(|_| anyhow!("Invalid graph_hops"))
+fn set_graph_hops(default_value: usize, prompter: &dyn Prompter) -> Result<usize> {
+    count_input(
+        prompter,
+        "Set graph expansion hops:",
+        default_value,
+        Some(
+            "Number of hops to expand from matched entities (0 = seed nodes only, 1 = direct neighbors, 2 = neighbors of neighbors)",
+        ),
+        "Must be a non-negative integer.",
+    )
 }
 
-fn set_chunk_overlay(default_value: usize) -> Result<usize> {
-    let value = Text::new("Set chunk overlay:")
-        .with_default(&default_value.to_string())
-        .with_validator(move |text: &str| {
-            let out = match text.parse::<usize>() {
-                Ok(_) => Validation::Valid,
-                Err(_) => Validation::Invalid("Must be a integer".into()),
-            };
-            Ok(out)
-        })
-        .prompt()?;
-    value.parse().map_err(|_| anyhow!("Invalid chunk_overlay"))
+fn set_chunk_overlay(default_value: usize, prompter: &dyn Prompter) -> Result<usize> {
+    count_input(
+        prompter,
+        "Set chunk overlay:",
+        default_value,
+        None,
+        "Must be an integer.",
+    )
 }
 
-fn add_documents() -> Result<Vec<String>> {
-    let text = Text::new("Add documents:")
-        .with_validator(required!("This field is required"))
-        .with_help_message("e.g. file;dir/;dir/**/*.{md,mdx};loader:resource;url;website/**")
-        .prompt()?;
+fn add_documents(prompter: &dyn Prompter) -> Result<Vec<String>> {
+    let text = required_input(
+        prompter,
+        "Add documents:",
+        None,
+        Some("e.g. file;dir/;dir/**/*.{md,mdx};loader:resource;url;website/**"),
+    )?;
     let paths = text
         .split(';')
         .filter_map(|v| {
@@ -2326,7 +2416,11 @@ fn is_missing_secret(err: &anyhow::Error) -> bool {
 /// answer they had already given. `Vault::add_secret` does the masked prompt,
 /// the provider write and the confirmation line, so this defers to it rather
 /// than collecting or storing the value itself.
-fn resolve_or_create_api_key_secret(vault: &Vault, secret_name: &str) -> Result<String> {
+fn resolve_or_create_api_key_secret(
+    vault: &Vault,
+    secret_name: &str,
+    prompter: &dyn Prompter,
+) -> Result<String> {
     let read_err = match vault.get_secret(secret_name, false) {
         Ok(secret) => return Ok(secret),
         Err(err) => err,
@@ -2336,11 +2430,11 @@ fn resolve_or_create_api_key_secret(vault: &Vault, secret_name: &str) -> Result<
             .with_context(|| format!("Cannot read secret '{secret_name}' from the vault"));
     }
 
-    let create = Confirm::new(&format!(
-        "Secret '{secret_name}' is not in the vault. Create it now?"
-    ))
-    .with_default(true)
-    .prompt()?;
+    let create = confirm(
+        prompter,
+        format!("Secret '{secret_name}' is not in the vault. Create it now?"),
+        true,
+    )?;
     if !create {
         bail!(
             "This instance needs an API key, so '{secret_name}' has to exist before \
@@ -2350,7 +2444,7 @@ fn resolve_or_create_api_key_secret(vault: &Vault, secret_name: &str) -> Result<
     }
 
     vault
-        .add_secret(secret_name)
+        .add_secret(secret_name, prompter)
         .with_context(|| format!("Failed to store secret '{secret_name}' in the vault"))?;
     vault
         .get_secret(secret_name, false)
@@ -2427,7 +2521,11 @@ where
 mod tests {
     use super::*;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
     use crate::sandbox::kit;
+    use crate::testing::{AtomicFlagGuard, TempLocalVault};
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2581,8 +2679,11 @@ mod tests {
             false,
             false,
             &AppConfig::default(),
-            create_abort_signal(),
-            sync_hooks,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks,
+                prompter: &ScriptedPrompter::refusing(),
+            },
         )
         .await
         .unwrap();
@@ -2628,8 +2729,11 @@ mod tests {
                 false,
                 false,
                 &AppConfig::default(),
-                create_abort_signal(),
-                sync_hooks,
+                RagInitRun {
+                    abort_signal: create_abort_signal(),
+                    sync_hooks,
+                    prompter: &ScriptedPrompter::refusing(),
+                },
             )
             .await;
 
@@ -2662,6 +2766,7 @@ mod tests {
         fs::write(&doc, "").unwrap();
         let save_path = dir.path.join("kb.yaml");
         let sync_hooks = RagSyncHooks::resolve(&rag_hooks_ctx(marker));
+        let prompter = ScriptedPrompter::refusing();
 
         let rag = Rag::init_with_config(
             &seeded_client_app(),
@@ -2669,8 +2774,11 @@ mod tests {
             &save_path,
             &[doc.display().to_string()],
             &init_config(),
-            create_abort_signal(),
-            sync_hooks,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks,
+                prompter: &prompter,
+            },
         )
         .await
         .unwrap();
@@ -2710,6 +2818,7 @@ mod tests {
         fs::write(&blocker, "not a directory").unwrap();
         let save_path = blocker.join("kb.yaml");
         let sync_hooks = RagSyncHooks::resolve(&rag_hooks_ctx(marker));
+        let prompter = ScriptedPrompter::refusing();
 
         let result = Rag::init_with_config(
             &seeded_client_app(),
@@ -2717,8 +2826,11 @@ mod tests {
             &save_path,
             &[doc.display().to_string()],
             &init_config(),
-            create_abort_signal(),
-            sync_hooks,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks,
+                prompter: &prompter,
+            },
         )
         .await;
 
@@ -2751,6 +2863,7 @@ mod tests {
         let missing = dir.path.join("missing.txt").display().to_string();
         let save_path = dir.path.join("kb.yaml");
         let sync_hooks = RagSyncHooks::resolve(&rag_hooks_ctx(marker));
+        let prompter = ScriptedPrompter::refusing();
 
         let result = Rag::init_with_config(
             &seeded_client_app(),
@@ -2758,8 +2871,11 @@ mod tests {
             &save_path,
             &[missing],
             &init_config(),
-            create_abort_signal(),
-            sync_hooks,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks,
+                prompter: &prompter,
+            },
         )
         .await;
 
@@ -2907,6 +3023,660 @@ mod tests {
         assert_eq!(ids, vec![DocumentId::new(0, 0)]);
         assert_eq!(embeddings, "[Source: notes.txt]\nthe only chunk");
         assert_eq!(sources, "- notes.txt");
+    }
+
+    /// A knowledge base whose only document is routed through a loader
+    /// that always fails, so every sync of it has a failed document.
+    fn rag_with_a_failing_document(
+        tag: &str,
+    ) -> (TempDir, Rag, Vec<String>, HashMap<String, String>) {
+        let dir = TempDir::new(tag);
+        let doc = dir.path.join("doc.broken");
+        std::fs::write(&doc, "body").unwrap();
+        let rag = yaml_rag("kb", &dir.path.join("kb.yaml"), buildable_data());
+        let loaders = HashMap::from([("broken".to_string(), "false $1".to_string())]);
+        (dir, rag, vec![doc.display().to_string()], loaders)
+    }
+
+    /// A sync with a document that fails to load asks whether to go on
+    /// without it through the prompter, so the full-screen UI shows the
+    /// question in its modal; declining aborts the sync.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_under_the_tui_asks_whether_to_continue_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-tui-failed-doc");
+        let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &declined)
+            .await
+            .unwrap_err();
+
+        let text = err.to_string();
+        assert!(
+            text.starts_with("Aborted: some documents failed to load"),
+            "{text}"
+        );
+        assert!(!text.contains("Re-run"), "{text}");
+        let [req] = declined.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Some documents failed to load. Continue?");
+        assert_eq!(req.default, Some(json!(false)));
+    }
+
+    /// Agreeing to go on without the failed document carries the sync past
+    /// the question; with nothing left to index it fails on the empty
+    /// corpus rather than on the failed document.
+    #[tokio::test]
+    #[serial]
+    async fn continuing_past_a_failed_document_under_the_tui_goes_on_with_the_rest() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (_dir, mut rag, paths, loaders) =
+            rag_with_a_failing_document("sync-tui-failed-doc-continue");
+        let accepted = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &accepted)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "No RAG files");
+        assert_eq!(accepted.requests().len(), 1);
+    }
+
+    /// With no human attached the question cannot be answered, and the
+    /// sync fails with the typed refusal rather than a silent abort.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_under_the_tui_without_a_human_is_a_needs_human_refusal() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (_dir, mut rag, paths, loaders) =
+            rag_with_a_failing_document("sync-tui-failed-doc-headless");
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &HeadlessPrompter)
+            .await
+            .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err}");
+    }
+
+    /// Without a terminal or the full-screen UI there is nowhere to show
+    /// the question, so the sync aborts without asking.
+    #[tokio::test]
+    #[serial]
+    async fn a_failed_document_without_a_tty_aborts_the_sync_without_asking() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let (_dir, mut rag, paths, loaders) = rag_with_a_failing_document("sync-no-tty-failed-doc");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = rag
+            .sync_documents(&paths, true, false, loaders, None, &prompter)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.to_string(), "Aborted: some documents failed to load");
+        assert!(prompter.requests().is_empty());
+    }
+
+    fn text(value: &str) -> PromptAnswer {
+        PromptAnswer::Text(value.to_string())
+    }
+
+    fn embedding_model(name: &str, max_tokens_per_chunk: Option<usize>) -> Model {
+        let mut data = ModelData::new(name);
+        data.model_type = "embedding".to_string();
+        data.max_tokens_per_chunk = max_tokens_per_chunk;
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    /// The RAG wizard asks through the prompter, so under the full-screen
+    /// UI each question is a closed select or an input carrying the
+    /// default and help the inquire widgets showed.
+    #[test]
+    #[serial]
+    fn wizard_prompts_under_the_tui_ask_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        // Under musl the driver question is not asked at all.
+        #[cfg(not(target_env = "musl"))]
+        {
+            let yaml_row = "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)"; // debris-exempt: inquire label kept verbatim
+            let duckdb_row = "duckdb — persistent on-disk store; vectors and content survive restarts; HNSW approximate search."; // debris-exempt: inquire label kept verbatim
+            let driver =
+                ScriptedPrompter::new(vec![PromptAnswer::Selected(duckdb_row.to_string())]);
+            assert_eq!(select_rag_driver(&driver).unwrap(), "duckdb");
+            let [req] = driver.requests().try_into().unwrap();
+            assert_eq!(req.action, PromptAction::Select);
+            assert_eq!(req.question, "RAG storage driver:");
+            assert!(req.closed);
+            assert_eq!(
+                req.options,
+                vec![yaml_row.to_string(), duckdb_row.to_string()]
+            );
+        }
+
+        let documents = ScriptedPrompter::new(vec![text("a.md; docs/ ;")]);
+        assert_eq!(
+            add_documents(&documents).unwrap(),
+            vec!["a.md".to_string(), "docs/".to_string()]
+        );
+        let [req] = documents.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "Add documents:");
+        assert_eq!(req.default, None);
+        assert_eq!(
+            req.help.as_deref(),
+            Some("e.g. file;dir/;dir/**/*.{md,mdx};loader:resource;url;website/**")
+        );
+
+        let hops = ScriptedPrompter::new(vec![text("2")]);
+        assert_eq!(set_graph_hops(1, &hops).unwrap(), 2);
+        let [req] = hops.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "Set graph expansion hops:");
+        assert_eq!(req.default, Some(json!("1")));
+        assert_eq!(
+            req.help.as_deref(),
+            Some(
+                "Number of hops to expand from matched entities (0 = seed nodes only, 1 = direct neighbors, 2 = neighbors of neighbors)"
+            )
+        );
+
+        let overlay = ScriptedPrompter::new(vec![text("25")]);
+        assert_eq!(set_chunk_overlay(50, &overlay).unwrap(), 25);
+        let [req] = overlay.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "Set chunk overlay:");
+        assert_eq!(req.default, Some(json!("50")));
+        assert_eq!(req.help, None);
+
+        let sized = ScriptedPrompter::new(vec![text("512")]);
+        assert_eq!(
+            set_chunk_size(&embedding_model("small", Some(8191)), &sized).unwrap(),
+            512
+        );
+        let [req] = sized.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "Set chunk size:");
+        assert_eq!(req.default, Some(json!("1000")));
+        assert_eq!(req.help.as_deref(), Some("The model's max_tokens is 8191"));
+
+        let capless = ScriptedPrompter::new(vec![text("512")]);
+        set_chunk_size(&embedding_model("small", None), &capless).unwrap();
+        let [req] = capless.requests().try_into().unwrap();
+        assert_eq!(req.help, None);
+
+        let small = embedding_model("small", Some(8191));
+        let large = embedding_model("text-embedding-3-large", None);
+        let pad = large.id().len();
+        let displays: Vec<String> = [&small, &large]
+            .iter()
+            .map(|model| SelectOption::new(model.id(), model.description(), pad).to_string())
+            .collect();
+        let embedding = ScriptedPrompter::new(vec![PromptAnswer::Selected(displays[0].clone())]);
+        assert_eq!(
+            select_embedding_model(&[&small, &large], &embedding).unwrap(),
+            "openai:small"
+        );
+        let [req] = embedding.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.question, "Select embedding model:");
+        assert!(req.closed);
+        assert_eq!(req.options, displays);
+    }
+
+    fn chat_model(name: &str) -> Model {
+        let mut data = ModelData::new(name);
+        data.model_type = "chat".to_string();
+        Model::from_config("openai", &[data]).remove(0)
+    }
+
+    /// The extractor question is a closed select with the skip row first;
+    /// skipping yields no extractor and the model row yields its id.
+    #[test]
+    #[serial]
+    fn select_extractor_model_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let model = chat_model("test-chat");
+        let pad = model.id().len().max(EXTRACTOR_SKIP.len());
+        let skip_row = SelectOption::new(
+            EXTRACTOR_SKIP.to_string(),
+            "vector + full text search only (no graph)".to_string(),
+            pad,
+        )
+        .to_string();
+        let model_row = SelectOption::new(model.id(), model.description(), pad).to_string();
+
+        let skipped = ScriptedPrompter::new(vec![PromptAnswer::Selected(skip_row.clone())]);
+        assert_eq!(select_extractor_model(&[&model], &skipped).unwrap(), None);
+        let [req] = skipped.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(
+            req.question,
+            "Extractor model for graph-based RAG (optional):"
+        );
+        assert!(req.closed);
+        assert_eq!(req.options, vec![skip_row, model_row.clone()]);
+
+        let chosen = ScriptedPrompter::new(vec![PromptAnswer::Selected(model_row)]);
+        assert_eq!(
+            select_extractor_model(&[&model], &chosen).unwrap(),
+            Some(model.id())
+        );
+
+        let none = ScriptedPrompter::refusing();
+        assert_eq!(select_extractor_model(&[], &none).unwrap(), None);
+        assert!(none.requests().is_empty());
+    }
+
+    /// A missing API key secret is offered for creation through the
+    /// prompter; declining names the secret in the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn a_missing_api_key_secret_under_the_tui_is_offered_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let store = TempLocalVault::new("attach-secret");
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let err = resolve_or_create_api_key_secret(&store.vault, "QDRANT_API_KEY", &prompter)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .starts_with("This instance needs an API key, so 'QDRANT_API_KEY' has to exist"),
+            "{err}"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(
+            req.question,
+            "Secret 'QDRANT_API_KEY' is not in the vault. Create it now?"
+        );
+        assert_eq!(req.default, Some(json!(true)));
+    }
+
+    #[test]
+    #[serial]
+    fn ask_qdrant_host_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![text("qdrant.example:6333")]);
+        assert_eq!(ask_qdrant_host(&prompter).unwrap(), "qdrant.example:6333");
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "Host (e.g. qdrant.company.com:6333):");
+        assert_eq!(req.default, None);
+        assert_eq!(req.help, None);
+    }
+
+    /// A run with no human refuses the host question with the typed
+    /// input refusal and draws nothing on the terminal.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn headless_ask_qdrant_host_is_a_typed_input_refusal_with_nothing_on_stdout() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let (saved, mut reader) = crate::testing::capture_stdout();
+
+        let err = ask_qdrant_host(&HeadlessPrompter).unwrap_err();
+
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Input))
+            ),
+            "{err:#}"
+        );
+    }
+
+    /// The API key question is a confirm defaulting to yes; `yes` is
+    /// followed by the secret name input defaulting to `QDRANT_API_KEY`,
+    /// `no` ends the question with no secret name.
+    #[test]
+    #[serial]
+    fn ask_api_key_secret_name_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let keyed = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true), text("MY_KEY")]);
+        assert_eq!(
+            ask_api_key_secret_name(&keyed).unwrap(),
+            Some("MY_KEY".to_string())
+        );
+        let [needs_key, secret_name] = keyed.requests().try_into().unwrap();
+        assert_eq!(needs_key.action, PromptAction::Confirm);
+        assert_eq!(needs_key.question, "Does this instance require an API key?");
+        assert_eq!(needs_key.default, Some(json!(true)));
+        assert_eq!(secret_name.action, PromptAction::Input);
+        assert_eq!(secret_name.question, "Vault secret name for API key:");
+        assert_eq!(secret_name.default, Some(json!("QDRANT_API_KEY")));
+        assert_eq!(secret_name.help, None);
+
+        let keyless = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        assert_eq!(ask_api_key_secret_name(&keyless).unwrap(), None);
+        let [req] = keyless.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Does this instance require an API key?");
+    }
+
+    /// The collection question is a closed select over the fetched
+    /// collections and hands back the chosen one.
+    #[test]
+    #[serial]
+    fn choose_collection_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let collections = vec!["docs".to_string(), "notes".to_string()];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Selected("notes".to_string())]);
+        assert_eq!(
+            choose_collection(&prompter, collections.clone()).unwrap(),
+            "notes"
+        );
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.question, "Select collection:");
+        assert!(req.closed);
+        assert_eq!(req.options, collections);
+    }
+
+    /// The empty-collection question is a confirm defaulting to no; `yes`
+    /// lets the attach go on and `no` ends it naming the collection.
+    #[test]
+    #[serial]
+    fn confirm_empty_collection_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let accepted = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+        confirm_empty_collection(&accepted, "docs").unwrap();
+        let [req] = accepted.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Attach to this empty collection anyway?");
+        assert_eq!(req.default, Some(json!(false)));
+        assert!(
+            req.help
+                .as_deref()
+                .is_some_and(|help| help.contains("Collection 'docs' contains no points")),
+            "{:?}",
+            req.help
+        );
+
+        let declined = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let err = confirm_empty_collection(&declined, "docs").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Collection 'docs' is empty; nothing to attach to."
+        );
+        let [req] = declined.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "Attach to this empty collection anyway?");
+    }
+
+    /// The attach wizard's opening questions go through the prompter in
+    /// order: driver, host, then the API key confirm. Without a key the
+    /// next step is the connection, which fails against a closed port.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn attach_under_the_tui_asks_driver_host_and_api_key_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let store = TempLocalVault::new("attach-wizard");
+        let dir = TempDir::new("attach-wizard-rag");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Selected("qdrant".to_string()),
+            text("127.0.0.1:9"),
+            PromptAnswer::Confirmed(false),
+        ]);
+
+        let err = Rag::attach(
+            &AppConfig::default(),
+            &store.vault,
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &prompter,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Failed to connect to 127.0.0.1:9. Check host and API key."),
+            "{err:#}"
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert_eq!(requests[0].action, PromptAction::Select);
+        assert_eq!(requests[0].question, "Select driver:");
+        assert!(requests[0].closed);
+        assert_eq!(requests[0].options, vec!["qdrant".to_string()]);
+        assert_eq!(requests[1].action, PromptAction::Input);
+        assert_eq!(requests[1].question, "Host (e.g. qdrant.company.com:6333):");
+        assert_eq!(requests[2].action, PromptAction::Confirm);
+        assert_eq!(
+            requests[2].question,
+            "Does this instance require an API key?"
+        );
+        assert_eq!(requests[2].default, Some(json!(true)));
+    }
+
+    /// With no human to answer, every question of the wizard is refused.
+    #[test]
+    #[serial]
+    fn wizard_prompts_without_a_human_are_refused() {
+        let model = embedding_model("small", None);
+        let errors = [
+            add_documents(&HeadlessPrompter).map(|_| ()).unwrap_err(),
+            set_graph_hops(1, &HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            set_chunk_overlay(0, &HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            set_chunk_size(&model, &HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            select_embedding_model(&[&model], &HeadlessPrompter)
+                .map(|_| ())
+                .unwrap_err(),
+            ask_qdrant_host(&HeadlessPrompter).map(|_| ()).unwrap_err(),
+        ];
+        for err in errors {
+            assert!(NeedsHuman::caused(&err), "{err:#}");
+        }
+        #[cfg(not(target_env = "musl"))]
+        {
+            let err = select_rag_driver(&HeadlessPrompter).unwrap_err();
+            assert!(NeedsHuman::caused(&err), "{err:#}");
+        }
+    }
+
+    /// Without a terminal the init wizard is refused up front, in the
+    /// shared refusal shape, before any question is asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn init_without_a_terminal_is_refused_before_any_prompt() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let dir = TempDir::new("init-no-tty");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = Rag::init(
+            &AppConfig::default(),
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &[],
+            true,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks: RagSyncHooks::resolve(&rag_hooks_ctx("init-no-tty")),
+                prompter: &prompter,
+            },
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to initialize RAG knowledge base 'kb' non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// The attach wizard is refused the same way: up front, before the
+    /// driver question or any secret handling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn attach_without_a_terminal_is_refused_before_any_prompt() {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let store = TempLocalVault::new("attach-no-tty");
+        let dir = TempDir::new("attach-no-tty-rag");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = Rag::attach(
+            &AppConfig::default(),
+            &store.vault,
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &prompter,
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to run the attach wizard for RAG 'kb' non-interactively. Re-run in a terminal."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// A configured build with no embedding model anywhere would have to
+    /// ask for one; without a terminal it is refused with the remedy that
+    /// names the field, before the model list is consulted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn init_with_config_without_a_terminal_and_no_embedding_model_is_refused_before_any_prompt()
+     {
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let dir = TempDir::new("init-config-no-tty");
+        let doc = dir.path.join("doc.txt");
+        fs::write(&doc, "").unwrap();
+        let prompter = ScriptedPrompter::refusing();
+        let config = RagInitConfig {
+            embedding_model: None,
+            ..init_config()
+        };
+
+        let err = Rag::init_with_config(
+            &seeded_client_app(),
+            "kb",
+            &dir.path.join("kb.yaml"),
+            &[doc.display().to_string()],
+            &config,
+            RagInitRun {
+                abort_signal: create_abort_signal(),
+                sync_hooks: RagSyncHooks::resolve(&rag_hooks_ctx("init-config-no-tty")),
+                prompter: &prompter,
+            },
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to choose an embedding model for RAG knowledge base 'kb' non-interactively. \
+             Re-run in a terminal. Set `embedding_model` on the rag node, or run the agent interactively once."
+        );
+        assert!(prompter.requests().is_empty());
+    }
+
+    /// A rejected answer is asked again with the reason in front of the
+    /// label, so the field keeps its name in the modal.
+    #[test]
+    #[serial]
+    fn rejected_wizard_answers_are_asked_again_with_the_reason() {
+        let required = ScriptedPrompter::new(vec![text(""), text("x")]);
+        assert_eq!(
+            required_input(&required, "Vault secret name for API key:", None, None).unwrap(),
+            "x"
+        );
+        let [first, second] = required.requests().try_into().unwrap();
+        assert_eq!(first.question, "Vault secret name for API key:");
+        assert_eq!(
+            second.question,
+            reask("This field is required.", "Vault secret name for API key:")
+        );
+
+        let counted = ScriptedPrompter::new(vec![text("abc"), text("7")]);
+        assert_eq!(
+            count_input(
+                &counted,
+                "Set chunk size:",
+                1000,
+                None,
+                "Must be an integer."
+            )
+            .unwrap(),
+            7
+        );
+        let [first, second] = counted.requests().try_into().unwrap();
+        assert_eq!(first.question, "Set chunk size:");
+        assert_eq!(first.default, Some(json!("1000")));
+        assert_eq!(
+            second.question,
+            reask("Must be an integer.", "Set chunk size:")
+        );
+        assert_eq!(second.default, Some(json!("1000")));
+
+        let host = ScriptedPrompter::new(vec![
+            text(""),
+            text("[::1]:6333"),
+            text("   "),
+            text("qdrant.local:6333"),
+        ]);
+        assert_eq!(ask_qdrant_host(&host).unwrap(), "qdrant.local:6333");
+        let [first, second, third, fourth] = host.requests().try_into().unwrap();
+        assert_eq!(first.question, "Host (e.g. qdrant.company.com:6333):");
+        assert_eq!(
+            second.question,
+            "This field is required. Host (e.g. qdrant.company.com:6333):"
+        );
+        assert_eq!(
+            third.question,
+            "Bracketed IPv6 literals are not supported; use a hostname. Host (e.g. qdrant.company.com:6333):"
+        );
+        assert_eq!(
+            fourth.question,
+            "This field is required. Bracketed IPv6 literals are not supported; use a hostname. Host (e.g. qdrant.company.com:6333):"
+        );
+    }
+
+    /// A select over described options hands back the value behind the
+    /// chosen display line, and only a line that was offered.
+    #[test]
+    #[serial]
+    fn select_option_maps_the_chosen_display_line_back_to_its_value() {
+        let options = || {
+            vec![
+                SelectOption::new("a".to_string(), "first".to_string(), 2),
+                SelectOption::new("bb".to_string(), String::new(), 2),
+            ]
+        };
+        let chosen = ScriptedPrompter::new(vec![PromptAnswer::Selected("a  (first)".to_string())]);
+        assert_eq!(select_option(&chosen, "Pick:", options()).unwrap(), "a");
+        let [req] = chosen.requests().try_into().unwrap();
+        assert_eq!(
+            req.options,
+            vec!["a  (first)".to_string(), "bb".to_string()]
+        );
+
+        let unknown = ScriptedPrompter::new(vec![PromptAnswer::Selected("c".to_string())]);
+        let err = select_option(&unknown, "Pick:", options()).unwrap_err();
+        assert_eq!(err.to_string(), "'c' is not one of the offered options");
     }
 
     #[test]

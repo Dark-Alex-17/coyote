@@ -8,7 +8,7 @@ use crossterm::terminal;
 use fancy_regex::{Captures, Regex};
 use std::collections::HashMap;
 use std::iter;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use syntect::highlighting::{Color as SyntectColor, FontStyle, Style, Theme, ThemeItem};
 use syntect::parsing::SyntaxSet;
 use syntect::{easy::HighlightLines, parsing::SyntaxReference};
@@ -646,7 +646,7 @@ enum TableAction {
 
 pub struct MarkdownRender {
     options: RenderOptions,
-    syntax_set: SyntaxSet,
+    syntax_set: Arc<SyntaxSet>,
     code_color: Option<Color>,
     md_syntax: SyntaxReference,
     code_syntax: Option<SyntaxReference>,
@@ -658,9 +658,18 @@ pub struct MarkdownRender {
 
 impl MarkdownRender {
     pub fn init(options: RenderOptions) -> Result<Self> {
-        let syntax_set: SyntaxSet =
-            decode_bin(SYNTAXES).with_context(|| "MarkdownRender: invalid syntaxes binary")?;
+        Self::with_syntax_set(options, Self::syntax_set()?)
+    }
 
+    /// The syntaxes `init` decodes for each renderer, for callers that
+    /// make many renderers and share one set between them.
+    pub fn syntax_set() -> Result<Arc<SyntaxSet>> {
+        decode_bin(SYNTAXES)
+            .map(Arc::new)
+            .with_context(|| "MarkdownRender: invalid syntaxes binary")
+    }
+
+    pub fn with_syntax_set(options: RenderOptions, syntax_set: Arc<SyntaxSet>) -> Result<Self> {
         let code_color = options
             .theme
             .as_ref()
@@ -695,6 +704,12 @@ impl MarkdownRender {
             table_state: None,
             options,
         })
+    }
+
+    /// Overrides the width `init` derived from the terminal; `None` turns
+    /// wrapping off. Tables and lists are laid out to this width too.
+    pub fn set_wrap_width(&mut self, width: Option<u16>) {
+        self.wrap_width = width;
     }
 
     pub fn render(&mut self, text: &str) -> String {

@@ -1,6 +1,7 @@
 pub(crate) mod agents;
 pub(crate) mod jobs;
 pub(crate) mod memory;
+pub(crate) mod prompt_channel;
 pub(crate) mod rag_query;
 pub(crate) mod skill;
 pub(crate) mod todo;
@@ -9,7 +10,8 @@ pub(crate) mod user_interaction;
 use crate::{
     client::ThinkingBlock,
     config::{
-        Agent, RequestContext, flatten_prompt_messages, resolve_prompt_args, sanitize_display_text,
+        Agent, RequestContext, UiKind, flatten_prompt_messages, resolve_prompt_args,
+        sanitize_display_text,
     },
     graph,
     utils::*,
@@ -17,6 +19,7 @@ use crate::{
 
 use crate::config::ensure_parent_exists;
 use crate::config::paths;
+use crate::events::{self, Event, NoticeKind, Origin, OutputStream};
 use crate::hooks::{self, HookEvent};
 use crate::mcp::{
     MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX, MCP_INVOKE_META_FUNCTION_NAME_PREFIX,
@@ -25,6 +28,9 @@ use crate::mcp::{
     McpServersConfig, is_mcp_meta_function, render,
 };
 use crate::parsers::{bash, python, typescript};
+use crate::prompt::{PromptMemory, Prompter};
+use crate::supervisor::notification::{SystemNotification, USER_MESSAGE_EVENT};
+use crate::turn::UiSink;
 use crate::utils::fs::TempFileGuard;
 use agents::AGENT_FUNCTION_PREFIX;
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,8 +46,9 @@ use serde_json::{Value, json};
 use skill::SKILL_FUNCTION_PREFIX;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::Read;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{collections::VecDeque, thread};
 use std::{
     collections::{HashMap, HashSet},
@@ -63,6 +70,11 @@ struct FunctionAssets;
 const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
+
+/// How long a finished tool's output pumps may wait for pipe EOF. A
+/// descendant the tool left behind can hold the pipe open indefinitely, so
+/// the pump is detached once this passes.
+const TOOL_PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(AsRefStr)]
 enum BinaryType<'a> {
@@ -332,11 +344,12 @@ pub async fn eval_tool_calls(
     for (idx, call) in calls.into_iter().enumerate() {
         if let Some(msg) = ctx.tool_scope.tool_tracker.check_loop(&call.clone()) {
             let dup_msg = format!("{{\"tool_call_loop_alert\":{}}}", msg.trim());
-            println!(
-                "{}",
-                muted_warning_text(
-                    format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name).as_str()
-                )
+            let plain = format!("{}: ⚠️ Tool-call loop detected! ⚠️", call.name);
+            emit_tool_warning(
+                ctx.ui.as_ref(),
+                ctx.current_depth,
+                &sanitize_display_text(&plain),
+                &plain,
             );
             indexed_results.push((idx, ToolResult::new(call, json!(dup_msg))));
         } else {
@@ -429,32 +442,43 @@ fn normalize_tool_result(result: Value) -> Value {
     }
 }
 
-/// Drains this context's own notification queue and drops events whose
+/// Drains this context's own notification queue and drops task events whose
 /// handle is no longer registered with the supervisor (already collected or
-/// cancelled), so the model is never pointed at a dead id.
+/// cancelled), so the model is never pointed at a dead id. User messages
+/// name no task and always pass through; each one is announced on the bus
+/// as sent before the caller puts it in front of the model.
 fn drain_live_notifications(ctx: &RequestContext) -> Vec<Value> {
     let events = ctx.notification_queue.drain();
     if events.is_empty() {
         return vec![];
     }
 
-    let Some(supervisor) = ctx.supervisor.as_ref() else {
-        return vec![];
+    let sup = ctx.supervisor.as_ref().map(|supervisor| supervisor.read());
+    let task_is_live = |id: &str| {
+        sup.as_ref()
+            .is_some_and(|sup| sup.has_job(id) || sup.has_agent(id))
     };
-    let sup = supervisor.read();
-    events
+    let live: Vec<SystemNotification> = events
         .into_iter()
-        .filter(|event| sup.has_job(&event.id) || sup.has_agent(&event.id))
-        .map(|event| event.to_value())
-        .collect()
+        .filter(|event| event.id().is_none_or(task_is_live))
+        .collect();
+    drop(sup);
+    for event in &live {
+        if let SystemNotification::UserMessage { text } = event {
+            events::bus().publish(Event::QueuedInputSent { text: text.clone() });
+        }
+    }
+    live.into_iter().map(|event| event.to_value()).collect()
 }
 
 /// Single-pass merge of both system channels onto the last tool result of a
 /// batch: pending escalations (children are blocked; listed first) and
-/// background-task completion notifications. A single pass is mandatory —
-/// two independent mergers would each apply the non-object wrap and nest the
-/// output twice. With both channels empty this is a no-op, and with only
-/// escalations it produces exactly the pre-notification output shape.
+/// system notifications (background-task completions and user messages typed
+/// mid-turn), whose instruction is derived from the kinds of entries present.
+/// A single pass is mandatory: two independent mergers would each apply the
+/// non-object wrap and nest the output twice. With both channels empty this
+/// is a no-op, and with only escalations it produces exactly the
+/// pre-notification output shape.
 fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifications: Vec<Value>) {
     if escalations.is_empty() && notifications.is_empty() {
         return;
@@ -462,8 +486,21 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
 
     let escalation_instruction = "Child agents are BLOCKED waiting for your reply. \
         Call agent__reply_escalation for each pending escalation to unblock them.";
-    let notification_instruction =
+    let task_instruction =
         "Background tasks have finished; collect each result with its next_action command.";
+    let user_message_instruction =
+        "The user sent a message while you were working; read it before continuing.";
+    let has_tasks = notifications
+        .iter()
+        .any(|n| n.get("event").and_then(Value::as_str) != Some(USER_MESSAGE_EVENT));
+    let has_user_message = notifications
+        .iter()
+        .any(|n| n.get("event").and_then(Value::as_str) == Some(USER_MESSAGE_EVENT));
+    let notification_instruction = match (has_tasks, has_user_message) {
+        (false, true) => user_message_instruction.to_string(),
+        (true, true) => format!("{task_instruction} {user_message_instruction}"),
+        (true, false) | (false, false) => task_instruction.to_string(),
+    };
 
     let map = match &mut last.output {
         Value::Object(map) => map,
@@ -1543,22 +1580,31 @@ impl ToolCall {
     async fn eval_mcp_output(&self, ctx: &RequestContext) -> Result<ToolOutput> {
         let json_data = self.parse_arguments()?;
         let cmd_name = self.name.as_str();
-        let quiet = ctx.current_depth > 0;
+        let display_name = sanitize_display_text(cmd_name);
+        let call_id = self.id.clone().unwrap_or_default();
+        let cmd_args = [json_data.to_string()];
         if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
             && ctx.current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            println!(
-                "{}",
-                format_call_log(cmd_name, &[json_data.to_string()], &json_data)
-            );
+            ctx.ui
+                .tool_narration(&call_id, &display_name, &cmd_args, &json_data);
         }
+        events::bus().publish(Event::ToolNarration {
+            call_id,
+            line: plain_call_log(&display_name, &cmd_args),
+        });
         let result = if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) {
             Self::search_mcp_tools(ctx, cmd_name, &json_data)
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP search failed: {e}");
-                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        ctx.current_depth,
+                        &mcp_error_display(&error_msg),
+                        &error_msg,
+                    );
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_DESCRIBE_META_FUNCTION_NAME_PREFIX) {
@@ -1566,7 +1612,12 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP describe failed: {e}");
-                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        ctx.current_depth,
+                        &mcp_error_display(&error_msg),
+                        &error_msg,
+                    );
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_READ_META_FUNCTION_NAME_PREFIX) {
@@ -1574,7 +1625,12 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP read failed: {e}");
-                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        ctx.current_depth,
+                        &mcp_error_display(&error_msg),
+                        &error_msg,
+                    );
                     json!({"tool_call_error": error_msg})
                 })
         } else if cmd_name.starts_with(MCP_PROMPT_META_FUNCTION_NAME_PREFIX) {
@@ -1582,7 +1638,12 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP prompt failed: {e}");
-                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        ctx.current_depth,
+                        &mcp_error_display(&error_msg),
+                        &error_msg,
+                    );
                     json!({"tool_call_error": error_msg})
                 })
         } else {
@@ -1590,7 +1651,12 @@ impl ToolCall {
                 .await
                 .unwrap_or_else(|e| {
                     let error_msg = format!("MCP tool invocation failed: {e}");
-                    emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        ctx.current_depth,
+                        &mcp_error_display(&error_msg),
+                        &error_msg,
+                    );
                     ToolOutput::from(json!({"tool_call_error": error_msg}))
                 }));
         };
@@ -1614,6 +1680,7 @@ impl ToolCall {
                 ctx,
                 &[
                     ("COYOTE_TOOL_NAME", self.name.clone()),
+                    ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
                     ("COYOTE_TOOL_ERROR", err.to_string()),
                 ],
                 None,
@@ -1626,7 +1693,6 @@ impl ToolCall {
         let agent = ctx.agent.clone();
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
-        let quiet = current_depth > 0;
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
         let (call_name, cmd_name, mut cmd_args, mut envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
@@ -1635,6 +1701,8 @@ impl ToolCall {
 
         envs.entry("COYOTE_CURRENT_MODEL".to_string())
             .or_insert_with(|| ctx.current_model().id());
+        envs.entry(UiKind::ENV.to_string())
+            .or_insert_with(|| ctx.ui_kind().as_str().to_string());
 
         let json_data = if self.arguments.is_object() {
             self.arguments.clone()
@@ -1653,17 +1721,26 @@ impl ToolCall {
         let args_json = json_data.to_string();
         cmd_args.push(args_json.clone());
 
+        let call_id = self.id.clone().unwrap_or_default();
         if (*IS_STDOUT_TERMINAL || *SHOW_TOOL_CALLS)
             && current_depth == 0
             && !HEADLESS.load(Ordering::SeqCst)
         {
-            println!("{}", format_call_log(&cmd_name, &cmd_args, &json_data));
+            ctx.ui
+                .tool_narration(&call_id, &cmd_name, &cmd_args, &json_data);
         }
+        events::bus().publish(Event::ToolNarration {
+            call_id,
+            line: plain_call_log(&cmd_name, &cmd_args),
+        });
 
         hooks::fire(
             HookEvent::ToolStarted,
             ctx,
-            &[("COYOTE_TOOL_NAME", self.name.clone())],
+            &[
+                ("COYOTE_TOOL_NAME", self.name.clone()),
+                ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
+            ],
             Some(args_json.clone()),
         );
         info!("Tool call '{}' started", self.name);
@@ -1677,7 +1754,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP search failed: {e}");
-                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &mcp_error_display(&error_msg),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1686,7 +1768,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP describe failed: {e}");
-                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &mcp_error_display(&error_msg),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1695,7 +1782,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP read failed: {e}");
-                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &mcp_error_display(&error_msg),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1704,7 +1796,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("MCP prompt failed: {e}");
-                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &mcp_error_display(&error_msg),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1716,7 +1813,12 @@ impl ToolCall {
                     }
                     Err(e) => {
                         let error_msg = format!("MCP tool invocation failed: {e}");
-                        emit_tool_warning(quiet, &mcp_error_display(&error_msg), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &mcp_error_display(&error_msg),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     }
                 }
@@ -1724,14 +1826,24 @@ impl ToolCall {
             _ if cmd_name.starts_with(TODO_FUNCTION_PREFIX) => {
                 todo::handle_todo_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("Todo tool failed: {e}");
-                    emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        current_depth,
+                        &format!("⚠️ {error_msg} ⚠️"),
+                        &error_msg,
+                    );
                     json!({"tool_call_error": error_msg})
                 })
             }
             _ if cmd_name.starts_with(MEMORY_FUNCTION_PREFIX) => {
                 memory::handle_memory_tool(ctx, &cmd_name, &json_data).unwrap_or_else(|e| {
                     let error_msg = format!("Memory tool failed: {e}");
-                    emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                    emit_tool_warning(
+                        ctx.ui.as_ref(),
+                        current_depth,
+                        &format!("⚠️ {error_msg} ⚠️"),
+                        &error_msg,
+                    );
                     json!({"tool_call_error": error_msg})
                 })
             }
@@ -1740,7 +1852,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Skill tool failed: {e}");
-                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &format!("⚠️ {error_msg} ⚠️"),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1749,7 +1866,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Agent tool failed: {e}");
-                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &format!("⚠️ {error_msg} ⚠️"),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1758,7 +1880,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("User interaction failed: {e}");
-                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &format!("⚠️ {error_msg} ⚠️"),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1767,7 +1894,12 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("RAG query failed: {e}");
-                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &format!("⚠️ {error_msg} ⚠️"),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
@@ -1776,19 +1908,30 @@ impl ToolCall {
                     .await
                     .unwrap_or_else(|e| {
                         let error_msg = format!("Job tool failed: {e}");
-                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                        emit_tool_warning(
+                            ctx.ui.as_ref(),
+                            current_depth,
+                            &format!("⚠️ {error_msg} ⚠️"),
+                            &error_msg,
+                        );
                         json!({"tool_call_error": error_msg})
                     })
             }
-            _ => match run_llm_function(
+            _ => match run_llm_function_off_worker(
                 cmd_name,
                 cmd_args,
                 envs,
                 agent_name,
                 ctx.app.config.tool_timeout,
-                quiet,
+                ToolIo::new(Arc::clone(&ctx.ui), self.id.clone(), current_depth).with_prompter(
+                    Arc::clone(&ctx.prompter),
+                    Arc::clone(&ctx.prompt_memory),
+                    Origin::from(&*ctx),
+                ),
                 ctx.session_abort.clone(),
-            ) {
+            )
+            .await
+            {
                 Ok(run) => {
                     let value = match run.output {
                         Some(contents) => serde_json::from_str(&contents)
@@ -1831,6 +1974,7 @@ impl ToolCall {
                     ctx,
                     &[
                         ("COYOTE_TOOL_NAME", self.name.clone()),
+                        ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
                         ("COYOTE_TOOL_ERROR", error),
                     ],
                     Some(args_json),
@@ -1847,6 +1991,7 @@ impl ToolCall {
                     ctx,
                     &[
                         ("COYOTE_TOOL_NAME", self.name.clone()),
+                        ("COYOTE_TOOL_CALL_ID", self.id.clone().unwrap_or_default()),
                         (
                             "COYOTE_TOOL_DURATION_MS",
                             tool_started_at.elapsed().as_millis().to_string(),
@@ -2296,12 +2441,12 @@ fn mcp_error_display(error_msg: &str) -> String {
 }
 
 // Subagent (depth > 0) tool calls run while the parent session owns the
-// terminal; route their warnings to the debug log instead of stderr.
-fn emit_tool_warning(quiet: bool, display: &str, plain: &str) {
-    if quiet {
+// terminal; route their warnings to the debug log instead of the sink.
+fn emit_tool_warning(sink: &dyn UiSink, depth: usize, display: &str, plain: &str) {
+    if depth > 0 {
         debug!("{plain}");
     } else {
-        eprintln!("{}", muted_warning_text(display));
+        sink.notice(NoticeKind::ToolWarning, display);
     }
 }
 
@@ -2507,6 +2652,76 @@ pub(crate) fn tool_timeout_secs(config_value: Option<u64>) -> u64 {
         .unwrap_or(1800)
 }
 
+/// Where a running tool's output and warnings go, carried into the pump threads.
+#[derive(Clone)]
+pub(crate) struct ToolIo {
+    ui: Arc<dyn UiSink>,
+    call_id: Option<String>,
+    depth: usize,
+    prompter: Option<prompt_channel::ToolPrompter>,
+}
+
+impl ToolIo {
+    pub(crate) fn new(ui: Arc<dyn UiSink>, call_id: Option<String>, depth: usize) -> Self {
+        Self {
+            ui,
+            call_id,
+            depth,
+            prompter: None,
+        }
+    }
+
+    /// Lets the tool ask the human; without it no reply channel is offered.
+    pub(crate) fn with_prompter(
+        mut self,
+        prompter: Arc<dyn Prompter>,
+        memory: Arc<PromptMemory>,
+        origin: Origin,
+    ) -> Self {
+        self.prompter = Some(prompt_channel::ToolPrompter::new(prompter, memory, origin));
+        self
+    }
+}
+
+/// Runs [`run_llm_function`] on the blocking pool. Its wait loop sleeps
+/// its thread for the whole tool run; on a runtime worker that can strand
+/// the IO and time drivers, which only parked workers service, and every
+/// timer and socket in the process (the TUI's frames included) then waits
+/// for the tool to end.
+pub(crate) async fn run_llm_function_off_worker(
+    cmd_name: String,
+    cmd_args: Vec<String>,
+    envs: HashMap<String, String>,
+    agent_name: Option<String>,
+    tool_timeout: Option<u64>,
+    io: ToolIo,
+    abort: Option<AbortSignal>,
+) -> Result<ScriptRunOutput> {
+    tokio::task::spawn_blocking(move || {
+        run_llm_function(
+            cmd_name,
+            cmd_args,
+            envs,
+            agent_name,
+            tool_timeout,
+            io,
+            abort,
+        )
+    })
+    .await
+    .unwrap_or_else(|err| Err(tool_task_failure(err)))
+}
+
+fn tool_task_failure(err: tokio::task::JoinError) -> anyhow::Error {
+    if err.is_panic() {
+        anyhow!("tool task panicked: {err}")
+    } else if err.is_cancelled() {
+        anyhow!("tool task was cancelled")
+    } else {
+        anyhow!("tool task failed: {err}")
+    }
+}
+
 pub const MAX_ATTACHMENTS_PER_TOOL_RESULT: usize = 5;
 
 const ATTACHMENTS_FILE_MAX_BYTES: u64 = 64 * 1024;
@@ -2643,13 +2858,18 @@ pub fn run_llm_function(
     mut envs: HashMap<String, String>,
     agent_name: Option<String>,
     tool_timeout: Option<u64>,
-    quiet: bool,
+    io: ToolIo,
     abort: Option<AbortSignal>,
 ) -> Result<ScriptRunOutput> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
     if let Some(agent_name) = agent_name {
-        command_name = cmd_args[0].clone();
+        // Only an agent's own function runs through the agent's binary,
+        // with the function's name as the first argument; a global tool
+        // under an agent keeps its own name.
+        if cmd_name == agent_name {
+            command_name = cmd_args[0].clone();
+        }
         let dir = paths::agent_bin_dir(&agent_name);
         if dir.exists() {
             bin_dirs.push(dir);
@@ -2702,78 +2922,152 @@ pub fn run_llm_function(
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());
 
-    let mut child = Command::new(&cmd_name)
+    let mut reply = match io.prompter.as_ref().map(|_| prompt_channel::Server::open()) {
+        Some(Ok(server)) => {
+            envs.insert(prompt_channel::REPLY_ENV.into(), server.env_value());
+            Some(server)
+        }
+        Some(Err(err)) => {
+            debug!("Prompt reply channel unavailable for '{command_name}': {err}");
+            None
+        }
+        None => None,
+    };
+
+    let mut command = Command::new(&cmd_name);
+    command
         .args(&cmd_args)
         .envs(envs)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+        .stderr(Stdio::piped());
+    // The bash helper exports the fd it saved stdout on; a nested coyote's
+    // tools must not inherit that marker or they would write requests to
+    // the outer pump.
+    command.env_remove(prompt_channel::OUT_FD_ENV);
+    match reply.as_ref() {
+        Some(server) => server.configure(&mut command),
+        None => {
+            command.env_remove(prompt_channel::REPLY_ENV);
+        }
+    }
+    let spawned_child = command.spawn();
+    if let Some(server) = reply.as_mut() {
+        server.spawned();
+    }
+    let mut child = spawned_child.map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
     debug!("Spawned tool process '{command_name}' pid {}", child.id());
     let spawned = Instant::now();
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
 
+    let stdout_io = io.clone();
+    let stderr_io = io.clone();
+    let stdout_tool = command_name.clone();
+    let stdout_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let (stdout_done, stdout_done_rx) = std::sync::mpsc::channel();
+    let (stderr_done, stderr_done_rx) = std::sync::mpsc::channel();
+    let stdout_sink = Arc::clone(&stdout_buf);
+    let stderr_sink = Arc::clone(&stderr_buf);
+    // A pump detached after the tool exited may still read request lines
+    // from a surviving descendant; those are answered null rather than
+    // raised to the user as prompts for a tool already reported finished.
+    let tool_exited = Arc::new(AtomicBool::new(false));
+    let stdout_tool_exited = Arc::clone(&tool_exited);
+    // Once the drain grace runs out the pump is detached and anything a
+    // surviving descendant writes is dropped rather than attributed to a
+    // tool already reported finished.
+    let pump_detached = Arc::new(AtomicBool::new(false));
+    let stdout_detached = Arc::clone(&pump_detached);
+    let stderr_detached = Arc::clone(&pump_detached);
     let stdout_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stdout;
-        let mut out = io::stdout();
-        let mut buf = Vec::new();
+        let mut lines = prompt_channel::LineAssembler::default();
+        let served = stdout_io.prompter.as_ref().zip(reply.as_ref());
+        let emit = |chunk: &[u8]| {
+            if stdout_detached.load(Ordering::Acquire) {
+                return;
+            }
+            stdout_sink.lock().extend_from_slice(chunk);
+            events::bus().publish(Event::ToolOutputChunk {
+                call_id: stdout_io.call_id.clone().unwrap_or_default(),
+                stream: OutputStream::Stdout,
+                bytes: chunk.to_vec(),
+            });
+            stdout_io.ui.tool_output(
+                stdout_io.call_id.as_deref(),
+                OutputStream::Stdout,
+                stdout_io.depth,
+                chunk,
+            );
+        };
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
             }
-            let chunk = &buffer[0..n];
-            buf.extend_from_slice(chunk);
-            if quiet {
-                continue;
-            }
-            let mut last_pos = 0;
-            for (i, &byte) in chunk.iter().enumerate() {
-                if byte == b'\n' {
-                    let _ = out.write_all(&chunk[last_pos..i]);
-                    let _ = out.write_all(b"\r\n");
-                    last_pos = i + 1;
+            for classified in lines.feed(&buffer[0..n]) {
+                match classified {
+                    prompt_channel::Classified::Output(bytes) => emit(&bytes),
+                    prompt_channel::Classified::Prompt(line) => {
+                        let live = if stdout_tool_exited.load(Ordering::Acquire) {
+                            None
+                        } else {
+                            served
+                        };
+                        let request = live.and_then(|(prompter, server)| {
+                            prompter
+                                .parse_line(&line, &stdout_tool, stdout_io.call_id.clone(), None)
+                                .map(|parsed| (prompter, server, parsed))
+                        });
+                        match request {
+                            Some((prompter, server, parsed)) => {
+                                prompt_channel::handle_prompt_line(prompter, server, parsed);
+                            }
+                            None => {
+                                emit(&line);
+                                if let Some((_, server)) = served {
+                                    prompt_channel::reject_line(server, &stdout_tool, &line);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            if last_pos < n {
-                let _ = out.write_all(&chunk[last_pos..n]);
-            }
-            let _ = out.flush();
         }
-        buf
+        if let Some(tail) = lines.finish() {
+            emit(&tail);
+        }
+        let _ = stdout_done.send(());
     });
 
     let stderr_thread = thread::spawn(move || {
         let mut buffer = [0; 1024];
         let mut reader = stderr;
-        let mut err = io::stderr();
-        let mut buf = Vec::new();
         while let Ok(n) = reader.read(&mut buffer) {
             if n == 0 {
                 break;
             }
-            let chunk = &buffer[0..n];
-            buf.extend_from_slice(chunk);
-            if quiet {
+            if stderr_detached.load(Ordering::Acquire) {
                 continue;
             }
-            let mut last_pos = 0;
-            for (i, &byte) in chunk.iter().enumerate() {
-                if byte == b'\n' {
-                    let _ = err.write_all(&chunk[last_pos..i]);
-                    let _ = err.write_all(b"\r\n");
-                    last_pos = i + 1;
-                }
-            }
-            if last_pos < n {
-                let _ = err.write_all(&chunk[last_pos..n]);
-            }
-            let _ = err.flush();
+            let chunk = &buffer[0..n];
+            stderr_sink.lock().extend_from_slice(chunk);
+            events::bus().publish(Event::ToolOutputChunk {
+                call_id: stderr_io.call_id.clone().unwrap_or_default(),
+                stream: OutputStream::Stderr,
+                bytes: chunk.to_vec(),
+            });
+            stderr_io.ui.tool_output(
+                stderr_io.call_id.as_deref(),
+                OutputStream::Stderr,
+                stderr_io.depth,
+                chunk,
+            );
         }
-        buf
+        let _ = stderr_done.send(());
     });
 
     let timeout_secs = tool_timeout_secs(tool_timeout);
@@ -2788,7 +3082,11 @@ pub fn run_llm_function(
                 break status;
             }
             Ok(None) => {}
-            Err(err) => bail!("Unable to run {command_name}, {err}"),
+            Err(err) => {
+                tool_exited.store(true, Ordering::Release);
+                pump_detached.store(true, Ordering::Release);
+                bail!("Unable to run {command_name}, {err}")
+            }
         }
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
@@ -2797,6 +3095,8 @@ pub fn run_llm_function(
                 "Tool process '{command_name}' killed after {:.1?} (timeout)",
                 spawned.elapsed()
             );
+            tool_exited.store(true, Ordering::Release);
+            pump_detached.store(true, Ordering::Release);
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -2805,7 +3105,8 @@ pub fn run_llm_function(
                 "Tool call '{command_name}' timed out after {timeout_secs}s and was killed (set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)"
             );
             emit_tool_warning(
-                quiet,
+                io.ui.as_ref(),
+                io.depth,
                 &format!("⚠️ {tool_error_message} ⚠️"),
                 &tool_error_message,
             );
@@ -2820,13 +3121,16 @@ pub fn run_llm_function(
                 "Tool process '{command_name}' killed after {:.1?} (abort)",
                 spawned.elapsed()
             );
+            tool_exited.store(true, Ordering::Release);
+            pump_detached.store(true, Ordering::Release);
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
             drop(stderr_thread);
             let tool_error_message = format!("Tool call '{command_name}' aborted");
             emit_tool_warning(
-                quiet,
+                io.ui.as_ref(),
+                io.depth,
                 &format!("⚠️ {tool_error_message} ⚠️"),
                 &tool_error_message,
             );
@@ -2836,8 +3140,26 @@ pub fn run_llm_function(
         }
         thread::sleep(Duration::from_millis(100));
     };
-    let stdout_bytes = stdout_thread.join().unwrap_or_default();
-    let stderr_bytes = stderr_thread.join().unwrap_or_default();
+    tool_exited.store(true, Ordering::Release);
+    let drain = |pump: thread::JoinHandle<()>,
+                 done: std::sync::mpsc::Receiver<()>,
+                 stream: OutputStream| {
+        match done.recv_timeout(TOOL_PUMP_DRAIN_GRACE) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = pump.join();
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                pump_detached.store(true, Ordering::Release);
+                debug!(
+                    "Tool '{command_name}' exited but a descendant still holds its {stream:?} pipe; detaching the pump"
+                );
+            }
+        }
+    };
+    drain(stdout_thread, stdout_done_rx, OutputStream::Stdout);
+    drain(stderr_thread, stderr_done_rx, OutputStream::Stderr);
+    let stdout_bytes = std::mem::take(&mut *stdout_buf.lock());
+    let stderr_bytes = std::mem::take(&mut *stderr_buf.lock());
 
     let exit_code = status.code().unwrap_or_default();
     if exit_code != 0 {
@@ -2845,7 +3167,8 @@ pub fn run_llm_function(
         let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
         let tool_error_message = format!("Tool call '{command_name}' exited with code {exit_code}");
         emit_tool_warning(
-            quiet,
+            io.ui.as_ref(),
+            io.depth,
             &format!("⚠️ {tool_error_message} ⚠️"),
             &tool_error_message,
         );
@@ -3006,9 +3329,16 @@ impl ToolCallTracker {
     }
 }
 
-fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &Value) -> String {
+/// The `Call <tool> <args>` narration line without any terminal styling.
+pub(crate) fn plain_call_log(cmd_name: &str, cmd_args: &[String]) -> String {
+    format!("Call {cmd_name} {}", cmd_args.join(" "))
+}
+
+/// The narration line as the terminal prints it: plain under `NO_COLOR`,
+/// otherwise with the tool name and the argument keys coloured.
+pub(crate) fn format_call_log(cmd_name: &str, cmd_args: &[String], json_data: &Value) -> String {
     if *NO_COLOR {
-        return format!("Call {cmd_name} {}", cmd_args.join(" "));
+        return plain_call_log(cmd_name, cmd_args);
     }
     let prefix_args = &cmd_args[..cmd_args.len().saturating_sub(1)];
     let prefix = if prefix_args.is_empty() {
@@ -3057,11 +3387,16 @@ mod tests {
     use crate::config::{Agent, AgentConfig, AppConfig, AppState, Session, WorkingMode};
     use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
     use crate::supervisor::mailbox::Inbox;
-    use crate::supervisor::notification::{agent_notification, job_notification};
+    use crate::supervisor::notification::{
+        SystemNotification, agent_notification, job_notification,
+    };
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
         Supervisor,
     };
+    use crate::turn::NoticeProbe;
+    #[cfg(unix)]
+    use crate::turn::{SilentSink, StdoutSink};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     use jobs::RingBuf;
@@ -3069,6 +3404,8 @@ mod tests {
     use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
+    #[cfg(unix)]
+    use std::sync::mpsc;
     use std::{mem, process};
 
     #[test]
@@ -3147,8 +3484,13 @@ mod tests {
             .block_on(f)
     }
 
-    fn submit_escalation(queue: &EscalationQueue, id: &str) {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
+    /// The receiver stands for the waiting asker; dropping it withdraws
+    /// the question from the queue.
+    fn submit_escalation(
+        queue: &EscalationQueue,
+        id: &str,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         queue.submit(EscalationRequest {
             id: id.to_string(),
             from_agent_id: "a1".into(),
@@ -3157,6 +3499,7 @@ mod tests {
             options: None,
             reply_tx: tx,
         });
+        rx
     }
 
     #[test]
@@ -3340,6 +3683,123 @@ mod tests {
         assert!(drain_live_notifications(&ctx).is_empty());
     }
 
+    #[test]
+    fn user_message_notification_merges_without_a_supervisor() {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "user-msg-probe-x7x".into(),
+            });
+        let expected = json!({
+            "output": "DONE",
+            "system_notifications": [{"event": "user_message", "text": "user-msg-probe-x7x"}],
+            "notification_instruction": "The user sent a message while you were working; \
+                read it before continuing.",
+        });
+
+        let notifications = drain_live_notifications(&ctx);
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(&mut result, vec![], notifications);
+
+        assert_eq!(
+            serde_json::to_string(&result.output).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn mixed_task_and_user_message_notifications_join_both_instructions() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(job_notification("job_live", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "user-msg-probe-x7x".into(),
+            });
+        let expected = json!({
+            "output": "DONE",
+            "system_notifications": [
+                {
+                    "event": "job_completed",
+                    "id": "job_live",
+                    "tool_or_agent": "execute_command",
+                    "status": "success",
+                    "next_action": "job__collect --id job_live for output",
+                },
+                {"event": "user_message", "text": "user-msg-probe-x7x"},
+            ],
+            "notification_instruction": "Background tasks have finished; collect each result \
+                with its next_action command. The user sent a message while you were \
+                working; read it before continuing.",
+        });
+
+        let notifications = drain_live_notifications(&ctx);
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!("DONE"));
+        merge_system_channel(&mut result, vec![], notifications);
+
+        assert_eq!(
+            serde_json::to_string(&result.output).unwrap(),
+            serde_json::to_string(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn drain_live_notifications_keeps_user_messages_but_drops_dead_tasks() {
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "user-msg-probe-x7x".into(),
+            });
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(
+            live,
+            vec![json!({"event": "user_message", "text": "user-msg-probe-x7x"})]
+        );
+    }
+
+    /// Each user message leaving the queue is announced once, in queue
+    /// order; task events are not, whatever their fate.
+    #[test]
+    #[serial]
+    fn drain_live_notifications_announces_each_sent_user_message_in_order() {
+        let recording = crate::events::RecordingSink::install();
+        let ctx = ctx_with_registered_job("job_live");
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "sent-probe-k4e-a".into(),
+            });
+        ctx.notification_queue
+            .push(job_notification("job_gone", "execute_command", true));
+        ctx.notification_queue
+            .push(SystemNotification::UserMessage {
+                text: "sent-probe-k4e-b".into(),
+            });
+
+        let live = drain_live_notifications(&ctx);
+
+        assert_eq!(live.len(), 2);
+        let sent: Vec<Event> = recording
+            .drain()
+            .into_iter()
+            .filter(|event| matches!(event, Event::QueuedInputSent { text } if text.contains("sent-probe-k4e")))
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                Event::QueuedInputSent {
+                    text: "sent-probe-k4e-a".into()
+                },
+                Event::QueuedInputSent {
+                    text: "sent-probe-k4e-b".into()
+                },
+            ]
+        );
+    }
+
     fn ctx_with_registered_agent(id: &str) -> RequestContext {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3411,7 +3871,7 @@ mod tests {
         let mut ctx = ctx_with_registered_job("job_n1");
         ctx.current_depth = 1;
         let queue = ctx.ensure_root_escalation_queue();
-        submit_escalation(&queue, "esc_1");
+        let _asker = submit_escalation(&queue, "esc_1");
         ctx.notification_queue
             .push(job_notification("job_n1", "execute_command", true));
 
@@ -3432,7 +3892,7 @@ mod tests {
     fn eval_tool_calls_merges_both_channels_onto_last_result() {
         let mut ctx = ctx_with_registered_job("job_n1");
         let queue = ctx.ensure_root_escalation_queue();
-        submit_escalation(&queue, "esc_1");
+        let _asker = submit_escalation(&queue, "esc_1");
         ctx.notification_queue
             .push(job_notification("job_n1", "execute_command", false));
 
@@ -3463,7 +3923,7 @@ mod tests {
     fn eval_tool_calls_injects_escalations_into_last_result() {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
         let queue = ctx.ensure_root_escalation_queue();
-        submit_escalation(&queue, "esc_1");
+        let _asker = submit_escalation(&queue, "esc_1");
 
         let calls = vec![call("unknown_tool", Some("id-1"))];
         let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
@@ -5106,6 +5566,46 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn eval_mcp_publishes_tool_narration() {
+        let recording = crate::events::RecordingSink::install();
+        let fixture = FixtureServer {
+            tool_result: Some(CallToolResult::success(vec![ContentBlock::text("hi")])),
+            ..Default::default()
+        };
+
+        run_async(async {
+            let (runtime, _server) = fixture_runtime(fixture).await;
+            let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+            ctx.tool_scope.mcp_runtime = runtime;
+            call_with_args(
+                "mcp_invoke_fixture",
+                json!({"tool": "dup", "arguments": {"q": "mcp-narration-probe-x7x"}}),
+            )
+            .eval_mcp(&ctx)
+            .await
+        })
+        .unwrap();
+
+        let narrations: Vec<(String, String)> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolNarration { call_id, line }
+                    if line.contains("mcp-narration-probe-x7x") =>
+                {
+                    Some((call_id, line))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(narrations.len(), 1, "{narrations:?}");
+        assert_eq!(narrations[0].0, "id1");
+        assert!(narrations[0].1.starts_with("Call mcp_invoke_fixture "));
+        assert!(!narrations[0].1.contains('\x1b'));
+    }
+
+    #[test]
     fn functions_supervisor_includes_task_queue_tools() {
         let mut f = Functions::default();
         f.append_supervisor_functions();
@@ -5261,7 +5761,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
-            false,
+            ToolIo::new(Arc::new(StdoutSink::default()), None, 0),
             None,
         )
         .unwrap()
@@ -5281,23 +5781,152 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn run_llm_function_quiet_still_collects_output_buffers() {
-        let result = run_llm_function(
+    #[serial]
+    fn run_llm_function_publishes_output_chunks_per_stream() {
+        let recording = crate::events::RecordingSink::install();
+        run_llm_function(
             "bash".into(),
             vec![
                 "-c".into(),
-                "echo partial-output >> \"$LLM_OUTPUT\"; echo err-text >&2; exit 3".into(),
+                "printf out-chunk-x7x; printf err-chunk-x7x >&2".into(),
             ],
             HashMap::new(),
             None,
             None,
-            true,
+            ToolIo::new(Arc::new(SilentSink), Some("call-chunk-x7x".into()), 0),
             None,
         )
-        .unwrap()
-        .output
-        .expect("nonzero exit must return an error payload");
+        .unwrap();
 
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        for event in recording.drain() {
+            if let Event::ToolOutputChunk {
+                call_id,
+                stream,
+                bytes,
+            } = event
+                && call_id == "call-chunk-x7x"
+            {
+                match stream {
+                    OutputStream::Stdout => stdout_bytes.extend(bytes),
+                    OutputStream::Stderr => stderr_bytes.extend(bytes),
+                }
+            }
+        }
+        assert_eq!(String::from_utf8(stdout_bytes).unwrap(), "out-chunk-x7x");
+        assert_eq!(String::from_utf8(stderr_bytes).unwrap(), "err-chunk-x7x");
+    }
+
+    #[test]
+    fn emit_tool_warning_hands_the_sink_unpainted_text_at_depth_zero_only() {
+        let probe = NoticeProbe::default();
+        emit_tool_warning(&probe, 1, "⚠️ boom ⚠️", "boom");
+        assert!(probe.notices().is_empty());
+
+        emit_tool_warning(&probe, 0, "⚠️ boom ⚠️", "boom");
+        let notices = probe.notices();
+        assert_eq!(
+            notices,
+            vec![(NoticeKind::ToolWarning, "⚠️ boom ⚠️".to_string())]
+        );
+        assert!(!notices[0].1.contains('\x1b'));
+    }
+
+    #[test]
+    fn eval_tool_calls_hands_the_loop_alert_to_the_sink_unpainted() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let probe = Arc::new(NoticeProbe::default());
+        ctx.ui = Arc::clone(&probe) as Arc<dyn UiSink>;
+        let repeated = call_with_args("loop-probe-x7x", json!({"a": 1}));
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+
+        let results = run_async(eval_tool_calls(&mut ctx, vec![repeated])).unwrap();
+
+        assert_eq!(
+            probe.notices(),
+            vec![(
+                NoticeKind::ToolWarning,
+                "loop-probe-x7x: ⚠️ Tool-call loop detected! ⚠️".to_string()
+            )]
+        );
+        assert!(
+            results[0]
+                .output
+                .as_str()
+                .is_some_and(|text| text.contains("tool_call_loop_alert"))
+        );
+    }
+
+    #[test]
+    fn eval_tool_calls_keeps_the_loop_alert_off_the_sink_at_depth_one() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.current_depth = 1;
+        let probe = Arc::new(NoticeProbe::default());
+        ctx.ui = Arc::clone(&probe) as Arc<dyn UiSink>;
+        let repeated = call_with_args("loop-depth1-probe-x7x", json!({"a": 1}));
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+        ctx.tool_scope.tool_tracker.record_call(repeated.clone());
+
+        let results = run_async(eval_tool_calls(&mut ctx, vec![repeated])).unwrap();
+
+        assert!(probe.notices().is_empty());
+        assert!(
+            results[0]
+                .output
+                .as_str()
+                .is_some_and(|text| text.contains("tool_call_loop_alert"))
+        );
+    }
+
+    // The capture lock is held on this thread, so a regression that echoes
+    // depth-1 output would block the pump thread on `io::stdout()` and
+    // `run_llm_function` would never return from joining it. Running it on
+    // a helper thread turns that deadlock into a timeout we can report.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_at_depth_one_keeps_tool_output_off_the_terminal() {
+        let (saved, mut reader) = crate::testing::capture_stdout();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_llm_function(
+                "bash".into(),
+                vec![
+                    "-c".into(),
+                    "echo depth-one-marker-x7x; echo partial-output >> \"$LLM_OUTPUT\"; echo err-text >&2; exit 3".into(),
+                ],
+                HashMap::new(),
+                None,
+                None,
+                ToolIo::new(Arc::new(StdoutSink::default()), Some("call-1".into()), 1),
+                None,
+            );
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(saved);
+                panic!(
+                    "depth-1 tool output reached io::stdout(): the pump thread blocked on the capture lock"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(saved);
+                panic!("the helper thread panicked before reporting");
+            }
+        };
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(!out.contains("depth-one-marker-x7x"), "{out:?}");
+        crate::testing::write_fd1(out.as_bytes());
+
+        let result = result
+            .unwrap()
+            .output
+            .expect("nonzero exit must return an error payload");
         let json: Value = serde_json::from_str(&result).unwrap();
         assert!(
             json["tool_call_error"]
@@ -5329,7 +5958,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
-            true,
+            ToolIo::new(Arc::new(StdoutSink::default()), None, 1),
             Some(abort),
         )
         .unwrap()
@@ -5360,7 +5989,7 @@ mod tests {
                 envs,
                 None,
                 tool_timeout,
-                true,
+                ToolIo::new(Arc::new(SilentSink), None, 0),
                 abort,
             )
             .unwrap(),
@@ -6614,11 +7243,60 @@ mod tests {
             captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
             Some("todo__init")
         );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert_eq!(captures[0].payload.as_deref(), Some(r#"{"goal":"g"}"#));
         assert_eq!(captures[0].cwd, paths::config_dir());
         assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert!(captures[1].envs.contains_key("COYOTE_TOOL_DURATION_MS"));
         assert_eq!(captures[1].payload.as_deref(), Some(r#"{"goal":"g"}"#));
+    }
+
+    #[test]
+    #[serial]
+    fn eval_fires_tool_hooks_with_empty_call_id_when_the_call_has_no_id() {
+        use crate::hooks::HookEvent;
+        let marker = "tool-hooks-no-id-x7x";
+        let mut ctx = ctx_with_tool_hooks(marker, |config| {
+            config.function_calling_support = true;
+            config.auto_continue = true;
+        });
+        ctx.tool_scope.functions.append_todo_functions();
+        let _guard = hooks::test_sink::install();
+
+        let output = run_async(call("todo__init", None).eval(&mut ctx)).unwrap();
+
+        assert_eq!(output["status"], "ok");
+        let captures = tool_captures(marker);
+        assert_eq!(captures.len(), 2, "{captures:?}");
+        assert_eq!(captures[0].event, HookEvent::ToolStarted);
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("")
+        );
+        assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("")
+        );
     }
 
     #[test]
@@ -6654,6 +7332,13 @@ mod tests {
                 captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
                 Some("mcp_invoke_fixture")
             );
+            assert_eq!(
+                captures[0]
+                    .envs
+                    .get("COYOTE_TOOL_CALL_ID")
+                    .map(String::as_str),
+                Some("id1")
+            );
             assert_eq!(captures[0].payload.as_deref(), Some(r#"{"tool":"dup"}"#));
             assert_eq!(captures[1].event, HookEvent::ToolCompleted);
         });
@@ -6686,7 +7371,116 @@ mod tests {
             captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
             Some("echo")
         );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert_eq!(captures[1].event, HookEvent::ToolCompleted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_publishes_tool_narration_for_external_command_tools() {
+        let recording = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_tool_hooks("tool-narration-x7x", |_| {});
+        ctx.ui = Arc::new(SilentSink);
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "echo".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        run_async(call_with_args("echo", json!({"x": "narration-probe-x7x"})).eval(&mut ctx))
+            .unwrap();
+
+        let narrations: Vec<(String, String)> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolNarration { call_id, line } if line.contains("narration-probe-x7x") => {
+                    Some((call_id, line))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(narrations.len(), 1, "{narrations:?}");
+        let (call_id, line) = &narrations[0];
+        assert_eq!(call_id, "id1");
+        assert!(line.contains("echo"), "{line:?}");
+        assert!(!line.contains('\x1b'), "{line:?}");
+    }
+
+    // A child agent's tool call still announces itself on the bus, while the
+    // terminal sink keeps fd 1 silent for it. The capture lock is held on
+    // this thread, so the call runs on a helper thread: a regression that
+    // echoed at depth 1 would block the pump on `io::stdout()` and show up
+    // here as a timeout instead of a deadlock.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_at_depth_one_publishes_narration_but_keeps_fd_one_silent() {
+        let recording = crate::events::RecordingSink::install();
+        let mut ctx = ctx_with_tool_hooks("tool-narration-depth-one-x7x", |_| {});
+        ctx.current_depth = 1;
+        ctx.ui = Arc::new(StdoutSink::default());
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "echo".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let (saved, mut reader) = crate::testing::capture_stdout();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = run_async(
+                call_with_args("echo", json!({"x": "depth-one-narration-x7x"})).eval(&mut ctx),
+            );
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(saved);
+                panic!(
+                    "depth-1 tool output reached io::stdout(): the pump thread blocked on the capture lock"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(saved);
+                panic!("the helper thread panicked before reporting");
+            }
+        };
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(!out.contains("depth-one-narration-x7x"), "{out:?}");
+        crate::testing::write_fd1(out.as_bytes());
+
+        assert_eq!(result.unwrap(), Value::Null);
+        let narrations: Vec<(String, String)> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ToolNarration { call_id, line }
+                    if line.contains("depth-one-narration-x7x") =>
+                {
+                    Some((call_id, line))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(narrations.len(), 1, "{narrations:?}");
+        assert_eq!(narrations[0].0, "id1");
+        assert!(!narrations[0].1.contains('\x1b'), "{:?}", narrations[0].1);
     }
 
     #[cfg(unix)]
@@ -6713,6 +7507,13 @@ mod tests {
         assert_eq!(captures.len(), 2, "{captures:?}");
         assert_eq!(captures[0].event, HookEvent::ToolStarted);
         assert_eq!(captures[1].event, HookEvent::ToolFailed);
+        assert_eq!(
+            captures[1]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert!(
             captures[1]
                 .envs
@@ -6891,6 +7692,13 @@ mod tests {
             captures[0].envs.get("COYOTE_TOOL_NAME").map(String::as_str),
             Some("nonexistent_tool")
         );
+        assert_eq!(
+            captures[0]
+                .envs
+                .get("COYOTE_TOOL_CALL_ID")
+                .map(String::as_str),
+            Some("id1")
+        );
         assert!(
             captures[0]
                 .envs
@@ -6899,5 +7707,28 @@ mod tests {
                 .contains("Unexpected call")
         );
         assert!(captures[0].payload.is_none());
+    }
+
+    /// A tool task that ends without a result is named for how it ended:
+    /// a panic keeps its message, a cancel is not called a panic.
+    #[test]
+    fn a_tool_task_that_did_not_finish_says_whether_it_panicked_or_was_cancelled() {
+        run_async(async {
+            let cancelled = tokio::spawn(std::future::pending::<()>());
+            cancelled.abort();
+            let err = cancelled.await.unwrap_err();
+            assert_eq!(
+                tool_task_failure(err).to_string(),
+                "tool task was cancelled"
+            );
+
+            let panicked = tokio::spawn(async { panic!("tool boom x7x") });
+            let err = panicked.await.unwrap_err();
+            let message = tool_task_failure(err).to_string();
+            assert!(
+                message.starts_with("tool task panicked: ") && message.contains("tool boom x7x"),
+                "{message}"
+            );
+        });
     }
 }

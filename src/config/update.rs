@@ -1,12 +1,13 @@
+use crate::config::conflict::menu_can_use_terminal;
+use crate::prompt::Prompter;
 use crate::utils::warning_text;
 use anyhow::{Context, Result, bail};
 use dunce::canonicalize;
-use inquire::Confirm;
 use is_terminal::IsTerminal;
 use self_update::Status;
 use self_update::backends::github::Update;
 use std::fs::OpenOptions;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{env, fs, io, process};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,11 +90,27 @@ fn is_dir_writable(dir: &Path) -> bool {
     }
 }
 
-pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
-    let target_tag = normalize_version(requested);
-
+/// `remedy` names what the caller offers instead of the package-manager
+/// confirm (the CLI has `--force`, the REPL nothing).
+pub fn run_self_update(
+    requested: Option<String>,
+    force: bool,
+    prompter: &dyn Prompter,
+    remedy: &str,
+) -> Result<()> {
     let exe_path = env::current_exe()
         .context("Could not determine the path of the running coyote executable")?;
+    update_binary_at(exe_path, requested, force, prompter, remedy)
+}
+
+fn update_binary_at(
+    exe_path: PathBuf,
+    requested: Option<String>,
+    force: bool,
+    prompter: &dyn Prompter,
+    remedy: &str,
+) -> Result<()> {
+    let target_tag = normalize_version(requested);
     let resolved = canonicalize(&exe_path).unwrap_or_else(|_| exe_path.clone());
     let source = classify_install_path(&resolved);
 
@@ -119,19 +136,18 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
 
         if force {
             println!("--force specified; updating anyway.");
-        } else if io::stdin().is_terminal() {
-            let proceed = Confirm::new("Update anyway?")
-                .with_default(false)
-                .prompt()?;
+        } else if menu_can_use_terminal() {
+            let proceed =
+                crate::prompt::confirm_with_help(prompter, "Update anyway?", false, &body)?;
             if !proceed {
                 println!("Update cancelled.");
                 return Ok(());
             }
         } else {
-            bail!(
-                "Refusing to update a {} install. Re-run with --force to override.",
-                source.label()
-            );
+            return Err(crate::config::conflict::refuse_non_interactive(
+                format_args!("update a {} install", source.label()),
+                remedy,
+            ));
         }
     }
 
@@ -145,7 +161,9 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
         );
     }
 
-    let interactive = io::stdin().is_terminal();
+    // The bar redraws with carriage returns, which the full-screen UI's
+    // captured stdout would show as a wall of frames.
+    let interactive = !crate::tui::active() && io::stdin().is_terminal();
     let mut builder = Update::configure();
     builder
         .repo_owner("Dark-Alex-17")
@@ -180,7 +198,13 @@ pub fn run_self_update(requested: Option<String>, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::prompt::{
+        HeadlessPrompter, NeedsHuman, PromptAction, PromptAnswer, ScriptedPrompter,
+    };
+    use crate::testing::AtomicFlagGuard;
+    use serial_test::serial;
+
+    const CARGO_INSTALLED: &str = "/home/u/.cargo/bin/coyote";
 
     #[test]
     fn classify_cargo_install() {
@@ -253,5 +277,97 @@ mod tests {
             normalize_version(Some("  v0.4.0  ".to_string())),
             Some("v0.4.0".to_string())
         );
+    }
+
+    /// A package-managed install asks before updating in place; under the
+    /// full-screen UI the question is a Confirm through the prompter,
+    /// defaulting to no, and declining ends the update before any download.
+    #[test]
+    #[serial]
+    fn package_managed_update_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+
+        update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter, ".").unwrap();
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Update anyway?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+        assert_eq!(
+            requests[0].help.as_deref(),
+            Some(
+                "Coyote appears to be installed via `cargo install` (/home/u/.cargo/bin/coyote).\n\
+                 Updating in place leaves Cargo's records out of sync with the binary on disk.\n\
+                 The clean way to update is:  cargo install --locked coyote-ai"
+            )
+        );
+    }
+
+    /// Esc or Ctrl-C at the package-managed question ends the update with
+    /// an error before any download.
+    #[test]
+    #[serial]
+    fn closing_the_package_managed_question_aborts_the_update() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        for answer in [PromptAnswer::Cancelled, PromptAnswer::Interrupted] {
+            let prompter = ScriptedPrompter::new(vec![answer.clone()]);
+
+            let err = update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter, ".")
+                .unwrap_err();
+
+            assert!(
+                crate::prompt::PromptCancelled::caused(&err),
+                "{answer:?}: {err:#}"
+            );
+            assert_eq!(prompter.requests().len(), 1);
+        }
+    }
+
+    /// Off a terminal and without --force, a package-managed update is
+    /// refused in the shape every non-interactive menu shares, ending in
+    /// the remedy the caller offers.
+    #[test]
+    #[serial]
+    fn package_managed_update_without_a_tty_is_refused() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = update_binary_at(
+            PathBuf::from(CARGO_INSTALLED),
+            None,
+            false,
+            &prompter,
+            " or pass --force.",
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.starts_with("Refusing to update a"), "{message}");
+        assert!(
+            message.contains("non-interactively. Re-run in a terminal"),
+            "{message}"
+        );
+        assert!(message.ends_with(" or pass --force."), "{message}");
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn package_managed_update_under_the_tui_with_no_human_is_refused() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        let err = update_binary_at(
+            PathBuf::from(CARGO_INSTALLED),
+            None,
+            false,
+            &HeadlessPrompter,
+            ".",
+        )
+        .unwrap_err();
+
+        assert!(NeedsHuman::caused(&err), "{err:?}");
     }
 }

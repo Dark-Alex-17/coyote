@@ -3,22 +3,20 @@ use super::{AbortSignal, IS_STDOUT_TERMINAL, poll_abort_signal, wait_abort_signa
 use anyhow::{Result, anyhow};
 use crossterm::{cursor, queue, style, terminal};
 #[cfg(test)]
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     future::Future,
     io::{Write, stdout},
+    sync::{Arc, Mutex, mpsc as std_mpsc},
     time::Duration,
 };
-use tokio::{
-    sync::{
-        mpsc::{self, UnboundedReceiver},
-        oneshot,
-    },
-    time::interval,
+use tokio::sync::{
+    mpsc::{self, UnboundedReceiver},
+    oneshot,
 };
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+const STOP_ACK_DEADLINE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Default)]
 pub struct SpinnerInner {
@@ -101,25 +99,56 @@ impl Drop for SpinnerInner {
 }
 
 #[derive(Clone)]
-pub struct Spinner(mpsc::UnboundedSender<SpinnerEvent>);
+enum SpinnerTx {
+    Std(std_mpsc::Sender<SpinnerEvent>),
+    Tokio(mpsc::UnboundedSender<SpinnerEvent>),
+}
+
+impl SpinnerTx {
+    fn send(&self, event: SpinnerEvent) -> Result<()> {
+        match self {
+            Self::Std(tx) => tx.send(event)?,
+            Self::Tokio(tx) => tx.send(event)?,
+        }
+        Ok(())
+    }
+}
+
+/// Handle to a running spinner. A `spawn_spinner` one lives on its own
+/// thread and acknowledges `stop` once the terminal is clear; a `create`
+/// one is stepped by whichever `abortable_run_with_spinner*` call consumes
+/// its receiver, so its stop needs no ack.
+#[derive(Clone)]
+pub struct Spinner {
+    tx: SpinnerTx,
+    cleared: Option<Arc<Mutex<std_mpsc::Receiver<()>>>>,
+}
 
 impl Spinner {
     pub fn create(message: &str) -> (Self, UnboundedReceiver<SpinnerEvent>) {
         let (tx, spinner_rx) = mpsc::unbounded_channel();
-        let spinner = Spinner(tx);
+        let spinner = Spinner {
+            tx: SpinnerTx::Tokio(tx),
+            cleared: None,
+        };
         let _ = spinner.set_message(message.to_string());
         (spinner, spinner_rx)
     }
 
     pub fn set_message(&self, message: String) -> Result<()> {
-        self.0.send(SpinnerEvent::SetMessage(message))?;
-        std::thread::sleep(Duration::from_millis(10));
-        Ok(())
+        self.tx.send(SpinnerEvent::SetMessage(message))
     }
 
+    /// Returns once the spinner's line is gone, or after `STOP_ACK_DEADLINE`
+    /// if the thread never answers; the caller may print straight after.
     pub fn stop(&self) {
-        let _ = self.0.send(SpinnerEvent::Stop);
-        std::thread::sleep(Duration::from_millis(10));
+        let _ = self.tx.send(SpinnerEvent::Stop);
+        if let Some(cleared) = &self.cleared {
+            let _ = cleared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(STOP_ACK_DEADLINE);
+        }
     }
 }
 
@@ -128,34 +157,55 @@ pub enum SpinnerEvent {
     Stop,
 }
 
+/// Runs the spinner on its own thread, off the tokio runtime, so a frame
+/// lands every `FRAME_INTERVAL` whatever the async workers are doing and
+/// `stop` can block on the clear without a runtime in scope.
 pub fn spawn_spinner(message: &str) -> Spinner {
-    let (spinner, mut spinner_rx) = Spinner::create(message);
-    tokio::spawn(async move {
-        let mut spinner = SpinnerInner::default();
-        let mut interval = interval(Duration::from_millis(50));
-        loop {
-            tokio::select! {
-                evt = spinner_rx.recv() => {
-                    if let Some(evt) = evt {
-                        match evt {
-                            SpinnerEvent::SetMessage(message) => {
-                                spinner.set_message(message)?;
-                            }
-                            SpinnerEvent::Stop => {
-                                spinner.clear_message()?;
-                                break;
-                            }
-                        }
+    spawn_spinner_with(SpinnerInner::default(), message)
+}
 
+/// Returns a dark handle when the thread cannot be spawned, and under the
+/// full-screen UI without trying (the frames would land in the turn's fd
+/// capture): sends fail harmlessly and `stop` has no ack to wait for.
+fn spawn_spinner_with(mut inner: SpinnerInner, message: &str) -> Spinner {
+    let (tx, spinner_rx) = std_mpsc::channel();
+    if crate::tui::active() {
+        return Spinner {
+            tx: SpinnerTx::Std(tx),
+            cleared: None,
+        };
+    }
+    let (cleared_tx, cleared_rx) = std_mpsc::channel();
+    let mut spinner = Spinner {
+        tx: SpinnerTx::Std(tx),
+        cleared: Some(Arc::new(Mutex::new(cleared_rx))),
+    };
+    let _ = spinner.set_message(message.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("spinner".into())
+        .spawn(move || {
+            loop {
+                match spinner_rx.recv_timeout(FRAME_INTERVAL) {
+                    Ok(SpinnerEvent::SetMessage(message)) => {
+                        if inner.set_message(message).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(SpinnerEvent::Stop) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        break;
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        let _ = inner.step();
                     }
                 }
-                _ = interval.tick() => {
-                    let _ = spinner.step();
-                }
             }
-        }
-        Ok::<(), anyhow::Error>(())
-    });
+            let _ = inner.clear_message();
+            let _ = cleared_tx.send(());
+        });
+    if let Err(err) = spawned {
+        debug!("Failed to spawn the spinner thread: {err}");
+        spinner.cleared = None;
+    }
     spinner
 }
 
@@ -213,6 +263,11 @@ where
     run_with_spinner_rx(task, spinner_rx, abort_signal, *IS_STDOUT_TERMINAL, policy).await
 }
 
+/// Under the full-screen UI no spinner runs and no SIGINT listener is
+/// armed, whatever the caller's `policy` says: the frames would land in the
+/// turn's fd capture as escape garbage, and the spinner's abort polling
+/// would read keystrokes the UI's event stream owns. The UI turns Esc into
+/// `set_ctrlc`, which `run_abortable` still honours.
 async fn run_with_spinner_rx<F, T>(
     task: F,
     spinner_rx: UnboundedReceiver<SpinnerEvent>,
@@ -223,6 +278,10 @@ async fn run_with_spinner_rx<F, T>(
 where
     F: Future<Output = Result<T>>,
 {
+    if crate::tui::active() {
+        let (done_tx, _done_rx) = oneshot::channel();
+        return run_abortable(task, &abort_signal, UserInterrupt::NotOwned, done_tx).await;
+    }
     if on_terminal {
         let (done_tx, done_rx) = oneshot::channel();
         let (task_ret, spinner_ret) = tokio::join!(
@@ -332,6 +391,7 @@ async fn run_abortable_spinner(
 mod tests {
     use super::*;
     use crate::utils::create_abort_signal;
+    use serial_test::serial;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -343,6 +403,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn drop_with_active_message_clears_once() {
         let (spinner, cleared) = observed("Thinking");
         assert_eq!(cleared.load(Ordering::SeqCst), 0);
@@ -351,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn explicit_clear_then_drop_clears_exactly_once() {
         let (mut spinner, cleared) = observed("Thinking");
         spinner.clear_message().unwrap();
@@ -369,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn set_message_replaces_and_clears_previous_once() {
         let (mut spinner, cleared) = observed("Thinking");
         spinner.set_message("Fetching".to_string()).unwrap();
@@ -378,6 +441,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn cancelled_task_restores_terminal_on_drop() {
         let (spinner, cleared) = observed("Thinking");
         let task = tokio::spawn(async move {
@@ -392,12 +456,90 @@ mod tests {
         assert_eq!(cleared.load(Ordering::SeqCst), 1);
     }
 
+    /// No runtime here on purpose: the thread-backed spinner must stop from
+    /// plain sync code. The counter, not the clock, proves the clear ran
+    /// before `stop` returned; the timing bound only shows it was the ack
+    /// that released the call rather than the deadline.
+    #[test]
+    #[serial]
+    fn spawned_spinner_stop_returns_after_the_clear() {
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let spinner = spawn_spinner_with(SpinnerInner::observed(cleared.clone()), "Thinking");
+        std::thread::sleep(FRAME_INTERVAL * 2);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+
+        let started = std::time::Instant::now();
+        spinner.stop();
+        let elapsed = started.elapsed();
+
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+        assert!(elapsed < STOP_ACK_DEADLINE / 2, "stop took {elapsed:?}");
+
+        spinner.stop();
+        assert_eq!(cleared.load(Ordering::SeqCst), 1);
+    }
+
+    /// Under the full-screen UI the thread-backed spinner is inert: no
+    /// thread takes the message, so there is never a frame to clear, and
+    /// `stop` has no ack to wait for.
+    #[test]
+    #[serial]
+    fn under_the_tui_a_spawned_spinner_is_inert() {
+        let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let cleared = Arc::new(AtomicUsize::new(0));
+        let spinner = spawn_spinner_with(SpinnerInner::observed(cleared.clone()), "Thinking");
+        std::thread::sleep(FRAME_INTERVAL * 2);
+
+        let started = std::time::Instant::now();
+        spinner.stop();
+
+        assert!(started.elapsed() < STOP_ACK_DEADLINE / 2);
+        assert_eq!(cleared.load(Ordering::SeqCst), 0);
+    }
+
     fn set_ctrlc_soon(abort_signal: &AbortSignal) {
         let abort_signal = abort_signal.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
             abort_signal.set_ctrlc();
         });
+    }
+
+    /// While the full-screen UI owns the terminal the choke point runs the
+    /// task bare: the abort signal still ends it, well before the task
+    /// would have, and a task that finishes hands its value back.
+    #[tokio::test]
+    #[serial]
+    async fn under_the_tui_the_task_runs_bare_and_still_aborts_on_the_signal() {
+        let _tui = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let abort_signal = create_abort_signal();
+        set_ctrlc_soon(&abort_signal);
+        let (_, spinner_rx) = Spinner::create("Thinking");
+        let started = std::time::Instant::now();
+        let err = abortable_run_with_spinner_rx(
+            async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(())
+            },
+            spinner_rx,
+            abort_signal,
+            UserInterrupt::Owned,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Aborted"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let (_, spinner_rx) = Spinner::create("Thinking");
+        let value = abortable_run_with_spinner_rx(
+            async { Ok(42) },
+            spinner_rx,
+            create_abort_signal(),
+            UserInterrupt::Owned,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 42);
     }
 
     async fn run<F, T>(task: F, abort_signal: &AbortSignal, policy: UserInterrupt) -> Result<T>
@@ -504,9 +646,16 @@ mod tests {
     }
 
     fn production_half(source: &str) -> &str {
-        source
-            .find("\n#[cfg(test)]\nmod tests")
-            .map_or(source, |end| &source[..end])
+        // A test module is gated plain or, when every case needs unix,
+        // with the target in the same attribute.
+        [
+            "\n#[cfg(test)]\nmod tests",
+            "\n#[cfg(all(test, unix))]\nmod tests",
+        ]
+        .iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .map_or(source, |end| &source[..end])
     }
 
     /// The top-level arguments of the call whose opening paren starts `rest`.
@@ -548,10 +697,12 @@ mod tests {
     /// turn and says so with the `Owned` literal, or forwards its caller's
     /// `policy`; a new call site has to pick one of those on purpose. The
     /// `NotOwned` literal itself belongs only to the derivation in
-    /// `request_context.rs` and the match in this file. The census assumes
-    /// the production half of a file ends at a `\n#[cfg(test)]\nmod tests`
-    /// marker, and `call_args` is not string-literal aware, so a paren or
-    /// comma inside a quoted argument miscounts.
+    /// `request_context.rs` and, in this file, the match and the
+    /// full-screen UI's choke point in `run_with_spinner_rx`. The
+    /// census assumes the production half of a file ends at a
+    /// `\n#[cfg(test)]\nmod tests` marker, and `call_args` is not
+    /// string-literal aware, so a paren or comma inside a quoted argument
+    /// miscounts.
     #[test]
     fn interrupt_policy_is_derived_at_three_sites_and_owned_literally_elsewhere() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -611,7 +762,7 @@ mod tests {
             not_owned_literals,
             BTreeMap::from([
                 ("config/request_context.rs".to_string(), 1),
-                ("utils/spinner.rs".to_string(), 1),
+                ("utils/spinner.rs".to_string(), 2),
             ])
         );
         assert!(unpinned.is_empty(), "{}", unpinned.join("\n"));

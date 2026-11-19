@@ -315,7 +315,9 @@ You can use the following settings to modify the behavior of Coyote:
 | `save`        | `true`        | Controls whether to save each query/response to every model to `messages.md` for posterity; Useful for debugging                    |
 | `keybindings` | `emacs`       | Specifies which keybinding schema to use; can either be `emacs` or `vi`                                                             |
 | `command_prefix` | `dot`      | Which sigil starts a REPL command: `dot` (`.info`), `slash` (`/info`), or `both` (either). Set at runtime with `.set command_prefix`. Hints printed outside the REPL (for example by `coyote --auth-mcp`) always use the `.` form. Macro steps are always accepted in the `.` form regardless of this setting. |
-| `editor`      | `null`        | What text editor Coyote should use to edit the input buffer or session (e.g. `vim`, `emacs`, `nano`, `hx`); <br>Defaults to `$EDITOR` |
+| `ui`          | `repl`        | Which shell starts for an interactive run: `repl` (the line-editor [REPL](https://github.com/Dark-Alex-17/coyote/wiki/REPL)) or `tui` (the full-screen [TUI](https://github.com/Dark-Alex-17/coyote/wiki/TUI)); <br>Also `--tui` / `--repl` for one run |
+| `tui_dump_on_exit` | `true`   | Print the conversation on the normal screen when the [TUI](https://github.com/Dark-Alex-17/coyote/wiki/TUI) leaves                  |
+| `editor`      | `null`        | What text editor Coyote should use to edit the input buffer or session (e.g. `vim`, `emacs`, `nano`, `hx`); <br>Defaults to `$VISUAL`, then `$EDITOR` |
 | `wrap`        | `no`          | Controls whether text is wrapped (can be `no`, `auto`, or some `<max_width>`                                                        |
 | `wrap_code`   | `false`       | Enables or disables the wrapping of code blocks                                                                                     |
 
@@ -335,7 +337,7 @@ The appearance of Coyote can be modified using the following settings:
 | Setting       | Default Value | Description                                          |
 |---------------|---------------|------------------------------------------------------|
 | `highlight`   | `true`        | This setting enables or disables syntax highlighting |
-| `light_theme` | `false`       | This setting toggles light mode in Coyote              |
+| `theme`       | `null`        | `null` asks the terminal for its background and uses the matching built-in theme (dark when the terminal does not answer); `light` or `dark` picks one. `COYOTE_THEME` is used while `theme` is null. See [Themes](https://github.com/Dark-Alex-17/coyote/wiki/Themes) |
 
 ### Miscellaneous Settings
 | Setting              | Default Value | Description                                                                                                      |

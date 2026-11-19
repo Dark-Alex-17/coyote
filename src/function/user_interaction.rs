@@ -1,12 +1,12 @@
 use super::{FunctionDeclaration, JsonSchema};
 use crate::config::RequestContext;
 use crate::hooks::{self, HookEvent};
+use crate::prompt::{NeedsHuman, PromptAction, PromptAnswer, PromptRequest, headless_reply};
 use crate::supervisor::escalation::{EscalationRequest, new_escalation_id};
-use crate::utils::{ACP_SERVER, HEADLESS, queue_acp_permission};
+use crate::utils::{ACP_SERVER, AbortSignal, HEADLESS, queue_acp_permission, wait_abort_signal};
 
 use anyhow::{Result, anyhow, bail};
 use indexmap::IndexMap;
-use inquire::{Confirm, MultiSelect, Select, Text};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -16,7 +16,6 @@ pub const USER_FUNCTION_PREFIX: &str = "user__";
 pub const HEADLESS_GUIDANCE: &str = "No human is available to answer. Go with the recommended option; if none is marked, use your best judgment.";
 
 const DEFAULT_ESCALATION_TIMEOUT_SECS: u64 = 0;
-const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 
 pub fn user_interaction_function_declarations() -> Vec<FunctionDeclaration> {
     vec![
@@ -136,14 +135,16 @@ pub async fn handle_user_tool(
     cmd_name: &str,
     args: &Value,
 ) -> Result<Value> {
-    let action = cmd_name
-        .strip_prefix(USER_FUNCTION_PREFIX)
-        .unwrap_or(cmd_name);
+    let action = parse_action(
+        cmd_name
+            .strip_prefix(USER_FUNCTION_PREFIX)
+            .unwrap_or(cmd_name),
+    )?;
 
     if ACP_SERVER.load(Ordering::SeqCst) {
-        let result = handle_headless(action, args);
+        let result = headless_value(ctx, headless_request(ctx, action, args))?;
         queue_acp_permission(json!({
-            "action": action,
+            "action": action.name(),
             "question": result["question"],
             "options": result["options"],
         }));
@@ -152,14 +153,18 @@ pub async fn handle_user_tool(
     }
 
     if HEADLESS.load(Ordering::SeqCst) {
-        emit_headless_default(None, &format!("{USER_FUNCTION_PREFIX}{action}"), None);
-        return Ok(handle_headless(action, args));
+        emit_headless_default(
+            None,
+            &format!("{USER_FUNCTION_PREFIX}{}", action.name()),
+            None,
+        );
+        return headless_value(ctx, headless_request(ctx, action, args));
     }
 
     let depth = ctx.current_depth;
 
     if depth == 0 {
-        handle_direct(action, args)
+        handle_direct(ctx, action, args)
     } else {
         handle_escalated(ctx, action, args).await
     }
@@ -229,93 +234,111 @@ impl Drop for HeadlessModeGuard {
     }
 }
 
-fn handle_headless(action: &str, args: &Value) -> Value {
-    let question = args.get("question").and_then(Value::as_str).unwrap_or("");
-    let options: Vec<Value> = args
-        .get("options")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    json!({
-        "needs_human": true,
-        "action": action,
-        "question": question,
-        "options": options,
-        "guidance": HEADLESS_GUIDANCE,
-    })
+/// The prompts a `user__*` tool can raise: the [`PromptAction`]s a model may
+/// ask of the user, without the secret-bearing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserAction {
+    Select,
+    Confirm,
+    Input,
+    Checkbox,
 }
 
-fn handle_direct(action: &str, args: &Value) -> Result<Value> {
+impl UserAction {
+    fn name(self) -> &'static str {
+        PromptAction::from(self).name()
+    }
+}
+
+impl From<UserAction> for PromptAction {
+    fn from(action: UserAction) -> Self {
+        match action {
+            UserAction::Select => PromptAction::Select,
+            UserAction::Confirm => PromptAction::Confirm,
+            UserAction::Input => PromptAction::Input,
+            UserAction::Checkbox => PromptAction::Checkbox,
+        }
+    }
+}
+
+fn parse_action(action: &str) -> Result<UserAction> {
     match action {
-        "select" => handle_direct_ask(args),
-        "confirm" => handle_direct_confirm(args),
-        "input" => handle_direct_input(args),
-        "checkbox" => handle_direct_checkbox(args),
+        "select" => Ok(UserAction::Select),
+        "confirm" => Ok(UserAction::Confirm),
+        "input" => Ok(UserAction::Input),
+        "checkbox" => Ok(UserAction::Checkbox),
         _ => Err(anyhow!("Unknown user interaction: {action}")),
     }
 }
 
-fn handle_direct_ask(args: &Value) -> Result<Value> {
-    let question = args
-        .get("question")
+fn required_question(args: &Value) -> Result<&str> {
+    args.get("question")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("'question' is required"))?;
-    let mut options = parse_options(args)?;
-    options.push(CUSTOM_MULTI_CHOICE_ANSWER_OPTION.to_string());
+        .ok_or_else(|| anyhow!("'question' is required"))
+}
 
-    let mut answer = Select::new(question, options)
-        .without_filtering()
-        .with_help_message("↑↓ to move, enter to select")
-        .prompt()?;
+/// The request a run with no human answers for itself. It tolerates the
+/// gaps a live prompt rejects (no question, unusable options) so the
+/// structured reply still reaches the model. Options are normalised the
+/// way a live prompt reads them: a string-encoded array is decoded and
+/// non-string elements are dropped.
+fn headless_request(ctx: &RequestContext, action: UserAction, args: &Value) -> PromptRequest {
+    let question = args.get("question").and_then(Value::as_str).unwrap_or("");
+    let options = parse_options(args).unwrap_or_default();
+    ctx.prompt_request(action.into(), question, options, None)
+}
 
-    if answer == CUSTOM_MULTI_CHOICE_ANSWER_OPTION {
-        answer = Text::new("Custom response:").prompt()?
+/// The structured reply a run with no human hands the model. The prompter
+/// carries it as text for a confirm and refuses every other kind; the
+/// refusal becomes the same reply here, since the model is the one party
+/// that can act on it.
+fn headless_value(ctx: &RequestContext, req: PromptRequest) -> Result<Value> {
+    let reply = headless_reply(&req);
+    match ctx.prompt(req) {
+        Ok(PromptAnswer::Text(json)) => Ok(serde_json::from_str(&json)?),
+        Ok(other) => bail!("Unexpected answer to a headless prompt: {other:?}"),
+        Err(err) if NeedsHuman::caused(&err) => Ok(reply),
+        Err(err) => Err(err),
     }
-
-    Ok(json!({ "answer": answer }))
 }
 
-fn handle_direct_confirm(args: &Value) -> Result<Value> {
-    let question = args
-        .get("question")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("'question' is required"))?;
-
-    let answer = Confirm::new(question).with_default(true).prompt()?;
-
-    Ok(json!({ "answer": if answer { "yes" } else { "no" } }))
+fn handle_direct(ctx: &RequestContext, action: UserAction, args: &Value) -> Result<Value> {
+    let question = required_question(args)?;
+    match action {
+        UserAction::Select => {
+            let req =
+                ctx.prompt_request(PromptAction::Select, question, parse_options(args)?, None);
+            Ok(json!({ "answer": ctx.prompt(req)?.into_selected()? }))
+        }
+        UserAction::Confirm => {
+            let req = ctx.prompt_request(
+                PromptAction::Confirm,
+                question,
+                Vec::new(),
+                Some(json!(true)),
+            );
+            let answer = ctx.prompt(req)?.into_confirmed()?;
+            Ok(json!({ "answer": if answer { "yes" } else { "no" } }))
+        }
+        UserAction::Input => {
+            let req = ctx.prompt_request(
+                PromptAction::Input,
+                format!("{question}\nYour answer: "),
+                Vec::new(),
+                None,
+            );
+            Ok(json!({ "answer": ctx.prompt(req)?.into_text()? }))
+        }
+        UserAction::Checkbox => {
+            let req =
+                ctx.prompt_request(PromptAction::Checkbox, question, parse_options(args)?, None);
+            Ok(json!({ "answers": ctx.prompt(req)?.into_checked()? }))
+        }
+    }
 }
 
-fn handle_direct_input(args: &Value) -> Result<Value> {
-    let question = args
-        .get("question")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("'question' is required"))?;
-
-    let answer = Text::new(&format!("{question}\nYour answer: ")).prompt()?;
-
-    Ok(json!({ "answer": answer }))
-}
-
-fn handle_direct_checkbox(args: &Value) -> Result<Value> {
-    let question = args
-        .get("question")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("'question' is required"))?;
-    let options = parse_options(args)?;
-
-    let answers = MultiSelect::new(question, options).prompt()?;
-
-    Ok(json!({ "answers": answers }))
-}
-
-async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> Result<Value> {
-    let question = args
-        .get("question")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("'question' is required"))?
-        .to_string();
+async fn handle_escalated(ctx: &RequestContext, action: UserAction, args: &Value) -> Result<Value> {
+    let question = required_question(args)?.to_string();
 
     let options: Option<Vec<String>> = if args.get("options").is_some() {
         Some(parse_options(args)?)
@@ -345,7 +368,7 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
     let escalation_id = new_escalation_id();
     let (tx, rx) = oneshot::channel();
 
-    let question = format!("[{action}] {question}");
+    let question = format!("[{}] {question}", action.name());
     let request = EscalationRequest {
         id: escalation_id.clone(),
         from_agent_id: from_agent_id.clone(),
@@ -369,37 +392,62 @@ async fn handle_escalated(ctx: &RequestContext, action: &str, args: &Value) -> R
         None,
     );
 
-    await_escalation_reply(rx, timeout_secs).await
+    await_escalation_reply(rx, timeout_secs, ctx.task_abort.clone()).await
 }
 
 /// Waits for the parent's reply. `timeout_secs == 0` waits indefinitely; a
 /// dropped sender (the parent cancelled the request) resolves either way.
-/// Both fallback arms resolve without touching the escalation queue, so
-/// neither fires an escalation event: the request was never answered.
-async fn await_escalation_reply(rx: oneshot::Receiver<String>, timeout_secs: u64) -> Result<Value> {
-    let reply = if timeout_secs == 0 {
-        rx.await
-    } else {
-        match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
-            Ok(reply) => reply,
-            Err(_) => {
-                return Ok(json!({
-                    "error": format!(
-                        "Escalation timed out after {timeout_secs} seconds waiting for user response"
-                    ),
-                    "fallback": "Make your best judgment and proceed",
-                }));
-            }
+/// So does `abort` (the asking agent's own signal) being set: the receiver
+/// is dropped with the wait, which takes the question off the queue's
+/// pending list. The fallback arms resolve without touching the escalation
+/// queue, so none fires an escalation event: the request was never answered.
+async fn await_escalation_reply(
+    rx: oneshot::Receiver<String>,
+    timeout_secs: u64,
+    abort: Option<AbortSignal>,
+) -> Result<Value> {
+    let reply = async {
+        if timeout_secs == 0 {
+            Some(rx.await)
+        } else {
+            tokio::time::timeout(Duration::from_secs(timeout_secs), rx)
+                .await
+                .ok()
+        }
+    };
+    let aborted = async {
+        match abort.as_ref() {
+            Some(abort) => wait_abort_signal(abort).await,
+            None => std::future::pending().await,
+        }
+    };
+    let reply = tokio::select! {
+        reply = reply => reply,
+        () = aborted => {
+            return Ok(json!({
+                "error": "Escalation withdrawn: this agent was cancelled",
+                "fallback": "Make your best judgment and proceed",
+            }));
         }
     };
 
     match reply {
-        Ok(reply) => Ok(json!({ "answer": reply })),
-        Err(_) => Ok(json!({
-            "error": "Escalation was cancelled. The parent agent dropped the request",
+        Some(Ok(reply)) => Ok(json!({ "answer": reply })),
+        Some(Err(_)) => Ok(escalation_cancelled()),
+        None => Ok(json!({
+            "error": format!(
+                "Escalation timed out after {timeout_secs} seconds waiting for user response"
+            ),
             "fallback": "Make your best judgment and proceed",
         })),
     }
+}
+
+fn escalation_cancelled() -> Value {
+    json!({
+        "error": "Escalation was cancelled. The parent agent dropped the request",
+        "fallback": "Make your best judgment and proceed",
+    })
 }
 
 fn parse_options(args: &Value) -> Result<Vec<String>> {
@@ -430,32 +478,389 @@ mod tests {
     use super::headless_capture::take_captured_headless_lines;
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::events::{Event, Origin, RecordingSink};
     use crate::function::agents::handle_agent_tool;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::prompt::{NEEDS_HUMAN_MARKER, ScriptedPrompter, prompt_events};
     use crate::supervisor::escalation::EscalationQueue;
+    use crate::testing::AtomicFlagGuard;
+    use crate::utils::drain_acp_permissions;
     use serial_test::serial;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    #[test]
-    fn headless_select_returns_structured_json() {
-        let args = json!({"question": "pick one", "options": ["a", "b"]});
-        let v = handle_headless("select", &args);
-        assert_eq!(v["needs_human"], true);
-        assert_eq!(v["action"], "select");
-        assert_eq!(v["question"], "pick one");
-        assert_eq!(v["options"], json!(["a", "b"]));
-        assert!(v["guidance"].is_string());
+    fn cmd_ctx() -> RequestContext {
+        RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd)
+    }
+
+    fn scripted_ctx(answers: Vec<PromptAnswer>) -> (RequestContext, Arc<ScriptedPrompter>) {
+        let mut ctx = cmd_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(answers));
+        ctx.prompter = prompter.clone();
+        (ctx, prompter)
+    }
+
+    fn run_user_tool(ctx: &mut RequestContext, cmd_name: &str, args: Value) -> Value {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(handle_user_tool(ctx, cmd_name, &args))
+            .unwrap()
+    }
+
+    fn headless_json(action: &str, question: &str, options: Value) -> Value {
+        json!({
+            "needs_human": true,
+            "action": action,
+            "question": question,
+            "options": options,
+            "guidance": HEADLESS_GUIDANCE,
+        })
     }
 
     #[test]
+    #[serial]
+    fn headless_drops_non_string_options() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let args = json!({ "question": "q-hl-mixed-3f", "options": [1, "a", null] });
+        let v = run_user_tool(&mut ctx, "user__select", args);
+        assert_eq!(v, headless_json("select", "q-hl-mixed-3f", json!(["a"])));
+    }
+
+    #[test]
+    #[serial]
+    fn headless_accepts_a_string_encoded_options_array() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let args = json!({ "question": "q-hl-str-8d", "options": "[\"a\",\"b\"]" });
+        let v = run_user_tool(&mut ctx, "user__select", args);
+        assert_eq!(v, headless_json("select", "q-hl-str-8d", json!(["a", "b"])));
+    }
+
+    #[test]
+    #[serial]
+    fn headless_select_returns_structured_json() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let v = run_user_tool(
+            &mut ctx,
+            "user__select",
+            json!({"question": "q-hl-7k2", "options": ["a", "b"]}),
+        );
+        let expected = headless_json("select", "q-hl-7k2", json!(["a", "b"]));
+        assert_eq!(v, expected);
+        assert_eq!(v.to_string(), expected.to_string());
+    }
+
+    /// The refusal a run with no human gives a select still closes the
+    /// prompt's event pair, named as a refusal rather than a failure.
+    #[test]
+    #[serial]
+    fn a_headless_select_publishes_needs_human_as_its_answer() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let sink = RecordingSink::install();
+        let mut ctx = cmd_ctx();
+        run_user_tool(
+            &mut ctx,
+            "user__select",
+            json!({"question": "q-hl-evt-4p", "options": ["a", "b"]}),
+        );
+
+        let (requested, answered) = prompt_events(sink.drain(), "q-hl-evt-4p");
+        let [Event::PromptRequested { id, action, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(*action, PromptAction::Select);
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: NEEDS_HUMAN_MARKER.to_string(),
+                auto: false,
+            }]
+        );
+    }
+
+    #[test]
+    #[serial]
     fn headless_confirm_returns_empty_options_when_absent() {
-        let args = json!({"question": "yes or no?"});
-        let v = handle_headless("confirm", &args);
-        assert_eq!(v["needs_human"], true);
-        assert_eq!(v["action"], "confirm");
-        assert_eq!(v["options"], json!([]));
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let v = run_user_tool(
+            &mut ctx,
+            "user__confirm",
+            json!({"question": "yes or no? hl-c3n"}),
+        );
+        assert_eq!(v, headless_json("confirm", "yes or no? hl-c3n", json!([])));
+    }
+
+    #[test]
+    #[serial]
+    fn headless_tolerates_a_missing_question() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let v = run_user_tool(&mut ctx, "user__input", json!({}));
+        assert_eq!(v, headless_json("input", "", json!([])));
+    }
+
+    #[test]
+    #[serial]
+    fn acp_select_returns_the_headless_json_and_queues_one_permission() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let _acp = AtomicFlagGuard::set(&ACP_SERVER, true);
+        drain_acp_permissions();
+        let mut ctx = cmd_ctx();
+        let v = run_user_tool(
+            &mut ctx,
+            "user__select",
+            json!({"question": "q-acp-5n", "options": ["a", "b"]}),
+        );
+        assert_eq!(v, headless_json("select", "q-acp-5n", json!(["a", "b"])));
+        assert_eq!(
+            drain_acp_permissions(),
+            vec![json!({
+                "action": "select",
+                "question": "q-acp-5n",
+                "options": ["a", "b"],
+            })]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn headless_rejects_an_unknown_action() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, true);
+        let mut ctx = cmd_ctx();
+        let err = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(handle_user_tool(&mut ctx, "user__dance", &json!({})))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unknown user interaction: dance");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_select_round_trips_through_the_prompter() {
+        let (mut ctx, prompter) = scripted_ctx(vec![PromptAnswer::Selected("b".to_string())]);
+        let v = handle_user_tool(
+            &mut ctx,
+            "user__select",
+            &json!({"question": "pick one sel-8d1", "options": ["a", "b"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, json!({ "answer": "b" }));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.question, "pick one sel-8d1");
+        assert_eq!(req.options, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(req.default, None);
+        assert_eq!(req.tool, None);
+        assert_eq!(req.call_id, None);
+        assert_eq!(req.job_id, None);
+        assert_eq!(req.origin, Origin::from(&ctx));
+    }
+
+    /// The built-in select is open on both prompters, so an answer the
+    /// options did not offer comes back as typed.
+    #[tokio::test]
+    #[serial]
+    async fn direct_select_is_open_and_returns_a_typed_answer() {
+        let (mut ctx, prompter) =
+            scripted_ctx(vec![PromptAnswer::Selected("typed by hand".to_string())]);
+        let v = handle_user_tool(
+            &mut ctx,
+            "user__select",
+            &json!({"question": "pick one sel-4k9", "options": ["a", "b"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, json!({ "answer": "typed by hand" }));
+
+        let [req] = prompter.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert!(!req.closed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_confirm_round_trips_through_the_prompter() {
+        let (mut ctx, prompter) = scripted_ctx(vec![PromptAnswer::Confirmed(false)]);
+        let v = handle_user_tool(
+            &mut ctx,
+            "user__confirm",
+            &json!({"question": "sure? cf-2q9"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, json!({ "answer": "no" }));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(req.action, PromptAction::Confirm);
+        assert_eq!(req.question, "sure? cf-2q9");
+        assert!(req.options.is_empty());
+        assert_eq!(req.default, Some(json!(true)));
+        assert_eq!(req.tool, None);
+        assert_eq!(req.call_id, None);
+        assert_eq!(req.job_id, None);
+        assert_eq!(req.origin, Origin::from(&ctx));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_input_round_trips_through_the_prompter() {
+        let (mut ctx, prompter) = scripted_ctx(vec![PromptAnswer::Text("blue".to_string())]);
+        let v = handle_user_tool(
+            &mut ctx,
+            "user__input",
+            &json!({"question": "favourite colour? in-5v7"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, json!({ "answer": "blue" }));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(req.action, PromptAction::Input);
+        assert_eq!(req.question, "favourite colour? in-5v7\nYour answer: ");
+        assert!(req.options.is_empty());
+        assert_eq!(req.default, None);
+        assert_eq!(req.tool, None);
+        assert_eq!(req.call_id, None);
+        assert_eq!(req.job_id, None);
+        assert_eq!(req.origin, Origin::from(&ctx));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_checkbox_round_trips_through_the_prompter() {
+        let (mut ctx, prompter) = scripted_ctx(vec![PromptAnswer::Checked(vec![
+            "a".to_string(),
+            "c".to_string(),
+        ])]);
+        let v = handle_user_tool(
+            &mut ctx,
+            "user__checkbox",
+            &json!({"question": "which? cb-9x4", "options": ["a", "b", "c"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v, json!({ "answers": ["a", "c"] }));
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        let req = &requests[0];
+        assert_eq!(req.action, PromptAction::Checkbox);
+        assert_eq!(req.question, "which? cb-9x4");
+        assert_eq!(
+            req.options,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(req.default, None);
+        assert_eq!(req.tool, None);
+        assert_eq!(req.call_id, None);
+        assert_eq!(req.job_id, None);
+        assert_eq!(req.origin, Origin::from(&ctx));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_prompt_requires_a_question() {
+        let (mut ctx, prompter) = scripted_ctx(vec![]);
+        let err = handle_user_tool(&mut ctx, "user__confirm", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "'question' is required");
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_unknown_action_is_reported_before_the_missing_question() {
+        let (mut ctx, prompter) = scripted_ctx(vec![]);
+        let err = handle_user_tool(&mut ctx, "user__dance", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unknown user interaction: dance");
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn escalated_unknown_action_is_reported_before_reaching_the_queue() {
+        let queue = Arc::new(EscalationQueue::new());
+        let (mut ctx, prompter) = scripted_ctx(vec![]);
+        ctx.current_depth = 1;
+        ctx.escalation_queue = Some(Arc::clone(&queue));
+        let err = handle_user_tool(&mut ctx, "user__dance", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unknown user interaction: dance");
+        assert!(queue.pending_summary().is_empty());
+        assert!(prompter.requests().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn direct_cancel_surfaces_as_the_inquire_wording() {
+        let (mut ctx, _prompter) = scripted_ctx(vec![PromptAnswer::Cancelled]);
+        let err = handle_user_tool(
+            &mut ctx,
+            "user__confirm",
+            &json!({"question": "sure? cx-1a2"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+    }
+
+    #[test]
+    #[serial]
+    fn direct_prompt_publishes_requested_then_answered() {
+        let sink = RecordingSink::install();
+        let (mut ctx, _prompter) = scripted_ctx(vec![PromptAnswer::Confirmed(true)]);
+        let v = run_user_tool(
+            &mut ctx,
+            "user__confirm",
+            json!({"question": "evt-probe-x9q"}),
+        );
+        assert_eq!(v, json!({ "answer": "yes" }));
+
+        let (requested, answered) = prompt_events(sink.drain(), "evt-probe-x9q");
+        let [
+            Event::PromptRequested {
+                id,
+                action,
+                options,
+                tool,
+                origin,
+                ..
+            },
+        ] = requested.as_slice()
+        else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(*action, PromptAction::Confirm);
+        assert!(options.is_empty());
+        assert_eq!(*tool, None);
+        assert_eq!(*origin, Origin::from(&ctx));
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: "yes".to_string(),
+                auto: false,
+            }]
+        );
     }
 
     #[test]
@@ -502,7 +907,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, handle_headless("select", &args));
+        assert_eq!(
+            result,
+            headless_json("select", "headless prose pick", json!(["a", "b"]))
+        );
         assert_eq!(result["guidance"], HEADLESS_GUIDANCE);
         assert!(result.get("answer").is_none());
         assert_eq!(
@@ -545,7 +953,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result, handle_headless("select", &args));
+        assert_eq!(result, headless_json("select", question, json!(["a", "b"])));
         assert!(result.get("answer").is_none());
         let queued: Vec<Value> = crate::utils::drain_acp_permissions()
             .into_iter()
@@ -607,7 +1015,7 @@ mod tests {
         parent_ctx.escalation_queue = Some(Arc::clone(&queue));
 
         let raise_args = json!({ "question": "which db?" });
-        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let raise = handle_escalated(&child_ctx, UserAction::Input, &raise_args);
         let reply = async {
             // Bounded poll: on the current-thread runtime the raise future
             // submits before its first await, so this resolves immediately.
@@ -684,7 +1092,7 @@ mod tests {
         child_ctx.self_agent_id = Some("esc-child-trunc".to_string());
 
         let raise_args = json!({ "question": "q".repeat(3000) });
-        let raise = handle_escalated(&child_ctx, "input", &raise_args);
+        let raise = handle_escalated(&child_ctx, UserAction::Input, &raise_args);
         let reply = async {
             // Bounded poll: on the current-thread runtime the raise future
             // submits before its first await, so this resolves immediately.
@@ -720,7 +1128,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn zero_timeout_waits_indefinitely_for_the_reply() {
         let (tx, rx) = oneshot::channel();
-        let wait = tokio::spawn(await_escalation_reply(rx, 0));
+        let wait = tokio::spawn(await_escalation_reply(rx, 0, None));
 
         tokio::time::advance(Duration::from_secs(3600)).await;
         assert!(!wait.is_finished());
@@ -733,7 +1141,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn nonzero_timeout_still_expires_with_the_existing_message() {
         let (tx, rx) = oneshot::channel::<String>();
-        let wait = tokio::spawn(await_escalation_reply(rx, 5));
+        let wait = tokio::spawn(await_escalation_reply(rx, 5, None));
         tokio::task::yield_now().await;
 
         tokio::time::advance(Duration::from_secs(4)).await;
@@ -754,7 +1162,7 @@ mod tests {
         let (tx, rx) = oneshot::channel::<String>();
         drop(tx);
 
-        let v = tokio::time::timeout(Duration::from_secs(1), await_escalation_reply(rx, 0))
+        let v = tokio::time::timeout(Duration::from_secs(1), await_escalation_reply(rx, 0, None))
             .await
             .expect("the wait must complete once the sender is gone")
             .unwrap();
@@ -766,6 +1174,44 @@ mod tests {
             "{v}"
         );
         assert_eq!(v["fallback"], "Make your best judgment and proceed");
+    }
+
+    /// A cancelled asker stops waiting: the wait returns the cancelled
+    /// outcome and drops its receiver, so the queue no longer lists the
+    /// question.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_when_the_askers_signal_is_set() {
+        let queue = EscalationQueue::new();
+        let (reply_tx, rx) = oneshot::channel::<String>();
+        queue.submit(EscalationRequest {
+            id: "esc_ab1".to_string(),
+            from_agent_id: "agent_ab1".to_string(),
+            from_agent_name: "asker".to_string(),
+            question: "[confirm] Still there?".to_string(),
+            options: None,
+            reply_tx,
+        });
+        let abort = crate::utils::create_abort_signal();
+        let wait = tokio::spawn(await_escalation_reply(rx, 0, Some(abort.clone())));
+
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert!(!wait.is_finished());
+        assert_eq!(queue.pending().len(), 1);
+
+        abort.set_ctrlc();
+        let v = tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("the wait must end once the asker's signal is set")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "error": "Escalation withdrawn: this agent was cancelled",
+                "fallback": "Make your best judgment and proceed",
+            })
+        );
+        assert!(queue.pending().is_empty());
     }
 
     #[test]

@@ -24,7 +24,7 @@ read_query() {
 # @cmd Execute an SQL query
 # @option --query!                  SQL query to execute
 write_query() {
-    guard_operation "Execute SQL?"
+    guard_operation "Execute SQL?" "$argc_query"
     _run_sql "$argc_query"
 }
 

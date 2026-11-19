@@ -3,12 +3,12 @@ use super::install_remote::{
 };
 use super::{paths, request_context};
 use crate::config::AssetCategory;
+use crate::config::conflict::menu_can_use_terminal;
 use crate::function::write_file_atomic;
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::prompt::Prompter;
 
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
-use inquire::Confirm;
 use log::warn;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -210,6 +210,7 @@ impl BundleStore {
         &mut self,
         url: &str,
         manifest_name: Option<&str>,
+        prompter: &dyn Prompter,
     ) -> Result<ResolvedBundleName> {
         let canonical = canonical_source_url(url);
         let existing_key = self
@@ -279,15 +280,17 @@ impl BundleStore {
 
             if let Some(other_source) = &collision
                 && manifest_name.is_some()
-                && *IS_STDOUT_TERMINAL
+                && menu_can_use_terminal()
             {
-                let proceed = Confirm::new(&format!(
-                    "Bundle name '{base}' is already used by an install from \
-                     '{other_source}' (a fork or typo-squat?). Track this install \
-                     as '{qualified}'?"
-                ))
-                .with_default(false)
-                .prompt()
+                let proceed = crate::prompt::confirm(
+                    prompter,
+                    format!(
+                        "Bundle name '{base}' is already used by an install from \
+                         '{other_source}' (a fork or typo-squat?). Track this install \
+                         as '{qualified}'?"
+                    ),
+                    false,
+                )
                 .with_context(|| "failed to read bundle name confirmation")?;
                 if !proceed {
                     bail!("install aborted: bundle name '{base}' {reason}");
@@ -707,6 +710,7 @@ fn sanitize_name_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::{PromptAction, PromptAnswer, ScriptedPrompter};
     use crate::utils::temp_file;
     use serial_test::serial;
 
@@ -1067,7 +1071,11 @@ mod tests {
             .unwrap();
 
         let resolved = store
-            .resolve_bundle_name("git@github.com:x/omc.git", None)
+            .resolve_bundle_name(
+                "git@github.com:x/omc.git",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "omc");
@@ -1086,7 +1094,11 @@ mod tests {
             .unwrap();
 
         let resolved = store
-            .resolve_bundle_name("git@github.com:x/omc.git", Some("oh-my-coyote"))
+            .resolve_bundle_name(
+                "git@github.com:x/omc.git",
+                Some("oh-my-coyote"),
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "oh-my-coyote");
@@ -1104,7 +1116,11 @@ mod tests {
             .unwrap();
 
         let resolved = store
-            .resolve_bundle_name("https://gitlab.com/b/repo.git", None)
+            .resolve_bundle_name(
+                "https://gitlab.com/b/repo.git",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "b/repo");
@@ -1124,7 +1140,11 @@ mod tests {
             .unwrap();
 
         let resolved = store
-            .resolve_bundle_name("git@bitbucket.org:c/repo.git", None)
+            .resolve_bundle_name(
+                "git@bitbucket.org:c/repo.git",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "c/repo");
@@ -1143,7 +1163,11 @@ mod tests {
             .unwrap();
 
         let resolved = store
-            .resolve_bundle_name("https://gitlab.com/b/repo.git", None)
+            .resolve_bundle_name(
+                "https://gitlab.com/b/repo.git",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "b/repo");
@@ -1156,7 +1180,11 @@ mod tests {
         let mut store = dir.store();
 
         let resolved = store
-            .resolve_bundle_name("https://github.com/vercel/next.js.git", None)
+            .resolve_bundle_name(
+                "https://github.com/vercel/next.js.git",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "next-js");
@@ -1168,7 +1196,11 @@ mod tests {
         let mut store = dir.store();
 
         let resolved = store
-            .resolve_bundle_name("https://github.com/x/agents", None)
+            .resolve_bundle_name(
+                "https://github.com/x/agents",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "x/agents");
@@ -1176,14 +1208,22 @@ mod tests {
         assert!(resolved.same_name_other_source.is_none());
 
         let resolved = store
-            .resolve_bundle_name("https://github.com/y/repo", Some("mcp_config"))
+            .resolve_bundle_name(
+                "https://github.com/y/repo",
+                Some("mcp_config"),
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "y/mcp_config");
         assert_eq!(resolved.qualified_from.as_deref(), Some("mcp_config"));
 
         let resolved = store
-            .resolve_bundle_name("https://github.com/z/hooks", None)
+            .resolve_bundle_name(
+                "https://github.com/z/hooks",
+                None,
+                &ScriptedPrompter::refusing(),
+            )
             .unwrap();
 
         assert_eq!(resolved.name, "z/hooks");
@@ -1195,9 +1235,79 @@ mod tests {
         let dir = TempStoreDir::new("bundles-invalid-name");
         let mut store = dir.store();
 
-        let result = store.resolve_bundle_name("https://github.com/x/repo", Some("a/b/c"));
+        let result = store.resolve_bundle_name(
+            "https://github.com/x/repo",
+            Some("a/b/c"),
+            &ScriptedPrompter::refusing(),
+        );
 
         assert!(result.is_err());
+    }
+
+    /// A manifest name colliding with another source's bundle is a
+    /// typo-squat question; under the full-screen UI it is a Confirm
+    /// through the prompter, defaulting to no.
+    #[test]
+    #[serial]
+    fn resolve_bundle_name_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let dir = TempStoreDir::new("bundles-collision-confirm");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("repo", metadata("https://github.com/a/repo", "abc123"))
+            .unwrap();
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]);
+        let resolved = store
+            .resolve_bundle_name("https://gitlab.com/b/repo.git", Some("repo"), &prompter)
+            .unwrap();
+
+        assert_eq!(resolved.name, "b/repo");
+        assert_eq!(resolved.qualified_from.as_deref(), Some("repo"));
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(
+            requests[0].question,
+            "Bundle name 'repo' is already used by an install from \
+             'https://github.com/a/repo' (a fork or typo-squat?). Track this install \
+             as 'b/repo'?"
+        );
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]);
+        let err = store
+            .resolve_bundle_name("https://gitlab.com/b/repo.git", Some("repo"), &prompter)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("install aborted: bundle name 'repo' is already used"),
+            "got: {err}"
+        );
+    }
+
+    /// Without a terminal the same collision is not a question: the
+    /// install is tracked under the qualified name and nothing is asked.
+    #[test]
+    #[serial]
+    fn without_a_terminal_a_colliding_bundle_name_qualifies_without_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let dir = TempStoreDir::new("bundles-collision-no-tty");
+        let mut store = dir.store();
+        store
+            .upsert_bundle("repo", metadata("https://github.com/a/repo", "abc123"))
+            .unwrap();
+
+        let prompter = ScriptedPrompter::refusing();
+        let resolved = store
+            .resolve_bundle_name("https://gitlab.com/b/repo.git", Some("repo"), &prompter)
+            .unwrap();
+
+        assert_eq!(resolved.name, "b/repo");
+        assert_eq!(resolved.qualified_from, Some("repo".to_string()));
+        assert!(prompter.requests().is_empty());
     }
 
     #[test]

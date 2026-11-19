@@ -4,8 +4,9 @@ mod placeholder_edit;
 mod prompt;
 mod replay;
 
-use self::completer::ReplCompleter;
-use self::highlighter::ReplHighlighter;
+pub(crate) use self::completer::{ReplCompleter, command_candidates, macro_candidates, split_line};
+pub(crate) use self::highlighter::{CommandSpan, classify_command};
+use self::highlighter::{MacroNames, ReplHighlighter};
 use self::placeholder_edit::{
     PlaceholderAwareEditMode, PlaceholderDelete, SharedLineSnapshot, recorded_placeholder_indices,
 };
@@ -17,24 +18,26 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, CommandPrefix, Input, LastMessage, MacroState,
-    RequestContext, Session, SessionScope, StateFlags, TURN_INTERRUPTED_TEXT,
-    flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
-    vision_unsupported_message,
+    RequestContext, SessionScope, StateFlags, flatten_prompt_messages, macro_execute,
+    resolve_prompt_args, sanitize_display_text, vision_unsupported_message,
 };
 use crate::config::{AssetCategory, paths};
-use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail, pending_tasks};
-use crate::graph::dispatch::{GraphTurn, run_graph_turn};
 use crate::graph::llm::{CompletionFuture, CompletionRunner};
 use crate::graph::route::Branch;
 use crate::hooks::{self, HookEvent};
+use crate::prompt::PromptAction;
 use crate::render::render_error;
-use crate::supervisor::{Supervisor, TaskKind};
+use crate::supervisor::Supervisor;
+use crate::turn::driver::{
+    PreflightError, autoname_with_notice, emit_pause_banner, reset_continuation,
+};
+use crate::turn::{TurnDriver, TurnMode};
 use crate::utils::{
-    AbortSignal, ClipboardContent, IMAGE_SLOT, IS_STDOUT_TERMINAL, SHELL, TaskCancelGuard,
-    UserInterrupt, abortable_run_with_spinner, abortable_run_with_spinner_on, create_abort_signal,
-    dimmed_text, drain_stale_tty_input, hex_encode, image_marker, is_supported_image_path,
-    read_for_paste, resolve_home_dir, resync_cursor_queries, run_command, set_text,
-    sniff_supported_image, strip_image_slots, temp_file, wait_user_interrupt,
+    AbortSignal, ClipboardContent, IMAGE_SLOT, IS_STDOUT_TERMINAL, SHELL, UserInterrupt,
+    abortable_run_with_spinner, abortable_run_with_spinner_on, create_abort_signal, dimmed_text,
+    drain_stale_tty_input, hex_encode, image_marker, is_supported_image_path, read_for_paste,
+    resolve_home_dir, resync_cursor_queries, run_command, set_text, sniff_supported_image,
+    strip_image_slots, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -43,7 +46,6 @@ use anyhow::{Context, Error, Result, bail};
 use crossterm::cursor::SetCursorStyle;
 use fancy_regex::Regex;
 use indoc::indoc;
-use inquire::Text;
 use log::warn;
 use parking_lot::RwLock;
 use reedline::CursorConfig;
@@ -82,14 +84,17 @@ pub(crate) const EXIT_HOOK_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ceiling on how long an exiting session waits for its cancelled background
 /// agents to finish writing their status before the session itself settles.
-const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);
 
 const CANCELLED_TASKS_HINT: &str =
     "Cancelled the background task(s) left running by the interrupted turn.";
 
-const WELCOME_INTERRUPT_HINT: &str = "\
+pub(crate) const WELCOME_INTERRUPT_HINT: &str = "\
 Tip: Press Ctrl-C as the model works to interrupt the turn and send another prompt.
 In a session, press it again at the idle prompt to cancel background work.";
+
+/// Spelled with the dot prefix; `render_hints` swaps in the active one.
+pub(crate) const WELCOME_HELP_HINT: &str = r#"Type ".help" for additional help."#;
 
 /// Brackets one user-visible turn at an outer boundary (`ask`,
 /// `start_directive`, `shell_execute`): `enter` fires `turn.started`, and
@@ -482,13 +487,15 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
+    macro_names: MacroNames,
 }
 
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
         let ctx = Arc::new(RwLock::new(ctx));
-        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let macro_names = MacroNames::default();
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), macro_names.clone())?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
 
@@ -497,6 +504,7 @@ impl Repl {
             editor,
             prompt,
             abort_signal,
+            macro_names,
         })
     }
 
@@ -507,9 +515,7 @@ impl Repl {
                 "Welcome to {} {}\n{}\n\n{}\n",
                 env!("CARGO_CRATE_NAME"),
                 env!("CARGO_PKG_VERSION"),
-                self.ctx
-                    .read()
-                    .render_hints(r#"Type ".help" for additional help."#),
+                self.ctx.read().render_hints(WELCOME_HELP_HINT),
                 dimmed_text(WELCOME_INTERRUPT_HINT)
             );
             if env::var_os(SANDBOX_ENV_FLAG).is_some() {
@@ -562,7 +568,7 @@ impl Repl {
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
 
-        print_pause_banner(&self.ctx.read());
+        emit_pause_banner(&self.ctx.read());
 
         loop {
             if self.abort_signal.aborted_ctrld() {
@@ -570,6 +576,7 @@ impl Repl {
             }
             // Drain stale ESC[6n replies so reedline anchors the prompt on the real row.
             resync_cursor_queries();
+            self.macro_names.refresh(&self.ctx.read());
             let sig = self.editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(line)) => {
@@ -665,10 +672,15 @@ impl Repl {
         exit_result
     }
 
-    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+    fn create_editor(
+        ctx: Arc<RwLock<RequestContext>>,
+        app: &AppConfig,
+        macro_names: MacroNames,
+    ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
         let snapshot = SharedLineSnapshot::default();
-        let highlighter = ReplHighlighter::new(Arc::clone(&ctx), Arc::clone(&snapshot));
+        let highlighter =
+            ReplHighlighter::new(Arc::clone(&ctx), macro_names, Arc::clone(&snapshot));
         let menu = Self::create_menu();
         let edit_mode = Self::create_edit_mode(app, snapshot);
         let cursor_config = CursorConfig {
@@ -785,6 +797,14 @@ impl ReplCommand {
     fn is_valid(&self, flags: StateFlags) -> bool {
         self.state.assert(flags)
     }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    pub(crate) fn description(&self) -> &'static str {
+        self.description
+    }
 }
 
 /// A default validator which checks for mismatched quotes and brackets
@@ -826,15 +846,11 @@ pub async fn run_repl_command_with_prefix(
 async fn dispatch_repl_line(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
-    mut line: &str,
+    line: &str,
     prefix: CommandPrefix,
 ) -> Result<bool> {
     ctx.pending_tasks_guardrail_count = 0;
-    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
-        && let Some(text_match) = captures.get(1)
-    {
-        line = text_match.as_str();
-    }
+    let line = unfence(line);
     // A dragged absolute path under the slash prefix, or `./shot.png` under
     // the dot prefix, would otherwise parse as an unknown command.
     if starts_with_image_path(line)
@@ -912,8 +928,9 @@ async fn dispatch_repl_line(
                     );
                 }
                 let clients = ctx.app.config.clients.clone();
-                let (client_name, provider) = resolve_oauth_client(Some(client.name()), &clients)?;
-                oauth::run_oauth_flow(&*provider, &client_name).await?;
+                let (client_name, provider) =
+                    resolve_oauth_client(Some(client.name()), &clients, ctx.prompter.as_ref())?;
+                oauth::run_oauth_flow(&*provider, &client_name, ctx.prompter.as_ref()).await?;
             }
             ".mcp" => match args {
                 Some(args) => {
@@ -962,6 +979,7 @@ async fn dispatch_repl_line(
                                             client_id,
                                             callback_port,
                                             redirect_host,
+                                            ctx.prompter.as_ref(),
                                         )
                                         .await?;
                                         println!("Authentication saved.");
@@ -1054,14 +1072,7 @@ async fn dispatch_repl_line(
                             .arguments
                             .unwrap_or_default();
                         let (mut arguments, missing) = resolve_prompt_args(&declared, provided);
-                        for key in missing {
-                            let value = Text::new(&prompt_arg_inquire_label(server, name, &key))
-                                .prompt()
-                                .with_context(|| {
-                                    format!("Failed to read prompt argument '{key}'")
-                                })?;
-                            arguments.insert(key, value);
-                        }
+                        arguments.extend(prompt_missing_args(ctx, server, name, missing)?);
                         let result = ctx
                             .tool_scope
                             .mcp_runtime
@@ -1167,30 +1178,27 @@ async fn dispatch_repl_line(
                 }
                 ctx.use_session(app.as_ref(), args, abort_signal.clone())
                     .await?;
-                if ctx.maybe_autoname_session() {
-                    eprintln!(
-                        "\n📢 {}",
-                        dim_notice_color(app.as_ref())
-                            .italic()
-                            .paint("Autonaming the session."),
-                    );
-                    if let Err(err) = ctx.autoname_session(app.as_ref()).await {
-                        warn!("Failed to autonaming the session: {err}");
-                    }
-                    if let Some(session) = ctx.session.as_mut() {
-                        session.set_autonaming(false);
-                    }
-                }
+                autoname_with_notice(ctx, app.as_ref()).await;
                 if let Some(session) = &ctx.session {
                     let (compressed, active) = replay::snapshot(session);
                     replay::render(app.as_ref(), &compressed, &active)?;
                 }
-                print_pause_banner(ctx);
+                emit_pause_banner(ctx);
             }
             ".install" => match parse_repl_install(args) {
-                ReplInstallDispatch::Builtins(category) => config::install_assets(category)?,
+                ReplInstallDispatch::Builtins(category) => {
+                    config::install_assets(category, ctx.prompter.as_ref(), false, ".")?
+                }
                 ReplInstallDispatch::Unified(value) => {
-                    config::install_or_update_from_repl_args(value, ctx.command_prefix())?;
+                    config::install_or_update_from_repl_args(
+                        value,
+                        config::InstallIo {
+                            prefix: ctx.command_prefix(),
+                            prompter: ctx.prompter.as_ref(),
+                            remedy: config::REPL_CONFLICT_REMEDY,
+                            force_flag: "--force",
+                        },
+                    )?;
                 }
                 ReplInstallDispatch::Help => {
                     println!("{}", ctx.render_hints(&repl_install_help()))
@@ -1209,7 +1217,11 @@ async fn dispatch_repl_line(
                     bail!("Cannot perform this operation because you are in a macro")
                 }
                 let version = args.map(|s| s.trim().to_string());
-                task::spawn_blocking(move || config::run_self_update(version, false)).await??;
+                let prompter = Arc::clone(&ctx.prompter);
+                task::spawn_blocking(move || {
+                    config::run_self_update(version, false, prompter.as_ref(), ".")
+                })
+                .await??;
             }
             ".rag" => match split_first_arg(args) {
                 Some(("attach", rest)) => match rest {
@@ -1248,7 +1260,7 @@ async fn dispatch_repl_line(
                     if let Some(session) = &ctx.session {
                         let (compressed, active) = replay::snapshot(session);
                         replay::render(app.as_ref(), &compressed, &active)?;
-                        print_pause_banner(ctx);
+                        emit_pause_banner(ctx);
                     }
                 }
                 None => {
@@ -1612,7 +1624,7 @@ async fn dispatch_repl_line(
             },
             ".uninstall" => match parse_repl_uninstall(args) {
                 ReplUninstallDispatch::Run(name, assume_yes) => {
-                    config::uninstall_bundle(&name, assume_yes)?
+                    config::uninstall_bundle(&name, assume_yes, ctx.prompter.as_ref())?
                 }
                 ReplUninstallDispatch::Help => {
                     println!("{}", ctx.render_hints(&repl_uninstall_help()))
@@ -1690,7 +1702,7 @@ async fn dispatch_repl_line(
                     println!("{}", dimmed_text("─── ↑ redrawn ↑ ───"));
                     println!();
                     io::stdout().flush()?;
-                    print_pause_banner(ctx);
+                    emit_pause_banner(ctx);
                 }
                 Some("session") => {
                     let Some(session) = &ctx.session else {
@@ -1709,7 +1721,7 @@ async fn dispatch_repl_line(
                         replay::clear_viewport()?;
                         replay::render(app.as_ref(), &compressed, &active)?;
                         io::stdout().flush()?;
-                        print_pause_banner(ctx);
+                        emit_pause_banner(ctx);
                     }
                 }
                 _ => unknown_command(ctx)?,
@@ -1781,7 +1793,7 @@ async fn dispatch_repl_line(
             ".vault" => match split_first_arg(args) {
                 Some(("add", name)) => {
                     if let Some(name) = name {
-                        ctx.app.vault.add_secret(name)?;
+                        ctx.app.vault.add_secret(name, ctx.prompter.as_ref())?;
                     } else {
                         println!("{}", ctx.render_hints("Usage: .vault add <name>"));
                     }
@@ -1795,7 +1807,7 @@ async fn dispatch_repl_line(
                 }
                 Some(("update", name)) => {
                     if let Some(name) = name {
-                        ctx.app.vault.update_secret(name)?;
+                        ctx.app.vault.update_secret(name, ctx.prompter.as_ref())?;
                     } else {
                         println!("{}", ctx.render_hints("Usage: .vault update <name>"));
                     }
@@ -1878,23 +1890,6 @@ fn select_transport(input: &Input) -> Transport {
     }
 }
 
-/// Marks an error raised before any request went out, so the completion
-/// step can return it bare instead of treating it as a failed request.
-#[derive(Debug)]
-struct PreflightError(anyhow::Error);
-
-impl std::fmt::Display for PreflightError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl std::error::Error for PreflightError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0.source()
-    }
-}
-
 /// One model call as the REPL makes it: build the client, run the
 /// before-hook, then the transport `select_transport` picks. The same
 /// runner serves the route classifier and the turn's own completion, so a
@@ -1968,13 +1963,17 @@ async fn ask_with_branch_with_runner(
 ) -> Result<()> {
     restore_graph_agent_if_left_swapped_in(ctx);
     let bracket = TurnBracket::enter(ctx);
+    let mut driver = TurnDriver {
+        runner,
+        mode: TurnMode::Repl,
+    };
     let result = ask_inner(
         ctx,
         abort_signal.clone(),
         input,
         with_embeddings,
         forced,
-        runner,
+        &mut driver,
     )
     .await;
     bracket.finish(ctx, &abort_signal, result)
@@ -2013,404 +2012,16 @@ async fn ask_inner(
     input: Input,
     with_embeddings: bool,
     forced: Option<Branch>,
-    runner: &mut CompletionRunner<'_>,
+    driver: &mut TurnDriver<'_>,
 ) -> Result<()> {
-    let result = ask_loop(ctx, abort_signal, input, with_embeddings, forced, runner).await;
+    let result = driver
+        .run_turn(ctx, abort_signal, input, with_embeddings, forced)
+        .await
+        // The outcome is not needed here: the REPL derives interrupt state
+        // from `abort_signal` via `TurnBracket::finish`.
+        .map(|_| ());
     ctx.leave_delegate_turn();
     result
-}
-
-async fn ask_loop(
-    ctx: &mut RequestContext,
-    abort_signal: AbortSignal,
-    input: Input,
-    with_embeddings: bool,
-    forced: Option<Branch>,
-    runner: &mut CompletionRunner<'_>,
-) -> Result<()> {
-    // The graph branch never reaches the runner's preflight, so a refused
-    // image must stop the turn here, before it is recorded or routed.
-    input.guard_images()?;
-    let mut input = input;
-    let mut with_embeddings = with_embeddings;
-    // One compress-and-retry per fresh input; tool-loop iterations share it.
-    let mut retried_after_compress = false;
-    // The graph gate runs once per user turn: tool rounds, the compress
-    // retry, the guardrail inject and auto-continue all re-enter the loop
-    // with `routed` set, so a chat turn's tool rounds are never
-    // re-classified and the graph never runs mid tool-loop.
-    let mut routed = false;
-    ctx.last_graph_branch = None;
-    let _sigint_bridge = spawn_turn_interrupt_bridge(&abort_signal);
-    loop {
-        if input.is_empty() {
-            return Ok(());
-        }
-        ctx.session_abort = Some(abort_signal.clone());
-        if with_embeddings {
-            let embeddings = input.use_embeddings(abort_signal.clone());
-            interruptible_step(ctx, &abort_signal, embeddings).await?;
-            with_embeddings = false;
-        }
-        while ctx.is_compressing_session() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        let app = Arc::clone(&ctx.app.config);
-
-        if maybe_auto_compress(ctx, app.as_ref()).await.succeeded {
-            input.refresh_session(ctx);
-        }
-
-        if !routed && input.tool_calls().is_none() && graph::active_agent_graph_name(ctx).is_some()
-        {
-            routed = true;
-            ctx.before_chat_completion(&input)?;
-            let turn = match run_graph_turn(ctx, &input, abort_signal.clone(), forced, runner).await
-            {
-                Ok(turn) => turn,
-                Err(err) => {
-                    if abort_signal.aborted_ctrlc() {
-                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
-                    }
-                    return Err(err);
-                }
-            };
-            match turn {
-                GraphTurn::Run { output, last_run } => {
-                    app.print_markdown(&output)?;
-                    input.clear_continue_output();
-                    // `None` (a run the graph does not record: no session
-                    // block and nothing to carry) clears any stale record
-                    // from an earlier run.
-                    ctx.record_graph_run(app.as_ref(), &input, &output, last_run.map(|run| *run))?;
-                    settle_turn(ctx, app.as_ref()).await;
-                    print_turn_divider();
-                    return Ok(());
-                }
-                GraphTurn::Chat(attached) => {
-                    input = *attached;
-                }
-            }
-        }
-
-        let (output, tool_results) = {
-            let result = runner(&input, ctx, abort_signal.clone()).await;
-            match result {
-                Ok(v) => v,
-                Err(err) => {
-                    let err = match err.downcast::<PreflightError>() {
-                        Ok(preflight) => return Err(preflight.0),
-                        Err(err) => err,
-                    };
-                    if compress_for_error_retry(
-                        ctx,
-                        app.as_ref(),
-                        retried_after_compress,
-                        &abort_signal,
-                        &err,
-                    )
-                    .await
-                    {
-                        input.refresh_session(ctx);
-                        retried_after_compress = true;
-                        continue;
-                    }
-                    // A request aborted by Ctrl-C without streamed text ends
-                    // here rather than in the interrupted arm below, and gets
-                    // the same notice.
-                    if abort_signal.aborted_ctrlc() {
-                        print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
-                    }
-                    ctx.on_chat_completion_error(app.as_ref(), &input);
-                    return Err(err);
-                }
-            }
-        };
-        ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
-        let interrupted = abort_signal.aborted_ctrlc();
-        if !tool_results.is_empty() {
-            if interrupted {
-                debug!(
-                    "turn interrupted: {} tool results committed, unfinished tasks {:?}",
-                    tool_results.len(),
-                    pending_tasks(ctx)
-                        .into_iter()
-                        .filter(|task| !task.finished)
-                        .map(|task| task.id)
-                        .collect::<Vec<_>>()
-                );
-                let merged = input.merge_tool_results(output.clone(), tool_results);
-                ctx.after_chat_completion(app.as_ref(), &merged, TURN_INTERRUPTED_TEXT, &[])?;
-                // The marker is bookkeeping, not model text: `.continue` and
-                // `%%` must not replay it. `continuous` stays set so
-                // `.recover` and `.regenerate` work as after any tool turn.
-                if let Some(last) = ctx.last_message.as_mut() {
-                    last.output.clear();
-                }
-            } else {
-                input = input.merge_tool_results(output, tool_results);
-                let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input)?;
-                input = next;
-                if let Some(checkpoint) = checkpoint {
-                    eprintln!(
-                        "\n📎 {}",
-                        dim_notice_color(app.as_ref()).italic().paint(format!(
-                            "Checkpointed {} tool results (~{} tokens) to the session; the tool loop continues.",
-                            checkpoint.committed_results, checkpoint.committed_tokens
-                        ))
-                    );
-                    retried_after_compress = false;
-                }
-                continue;
-            }
-        }
-
-        // The guardrail must not run on an interrupted turn: its reminders
-        // would be saved as phantom exchanges and, in a session, its
-        // force-terminate would cancel the background tasks the user chose to
-        // leave running; without one, the arm cancels them itself.
-        if interrupted {
-            print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);
-        } else {
-            match check_pending_tasks_guardrail(ctx) {
-                GuardrailAction::Inject(prompt) => {
-                    input = Input::from_str(ctx, &prompt, None)?;
-                    retried_after_compress = false;
-                    continue;
-                }
-                GuardrailAction::ForceTerminate(ids) => {
-                    warn!(
-                        "Pending-agent guardrail force-cancelled {} agent(s) after max reminders: {:?}",
-                        ids.len(),
-                        ids
-                    );
-                }
-                GuardrailAction::NoAction => {}
-            }
-        }
-        let do_continue = should_continue(ctx) && !abort_signal.aborted_ctrlc();
-
-        if do_continue {
-            let full_prompt = {
-                let config = ctx.auto_continue_config();
-                let todo_state = ctx.todo_list.render_for_model();
-                let remaining = ctx.todo_list.incomplete_count();
-                ctx.set_last_continuation_response(output.clone());
-                ctx.increment_auto_continue_count();
-                let count = ctx.auto_continue_count;
-                let max = config.max_continues;
-
-                let prompt = config
-                    .continuation_prompt
-                    .as_deref()
-                    .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
-
-                eprintln!(
-                    "\n📋 {}",
-                    dim_notice_color(app.as_ref()).italic().paint(format!(
-                        "Auto-continuing ({count}/{max}): {remaining} incomplete todo(s) remain"
-                    ))
-                );
-
-                format!("{prompt}\n\n{todo_state}")
-            };
-            input = Input::from_str(ctx, &full_prompt, None)?;
-            retried_after_compress = false;
-            continue;
-        }
-
-        settle_turn(ctx, app.as_ref()).await;
-
-        let agent_can_continue_after_compress =
-            should_continue(ctx) && !abort_signal.aborted_ctrlc();
-
-        // Auto-continue keys off the compression CONDITION, not the outcome:
-        // a transiently failed compression retries at the next turn end, and
-        // gating on success would stall an unattended agent at the pause
-        // banner with incomplete todos.
-        let compression = maybe_auto_compress(ctx, app.as_ref()).await;
-        if compression.fired && agent_can_continue_after_compress {
-            let full_prompt = {
-                let config = ctx.auto_continue_config();
-                let todo_state = ctx.todo_list.render_for_model();
-                let remaining = ctx.todo_list.incomplete_count();
-                ctx.increment_auto_continue_count();
-                let count = ctx.auto_continue_count;
-                let max = config.max_continues;
-
-                let prompt = config
-                    .continuation_prompt
-                    .as_deref()
-                    .unwrap_or(DEFAULT_CONTINUATION_PROMPT);
-
-                eprintln!(
-                    "\n📋 {}",
-                    dim_notice_color(app.as_ref()).italic().paint(format!(
-                        "Auto-continuing after compression ({count}/{max}): {remaining} incomplete todo(s) remain"
-                    ))
-                );
-
-                format!("{prompt}\n\n{todo_state}")
-            };
-            input = Input::from_str(ctx, &full_prompt, None)?;
-            retried_after_compress = false;
-            continue;
-        }
-
-        print_turn_divider();
-        return Ok(());
-    }
-}
-
-/// The end-of-turn bookkeeping every completed turn shares, graph run or
-/// chat: the continuation counter resets, the pause banner prints and a
-/// temp session gets its autoname.
-async fn settle_turn(ctx: &mut RequestContext, app: &AppConfig) {
-    reset_continuation(ctx);
-    print_pause_banner(ctx);
-    if ctx.maybe_autoname_session() {
-        eprintln!(
-            "\n📢 {}",
-            dim_notice_color(app)
-                .italic()
-                .paint("Autonaming the session."),
-        );
-        if let Err(err) = ctx.autoname_session(app).await {
-            warn!("Failed to autonaming the session: {err}");
-        }
-        if let Some(session) = ctx.session.as_mut() {
-            session.set_autonaming(false);
-        }
-    }
-}
-
-fn print_turn_divider() {
-    let width = crossterm::terminal::size()
-        .map(|(columns, _)| columns as usize)
-        .unwrap_or(33);
-    println!("{}", dimmed_text(&"─".repeat(width)));
-    println!();
-}
-
-struct AutoCompressOutcome {
-    fired: bool,
-    succeeded: bool,
-}
-
-async fn maybe_auto_compress(ctx: &mut RequestContext, app: &AppConfig) -> AutoCompressOutcome {
-    let keep = ctx.compression_keep_policy(None);
-    let should_compress = ctx.session.as_ref().is_some_and(|session| {
-        session.needs_compression(app.compression_threshold, keep)
-            || session.safety_valve_triggered(
-                app.compression_safety_valve,
-                keep,
-                ctx.last_prompt_token_usage,
-            )
-    });
-    if !should_compress {
-        return AutoCompressOutcome {
-            fired: false,
-            succeeded: false,
-        };
-    }
-    AutoCompressOutcome {
-        fired: true,
-        succeeded: run_auto_compress(ctx, app).await,
-    }
-}
-
-async fn run_auto_compress(ctx: &mut RequestContext, app: &AppConfig) -> bool {
-    if let Some(session) = ctx.session.as_mut() {
-        session.set_compressing(true);
-    }
-
-    eprintln!(
-        "\n📢 {}",
-        dim_notice_color(app)
-            .italic()
-            .paint("Compressing the session."),
-    );
-
-    let compressed = auto_compress_session(ctx, app).await;
-    if let Some(session) = ctx.session.as_mut() {
-        session.set_compressing(false);
-    }
-    compressed
-}
-
-/// A context-overflow rejection is proof the prompt is too big even when the
-/// model declares no window for the valve to measure against, so it earns
-/// the same compress-and-retry as a tripped valve, provided there is a
-/// session with something to fold.
-async fn compress_for_error_retry(
-    ctx: &mut RequestContext,
-    app: &AppConfig,
-    already_retried: bool,
-    abort_signal: &AbortSignal,
-    err: &Error,
-) -> bool {
-    if already_retried || abort_signal.aborted() {
-        return false;
-    }
-    let keep = ctx.compression_keep_policy(None);
-    let valve_triggered = ctx.session.as_ref().is_some_and(|session| {
-        session.safety_valve_triggered(
-            app.compression_safety_valve,
-            keep,
-            ctx.last_prompt_token_usage,
-        )
-    });
-    let compressible = ctx.session.as_ref().is_some_and(Session::has_user_messages);
-    (valve_triggered || (compressible && graph::is_context_overflow_error(err)))
-        && run_auto_compress(ctx, app).await
-}
-
-async fn auto_compress_session(ctx: &mut RequestContext, app: &AppConfig) -> bool {
-    match ctx.compress_session().await {
-        Ok(()) => {
-            hooks::fire(
-                HookEvent::SessionCompressed,
-                ctx,
-                &hooks::role_extras(ctx),
-                None,
-            );
-            true
-        }
-        Err(err) => {
-            warn!("Failed to compress the session: {err:#}");
-            eprintln!("\n{}", compression_failure_notice(app, &err));
-            false
-        }
-    }
-}
-
-fn compression_failure_notice(app: &AppConfig, err: &Error) -> String {
-    dim_notice_color(app)
-        .italic()
-        .paint(format!("⚠️ Compression failed: {err:#}"))
-        .to_string()
-}
-
-fn dim_notice_color(app: &AppConfig) -> nu_ansi_term::Color {
-    if app.light_theme() {
-        nu_ansi_term::Color::LightGray
-    } else {
-        nu_ansi_term::Color::DarkGray
-    }
-}
-
-fn should_continue(ctx: &RequestContext) -> bool {
-    let config = ctx.auto_continue_config();
-    ctx.app.config.function_calling_support
-        && config.enabled
-        && ctx.auto_continue_count < config.max_continues
-        && ctx.todo_list.has_incomplete()
-        && ctx.auto_continue_paused.is_none()
-}
-
-fn reset_continuation(ctx: &mut RequestContext) {
-    ctx.reset_continuation_count();
 }
 
 /// Returns whether any background task was still running and got cancelled.
@@ -2425,191 +2036,6 @@ pub(crate) fn latch_prompt_interrupt(
     }
     supervisor.cancel_recursive();
     had_active_tasks
-}
-
-fn spawn_turn_interrupt_bridge(abort_signal: &AbortSignal) -> TaskCancelGuard {
-    let signal = abort_signal.clone();
-    TaskCancelGuard::spawn_one(async move { wait_user_interrupt(Some(&signal)).await })
-}
-
-fn pause_banner_text(ctx: &RequestContext) -> Option<String> {
-    let reason = ctx.auto_continue_paused.as_deref()?;
-    if !ctx.todo_list.has_incomplete() {
-        return None;
-    }
-    let remaining = ctx.todo_list.incomplete_count();
-    Some(format!(
-        "Auto-continue paused, awaiting user ({remaining} incomplete todo(s) preserved): {reason}"
-    ))
-}
-
-fn print_pause_banner(ctx: &RequestContext) {
-    if let Some(text) = pause_banner_text(ctx) {
-        eprintln!(
-            "\n⏸ {}",
-            dim_notice_color(&ctx.app.config).italic().paint(text)
-        );
-    }
-}
-
-fn interrupted_turn_notice(ctx: &RequestContext) -> Option<String> {
-    let running: Vec<String> = pending_tasks(ctx)
-        .into_iter()
-        .filter(|task| !task.finished)
-        .map(|task| {
-            let kind = match task.kind {
-                TaskKind::Agent => "agent",
-                TaskKind::Job => "job",
-            };
-            format!("{} ({kind})", task.id)
-        })
-        .collect();
-    if running.is_empty() {
-        // Grandchild-only activity has no top-level id to list, but it is
-        // what the second Ctrl-C would cancel, so the notice must still
-        // agree with `latch_prompt_interrupt`.
-        let has_active_tasks = ctx
-            .supervisor
-            .as_ref()
-            .is_some_and(|supervisor| supervisor.read().has_active_tasks());
-        if has_active_tasks {
-            return Some("Turn interrupted; background work is still running. Press Ctrl-C again to cancel it, or type to continue.".into());
-        }
-        return None;
-    }
-    Some(format!(
-        "Turn interrupted; {} background task(s) still running: {}. Press Ctrl-C again to cancel them, or type to continue.",
-        running.len(),
-        running.join(", ")
-    ))
-}
-
-/// The notice for a Ctrl-C that ended the turn, whichever way the turn ended.
-/// Without a session the press also cancels the turn's background work; in a
-/// session it leaves that work for a second press.
-async fn turn_interrupt_notice(ctx: &RequestContext, abort_signal: &AbortSignal) -> Option<String> {
-    if ctx.session.is_none() {
-        cancel_sessionless_turn_tasks(ctx, abort_signal).await
-    } else {
-        interrupted_turn_notice(ctx)
-    }
-}
-
-/// Awaits a step that runs before the turn's request, such as the RAG
-/// lookup, so a Ctrl-C that fails it prints the same notice (and, without a
-/// session, cancels the same background work) as an aborted request.
-async fn interruptible_step<T>(
-    ctx: &RequestContext,
-    abort_signal: &AbortSignal,
-    step: impl Future<Output = Result<T>>,
-) -> Result<T> {
-    let result = step.await;
-    if result.is_err() && abort_signal.aborted_ctrlc() {
-        print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);
-    }
-    result
-}
-
-/// The notice for a sessionless turn whose interrupt is cancelling
-/// `unfinished` top-level tasks; zero means only a sub-agent's own children
-/// were live, which have no top-level id to count.
-fn sessionless_cancelling_notice(unfinished: usize) -> String {
-    if unfinished == 0 {
-        return "Turn interrupted; cancelling the background work.".into();
-    }
-    format!("Turn interrupted; cancelling {unfinished} background task(s).")
-}
-
-/// The notice for agents that had not stopped when the cancel wait of
-/// `wait` gave up.
-fn sessionless_still_running_notice(names: &[String], wait: Duration) -> String {
-    format!(
-        "{} background agent(s) still running after {}s: {}. Press Ctrl-C again at the idle prompt to cancel them.",
-        names.len(),
-        wait.as_secs(),
-        names.join(", ")
-    )
-}
-
-/// Without a session the next prompt carries no history of what this turn
-/// started, so the interrupt that ended the turn also cancels that work and
-/// waits for the agents to finish. The cancel is announced before the wait,
-/// which can take seconds; returns the notice naming the agents still
-/// running when the wait gave up, or `None` when nothing was running or
-/// everything stopped in time.
-async fn cancel_sessionless_turn_tasks(
-    ctx: &RequestContext,
-    abort_signal: &AbortSignal,
-) -> Option<String> {
-    let supervisor = ctx.supervisor.clone()?;
-    let has_active_tasks = supervisor.read().has_active_tasks();
-    if !has_active_tasks {
-        return None;
-    }
-    let unfinished = pending_tasks(ctx)
-        .into_iter()
-        .filter(|task| !task.finished)
-        .count();
-    latch_prompt_interrupt(abort_signal, &supervisor);
-    print_turn_notice(
-        ctx,
-        Some(
-            ctx.render_hints(&sessionless_cancelling_notice(unfinished))
-                .into_owned(),
-        ),
-    );
-    ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
-    let mut still_running: Vec<String> = {
-        let supervisor = supervisor.read();
-        supervisor
-            .list_agents()
-            .into_iter()
-            .filter(|(id, _)| supervisor.is_finished(id) == Some(false))
-            .map(|(id, _)| id.to_string())
-            .collect()
-    };
-    if still_running.is_empty() {
-        return None;
-    }
-    still_running.sort();
-    Some(
-        ctx.render_hints(&sessionless_still_running_notice(
-            &still_running,
-            EXIT_CANCEL_WAIT,
-        ))
-        .into_owned(),
-    )
-}
-
-fn print_turn_notice(ctx: &RequestContext, notice: Option<String>) {
-    if let Some(text) = notice {
-        #[cfg(test)]
-        turn_notice_sink::record(&text);
-        eprintln!(
-            "\n⏸ {}",
-            dim_notice_color(&ctx.app.config).italic().paint(text)
-        );
-    }
-}
-
-/// Records every notice `print_turn_notice` prints on the current thread, so
-/// a test running the turn on its own runtime thread reads only its own.
-#[cfg(test)]
-mod turn_notice_sink {
-    use std::cell::RefCell;
-
-    thread_local! {
-        static NOTICES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
-
-    pub(super) fn record(text: &str) {
-        NOTICES.with(|notices| notices.borrow_mut().push(text.to_string()));
-    }
-
-    /// Removes and returns everything this thread recorded so far.
-    pub(super) fn drain() -> Vec<String> {
-        NOTICES.with(|notices| notices.take())
-    }
 }
 
 fn unknown_command(ctx: &RequestContext) -> Result<()> {
@@ -2816,6 +2242,24 @@ fn parse_command(line: &str, prefix: CommandPrefix) -> Option<(Cow<'_, str>, Opt
     }
 }
 
+/// The text inside a `::: ... :::` multi-line fence, or the line itself
+/// when it has none. Every surface classifies a submitted line through
+/// this, so a fenced command runs and is shown as a command everywhere.
+pub(crate) fn unfence(line: &str) -> &str {
+    match MULTILINE_RE.captures(line) {
+        Ok(Some(captures)) => captures.get(1).map_or(line, |text| text.as_str()),
+        _ => line,
+    }
+}
+
+/// Whether a submitted line, fence stripped, is a command rather than a
+/// message for the model: a `.command` or a `!shell` passthrough, the two
+/// arms the dispatcher below handles itself.
+pub(crate) fn is_command(line: &str, prefix: CommandPrefix) -> bool {
+    let line = unfence(line);
+    parse_command(line, prefix).is_some() || try_extract_shell_command(line).is_some()
+}
+
 fn try_extract_shell_command(line: &str) -> Option<&str> {
     let rest = line.strip_prefix('!')?;
     Some(rest.trim_start())
@@ -2871,6 +2315,31 @@ fn prompt_arg_inquire_label(server: &str, prompt: &str, arg: &str) -> String {
         sanitize_display_text(server),
         sanitize_display_text(arg)
     )
+}
+
+/// Asks for each required argument the `.prompt` call left out, one
+/// Input question per key in the order the prompt declares them.
+fn prompt_missing_args(
+    ctx: &RequestContext,
+    server: &str,
+    prompt: &str,
+    missing: Vec<String>,
+) -> Result<Vec<(String, String)>> {
+    missing
+        .into_iter()
+        .map(|key| {
+            let value = ctx
+                .prompt(ctx.prompt_request(
+                    PromptAction::Input,
+                    prompt_arg_inquire_label(server, prompt, &key),
+                    Vec::new(),
+                    None,
+                ))?
+                .into_text()
+                .with_context(|| format!("Failed to read prompt argument '{key}'"))?;
+            Ok((key, value))
+        })
+        .collect()
 }
 
 pub fn split_args_text(line: &str, is_win: bool) -> (Vec<String>, &str) {
@@ -3539,14 +3008,27 @@ fn sweep_pasted_images_older_than(dir: &Path, max_age: Duration) {
 mod tests {
     use super::*;
     use crate::client::{ClientConfig, MessageContent, Model, ModelData, ToolCall};
-    use crate::config::{AppState, Role, RoleLike, TEMP_ROLE_NAME, WorkingMode};
+    use crate::config::{
+        AppState, Role, RoleLike, Session, TEMP_ROLE_NAME, TURN_INTERRUPTED_TEXT, WorkingMode,
+    };
     use crate::function::ToolResult;
     use crate::function::agents::AGENT_FUNCTION_PREFIX;
+    use crate::function::agents::pending_tasks;
     use crate::function::memory::MEMORY_FUNCTION_PREFIX;
     use crate::function::user_interaction::USER_FUNCTION_PREFIX;
     use crate::graph::llm::test_support::{boxed_completion, completion_runner};
     use crate::graph::route::ROUTE_ROLE_NAME;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::prompt::{PromptAnswer, ScriptedPrompter};
+    use crate::turn::driver::{
+        auto_compress_session, compress_for_error_retry, compression_failure_notice,
+        dim_notice_color, interrupted_turn_notice, maybe_auto_compress, pause_banner_text,
+        spawn_turn_interrupt_bridge,
+    };
+    use crate::turn::driver::{
+        cancel_sessionless_turn_tasks, interruptible_step, sessionless_still_running_notice,
+        turn_notice_sink,
+    };
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;
@@ -9353,6 +8835,78 @@ local_hello() {\n\
         );
     }
 
+    /// The arguments a `.prompt` call leaves out are asked for through
+    /// the context's prompter, one Input question per key in declaration
+    /// order; a cancel on any of them ends the call with the key named.
+    #[test]
+    fn missing_prompt_args_are_asked_through_the_prompter() {
+        let mut ctx = repl_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Text("notes.txt".to_string()),
+            PromptAnswer::Text("terse".to_string()),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        let filled = prompt_missing_args(
+            &ctx,
+            "srv",
+            "summarize",
+            vec!["path".to_string(), "style".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            filled,
+            vec![
+                ("path".to_string(), "notes.txt".to_string()),
+                ("style".to_string(), "terse".to_string()),
+            ]
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|req| req.action == PromptAction::Input));
+        assert_eq!(
+            requests[0].question,
+            "Prompt 'summarize' on 'srv' requires 'path':"
+        );
+        assert_eq!(
+            requests[1].question,
+            "Prompt 'summarize' on 'srv' requires 'style':"
+        );
+        assert!(
+            prompt_missing_args(&ctx, "srv", "summarize", Vec::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err =
+            prompt_missing_args(&ctx, "srv", "summarize", vec!["path".to_string()]).unwrap_err();
+        assert_eq!(err.to_string(), "Failed to read prompt argument 'path'");
+        assert_eq!(
+            err.root_cause().to_string(),
+            "Operation was canceled by the user"
+        );
+    }
+
+    /// With no human to fill them in, the missing arguments end the call
+    /// before anything reaches the server.
+    #[test]
+    fn missing_prompt_args_with_no_human_end_the_call() {
+        let mut ctx = repl_ctx();
+        ctx.prompter = Arc::new(crate::prompt::HeadlessPrompter);
+
+        let err =
+            prompt_missing_args(&ctx, "srv", "summarize", vec!["path".to_string()]).unwrap_err();
+
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "The input prompt needs a human and none is attached to this run; \
+             run it without --headless or --acp-server"
+        );
+    }
+
     #[test]
     fn parse_repl_install_routes_categories_to_builtins() {
         assert_eq!(
@@ -9523,7 +9077,7 @@ local_hello() {\n\
         }
     }
 
-    // Usage probe (spec-first, criterion 5): `-h/--help` wins from ANY
+    // `-h/--help` wins from ANY
     // position — including when it is preceded by a token that would
     // otherwise route to Usage (unknown `-` flag) or Conflict (both scope
     // flags) — while, absent help, an unknown `-` token still routes to
@@ -9807,6 +9361,23 @@ local_hello() {\n\
             parse_command(".", CommandPrefix::Dot),
             Some((Cow::Borrowed("."), None))
         );
+    }
+
+    /// A command inside the multi-line fence is a command on every
+    /// surface: the dispatcher runs it and the UI shows it as one.
+    #[test]
+    fn a_fenced_command_is_classified_as_a_command() {
+        assert_eq!(unfence("::: .info :::"), ".info ");
+        assert_eq!(unfence(":::\n.info session\n:::"), ".info session\n");
+        assert_eq!(unfence(".info"), ".info");
+        assert_eq!(unfence("::: unterminated"), "::: unterminated");
+        assert!(is_command("::: .info :::", CommandPrefix::Dot));
+        assert!(is_command(".info", CommandPrefix::Dot));
+        assert!(is_command("!ls", CommandPrefix::Dot));
+        assert!(is_command("::: !ls :::", CommandPrefix::Dot));
+        assert!(!is_command("::: plain chat :::", CommandPrefix::Dot));
+        assert!(!is_command("::: .info :::", CommandPrefix::Slash));
+        assert!(!is_command("ls!", CommandPrefix::Dot));
     }
 
     #[test]
@@ -10489,6 +10060,39 @@ local_hello() {\n\
 
     #[test]
     #[serial]
+    fn sessionless_interrupt_in_the_full_screen_ui_leaves_background_tasks_running() {
+        let _sink = test_sink::install();
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let marker = "sessionless-tui-interrupt-k4q";
+        run_async(async {
+            let mut ctx = sessionless_interruptible_ctx(marker);
+            turn_notice_sink::drain();
+
+            let (agent_abort, job_abort) =
+                interrupt_a_tool_round_over_agent_and_job(&mut ctx).await;
+
+            assert!(!agent_abort.aborted(), "the agent must be left running");
+            assert!(!job_abort.aborted(), "the job must be left running");
+            let notices = turn_notice_sink::drain();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(
+                notices[0].starts_with("Turn interrupted; 2 background task(s) still running"),
+                "{notices:?}"
+            );
+            {
+                let sup = ctx.supervisor.as_ref().unwrap().read();
+                assert_eq!(sup.is_finished("a1"), Some(false));
+                assert!(sup.has_active_tasks());
+            }
+            agent_abort.set_ctrlc();
+            job_abort.set_ctrlc();
+            yield_until_no_active_tasks(&ctx).await;
+        });
+        assert_eq!(hook_count(marker, "turn.interrupted"), 1);
+    }
+
+    #[test]
+    #[serial]
     fn session_ctrl_c_in_a_tool_round_leaves_abort_aware_tasks_alive() {
         let _sink = test_sink::install();
         let marker = "session-ctrlc-tool-round-w8d";
@@ -10898,41 +10502,41 @@ local_hello() {\n\
     /// Every way a Ctrl-C ends the turn (the interrupted arm, an aborted
     /// request, an aborted graph turn, an aborted RAG lookup) prints through
     /// the one notice helper that branches on the session, so the sessionless
-    /// notices reach the same stderr channel as the two-stage one, and the
+    /// notices reach the same notice channel as the two-stage one, and the
     /// idle-prompt second press keeps its hint.
     #[test]
     fn every_interrupt_path_prints_through_one_notice_channel() {
-        let source = include_str!("mod.rs").replace("\r\n", "\n");
-        let production = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
-        let notice = "print_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);";
-        let arm = format!("        if interrupted {{\n            {notice}\n        }} else {{\n");
+        let source = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let production = &source[..source.find("\n#[cfg(test)]\n").unwrap()];
+        let notice = "emit_turn_notice(ctx, turn_interrupt_notice(ctx, &abort_signal).await);";
+        let arm = format!(
+            "            if interrupted {{\n                {notice}\n            }} else {{\n"
+        );
         assert_eq!(production.matches(&arm).count(), 1);
-        let rag = "            let embeddings = input.use_embeddings(abort_signal.clone());\n            interruptible_step(ctx, &abort_signal, embeddings).await?;\n";
+        let rag = "                let embeddings = input.use_embeddings(abort_signal.clone());\n                interruptible_step(ctx, &abort_signal, embeddings).await?;\n";
         assert_eq!(production.matches(rag).count(), 1);
         assert_eq!(production.matches(".use_embeddings(").count(), 1);
         let step = &production[production.find("async fn interruptible_step<").unwrap()..];
         let step = &step[..step.find("\n}\n").unwrap()];
         assert!(
-            step.contains(
-                "print_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);"
-            ),
+            step.contains("emit_turn_notice(ctx, turn_interrupt_notice(ctx, abort_signal).await);"),
             "{step}"
         );
         let graph = format!(
-            "                Err(err) => {{\n                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    return Err(err);\n                }}\n            }};\n            match turn {{\n"
+            "                    Err(err) => {{\n                        if abort_signal.aborted_ctrlc() {{\n                            {notice}\n                        }}\n                        return Err(err);\n                    }}\n                }};\n                match turn {{\n"
         );
         assert_eq!(production.matches(&graph).count(), 1);
         let aborted = format!(
-            "                    if abort_signal.aborted_ctrlc() {{\n                        {notice}\n                    }}\n                    ctx.on_chat_completion_error(app.as_ref(), &input);\n                    return Err(err);\n"
+            "                        if abort_signal.aborted_ctrlc() {{\n                            {notice}\n                        }}\n                        ctx.on_chat_completion_error(app.as_ref(), &input);\n                        return Err(err);\n"
         );
         assert_eq!(production.matches(&aborted).count(), 1);
         assert_eq!(production.matches(notice).count(), 3);
-        assert_eq!(production.matches("print_turn_notice(").count(), 6);
+        assert_eq!(production.matches("emit_turn_notice(").count(), 6);
         let helper = &production[production.find("async fn turn_interrupt_notice(").unwrap()..];
         let helper = &helper[..helper.find("\n}\n").unwrap()];
         assert!(
             helper.contains(
-                "    if ctx.session.is_none() {\n        cancel_sessionless_turn_tasks(ctx, abort_signal).await\n    } else {\n        interrupted_turn_notice(ctx)\n    }"
+                "    if ctx.session.is_none() && !crate::tui::active() {\n        cancel_sessionless_turn_tasks(ctx, abort_signal).await\n    } else {\n        interrupted_turn_notice(ctx)\n    }"
             ),
             "{helper}"
         );
@@ -10942,9 +10546,10 @@ local_hello() {\n\
                 .count(),
             1
         );
-        let printer = &production[production.find("fn print_turn_notice(").unwrap()..];
+        let printer = &production[production.find("fn emit_turn_notice(").unwrap()..];
         let printer = &printer[..printer.find("\n}\n").unwrap()];
-        assert!(printer.contains("eprintln!("), "{printer}");
+        assert!(printer.contains("emit_notice("), "{printer}");
+        assert!(printer.contains("NoticeKind::Interrupted"), "{printer}");
         assert_eq!(
             CANCELLED_TASKS_HINT,
             "Cancelled the background task(s) left running by the interrupted turn."
@@ -11713,7 +11318,11 @@ local_hello() {\n\
         let call = "cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await";
         assert_eq!(EXIT_CANCEL_WAIT, Duration::from_secs(5));
         assert!(production.contains("const EXIT_CANCEL_WAIT: Duration = Duration::from_secs(5);"));
-        assert_eq!(production.matches(&format!("{call};")).count(), 6);
+        // The sessionless interrupt's wait lives with the turn loop.
+        assert_eq!(production.matches(&format!("{call};")).count(), 5);
+        let driver = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let driver = &driver[..driver.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(driver.matches(&format!("{call};")).count(), 1);
 
         let finished = production.find("top_level_agent_finished(").unwrap();
         let before_finished = &production[..finished];

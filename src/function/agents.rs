@@ -11,10 +11,11 @@ use crate::config::{
     effective_max_concurrent_jobs, jobs_enabled, list_agents_with_descriptions,
     load_agent_variables, paths, roster_line,
 };
+use crate::events::Origin;
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mcp::is_auth_required_error;
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox, PeerRegistry, graph_agent_id};
-use crate::supervisor::notification::agent_notification;
+use crate::supervisor::notification::{SystemNotification, agent_notification};
 use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor, TaskKind};
 use crate::utils::fs::{refuse_symlinked_dir, write_private_atomic};
 use crate::utils::process::ProcessStamp;
@@ -47,6 +48,10 @@ pub const AGENT_FUNCTION_PREFIX: &str = "agent__";
 pub const PENDING_TASKS_GUARDRAIL_MAX: u32 = 3;
 
 pub const PARENT_ALIAS: &str = "parent";
+
+/// How long `agent__cancel` waits for a cancelled agent's task to join
+/// before it reports the cleanup as still under way.
+pub(crate) const CANCEL_CLEANUP_WAIT: Duration = Duration::from_secs(5);
 
 /// Rows per page of `agent__list_sessions` when the caller names none.
 const LIST_SESSIONS_PAGE_SIZE: usize = 20;
@@ -1144,6 +1149,7 @@ pub async fn run_agent_for_graph(
         info_flag,
         agent_name,
         child_abort.clone(),
+        Arc::clone(&parent_ctx.prompter),
     )
     .await?;
 
@@ -1489,13 +1495,10 @@ impl SpawnResultHooks {
                 (HookEvent::AgentFailed, self.failed)
             }
         };
-        hooks::fire_resolved(
-            event,
-            resolved,
-            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name)),
-            &extras,
-            None,
-        );
+        let base_envs =
+            hooks::base_envs_parts(event, self.session_name.as_deref(), Some(&self.agent_name));
+        hooks::publish_hook_event(event, &base_envs, &extras, None, Origin::detached());
+        hooks::fire_resolved(event, resolved, base_envs, &extras, None);
     }
 }
 
@@ -2257,6 +2260,7 @@ async fn build_child_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Spa
         info_flag,
         &agent_name,
         child_abort.clone(),
+        Arc::clone(&ctx.prompter),
     )
     .await?;
 
@@ -2952,7 +2956,10 @@ async fn handle_wait(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
                 .notification_queue
                 .take_ids(&ids)
                 .into_iter()
-                .map(|n| (n.id, n.status))
+                .filter_map(|n| match n {
+                    SystemNotification::Task { id, status, .. } => Some((id, status)),
+                    SystemNotification::UserMessage { .. } => None,
+                })
                 .collect();
             let ready: Vec<Value> = finished
                 .iter()
@@ -3323,6 +3330,11 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
             }
             let was_running = !join_handle.is_finished();
             abort_signal.set_ctrlc();
+            // Descendants' questions go when their own waits see the abort;
+            // this one goes now so the roster drops it before the cleanup wait.
+            if let Some(queue) = ctx.root_escalation_queue() {
+                queue.remove_for_agents(&[id]);
+            }
             // Written here as well as by the child's own exit, so the
             // sidecar reads cancelled even when the child outlives the
             // cleanup wait below. A child that had already finished keeps
@@ -3339,7 +3351,7 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 );
             }
 
-            let cleanup = tokio::time::timeout(Duration::from_secs(5), join_handle).await;
+            let cleanup = tokio::time::timeout(CANCEL_CLEANUP_WAIT, join_handle).await;
             let cleaned_up = cleanup.is_ok();
 
             // A task that panicked, whether before this cancel or while
@@ -3362,7 +3374,8 @@ async fn handle_cancel(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
                 format!("Cancelled agent '{agent_name}' and waited for cleanup.")
             } else {
                 format!(
-                    "Cancelled agent '{agent_name}'; cleanup did not complete within 5s. Its descendants have been signalled and will tear down asynchronously."
+                    "Cancelled agent '{agent_name}'; cleanup did not complete within {}s. Its descendants have been signalled and will tear down asynchronously.",
+                    CANCEL_CLEANUP_WAIT.as_secs()
                 )
             };
 
@@ -3521,7 +3534,17 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         .get("reply")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'reply' is required"))?;
+    reply_escalation(ctx, escalation_id, reply)
+}
 
+/// Answers a pending escalation from the parent's side; the reply reaches
+/// the waiting child and `escalation.answered` fires from the replying
+/// context, carrying the request's agent and question in its envs.
+pub(crate) fn reply_escalation(
+    ctx: &mut RequestContext,
+    escalation_id: &str,
+    reply: &str,
+) -> Result<Value> {
     let queue = ctx
         .escalation_queue
         .clone()
@@ -3531,7 +3554,12 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         Some(request) => {
             let from_agent = request.from_agent_name.clone();
             let question = request.question.clone();
-            let _ = request.reply_tx.send(reply.to_string());
+            if request.reply_tx.send(reply.to_string()).is_err() {
+                return Ok(json!({
+                    "status": "error",
+                    "message": format!("The reply was not delivered: agent '{from_agent}' stopped waiting on escalation '{escalation_id}'"),
+                }));
+            }
             hooks::fire(
                 HookEvent::EscalationAnswered,
                 ctx,
@@ -3552,7 +3580,7 @@ fn handle_reply_escalation(ctx: &mut RequestContext, args: &Value) -> Result<Val
         }
         None => Ok(json!({
             "status": "error",
-            "message": format!("No pending escalation found with id '{escalation_id}'. It may have already been replied to."),
+            "message": format!("The reply was not delivered: no pending escalation has id '{escalation_id}'. It was already answered, or its asker stopped waiting."),
         })),
     }
 }
@@ -3933,6 +3961,7 @@ mod tests {
             false,
             &agent_name,
             create_abort_signal(),
+            Arc::clone(&ctx.prompter),
         ))
         .unwrap();
         ctx.agent = Some(agent);
@@ -4233,12 +4262,11 @@ mod tests {
             .notification_queue
             .drain()
             .iter()
-            .map(|notification| {
-                (
-                    notification.event,
-                    notification.id.clone(),
-                    notification.status,
-                )
+            .map(|notification| match notification {
+                SystemNotification::Task {
+                    event, id, status, ..
+                } => (*event, id.clone(), *status),
+                SystemNotification::UserMessage { .. } => panic!("{:?}", notification.to_value()),
             })
             .collect();
         assert_eq!(notified, [("agent_failed", id, "failed")]);
@@ -4433,6 +4461,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_bus_twin_without_resolved_hooks() {
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let agent_id = "agent-bus-probe-x7x";
+        let _sink = hooks::test_sink::install();
+        let bus = crate::events::RecordingSink::install();
+
+        SpawnResultHooks::resolve(&ctx, agent_id, "explore", None).fire(None, false);
+
+        let published = bus.drain_hooks_with_env("COYOTE_AGENT_ID", agent_id);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let crate::events::Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::AgentCompleted);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_AGENT_NAME".to_string(), "explore".to_string())));
+        assert!(envs.contains(&("COYOTE_EVENT".to_string(), "agent.completed".to_string())));
+        assert!(!envs.iter().any(|(key, _)| key == "COYOTE_AGENT_SESSION_ID"));
+        assert!(
+            hooks::test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_AGENT_ID").map(String::as_str) != Some(agent_id)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
     }
 
     #[test]
@@ -6577,8 +6640,8 @@ mod tests {
 
     /// Recording a graph run is the caller's job: the dispatcher hands the
     /// record back and never touches the session itself, and exactly three
-    /// callers store it: the REPL `.run` arm and the one-shot graph arm in
-    /// main.rs, on the engaged session, and the child runner, on the
+    /// callers store it: the REPL turn and the one-shot graph turn, both in
+    /// the turn driver, on the engaged session, and the child runner, on the
     /// child's own session.
     #[test]
     fn only_the_repl_turn_the_one_shot_arm_and_the_child_runner_record_a_graph_run() {
@@ -6601,11 +6664,15 @@ mod tests {
 
         let repl = include_str!("../repl/mod.rs").replace("\r\n", "\n");
         let repl = &repl[..repl.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        assert_eq!(repl.matches("record_graph_run(").count(), 1);
+        assert_eq!(repl.matches("record_graph_run(").count(), 0);
 
         let main = include_str!("../main.rs").replace("\r\n", "\n");
         let main = &main[..main.find("\n#[cfg(test)]\nmod tests").unwrap()];
-        assert_eq!(main.matches("record_graph_run(").count(), 1);
+        assert_eq!(main.matches("record_graph_run(").count(), 0);
+
+        let driver = include_str!("../turn/driver.rs").replace("\r\n", "\n");
+        let driver = &driver[..driver.find("\n#[cfg(test)]\n").unwrap()];
+        assert_eq!(driver.matches("record_graph_run(").count(), 2);
     }
 
     #[test]
@@ -14471,6 +14538,34 @@ mod tests {
         assert_eq!(result["status"], "error");
     }
 
+    /// The cancelled agent's open question leaves the queue with it, even
+    /// while its wait still holds the receiver; other agents' stay.
+    #[test]
+    fn handle_cancel_withdraws_the_agents_pending_questions() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        register_fake_agent(&mut ctx, "a1", "explore");
+        let queue = ctx.ensure_root_escalation_queue();
+        let mut receivers = Vec::new();
+        for (id, from) in [("esc_c1", "a1"), ("esc_o1", "a2")] {
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            queue.submit(EscalationRequest {
+                id: id.into(),
+                from_agent_id: from.into(),
+                from_agent_name: "explore".into(),
+                question: "Which way?".into(),
+                options: None,
+                reply_tx: tx,
+            });
+            receivers.push(rx);
+        }
+
+        let result = run_async(handle_cancel(&mut ctx, &json!({"id": "a1"}))).unwrap();
+
+        assert_eq!(result["status"], "ok");
+        let ids: Vec<String> = queue.pending().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, ["esc_o1"]);
+    }
+
     #[test]
     fn handle_cancel_no_supervisor_errors() {
         let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
@@ -15059,7 +15154,7 @@ mod tests {
         assert_eq!(result["status"], "error");
         assert_eq!(
             result["message"],
-            "No pending escalation found with id 'missing'. It may have already been replied to."
+            "The reply was not delivered: no pending escalation has id 'missing'. It was already answered, or its asker stopped waiting."
         );
     }
 
@@ -15071,14 +15166,43 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// `escalation.answered` belongs to the successful take -> reply arm
-    /// alone: exactly once per escalation, and never from the failure arms
-    /// (unknown id, already-taken id).
+    /// A reply that reaches no one is an error, and `escalation.answered`
+    /// does not fire for it.
     #[test]
     #[serial]
-    fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
+    fn replying_after_the_asker_stopped_waiting_is_an_error() {
         let _sink = hooks::test_sink::install();
-        let marker = "t049_answered_once";
+        let marker = "answered_after_asker_left_k4p";
+        let mut ctx = ctx_with_answered_hook(marker);
+        let queue = Arc::new(EscalationQueue::new());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        queue.submit(EscalationRequest {
+            id: "esc_gone".into(),
+            from_agent_id: "a1".into(),
+            from_agent_name: "explore".into(),
+            question: "What do?".into(),
+            options: None,
+            reply_tx: tx,
+        });
+        ctx.escalation_queue = Some(queue.clone());
+        drop(rx);
+
+        let result = reply_escalation(&mut ctx, "esc_gone", "do X").unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "status": "error",
+                "message": "The reply was not delivered: agent 'explore' stopped waiting on escalation 'esc_gone'",
+            })
+        );
+        assert!(queue.take("esc_gone").is_none());
+        assert!(
+            hook_captures_named(marker).is_empty(),
+            "an undelivered reply must not fire escalation.answered"
+        );
+    }
+
+    fn ctx_with_answered_hook(marker: &str) -> RequestContext {
         let mut hooks_map = hooks::HooksMap::default();
         hooks_map.insert(
             "escalation.answered".to_string(),
@@ -15092,7 +15216,34 @@ mod tests {
             hooks: hooks_map,
             ..Default::default()
         });
-        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
+    }
+
+    #[tokio::test]
+    async fn reply_escalation_matches_the_tool_wrapper_for_an_unknown_id() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.escalation_queue = Some(Arc::new(EscalationQueue::new()));
+        let via_tool = handle_agent_tool(
+            &mut ctx,
+            "agent__reply_escalation",
+            &json!({ "escalation_id": "esc_missing_7h", "reply": "ok" }),
+        )
+        .await
+        .unwrap();
+        let lifted = reply_escalation(&mut ctx, "esc_missing_7h", "ok").unwrap();
+        assert_eq!(via_tool["status"], "error");
+        assert_eq!(via_tool, lifted);
+    }
+
+    /// `escalation.answered` belongs to the successful take -> reply arm
+    /// alone: exactly once per escalation, and never from the failure arms
+    /// (unknown id, already-taken id).
+    #[test]
+    #[serial]
+    fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
+        let _sink = hooks::test_sink::install();
+        let marker = "t049_answered_once";
+        let mut ctx = ctx_with_answered_hook(marker);
         let queue = Arc::new(EscalationQueue::new());
         let (tx, rx) = tokio::sync::oneshot::channel();
         queue.submit(EscalationRequest {
@@ -17000,7 +17151,7 @@ mod tests {
                 .notification_queue
                 .drain()
                 .into_iter()
-                .map(|n| n.id)
+                .map(|n| n.id().unwrap().to_string())
                 .collect();
             assert_eq!(left, vec!["other"]);
         });

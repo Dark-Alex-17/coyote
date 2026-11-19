@@ -1,11 +1,12 @@
 use crate::cli::{Cli, McpScopeArg, McpTransportArg};
+use crate::config::conflict::{menu_can_use_terminal, refuse_non_interactive};
 use crate::config::{ensure_parent_exists, paths};
 use crate::mcp::{JsonField, McpOAuthConfig, McpServer, McpServersConfig, McpTransportType};
 use crate::vault::{SECRET_RE, Vault};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::{IndexMap, IndexSet};
-use inquire::Confirm;
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -112,13 +113,11 @@ fn handle_get(name: &str, scope: Option<McpScopeArg>) -> Result<()> {
 fn handle_remove(name: &str, scope: Option<McpScopeArg>, force: bool) -> Result<()> {
     let (path, mut cfg) = load_for_scope_or_search(name, scope)?;
     if !force {
-        let ok = Confirm::new(&format!(
-            "Remove MCP server '{name}' from {}?",
-            path.display()
-        ))
-        .with_default(false)
-        .prompt()?;
-
+        let ok = confirm_on_the_terminal(
+            format_args!("remove MCP server '{name}'"),
+            format!("Remove MCP server '{name}' from {}?", path.display()),
+            " or pass --mcp-force.",
+        )?;
         if !ok {
             println!("Aborted.");
             return Ok(());
@@ -142,25 +141,42 @@ fn handle_add(cli: &Cli, name: &str, vault: &Vault) -> Result<()> {
     let mut cfg = load_config_raw(&path)?;
 
     if cfg.mcp_servers.contains_key(name) && !cli.mcp_force {
-        let ok = Confirm::new(&format!(
-            "MCP server '{name}' already exists in {}. Overwrite?",
-            path.display()
-        ))
-        .with_default(false)
-        .prompt()?;
+        let ok = confirm_on_the_terminal(
+            format_args!("overwrite MCP server '{name}'"),
+            format!(
+                "MCP server '{name}' already exists in {}. Overwrite?",
+                path.display()
+            ),
+            " or pass --mcp-force.",
+        )?;
         if !ok {
             println!("Aborted. Use --mcp-force to overwrite without prompting.");
             return Ok(());
         }
     }
 
-    provision_secrets(cli, vault)?;
+    provision_secrets(cli, name, vault)?;
 
     cfg.mcp_servers.insert(name.to_string(), server);
     save_config(&path, &cfg)?;
     println!("✓ Added MCP server '{name}' to {}", path.display());
 
     Ok(())
+}
+
+/// A yes/no question on the terminal, defaulting to no. A run with
+/// nowhere to ask is refused in the shared shape rather than left on a
+/// widget nothing can answer; `remedy` names the flag that skips it.
+fn confirm_on_the_terminal(
+    action: fmt::Arguments<'_>,
+    question: String,
+    remedy: &str,
+) -> Result<bool> {
+    if !menu_can_use_terminal() {
+        return Err(refuse_non_interactive(action, remedy));
+    }
+    let prompter = crate::prompt::InquirePrompter::default();
+    crate::prompt::confirm(&prompter, question, false)
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -307,7 +323,7 @@ fn build_remote(cli: &Cli, transport: McpTransportType, has_command: bool) -> Re
     })
 }
 
-fn provision_secrets(cli: &Cli, vault: &Vault) -> Result<()> {
+fn provision_secrets(cli: &Cli, server: &str, vault: &Vault) -> Result<()> {
     let mut sources: Vec<&str> = Vec::new();
     if let Some(s) = cli.url.as_deref() {
         sources.push(s);
@@ -341,24 +357,50 @@ fn provision_secrets(cli: &Cli, vault: &Vault) -> Result<()> {
     }
 
     let existing: HashSet<String> = vault.list_secrets(false)?.into_iter().collect();
-    for name in needed {
-        if existing.contains(&name) {
-            continue;
-        }
+    let missing: Vec<&str> = needed
+        .iter()
+        .filter(|name| !existing.contains(*name))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    refuse_missing_secrets_without_a_terminal(server, &missing)?;
+    let prompter = crate::prompt::InquirePrompter::default();
+    for name in missing {
         eprintln!("Value references vault secret {{{{ {name} }}}} which is not stored yet.");
-        let ok = Confirm::new(&format!("Add '{name}' to the vault now?"))
-            .with_default(true)
-            .prompt()?;
+        let ok =
+            crate::prompt::confirm(&prompter, format!("Add '{name}' to the vault now?"), true)?;
         if !ok {
             bail!(
                 "Vault secret '{name}' is required by the config; aborting. \
                  Add it later with `coyote --add-secret {name}`."
             );
         }
-        vault.add_secret(&name)?;
+        vault.add_secret(name, &prompter)?;
     }
 
     Ok(())
+}
+
+/// Each missing secret is asked for and then entered on the terminal, so
+/// a run with nowhere to ask is refused before the first question rather
+/// than part way through the list.
+fn refuse_missing_secrets_without_a_terminal(server: &str, missing: &[&str]) -> Result<()> {
+    if menu_can_use_terminal() {
+        return Ok(());
+    }
+    let commands: Vec<String> = missing
+        .iter()
+        .map(|name| format!("`coyote --add-secret {name}`"))
+        .collect();
+    Err(refuse_non_interactive(
+        format_args!("provision the MCP secrets for '{server}'"),
+        format_args!(
+            " or add them to the vault first with {}.",
+            commands.join(", ")
+        ),
+    ))
 }
 
 fn load_for_scope_or_search(
@@ -444,4 +486,107 @@ fn save_config(path: &Path, config: &McpServersConfig) -> Result<()> {
         .with_context(|| format!("failed to finalize MCP config at {}", path.display()))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::conflict::prompt_script;
+    use crate::testing::TestConfigDirGuard;
+    use clap::Parser;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn without_a_terminal_missing_mcp_secrets_are_refused_before_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+
+        let err = refuse_missing_secrets_without_a_terminal("github", &["GH_TOKEN", "GH_USER"])
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to provision the MCP secrets for 'github' non-interactively. \
+             Re-run in a terminal or add them to the vault first with \
+             `coyote --add-secret GH_TOKEN`, `coyote --add-secret GH_USER`."
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn with_a_terminal_missing_mcp_secrets_go_on_to_be_asked_for() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install(&[]);
+
+        refuse_missing_secrets_without_a_terminal("github", &["GH_TOKEN"]).unwrap();
+    }
+
+    /// A config dir holding a user mcp.json with one server, plus the
+    /// config.yaml the vault needs to open.
+    fn config_dir_with_server(label: &str, name: &str) -> TestConfigDirGuard {
+        let guard = TestConfigDirGuard::new(&format!("mcp-{label}"));
+        fs::write(
+            guard.path.join("config.yaml"),
+            "vault_password_file: /dev/null\n",
+        )
+        .unwrap();
+        fs::write(
+            guard.path.join("mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"{name}":{{"type":"http","url":"https://example.test/mcp"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        guard
+    }
+
+    fn mcp_json(dir: &TestConfigDirGuard) -> String {
+        fs::read_to_string(dir.path.join("mcp.json")).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn without_a_terminal_removing_an_mcp_server_is_refused_before_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let dir = config_dir_with_server("remove", "github");
+        let before = mcp_json(&dir);
+
+        let err = handle_remove("github", Some(McpScopeArg::User), false).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to remove MCP server 'github' non-interactively. \
+             Re-run in a terminal or pass --mcp-force."
+        );
+        assert_eq!(mcp_json(&dir), before);
+    }
+
+    #[test]
+    #[serial]
+    fn without_a_terminal_overwriting_an_mcp_server_is_refused_before_asking() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = prompt_script::install_non_interactive();
+        let dir = config_dir_with_server("overwrite", "github");
+        let before = mcp_json(&dir);
+        let cli = Cli::try_parse_from([
+            "coyote",
+            "--mcp-add",
+            "github",
+            "--url",
+            "https://example.test/other",
+        ])
+        .unwrap();
+        let vault = Vault::init_bare().unwrap();
+
+        let err = handle_add(&cli, "github", &vault).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Refusing to overwrite MCP server 'github' non-interactively. \
+             Re-run in a terminal or pass --mcp-force."
+        );
+        assert_eq!(mcp_json(&dir), before);
+    }
 }

@@ -3,7 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::{CommandPrefix, RoundChains, paths};
+use super::{CommandPrefix, RoundChains, UiMode, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -29,6 +29,8 @@ pub struct AppConfig {
     pub save: bool,
     pub keybindings: String,
     pub command_prefix: CommandPrefix,
+    pub ui: UiMode,
+    pub tui_dump_on_exit: bool,
     pub editor: Option<String>,
     pub wrap: Option<String>,
     pub wrap_code: bool,
@@ -135,6 +137,8 @@ impl Default for AppConfig {
             save: false,
             keybindings: "emacs".into(),
             command_prefix: CommandPrefix::default(),
+            ui: UiMode::default(),
+            tui_dump_on_exit: true,
             editor: None,
             wrap: None,
             wrap_code: false,
@@ -247,6 +251,8 @@ impl AppConfig {
             save: config.save,
             keybindings: config.keybindings,
             command_prefix: config.command_prefix,
+            ui: config.ui,
+            tui_dump_on_exit: config.tui_dump_on_exit,
             editor: config.editor,
             wrap: config.wrap,
             wrap_code: config.wrap_code,
@@ -801,7 +807,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, UiKind};
 
     fn cached_editor() -> Option<String> {
         super::super::EDITOR.get().cloned().flatten()
@@ -1153,6 +1159,42 @@ mod tests {
                 Some(v) => env::set_var(&env_name, v),
                 None => env::remove_var(&env_name),
             }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_config_copies_ui_and_tui_dump_on_exit() {
+        let cfg = Config {
+            model_id: "test-model".to_string(),
+            ui: UiMode::Tui,
+            tui_dump_on_exit: false,
+            clients: vec![ClientConfig::default()],
+            ..Config::default()
+        };
+
+        let app = AppConfig::from_config(cfg).unwrap();
+
+        assert_eq!(app.ui, UiMode::Tui);
+        assert!(!app.tui_dump_on_exit);
+    }
+
+    /// `COYOTE_UI` is what coyote exports to its tools, not a setting:
+    /// whatever it holds, loading the environment leaves the file's `ui`
+    /// alone and does not fail.
+    #[test]
+    #[serial_test::serial]
+    fn load_envs_ignores_coyote_ui() {
+        for value in ["foo", "tui"] {
+            let _env = crate::testing::EnvVarGuard::set(UiKind::ENV, value);
+            let mut app = AppConfig {
+                ui: UiMode::Repl,
+                ..AppConfig::default()
+            };
+
+            app.load_envs();
+
+            assert_eq!(app.ui, UiMode::Repl, "COYOTE_UI={value}");
         }
     }
 

@@ -1622,7 +1622,7 @@ mod tests {
                 .expect("failed to spawn the child test process")
         };
 
-        // Phase 1: this process holds a READ-ONLY handle. The child must get one too.
+        // While this process holds a READ-ONLY handle, the child must get one too.
         let provider = DuckDbProvider::open(&db.path, 3).unwrap();
         assert!(!is_writable(&provider), "precondition: parent is read-only");
         let out = run_child("readable");
@@ -1642,8 +1642,8 @@ mod tests {
             "the parent must still read after the child ran"
         );
 
-        // Phase 2: upgrade this process to READ-WRITE. The child must now be refused,
-        // with the message that explains why.
+        // Once this process upgrades to READ-WRITE, the child must be refused, with
+        // the message that explains why.
         provider.ensure_writable().unwrap();
         let out = run_child("blocked");
         assert!(

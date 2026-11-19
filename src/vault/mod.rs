@@ -12,14 +12,14 @@ pub use utils::prompt_provider_choice;
 
 use crate::cli::Cli;
 use crate::config::AppConfig;
-use crate::utils::drain_stale_tty_input;
+use crate::events::Origin;
+use crate::prompt::{PromptAction, PromptAnswer, PromptRequest, Prompter, ask};
 use crate::vault::utils::ensure_password_file_initialized;
 use anyhow::{Context, Result, anyhow, bail};
 use fancy_regex::Regex;
 use gman::providers::SecretProvider;
 use gman::providers::SupportedProvider;
 use gman::providers::local::LocalProvider;
-use inquire::{Password, PasswordDisplayMode, required};
 use log::warn;
 use serde_yaml::Value;
 use std::sync::{Arc, LazyLock};
@@ -153,18 +153,36 @@ impl Vault {
         }
     }
 
-    pub fn add_secret(&self, secret_name: &str) -> Result<()> {
+    /// The secret's value, masked, re-asked until it is non-empty.
+    fn ask_secret_value(prompter: &dyn Prompter) -> Result<String> {
+        let label = "Enter the secret value:";
+        let mut question = label.to_string();
+        loop {
+            let req = PromptRequest::new(PromptAction::Password, &question, Origin::detached());
+            let value = ask(prompter, req)
+                .and_then(PromptAnswer::into_text)
+                .with_context(|| "unable to read secret from input")?;
+            if value.is_empty() {
+                question = crate::prompt::reask("A response is required.", label);
+                continue;
+            }
+            return Ok(value);
+        }
+    }
+
+    pub fn add_secret(&self, secret_name: &str, prompter: &dyn Prompter) -> Result<()> {
         if self.sandbox_mode {
             bail!(
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
-        drain_stale_tty_input();
-        let secret_value = Password::new("Enter the secret value:")
-            .with_validator(required!())
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .prompt()
-            .with_context(|| "unable to read secret from input")?;
+        if !crate::config::conflict::menu_can_use_terminal() {
+            return Err(crate::config::conflict::refuse_non_interactive(
+                format_args!("add secret '{secret_name}'"),
+                ".",
+            ));
+        }
+        let secret_value = Self::ask_secret_value(prompter)?;
 
         let h = Handle::current();
         tokio::task::block_in_place(|| {
@@ -193,18 +211,19 @@ impl Vault {
         Ok(secret)
     }
 
-    pub fn update_secret(&self, secret_name: &str) -> Result<()> {
+    pub fn update_secret(&self, secret_name: &str, prompter: &dyn Prompter) -> Result<()> {
         if self.sandbox_mode {
             bail!(
                 "Vault management is disabled in sandbox mode. Use `coyote --add-secret` on your host."
             );
         }
-        drain_stale_tty_input();
-        let secret_value = Password::new("Enter the secret value:")
-            .with_validator(required!())
-            .with_display_mode(PasswordDisplayMode::Masked)
-            .prompt()
-            .with_context(|| "unable to read secret from input")?;
+        if !crate::config::conflict::menu_can_use_terminal() {
+            return Err(crate::config::conflict::refuse_non_interactive(
+                format_args!("update secret '{secret_name}'"),
+                ".",
+            ));
+        }
+        let secret_value = Self::ask_secret_value(prompter)?;
         let h = Handle::current();
         tokio::task::block_in_place(|| {
             h.block_on(
@@ -314,21 +333,21 @@ impl Vault {
         Ok(())
     }
 
-    pub fn handle_vault_flags(cli: Cli, vault: &Vault) -> Result<()> {
-        if let Some(secret_name) = cli.add_secret {
-            vault.add_secret(&secret_name)?;
+    pub fn handle_vault_flags(cli: &Cli, vault: &Vault, prompter: &dyn Prompter) -> Result<()> {
+        if let Some(secret_name) = &cli.add_secret {
+            vault.add_secret(secret_name, prompter)?;
         }
 
-        if let Some(secret_name) = cli.get_secret {
-            vault.get_secret(&secret_name, true)?;
+        if let Some(secret_name) = &cli.get_secret {
+            vault.get_secret(secret_name, true)?;
         }
 
-        if let Some(secret_name) = cli.update_secret {
-            vault.update_secret(&secret_name)?;
+        if let Some(secret_name) = &cli.update_secret {
+            vault.update_secret(secret_name, prompter)?;
         }
 
-        if let Some(secret_name) = cli.delete_secret {
-            vault.delete_secret(&secret_name)?;
+        if let Some(secret_name) = &cli.delete_secret {
+            vault.delete_secret(secret_name)?;
         }
 
         if cli.list_secrets {
@@ -348,6 +367,155 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt::{HeadlessPrompter, NeedsHuman, ScriptedPrompter};
+    use crate::testing::{AtomicFlagGuard, TempLocalVault};
+    use serial_test::serial;
+
+    /// Secret entry asks for the value through the prompter, so under the
+    /// full-screen UI it is a masked modal rather than a refusal, and the
+    /// answer is what the provider stores.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn secret_entry_under_the_tui_asks_through_the_prompter() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let store = TempLocalVault::new("tui-entry");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text("s3cret".to_string()),
+            PromptAnswer::Text("s3cret-two".to_string()),
+        ]);
+
+        store.vault.add_secret("tui-entered", &prompter).unwrap();
+        assert!(store.has_secrets_file());
+        assert_eq!(
+            store.vault.get_secret("tui-entered", false).unwrap(),
+            "s3cret"
+        );
+        store.vault.update_secret("tui-entered", &prompter).unwrap();
+        assert_eq!(
+            store.vault.get_secret("tui-entered", false).unwrap(),
+            "s3cret-two"
+        );
+
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 2);
+        for req in &requests {
+            assert_eq!(req.action, PromptAction::Password);
+            assert_eq!(req.question, "Enter the secret value:");
+        }
+    }
+
+    /// Off the UI, the value is only asked for when stdout is a terminal;
+    /// without one the entry is refused before the prompter is consulted
+    /// and nothing reaches the provider.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn without_a_terminal_secret_entry_is_refused_before_asking_and_writes_nothing() {
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let store = TempLocalVault::new("no-terminal");
+        let prompter = ScriptedPrompter::refusing();
+
+        let err = store.vault.add_secret("x", &prompter).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to add secret 'x' non-interactively. Re-run in a terminal."
+        );
+
+        let err = store.vault.update_secret("x", &prompter).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Refusing to update secret 'x' non-interactively. Re-run in a terminal."
+        );
+
+        assert!(prompter.requests().is_empty());
+        assert!(!store.has_secrets_file());
+    }
+
+    /// An empty value is asked again with inquire's own wording in front
+    /// of the label; the first non-empty one lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn an_empty_secret_value_is_asked_again() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let store = TempLocalVault::new("re-ask");
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text("s3cret".to_string()),
+        ]);
+
+        store.vault.add_secret("re-asked", &prompter).unwrap();
+
+        assert_eq!(store.vault.get_secret("re-asked", false).unwrap(), "s3cret");
+        let questions: Vec<String> = prompter
+            .requests()
+            .into_iter()
+            .map(|req| req.question)
+            .collect();
+        assert_eq!(
+            questions,
+            vec![
+                "Enter the secret value:",
+                "A response is required. Enter the secret value:"
+            ]
+        );
+    }
+
+    /// A cancelled entry keeps the wording the inquire widget's failure
+    /// had, and a run with no human is refused before anything is
+    /// written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn secret_entry_without_an_answer_writes_nothing() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let store = TempLocalVault::new("no-answer");
+
+        let cancelled = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        let err = store.vault.add_secret("never", &cancelled).unwrap_err();
+        assert_eq!(err.to_string(), "unable to read secret from input");
+
+        for err in [
+            store
+                .vault
+                .add_secret("never", &HeadlessPrompter)
+                .unwrap_err(),
+            store
+                .vault
+                .update_secret("never", &HeadlessPrompter)
+                .unwrap_err(),
+        ] {
+            assert!(NeedsHuman::caused(&err), "{err:#}");
+        }
+        assert!(!store.has_secrets_file());
+    }
+
+    /// A run with no human refuses the secret value with the typed
+    /// password refusal, draws nothing on the terminal and writes no
+    /// vault file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    async fn headless_add_secret_is_a_typed_password_refusal_with_nothing_on_stdout() {
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let store = TempLocalVault::new("headless");
+        let (saved, mut reader) = crate::testing::capture_stdout();
+
+        let err = store
+            .vault
+            .add_secret("never", &HeadlessPrompter)
+            .unwrap_err();
+
+        drop(saved);
+        let out = crate::testing::read_all(&mut reader);
+        assert!(out.is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                err.root_cause().downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Password))
+            ),
+            "{err:#}"
+        );
+        assert!(!store.has_secrets_file());
+    }
 
     #[test]
     fn secret_re_matches_double_braces() {
@@ -394,6 +562,7 @@ mod tests {
         }
 
         let vault = Vault::init(&AppConfig::default()).unwrap();
+        let prompter = ScriptedPrompter::refusing();
 
         let check = |err: anyhow::Error| {
             let msg = err.to_string();
@@ -403,9 +572,9 @@ mod tests {
             );
         };
 
-        check(vault.add_secret("test").unwrap_err());
+        check(vault.add_secret("test", &prompter).unwrap_err());
         check(vault.get_secret("test", false).unwrap_err());
-        check(vault.update_secret("test").unwrap_err());
+        check(vault.update_secret("test", &prompter).unwrap_err());
         check(vault.delete_secret("test").unwrap_err());
         check(vault.list_secrets(false).unwrap_err());
 
@@ -432,7 +601,7 @@ mod tests {
         // Pins the --list-secrets sandbox contract: rc=0 with an informational
         // readout instead of the hard failure the mutating flags keep. The
         // message goes straight to stdout, so only Ok is asserted here.
-        Vault::handle_vault_flags(cli, &vault)
+        Vault::handle_vault_flags(&cli, &vault, &ScriptedPrompter::refusing())
             .expect("--list-secrets must succeed in sandbox mode");
     }
 }

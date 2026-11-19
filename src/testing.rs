@@ -2,10 +2,22 @@
 
 use crate::config::{WORKSPACE_COYOTE_DIR_NAME, memory};
 use crate::utils;
+use crate::vault::Vault;
+use gman::providers::SupportedProvider;
+use gman::providers::local::LocalProvider;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 struct TestLogCollector;
 
@@ -185,6 +197,27 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Holds a process-global flag such as `utils::HEADLESS` at a value for the
+/// guard's lifetime and puts the old value back on drop, including on panic.
+/// Tests using it must serialize (`#[serial]`).
+pub(crate) struct AtomicFlagGuard {
+    flag: &'static AtomicBool,
+    previous: bool,
+}
+
+impl AtomicFlagGuard {
+    pub(crate) fn set(flag: &'static AtomicBool, value: bool) -> Self {
+        let previous = flag.swap(value, Ordering::SeqCst);
+        Self { flag, previous }
+    }
+}
+
+impl Drop for AtomicFlagGuard {
+    fn drop(&mut self) {
+        self.flag.store(self.previous, Ordering::SeqCst);
+    }
+}
+
 /// Points the config dir and the workspace config dir at fresh temp
 /// directories for the guard's lifetime and removes them on drop, including
 /// on panic, so the developer's real `./.coyote/` never leaks into a test.
@@ -299,6 +332,141 @@ impl Drop for CacheDirGuard {
     }
 }
 
+/// A fresh directory under the temp dir for a test's scratch files,
+/// removed on drop, including on panic, so no outcome leaves them behind.
+pub(crate) struct ScratchDirGuard {
+    pub(crate) path: PathBuf,
+}
+
+impl ScratchDirGuard {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("coyote-scratch-{label}-{unique}"));
+        std::fs::create_dir_all(&path).unwrap();
+        Self { path }
+    }
+}
+
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A local vault whose password file and secrets file both live in a
+/// fresh temp dir: the provider derives the secrets file from
+/// `XDG_CONFIG_HOME`, so the developer's real vault is never touched.
+/// The dir is removed on drop. Tests using it must serialize
+/// (`#[serial]`); the env var is process-global.
+pub(crate) struct TempLocalVault {
+    _xdg: EnvVarGuard,
+    dir: PathBuf,
+    pub(crate) vault: Vault,
+}
+
+impl TempLocalVault {
+    pub(crate) fn new(label: &str) -> Self {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-vault-{label}-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let password_file = dir.join("password");
+        std::fs::write(&password_file, "correct horse battery staple").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&password_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+        let vault = Vault::from_provider(SupportedProvider::Local {
+            provider_def: LocalProvider {
+                password_file: Some(password_file),
+                git_branch: None,
+                ..LocalProvider::default()
+            },
+        });
+        Self {
+            _xdg: EnvVarGuard::set("XDG_CONFIG_HOME", &dir),
+            dir,
+            vault,
+        }
+    }
+
+    /// Whether the provider has written its secrets file, which it keeps
+    /// at `<XDG_CONFIG_HOME>/<app>/vault.yml`.
+    pub(crate) fn has_secrets_file(&self) -> bool {
+        std::fs::read_dir(&self.dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.path().join("vault.yml").is_file())
+    }
+}
+
+impl Drop for TempLocalVault {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A fragment only one test's files carry under the shared
+/// `env::temp_dir()`. Entries named with it are removed when the guard is
+/// made (a run killed mid-test must not fail the next one) and when it is
+/// dropped; everything else in the directory, including what tests
+/// running alongside write there, is left alone.
+pub(crate) struct TempNeedleGuard {
+    needle: String,
+}
+
+impl TempNeedleGuard {
+    pub(crate) fn new(needle: &str) -> Self {
+        assert!(
+            needle.len() >= 12,
+            "a temp needle of {} bytes could match another test's files: {needle:?}",
+            needle.len()
+        );
+        let guard = Self {
+            needle: needle.to_string(),
+        };
+        guard.remove_leftovers();
+        guard
+    }
+
+    /// The entries under the temp dir whose file name carries the needle.
+    pub(crate) fn leftovers(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(std::env::temp_dir())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains(&self.needle))
+            })
+            .collect()
+    }
+
+    fn remove_leftovers(&self) {
+        for path in self.leftovers() {
+            let _ = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+}
+
+impl Drop for TempNeedleGuard {
+    fn drop(&mut self) {
+        self.remove_leftovers();
+    }
+}
+
 /// Puts the mode back on a path when dropped, so a failing assertion
 /// cannot leave a directory the next run cannot clean up.
 #[cfg(unix)]
@@ -347,13 +515,167 @@ fn is_outside_system32(path: &Path) -> bool {
         .any(|part| part.eq_ignore_ascii_case("system32"))
 }
 
+/// Holds the stdout lock for the whole capture: the harness reports
+/// from the main thread through `io::stdout()`, and a report caught
+/// mid-`write(1)` while fd 1 is re-pointed fails with EPIPE and kills the run.
+#[cfg(unix)]
+pub(crate) struct SavedStdout {
+    fd: OwnedFd,
+    _lock: io::StdoutLock<'static>,
+}
+
+#[cfg(unix)]
+impl Drop for SavedStdout {
+    fn drop(&mut self) {
+        // SAFETY: both descriptors are open; dup2 takes no pointers.
+        assert_ne!(
+            unsafe { libc::dup2(self.fd.as_raw_fd(), libc::STDOUT_FILENO) },
+            -1
+        );
+    }
+}
+
+/// Points fd 1 at a fresh pipe; the reader sees EOF once the guard
+/// restores fd 1, because fd 1 is the pipe's only writer. The read end
+/// is non-blocking so a writer inherited by a child of another test
+/// fails `read_all` at its deadline instead of hanging the test.
+/// Same-thread only: the guard holds the `io::stdout()` lock, so a write
+/// through `io::stdout()` from any other thread blocks until the guard
+/// drops. Raw `write(1)` calls are unaffected.
+/// Callers must be `#[serial]`: fd 1 is process-global, and two live
+/// captures would race each other's `dup2`.
+#[cfg(unix)]
+pub(crate) fn capture_stdout() -> (SavedStdout, File) {
+    let mut lock = io::stdout().lock();
+    lock.flush().unwrap();
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let saved = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    assert_ne!(saved, -1);
+    // SAFETY: `saved` was just created by fcntl and nothing else owns it.
+    let saved = SavedStdout {
+        fd: unsafe { OwnedFd::from_raw_fd(saved) },
+        _lock: lock,
+    };
+
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element array for pipe to fill.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: fcntl with F_GETFL/F_SETFL takes no pointers; results are checked.
+    let flags = unsafe { libc::fcntl(fds[0], libc::F_GETFL) };
+    assert_ne!(flags, -1);
+    // SAFETY: as above.
+    let rc = unsafe { libc::fcntl(fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    assert_ne!(rc, -1);
+    // SAFETY: both ends were just created by pipe and nothing else owns them.
+    let (reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    // SAFETY: both descriptors are open; dup2 takes no pointers.
+    assert_ne!(
+        unsafe { libc::dup2(writer.as_raw_fd(), libc::STDOUT_FILENO) },
+        -1
+    );
+    drop(writer);
+    (saved, reader)
+}
+
+/// Writes straight to fd 1, bypassing the `io::stdout()` lock a live
+/// capture holds; used to pass captured harness output through.
+#[cfg(unix)]
+pub(crate) fn write_fd1(bytes: &[u8]) {
+    // SAFETY: `bytes` is a valid buffer of the given length.
+    let n = unsafe { libc::write(libc::STDOUT_FILENO, bytes.as_ptr().cast(), bytes.len()) };
+    assert_eq!(n, bytes.len() as isize);
+}
+
+/// Drains the capture pipe to EOF, giving up after two seconds if some
+/// inherited writer still holds it open.
+#[cfg(unix)]
+pub(crate) fn read_all(reader: &mut File) -> String {
+    use std::io::Read;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut out = Vec::new();
+    let mut buf = [0; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => out.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "pipe still open: {out:?}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => panic!("{err}"),
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// Puts the original fd 0 back when dropped.
+#[cfg(unix)]
+pub(crate) struct SavedStdin {
+    fd: OwnedFd,
+}
+
+#[cfg(unix)]
+impl Drop for SavedStdin {
+    fn drop(&mut self) {
+        // SAFETY: both descriptors are open; dup2 takes no pointers.
+        assert_ne!(
+            unsafe { libc::dup2(self.fd.as_raw_fd(), libc::STDIN_FILENO) },
+            -1
+        );
+    }
+}
+
+/// Points fd 0 at the read end of a pipe with no writer, so stdin is not
+/// a terminal and reads see EOF until the guard drops, wherever the
+/// tests run. Callers must be `#[serial]`: fd 0 is process-global.
+#[cfg(unix)]
+pub(crate) fn pipe_stdin() -> SavedStdin {
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let saved = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    assert_ne!(saved, -1);
+    // SAFETY: `saved` was just created by fcntl and nothing else owns it.
+    let saved = SavedStdin {
+        fd: unsafe { OwnedFd::from_raw_fd(saved) },
+    };
+
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element array for pipe to fill.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both ends were just created by pipe and nothing else owns them.
+    let (reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    drop(writer);
+    // SAFETY: both descriptors are open; dup2 takes no pointers.
+    assert_ne!(
+        unsafe { libc::dup2(reader.as_raw_fd(), libc::STDIN_FILENO) },
+        -1
+    );
+    saved
+}
+
 mod tests {
-    use super::{TestConfigDirGuard, is_outside_system32};
+    use super::{
+        ScratchDirGuard, TempLocalVault, TempNeedleGuard, TestConfigDirGuard, is_outside_system32,
+    };
     use crate::utils;
     use serial_test::serial;
     use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    /// Only a `vault.yml` under an app dir is the secrets file; an app
+    /// dir alone is not.
+    #[test]
+    #[serial]
+    fn a_local_vault_has_a_secrets_file_only_once_vault_yml_exists() {
+        let store = TempLocalVault::new("testing-secrets-file");
+        let app_dir = store.dir.join("some-app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        assert!(!store.has_secrets_file());
+
+        std::fs::write(app_dir.join("vault.yml"), "{}\n").unwrap();
+        assert!(store.has_secrets_file());
+    }
 
     #[test]
     fn is_outside_system32_reads_windows_and_unix_paths() {
@@ -397,6 +719,63 @@ mod tests {
             !cache_root.exists(),
             "the temp cache dir is removed on drop"
         );
+    }
+
+    /// The scratch dir exists, with what the test put in it, while the
+    /// guard lives and is gone once it is dropped.
+    #[test]
+    fn scratch_dir_guard_removes_its_dir_on_drop() {
+        let path = {
+            let guard = ScratchDirGuard::new("scratch-guard-unit");
+            std::fs::write(guard.path.join("inner.txt"), "kept until drop").unwrap();
+            assert!(guard.path.is_dir());
+            guard.path.clone()
+        };
+        assert!(!path.exists(), "the scratch dir is removed on drop");
+    }
+
+    /// The guard's sweeps, on creation and on drop, remove only entries
+    /// whose name carries the needle; a neighbour without it stays.
+    #[test]
+    fn temp_needle_guard_sweeps_needle_hits_only() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let needle = format!("needle-guard-unit-{unique}");
+        let temp = std::env::temp_dir();
+        let hit_file = temp.join(format!("{needle}-file"));
+        let hit_dir = temp.join(format!("{needle}-dir"));
+        let bystander = temp.join(format!("bystander-{unique}"));
+        std::fs::write(&hit_file, "").unwrap();
+        std::fs::create_dir_all(hit_dir.join("inner")).unwrap();
+        std::fs::write(&bystander, "").unwrap();
+
+        let guard = TempNeedleGuard::new(&needle);
+        assert!(!hit_file.exists(), "a leftover file survived the sweep");
+        assert!(!hit_dir.exists(), "a leftover directory survived the sweep");
+        assert!(bystander.exists(), "a file without the needle was removed");
+
+        std::fs::write(&hit_file, "").unwrap();
+        assert_eq!(guard.leftovers(), vec![hit_file.clone()]);
+        drop(guard);
+        assert!(
+            !hit_file.exists(),
+            "a file made under the guard survived its drop"
+        );
+        assert!(
+            bystander.exists(),
+            "the drop removed a file without the needle"
+        );
+        let _ = std::fs::remove_file(&bystander);
+    }
+
+    /// A needle shorter than twelve bytes could match another test's
+    /// files, so the guard refuses it.
+    #[test]
+    #[should_panic(expected = "could match another test's files")]
+    fn temp_needle_guard_refuses_a_short_needle() {
+        let _guard = TempNeedleGuard::new("short-x7x");
     }
 
     #[test]

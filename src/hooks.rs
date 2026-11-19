@@ -2,7 +2,9 @@ use crate::config::conflict::{self, InstallMode, StickyMode};
 use crate::config::{
     RequestContext, builtin_manifest, ensure_parent_exists, paths, set_executable_bit_if_script,
 };
+use crate::events::{Event, Origin};
 use crate::function::write_file_atomic;
+use crate::prompt::Prompter;
 
 use anyhow::{Error, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
@@ -23,7 +25,11 @@ use tokio::sync::Notify;
 #[folder = "assets/hooks/"]
 struct HookAssets;
 
-pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
+pub fn install_builtin_hooks(
+    mode: InstallMode,
+    sticky: &mut StickyMode,
+    prompter: &dyn Prompter,
+) -> Result<()> {
     info!(
         "Installing built-in example hooks in {}",
         paths::hooks_dir().display()
@@ -41,7 +47,9 @@ pub fn install_builtin_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Resu
         let file_path = paths::hooks_dir().join(file.as_ref());
 
         if file_path.exists()
-            && !conflict::should_replace_existing(&file_path, content, "hooks", mode, sticky)?
+            && !conflict::should_replace_existing(
+                &file_path, content, "hooks", mode, sticky, prompter,
+            )?
         {
             debug!(
                 "Hook file already exists, skipping: {}",
@@ -311,9 +319,6 @@ impl RagSyncHooks {
         rag_path: &str,
         extras: &[(&str, String)],
     ) {
-        if resolved.is_empty() {
-            return;
-        }
         let base_envs = base_envs_parts(
             event,
             self.session_name.as_deref(),
@@ -324,6 +329,10 @@ impl RagSyncHooks {
             ("COYOTE_RAG_PATH", rag_path.to_string()),
         ];
         envs.extend(extras.iter().map(|(key, value)| (*key, value.clone())));
+        publish_hook_event(event, &base_envs, &envs, None, Origin::detached());
+        if resolved.is_empty() {
+            return;
+        }
         fire_resolved(event, resolved.to_vec(), base_envs, &envs, None);
     }
 }
@@ -373,14 +382,15 @@ impl McpServerHooks {
     }
 
     fn fire(&self, event: HookEvent, resolved: &[ResolvedHook], extras: &[(&str, String)]) {
-        if resolved.is_empty() {
-            return;
-        }
         let base_envs = base_envs_parts(
             event,
             self.session_name.as_deref(),
             self.agent_name.as_deref(),
         );
+        publish_hook_event(event, &base_envs, extras, None, Origin::detached());
+        if resolved.is_empty() {
+            return;
+        }
         fire_resolved(event, resolved.to_vec(), base_envs, extras, None);
     }
 }
@@ -528,6 +538,10 @@ fn push_defs(event_name: &str, defs: &[HookDef], cwd: &Path, out: &mut Vec<Resol
     }
 }
 
+/// Fires `event` for every hook resolved from `ctx` and publishes its
+/// in-process twin on the event bus. The bus event goes out even when no
+/// shell hook is configured, so observers see the full hook stream without
+/// user configuration.
 pub fn fire(
     event: HookEvent,
     ctx: &RequestContext,
@@ -535,11 +549,38 @@ pub fn fire(
     payload: Option<String>,
 ) {
     let resolved = ctx.resolved_hooks(event);
+    let base = base_envs(event, ctx);
+    publish_hook_event(event, &base, extras, payload.clone(), Origin::from(ctx));
     if resolved.is_empty() {
         return;
     }
 
-    fire_resolved(event, resolved, base_envs(event, ctx), extras, payload);
+    fire_resolved(event, resolved, base, extras, payload);
+}
+
+/// Publishes the [`Event::Hook`] twin of a dispatch. Call sites that hand
+/// pre-resolved hooks to [`fire_resolved`] must call this themselves, before
+/// any empty-hooks early return, so the bus sees every event. The envs match
+/// what a hook would receive minus the per-hook `COYOTE_HOOK_NAME`.
+pub(crate) fn publish_hook_event(
+    event: HookEvent,
+    base_envs: &[(String, String)],
+    extras: &[(&str, String)],
+    payload: Option<String>,
+    origin: Origin,
+) {
+    let mut envs = base_envs.to_vec();
+    envs.extend(
+        extras
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone())),
+    );
+    crate::events::bus().publish(Event::Hook {
+        event,
+        envs: sanitize_envs(envs),
+        payload,
+        origin,
+    });
 }
 
 /// Dispatches already-resolved hooks, for call sites that outlive the context
@@ -569,21 +610,7 @@ pub fn fire_resolved(
                 .iter()
                 .map(|(key, value)| (key.to_string(), value.clone())),
         );
-        let envs: Vec<(String, String)> = envs
-            .into_iter()
-            .map(|(key, mut value)| {
-                // Values like escalation questions carry agent-authored text;
-                // an interior NUL makes `Command::spawn` fail on Unix, which
-                // would let a child suppress its own hooks. Strip them.
-                if value.contains('\0') {
-                    value.retain(|c| c != '\0');
-                }
-                // `end` is a char boundary by construction, so `truncate` cannot panic.
-                let end = truncate_env_value(&value).len();
-                value.truncate(end);
-                (key, value)
-            })
-            .collect();
+        let envs = sanitize_envs(envs);
 
         #[cfg(test)]
         if test_sink::record(event, &hook, &envs, payload.as_deref()) {
@@ -607,6 +634,25 @@ pub fn fire_resolved(
             SpawnAckGuard::register(),
         )));
     }
+}
+
+/// Makes env values safe to hand to `Command::spawn`: strips NUL bytes and
+/// bounds each value to the hook env size limit.
+pub(crate) fn sanitize_envs(envs: Vec<(String, String)>) -> Vec<(String, String)> {
+    envs.into_iter()
+        .map(|(key, mut value)| {
+            // Values like escalation questions carry agent-authored text;
+            // an interior NUL makes `Command::spawn` fail on Unix, which
+            // would let a child suppress its own hooks. Strip them.
+            if value.contains('\0') {
+                value.retain(|c| c != '\0');
+            }
+            // `end` is a char boundary by construction, so `truncate` cannot panic.
+            let end = truncate_env_value(&value).len();
+            value.truncate(end);
+            (key, value)
+        })
+        .collect()
 }
 
 static PENDING_SPAWNS: AtomicUsize = AtomicUsize::new(0);
@@ -1062,6 +1108,7 @@ mod tests {
     use crate::config::{AppConfig, AppState, Role, WorkingMode};
     use crate::{testing, utils};
     use serial_test::serial;
+    use std::collections::BTreeMap;
     use std::env;
     use std::sync::Arc;
     use std::time::UNIX_EPOCH;
@@ -1258,7 +1305,11 @@ mod tests {
         // below still has to run before any assertion can bail out.
         let notify = root.join("notify.sh");
         let log_events = root.join("log-events.sh");
-        let fresh = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+        let fresh = install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        );
         let installed = (notify.is_file(), log_events.is_file());
         #[cfg(unix)]
         let modes: Vec<std::io::Result<u32>> = {
@@ -1269,9 +1320,17 @@ mod tests {
                 .collect()
         };
         let modified = std::fs::write(&notify, "modified");
-        let no_force = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+        let no_force = install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        );
         let after_no_force = std::fs::read_to_string(&notify);
-        let force = install_builtin_hooks(InstallMode::Force, &mut StickyMode::None);
+        let force = install_builtin_hooks(
+            InstallMode::Force,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        );
         let after_force = std::fs::read_to_string(&notify);
 
         drop(env_guard);
@@ -1300,14 +1359,24 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_skip_mode_never_prompts_even_on_a_terminal() {
         let guard = HooksDirGuard::new("hooks-skip-no-prompt");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         std::fs::write(&notify, "modified").unwrap();
 
         // A forced terminal with no scripted answers: any prompt would panic
         // and the counter would move.
         let _script = prompt_script::install(&[]);
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
@@ -1317,19 +1386,34 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_prompt_mode_asks_only_for_differing_files() {
         let guard = HooksDirGuard::new("hooks-prompt-conflict");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         std::fs::write(&notify, "modified").unwrap();
 
         // log-events.sh is identical to the embed, so only notify.sh asks.
         let script = prompt_script::install(&["keep"]);
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
         drop(script);
 
         let script = prompt_script::install(&["replace"]);
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert!(
             std::fs::read_to_string(&notify)
@@ -1345,7 +1429,12 @@ mod tests {
         let guard = HooksDirGuard::new("hooks-prompt-missing");
         let _script = prompt_script::install(&[]);
 
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert!(guard.root.join("notify.sh").is_file());
@@ -1356,12 +1445,22 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_prompt_mode_keeps_local_files_without_a_terminal() {
         let guard = HooksDirGuard::new("hooks-prompt-non-tty");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         std::fs::write(&notify, "modified").unwrap();
 
         let _script = prompt_script::install_non_interactive();
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 0);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified");
@@ -1371,14 +1470,24 @@ mod tests {
     #[serial]
     fn install_builtin_hooks_keep_all_covers_every_remaining_conflict() {
         let guard = HooksDirGuard::new("hooks-prompt-keep-all");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         let notify = guard.root.join("notify.sh");
         let log_events = guard.root.join("log-events.sh");
         std::fs::write(&notify, "modified notify").unwrap();
         std::fs::write(&log_events, "modified log-events").unwrap();
 
         let _script = prompt_script::install(&["keep-all"]);
-        install_builtin_hooks(InstallMode::Prompt, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Prompt,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert_eq!(prompt_script::prompts_asked(), 1);
         assert_eq!(std::fs::read_to_string(&notify).unwrap(), "modified notify");
@@ -1394,7 +1503,12 @@ mod tests {
         use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
 
         let guard = HooksDirGuard::new("hooks-manifest-stale");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         // Simulate an upgrade from a release that also shipped old-hook.sh:
         // the manifest records it, so reinstall removes it — while a user
@@ -1407,7 +1521,12 @@ mod tests {
         std::fs::write(guard.root.join("old-hook.sh"), "stale").unwrap();
         std::fs::write(guard.root.join("user-hook.sh"), "user-owned").unwrap();
 
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert!(!guard.root.join("old-hook.sh").exists());
         assert_eq!(
@@ -1426,11 +1545,21 @@ mod tests {
         use crate::config::builtin_manifest::BUILTIN_MANIFEST_FILE;
 
         let guard = HooksDirGuard::new("hooks-manifest-malformed");
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         std::fs::write(guard.root.join(BUILTIN_MANIFEST_FILE), [0xff, 0xfe, 0x00]).unwrap();
         std::fs::write(guard.root.join("old-hook.sh"), "keep").unwrap();
 
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         assert!(
             guard.root.join("old-hook.sh").exists(),
@@ -1451,7 +1580,12 @@ mod tests {
         // must stay quiet even though the strings differ.
         let alias = guard.path.join("hooks").join("..").join("hooks");
         let env_guard = testing::EnvVarGuard::set(&env_name, &alias);
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
         drop(env_guard);
 
         let default_notify = guard.path.join("hooks").join("notify.sh");
@@ -1469,7 +1603,12 @@ mod tests {
             std::os::unix::fs::symlink(guard.path.join("hooks"), &link).unwrap();
             std::fs::remove_file(&default_notify).unwrap();
             let _env_guard = testing::EnvVarGuard::set(&env_name, &link);
-            install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+            install_builtin_hooks(
+                InstallMode::Skip,
+                &mut StickyMode::None,
+                &prompt_script::Scripted,
+            )
+            .unwrap();
             assert!(
                 default_notify.is_file(),
                 "the removed script must be reinstalled, so wrote_any was true"
@@ -1496,7 +1635,12 @@ mod tests {
         let override_dir = guard.path.join("elsewhere-hooks");
         let _env_guard = testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &override_dir);
 
-        install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+        install_builtin_hooks(
+            InstallMode::Skip,
+            &mut StickyMode::None,
+            &prompt_script::Scripted,
+        )
+        .unwrap();
 
         // Fresh install: nothing ever created the default dir, so its
         // canonicalization fails and the compare falls back to the original
@@ -2247,6 +2391,206 @@ mod tests {
         assert!(
             !marker.exists(),
             "no process may spawn while the sink is installed"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_one_bus_twin_per_hook_event() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        for event in HookEvent::ALL {
+            let mut ctx =
+                ctx_with_global_hooks(hooks_map(event.as_str(), &[("parity-probe", "true")]));
+            ctx.self_agent_id = Some("parity-child".to_string());
+            ctx.current_depth = 2;
+            test_sink::drain();
+            sink.drain();
+
+            fire(
+                event,
+                &ctx,
+                &[("HOOK_EXTRA", "parity-probe-x7x".to_string())],
+                Some(format!("{{\"event\":\"{}\"}}", event.as_str())),
+            );
+
+            let captures: Vec<_> = test_sink::drain()
+                .into_iter()
+                .filter(|capture| capture.hook_name == "parity-probe")
+                .collect();
+            assert_eq!(captures.len(), 1, "{event:?}: {captures:?}");
+            let capture = &captures[0];
+            let published: Vec<_> = sink
+                .drain()
+                .into_iter()
+                .filter(|published| {
+                    matches!(
+                        published,
+                        Event::Hook { envs, .. }
+                            if envs.contains(&("HOOK_EXTRA".to_string(), "parity-probe-x7x".to_string()))
+                    )
+                })
+                .collect();
+            assert_eq!(published.len(), 1, "{event:?}: {published:?}");
+            let Event::Hook {
+                event: got,
+                envs,
+                payload,
+                origin,
+            } = &published[0]
+            else {
+                panic!("{event:?}: expected Event::Hook, got {:?}", published[0]);
+            };
+            assert_eq!(*got, event);
+            assert_eq!(*payload, capture.payload, "{event:?}");
+            assert_eq!(
+                *origin,
+                Origin {
+                    agent_id: Some("parity-child".to_string()),
+                    depth: 2,
+                },
+                "{event:?}"
+            );
+            let bus_envs: BTreeMap<String, String> = envs.iter().cloned().collect();
+            assert_eq!(
+                bus_envs.len(),
+                envs.len(),
+                "{event:?}: duplicate key in {envs:?}"
+            );
+            let hook_envs: BTreeMap<String, String> = capture
+                .envs
+                .iter()
+                .filter(|(key, _)| key.as_str() != "COYOTE_HOOK_NAME")
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            assert_eq!(bus_envs, hook_envs, "{event:?}");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn fire_publishes_bus_twin_when_no_hook_is_configured() {
+        let _guard = test_sink::install();
+        test_sink::drain();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let probe = ("HOOK_EXTRA".to_string(), "no-hook-probe-k4v".to_string());
+
+        fire(
+            HookEvent::TurnStarted,
+            &ctx,
+            &[("HOOK_EXTRA", "no-hook-probe-k4v".to_string())],
+            None,
+        );
+
+        let published: Vec<_> = sink
+            .drain()
+            .into_iter()
+            .filter(
+                |published| matches!(published, Event::Hook { envs, .. } if envs.contains(&probe)),
+            )
+            .collect();
+        assert_eq!(published.len(), 1, "{published:?}");
+        assert!(matches!(
+            &published[0],
+            Event::Hook {
+                event: HookEvent::TurnStarted,
+                payload: None,
+                ..
+            }
+        ));
+        assert!(
+            test_sink::drain()
+                .iter()
+                .all(|capture| capture.envs.get("HOOK_EXTRA") != Some(&probe.1)),
+            "no shell hook is configured, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rag_sync_fire_completed_publishes_bus_twin_without_resolved_hooks() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let rag_name = "rag-bus-probe-x7x";
+
+        RagSyncHooks::resolve(&ctx).fire_completed(rag_name, "/tmp/rag", 3);
+
+        let published = sink.drain_hooks_with_env("COYOTE_RAG_NAME", rag_name);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::RagSyncCompleted);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_RAG_PATH".to_string(), "/tmp/rag".to_string())));
+        assert!(envs.contains(&("COYOTE_RAG_DOC_COUNT".to_string(), "3".to_string())));
+        assert!(
+            test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_RAG_NAME").map(String::as_str) != Some(rag_name)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mcp_server_fire_connected_publishes_bus_twin_without_resolved_hooks() {
+        let _guard = test_sink::install();
+        let sink = crate::events::RecordingSink::install();
+        let ctx = ctx_with_global_hooks(IndexMap::new());
+        let server = "mcp-bus-probe-x7x";
+
+        McpServerHooks::resolve(&ctx).fire_connected(server, "stdio", true);
+
+        let published = sink.drain_hooks_with_env("COYOTE_MCP_SERVER", server);
+        assert_eq!(published.len(), 1, "{published:?}");
+        let Event::Hook {
+            event,
+            envs,
+            payload,
+            origin,
+        } = &published[0]
+        else {
+            panic!("expected Event::Hook, got {:?}", published[0]);
+        };
+        assert_eq!(*event, HookEvent::McpServerConnected);
+        assert_eq!(*origin, Origin::detached());
+        assert_eq!(*payload, None);
+        assert!(envs.contains(&("COYOTE_MCP_TRANSPORT".to_string(), "stdio".to_string())));
+        assert!(envs.contains(&("COYOTE_MCP_RECONNECT".to_string(), "true".to_string())));
+        assert!(
+            test_sink::drain().iter().all(|capture| {
+                capture.envs.get("COYOTE_MCP_SERVER").map(String::as_str) != Some(server)
+            }),
+            "no hook is resolved, so nothing may reach test_sink"
+        );
+    }
+
+    #[test]
+    fn sanitize_envs_strips_nul_and_bounds_length() {
+        let oversized = "x".repeat(3000);
+        let sanitized = sanitize_envs(vec![
+            ("NUL".to_string(), "before\u{0000}after".to_string()),
+            ("BIG".to_string(), oversized),
+            ("SHORT".to_string(), "fine".to_string()),
+        ]);
+
+        assert_eq!(
+            sanitized,
+            vec![
+                ("NUL".to_string(), "beforeafter".to_string()),
+                ("BIG".to_string(), "x".repeat(2048)),
+                ("SHORT".to_string(), "fine".to_string()),
+            ]
         );
     }
 
@@ -3270,7 +3614,11 @@ mod tests {
             ));
             let _env = testing::EnvVarGuard::set(utils::get_env_name("hooks_dir"), &hooks_dir);
 
-            let result = install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None);
+            let result = install_builtin_hooks(
+                InstallMode::Skip,
+                &mut StickyMode::None,
+                &prompt_script::Scripted,
+            );
 
             // Capture outcomes first and assert only after the temp dir is
             // removed, so a failed assertion cannot leak it.
@@ -3342,7 +3690,12 @@ mod tests {
         fn install_completes_without_the_unix_exec_bit() {
             let guard = HooksDirGuard::new("win-hooks-exec-noop");
 
-            install_builtin_hooks(InstallMode::Skip, &mut StickyMode::None).unwrap();
+            install_builtin_hooks(
+                InstallMode::Skip,
+                &mut StickyMode::None,
+                &prompt_script::Scripted,
+            )
+            .unwrap();
 
             let notify = guard.root.join("notify.sh");
             assert!(notify.is_file());

@@ -20,13 +20,14 @@ use super::{
     CommandPrefix, Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME,
     MacroAllowlistLevel, MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT,
     ResolvedMacro, Role, RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT,
-    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles,
-    ensure_parent_exists, list_agents_with_descriptions, memory, paths,
+    StateFlags, TEMP_ROLE_NAME, TEMP_SESSION_NAME, UiKind, UiMode, WORKSPACE_COYOTE_DIR_NAME,
+    WorkingMode, bundles, ensure_parent_exists, list_agents_with_descriptions, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, ThinkingBlock, TokenUsage, list_models,
 };
+use crate::events::{self, Event, Origin};
 use crate::function::{
     FunctionDeclaration, Functions, ToolCall, ToolCallTracker, ToolResult,
     agents::AGENT_FUNCTION_PREFIX,
@@ -43,11 +44,16 @@ use crate::mcp::{
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
     is_mcp_meta_function, mcp_meta_function_names,
 };
-use crate::rag::Rag;
+use crate::prompt::{
+    HeadlessPrompter, InquirePrompter, NeedsHuman, PromptAction, PromptAnswer, PromptMemory,
+    PromptRequest, Prompter, human_present,
+};
+use crate::rag::{Rag, RagInitRun};
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
+use crate::turn::{StdoutSink, UiSink};
 use crate::utils::fs::refuse_symlinked_dir;
 use crate::utils::process::ProcessStamp;
 use crate::utils::{
@@ -71,7 +77,6 @@ use gman::providers::SupportedProvider;
 use hooks::{McpServerHooks, RagSyncHooks};
 use indexmap::IndexMap;
 use indoc::formatdoc;
-use inquire::{Confirm, MultiSelect, Text, list_option::ListOption, validator::Validation};
 use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
@@ -303,6 +308,7 @@ fn seed_delegate_shared_variables(
     chat_variables: Option<&AgentVariables>,
     info_flag: bool,
     interactive: bool,
+    prompter: &dyn Prompter,
 ) -> Result<()> {
     if agent.defined_variables().is_empty() || !agent.shared_variables().is_empty() {
         return Ok(());
@@ -312,9 +318,20 @@ fn seed_delegate_shared_variables(
         chat_variables,
         info_flag,
         interactive,
+        prompter,
     )?;
     agent.set_shared_variables(variables);
     Ok(())
+}
+
+/// A run with no human -- headless or the ACP server -- answers for itself;
+/// every other run draws prompts on the terminal.
+fn default_prompter(memory: &Arc<PromptMemory>) -> Arc<dyn Prompter> {
+    if human_present() {
+        Arc::new(InquirePrompter::new(Arc::clone(memory)))
+    } else {
+        Arc::new(HeadlessPrompter)
+    }
 }
 
 fn ensure_reasoning_effort_supported(agent: &Agent) -> Result<()> {
@@ -644,6 +661,16 @@ pub struct RequestContext {
 
     pub render_mode: RenderMode,
 
+    /// Where this context's turn output is drawn.
+    pub ui: Arc<dyn UiSink>,
+
+    /// Who answers this context's questions to the human.
+    pub prompter: Arc<dyn Prompter>,
+
+    /// Confirms already waved through for the session; shared with the
+    /// prompter that records them and with forks and children.
+    pub prompt_memory: Arc<PromptMemory>,
+
     /// Test-only replacement for the summarizer call: given the rendered
     /// summarization request text it returns the summary, so compression
     /// pins run the real `compress_session` without a model.
@@ -653,6 +680,8 @@ pub struct RequestContext {
 
 impl RequestContext {
     pub fn new(app: Arc<AppState>, working_mode: WorkingMode) -> Self {
+        let prompt_memory = Arc::new(PromptMemory::default());
+        let prompter = default_prompter(&prompt_memory);
         Self {
             app,
             macro_flag: false,
@@ -705,6 +734,9 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            ui: Arc::new(StdoutSink::default()),
+            prompter,
+            prompt_memory,
             #[cfg(test)]
             test_summary_fetch: None,
         }
@@ -738,6 +770,8 @@ impl RequestContext {
             mcp_runtime.sync_from_registry(registry);
         }
 
+        let prompt_memory = Arc::new(PromptMemory::default());
+        let prompter = default_prompter(&prompt_memory);
         let mut ctx = Self {
             app,
             macro_flag: false,
@@ -794,6 +828,9 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: RenderMode::default(),
+            ui: Arc::new(StdoutSink::default()),
+            prompter,
+            prompt_memory,
             #[cfg(test)]
             test_summary_fetch: None,
         };
@@ -920,6 +957,9 @@ impl RequestContext {
             // root flow that opened it may fire its terminal event.
             top_level_agent_id: None,
             render_mode: self.render_mode,
+            ui: Arc::clone(&self.ui),
+            prompter: Arc::clone(&self.prompter),
+            prompt_memory: Arc::clone(&self.prompt_memory),
             #[cfg(test)]
             test_summary_fetch: self.test_summary_fetch.clone(),
         }
@@ -990,8 +1030,39 @@ impl RequestContext {
             task_abort: None,
             top_level_agent_id: None,
             render_mode: parent.render_mode,
+            ui: Arc::clone(&parent.ui),
+            prompter: Arc::clone(&parent.prompter),
+            prompt_memory: Arc::clone(&parent.prompt_memory),
             #[cfg(test)]
             test_summary_fetch: parent.test_summary_fetch.clone(),
+        }
+    }
+
+    /// Asks the human through this context's prompter, unless an earlier
+    /// "Yes for this session" already answered the same tool confirm; that
+    /// answer is replayed and published as automatic.
+    pub(crate) fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
+        if self.prompt_memory.auto_answer(&req) == Some(true) {
+            let answer = PromptAnswer::Confirmed(true);
+            events::bus().publish(req.requested_event());
+            events::bus().publish(req.answered_event(&answer, true));
+            return Ok(answer);
+        }
+        crate::prompt::ask(self.prompter.as_ref(), req)
+    }
+
+    /// A request from this context: fresh id, no tool or job, this origin.
+    pub(crate) fn prompt_request(
+        &self,
+        action: PromptAction,
+        question: impl Into<String>,
+        options: Vec<String>,
+        default: Option<serde_json::Value>,
+    ) -> PromptRequest {
+        PromptRequest {
+            options,
+            default,
+            ..PromptRequest::new(action, question, Origin::from(self))
         }
     }
 
@@ -1006,6 +1077,24 @@ impl RequestContext {
 
     pub fn command_prefix(&self) -> CommandPrefix {
         self.app.config.command_prefix
+    }
+
+    /// What kind of surface answers this run's prompts, exported to tools
+    /// as `COYOTE_UI`: headless when no human is present, the full-screen
+    /// UI while it owns the terminal, the REPL otherwise. An interactive
+    /// run configured for the full-screen UI already counts as `Tui`
+    /// before the loop takes the terminal, so the dispatch in `main` and
+    /// the tools it starts on the way agree with what is about to start.
+    /// A prompt run with a human present stays `Repl` whatever the config
+    /// says. Who owns the interrupt is a separate question, answered by
+    /// `interrupt_policy` from the terminal's actual owner.
+    pub(crate) fn ui_kind(&self) -> UiKind {
+        match UiKind::current() {
+            UiKind::Repl if self.working_mode.is_repl() && self.app.config.ui == UiMode::Tui => {
+                UiKind::Tui
+            }
+            kind => kind,
+        }
     }
 
     pub fn render_hints<'a>(&self, text: &'a str) -> Cow<'a, str> {
@@ -1025,8 +1114,14 @@ impl RequestContext {
         self.self_agent_id.is_none() || self.session_abort.is_some()
     }
 
+    /// The full-screen UI reads the keyboard itself and turns Esc into an
+    /// abort, so the derivation says `NotOwned` while it runs; the spinner
+    /// entry point enforces the same rule for sites that pass a literal.
+    /// Until the loop has taken the terminal nothing else answers a key,
+    /// so a run merely configured for the full-screen UI keeps SIGINT
+    /// armed on the spinners it starts on the way in.
     pub(crate) fn interrupt_policy(&self) -> UserInterrupt {
-        if self.user_interrupts_here() {
+        if self.user_interrupts_here() && !crate::tui::active() {
             UserInterrupt::Owned
         } else {
             UserInterrupt::NotOwned
@@ -1051,6 +1146,19 @@ impl RequestContext {
             .clone()
     }
 
+    /// The supervisor, made for jobs alone when no engaged agent needed one.
+    pub fn ensure_supervisor(&mut self) -> Arc<RwLock<Supervisor>> {
+        if let Some(supervisor) = &self.supervisor {
+            return Arc::clone(supervisor);
+        }
+        let max_jobs = effective_max_concurrent_jobs(self.agent.as_ref(), &self.app.config);
+        let supervisor = Arc::new(RwLock::new(
+            Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
+        ));
+        self.supervisor = Some(Arc::clone(&supervisor));
+        supervisor
+    }
+
     pub fn ensure_inbox(&mut self) -> Arc<Inbox> {
         self.inbox
             .get_or_insert_with(|| Arc::new(Inbox::new()))
@@ -1065,17 +1173,22 @@ impl RequestContext {
         self.todo_list = TodoList::new(goal);
         self.auto_continue_paused = None;
         self.sync_todo_state_to_session();
+        self.publish_todo_update();
     }
 
     pub fn add_todo(&mut self, task: &str) -> usize {
         let id = self.todo_list.add(task);
         self.sync_todo_state_to_session();
+        self.publish_todo_update();
         id
     }
 
     pub fn mark_todo_done(&mut self, id: usize) -> bool {
         let marked = self.todo_list.mark_done(id);
         self.sync_todo_state_to_session();
+        if marked {
+            self.publish_todo_update();
+        }
         marked
     }
 
@@ -1084,6 +1197,12 @@ impl RequestContext {
         self.auto_continue_count = 0;
         self.auto_continue_paused = None;
         self.sync_todo_state_to_session();
+        self.publish_todo_update();
+    }
+
+    pub(crate) fn replace_todo_list(&mut self, list: TodoList) {
+        self.todo_list = list;
+        self.publish_todo_update();
     }
 
     pub fn increment_auto_continue_count(&mut self) {
@@ -1106,6 +1225,16 @@ impl RequestContext {
     fn sync_todo_state_to_session(&mut self) {
         if let Some(session) = self.session.as_mut() {
             session.sync_todo_state(&self.todo_list, self.auto_continue_paused.as_deref());
+        }
+    }
+
+    /// Only the root context drives the todo panel; a child agent's todo list
+    /// is its own and would otherwise overwrite the user's.
+    fn publish_todo_update(&self) {
+        if self.self_agent_id.is_none() {
+            events::bus().publish(Event::TodoUpdated {
+                items: self.todo_list.todos.clone(),
+            });
         }
     }
 
@@ -1622,9 +1751,19 @@ impl RequestContext {
         let mut taken = self.session.take();
         let exited = taken.as_mut().map(|session| {
             let sessions_dir = self.sessions_dir_for(session.scope());
-            session.exit(&sessions_dir, self.working_mode.is_repl())
+            session.exit(
+                &sessions_dir,
+                self.working_mode.is_repl(),
+                self.prompter.as_ref(),
+            )
         });
         if taken.is_some() {
+            // A "Yes for this session" answer lasts as long as the root's
+            // session. The memory is shared with forks, children and the
+            // isolated macro context, so only the root clears it.
+            if self.owns_prompt_memory() {
+                self.prompt_memory.clear();
+            }
             // The session is gone from ctx whether or not the save succeeds,
             // so the message that belonged to it stops being continuous
             // either way, and the turn state it scoped goes with it: a todo
@@ -1633,7 +1772,7 @@ impl RequestContext {
             self.discontinuous_last_message();
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
-            self.todo_list = TodoList::default();
+            self.replace_todo_list(TodoList::default());
             self.auto_continue_paused = None;
             if let Some(delegate) = self.delegate_agent_mut() {
                 delegate.exit_session();
@@ -1650,6 +1789,14 @@ impl RequestContext {
         self.child_session_root = None;
         exited.transpose()?;
         Ok(())
+    }
+
+    /// The root context, excluding the forked context an isolated macro
+    /// runs in (the only context with `macro_flag` set and
+    /// `macro_non_isolated` unset).
+    fn owns_prompt_memory(&self) -> bool {
+        let in_isolated_macro = self.macro_flag && !self.macro_non_isolated;
+        self.self_agent_id.is_none() && !in_isolated_macro
     }
 
     pub fn save_session(&mut self, name: Option<&str>, scope: Option<SessionScope>) -> Result<()> {
@@ -1888,6 +2035,7 @@ impl RequestContext {
                 chat_variables,
                 self.info_flag,
                 delegate.interactive,
+                self.prompter.as_ref(),
             )
             .with_context(|| chat_agent_engage_failure(&delegate.name, graph_agent_name))?;
             if !self.info_flag {
@@ -1944,16 +2092,23 @@ impl RequestContext {
         if dry_run || !self.persists_session {
             return Ok(());
         }
+        let is_child = self.self_agent_id.is_some();
         let Some(session) = self.session.as_mut() else {
             return Ok(());
         };
         if session.effective_save_session() != Some(true) {
             return Ok(());
         }
-        if let Err(err) = session.flush() {
-            warn!("Failed to checkpoint session '{}': {err:#}", session.name());
-            if self.self_agent_id.is_some() {
-                return Err(err).context("final session flush failed");
+        match session.flush() {
+            Ok(()) if is_child => events::bus().publish(Event::ChildTranscriptFlushed {
+                session_id: session.name().to_string(),
+            }),
+            Ok(()) => {}
+            Err(err) => {
+                warn!("Failed to checkpoint session '{}': {err:#}", session.name());
+                if is_child {
+                    return Err(err).context("final session flush failed");
+                }
             }
         }
         Ok(())
@@ -1968,6 +2123,10 @@ impl RequestContext {
     /// all. A sessionless root keys it on this process's stamp. A fork
     /// or child inherits its parent's handle and never resolves one itself.
     /// Resolving touches no directory: the first child file write creates it.
+    /// A root context announces the root it resolves on the event bus. So
+    /// does a sessionless fork of a root that had not resolved one yet: it
+    /// keys on the same process stamp, so it announces a root equal to the
+    /// one its parent would, and observers compare roots by value.
     pub(crate) fn ensure_child_session_root(&mut self) -> Option<Arc<ChildSessionRoot>> {
         if let Some(root) = &self.child_session_root {
             return Some(Arc::clone(root));
@@ -1990,6 +2149,9 @@ impl RequestContext {
         };
         let root = Arc::new(root);
         self.child_session_root = Some(Arc::clone(&root));
+        events::bus().publish(Event::ChildSessionRootResolved {
+            root: Arc::clone(&root),
+        });
         Some(root)
     }
 
@@ -2100,6 +2262,7 @@ impl RequestContext {
                 self.agent_variables.as_ref(),
                 self.info_flag,
                 self.self_agent_id.is_none(),
+                self.prompter.as_ref(),
             )?;
             agent.set_shared_variables(new_variables);
         }
@@ -2125,6 +2288,7 @@ impl RequestContext {
                         self.agent_variables.as_ref(),
                         self.info_flag,
                         self.self_agent_id.is_none(),
+                        self.prompter.as_ref(),
                     )?;
                     agent.set_shared_variables(new_variables.clone());
                     new_variables
@@ -2178,9 +2342,16 @@ impl RequestContext {
         let graph_agent_name = graph_agent.map(Agent::name).unwrap_or_default();
         let engage_failure = || chat_agent_engage_failure(&delegate.name, graph_agent_name);
         let interactive = delegate.interactive;
+        let prompter = self.prompter.as_ref();
         if new_session {
-            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)
-                .with_context(engage_failure)?;
+            seed_delegate_shared_variables(
+                agent,
+                chat_variables,
+                self.info_flag,
+                interactive,
+                prompter,
+            )
+            .with_context(engage_failure)?;
             agent.set_session_variables(agent.shared_variables().clone());
             if !self.info_flag {
                 agent.update_session_dynamic_instructions(None, tool_timeout)?;
@@ -2194,8 +2365,14 @@ impl RequestContext {
             )?;
         } else {
             let previous = session.chat_agent().map(str::to_string);
-            seed_delegate_shared_variables(agent, chat_variables, self.info_flag, interactive)
-                .with_context(engage_failure)?;
+            seed_delegate_shared_variables(
+                agent,
+                chat_variables,
+                self.info_flag,
+                interactive,
+                prompter,
+            )
+            .with_context(engage_failure)?;
             agent.set_session_variables(agent.shared_variables().clone());
             if !self.info_flag {
                 agent.update_session_dynamic_instructions(None, tool_timeout)?;
@@ -3280,6 +3457,7 @@ impl RequestContext {
             ("save", app.save.to_string()),
             ("keybindings", app.keybindings.clone()),
             ("command_prefix", app.command_prefix.to_string()),
+            ("ui", app.ui.to_string()),
             ("wrap", wrap),
             ("wrap_code", app.wrap_code.to_string()),
             ("highlight", app.highlight.to_string()),
@@ -3438,6 +3616,13 @@ impl RequestContext {
         }
         self.last_token_usage = usage;
         self.last_cost = cost;
+        // Only the session-owning root context feeds the footer. A child
+        // agent or a graph branch (which clones the session but never writes
+        // it back) would otherwise overwrite the user's totals with its own.
+        if self.self_agent_id.is_none() && self.persists_session {
+            let right_prompt = self.render_prompt_right(&self.app.config);
+            events::bus().publish(Event::UsageUpdated { right_prompt });
+        }
     }
 
     pub fn generate_prompt_context(&self, app: &AppConfig) -> HashMap<&str, String> {
@@ -4028,11 +4213,25 @@ impl RequestContext {
 
     pub fn new_role(&self, app: &AppConfig, name: &str) -> Result<()> {
         if self.macro_flag {
+            // `.role <new>` inside a macro step never opens an editor. With
+            // no human on the run the refusal names what could not be
+            // created and who is missing, raised before any prompt is built
+            // so the prompter is never reached; an interactive macro keeps
+            // the terse `No role`.
+            if !human_present() {
+                return Err(NeedsHuman::for_creating("role", name).into());
+            }
             bail!("No role");
         }
-        let ans = Confirm::new("Create a new role?")
-            .with_default(true)
-            .prompt()?;
+        crate::tui::ensure_terminal_lendable()?;
+        let ans = self
+            .prompt(self.prompt_request(
+                PromptAction::Confirm,
+                "Create a new role?",
+                Vec::new(),
+                Some(serde_json::json!(true)),
+            ))?
+            .into_confirmed()?;
         if ans {
             self.upsert_role(app, name)?;
         } else {
@@ -4055,18 +4254,22 @@ impl RequestContext {
             None => bail!("No role"),
         };
         if role_name == TEMP_ROLE_NAME {
-            role_name = Text::new("Role name:")
-                .with_validator(|input: &str| {
-                    let input = input.trim();
-                    if input.is_empty() {
-                        Ok(Validation::Invalid("This name is required".into()))
-                    } else if input == TEMP_ROLE_NAME {
-                        Ok(Validation::Invalid("This name is reserved".into()))
-                    } else {
-                        Ok(Validation::Valid)
-                    }
-                })
-                .prompt()?;
+            let mut question = "Role name:".to_string();
+            role_name = loop {
+                let input = self
+                    .prompt(self.prompt_request(PromptAction::Input, &question, Vec::new(), None))?
+                    .into_text()?;
+                let input = input.trim();
+                if input.is_empty() {
+                    question = "Role name (required):".to_string();
+                    continue;
+                }
+                if input == TEMP_ROLE_NAME {
+                    question = format!("Role name ('{TEMP_ROLE_NAME}' is reserved):");
+                    continue;
+                }
+                break input.to_string();
+            };
         }
         let role_path = paths::role_file(&role_name);
         if let Some(role) = self.role.as_mut() {
@@ -4080,6 +4283,7 @@ impl RequestContext {
             Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
         };
+        crate::tui::ensure_terminal_lendable()?;
         let session_path = self.session_file_for(&name, scope);
         self.save_session(Some(&name), None)?;
         let editor = app.editor()?;
@@ -4106,6 +4310,7 @@ impl RequestContext {
             Some(agent) => agent.name(),
             None => bail!("No agent"),
         };
+        crate::tui::ensure_terminal_lendable()?;
         let config_path = paths::agent_config_file(agent_name);
         let graph_path = paths::agent_graph_file(agent_name);
         let target_path = if !config_path.exists() && graph_path.exists() {
@@ -4138,11 +4343,22 @@ impl RequestContext {
             bail!("'{name}' is a reserved macro name");
         }
         if self.macro_flag {
+            // `.macro <new>` inside a macro step: the same pre-prompt
+            // refusal as `new_role`, nothing reaches the prompter.
+            if !human_present() {
+                return Err(NeedsHuman::for_creating("macro", name).into());
+            }
             bail!("No macro");
         }
-        let ans = Confirm::new("Create a new macro?")
-            .with_default(true)
-            .prompt()?;
+        crate::tui::ensure_terminal_lendable()?;
+        let ans = self
+            .prompt(self.prompt_request(
+                PromptAction::Confirm,
+                "Create a new macro?",
+                Vec::new(),
+                Some(serde_json::json!(true)),
+            ))?
+            .into_confirmed()?;
         if ans {
             let macro_path = paths::macro_file(name);
             ensure_parent_exists(&macro_path)?;
@@ -4573,17 +4789,24 @@ impl RequestContext {
             bail!("No {kind} to delete")
         }
 
-        let select_names = MultiSelect::new(&format!("Select {kind} to delete:"), names)
-            .with_validator(|list: &[ListOption<&String>]| {
-                if list.is_empty() {
-                    Ok(Validation::Invalid(
-                        "At least one item must be selected".into(),
-                    ))
-                } else {
-                    Ok(Validation::Valid)
-                }
-            })
-            .prompt()?;
+        let select_names = loop {
+            let picked = self
+                .prompt(self.prompt_request(
+                    PromptAction::Checkbox,
+                    format!("Select {kind} to delete:"),
+                    names.clone(),
+                    None,
+                ))?
+                .into_checked()?;
+            if picked.is_empty() {
+                eprintln!("At least one item must be selected");
+                continue;
+            }
+            break picked;
+        };
+        if let Some(name) = select_names.iter().find(|name| !names.contains(name)) {
+            bail!("Unknown {kind} '{name}'");
+        }
 
         if kind == "agent-data" {
             self.delete_agent_data_selection(&dir, &select_names)?;
@@ -4775,20 +4998,27 @@ impl RequestContext {
             .map(|(name, scope)| session_delete_label(name, *scope))
             .collect();
 
-        let selected = MultiSelect::new("Select session to delete:", labels)
-            .with_validator(|list: &[ListOption<&String>]| {
-                if list.is_empty() {
-                    Ok(Validation::Invalid(
-                        "At least one item must be selected".into(),
-                    ))
-                } else {
-                    Ok(Validation::Valid)
-                }
-            })
-            .raw_prompt()?;
+        let selected = loop {
+            let picked = self
+                .prompt(self.prompt_request(
+                    PromptAction::Checkbox,
+                    "Select session to delete:",
+                    labels.clone(),
+                    None,
+                ))?
+                .into_checked()?;
+            if picked.is_empty() {
+                eprintln!("At least one item must be selected");
+                continue;
+            }
+            break picked;
+        };
 
-        for option in selected {
-            let (name, scope) = &entries[option.index];
+        for label in selected {
+            let Some(index) = labels.iter().position(|candidate| *candidate == label) else {
+                bail!("Unknown session '{label}'");
+            };
+            let (name, scope) = &entries[index];
             self.delete_session_at(name, *scope)?;
         }
         println!("✓ Successfully deleted session.");
@@ -5358,15 +5588,40 @@ impl RequestContext {
         }
     }
 
+    /// Completion rows for a command's arguments: the value, its
+    /// description, and a kind (`session` or `variable`) on the rows
+    /// offered after `.agent <name> `, where sessions and variables
+    /// share a list; other rows have none.
     pub fn repl_complete(
         &self,
         cmd: &str,
         args: &[&str],
         _line: &str,
-    ) -> Vec<(String, Option<String>)> {
+    ) -> Vec<(String, Option<String>, Option<&'static str>)> {
         let app = self.app.config.as_ref();
-        let mut values: Vec<(String, Option<String>)> = vec![];
         let filter = args.last().unwrap_or(&"");
+        if cmd == ".agent" && args.len() >= 2 {
+            let mut values = vec![];
+            if args.len() == 2
+                && (!graph::agent_has_graph(args[0]) || graph::graph_supports_sessions(args[0]))
+            {
+                let (workspace_dir, global_dir) = session_scope_dirs(Some(args[0]));
+                values.extend(
+                    labeled_session_names(&workspace_dir, &global_dir)
+                        .into_iter()
+                        .map(|(name, scope)| {
+                            (
+                                sanitize_display_text(&name),
+                                Some(scope.to_string()),
+                                Some("session"),
+                            )
+                        }),
+                );
+            }
+            values.extend(super::complete_agent_variables(args[0]));
+            return fuzzy_filter(values, |v| v.0.as_str(), filter);
+        }
+        let mut values: Vec<(String, Option<String>)> = vec![];
         if args.len() == 1 {
             values = match cmd {
                 ".role" => super::map_completion_values(paths::list_roles(true)),
@@ -5825,17 +6080,6 @@ impl RequestContext {
                 .into_iter()
                 .map(|v| (v, None))
                 .collect();
-        } else if cmd == ".agent" {
-            if args.len() == 2
-                && (!graph::agent_has_graph(args[0]) || graph::graph_supports_sessions(args[0]))
-            {
-                let (workspace_dir, global_dir) = session_scope_dirs(Some(args[0]));
-                values = labeled_session_names(&workspace_dir, &global_dir)
-                    .into_iter()
-                    .map(|(name, scope)| (sanitize_display_text(&name), Some(scope.to_string())))
-                    .collect();
-            }
-            values.extend(super::complete_agent_variables(args[0]));
         } else if cmd == ".save" && args.first() == Some(&"session") {
             if !args.contains(&"--workspace") && !args.contains(&"--global") {
                 values.push((
@@ -5852,6 +6096,10 @@ impl RequestContext {
         } else if args.len() >= 2 {
             values = self.macro_variable_completions(cmd, &args[..args.len() - 1]);
         };
+        let values = values
+            .into_iter()
+            .map(|(value, description)| (value, description, None))
+            .collect();
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
@@ -6277,11 +6525,14 @@ impl RequestContext {
                     && (*continuous && !output.is_empty())
                     && self.agent.is_some() == input.with_agent()
                 {
-                    let ans = Confirm::new(
-                        "Start a session that incorporates the last question and answer?",
-                    )
-                    .with_default(false)
-                    .prompt()?;
+                    let ans = self
+                        .prompt(self.prompt_request(
+                            PromptAction::Confirm,
+                            "Start a session that incorporates the last question and answer?",
+                            Vec::new(),
+                            Some(serde_json::json!(false)),
+                        ))?
+                        .into_confirmed()?;
                     if ans {
                         incorporate_last_exchange(session, input, output)?;
                     }
@@ -6301,18 +6552,17 @@ impl RequestContext {
         self.graph_chat_fc_warned = false;
         // Adopt the session's todo state wholesale: a session without any todo
         // state resets ctx to defaults, so nothing leaks across a session switch.
-        match &self.session {
-            Some(session) => {
-                self.todo_list = session.todo_list().clone();
-                self.auto_continue_paused = session.auto_continue_paused().map(str::to_string);
-            }
-            None => {
-                // Structurally unreachable today (both arms above assign Some);
-                // kept so the no-leakage reset stays explicit.
-                self.todo_list = TodoList::default();
-                self.auto_continue_paused = None;
-            }
-        }
+        let (todo_list, auto_continue_paused) = match &self.session {
+            Some(session) => (
+                session.todo_list().clone(),
+                session.auto_continue_paused().map(str::to_string),
+            ),
+            // Structurally unreachable today (both arms above assign Some);
+            // kept so the no-leakage reset stays explicit.
+            None => (TodoList::default(), None),
+        };
+        self.replace_todo_list(todo_list);
+        self.auto_continue_paused = auto_continue_paused;
         self.refresh_mcp_tool_filters();
         self.init_agent_session_variables(new_session)?;
         if created_new_session {
@@ -6359,6 +6609,7 @@ impl RequestContext {
             self.info_flag,
             agent_name,
             abort_signal.clone(),
+            Arc::clone(&self.prompter),
         )
         .await?;
         ensure_reasoning_effort_supported(&agent)?;
@@ -6510,7 +6761,7 @@ impl RequestContext {
         self.parent_supervisor = None;
         self.current_depth = 0;
         self.auto_continue_count = 0;
-        self.todo_list = TodoList::default();
+        self.replace_todo_list(TodoList::default());
         self.auto_continue_paused = None;
         // Defensive: the already-in-a-session bail above guarantees no session
         // is attached here; this sync only matters if that bail is relaxed.
@@ -6620,6 +6871,7 @@ impl RequestContext {
             self.info_flag,
             name,
             abort_signal.clone(),
+            Arc::clone(&self.prompter),
         )
         .await?;
         ensure_reasoning_effort_supported(&agent)?;
@@ -6630,6 +6882,7 @@ impl RequestContext {
                 Some(chat_variables),
                 self.info_flag,
                 interactive,
+                self.prompter.as_ref(),
             )?;
             if !self.info_flag {
                 agent.update_shared_dynamic_instructions(false, self.app.config.tool_timeout)?;
@@ -6727,7 +6980,7 @@ impl RequestContext {
             self.current_depth = 0;
             self.auto_continue_count = 0;
             self.pending_tasks_guardrail_count = 0;
-            self.todo_list = TodoList::default();
+            self.replace_todo_list(TodoList::default());
             self.auto_continue_paused = None;
             self.last_graph_branch = None;
             self.graph_chat_fc_warned = false;
@@ -6821,6 +7074,7 @@ impl RequestContext {
     }
 
     fn upsert_role(&self, app: &AppConfig, name: &str) -> Result<()> {
+        crate::tui::ensure_terminal_lendable()?;
         let role_path = paths::role_file(name);
         ensure_parent_exists(&role_path)?;
         let editor = app.editor()?;
@@ -6833,6 +7087,7 @@ impl RequestContext {
 
     pub fn upsert_skill(&self, app: &AppConfig, name: &str) -> Result<()> {
         paths::validate_skill_name(name)?;
+        crate::tui::ensure_terminal_lendable()?;
         let path = paths::skill_file(name);
         ensure_parent_exists(&path)?;
         let is_new = !path.exists();
@@ -7347,30 +7602,37 @@ impl RequestContext {
         let rag_cache = self.rag_cache();
         let working_mode = self.working_mode;
         let sync_hooks = RagSyncHooks::resolve(self);
+        let prompter = Arc::clone(&self.prompter);
 
         let (rag, rag_key): (Arc<Rag>, Option<RagKey>) = match rag {
             None => {
+                if !crate::config::conflict::menu_can_use_terminal() {
+                    return Err(Rag::refuse_init(super::TEMP_RAG_NAME));
+                }
                 let rag_path = self.rag_file(super::TEMP_RAG_NAME);
+                // A temp rag is never saved, so the wizard can run with
+                // the previous one still on disk; it is removed only once
+                // the wizard has answered, so a refusal or a cancelled
+                // question keeps it.
+                let rag = Rag::init(
+                    &app,
+                    super::TEMP_RAG_NAME,
+                    &rag_path,
+                    &[],
+                    false,
+                    RagInitRun {
+                        abort_signal: abort_signal.clone(),
+                        sync_hooks,
+                        prompter: prompter.as_ref(),
+                    },
+                )
+                .await?;
                 if rag_path.exists() {
                     remove_file(&rag_path).with_context(|| {
                         format!("Failed to cleanup previous '{}' rag", super::TEMP_RAG_NAME)
                     })?;
                 }
-                (
-                    Arc::new(
-                        Rag::init(
-                            &app,
-                            super::TEMP_RAG_NAME,
-                            &rag_path,
-                            &[],
-                            abort_signal.clone(),
-                            false,
-                            sync_hooks,
-                        )
-                        .await?,
-                    ),
-                    None,
-                )
+                (Arc::new(rag), None)
             }
             Some(name) => {
                 let rag_path = self.rag_file(name);
@@ -7382,6 +7644,7 @@ impl RequestContext {
                         let vault = vault.clone();
                         let rag_path = rag_path.clone();
                         let abort_signal = abort_signal.clone();
+                        let prompter = Arc::clone(&prompter);
                         async move {
                             if !rag_path.exists() {
                                 if working_mode.is_cmd() {
@@ -7392,9 +7655,12 @@ impl RequestContext {
                                     name,
                                     &rag_path,
                                     &[],
-                                    abort_signal.clone(),
                                     true,
-                                    sync_hooks,
+                                    RagInitRun {
+                                        abort_signal: abort_signal.clone(),
+                                        sync_hooks,
+                                        prompter: prompter.as_ref(),
+                                    },
                                 )
                                 .await
                             } else {
@@ -7423,7 +7689,7 @@ impl RequestContext {
         }
         let app = self.app.config.as_ref();
         let vault = self.app.vault.clone();
-        let rag = Rag::attach(app, &vault, name, &rag_path).await?;
+        let rag = Rag::attach(app, &vault, name, &rag_path, self.prompter.as_ref()).await?;
         let rag = Arc::new(rag);
         let key = RagKey::Named(name.to_string());
         self.rag_cache().insert(key.clone(), &rag);
@@ -7446,6 +7712,7 @@ impl RequestContext {
         }
 
         let document_paths = rag.document_paths();
+        crate::tui::ensure_terminal_lendable()?;
         let temp_file = temp_file(&format!("-rag-{}", rag.name()), ".txt");
         tokio::fs::write(&temp_file, &document_paths.join("\n"))
             .await
@@ -7479,8 +7746,11 @@ impl RequestContext {
             false,
             false,
             &self.app.config,
-            abort_signal,
-            RagSyncHooks::resolve(self),
+            RagInitRun {
+                abort_signal,
+                sync_hooks: RagSyncHooks::resolve(self),
+                prompter: self.prompter.as_ref(),
+            },
         )
         .await?;
         self.rag = Some(Arc::new(rag));
@@ -7516,8 +7786,11 @@ impl RequestContext {
             true,
             true,
             &self.app.config,
-            abort_signal,
-            RagSyncHooks::resolve(self),
+            RagInitRun {
+                abort_signal,
+                sync_hooks: RagSyncHooks::resolve(self),
+                prompter: self.prompter.as_ref(),
+            },
         )
         .await?;
         self.rag = Some(Arc::new(rag));
@@ -8204,10 +8477,15 @@ mod tests {
     use crate::mcp::{
         ConnectedServer, McpServer, McpServerFeatures, McpServersConfig, McpTransportType,
     };
+    use crate::prompt::{ScriptedPrompter, prompt_events};
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
-    use crate::testing::{EnvVarGuard, TestConfigDirGuard, install_log_collector, warn_snapshot};
+    use crate::testing::{
+        AtomicFlagGuard, EnvVarGuard, TempNeedleGuard, TestConfigDirGuard, install_log_collector,
+        warn_snapshot,
+    };
+    use crate::turn::SilentSink;
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -8418,7 +8696,7 @@ mod tests {
             return;
         }
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents = paths::agents_data_dir();
         let shared = agents.join(".shared").join("debris.py");
@@ -8604,6 +8882,133 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn record_token_usage_publishes_the_rendered_right_prompt_on_every_call() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.right_prompt = Some("usage-probe-x7x".into()));
+        let recording = crate::events::RecordingSink::install();
+
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
+
+        let prompts: Vec<String> = recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::UsageUpdated { right_prompt }
+                    if right_prompt.contains("usage-probe-x7x") =>
+                {
+                    Some(right_prompt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn record_token_usage_publishes_nothing_for_a_child_context() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.right_prompt = Some("usage-probe-x7x".into()));
+        ctx.self_agent_id = Some("agent-usage-x7x".into());
+        let recording = crate::events::RecordingSink::install();
+
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
+
+        let published = recording.drain().into_iter().any(|event| {
+            matches!(
+                event,
+                Event::UsageUpdated { right_prompt } if right_prompt.contains("usage-probe-x7x")
+            )
+        });
+        assert!(!published);
+        assert!(ctx.last_prompt_token_usage.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn record_token_usage_publishes_nothing_for_a_graph_branch() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.right_prompt = Some("usage-probe-x7x".into()));
+        let mut branch = ctx.fork_for_branch();
+        assert!(!branch.persists_session);
+        let recording = crate::events::RecordingSink::install();
+
+        branch.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(1),
+                ..Default::default()
+            }),
+            &priced_model(),
+        );
+
+        let published = recording.drain().into_iter().any(|event| {
+            matches!(
+                event,
+                Event::UsageUpdated { right_prompt } if right_prompt.contains("usage-probe-x7x")
+            )
+        });
+        assert!(!published);
+        assert!(branch.last_prompt_token_usage.is_some());
+    }
+
+    fn todo_updates_bearing(
+        recording: &crate::events::RecordingSink,
+        desc: &str,
+    ) -> Vec<Vec<crate::config::todo::TodoItem>> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::TodoUpdated { items } if items.iter().any(|item| item.desc == desc) => {
+                    Some(items)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn replace_todo_list_publishes_on_root_and_not_on_child() {
+        let mut root = create_test_ctx();
+        let mut replacement = TodoList::new("g");
+        replacement.add("replace-probe-x7x");
+        let recording = crate::events::RecordingSink::install();
+
+        root.replace_todo_list(replacement.clone());
+
+        let updates = todo_updates_bearing(&recording, "replace-probe-x7x");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0], replacement.todos);
+        assert_eq!(root.todo_list, replacement);
+
+        let mut child = create_test_ctx();
+        child.self_agent_id = Some("agent-todo-x7x".into());
+        let mut replacement = TodoList::new("g");
+        replacement.add("replace-child-probe-x7x");
+
+        child.replace_todo_list(replacement.clone());
+
+        assert!(todo_updates_bearing(&recording, "replace-child-probe-x7x").is_empty());
+        assert_eq!(child.todo_list, replacement);
+    }
+
+    #[test]
     fn generate_prompt_context_counts_pending_images() {
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
@@ -8709,8 +9114,42 @@ mod tests {
 
         assert!(SET_COMPLETION_KEYS.contains(&"command_prefix"));
         let values = ctx.repl_complete(".set", &["command_prefix", ""], "command_prefix ");
-        let names: Vec<&str> = values.iter().map(|(v, _)| v.as_str()).collect();
+        let names: Vec<&str> = values.iter().map(|(v, _, _)| v.as_str()).collect();
         assert_eq!(names, ["dot", "slash", "both"]);
+    }
+
+    /// The shell is chosen before the REPL exists, so `.set ui` would only
+    /// take effect on the next start; it is not offered at all.
+    #[test]
+    #[serial]
+    fn set_ui_is_refused_and_not_completed() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        assert_eq!(ctx.app.config.ui, UiMode::Repl);
+
+        let err = run_async(ctx.update("ui tui", utils::create_abort_signal()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "Unknown key 'ui'");
+        assert_eq!(ctx.app.config.ui, UiMode::Repl);
+        assert!(!SET_COMPLETION_KEYS.contains(&"ui"));
+    }
+
+    #[test]
+    #[serial]
+    fn sysinfo_reports_the_configured_ui() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let ui_row = |ctx: &RequestContext| {
+            let info = ctx.sysinfo(&ctx.app.config).unwrap();
+            info.lines()
+                .find(|line| line.split_whitespace().next() == Some("ui"))
+                .unwrap_or_else(|| panic!("ui row missing from:\n{info}"))
+                .to_string()
+        };
+        assert!(ui_row(&ctx).ends_with("repl"), "{}", ui_row(&ctx));
+        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        assert!(ui_row(&ctx).ends_with("tui"), "{}", ui_row(&ctx));
     }
 
     /// `child_sessions` is a config-file-only knob: `.set` refuses it as an
@@ -11583,7 +12022,7 @@ mod tests {
         let values = ctx.repl_complete(".uninstall", &[""], "");
 
         assert!(
-            values.iter().any(|(name, _)| name == "omc"),
+            values.iter().any(|(name, _, _)| name == "omc"),
             "got: {values:?}"
         );
     }
@@ -11612,7 +12051,7 @@ mod tests {
 
         for expected in ["agents", "omc"] {
             assert!(
-                values.iter().any(|(name, _)| name == expected),
+                values.iter().any(|(name, _, _)| name == expected),
                 "missing '{expected}'; got: {values:?}"
             );
         }
@@ -12000,6 +12439,7 @@ mod tests {
     /// A spawned child must not carry the SIGINT arm on any of its spinners,
     /// or the first Ctrl-C of a turn would kill every child mid-request.
     #[test]
+    #[serial]
     fn interrupt_policy_is_owned_for_root_and_not_owned_for_spawned_child() {
         let root = create_test_ctx();
         assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
@@ -12014,6 +12454,480 @@ mod tests {
             "agent_test_1".to_string(),
         );
         assert_eq!(child.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// Under the full-screen UI the loop owns the keyboard, so even the
+    /// root turn's spinners must not arm SIGINT.
+    #[test]
+    #[serial]
+    fn interrupt_policy_is_not_owned_while_the_tui_is_active() {
+        let root = create_test_ctx();
+        assert_eq!(root.interrupt_policy(), UserInterrupt::Owned);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert_eq!(root.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// An interactive run configured for the full-screen UI is `Tui` from
+    /// the start, but the spinners it runs before the loop takes the
+    /// terminal (the MCP start, the models refresh) still paint the normal
+    /// screen with nobody reading Esc, so they keep SIGINT armed until the
+    /// UI is actually up.
+    #[test]
+    #[serial]
+    fn interrupt_policy_stays_owned_until_the_configured_tui_takes_the_terminal() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
+        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        assert!(!crate::tui::active());
+        assert_eq!(ctx.ui_kind(), UiKind::Tui);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::NotOwned);
+    }
+
+    /// A prompt run never starts the full-screen UI, so the config value
+    /// does not change its surface or who owns its interrupt.
+    #[test]
+    #[serial]
+    fn configured_tui_is_ignored_on_the_command_path() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        ctx.update_app_config(|app| app.ui = UiMode::Tui);
+        assert_eq!(ctx.ui_kind(), UiKind::Repl);
+        assert_eq!(ctx.interrupt_policy(), UserInterrupt::Owned);
+    }
+
+    /// `.skill <name>` under the full-screen UI needs the terminal lent
+    /// to the editor; with nobody lending it the command fails before the
+    /// scaffold is written, since a scaffold left behind would turn the
+    /// next `.skill` into an edit of an empty template.
+    #[test]
+    #[serial]
+    fn upsert_skill_under_the_tui_without_a_lender_fails_before_scaffolding_the_file() {
+        let _guard = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = ctx
+            .upsert_skill(&ctx.app.config, "tui-refused-skill")
+            .unwrap_err();
+        assert_no_lender_under_the_tui(err);
+        let path = paths::skill_file("tui-refused-skill");
+        assert!(
+            !path.exists(),
+            "the failed lend left a scaffold at {}",
+            path.display()
+        );
+    }
+
+    /// `.rag` with no name rebuilds the temp rag through the wizard;
+    /// under the full-screen UI the wizard's first question, the
+    /// embedding model, is a closed select through the prompter. A
+    /// rebuild that fails on it keeps the previous temp rag.
+    #[test]
+    #[serial]
+    fn use_rag_under_the_tui_asks_through_the_prompter() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(&rag_path, "driver: yaml\n").unwrap();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let scripted = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Selected(
+            "not-an-offered-model".to_string(),
+        )]));
+        ctx.prompter = scripted.clone();
+        let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("is not one of the offered options"),
+            "{err}"
+        );
+        let [req] = scripted.requests().try_into().unwrap();
+        assert_eq!(req.action, PromptAction::Select);
+        assert_eq!(req.question, "Select embedding model:");
+        assert!(req.closed);
+        assert!(!req.options.is_empty());
+        assert!(
+            rag_path.exists(),
+            "the failed rebuild removed the previous temp rag at {}",
+            rag_path.display()
+        );
+        assert!(ctx.rag.is_none());
+    }
+
+    /// `.rag` with no name and nowhere to ask is refused the way the
+    /// wizard refuses, before the previous temp rag is removed: a refused
+    /// rebuild must not cost the knowledge base it would have replaced.
+    #[test]
+    #[serial]
+    fn use_rag_without_a_name_and_without_a_tty_refuses_before_removing_the_temp_rag() {
+        let _guard = HelperConfigDirGuard::new();
+        let _script = crate::config::conflict::prompt_script::install_non_interactive();
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let mut ctx = create_test_ctx();
+        let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(&rag_path, "driver: yaml\n").unwrap();
+        let scripted = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompter = scripted.clone();
+        let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Refusing to initialize RAG knowledge base 'temp' non-interactively."),
+            "{err}"
+        );
+        assert!(
+            rag_path.exists(),
+            "the refused rebuild removed the previous temp rag at {}",
+            rag_path.display()
+        );
+        assert!(scripted.requests().is_empty());
+        assert!(ctx.rag.is_none());
+    }
+
+    /// On a terminal with no human to answer (a headless run), the
+    /// wizard's first question is refused as a typed select, and the
+    /// previous temp rag is still there, byte for byte.
+    #[test]
+    #[serial]
+    fn use_rag_without_a_name_and_without_a_human_refuses_with_a_typed_select_and_keeps_the_temp_rag()
+     {
+        use crate::prompt::{HeadlessPrompter, NeedsHuman};
+
+        let _guard = HelperConfigDirGuard::new();
+        let _script = crate::config::conflict::prompt_script::install(&[]);
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let mut ctx = create_test_ctx();
+        let rag_path = ctx.rag_file(super::super::TEMP_RAG_NAME);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(&rag_path, "driver: yaml\n").unwrap();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+        let err = run_async(ctx.use_rag(None, utils::create_abort_signal())).unwrap_err();
+        assert!(NeedsHuman::caused(&err), "{err}");
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<NeedsHuman>(),
+                Some(NeedsHuman::Prompt(PromptAction::Select))
+            )),
+            "{err}"
+        );
+        assert_eq!(
+            read_to_string(&rag_path).unwrap(),
+            "driver: yaml\n",
+            "the refused rebuild touched the previous temp rag at {}",
+            rag_path.display()
+        );
+        assert!(ctx.rag.is_none());
+    }
+
+    fn assert_no_lender_under_the_tui(err: anyhow::Error) {
+        assert!(
+            err.to_string()
+                .contains("the TUI is not lending its terminal"),
+            "{err}"
+        );
+    }
+
+    /// `.edit session` saves the session before opening it; under the
+    /// full-screen UI with nobody lending the terminal the failure comes
+    /// first, so the file is never written.
+    #[test]
+    #[serial]
+    fn edit_session_under_the_tui_without_a_lender_fails_before_saving_the_session() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let mut session = Session::default();
+        session.set_name("tui-refused-session".into());
+        let path = ctx.session_file_for(session.name(), session.scope());
+        ctx.session = Some(session);
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let app = ctx.app.config.clone();
+        assert_no_lender_under_the_tui(ctx.edit_session(&app).unwrap_err());
+        assert!(
+            !path.exists(),
+            "the failed lend saved the session to {}",
+            path.display()
+        );
+    }
+
+    /// `.edit agent-config` writes a stub config when the agent has none;
+    /// a stub left behind by a failed lend would redirect every later edit
+    /// of a graph-only agent to it.
+    #[test]
+    #[serial]
+    fn edit_agent_config_under_the_tui_without_a_lender_fails_before_writing_the_stub() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "tui-refused-agent".to_string(),
+            ..AgentConfig::default()
+        }));
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let app = ctx.app.config.clone();
+        assert_no_lender_under_the_tui(ctx.edit_agent_config(&app).unwrap_err());
+        let path = paths::agent_config_file("tui-refused-agent");
+        assert!(
+            !path.exists(),
+            "the failed lend left a stub config at {}",
+            path.display()
+        );
+    }
+
+    /// `.edit rag-docs` hands the document list to the editor through a
+    /// temp file; with nobody lending the terminal the failure comes
+    /// before that file is created. The leak check looks for the file's
+    /// own name in the shared temp dir, nothing another test wrote.
+    #[test]
+    #[serial]
+    fn edit_rag_docs_under_the_tui_without_a_lender_fails_before_writing_the_temp_file() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let name = "tui-refused-kb";
+        let temp = TempNeedleGuard::new(&format!("-rag-{name}"));
+        let rag_path = ctx.rag_file(name);
+        ensure_parent_exists(&rag_path).unwrap();
+        write(
+            &rag_path,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 512\nchunk_overlap: 64\ntop_k: 5\n",
+        )
+        .unwrap();
+        ctx.rag = Some(Arc::new(run_async(async {
+            Rag::load(&AppConfig::default(), name, &rag_path)
+                .await
+                .unwrap()
+        })));
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let err = run_async(ctx.edit_rag_docs(utils::create_abort_signal())).unwrap_err();
+        assert_no_lender_under_the_tui(err);
+        let leftovers = temp.leftovers();
+        assert!(
+            leftovers.is_empty(),
+            "the failed lend left the editor's temp file behind: {leftovers:?}"
+        );
+    }
+
+    /// `.role <new>` and `.macro new` open the editor on a file under the
+    /// roles or macros dir; with nobody lending the terminal the failure
+    /// comes before anything is written, so a failed lend leaves no
+    /// half-made role or macro behind.
+    #[test]
+    #[serial]
+    fn upsert_role_and_new_macro_without_a_lender_fails_before_creating_anything() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let prompter = Arc::new(ScriptedPrompter::new(Vec::new()));
+        ctx.prompter = prompter.clone();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+
+        assert_no_lender_under_the_tui(ctx.upsert_role(&app, "tui-refused-role").unwrap_err());
+        assert_no_lender_under_the_tui(ctx.new_role(&app, "tui-refused-role").unwrap_err());
+        assert_no_lender_under_the_tui(ctx.new_macro(&app, "tui-refused-macro").unwrap_err());
+        assert!(
+            prompter.requests().is_empty(),
+            "the refused lend still asked: {:?}",
+            prompter.requests()
+        );
+
+        for dir in [paths::roles_dir(), paths::macros_dir()] {
+            let written: Vec<PathBuf> = read_dir(&dir)
+                .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+                .unwrap_or_default();
+            assert!(
+                written.is_empty(),
+                "the failed lend wrote under {}: {written:?}",
+                dir.display()
+            );
+        }
+    }
+
+    /// `.macro new` asks `Create a new macro?` through the prompter; a
+    /// `no` leaves neither the file nor its directory behind.
+    #[test]
+    #[serial]
+    fn new_macro_declined_through_the_prompter_creates_nothing() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let macro_path = paths::macro_file("declined-macro");
+        assert!(!macro_path.parent().unwrap().exists());
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+
+        let err = ctx.new_macro(&app, "declined-macro").unwrap_err();
+
+        assert_eq!(err.to_string(), "No macro");
+        assert!(
+            !macro_path.exists() && !macro_path.parent().unwrap().exists(),
+            "the declined macro created {} or its directory",
+            macro_path.display()
+        );
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Create a new macro?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(true)));
+    }
+
+    /// `.role <new>` asks `Create a new role?` through the prompter, with
+    /// yes as the default; a `no` is `No role`, a cancel is the
+    /// prompter's cancel error, and neither leaves a role file. The yes
+    /// path opens the configured editor, a process-wide choice a unit
+    /// test cannot stub, so it is not driven here.
+    #[test]
+    #[serial]
+    fn new_role_asks_through_the_prompter() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+
+        let err = ctx.new_role(&app, "declined-role").unwrap_err();
+
+        assert_eq!(err.to_string(), "No role");
+        assert!(!paths::role_file("declined-role").exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert_eq!(requests[0].question, "Create a new role?");
+        assert_eq!(requests[0].default, Some(serde_json::json!(true)));
+
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err = ctx.new_role(&app, "cancelled-role").unwrap_err();
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+        assert!(!paths::role_file("cancelled-role").exists());
+    }
+
+    /// `.save role` on the temp role asks for a name through the prompter
+    /// and asks again after an empty or the reserved one, with the reason
+    /// in the question; the role is saved under the first usable answer,
+    /// trimmed.
+    #[test]
+    #[serial]
+    fn save_role_re_asks_until_the_name_is_usable() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "a temporary role").unwrap();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text(TEMP_ROLE_NAME.to_string()),
+            PromptAnswer::Text(" mine ".to_string()),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.save_role(None).unwrap();
+
+        assert!(paths::role_file("mine").exists());
+        assert!(!paths::role_file(TEMP_ROLE_NAME).exists());
+        assert_eq!(ctx.role.as_ref().unwrap().name(), "mine");
+        let requests = prompter.requests();
+        assert!(requests.iter().all(|req| req.action == PromptAction::Input));
+        let questions: Vec<&str> = requests.iter().map(|req| req.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            [
+                "Role name:",
+                "Role name (required):",
+                "Role name ('temp' is reserved):",
+            ]
+        );
+
+        ctx.use_temp_role(&app, "another temporary role").unwrap();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let err = ctx.save_role(None).unwrap_err();
+        assert_eq!(err.to_string(), "Operation was canceled by the user");
+    }
+
+    /// With no human to name it, saving the temp role fails instead of
+    /// writing a role under whatever the headless prompter answered.
+    #[test]
+    #[serial]
+    fn save_role_with_no_human_writes_nothing() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.use_temp_role(&app, "a temporary role").unwrap();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+
+        let err = ctx.save_role(None).unwrap_err();
+
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        let roles = paths::roles_dir();
+        let written: Vec<_> = fs::read_dir(&roles)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default();
+        assert!(written.is_empty(), "{written:?}");
+        assert_eq!(ctx.role.as_ref().unwrap().name(), TEMP_ROLE_NAME);
+    }
+
+    /// With no human to confirm, `.role <new>` and `.macro new` fail on
+    /// the headless prompter's refusal, by name, and open no editor and
+    /// write nothing, not even the macros directory.
+    #[test]
+    #[serial]
+    fn new_role_and_new_macro_with_no_human_create_nothing() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.prompter = Arc::new(HeadlessPrompter);
+
+        let err = ctx.new_role(&app, "headless-role").unwrap_err();
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        assert!(
+            err.to_string().contains("confirm prompt needs a human"),
+            "{err}"
+        );
+        assert!(!paths::role_file("headless-role").exists());
+
+        let err = ctx.new_macro(&app, "headless-macro").unwrap_err();
+        assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+        assert!(!paths::macros_dir().exists());
+    }
+
+    /// A macro step reaches the creation gate before any prompter. With
+    /// no human on the run the refusal names what would have been created
+    /// and who is missing; an interactive macro keeps its terse refusal.
+    #[test]
+    #[serial]
+    fn a_macro_step_creating_a_role_or_macro_names_the_missing_human_when_headless() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        ctx.macro_flag = true;
+        let scripted = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompter = scripted.clone();
+        {
+            let _headless = AtomicFlagGuard::set(&utils::HEADLESS, true);
+            let err = ctx.new_role(&app, "gate-role").unwrap_err();
+            assert!(err.is::<crate::prompt::NeedsHuman>(), "{err}");
+            assert_eq!(
+                err.to_string(),
+                "Creating role 'gate-role' needs a human to answer the prompt and none is \
+                 attached to this run; run it without --headless or --acp-server"
+            );
+            let err = ctx.new_macro(&app, "gate-macro").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "Creating macro 'gate-macro' needs a human to answer the prompt and none is \
+                 attached to this run; run it without --headless or --acp-server"
+            );
+            assert!(scripted.requests().is_empty(), "{:?}", scripted.requests());
+        }
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        assert_eq!(
+            ctx.new_role(&app, "gate-role").unwrap_err().to_string(),
+            "No role"
+        );
+        assert_eq!(
+            ctx.new_macro(&app, "gate-macro").unwrap_err().to_string(),
+            "No macro"
+        );
+        assert!(!paths::role_file("gate-role").exists());
+        assert!(!paths::macros_dir().exists());
     }
 
     /// A seeded child hands out the very signal `agent__cancel` sets; the
@@ -12344,6 +13258,353 @@ mod tests {
             &ctx.notification_queue,
             &branch.notification_queue
         ));
+    }
+
+    #[test]
+    fn fork_for_branch_shares_the_ui_sink() {
+        let mut ctx = create_test_ctx();
+        let sink: Arc<dyn UiSink> = Arc::new(SilentSink);
+        ctx.ui = Arc::clone(&sink);
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(&ctx.ui, &branch.ui));
+    }
+
+    #[test]
+    fn new_for_child_shares_the_parent_ui_sink() {
+        let mut parent = create_test_ctx();
+        let sink: Arc<dyn UiSink> = Arc::new(SilentSink);
+        parent.ui = Arc::clone(&sink);
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(Arc::ptr_eq(&parent.ui, &child.ui));
+    }
+
+    #[test]
+    fn fork_for_branch_shares_the_prompter() {
+        let mut ctx = create_test_ctx();
+        let prompter: Arc<dyn Prompter> = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompter = Arc::clone(&prompter);
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(&ctx.prompter, &branch.prompter));
+        assert!(Arc::ptr_eq(&ctx.prompt_memory, &branch.prompt_memory));
+    }
+
+    #[test]
+    fn new_for_child_shares_the_parent_prompter() {
+        let mut parent = create_test_ctx();
+        let prompter: Arc<dyn Prompter> = Arc::new(ScriptedPrompter::refusing());
+        parent.prompter = Arc::clone(&prompter);
+        let child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(Arc::ptr_eq(&parent.prompter, &child.prompter));
+        assert!(Arc::ptr_eq(&parent.prompt_memory, &child.prompt_memory));
+    }
+
+    #[test]
+    #[serial]
+    fn headless_run_seats_the_headless_prompter() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, true);
+        let ctx = create_test_ctx();
+        let seat = format!("{:?}", ctx.prompter);
+        assert!(seat.starts_with("HeadlessPrompter"), "{seat}");
+        let req = ctx.prompt_request(PromptAction::Confirm, "go? hl-ctx-5r", Vec::new(), None);
+        let answer = ctx.prompt(req).unwrap();
+        let PromptAnswer::Text(json) = answer else {
+            panic!("{answer:?}");
+        };
+        let reply: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(reply["needs_human"], true);
+        assert_eq!(reply["question"], "go? hl-ctx-5r");
+    }
+
+    /// The seat is inspected rather than exercised: drawing an inquire
+    /// widget here would block on `/dev/tty` wherever a controlling
+    /// terminal exists.
+    #[test]
+    #[serial]
+    fn interactive_run_seats_the_inquire_prompter_in_every_working_mode() {
+        let _headless = AtomicFlagGuard::set(&utils::HEADLESS, false);
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, false);
+        for mode in [WorkingMode::Cmd, WorkingMode::Repl] {
+            let ctx = RequestContext::new(default_app_state(), mode);
+            let seat = format!("{:?}", ctx.prompter);
+            assert!(seat.starts_with("InquirePrompter"), "{mode:?}: {seat}");
+            let inquire = ctx
+                .prompter
+                .as_any()
+                .downcast_ref::<InquirePrompter>()
+                .unwrap_or_else(|| panic!("{mode:?}: {seat}"));
+            // The prompter records "Yes for this session" into the same
+            // memory the context replays from.
+            assert!(
+                Arc::ptr_eq(&ctx.prompt_memory, inquire.memory()),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn acp_server_run_seats_the_headless_prompter() {
+        let _acp = AtomicFlagGuard::set(&utils::ACP_SERVER, true);
+        let ctx = RequestContext::new(default_app_state(), WorkingMode::Repl);
+        let seat = format!("{:?}", ctx.prompter);
+        assert!(seat.starts_with("HeadlessPrompter"), "{seat}");
+    }
+
+    #[test]
+    #[serial]
+    fn delete_role_asks_a_checkbox_and_removes_the_pick() {
+        let _guard = HelperConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("doomed-role-6w.md");
+        fs::write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = create_test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            "doomed-role-6w".to_string(),
+        ])]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("role").unwrap();
+
+        assert!(!role_path.exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Checkbox);
+        assert_eq!(requests[0].question, "Select role to delete:");
+        assert_eq!(requests[0].options, vec!["doomed-role-6w".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn delete_re_asks_after_an_empty_selection() {
+        let _guard = HelperConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("kept-role-2j.md");
+        fs::write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = create_test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Checked(vec![]),
+            PromptAnswer::Checked(vec!["kept-role-2j".to_string()]),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("role").unwrap();
+
+        assert_eq!(prompter.requests().len(), 2);
+        assert!(!role_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_refuses_a_name_it_did_not_offer() {
+        let _guard = HelperConfigDirGuard::new();
+        let roles_dir = paths::roles_dir();
+        create_dir_all(&roles_dir).unwrap();
+        let role_path = roles_dir.join("offered-role-4n.md");
+        fs::write(&role_path, "---\n---\nPrompt").unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            "../escaped-role".to_string(),
+        ])]));
+
+        let err = ctx.delete("role").unwrap_err();
+
+        assert_eq!(err.to_string(), "Unknown role '../escaped-role'");
+        assert!(role_path.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sessions_removes_only_the_picked_session() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "first-sess-8d",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        write_session_file(
+            &ctx,
+            "second-sess-8d",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let first = ctx.session_file_for("first-sess-8d", SessionScope::Workspace);
+        let second = ctx.session_file_for("second-sess-8d", SessionScope::Workspace);
+        let second_label = session_delete_label("second-sess-8d", SessionScope::Workspace);
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Checked(vec![
+            second_label.clone(),
+        ])]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("session").unwrap();
+
+        assert!(first.exists());
+        assert!(!second.exists());
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].action, PromptAction::Checkbox);
+        assert_eq!(requests[0].question, "Select session to delete:");
+        assert!(requests[0].options.contains(&second_label));
+    }
+
+    #[test]
+    #[serial]
+    fn delete_sessions_re_asks_after_an_empty_selection() {
+        let _guard = HelperConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "lone-sess-3f",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let path = ctx.session_file_for("lone-sess-3f", SessionScope::Workspace);
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Checked(vec![]),
+            PromptAnswer::Checked(vec![session_delete_label(
+                "lone-sess-3f",
+                SessionScope::Workspace,
+            )]),
+        ]));
+        ctx.prompter = prompter.clone();
+
+        ctx.delete("session").unwrap();
+
+        assert_eq!(prompter.requests().len(), 2);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn exit_session_clears_prompt_memory() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mem-9c", Vec::new(), None)
+        };
+        ctx.prompt_memory.remember(&req);
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
+
+        ctx.exit_session().unwrap();
+
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), None);
+    }
+
+    #[test]
+    fn exit_session_without_a_session_keeps_prompt_memory() {
+        let mut ctx = create_test_ctx();
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mem-2v", Vec::new(), None)
+        };
+        ctx.prompt_memory.remember(&req);
+
+        ctx.exit_session().unwrap();
+
+        assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
+    }
+
+    fn remembered_session_exit(configure: impl FnOnce(&mut RequestContext)) -> Option<bool> {
+        let mut ctx = create_test_ctx();
+        configure(&mut ctx);
+        ctx.session = Some(Session::default());
+        let req = PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "again? mem-own-5p", Vec::new(), None)
+        };
+        ctx.prompt_memory.remember(&req);
+
+        ctx.exit_session().unwrap();
+
+        ctx.prompt_memory.auto_answer(&req)
+    }
+
+    #[test]
+    fn exit_session_on_a_child_agent_keeps_the_shared_prompt_memory() {
+        assert_eq!(
+            remembered_session_exit(|ctx| ctx.self_agent_id = Some("child-9k".to_string())),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exit_session_in_an_isolated_macro_keeps_the_shared_prompt_memory() {
+        assert_eq!(
+            remembered_session_exit(|ctx| {
+                ctx.macro_flag = true;
+                ctx.macro_non_isolated = false;
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn exit_session_in_a_non_isolated_macro_clears_prompt_memory() {
+        assert_eq!(
+            remembered_session_exit(|ctx| {
+                ctx.macro_flag = true;
+                ctx.macro_non_isolated = true;
+            }),
+            None
+        );
+    }
+
+    fn remembered_request(ctx: &RequestContext) -> PromptRequest {
+        PromptRequest {
+            tool: Some("fake_tool".to_string()),
+            ..ctx.prompt_request(PromptAction::Confirm, "run it? ysf-3m1", Vec::new(), None)
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn yes_for_session_answers_without_the_prompter_until_the_session_exits() {
+        let sink = crate::events::RecordingSink::install();
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        ctx.prompter = Arc::new(ScriptedPrompter::refusing());
+        ctx.prompt_memory.remember(&remembered_request(&ctx));
+
+        let answer = ctx.prompt(remembered_request(&ctx)).unwrap();
+        assert_eq!(answer, PromptAnswer::Confirmed(true));
+        let (requested, answered) = prompt_events(sink.drain(), "run it? ysf-3m1");
+        let [Event::PromptRequested { id, tool, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(tool.as_deref(), Some("fake_tool"));
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: "yes".to_string(),
+                auto: true,
+            }]
+        );
+
+        ctx.exit_session().unwrap();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+        let answer = ctx.prompt(remembered_request(&ctx)).unwrap();
+        assert_eq!(answer, PromptAnswer::Confirmed(false));
+        assert_eq!(prompter.requests().len(), 1);
     }
 
     #[test]
@@ -14116,6 +15377,77 @@ mod tests {
         assert_eq!(ctx.session.as_ref().unwrap().name(), TEMP_SESSION_NAME);
     }
 
+    /// After a recorded exchange the question whether to carry it into the
+    /// new session goes through the context's prompter, so under the TUI
+    /// it is a modal rather than a refusal; "no" still seats the session.
+    #[test]
+    #[serial]
+    fn use_session_after_an_exchange_asks_through_the_prompter_under_the_tui() {
+        let _guard = HelperConfigDirGuard::new();
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(false)]));
+        ctx.prompter = prompter.clone();
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+
+        let session = ctx.session.as_ref().expect("the temp session was seated");
+        assert_eq!(session.name(), TEMP_SESSION_NAME);
+        assert!(session.is_empty(), "a declined exchange was incorporated");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].action, PromptAction::Confirm);
+        assert!(
+            requests[0]
+                .question
+                .contains("incorporates the last question"),
+            "{requests:?}"
+        );
+        assert_eq!(requests[0].default, Some(serde_json::json!(false)));
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_after_an_exchange_incorporates_it_when_confirmed() {
+        let _guard = HelperConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Confirmed(true)]));
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+
+        let session = ctx.session.as_ref().expect("the temp session was seated");
+        assert!(!session.is_empty(), "the confirmed exchange was dropped");
+    }
+
+    /// Esc on the incorporate question is neither yes nor no: the command
+    /// fails and no session is opened.
+    #[test]
+    #[serial]
+    fn use_session_after_an_exchange_opens_nothing_when_the_question_is_cancelled() {
+        let _guard = HelperConfigDirGuard::new();
+        let sessions_dir = paths::local_dir("sessions");
+        create_dir_all(&sessions_dir).unwrap();
+
+        let mut ctx = create_test_ctx();
+        ctx.prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Cancelled]));
+        let input = Input::from_str(&ctx, "what happened?", None).unwrap();
+        ctx.last_message = Some(LastMessage::new(input, "reply".to_string()));
+        let app = ctx.app.config.clone();
+        let err = run_async(ctx.use_session(&app, None, utils::create_abort_signal()))
+            .expect_err("a cancelled question opened a session");
+        assert!(ctx.session.is_none(), "a session was seated: {err:#}");
+    }
+
     #[test]
     #[serial]
     fn use_session_creates_named_session() {
@@ -14295,6 +15627,48 @@ mod tests {
 
         assert!(read_to_string(&path).unwrap().contains("reply"));
         assert!(!ctx.session.as_ref().unwrap().dirty());
+    }
+
+    fn flushed_sessions(recording: &crate::events::RecordingSink) -> Vec<String> {
+        recording
+            .drain()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ChildTranscriptFlushed { session_id } if session_id == "flush-probe-x7x" => {
+                    Some(session_id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The flush names the child's session, so the UI can read it again.
+    #[test]
+    #[serial]
+    fn checkpoint_publishes_child_transcript_flushed_for_a_child_context() {
+        let _config = HelperConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("flush-probe-x7x");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.self_agent_id = Some("agent-flush-x7x".into());
+        let recording = crate::events::RecordingSink::install();
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert_eq!(flushed_sessions(&recording), vec!["flush-probe-x7x"]);
+    }
+
+    #[test]
+    #[serial]
+    fn checkpoint_does_not_publish_child_transcript_flushed_for_the_root() {
+        let _config = HelperConfigDirGuard::new();
+        let (mut ctx, _path) = loaded_session_ctx("flush-probe-x7x");
+        ctx.session.as_mut().unwrap().set_save_session(Some(true));
+        ctx.self_agent_id = None;
+        let recording = crate::events::RecordingSink::install();
+
+        complete_turn(&mut ctx, "hello", "reply");
+
+        assert!(flushed_sessions(&recording).is_empty());
     }
 
     fn graph_run(prompt: &str, output: &str) -> LastRun {
@@ -14684,6 +16058,54 @@ mod tests {
         let mut sessionless_fork = create_test_ctx().fork_for_branch();
         let root = sessionless_fork.ensure_child_session_root().unwrap();
         assert_eq!(*root, ChildSessionRoot::from_stamp(ProcessStamp::current()));
+    }
+
+    fn resolutions_of(
+        recording: &crate::events::RecordingSink,
+        root: &Arc<ChildSessionRoot>,
+    ) -> usize {
+        recording
+            .drain()
+            .into_iter()
+            .filter(|event| {
+                matches!(event, Event::ChildSessionRootResolved { root: sent } if Arc::ptr_eq(sent, root))
+            })
+            .count()
+    }
+
+    #[test]
+    #[serial]
+    fn a_root_context_announces_its_child_session_root_once() {
+        let _config = HelperConfigDirGuard::new();
+        let mut ctx = clean_loaded_session_ctx("child-root-announce");
+        let recording = crate::events::RecordingSink::install();
+
+        let root = ctx.ensure_child_session_root().unwrap();
+        ctx.ensure_child_session_root();
+        ctx.ensure_child_session_root();
+
+        assert_eq!(resolutions_of(&recording, &root), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_context_never_announces_a_child_session_root() {
+        let _config = HelperConfigDirGuard::new();
+        let mut parent = clean_loaded_session_ctx("child-root-quiet");
+        let root = parent.ensure_child_session_root().unwrap();
+        let mut child = RequestContext::new_for_child(
+            Arc::clone(&parent.app),
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_child_quiet".to_string(),
+        );
+        let recording = crate::events::RecordingSink::install();
+
+        let shared = child.ensure_child_session_root().unwrap();
+
+        assert!(Arc::ptr_eq(&root, &shared));
+        assert_eq!(resolutions_of(&recording, &root), 0);
     }
 
     /// The workspace memory pin is process-global, so this passes whether
@@ -17291,8 +18713,8 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("both".to_string(), Some("workspace".to_string())),
-                ("only-global".to_string(), Some("global".to_string())),
+                ("both".to_string(), Some("workspace".to_string()), None),
+                ("only-global".to_string(), Some("global".to_string()), None),
             ]
         );
     }
@@ -17305,7 +18727,7 @@ mod tests {
             let mut names: Vec<String> = ctx
                 .repl_complete(".save", args, "")
                 .into_iter()
-                .map(|(name, _)| name)
+                .map(|(name, _, _)| name)
                 .collect();
             names.sort_unstable();
             names
@@ -17316,7 +18738,7 @@ mod tests {
         assert!(names(&["session", "--workspace", ""]).is_empty());
         assert!(names(&["session", "notes", "--global", ""]).is_empty());
 
-        for (name, description) in ctx.repl_complete(".save", &["session", ""], "") {
+        for (name, description, _) in ctx.repl_complete(".save", &["session", ""], "") {
             assert!(
                 description.as_deref().is_some_and(|d| !d.is_empty()),
                 "{name} has no description"
@@ -17560,8 +18982,16 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("both".to_string(), Some("workspace".to_string())),
-                ("only-global".to_string(), Some("global".to_string())),
+                (
+                    "both".to_string(),
+                    Some("workspace".to_string()),
+                    Some("session")
+                ),
+                (
+                    "only-global".to_string(),
+                    Some("global".to_string()),
+                    Some("session")
+                ),
             ]
         );
     }
@@ -17613,7 +19043,14 @@ mod tests {
         assert_eq!(ctx.labeled_autoname_sessions(), expected);
 
         // The fuzzy filter re-sorts by score, so only membership is checked here.
-        let mut completed = ctx.repl_complete(".session", &["_/"], "");
+        let mut completed: Vec<(String, Option<String>)> = ctx
+            .repl_complete(".session", &["_/"], "")
+            .into_iter()
+            .map(|(name, label, kind)| {
+                assert_eq!(kind, None, "{name}");
+                (name, label)
+            })
+            .collect();
         completed.sort_unstable();
         let mut expected_sorted = expected;
         expected_sorted.sort_unstable();
@@ -17782,7 +19219,7 @@ mod tests {
         assert_eq!(info.rows().len(), 13);
     }
 
-    // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
+    // --- usage coverage for the workspace-sessions surface ---
 
     #[test]
     #[serial]
@@ -17959,7 +19396,7 @@ mod tests {
         );
         assert_eq!(
             ctx.repl_complete(".session", &[""], ""),
-            vec![("solo".to_string(), Some("global".to_string()))]
+            vec![("solo".to_string(), Some("global".to_string()), None)]
         );
 
         // Load existing, save, exit: all global, no workspace dir materialises.
@@ -18064,7 +19501,7 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
     }
 
-    // Usage probe (spec-first, criteria 3+4): the reserved `temp` name can
+    // The reserved `temp` name can
     // never land in Workspace scope — not via the bare flag, and not by
     // spelling the name out either. The rejection is a no-op: no workspace
     // `temp.yaml`, and the live session keeps its Global scope/path so a
@@ -18231,7 +19668,7 @@ mod tests {
         let values = ctx.repl_complete(".session", &[""], "");
         assert_eq!(
             values,
-            vec![("evilred".to_string(), Some("workspace".to_string()))]
+            vec![("evilred".to_string(), Some("workspace".to_string()), None)]
         );
     }
 
@@ -22454,13 +23891,6 @@ mod tests {
         );
     }
 
-    fn scoped_session_rows(values: &[(String, Option<String>)]) -> Vec<&(String, Option<String>)> {
-        values
-            .iter()
-            .filter(|(_, label)| matches!(label.as_deref(), Some("workspace") | Some("global")))
-            .collect()
-    }
-
     #[test]
     #[serial]
     fn repl_complete_agent_sessions_lists_both_scopes_for_a_block_graph_agent() {
@@ -22482,8 +23912,16 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("global".to_string(), Some("global".to_string())),
-                ("ws".to_string(), Some("workspace".to_string())),
+                (
+                    "global".to_string(),
+                    Some("global".to_string()),
+                    Some("session")
+                ),
+                (
+                    "ws".to_string(),
+                    Some("workspace".to_string()),
+                    Some("session")
+                ),
             ]
         );
     }
@@ -22508,11 +23946,88 @@ mod tests {
 
         let values = ctx.repl_complete(".agent", &[&agent_name, ""], "");
 
-        assert!(scoped_session_rows(&values).is_empty(), "{values:?}");
         assert!(
-            values.contains(&("topic=".to_string(), Some("What to cover".to_string()))),
+            values.iter().all(|(_, _, kind)| *kind != Some("session")),
             "{values:?}"
         );
+        assert!(
+            values.contains(&(
+                "topic=".to_string(),
+                Some("What to cover".to_string()),
+                Some("variable")
+            )),
+            "{values:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_rows_carry_their_kind() {
+        let _guard = HelperConfigDirGuard::new();
+        let agent_name = unique_name("test_kinds_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            &format!(
+                "{GRAPH_SESSION_BLOCK}variables:\n  - name: topic\n    description: What to cover\n"
+            ),
+        );
+        let ctx = create_test_ctx();
+        let dir = paths::agent_sessions_dir(&agent_name);
+        create_dir_all(&dir).unwrap();
+        write(dir.join("s.yaml"), "model: x\n").unwrap();
+
+        let agents = ctx.repl_complete(".agent", &[""], "");
+        assert!(
+            agents.iter().any(|(name, _, _)| *name == agent_name),
+            "{agents:?}"
+        );
+        assert!(
+            agents.iter().all(|(_, _, kind)| kind.is_none()),
+            "{agents:?}"
+        );
+
+        let values = ctx.repl_complete(".agent", &[&agent_name, ""], "");
+        assert_eq!(
+            values,
+            vec![
+                ("s".to_string(), Some("global".to_string()), Some("session")),
+                (
+                    "topic=".to_string(),
+                    Some("What to cover".to_string()),
+                    Some("variable")
+                ),
+            ]
+        );
+
+        let narrowed = ctx.repl_complete(".agent", &[&agent_name, "top"], "");
+        assert_eq!(
+            narrowed,
+            vec![(
+                "topic=".to_string(),
+                Some("What to cover".to_string()),
+                Some("variable")
+            )]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_single_kind_first_arguments_carry_no_kind() {
+        let _guard = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "plain", SessionScope::Global, "messages: []\n");
+
+        let roles = ctx.repl_complete(".role", &[""], "");
+        let sessions = ctx.repl_complete(".session", &[""], "");
+        assert!(!roles.is_empty());
+        assert!(!sessions.is_empty());
+        for cmd in [".role", ".model", ".session"] {
+            let values = ctx.repl_complete(cmd, &[""], "");
+            assert!(
+                values.iter().all(|(_, _, kind)| kind.is_none()),
+                "{cmd}: {values:?}"
+            );
+        }
     }
 
     #[test]
@@ -22558,8 +24073,8 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("global".to_string(), Some("global".to_string())),
-                ("ws".to_string(), Some("workspace".to_string())),
+                ("global".to_string(), Some("global".to_string()), None),
+                ("ws".to_string(), Some("workspace".to_string()), None),
             ]
         );
     }
@@ -22842,19 +24357,19 @@ mod tests {
     fn install_builtin_agents_force_overwrites_only_with_force() {
         let _guard = HelperConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         let file =
             first_file(&paths::agents_data_dir()).expect("bundled agents should be installed");
 
         write(&file, "SENTINEL").unwrap();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         assert_eq!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
             "non-force install must not overwrite an existing file"
         );
 
-        Agent::install_builtin_agents(InstallMode::Force).unwrap();
+        Agent::install_builtin_agents(InstallMode::Force, &ScriptedPrompter::refusing()).unwrap();
         assert_ne!(
             read_to_string(&file).unwrap(),
             "SENTINEL",
@@ -22867,7 +24382,7 @@ mod tests {
     fn install_builtin_agents_removes_stale_definition_files() {
         let _guard = HelperConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install: coder used to ship
@@ -22888,7 +24403,7 @@ mod tests {
         create_dir_all(agents_dir.join("myagent")).unwrap();
         write(agents_dir.join("myagent").join("config.yaml"), "keep").unwrap();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(
             !agents_dir.join("coder").join("config.yaml").exists(),
@@ -22928,12 +24443,12 @@ mod tests {
     fn install_builtin_agents_removes_stale_graph_for_config_agent() {
         let _guard = HelperConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         write(agents_dir.join("architect").join("graph.yaml"), "stale").unwrap();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(
             !agents_dir.join("architect").join("graph.yaml").exists(),
@@ -22949,7 +24464,7 @@ mod tests {
 
         let _guard = HelperConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let agents_dir = paths::agents_data_dir();
         // Simulate an upgrade from an older install whose coder shipped a
@@ -22974,7 +24489,7 @@ mod tests {
         create_dir_all(&user_hooks).unwrap();
         write(user_hooks.join("mine.sh"), "keep").unwrap();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         assert!(
             !hooks_dir.join("old-hook.sh").exists(),
@@ -23044,7 +24559,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_task_queue_guidance() {
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         // 1. Architect instructions: the parallel-mode "Task-queue mirroring"
         //    section with all five HARD RULES. (The prose lives in
@@ -23111,7 +24626,7 @@ mod tests {
     #[serial]
     fn bundled_assets_teach_agent_wait() {
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         for (path, base_rule) in [
@@ -23166,7 +24681,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_review_incomplete_escalation() {
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         // Every anchor is a single-line prefix so re-wrapping cannot break
         // the pin; clauses that wrap differently per agent are split at the
@@ -23343,7 +24858,7 @@ mod tests {
     #[serial]
     fn bundled_assets_pin_verification_commands_as_declared_variable() {
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         const VARIABLES_FORM: &str =
             "--variables {\"verification_commands\": \"[\\\"cargo test --all\\\"";
@@ -23537,7 +25052,7 @@ mod tests {
         }
 
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         for (name, expected) in [
             ("architect", 10),
@@ -23656,7 +25171,7 @@ mod tests {
 
         let _guard = HelperConfigDirGuard::new();
 
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let mut checked = Vec::new();
@@ -23814,7 +25329,7 @@ mod tests {
 
         let _guard = HelperConfigDirGuard::new();
         Functions::install_builtin_global_tools(false).unwrap();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let declared_names = |path: &Path| -> Vec<String> {
@@ -23960,7 +25475,7 @@ mod tests {
 
         let _guard = HelperConfigDirGuard::new();
         Functions::install_builtin_global_tools(false).unwrap();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
         Skill::install_builtin_skills(false).unwrap();
 
         let mut ctx = create_test_ctx();
@@ -24148,7 +25663,7 @@ mod tests {
             .collect();
 
         let _guard = HelperConfigDirGuard::new();
-        Agent::install_builtin_agents(InstallMode::Skip).unwrap();
+        Agent::install_builtin_agents(InstallMode::Skip, &ScriptedPrompter::refusing()).unwrap();
 
         let mut checked = Vec::new();
         for entry in std::fs::read_dir(paths::agents_data_dir()).unwrap() {
@@ -25128,7 +26643,7 @@ mod tests {
     /// Every gauntlet lane that runs a graph-backed agent must outlive that
     /// graph's own timeout so the child's own graph timeout, not the lane
     /// timeout, is the binding bound; the child's internal retry envelope is
-    /// deliberately not derived here (follow-up). And because agent-node
+    /// not part of this bound. And because agent-node
     /// retries each get a fresh per-attempt budget (src/graph/agent.rs
     /// retry_transient/bounded_attempt), the gauntlet itself must outlive
     /// `max_attempts × timeout` for every lane, with headroom for the
@@ -33616,11 +35131,11 @@ mod tests {
         let values = ctx.repl_complete(".info", &["mcp-server", ""], "");
 
         assert!(
-            values.iter().any(|(name, _)| name == "fixture"),
+            values.iter().any(|(name, _, _)| name == "fixture"),
             "running server must be offered, got: {values:?}"
         );
         assert!(
-            !values.iter().any(|(name, _)| name == "gh"),
+            !values.iter().any(|(name, _, _)| name == "gh"),
             "configured-but-not-running server must not be offered, got: {values:?}"
         );
     }
