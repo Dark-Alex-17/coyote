@@ -1151,15 +1151,16 @@ impl RequestContext {
     }
 
     /// The supervisor, made for jobs alone when no engaged agent needed one.
-    pub fn ensure_root_supervisor(&mut self) -> Arc<RwLock<Supervisor>> {
+    pub fn ensure_supervisor(&mut self) -> Arc<RwLock<Supervisor>> {
+        if let Some(supervisor) = &self.supervisor {
+            return Arc::clone(supervisor);
+        }
         let max_jobs = effective_max_concurrent_jobs(self.agent.as_ref(), &self.app.config);
-        self.supervisor
-            .get_or_insert_with(|| {
-                Arc::new(RwLock::new(
-                    Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
-                ))
-            })
-            .clone()
+        let supervisor = Arc::new(RwLock::new(
+            Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
+        ));
+        self.supervisor = Some(Arc::clone(&supervisor));
+        supervisor
     }
 
     pub fn ensure_inbox(&mut self) -> Arc<Inbox> {

@@ -532,7 +532,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         }));
     }
 
-    let supervisor = ctx.ensure_root_supervisor();
+    let supervisor = ctx.ensure_supervisor();
 
     {
         let sup = supervisor.read();

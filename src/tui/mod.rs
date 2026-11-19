@@ -1456,7 +1456,7 @@ impl App {
         // The same goes for a supervisor `job__start` would otherwise make
         // mid-turn, out of the footer's and the roster's sight.
         if jobs_enabled(ctx.agent.as_ref(), &ctx.app.config) {
-            ctx.ensure_root_supervisor();
+            ctx.ensure_supervisor();
         }
         self.roster_sources = RosterSources {
             supervisor: ctx.supervisor.clone(),
@@ -3342,10 +3342,16 @@ impl App {
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
     /// that was just drawn, and so does an open roster for its next read
-    /// unless the pager covers it.
+    /// unless the pager covers it. The footer counts tick too while any
+    /// task runs: an agent reports finished before its join handle does,
+    /// and nested spawns send no message. Nothing can spawn while the
+    /// counts are zero and no turn runs, so idle stops there.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
-        if self.turn.is_some() || (self.pager.is_none() && matches!(self.view, View::Roster(_))) {
+        if self.turn.is_some()
+            || (self.pager.is_none() && matches!(self.view, View::Roster(_)))
+            || self.roster_sources.running_counts() != (0, 0)
+        {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }
@@ -11709,11 +11715,75 @@ mod tests {
             let mut harness = Harness::for_ctx(&ctx);
             harness.app.sync_from_ctx(&mut ctx);
 
-            let tasks = ctx.ensure_root_supervisor();
+            let tasks = ctx.ensure_supervisor();
             let held = harness.app.roster_sources.supervisor.as_ref();
             assert!(Arc::ptr_eq(held.expect("made on the return"), &tasks));
             tasks.write().register(running_job("job-l1c")).unwrap();
             assert_eq!(footer_counts(&mut harness), "agents 0 . jobs 1");
+        });
+    }
+
+    /// An idle chat keeps ticking while a task runs, so the footer sees
+    /// it end, and stops once nothing runs.
+    #[test]
+    fn an_idle_chat_ticks_only_while_the_footer_counts_a_task() {
+        run_async(async {
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            assert!(harness.app.turn.is_none() && matches!(harness.app.view, View::Composer));
+
+            harness.render();
+            harness.app.frame_drawn();
+            assert_eq!(harness.app.frames.due_at(), None);
+
+            tasks.write().register(running_agent("agent-t1d")).unwrap();
+            harness.render();
+            harness.app.frame_drawn();
+            assert!(harness.app.frames.due_at().is_some());
+        });
+    }
+
+    /// An agent reports finished before its join handle does; the footer
+    /// counts it until the handle finishes and drops it after.
+    #[test]
+    fn the_footer_drops_an_agent_once_its_join_handle_finishes() {
+        use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
+        run_async(async {
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+
+            let (finish, finished) = tokio::sync::oneshot::channel::<()>();
+            let done = finished_agent("agent-j1e");
+            let result = AgentResult {
+                id: done.id.clone(),
+                agent_name: done.agent_name.clone(),
+                output: String::new(),
+                exit_status: AgentExitStatus::Completed,
+                session_id: None,
+            };
+            tasks
+                .write()
+                .register(AgentHandle {
+                    join_handle: tokio::spawn(async move {
+                        let _ = finished.await;
+                        Ok(result)
+                    }),
+                    ..done
+                })
+                .unwrap();
+            assert_eq!(footer_counts(&mut harness), "agents 1 . jobs 0");
+
+            finish.send(()).unwrap();
+            while harness.app.roster_sources.running_counts() != (0, 0) {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(footer_counts(&mut harness), "agents 0 . jobs 0");
         });
     }
 

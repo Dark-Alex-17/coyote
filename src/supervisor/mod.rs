@@ -809,6 +809,32 @@ mod tests {
     }
 
     #[test]
+    fn running_counts_skip_finished_tasks_and_add_each_child_supervisor() {
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let running_agent = |id: &str| AgentHandle {
+            join_handle: rt.spawn(std::future::pending()),
+            ..make_handle(id, "explore", 1)
+        };
+        let mut sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+        sup.register(make_handle("a_finished", "explore", 1))
+            .unwrap();
+        let completed = make_job("j_completed", create_abort_signal());
+        completed.state.lock().status = JobStatus::Completed;
+        sup.register(completed).unwrap();
+
+        let mut child_sup = Supervisor::new(4, 3).with_max_concurrent_jobs(4);
+        child_sup.register(running_agent("a_grandchild")).unwrap();
+        child_sup
+            .register(make_job("j_grandchild", create_abort_signal()))
+            .unwrap();
+        let mut child = running_agent("a_child");
+        child.child_supervisor = Some(Arc::new(RwLock::new(child_sup)));
+        sup.register(child).unwrap();
+
+        assert_eq!(sup.running_counts(), (2, 1));
+    }
+
+    #[test]
     fn supervisor_task_queue_accessible() {
         let mut sup = Supervisor::new(4, 3);
         let id = sup
