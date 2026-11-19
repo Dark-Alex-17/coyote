@@ -4,14 +4,16 @@ The interop half of the mesh conformance suite (`src/mesh/conformance/interop.rs
 test spawns the pinned Python Reticulum/LXMF reference as a subprocess, joins this crate's
 node to it as a TCP client (the production `rnsd` relay topology) and proves the two agree
 on the wire: announce filing, request replies, message delivery and store-and-forward
-through a real LXMF propagation node. Four cases spawn the pinned `rnsd` itself instead.
+through a real LXMF propagation node. Five cases spawn the pinned `rnsd` itself instead.
 Three attach this crate's nodes to it as `local` shared-instance clients: a knock lands
 through it and both rows follow it down when it is killed and back when it is restarted;
 two sessions of one user started together are both heard by a third user at once; and a
 link to the first of two sessions of one user still reaches it after the second attached.
 The fourth runs it as a transport relay with a TCP server interface that two sessions of
 one user and a third user dial with a `private` entry, and a link to either session
-reaches that session. The
+reaches that session. The fifth runs it with an AutoInterface on a discovery group of its
+own: a node attached to it reads 0 LAN hosts over rnsd's RPC listener, and a wrong
+`rpc_key` leaves the count unknown, told once at debug, rather than warning. The
 vectors half, which needs nothing but Rust, lives next to it in the `*_vectors.rs` modules
 of that directory (and, for the REPL's attachment rules, in
 `src/repl/mesh_share_vectors.rs`).
@@ -25,7 +27,7 @@ of that directory (and, for the REPL's attachment rules, in
 
 ### Verification record
 
-Last verified 2026-11-16, on macOS (the netns rows do not exist on this host; they and the
+Last verified 2026-11-19, on macOS (the netns rows do not exist on this host; they and the
 Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side at
 [`coyote-rns-transport`](https://github.com/Dark-Alex-17/coyote-rns-transport) `0.18.3`
 (Coyote's fork of `reticulum-rs-transport`), `lxmf-wire` `0.14.0` and `reticulum-rs-core`
@@ -33,9 +35,9 @@ Linux run of row 1 are covered by the `Mesh Interop` CI job), with the Rust side
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 80 passed, 0 ignored |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop) | 81 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 21 passed |
-| `cargo test --all --no-fail-fast` | 9100 passed, 0 failed, 20 ignored in the unit binary; 693 passed, 1 failed, 1 ignored across the integration binaries (the failure is the `docker_entrypoint_script` signal test, which passes when run alone) |
+| `cargo test --all --no-fail-fast` | 9217 passed, 0 failed, 21 ignored in the unit binary; 709 passed, 3 failed, 1 ignored across the integration binaries (the failures are the `docker_entrypoint_script` signal test, which passes when run alone, and two `mesh_autostart_repl` tests, which pass with that binary run alone at `--test-threads=4`, 54 passed) |
 
 Rows 2 and 3 also run on all three legs of the CI matrix, and row 1 runs only in the Linux
 `Mesh Interop` job; none of those runs is part of this record.
