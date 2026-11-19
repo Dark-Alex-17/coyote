@@ -3347,8 +3347,9 @@ impl App {
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
         if self.turn.is_some()
-            || (self.pager.is_none() && matches!(self.view, View::Roster(_)))
-            || self.roster_sources.running_counts() != (0, 0)
+            || (self.pager.is_none()
+                && (matches!(self.view, View::Roster(_))
+                    || self.roster_sources.running_counts() != (0, 0)))
         {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
@@ -11773,6 +11774,11 @@ mod tests {
             harness.render();
             harness.app.frame_drawn();
             assert!(harness.app.frames.due_at().is_some());
+
+            harness.app.pager = Some(Pager::root());
+            harness.render();
+            harness.app.frame_drawn();
+            assert_eq!(harness.app.frames.due_at(), None, "the pager has no footer");
         });
     }
 
