@@ -1,5 +1,8 @@
 use super::*;
-use crate::tui::control::{cancel_context, catch_cancel, catch_child_load, settle_control_tasks};
+use crate::tui::control::{
+    cancel_context, catch_cancel, catch_child_load, settle_control_tasks, spawn_exit,
+};
+use crate::tui::run_loop::{EXIT_TEARDOWN_WAIT, Join, join_unattended};
 
 /// The exit waits for control tasks only up to its bound: one that
 /// finishes in time is joined, one that never does is aborted, and

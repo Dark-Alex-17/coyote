@@ -1167,9 +1167,12 @@ fn environment_page_documents_the_ui_and_reply_variables() {
 fn tui_page_quotes_the_code() {
     let tui_source = src(&["tui", "mod.rs"]);
     let tui = production(&tui_source);
+    let run_loop_source = src(&["tui", "run_loop.rs"]);
+    let run_loop = production(&run_loop_source);
+    let rewind_source = src(&["tui", "rewind.rs"]);
     let main_source = src(&["main.rs"]);
     let main = production(&main_source);
-    let no_tty = string_literals(&fn_body(tui, "pub fn ensure_tty("));
+    let no_tty = string_literals(&fn_body(run_loop, "pub fn ensure_tty("));
     assert_eq!(no_tty, ["No TTY for TUI"]);
     let flags = [clap_long("tui"), clap_long("repl")];
     let interactive =
@@ -1203,7 +1206,7 @@ fn tui_page_quotes_the_code() {
     assert_eq!(footer, ["agents <n>", "jobs <n>", "no session"]);
     let bottom = src(&["tui", "bottom_pane.rs"]);
     let search = const_str(&bottom, "SEARCH_LABEL");
-    let rewind = literal_with(tui, "Rewind stops at the last ");
+    let rewind = literal_with(&rewind_source, "Rewind stops at the last ");
     let barriers = string_literals(&fn_body(&cells, "pub(crate) fn kind_name("));
     assert_eq!(barriers.len(), 2);
     let roster_empty = const_str(&src(&["tui", "roster.rs"]), "EMPTY");
@@ -1213,13 +1216,13 @@ fn tui_page_quotes_the_code() {
     let welcome_keys = literal_with(production(&cells), "Empty prompt: ")
         .replace("{}{}", &format!(".{keys_command}"));
     let normal = const_str(&src(&["tui", "composer.rs"]), "NORMAL_TAG");
-    for gap in ["HOTKEY_IDLE", "REWIND_ESC_GAP"] {
-        assert_eq!(const_expr(tui, gap), "Duration::from_secs(1)", "{gap}");
+    for (source, gap) in [(tui, "HOTKEY_IDLE"), (&rewind_source, "REWIND_ESC_GAP")] {
+        assert_eq!(const_expr(source, gap), "Duration::from_secs(1)", "{gap}");
     }
     assert_eq!(const_expr(tui, "FULL_OUTPUT_LIMIT"), "4 * 1024 * 1024");
     assert_eq!(const_expr(tui, "FULL_OUTPUT_BUDGET"), "32 * 1024 * 1024");
-    assert!(tui.contains("if app.config.tui_dump_on_exit {"));
-    let suspend = tui
+    assert!(run_loop.contains("if app.config.tui_dump_on_exit {"));
+    let suspend = run_loop
         .lines()
         .skip_while(|line| line.trim() != "Some(Command::Suspend) => {")
         .nth(1)
@@ -1313,8 +1316,8 @@ fn the_word_cut_keys_on_the_page_match_the_key_help() {
 
 #[test]
 fn tool_prompts_are_documented_with_their_label() {
-    let tui_source = src(&["tui", "mod.rs"]);
-    let asks = literal_with(production(&tui_source), " asks:").replace("{}", "<tool>");
+    let modal_source = src(&["tui", "modal.rs"]);
+    let asks = literal_with(production(&modal_source), " asks:").replace("{}", "<tool>");
     assert_eq!(asks, "<tool> asks:");
     let prompt_source = src(&["prompt", "mod.rs"]);
     assert!(

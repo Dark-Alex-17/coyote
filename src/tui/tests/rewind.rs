@@ -1,6 +1,6 @@
 use super::*;
 use crate::tui::cells::RewindBarrier;
-use crate::tui::rewind::{REWIND_ESC_GAP, rewind_barrier, rewind_exchanges};
+use crate::tui::rewind::{REWIND_ESC_GAP, apply_rewind, rewind_barrier, rewind_exchanges};
 
 #[test]
 fn a_successful_undo_takes_the_last_exchange_out_of_the_transcript() {

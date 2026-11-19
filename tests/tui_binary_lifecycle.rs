@@ -198,7 +198,7 @@ fn a_panic_inside_the_exit_work_prints_its_message_on_the_restored_terminal() {
     );
     // The captured panic line is printed once; the task error the exit
     // returns names the payload again on its own line, as any error would.
-    let panic_line = b"panicked at src/tui/mod.rs";
+    let panic_line = b"panicked at src/tui/control.rs";
     assert_eq!(
         count(&raw[left..], panic_line),
         1,
