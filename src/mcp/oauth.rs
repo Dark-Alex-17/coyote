@@ -236,11 +236,14 @@ fn ask_client_id(prompter: &dyn Prompter, server_name: &str) -> Result<String> {
             ".",
         ));
     }
-    let req = PromptRequest::new(
-        PromptAction::Input,
-        "Enter the OAuth client ID for this MCP server:",
-        Origin::detached(),
-    );
+    let req = PromptRequest {
+        sensitive: true,
+        ..PromptRequest::new(
+            PromptAction::Input,
+            "Enter the OAuth client ID for this MCP server:",
+            Origin::detached(),
+        )
+    };
     ask(prompter, req)
         .and_then(PromptAnswer::into_text)
         .context("Failed to read client ID")
@@ -717,7 +720,8 @@ mod tests {
     use super::test_support::with_temp_cache;
     use super::*;
     use crate::config::conflict::prompt_script;
-    use crate::prompt::ScriptedPrompter;
+    use crate::events::{Event, RecordingSink};
+    use crate::prompt::{ScriptedPrompter, prompt_events};
     use crate::testing::AtomicFlagGuard;
     use crate::utils::HEADLESS;
     use serial_test::serial;
@@ -746,6 +750,30 @@ mod tests {
             requests[0].question,
             "Enter the OAuth client ID for this MCP server:"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn ask_client_id_never_publishes_the_client_id() {
+        let _tty = prompt_script::install(&[]);
+        let sink = RecordingSink::install();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("cid-6w3z".to_string())]);
+
+        let client_id = ask_client_id(&prompter, "srv-6w3z").unwrap();
+
+        assert_eq!(client_id, "cid-6w3z");
+        let events = sink.drain();
+        let (requested, answered) = prompt_events(
+            events.clone(),
+            "Enter the OAuth client ID for this MCP server:",
+        );
+        assert_eq!(requested.len(), 1, "{requested:?}");
+        assert!(
+            matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
+            "{answered:?}"
+        );
+        let published = format!("{events:?}");
+        assert!(!published.contains("cid-6w3z"), "{published}");
     }
 
     #[test]

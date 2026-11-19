@@ -20,6 +20,7 @@ const YES_FOR_SESSION: &str = "Yes for this session";
 const TOOL_CONFIRM_ROWS: [&str; 3] = ["Yes", "No", YES_FOR_SESSION];
 /// The published answer of a prompt a run with no human refused.
 pub(crate) const NEEDS_HUMAN_MARKER: &str = "<needs_human>";
+const REDACTED_MARKER: &str = "<redacted>";
 
 /// Whether a human can answer a prompt in this run. A headless run and the
 /// ACP server have none; every other run has a terminal.
@@ -76,6 +77,10 @@ pub struct PromptRequest {
     /// A select whose answer must be one of `options`: no "Other
     /// (custom)" row is offered. Not published either.
     pub closed: bool,
+    /// An answer that must not be published, though it is not masked
+    /// while typed. Its default is withheld from the published request
+    /// too.
+    pub sensitive: bool,
 }
 
 impl PromptRequest {
@@ -93,6 +98,7 @@ impl PromptRequest {
             origin,
             help: None,
             closed: false,
+            sensitive: false,
         }
     }
 
@@ -102,11 +108,29 @@ impl PromptRequest {
             action: self.action,
             question: self.question.clone(),
             options: self.options.clone(),
-            default: self.default.clone(),
+            default: if self.sensitive {
+                None
+            } else {
+                self.default.clone()
+            },
             tool: self.tool.clone(),
             call_id: self.call_id.clone(),
             job_id: self.job_id.clone(),
             origin: self.origin.clone(),
+        }
+    }
+
+    /// The event that closes this request, published wherever it is
+    /// answered so a sensitive answer is redacted at every site.
+    pub(crate) fn answered_event(&self, answer: &PromptAnswer, auto: bool) -> Event {
+        let answer = match answer {
+            PromptAnswer::Text(_) if self.sensitive => REDACTED_MARKER.to_string(),
+            answer => answer.summary(self.action),
+        };
+        Event::PromptAnswered {
+            id: self.id.clone(),
+            answer,
+            auto,
         }
     }
 }
@@ -133,7 +157,9 @@ impl PromptAnswer {
             PromptAnswer::Confirmed(false) => "no".to_string(),
             PromptAnswer::Selected(choice) => choice.clone(),
             PromptAnswer::Checked(choices) => json!(choices).to_string(),
-            PromptAnswer::Text(_) if action == PromptAction::Password => "<redacted>".to_string(),
+            PromptAnswer::Text(_) if action == PromptAction::Password => {
+                REDACTED_MARKER.to_string()
+            }
             // Only the headless prompter answers a confirm with text: its
             // `needs_human` JSON, which the bus reports like a refusal.
             PromptAnswer::Text(_) if action == PromptAction::Confirm => {
@@ -283,10 +309,8 @@ pub fn new_prompt_id() -> String {
 /// A prompter failure still closes the pair, with `<error>` as the answer,
 /// or `<needs_human>` when a run with no human refused the prompt.
 pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> {
-    let id = req.id.clone();
-    let action = req.action;
     bus().publish(req.requested_event());
-    let answer = match prompter.prompt(req) {
+    let answer = match prompter.prompt(req.clone()) {
         Ok(answer) => answer,
         Err(err) => {
             let answer = if NeedsHuman::caused(&err) {
@@ -295,18 +319,14 @@ pub fn ask(prompter: &dyn Prompter, req: PromptRequest) -> Result<PromptAnswer> 
                 "<error>"
             };
             bus().publish(Event::PromptAnswered {
-                id,
+                id: req.id,
                 answer: answer.to_string(),
                 auto: false,
             });
             return Err(err);
         }
     };
-    bus().publish(Event::PromptAnswered {
-        id,
-        answer: answer.summary(action),
-        auto: false,
-    });
+    bus().publish(req.answered_event(&answer, false));
     Ok(answer)
 }
 
@@ -403,9 +423,20 @@ pub(crate) fn input(
     default: Option<&str>,
     help: Option<&str>,
 ) -> Result<String> {
+    text_input(prompter, question, default, help, false)
+}
+
+fn text_input(
+    prompter: &dyn Prompter,
+    question: &str,
+    default: Option<&str>,
+    help: Option<&str>,
+    sensitive: bool,
+) -> Result<String> {
     let req = PromptRequest {
         default: default.map(|value| json!(value)),
         help: help.map(str::to_string),
+        sensitive,
         ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
     };
     ask(prompter, req).and_then(PromptAnswer::into_text)
@@ -420,9 +451,25 @@ pub(crate) fn required_input(
     default: Option<&str>,
     help: Option<&str>,
 ) -> Result<String> {
+    required_text_input(prompter, label, default, help, false)
+}
+
+/// [`required_input`] for a value that must not be published, such as a
+/// secret the human types in the clear.
+pub(crate) fn required_sensitive_input(prompter: &dyn Prompter, label: &str) -> Result<String> {
+    required_text_input(prompter, label, None, None, true)
+}
+
+fn required_text_input(
+    prompter: &dyn Prompter,
+    label: &str,
+    default: Option<&str>,
+    help: Option<&str>,
+    sensitive: bool,
+) -> Result<String> {
     let mut question = label.to_string();
     loop {
-        let answer = input(prompter, &question, default, help)?;
+        let answer = text_input(prompter, &question, default, help, sensitive)?;
         if answer.trim().is_empty() {
             question = reask("This field is required.", label);
             continue;
@@ -1062,6 +1109,80 @@ mod tests {
             }]
         );
         assert!(!format!("{requested:?}{answered:?}").contains("hunter2"));
+    }
+
+    /// A sensitive input is typed in the clear but published like a
+    /// password, and its default is withheld from the request.
+    #[test]
+    #[serial]
+    fn ask_returns_a_sensitive_answer_but_publishes_neither_it_nor_the_default() {
+        let sink = RecordingSink::install();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("tok-9v2q".to_string())]);
+        let req = PromptRequest {
+            default: Some(json!("dflt-4k8w")),
+            sensitive: true,
+            ..PromptRequest::new(PromptAction::Input, "token? sv-3n", Origin::detached())
+        };
+
+        let answer = ask(&prompter, req).unwrap();
+
+        assert_eq!(answer, PromptAnswer::Text("tok-9v2q".to_string()));
+        let [recorded] = prompter.requests().try_into().unwrap();
+        assert_eq!(recorded.default, Some(json!("dflt-4k8w")));
+        let events = sink.drain();
+        let (requested, answered) = prompt_events(events.clone(), "token? sv-3n");
+        let [Event::PromptRequested { id, default, .. }] = requested.as_slice() else {
+            panic!("{requested:?}");
+        };
+        assert_eq!(*default, None);
+        assert_eq!(
+            answered,
+            vec![Event::PromptAnswered {
+                id: id.clone(),
+                answer: "<redacted>".to_string(),
+                auto: false,
+            }]
+        );
+        let published = format!("{events:?}");
+        assert!(!published.contains("tok-9v2q"), "{published}");
+        assert!(!published.contains("dflt-4k8w"), "{published}");
+    }
+
+    /// Every site that closes a request publishes through
+    /// `answered_event`, so a sensitive request is redacted wherever it
+    /// is answered; only text carries the value.
+    #[test]
+    fn answered_event_redacts_a_sensitive_text_and_leaves_the_rest() {
+        let plain = request(PromptAction::Input, None);
+        let sensitive = PromptRequest {
+            sensitive: true,
+            ..plain.clone()
+        };
+        let answer_of = |req: &PromptRequest, answer: PromptAnswer| {
+            let Event::PromptAnswered { answer, .. } = req.answered_event(&answer, false) else {
+                unreachable!("answered_event builds a PromptAnswered");
+            };
+            answer
+        };
+        let text = PromptAnswer::Text("hunter2".to_string());
+        assert_eq!(answer_of(&plain, text.clone()), "hunter2");
+        assert_eq!(answer_of(&sensitive, text), "<redacted>");
+        assert_eq!(
+            answer_of(&sensitive, PromptAnswer::Cancelled),
+            "<cancelled>"
+        );
+        let confirm = PromptRequest {
+            sensitive: true,
+            ..request(PromptAction::Confirm, Some("tool-x"))
+        };
+        assert_eq!(
+            confirm.answered_event(&PromptAnswer::Confirmed(true), true),
+            Event::PromptAnswered {
+                id: confirm.id.clone(),
+                answer: "yes".to_string(),
+                auto: true,
+            }
+        );
     }
 
     #[test]

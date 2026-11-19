@@ -26,7 +26,7 @@ use crate::graph::session_turn::chat_tool_pool;
 use crate::graph::types::{RagNode, SessionBlock};
 use crate::graph::{Graph, GraphParser, NodeType};
 use crate::mcp::McpServerFeatures;
-use crate::prompt::{NeedsHuman, Prompter, confirm, human_present, required_input};
+use crate::prompt::{NeedsHuman, Prompter, confirm, human_present, required_sensitive_input};
 use crate::rag::{RagInitConfig, RagInitRun};
 use crate::turn::SilentSink;
 use crate::vault::SECRET_RE;
@@ -1696,7 +1696,7 @@ fn instructions_from_tool_output(value: Option<String>) -> Result<String> {
 }
 
 fn ask_required_variable(prompter: &dyn Prompter, name: &str, description: &str) -> Result<String> {
-    required_input(prompter, &format!("{name} ({description}):"), None, None)
+    required_sensitive_input(prompter, &format!("{name} ({description}):"))
 }
 
 /// Whether a required agent variable may be asked for rather than
@@ -1712,7 +1712,10 @@ fn may_ask_human(interactive: bool, tty: bool) -> bool {
 mod tests {
     use super::*;
     use crate::config::conflict::prompt_script::Scripted;
-    use crate::prompt::{HeadlessPrompter, PromptAction, PromptAnswer, ScriptedPrompter};
+    use crate::events::{Event, RecordingSink};
+    use crate::prompt::{
+        HeadlessPrompter, PromptAction, PromptAnswer, ScriptedPrompter, prompt_events,
+    };
     use crate::testing::{self, AtomicFlagGuard};
     use crate::utils::{ACP_SERVER, HEADLESS};
     use serial_test::serial;
@@ -1751,6 +1754,28 @@ mod tests {
                 .iter()
                 .all(|req| req.action == PromptAction::Input)
         );
+    }
+
+    /// A variable can hold a key or token, so the value typed for it
+    /// stays off the event bus.
+    #[test]
+    #[serial]
+    fn a_required_variable_value_is_never_published() {
+        let sink = RecordingSink::install();
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("key-2h9d".to_string())]);
+
+        let value = ask_required_variable(&prompter, "api_key", "Service key av-2h9d").unwrap();
+
+        assert_eq!(value, "key-2h9d");
+        let events = sink.drain();
+        let (requested, answered) = prompt_events(events.clone(), "api_key (Service key av-2h9d):");
+        assert_eq!(requested.len(), 1, "{requested:?}");
+        assert!(
+            matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
+            "{answered:?}"
+        );
+        let published = format!("{events:?}");
+        assert!(!published.contains("key-2h9d"), "{published}");
     }
 
     #[test]

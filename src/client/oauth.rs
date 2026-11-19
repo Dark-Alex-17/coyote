@@ -992,7 +992,10 @@ fn ask_paste_input(
     question: &str,
 ) -> Result<(String, Option<String>)> {
     ensure_paste_can_be_asked(client_name)?;
-    let req = PromptRequest::new(PromptAction::Input, question, Origin::detached());
+    let req = PromptRequest {
+        sensitive: true,
+        ..PromptRequest::new(PromptAction::Input, question, Origin::detached())
+    };
     let input = ask(prompter, req).and_then(PromptAnswer::into_text)?;
     parse_paste_input(input.trim())
 }
@@ -1325,7 +1328,8 @@ mod tests {
     use crate::client::openai_compatible::OpenAICompatibleConfig;
     use crate::client::{ModelData, ProviderModels};
     use crate::config::conflict::prompt_script;
-    use crate::prompt::ScriptedPrompter;
+    use crate::events::{Event, RecordingSink};
+    use crate::prompt::{ScriptedPrompter, prompt_events};
     use crate::testing::AtomicFlagGuard;
     use crate::utils::{HEADLESS, get_env_name};
     use serial_test::serial;
@@ -2124,6 +2128,40 @@ echo_pkce_in_token_exchange: true
                 .contains("Operation was canceled by the user"),
             "{err}"
         );
+    }
+
+    /// The pasted code is a credential, so neither paste question lets it
+    /// onto the event bus.
+    #[test]
+    #[serial]
+    fn ask_paste_input_never_publishes_the_paste() {
+        let _headless = AtomicFlagGuard::set(&HEADLESS, false);
+        let _tty = prompt_script::install(&[]);
+        let sink = RecordingSink::install();
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text("code-5r7x#state-5r7x".to_string()),
+            PromptAnswer::Text(
+                "http://localhost/callback?code=code-8m2w&state=state-8m2w".to_string(),
+            ),
+        ]);
+
+        let (code, _) = ask_paste_input(&prompter, "client-x", PASTE_QUESTION).unwrap();
+        assert_eq!(code, "code-5r7x");
+        let (code, _) = ask_paste_input(&prompter, "client-x", SANDBOX_PASTE_QUESTION).unwrap();
+        assert_eq!(code, "code-8m2w");
+
+        let events = sink.drain();
+        for question in [PASTE_QUESTION, SANDBOX_PASTE_QUESTION] {
+            let (requested, answered) = prompt_events(events.clone(), question);
+            assert_eq!(requested.len(), 1, "{requested:?}");
+            assert!(
+                matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
+                "{answered:?}"
+            );
+        }
+        let published = format!("{events:?}");
+        assert!(!published.contains("code-5r7x"), "{published}");
+        assert!(!published.contains("code-8m2w"), "{published}");
     }
 
     #[test]

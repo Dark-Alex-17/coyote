@@ -1045,11 +1045,7 @@ impl RequestContext {
         if self.prompt_memory.auto_answer(&req) == Some(true) {
             let answer = PromptAnswer::Confirmed(true);
             events::bus().publish(req.requested_event());
-            events::bus().publish(Event::PromptAnswered {
-                id: req.id,
-                answer: answer.summary(PromptAction::Confirm),
-                auto: true,
-            });
+            events::bus().publish(req.answered_event(&answer, true));
             return Ok(answer);
         }
         crate::prompt::ask(self.prompter.as_ref(), req)

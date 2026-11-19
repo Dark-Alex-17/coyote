@@ -6,7 +6,7 @@
 //! ordinary output.
 
 use crate::config::sanitize_display_text;
-use crate::events::{self, Event, Origin};
+use crate::events::{self, Origin};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, Prompter};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -1248,11 +1248,7 @@ impl ToolPrompter {
         if self.memory.auto_answer(&req) == Some(true) {
             let answer = PromptAnswer::Confirmed(true);
             events::bus().publish(req.requested_event());
-            events::bus().publish(Event::PromptAnswered {
-                id: req.id,
-                answer: answer.summary(PromptAction::Confirm),
-                auto: true,
-            });
+            events::bus().publish(req.answered_event(&answer, true));
             return Ok(answer);
         }
         // A run with no human cannot answer a tool, so the tool fails closed;
@@ -1264,11 +1260,7 @@ impl ToolPrompter {
         if !crate::prompt::human_present() {
             let answer = PromptAnswer::Cancelled;
             events::bus().publish(req.requested_event());
-            events::bus().publish(Event::PromptAnswered {
-                id: req.id,
-                answer: answer.summary(req.action),
-                auto: false,
-            });
+            events::bus().publish(req.answered_event(&answer, false));
             return Ok(answer);
         }
         crate::prompt::ask(self.prompter.as_ref(), req)
@@ -1441,6 +1433,7 @@ pub(crate) fn parse_request(
             // A picked option is mapped back to the raw text by index; the
             // custom row's typed text goes back to the tool verbatim.
             closed: false,
+            sensitive: false,
         },
         raw_options,
     })
@@ -1534,7 +1527,7 @@ fn could_become_prompt(tail: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::config::{AppState, RequestContext, WorkingMode};
-    use crate::events::{OutputStream, RecordingSink};
+    use crate::events::{Event, OutputStream, RecordingSink};
     use crate::function::{
         FunctionDeclaration, JsonSchema, ToolCall, ToolIo, jobs, run_llm_function,
     };
