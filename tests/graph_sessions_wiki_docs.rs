@@ -37,10 +37,14 @@
 //! `src/function/jobs.rs` and the spawn instructions in
 //! `src/config/prompts.rs`.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use common::source_scan::{const_str, fn_body, read, repo_root, src, string_literals};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test graph_sessions_wiki_docs`";
@@ -106,10 +110,6 @@ const CARRY_BULLET_LEAD: &str = "- **`carry`:**";
 /// to the state size.
 const SCRIPT_TURNS_LEAD: &str = "Under a session, [`previous_turns`]";
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
 /// The `agent.*` events a spawned child fires, scraped from the
 /// `HookEvent::as_str` arms in `src/hooks.rs` so a renamed or added event
 /// reaches the wiki checks without a hand-kept copy. The four lifecycle
@@ -169,23 +169,6 @@ fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
         .collect();
     texts.extend(edited_rows(wiki));
     texts
-}
-
-fn read(path: impl AsRef<Path>) -> String {
-    let path = path.as_ref();
-    // Line endings are normalised so the `\n`-anchored block and heading
-    // searches below hold on a CRLF checkout.
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
-}
-
-fn src(parts: &[&str]) -> String {
-    let mut path = repo_root().join("src");
-    for part in parts {
-        path = path.join(part);
-    }
-    read(path)
 }
 
 /// The one sentence of resume policy the bundled prompts and the Agents
@@ -249,41 +232,6 @@ fn wiki_dir() -> Option<PathBuf> {
         dir.display()
     );
     Some(dir)
-}
-
-/// Every `"..."` literal in `source`, in order, with `\"`, `\\` and `\n`
-/// unescaped and a `\` line continuation (the backslash, the newline and the
-/// next line's indentation) dropped the way rustc drops it.
-fn string_literals(source: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let mut chars = source.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut literal = String::new();
-        loop {
-            match chars.next() {
-                Some('"') => break,
-                Some('\\') => match chars.next() {
-                    Some(escaped @ ('"' | '\\')) => literal.push(escaped),
-                    Some('n') => literal.push('\n'),
-                    Some('\n') => {
-                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                            chars.next();
-                        }
-                    }
-                    other => panic!(
-                        "unexpected escape {other:?} in {literal:?}; extend string_literals in tests/graph_sessions_wiki_docs.rs"
-                    ),
-                },
-                Some(c) => literal.push(c),
-                None => panic!("unterminated string literal: {literal:?}"),
-            }
-        }
-        literals.push(literal);
-    }
-    literals
 }
 
 /// The cells of a markdown table row, split on unescaped pipes and trimmed.
@@ -581,28 +529,6 @@ fn const_str_array(source: &str, name: &str) -> Vec<String> {
     literals
 }
 
-/// The source of the function whose signature starts with `head` in
-/// `source`, up to its closing brace: the first `}` standing alone on a line
-/// at the function's own indentation.
-fn fn_body(source: &str, head: &str) -> String {
-    let start = source
-        .find(head)
-        .unwrap_or_else(|| panic!("the source defines {head}"));
-    let indent: String = source[..start]
-        .rsplit('\n')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .collect();
-    let body = &source[start..];
-    let close = format!("\n{indent}}}");
-    let end = body
-        .find(&close)
-        .unwrap_or_else(|| panic!("{head} closes with `}}` on its own line"));
-    body[..end].to_string()
-}
-
 /// The text of a source file before its `mod tests` block, so a pin on
 /// production code never matches a copy of the same text that a unit test
 /// holds in a string literal. A file whose test module is not found that
@@ -612,22 +538,6 @@ fn before_test_module(source: &str) -> &str {
         .split_once("\n#[cfg(test)]\nmod tests {")
         .map(|(before, _)| before)
         .expect("the source has a `#[cfg(test)] mod tests {` block")
-}
-
-/// The value of `const {name}: &str = "...";` in `source`, whatever its
-/// visibility.
-fn const_str(source: &str, name: &str) -> String {
-    let head = format!("const {name}: &str = ");
-    let start = source
-        .find(&head)
-        .unwrap_or_else(|| panic!("the source declares {name}"));
-    let rest = &source[start + head.len()..];
-    let end = rest
-        .find(';')
-        .unwrap_or_else(|| panic!("{name} ends with `;`"));
-    let mut literals = string_literals(&rest[..=end]);
-    assert_eq!(literals.len(), 1, "{name} is one string literal");
-    literals.remove(0)
 }
 
 /// The directory a workspace session for an agent lives in, as the wiki

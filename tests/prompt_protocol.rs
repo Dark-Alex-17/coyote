@@ -41,6 +41,129 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// A script helper the paired Python and TypeScript cases run against: a
+/// pair whose cases differ only in the language is one `check_*` body,
+/// called once with `PYTHON` and once with `TYPESCRIPT`.
+struct Lang {
+    /// Goes into the markers, temp dir names and fixture tool names, and is
+    /// the fixture tool's file extension.
+    tag: &'static str,
+    name: &'static str,
+    /// The variable a tool run by the binary finds the helper's path in.
+    helper_env: &'static str,
+    /// The interpreter that runs a driver, or None once the reason the case
+    /// is skipped has been printed.
+    runtime: fn() -> Option<&'static str>,
+    /// Set on the wrapper of a case that runs `source_command`.
+    env: &'static [(&'static str, &'static str)],
+    /// The shell command that runs the driver `source` against the helper:
+    /// Python passes it with `-c`, TypeScript writes it under a fresh temp
+    /// dir named for `scenario`, next to a copy of the helper.
+    source_command: fn(runtime: &str, scenario: &str, source: &str) -> Driver,
+    /// The same, with the driver always written to a file in a fresh temp
+    /// dir.
+    file_command: fn(runtime: &str, scenario: &str, source: &str) -> Driver,
+    /// How a driver prints a `true` answer.
+    true_text: &'static str,
+    confirm_driver: fn(question: &str) -> String,
+    guard_driver: fn(question: &str, operation: &str) -> String,
+    select_driver: fn(question: &str) -> String,
+    password_driver: fn(marker: &str) -> String,
+    /// Run by the cases that start with echo off, on top of their shared
+    /// assertions.
+    hidden_path_check: Option<fn(&str)>,
+    /// The source of a tool that reports the helper the binary exported.
+    export_probe: fn(runtime: &str) -> String,
+    /// The line `export_probe` prints when the export is complete.
+    export_probe_line: &'static str,
+}
+
+const PYTHON: Lang = Lang {
+    tag: "py",
+    name: "python",
+    helper_env: "LLM_PROMPT_UTILS_PY",
+    runtime: python_runtime,
+    env: &[("PYTHONDONTWRITEBYTECODE", "1")],
+    source_command: python_source_command,
+    file_command: python_file_command,
+    true_text: "True",
+    confirm_driver: python_confirm_driver,
+    guard_driver: python_guard_driver,
+    select_driver: python_select_driver,
+    password_driver: python_password_driver,
+    hidden_path_check: Some(assert_python_took_the_hidden_path),
+    export_probe: python_export_probe,
+    export_probe_line: "fixture py: abs=True file=True helpers=7 op=True ui=repl",
+};
+
+const TYPESCRIPT: Lang = Lang {
+    tag: "ts",
+    name: "typescript",
+    helper_env: "LLM_PROMPT_UTILS_TS",
+    runtime: ts_runtime,
+    env: &[],
+    source_command: typescript_file_command,
+    file_command: typescript_file_command,
+    true_text: "true",
+    confirm_driver: typescript_confirm_driver,
+    guard_driver: typescript_guard_driver,
+    select_driver: typescript_select_driver,
+    password_driver: typescript_password_driver,
+    hidden_path_check: None,
+    export_probe: typescript_export_probe,
+    export_probe_line: "fixture ts: abs=true file=true helpers=9 op=true ui=repl",
+};
+
+/// The command that runs a driver against a helper, and the temp dir that
+/// holds the driver, removed when this is dropped.
+struct Driver {
+    command: String,
+    _dir: Option<TempDirGuard>,
+}
+
+fn python_runtime() -> Option<&'static str> {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return None;
+    }
+    Some("python3")
+}
+
+fn python_source_command(runtime: &str, _scenario: &str, source: &str) -> Driver {
+    Driver {
+        command: format!("{runtime} -c '{source}' \"{PY_HELPER}\""),
+        _dir: None,
+    }
+}
+
+fn python_file_command(runtime: &str, scenario: &str, source: &str) -> Driver {
+    let dir = fresh_config_dir(scenario);
+    let guard = TempDirGuard(dir.clone());
+    let driver = dir.join("driver.py");
+    fs::write(&driver, source).unwrap();
+    Driver {
+        command: format!("{runtime} \"{}\" \"{PY_HELPER}\"", driver.display()),
+        _dir: Some(guard),
+    }
+}
+
+fn typescript_file_command(runtime: &str, scenario: &str, source: &str) -> Driver {
+    let dir = fresh_config_dir(scenario);
+    let guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(&driver, source).unwrap();
+    Driver {
+        command: format!(
+            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ),
+        _dir: Some(guard),
+    }
+}
+
 /// Without a reply channel `confirm` asks on the controlling terminal: it
 /// prints the question, queries the cursor row with `ESC[6n` and reads one
 /// key. Stdin is pointed at /dev/null first so only the terminal can
@@ -74,22 +197,23 @@ fn confirm_without_channel_reads_the_controlling_terminal() {
 /// whole line and sends no cursor query.
 #[test]
 fn python_confirm_without_channel_reads_the_controlling_terminal() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_confirm_without_channel_reads_the_controlling_terminal(&PYTHON);
+}
+
+fn check_confirm_without_channel_reads_the_controlling_terminal(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let driver = "import importlib.util, sys\n\
-        sys.dont_write_bytecode = True\n\
-        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
-        m = importlib.util.module_from_spec(spec)\n\
-        spec.loader.exec_module(m)\n\
-        print(\"confirm-result=\" + str(m.confirm(\"Go? tty-py-x7x\")))\n";
+    };
+    let tag = lang.tag;
+    let driver = (lang.source_command)(
+        runtime,
+        &format!("tty-{tag}"),
+        &(lang.confirm_driver)(&format!("Go? tty-{tag}-x7x")),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
-        ))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(format!("exec </dev/null; {}", driver.command))
+        .envs(lang.env.iter().copied())
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -99,7 +223,9 @@ fn python_confirm_without_channel_reads_the_controlling_terminal() {
     let mut pty = Pty::spawn(cmd).unwrap();
     pty.wait_for("(y/N)", PTY_DEADLINE).unwrap();
     pty.send(b"y\n").unwrap();
-    let transcript = pty.wait_for("confirm-result=True", PTY_DEADLINE).unwrap();
+    let transcript = pty
+        .wait_for(&format!("confirm-result={}", lang.true_text), PTY_DEADLINE)
+        .unwrap();
     assert!(
         !transcript.contains("coyote_prompt"),
         "confirm wrote a protocol line without a channel:\n{transcript}"
@@ -150,23 +276,23 @@ fn bash_confirm_without_channel_shows_a_command_in_full() {
 /// line under the question instead of running the two together.
 #[test]
 fn python_guard_without_channel_keeps_the_operation_on_its_own_line() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_guard_without_channel_keeps_the_operation_on_its_own_line(&PYTHON);
+}
+
+fn check_guard_without_channel_keeps_the_operation_on_its_own_line(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let driver = "import importlib.util, sys\n\
-        sys.dont_write_bytecode = True\n\
-        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
-        m = importlib.util.module_from_spec(spec)\n\
-        spec.loader.exec_module(m)\n\
-        m.guard_operation(\"Run? py-x7x\", \"ls op-x7x\")\n\
-        print(\"guard-passed\")\n";
+    };
+    let tag = lang.tag;
+    let driver = (lang.source_command)(
+        runtime,
+        &format!("tty-{tag}-guard"),
+        &(lang.guard_driver)(&format!("Run? {tag}-x7x"), "ls op-x7x"),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
-        ))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg(format!("exec </dev/null; {}", driver.command))
+        .envs(lang.env.iter().copied())
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -175,7 +301,7 @@ fn python_guard_without_channel_keeps_the_operation_on_its_own_line() {
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
     let shown = pty.wait_for("op-x7x (y/N)", PTY_DEADLINE).unwrap();
-    assert!(!shown.contains("py-x7xls"), "{shown}");
+    assert!(!shown.contains(&format!("{tag}-x7xls")), "{shown}");
     pty.send(b"y\n").unwrap();
     pty.wait_for("guard-passed", PTY_DEADLINE).unwrap();
 }
@@ -184,82 +310,14 @@ fn python_guard_without_channel_keeps_the_operation_on_its_own_line() {
 /// runtime can execute `.ts` files here.
 #[test]
 fn typescript_confirm_without_channel_reads_the_controlling_terminal() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("tty-ts");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(
-        &driver,
-        "import { pathToFileURL } from \"node:url\";\n\
-         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
-         console.log(\"confirm-result=\" + JSON.stringify(prompt.confirm(\"Go? tty-ts-x7x\")));\n",
-    )
-    .unwrap();
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ))
-        .env_remove("COYOTE_PROMPT_REPLY")
-        .env_remove("_COYOTE_PROMPT_OUT")
-        .env_remove("AUTO_CONFIRM")
-        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
-        .env_remove("COYOTE_UI")
-        .env("TERM", "xterm");
-    let mut pty = Pty::spawn(cmd).unwrap();
-    pty.wait_for("(y/N)", PTY_DEADLINE).unwrap();
-    pty.send(b"y\n").unwrap();
-    let transcript = pty.wait_for("confirm-result=true", PTY_DEADLINE).unwrap();
-    assert!(
-        !transcript.contains("coyote_prompt"),
-        "confirm wrote a protocol line without a channel:\n{transcript}"
-    );
+    check_confirm_without_channel_reads_the_controlling_terminal(&TYPESCRIPT);
 }
 
 /// The TypeScript guard's terminal fallback keeps the operation on its own
 /// line under the question, like the Python one.
 #[test]
 fn typescript_guard_without_channel_keeps_the_operation_on_its_own_line() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("tty-ts-guard");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(
-        &driver,
-        "import { pathToFileURL } from \"node:url\";\n\
-         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
-         prompt.guardOperation(\"Run? ts-x7x\", \"ls op-x7x\");\n\
-         console.log(\"guard-passed\");\n",
-    )
-    .unwrap();
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ))
-        .env_remove("COYOTE_PROMPT_REPLY")
-        .env_remove("_COYOTE_PROMPT_OUT")
-        .env_remove("AUTO_CONFIRM")
-        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
-        .env_remove("COYOTE_UI")
-        .env("TERM", "xterm");
-    let mut pty = Pty::spawn(cmd).unwrap();
-    let shown = pty.wait_for("op-x7x (y/N)", PTY_DEADLINE).unwrap();
-    assert!(!shown.contains("ts-x7xls"), "{shown}");
-    pty.send(b"y\n").unwrap();
-    pty.wait_for("guard-passed", PTY_DEADLINE).unwrap();
+    check_guard_without_channel_keeps_the_operation_on_its_own_line(&TYPESCRIPT);
 }
 
 const TUI_NO_CHANNEL: &str = "prompts are not available in the TUI without the reply channel";
@@ -288,59 +346,32 @@ fn under_the_tui_confirm_without_channel_fails_closed() {
 /// The Python helper, same shape: `confirm` exits the process non-zero.
 #[test]
 fn under_the_tui_python_confirm_without_channel_fails_closed() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
-    let driver = "import importlib.util, sys\n\
-        sys.dont_write_bytecode = True\n\
-        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
-        m = importlib.util.module_from_spec(spec)\n\
-        spec.loader.exec_module(m)\n\
-        print(\"confirm-result=\" + str(m.confirm(\"Go? tui-py-x7x\")))\n";
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\"; echo \"confirm-rc=$?\""
-        ))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env_remove("COYOTE_PROMPT_REPLY")
-        .env_remove("_COYOTE_PROMPT_OUT")
-        .env_remove("AUTO_CONFIRM")
-        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
-        .env("COYOTE_UI", "tui")
-        .env("TERM", "xterm");
-    let mut pty = Pty::spawn(cmd).unwrap();
-    let transcript = pty.wait_for("confirm-rc=", PTY_DEADLINE).unwrap();
-    assert_fails_closed_under_the_tui(&transcript, "confirm-rc=1");
-    assert!(!transcript.contains("confirm-result="), "{transcript}");
+    check_under_the_tui_confirm_without_channel_fails_closed(&PYTHON);
 }
 
 /// The TypeScript helper, same shape.
 #[test]
 fn under_the_tui_typescript_confirm_without_channel_fails_closed() {
-    let Some(runtime) = ts_runtime() else {
+    check_under_the_tui_confirm_without_channel_fails_closed(&TYPESCRIPT);
+}
+
+fn check_under_the_tui_confirm_without_channel_fails_closed(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
     };
-    let dir = fresh_config_dir("tui-ts");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(
-        &driver,
-        "import { pathToFileURL } from \"node:url\";\n\
-         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
-         console.log(\"confirm-result=\" + JSON.stringify(prompt.confirm(\"Go? tui-ts-x7x\")));\n",
-    )
-    .unwrap();
+    let tag = lang.tag;
+    let driver = (lang.source_command)(
+        runtime,
+        &format!("tui-{tag}"),
+        &(lang.confirm_driver)(&format!("Go? tui-{tag}-x7x")),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(format!(
-            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"; echo \"confirm-rc=$?\"",
-            driver.display(),
-            helper.display()
+            "exec </dev/null; {}; echo \"confirm-rc=$?\"",
+            driver.command
         ))
+        .envs(lang.env.iter().copied())
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -510,52 +541,32 @@ fn under_the_tui_bash_guard_without_channel_refuses_before_touching_the_tty() {
 /// `Secret?` painted, echo left on.
 #[test]
 fn under_the_tui_python_password_without_channel_fails_closed() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
-    let driver = python_password_driver("tui-pw-py-r8");
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; v=$(python3 -c '{driver}' \"{PY_HELPER}\"); rc=$?; {PASSWORD_REPORT}"
-        ))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env_remove("COYOTE_PROMPT_REPLY")
-        .env_remove("_COYOTE_PROMPT_OUT")
-        .env_remove("AUTO_CONFIRM")
-        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
-        .env("COYOTE_UI", "tui")
-        .env("TERM", "xterm");
-    let mut pty = Pty::spawn(cmd).unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_fails_closed_under_the_tui(&transcript, "password-rc=1 len=0");
-    assert_refused_cleanly_on_the_tty(&transcript, "Secret?");
-    assert!(
-        !transcript.contains("password-length="),
-        "the helper returned a value instead of failing:\n{transcript}"
-    );
+    check_under_the_tui_password_without_channel_fails_closed(&PYTHON);
 }
 
 /// The TypeScript helper's `password` (the hidden `ttyLine`), same shape.
 #[test]
 fn under_the_tui_typescript_password_without_channel_fails_closed() {
-    let Some(runtime) = ts_runtime() else {
+    check_under_the_tui_password_without_channel_fails_closed(&TYPESCRIPT);
+}
+
+fn check_under_the_tui_password_without_channel_fails_closed(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
     };
-    let dir = fresh_config_dir("tui-ts-password");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("tui-pw-ts-r8")).unwrap();
+    let tag = lang.tag;
+    let driver = (lang.source_command)(
+        runtime,
+        &format!("tui-{tag}-password"),
+        &(lang.password_driver)(&format!("tui-pw-{tag}-r8")),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(format!(
-            "exec </dev/null; v=$(NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"); rc=$?; {PASSWORD_REPORT}",
-            driver.display(),
-            helper.display()
+            "exec </dev/null; v=$({}); rc=$?; {PASSWORD_REPORT}",
+            driver.command
         ))
+        .envs(lang.env.iter().copied())
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -604,64 +615,28 @@ fn outside_the_tui_bash_confirm_without_channel_still_asks_the_terminal() {
 /// line and reads the pick from the terminal.
 #[test]
 fn python_select_without_channel_reads_the_controlling_terminal() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
-    let driver = "import importlib.util, sys\n\
-        sys.dont_write_bytecode = True\n\
-        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
-        m = importlib.util.module_from_spec(spec)\n\
-        spec.loader.exec_module(m)\n\
-        print(\"select-result=\" + str(m.select(\"Pick? sel-x7x\", [\"a\", \"b\"])))\n";
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
-        ))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env_remove("COYOTE_PROMPT_REPLY")
-        .env_remove("_COYOTE_PROMPT_OUT")
-        .env_remove("AUTO_CONFIRM")
-        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
-        .env_remove("COYOTE_UI")
-        .env("TERM", "xterm");
-    let mut pty = Pty::spawn(cmd).unwrap();
-    let listing = pty.wait_for("2) b", PTY_DEADLINE).unwrap();
-    assert_options_on_separate_lines(&listing);
-    pty.send(b"2\n").unwrap();
-    let transcript = pty.wait_for("select-result=1", PTY_DEADLINE).unwrap();
-    assert!(
-        !transcript.contains("coyote_prompt"),
-        "select wrote a protocol line without a channel:\n{transcript}"
-    );
+    check_select_without_channel_reads_the_controlling_terminal(&PYTHON);
 }
 
 /// The TypeScript helper's `select` fallback, same shape.
 #[test]
 fn typescript_select_without_channel_reads_the_controlling_terminal() {
-    let Some(runtime) = ts_runtime() else {
+    check_select_without_channel_reads_the_controlling_terminal(&TYPESCRIPT);
+}
+
+fn check_select_without_channel_reads_the_controlling_terminal(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
     };
-    let dir = fresh_config_dir("tty-ts-select");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(
-        &driver,
-        "import { pathToFileURL } from \"node:url\";\n\
-         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
-         console.log(\"select-result=\" + JSON.stringify(prompt.select(\"Pick? sel-x7x\", [\"a\", \"b\"])));\n",
-    )
-    .unwrap();
+    let driver = (lang.source_command)(
+        runtime,
+        &format!("tty-{}-select", lang.tag),
+        &(lang.select_driver)("Pick? sel-x7x"),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ))
+        .arg(format!("exec </dev/null; {}", driver.command))
+        .envs(lang.env.iter().copied())
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -684,70 +659,31 @@ fn typescript_select_without_channel_reads_the_controlling_terminal() {
 /// only the caller's report of its length does.
 #[test]
 fn python_password_without_channel_hides_the_typed_text() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
-    let driver = "import importlib.util, sys\n\
-        sys.dont_write_bytecode = True\n\
-        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
-        m = importlib.util.module_from_spec(spec)\n\
-        spec.loader.exec_module(m)\n\
-        v = m.password(\"Secret? pw-py-x7x\")\n\
-        print(\"password-length=\" + str(None if v is None else len(v)))\n";
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
-        ))
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .env_remove("COYOTE_PROMPT_REPLY")
-        .env_remove("_COYOTE_PROMPT_OUT")
-        .env_remove("AUTO_CONFIRM")
-        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
-        .env_remove("COYOTE_UI")
-        .env("TERM", "xterm");
-    let mut pty = Pty::spawn(cmd).unwrap();
-    pty.wait_for("pw-py-x7x", PTY_DEADLINE).unwrap();
-    pty.send(b"hunter2zq\n").unwrap();
-    let transcript = pty.wait_for("password-length=9", PTY_DEADLINE).unwrap();
-    assert!(
-        !transcript.contains("hunter2zq"),
-        "password echoed the typed text on the terminal:\n{transcript}"
-    );
-    assert!(
-        !transcript.contains("coyote_prompt"),
-        "password wrote a protocol line without a channel:\n{transcript}"
-    );
+    check_password_without_channel_hides_the_typed_text(&PYTHON);
 }
 
 /// The TypeScript helper's `password` fallback, same shape: its hidden
 /// read goes through a child that turns echo off on the terminal.
 #[test]
 fn typescript_password_without_channel_hides_the_typed_text() {
-    let Some(runtime) = ts_runtime() else {
+    check_password_without_channel_hides_the_typed_text(&TYPESCRIPT);
+}
+
+fn check_password_without_channel_hides_the_typed_text(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
     };
-    let dir = fresh_config_dir("tty-ts-password");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(
-        &driver,
-        "import { pathToFileURL } from \"node:url\";\n\
-         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
-         const v = prompt.password(\"Secret? pw-ts-x7x\");\n\
-         console.log(\"password-length=\" + (v === null ? \"null\" : String(v.length)));\n",
-    )
-    .unwrap();
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-x7x");
+    let driver = (lang.source_command)(
+        runtime,
+        &format!("tty-{tag}-password"),
+        &(lang.password_driver)(&marker),
+    );
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
-        .arg(format!(
-            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ))
+        .arg(format!("exec </dev/null; {}", driver.command))
+        .envs(lang.env.iter().copied())
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -755,7 +691,7 @@ fn typescript_password_without_channel_hides_the_typed_text() {
         .env_remove("COYOTE_UI")
         .env("TERM", "xterm");
     let mut pty = Pty::spawn(cmd).unwrap();
-    pty.wait_for("pw-ts-x7x", PTY_DEADLINE).unwrap();
+    pty.wait_for(&marker, PTY_DEADLINE).unwrap();
     pty.send(b"hunter2zq\n").unwrap();
     let transcript = pty.wait_for("password-length=9", PTY_DEADLINE).unwrap();
     assert!(
@@ -773,50 +709,26 @@ fn typescript_password_without_channel_hides_the_typed_text() {
 /// shows, then the wrapper reports `stty -a` on the same terminal.
 #[test]
 fn python_password_restores_echo_after_the_read() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
-    let dir = fresh_config_dir("tty-py-password-restore");
-    let _guard = TempDirGuard(dir.clone());
-    let driver = dir.join("driver.py");
-    fs::write(&driver, python_password_driver("pw-py-r3s")).unwrap();
-    let transcript = run_password_in_pty(
-        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
-        "pw-py-r3s",
-        |pty| pty.send(b"hunter2zq\n"),
-    );
-    assert!(
-        transcript.contains("password-length=9"),
-        "password did not return the typed text:\n{transcript}"
-    );
-    assert!(
-        !transcript.contains("hunter2zq"),
-        "password echoed the typed text on the terminal:\n{transcript}"
-    );
-    assert_echo_restored(&transcript);
+    check_password_restores_echo_after_the_read(&PYTHON);
 }
 
 #[test]
 fn typescript_password_restores_echo_after_the_read() {
-    let Some(runtime) = ts_runtime() else {
+    check_password_restores_echo_after_the_read(&TYPESCRIPT);
+}
+
+fn check_password_restores_echo_after_the_read(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
     };
-    let dir = fresh_config_dir("tty-ts-password-restore");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("pw-ts-r3s")).unwrap();
-    let transcript = run_password_in_pty(
-        &format!(
-            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ),
-        "pw-ts-r3s",
-        |pty| pty.send(b"hunter2zq\n"),
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-r3s");
+    let driver = (lang.file_command)(
+        runtime,
+        &format!("tty-{tag}-password-restore"),
+        &(lang.password_driver)(&marker),
     );
+    let transcript = run_password_in_pty(&driver.command, &marker, |pty| pty.send(b"hunter2zq\n"));
     assert!(
         transcript.contains("password-length=9"),
         "password did not return the typed text:\n{transcript}"
@@ -833,47 +745,26 @@ fn typescript_password_restores_echo_after_the_read() {
 /// the read is interrupted, as bash's `read -s` and Python's getpass do.
 #[test]
 fn python_password_restores_echo_after_ctrl_c() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
-        return;
-    }
-    let dir = fresh_config_dir("tty-py-password-intr");
-    let _guard = TempDirGuard(dir.clone());
-    let driver = dir.join("driver.py");
-    fs::write(&driver, python_password_driver("pw-py-1nt")).unwrap();
-    let transcript = run_password_in_pty(
-        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
-        "pw-py-1nt",
-        interrupt_mid_read,
-    );
-    assert!(
-        !transcript.contains("password-length="),
-        "password returned despite the interrupt:\n{transcript}"
-    );
-    assert_hidden_read_was_interrupted(&transcript);
-    assert_echo_restored(&transcript);
+    check_password_restores_echo_after_ctrl_c(&PYTHON);
 }
 
 #[test]
 fn typescript_password_restores_echo_after_ctrl_c() {
-    let Some(runtime) = ts_runtime() else {
+    check_password_restores_echo_after_ctrl_c(&TYPESCRIPT);
+}
+
+fn check_password_restores_echo_after_ctrl_c(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
     };
-    let dir = fresh_config_dir("tty-ts-password-intr");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("pw-ts-1nt")).unwrap();
-    let transcript = run_password_in_pty(
-        &format!(
-            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ),
-        "pw-ts-1nt",
-        interrupt_mid_read,
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-1nt");
+    let driver = (lang.file_command)(
+        runtime,
+        &format!("tty-{tag}-password-intr"),
+        &(lang.password_driver)(&marker),
     );
+    let transcript = run_password_in_pty(&driver.command, &marker, interrupt_mid_read);
     assert!(
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
@@ -887,53 +778,35 @@ fn typescript_password_restores_echo_after_ctrl_c() {
 /// still have echo off once the read completes.
 #[test]
 fn typescript_password_keeps_a_pre_prompt_echo_off_after_the_read() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("tty-ts-password-keep-noecho");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("pw-ts-k33p")).unwrap();
-    let transcript = run_password_in_pty_with(
-        ECHO_OFF_PRELUDE,
-        &format!(
-            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ),
-        "pw-ts-k33p",
-        |pty| pty.send(b"hunter2zq\n"),
-    );
-    assert!(
-        transcript.contains("password-length=9"),
-        "password did not return the typed text:\n{transcript}"
-    );
-    assert_echo_still_off(&transcript);
+    check_password_keeps_a_pre_prompt_echo_off_after_the_read(&TYPESCRIPT);
 }
 
 #[test]
 fn python_password_keeps_a_pre_prompt_echo_off_after_the_read() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_password_keeps_a_pre_prompt_echo_off_after_the_read(&PYTHON);
+}
+
+fn check_password_keeps_a_pre_prompt_echo_off_after_the_read(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let dir = fresh_config_dir("tty-py-password-keep-noecho");
-    let _guard = TempDirGuard(dir.clone());
-    let driver = dir.join("driver.py");
-    fs::write(&driver, python_password_driver("pw-py-k33p")).unwrap();
-    let transcript = run_password_in_pty_with(
-        ECHO_OFF_PRELUDE,
-        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
-        "pw-py-k33p",
-        |pty| pty.send(b"hunter2zq\n"),
+    };
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-k33p");
+    let driver = (lang.file_command)(
+        runtime,
+        &format!("tty-{tag}-password-keep-noecho"),
+        &(lang.password_driver)(&marker),
     );
+    let transcript = run_password_in_pty_with(ECHO_OFF_PRELUDE, &driver.command, &marker, |pty| {
+        pty.send(b"hunter2zq\n")
+    });
     assert!(
         transcript.contains("password-length=9"),
         "password did not return the typed text:\n{transcript}"
     );
-    assert_python_took_the_hidden_path(&transcript);
+    if let Some(check) = lang.hidden_path_check {
+        check(&transcript);
+    }
     assert_echo_still_off(&transcript);
 }
 
@@ -941,53 +814,38 @@ fn python_password_keeps_a_pre_prompt_echo_off_after_the_read() {
 /// that began with echo off must not switch echo on.
 #[test]
 fn typescript_password_keeps_a_pre_prompt_echo_off_after_ctrl_c() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("tty-ts-password-keep-noecho-intr");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("pw-ts-k1nt")).unwrap();
-    let transcript = run_password_in_pty_with(
-        ECHO_OFF_PRELUDE,
-        &format!(
-            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ),
-        "pw-ts-k1nt",
-        interrupt_mid_read,
-    );
-    assert!(
-        !transcript.contains("password-length="),
-        "password returned despite the interrupt:\n{transcript}"
-    );
-    assert_echo_still_off(&transcript);
+    check_password_keeps_a_pre_prompt_echo_off_after_ctrl_c(&TYPESCRIPT);
 }
 
 #[test]
 fn python_password_keeps_a_pre_prompt_echo_off_after_ctrl_c() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_password_keeps_a_pre_prompt_echo_off_after_ctrl_c(&PYTHON);
+}
+
+fn check_password_keeps_a_pre_prompt_echo_off_after_ctrl_c(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let dir = fresh_config_dir("tty-py-password-keep-noecho-intr");
-    let _guard = TempDirGuard(dir.clone());
-    let driver = dir.join("driver.py");
-    fs::write(&driver, python_password_driver("pw-py-k1nt")).unwrap();
+    };
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-k1nt");
+    let driver = (lang.file_command)(
+        runtime,
+        &format!("tty-{tag}-password-keep-noecho-intr"),
+        &(lang.password_driver)(&marker),
+    );
     let transcript = run_password_in_pty_with(
         ECHO_OFF_PRELUDE,
-        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
-        "pw-py-k1nt",
+        &driver.command,
+        &marker,
         interrupt_mid_read,
     );
     assert!(
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
-    assert_python_took_the_hidden_path(&transcript);
+    if let Some(check) = lang.hidden_path_check {
+        check(&transcript);
+    }
     assert_echo_still_off(&transcript);
 }
 
@@ -1052,53 +910,38 @@ fn python_password_restores_echo_after_an_immediate_ctrl_c() {
 /// restore must put back the snapshot, not switch echo on.
 #[test]
 fn typescript_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("tty-ts-password-keep-noecho-intr-0ms");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("pw-ts-0msk")).unwrap();
-    let transcript = run_password_in_pty_with(
-        ECHO_OFF_PRELUDE,
-        &format!(
-            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ),
-        "pw-ts-0msk",
-        interrupt_immediately,
-    );
-    assert!(
-        !transcript.contains("password-length="),
-        "password returned despite the interrupt:\n{transcript}"
-    );
-    assert_echo_still_off(&transcript);
+    check_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c(&TYPESCRIPT);
 }
 
 #[test]
 fn python_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c(&PYTHON);
+}
+
+fn check_password_keeps_a_pre_prompt_echo_off_after_an_immediate_ctrl_c(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let dir = fresh_config_dir("tty-py-password-keep-noecho-intr-0ms");
-    let _guard = TempDirGuard(dir.clone());
-    let driver = dir.join("driver.py");
-    fs::write(&driver, python_password_driver("pw-py-0msk")).unwrap();
+    };
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-0msk");
+    let driver = (lang.file_command)(
+        runtime,
+        &format!("tty-{tag}-password-keep-noecho-intr-0ms"),
+        &(lang.password_driver)(&marker),
+    );
     let transcript = run_password_in_pty_with(
         ECHO_OFF_PRELUDE,
-        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
-        "pw-py-0msk",
+        &driver.command,
+        &marker,
         interrupt_immediately,
     );
     assert!(
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
-    assert_python_took_the_hidden_path(&transcript);
+    if let Some(check) = lang.hidden_path_check {
+        check(&transcript);
+    }
     assert_echo_still_off(&transcript);
 }
 
@@ -1161,25 +1004,79 @@ fn typescript_password_without_stty_warns_and_still_reads() {
 const ECHO_OFF_PRELUDE: &str =
     "stty -echo </dev/tty; echo \"pre-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\";";
 
-fn python_password_driver(marker: &str) -> String {
+/// A Python driver that loads the helper named by its first argument as `m`
+/// and then runs `body`.
+fn python_driver(body: &str) -> String {
     format!(
         "import importlib.util, sys\n\
          sys.dont_write_bytecode = True\n\
          spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
          m = importlib.util.module_from_spec(spec)\n\
          spec.loader.exec_module(m)\n\
-         v = m.password(\"Secret? {marker}\")\n\
-         print(\"password-length=\" + str(None if v is None else len(v)))\n"
+         {body}"
     )
 }
 
-fn typescript_password_driver(marker: &str) -> String {
+fn python_confirm_driver(question: &str) -> String {
+    python_driver(&format!(
+        "print(\"confirm-result=\" + str(m.confirm(\"{question}\")))\n"
+    ))
+}
+
+fn python_guard_driver(question: &str, operation: &str) -> String {
+    python_driver(&format!(
+        "m.guard_operation(\"{question}\", \"{operation}\")\n\
+         print(\"guard-passed\")\n"
+    ))
+}
+
+fn python_select_driver(question: &str) -> String {
+    python_driver(&format!(
+        "print(\"select-result=\" + str(m.select(\"{question}\", [\"a\", \"b\"])))\n"
+    ))
+}
+
+fn python_password_driver(marker: &str) -> String {
+    python_driver(&format!(
+        "v = m.password(\"Secret? {marker}\")\n\
+         print(\"password-length=\" + str(None if v is None else len(v)))\n"
+    ))
+}
+
+/// A TypeScript driver that imports the helper named by its first argument
+/// as `prompt` and then runs `body`.
+fn typescript_driver(body: &str) -> String {
     format!(
         "import {{ pathToFileURL }} from \"node:url\";\n\
          const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
-         const v = prompt.password(\"Secret? {marker}\");\n\
-         console.log(\"password-length=\" + (v === null ? \"null\" : String(v.length)));\n"
+         {body}"
     )
+}
+
+fn typescript_confirm_driver(question: &str) -> String {
+    typescript_driver(&format!(
+        "console.log(\"confirm-result=\" + JSON.stringify(prompt.confirm(\"{question}\")));\n"
+    ))
+}
+
+fn typescript_guard_driver(question: &str, operation: &str) -> String {
+    typescript_driver(&format!(
+        "prompt.guardOperation(\"{question}\", \"{operation}\");\n\
+         console.log(\"guard-passed\");\n"
+    ))
+}
+
+fn typescript_select_driver(question: &str) -> String {
+    typescript_driver(&format!(
+        "console.log(\"select-result=\" + JSON.stringify(prompt.select(\"{question}\", [\"a\", \"b\"])));\n"
+    ))
+}
+
+fn typescript_password_driver(marker: &str) -> String {
+    typescript_driver(&format!(
+        "const v = prompt.password(\"Secret? {marker}\");\n\
+         console.log(\"password-length=\" + (v === null ? \"null\" : String(v.length)));\n"
+    ))
 }
 
 /// Runs `tool` on a pty behind a bash wrapper that survives the tool's
@@ -1437,15 +1334,19 @@ fn macro_run_tells_tools_a_human_is_present() {
 /// `COYOTE_UI=repl` under `--macro`.
 #[test]
 fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_macro_run_exports_the_prompt_helper(&PYTHON);
+}
+
+fn check_macro_run_exports_the_prompt_helper(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let dir = fresh_config_dir("helper-py");
+    };
+    let tag = lang.tag;
+    let dir = fresh_config_dir(&format!("helper-{tag}"));
     let _guard = TempDirGuard(dir.clone());
     let fake = FakeLlm::start(vec![
         Reply::ToolCall {
-            name: "fixture_helper_py".to_string(),
+            name: format!("fixture_helper_{tag}"),
             arguments: "{}".to_string(),
         },
         Reply::Text("fixture done".to_string()),
@@ -1453,8 +1354,34 @@ fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
     write_config(&dir, &fake);
     write_tool(
         &dir,
-        "fixture_helper_py.py",
-        "#!/usr/bin/env python3\n\
+        &format!("fixture_helper_{tag}.{tag}"),
+        &(lang.export_probe)(runtime),
+    );
+    write_macro(
+        &dir,
+        "helper",
+        &format!("Call the fixture helper {tag} tool"),
+    );
+
+    let output = run_coyote(&dir, &["--macro", "helper"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains(lang.export_probe_line),
+        "the {} tool did not get a loadable {} and COYOTE_UI=repl\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        lang.name,
+        lang.helper_env
+    );
+    assert_eq!(fake.served(), 2, "stdout:\n{stdout}");
+}
+
+fn python_export_probe(_runtime: &str) -> String {
+    "#!/usr/bin/env python3\n\
          import importlib.util\n\
          import inspect\n\
          import os\n\
@@ -1471,23 +1398,31 @@ fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
          \x20   op = \"operation\" in inspect.signature(prompt_utils.guard_operation).parameters\n\
          \x20   line = f\"fixture py: abs={os.path.isabs(path)} file={os.path.isfile(path)} helpers={helpers} op={op} ui={os.environ.get('COYOTE_UI', 'unset')}\"\n\
          \x20   print(line, flush=True)\n\
-         \x20   return line\n",
-    );
-    write_macro(&dir, "helper", "Call the fixture helper py tool");
+         \x20   return line\n"
+        .to_string()
+}
 
-    let output = run_coyote(&dir, &["--macro", "helper"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status
-    );
-    assert!(
-        stdout.contains("fixture py: abs=True file=True helpers=7 op=True ui=repl"),
-        "the python tool did not get a loadable LLM_PROMPT_UTILS_PY and COYOTE_UI=repl\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(fake.served(), 2, "stdout:\n{stdout}");
+fn typescript_export_probe(runtime: &str) -> String {
+    format!(
+        "#!/usr/bin/env {runtime}\n\
+         import * as fs from \"node:fs\";\n\
+         import * as path from \"node:path\";\n\
+         import {{ pathToFileURL }} from \"node:url\";\n\
+         \n\
+         /**\n\
+         \x20* Report the prompt helper the host exported.\n\
+         \x20*/\n\
+         export async function run(): Promise<string> {{\n\
+         \x20 const p = process.env.LLM_PROMPT_UTILS_TS ?? \"\";\n\
+         \x20 const prompt = await import(pathToFileURL(p).href);\n\
+         \x20 const names = [\"confirm\", \"select\", \"checkbox\", \"input\", \"password\", \"guard_operation\", \"guard_path\", \"guardOperation\", \"guardPath\"];\n\
+         \x20 const helpers = names.filter((n) => typeof (prompt as any)[n] === \"function\").length;\n\
+         \x20 const op = String(prompt.guardOperation).includes(\"operation\") && prompt.guard_operation === prompt.guardOperation;\n\
+         \x20 const line = `fixture ts: abs=${{path.isAbsolute(p)}} file=${{fs.existsSync(p)}} helpers=${{helpers}} op=${{op}} ui=${{process.env.COYOTE_UI ?? \"unset\"}}`;\n\
+         \x20 console.log(line);\n\
+         \x20 return line;\n\
+         }}\n"
+    )
 }
 
 /// A Python tool that really asks through the channel while nobody can
@@ -1556,58 +1491,7 @@ fn macro_run_cancels_a_python_tools_prompt_when_nobody_can_answer() {
 /// tool sees `COYOTE_UI=repl`.
 #[test]
 fn macro_run_exports_the_typescript_prompt_helper_to_typescript_tools() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("helper-ts");
-    let _guard = TempDirGuard(dir.clone());
-    let fake = FakeLlm::start(vec![
-        Reply::ToolCall {
-            name: "fixture_helper_ts".to_string(),
-            arguments: "{}".to_string(),
-        },
-        Reply::Text("fixture done".to_string()),
-    ]);
-    write_config(&dir, &fake);
-    write_tool(
-        &dir,
-        "fixture_helper_ts.ts",
-        &format!(
-            "#!/usr/bin/env {runtime}\n\
-             import * as fs from \"node:fs\";\n\
-             import * as path from \"node:path\";\n\
-             import {{ pathToFileURL }} from \"node:url\";\n\
-             \n\
-             /**\n\
-             \x20* Report the prompt helper the host exported.\n\
-             \x20*/\n\
-             export async function run(): Promise<string> {{\n\
-             \x20 const p = process.env.LLM_PROMPT_UTILS_TS ?? \"\";\n\
-             \x20 const prompt = await import(pathToFileURL(p).href);\n\
-             \x20 const names = [\"confirm\", \"select\", \"checkbox\", \"input\", \"password\", \"guard_operation\", \"guard_path\", \"guardOperation\", \"guardPath\"];\n\
-             \x20 const helpers = names.filter((n) => typeof (prompt as any)[n] === \"function\").length;\n\
-             \x20 const op = String(prompt.guardOperation).includes(\"operation\") && prompt.guard_operation === prompt.guardOperation;\n\
-             \x20 const line = `fixture ts: abs=${{path.isAbsolute(p)}} file=${{fs.existsSync(p)}} helpers=${{helpers}} op=${{op}} ui=${{process.env.COYOTE_UI ?? \"unset\"}}`;\n\
-             \x20 console.log(line);\n\
-             \x20 return line;\n\
-             }}\n"
-        ),
-    );
-    write_macro(&dir, "helper", "Call the fixture helper ts tool");
-
-    let output = run_coyote(&dir, &["--macro", "helper"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        output.status
-    );
-    assert!(
-        stdout.contains("fixture ts: abs=true file=true helpers=9 op=true ui=repl"),
-        "the typescript tool did not get a loadable LLM_PROMPT_UTILS_TS and COYOTE_UI=repl\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(fake.served(), 2, "stdout:\n{stdout}");
+    check_macro_run_exports_the_prompt_helper(&TYPESCRIPT);
 }
 
 /// The command that runs a `.ts` tool: `node` when it strips types itself,

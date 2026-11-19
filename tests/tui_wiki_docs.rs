@@ -30,10 +30,14 @@
 //! rather than shrinking the table. The literal scraper reads plain `"..."`
 //! strings only.
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use common::source_scan::{fn_body, read, repo_root, src, string_literals};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test tui_wiki_docs`";
@@ -74,25 +78,6 @@ const CHANGELOG_WORDS: [&str; 2] = ["new", "now"];
 /// `("Transcript view", "G")`.
 type Binding = (String, String);
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-fn read(path: impl AsRef<Path>) -> String {
-    let path = path.as_ref();
-    fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-        .replace("\r\n", "\n")
-}
-
-fn src(parts: &[&str]) -> String {
-    let mut path = repo_root().join("src");
-    for part in parts {
-        path = path.join(part);
-    }
-    read(path)
-}
-
 fn asset(parts: &[&str]) -> String {
     let mut path = repo_root().join("assets");
     for part in parts {
@@ -130,40 +115,6 @@ fn production(source: &str) -> &str {
         .map_or(source, |at| &source[..at])
 }
 
-/// Every `"..."` literal in `source`, in order, with `\"`, `\\` and `\n`
-/// unescaped and a `\` line continuation dropped the way rustc drops it.
-fn string_literals(source: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let mut chars = source.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut literal = String::new();
-        loop {
-            match chars.next() {
-                Some('"') => break,
-                Some('\\') => match chars.next() {
-                    Some(escaped @ ('"' | '\\')) => literal.push(escaped),
-                    Some('n') => literal.push('\n'),
-                    Some('\n') => {
-                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                            chars.next();
-                        }
-                    }
-                    other => panic!(
-                        "unexpected escape {other:?} in {literal:?}; extend string_literals in tests/tui_wiki_docs.rs"
-                    ),
-                },
-                Some(c) => literal.push(c),
-                None => panic!("unterminated string literal: {literal:?}"),
-            }
-        }
-        literals.push(literal);
-    }
-    literals
-}
-
 /// The value of the string constant `name` in `source`, whatever its
 /// visibility and whether it is typed `&str` or `&'static str`.
 fn const_str(source: &str, name: &str) -> String {
@@ -192,28 +143,6 @@ fn const_expr(source: &str, name: &str) -> String {
     value[..value.find(';').expect("a const ends with `;`")]
         .trim()
         .to_string()
-}
-
-/// The source of the function whose signature starts with `head` in
-/// `source`, up to the first `}` standing alone on a line at the function's
-/// own indentation.
-fn fn_body(source: &str, head: &str) -> String {
-    let start = source
-        .find(head)
-        .unwrap_or_else(|| panic!("the source defines {head}"));
-    let indent: String = source[..start]
-        .rsplit('\n')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take_while(|c| c.is_whitespace())
-        .collect();
-    let body = &source[start..];
-    let close = format!("\n{indent}}}");
-    let end = body
-        .find(&close)
-        .unwrap_or_else(|| panic!("{head} closes with `}}` on its own line"));
-    body[..end].to_string()
 }
 
 /// The one string literal in `source` that contains `needle`. Only the code
