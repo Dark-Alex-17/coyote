@@ -149,6 +149,21 @@ impl From<JobHandle> for TaskHandle {
     }
 }
 
+impl TaskHandle {
+    fn status(&self) -> TaskRowStatus {
+        match self {
+            Self::Agent(agent) if agent.join_handle.is_finished() => TaskRowStatus::Finished,
+            Self::Agent(_) => TaskRowStatus::Running,
+            Self::Job(job) => match job.state.lock().status {
+                JobStatus::Running if job.join_handle.is_finished() => TaskRowStatus::Finished,
+                JobStatus::Running => TaskRowStatus::Running,
+                JobStatus::Completed => TaskRowStatus::Completed,
+                JobStatus::Failed => TaskRowStatus::Failed,
+            },
+        }
+    }
+}
+
 pub struct Supervisor {
     handles: HashMap<String, TaskHandle>,
     task_queue: TaskQueue,
@@ -376,11 +391,7 @@ impl Supervisor {
                     kind: TaskKind::Agent,
                     name: agent.agent_name.clone(),
                     started_at: None,
-                    status: if agent.join_handle.is_finished() {
-                        TaskRowStatus::Finished
-                    } else {
-                        TaskRowStatus::Running
-                    },
+                    status: handle.status(),
                     session_id: agent.session_id.clone(),
                 },
                 TaskHandle::Job(job) => TaskRow {
@@ -388,20 +399,34 @@ impl Supervisor {
                     kind: TaskKind::Job,
                     name: job.tool.clone(),
                     started_at: Some(job.started_at),
-                    status: match job.state.lock().status {
-                        JobStatus::Running if job.join_handle.is_finished() => {
-                            TaskRowStatus::Finished
-                        }
-                        JobStatus::Running => TaskRowStatus::Running,
-                        JobStatus::Completed => TaskRowStatus::Completed,
-                        JobStatus::Failed => TaskRowStatus::Failed,
-                    },
+                    status: handle.status(),
                     session_id: None,
                 },
             })
             .collect();
         rows.sort_by(|a, b| a.id.cmp(&b.id));
         rows
+    }
+
+    /// How many agents and how many jobs are `Running`, as `task_snapshot`
+    /// reports it, here and in every agent's child supervisor below.
+    pub fn running_counts(&self) -> (usize, usize) {
+        let mut counts = (0, 0);
+        for handle in self.handles.values() {
+            let running = handle.status() == TaskRowStatus::Running;
+            match handle {
+                TaskHandle::Agent(agent) => {
+                    counts.0 += usize::from(running);
+                    if let Some(child_sup) = agent.child_supervisor.as_ref() {
+                        let (agents, jobs) = child_sup.read().running_counts();
+                        counts.0 += agents;
+                        counts.1 += jobs;
+                    }
+                }
+                TaskHandle::Job(_) => counts.1 += usize::from(running),
+            }
+        }
+        counts
     }
 
     pub fn cancel_all(&self) {

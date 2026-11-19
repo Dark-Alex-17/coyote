@@ -55,6 +55,14 @@ impl RosterSources {
         }
         rows
     }
+
+    /// The running agents and jobs for the footer, counted the way the
+    /// rows show them but through every child agent's supervisor too.
+    pub(super) fn running_counts(&self) -> (usize, usize) {
+        self.supervisor
+            .as_ref()
+            .map_or((0, 0), |supervisor| supervisor.read().running_counts())
+    }
 }
 
 /// A question a child agent is blocked on until the user answers it.

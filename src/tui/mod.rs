@@ -31,7 +31,7 @@ mod todo;
 mod transcript;
 
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
-use crate::config::{AppConfig, RequestContext};
+use crate::config::{AppConfig, RequestContext, jobs_enabled};
 use crate::events::{EventSink, NoticeKind, Origin, SubscriptionId};
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
 use crate::function::jobs::JOB_KILL_GRACE;
@@ -512,14 +512,13 @@ async fn settle_control_tasks(mut controls: JoinSet<()>, wait: Duration) {
     }
 }
 
-/// The footer's left half, read from the context only while the UI holds it.
+/// The footer's left half, read from the context only while the UI holds
+/// it; the task counts after it are read live when it is drawn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FooterInfo {
     who: Option<String>,
     model: String,
     session: Option<String>,
-    agents: usize,
-    jobs: usize,
 }
 
 impl FooterInfo {
@@ -529,20 +528,14 @@ impl FooterInfo {
             .as_ref()
             .map(|agent| agent.name().to_string())
             .or_else(|| ctx.role.as_ref().map(|role| role.name().to_string()));
-        let (agents, jobs) = ctx.supervisor.as_ref().map_or((0, 0), |supervisor| {
-            let supervisor = supervisor.read();
-            (supervisor.active_count(), supervisor.active_job_count())
-        });
         Self {
             who,
             model: ctx.model.id(),
             session: ctx.session.as_ref().map(|s| s.name().to_string()),
-            agents,
-            jobs,
         }
     }
 
-    fn text(&self) -> String {
+    fn text(&self, (agents, jobs): (usize, usize)) -> String {
         let mut parts = Vec::new();
         if let Some(who) = &self.who {
             parts.push(who.clone());
@@ -553,8 +546,8 @@ impl FooterInfo {
                 .clone()
                 .unwrap_or_else(|| "no session".to_string()),
         );
-        parts.push(format!("agents {}", self.agents));
-        parts.push(format!("jobs {}", self.jobs));
+        parts.push(format!("agents {agents}"));
+        parts.push(format!("jobs {jobs}"));
         parts.join(" . ")
     }
 }
@@ -1450,6 +1443,11 @@ impl App {
         // rather than by the first spawn, so the one a turn hands to its
         // children is the one the roster reads.
         ctx.ensure_root_escalation_queue();
+        // The same goes for a supervisor `job__start` would otherwise make
+        // mid-turn, out of the footer's and the roster's sight.
+        if jobs_enabled(ctx.agent.as_ref(), &ctx.app.config) {
+            ctx.ensure_root_supervisor();
+        }
         self.roster_sources = RosterSources {
             supervisor: ctx.supervisor.clone(),
             escalations: ctx.escalation_queue.clone(),
@@ -3294,7 +3292,7 @@ impl App {
 
         frame.render_widget(
             FooterBar {
-                left: self.footer.text(),
+                left: self.footer.text(self.roster_sources.running_counts()),
                 right: render::styled_line(&self.usage),
             },
             footer,
@@ -11421,6 +11419,94 @@ mod tests {
             child_session_root: None,
             succeeded: Default::default(),
         }
+    }
+
+    fn running_agent(id: &str) -> crate::supervisor::AgentHandle {
+        crate::supervisor::AgentHandle {
+            join_handle: tokio::spawn(std::future::pending()),
+            ..finished_agent(id)
+        }
+    }
+
+    fn footer_counts(harness: &mut Harness) -> String {
+        let frame = harness.draw();
+        let footer = frame.lines().last().unwrap_or_default();
+        let start = footer.find("agents").expect("the footer has its counts");
+        footer[start..]
+            .split("  ")
+            .next()
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    /// The turn holds the context while it runs, so the footer counts
+    /// what the supervisor it last saw has now, not what it had then.
+    #[test]
+    fn the_footer_counts_tasks_registered_after_the_context_left() {
+        run_async(async {
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+            assert_eq!(footer_counts(&mut harness), "agents 0 . jobs 0");
+
+            tasks.write().register(running_agent("agent-f1a")).unwrap();
+            assert_eq!(footer_counts(&mut harness), "agents 1 . jobs 0");
+            tasks.write().register(running_job("job-f1a")).unwrap();
+            assert_eq!(footer_counts(&mut harness), "agents 1 . jobs 1");
+
+            tasks.write().take("agent-f1a");
+            tasks.write().take_job("job-f1a");
+            assert_eq!(footer_counts(&mut harness), "agents 0 . jobs 0");
+        });
+    }
+
+    /// A child agent's own agents and jobs live in its supervisor, and
+    /// the footer counts them with the main session's.
+    #[test]
+    fn the_footer_counts_the_tasks_of_child_agents() {
+        run_async(async {
+            let mut ctx = chat_ctx();
+            let tasks = supervisor();
+            ctx.supervisor = Some(Arc::clone(&tasks));
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+
+            let child_tasks = supervisor();
+            let mut child = running_agent("agent-c1b");
+            child.child_supervisor = Some(Arc::clone(&child_tasks));
+            tasks.write().register(child).unwrap();
+            child_tasks
+                .write()
+                .register(running_agent("agent-g1b"))
+                .unwrap();
+            child_tasks
+                .write()
+                .register(running_job("job-g1b"))
+                .unwrap();
+            assert_eq!(footer_counts(&mut harness), "agents 2 . jobs 1");
+        });
+    }
+
+    /// A plain chat has no agent to make a supervisor, yet `job__start`
+    /// is offered; the return of the context makes the one it will use,
+    /// so a job it starts mid-turn reaches the footer and the roster.
+    #[test]
+    fn a_job_started_without_a_supervisor_lands_where_the_footer_reads() {
+        run_async(async {
+            let mut ctx = chat_ctx();
+            assert!(ctx.supervisor.is_none());
+            let mut harness = Harness::for_ctx(&ctx);
+            harness.app.sync_from_ctx(&mut ctx);
+
+            let tasks = ctx.ensure_root_supervisor();
+            let held = harness.app.roster_sources.supervisor.as_ref();
+            assert!(Arc::ptr_eq(held.expect("made on the return"), &tasks));
+            tasks.write().register(running_job("job-l1c")).unwrap();
+            assert_eq!(footer_counts(&mut harness), "agents 0 . jobs 1");
+        });
     }
 
     /// Runs what the roster or pager queued the way the loop does and
