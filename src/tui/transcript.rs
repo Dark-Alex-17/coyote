@@ -26,12 +26,14 @@ struct RowSpan {
 }
 
 /// The line at the top of the last frame, by the cell it belongs to and
-/// the row inside that cell; a row one past the cell's last is the blank
-/// line after it.
+/// the row inside that cell. The blank line between two cells is held by
+/// the cell below it with `gap` set, so the cell above growing does not
+/// carry it down.
 #[derive(Clone, Copy)]
 struct Anchor {
     cell: usize,
     row: usize,
+    gap: bool,
 }
 
 pub(super) struct Transcript {
@@ -243,10 +245,12 @@ impl Transcript {
             Some(anchor) if anchor.cell == index && index < self.cells.len() => Some(Anchor {
                 cell: index,
                 row: 0,
+                ..anchor
             }),
             Some(anchor) if anchor.cell == index => index.checked_sub(1).map(|cell| Anchor {
                 cell,
                 row: usize::MAX,
+                gap: false,
             }),
             Some(anchor) if anchor.cell > index => Some(Anchor {
                 cell: anchor.cell - 1,
@@ -277,9 +281,17 @@ impl Transcript {
         if self.stream.is_some_and(|stream| stream >= len) {
             self.stream = None;
         }
-        if self.anchor.is_some_and(|anchor| anchor.cell >= len) {
-            self.anchor = None;
-        }
+        self.anchor = match self.anchor {
+            Some(anchor) if anchor.gap && anchor.cell == len => {
+                len.checked_sub(1).map(|cell| Anchor {
+                    cell,
+                    row: usize::MAX,
+                    gap: false,
+                })
+            }
+            Some(anchor) if anchor.cell >= len => None,
+            other => other,
+        };
         if self.cells.is_empty() {
             self.cells
                 .push(Cell::welcome(self.model.clone(), self.prefix));
@@ -469,9 +481,17 @@ impl Transcript {
         self.anchor = headers
             .partition_point(|header| *header <= start)
             .checked_sub(1)
-            .map(|cell| Anchor {
-                cell,
-                row: start - headers[cell],
+            .map(|cell| match headers.get(cell + 1) {
+                Some(next) if start + 1 == *next => Anchor {
+                    cell: cell + 1,
+                    row: 0,
+                    gap: true,
+                },
+                _ => Anchor {
+                    cell,
+                    row: start - headers[cell],
+                    gap: false,
+                },
             });
 
         let mut lines = Vec::with_capacity(end - start);
@@ -550,6 +570,9 @@ impl Anchor {
     /// cell that shrank past the row gives the line after its last.
     fn line(self, headers: &[usize], total: usize) -> Option<usize> {
         let header = *headers.get(self.cell)?;
+        if self.gap {
+            return Some(header.saturating_sub(1));
+        }
         let end = headers.get(self.cell + 1).map_or(total, |next| next - 1);
         Some(header + self.row.min(end - header))
     }
@@ -1089,6 +1112,52 @@ mod tests {
         let view = transcript.view(area(5), &mut renderer);
         assert_eq!(rows(&view)[0], before[2], "{:?}", rows(&view));
         assert_eq!(view.chip.as_deref(), Some("3 new below  End = follow"));
+    }
+
+    /// Five user lines, a running tool row and ten more user lines, in a
+    /// 5-line view scrolled to start on the blank line after the tool row.
+    fn scrolled_to_the_gap_after_a_tool() -> (Transcript, Renderer, Vec<String>) {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..5 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(tool("a"));
+        grow_tool(&mut transcript, 5, "a", 2);
+        for i in 6..16 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        let all = rows(&transcript.view(area(100), &mut renderer));
+        let top = all.iter().position(|row| row == "> line 6").unwrap() - 1;
+        let offset = i32::try_from(all.len() - top - 5).unwrap();
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-offset);
+        let before = rows(&transcript.view(area(5), &mut renderer));
+        assert_eq!(before[..2], ["", "> line 6"], "{before:?}");
+        (transcript, renderer, before)
+    }
+
+    /// A view starting on the blank line after a running tool row stays
+    /// on it as the row grows, rather than starting on the new output.
+    #[test]
+    fn a_view_starting_between_cells_holds_as_the_cell_above_grows() {
+        let (mut transcript, mut renderer, before) = scrolled_to_the_gap_after_a_tool();
+        let offset = transcript.offset_from_bottom;
+        grow_tool(&mut transcript, 5, "a", 3);
+        let after = rows(&transcript.view(area(5), &mut renderer));
+        assert_eq!(after, before);
+        assert_eq!(transcript.offset_from_bottom, offset);
+    }
+
+    /// Removing the cell after the blank line the view starts on leaves
+    /// the view on that blank line, now before the cell that followed.
+    #[test]
+    fn removing_the_cell_after_a_view_starting_between_cells_keeps_the_gap() {
+        let (mut transcript, mut renderer, _) = scrolled_to_the_gap_after_a_tool();
+        transcript.remove(6);
+        transcript.push(Cell::user("late"));
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view)[..2], ["", "> line 7"], "{:?}", rows(&view));
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
     }
 
     /// Output arriving while the view had no room (the todo panel took
