@@ -2534,6 +2534,99 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         );
     }
 
+    /// Runs a guarded `tool` on `first`, remembers its question the way
+    /// "Yes for this session" does, and checks that `first` then runs
+    /// unasked while `second` asks again. Paths reach the question
+    /// resolved, so only their last component is looked for.
+    fn check_session_yes_covers_one_operation(
+        tool: &str,
+        run: impl Fn(&str, ToolIo) -> Value,
+        first: &str,
+        second: &str,
+    ) {
+        let leaf = |target: &str| target.rsplit('/').next().unwrap().to_string();
+        let memory = Arc::new(PromptMemory::default());
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+        ]));
+
+        let output = run(first, io_with(&prompter, Arc::clone(&memory)));
+        assert_eq!(output.get("tool_call_error"), None, "{tool}: {output}");
+        let asked = prompter.requests();
+        assert_eq!(asked.len(), 1, "{tool}: {asked:?}");
+        let question = asked[0].question.clone();
+        assert!(question.contains(&leaf(first)), "{tool}: {question:?}");
+        memory.remember(tool, &question);
+
+        let sink = RecordingSink::install();
+        let output = run(first, io_with(&prompter, Arc::clone(&memory)));
+        assert_eq!(output.get("tool_call_error"), None, "{tool}: {output}");
+        assert_eq!(
+            prompter.requests().len(),
+            1,
+            "{tool}: the remembered operation asked again"
+        );
+        let (_, answered) = prompt_events(sink.drain(), &question);
+        assert!(
+            matches!(
+                answered.as_slice(),
+                [Event::PromptAnswered { auto: true, .. }]
+            ),
+            "{tool}: {answered:?}"
+        );
+
+        let output = run(second, io_with(&prompter, memory));
+        assert_eq!(output.get("tool_call_error"), None, "{tool}: {output}");
+        let asked = prompter.requests();
+        assert_eq!(
+            asked.len(),
+            2,
+            "{tool}: a different operation must ask again: {asked:?}"
+        );
+        assert!(
+            asked[1].question.contains(&leaf(second)),
+            "{tool}: {:?}",
+            asked[1].question
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_yes_covers_only_that_operation_or_path() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-session-yes");
+        install_tool(
+            "op-x7x",
+            "unset AUTO_CONFIRM LLM_AGENT_VAR_AUTO_CONFIRM\nguard_operation \"Run?\" \"$GUARD_X7X\"\necho ok >> \"$LLM_OUTPUT\"",
+        );
+        install_tool(
+            "path-x7x",
+            "unset AUTO_CONFIRM LLM_AGENT_VAR_AUTO_CONFIRM\nguard_path \"$GUARD_X7X\" \"Touch?\"\necho ok >> \"$LLM_OUTPUT\"",
+        );
+        let runner = |tool: &'static str| {
+            move |target: &str, io: ToolIo| {
+                let mut envs = tool_envs();
+                envs.insert("GUARD_X7X".to_string(), target.to_string());
+                run_tool(tool, envs, io)
+            }
+        };
+        let outside = std::env::temp_dir();
+
+        check_session_yes_covers_one_operation(
+            "op-x7x",
+            runner("op-x7x"),
+            "echo one-x7x",
+            "echo two-x7x",
+        );
+        check_session_yes_covers_one_operation(
+            "path-x7x",
+            runner("path-x7x"),
+            &outside.join("one-x7x.txt").to_string_lossy(),
+            &outside.join("two-x7x.txt").to_string_lossy(),
+        );
+    }
+
     /// A tool that drew a progress line without a newline and then prompts
     /// must get its answer, keep the partial output, and never leak the
     /// request line to the display.
@@ -3376,8 +3469,14 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 "inside path asks nothing: {}",
                 run.stdout
             );
-            assert_eq!(requests[0]["coyote_prompt"]["question"], "Outside?");
-            assert_eq!(requests[1]["coyote_prompt"]["question"], "Again?");
+            assert_eq!(
+                requests[0]["coyote_prompt"]["question"],
+                format!("Outside?\n{outside}")
+            );
+            assert_eq!(
+                requests[1]["coyote_prompt"]["question"],
+                format!("Again?\n{outside}")
+            );
             assert_eq!(
                 run.other_lines(),
                 vec!["inside rc=0", "outside rc=0"],
@@ -3396,6 +3495,49 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             );
             assert_eq!(run.code, 1, "{}\n{}", run.stdout, run.stderr);
             assert!(!run.stdout.contains("outside rc="), "{}", run.stdout);
+            fs::remove_dir_all(&dir).ok();
+        }
+
+        /// "Yes for this session" is remembered against the question, so the
+        /// question must name the operation or path a guard lets through.
+        #[test]
+        fn guards_name_the_operation_or_path_they_guard() {
+            require_tools();
+            let dir = scratch_dir("guard-names");
+            let outside = std::env::temp_dir().join("coyote-prompt-utils-named.txt");
+            let outside = outside.to_string_lossy().into_owned();
+            let body = format!(
+                "guard_operation \"Run?\" \"rm -rf build\"; \
+                 guard_operation \"\" \"ls\"; \
+                 guard_operation \"Run?\"; \
+                 guard_path \"{outside}\" \"Remove '{outside}'?\"; \
+                 guard_path \"{outside}\" \"Touch?\"; echo done"
+            );
+            let yes = [
+                json!(true),
+                json!(true),
+                json!(true),
+                json!(true),
+                json!(true),
+            ];
+            let run = run_helper(&dir, Some(&yes), &body, false);
+            assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let questions: Vec<Value> = run
+                .request_lines()
+                .iter()
+                .map(|req| req["coyote_prompt"]["question"].clone())
+                .collect();
+            assert_eq!(
+                questions,
+                vec![
+                    json!("Run?\nrm -rf build"),
+                    json!("Are you sure you want to continue?\nls"),
+                    json!("Run?"),
+                    json!(format!("Remove '{outside}'?")),
+                    json!(format!("Touch?\n{outside}")),
+                ]
+            );
+            assert_eq!(run.other_lines(), vec!["done"]);
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -3559,14 +3701,14 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert_eq!(requests.len(), 1, "{}", run.stdout);
             assert_eq!(
                 requests[0]["coyote_prompt"]["question"],
-                "Are you sure you want to continue?"
+                "Run this command?\necho ran-x7x"
             );
             assert_eq!(run.other_lines(), vec!["ran-x7x"]);
 
             for answer in [json!(false), Value::Null] {
                 let run = run_helper(&dir, Some(std::slice::from_ref(&answer)), &body, false);
                 assert_eq!(run.code, 1, "{answer}: {}\n{}", run.stdout, run.stderr);
-                assert!(!run.stdout.contains("ran-x7x"), "{answer}: {}", run.stdout);
+                assert!(run.other_lines().is_empty(), "{answer}: {}", run.stdout);
                 assert!(
                     run.stderr.contains("Operation aborted!"),
                     "{answer}: execute_command must say why it stopped; stderr={:?}",
@@ -3618,6 +3760,78 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             );
             fs::remove_dir_all(&dir).ok();
             fs::remove_dir_all(&victim_dir).ok();
+        }
+
+        /// Installs shipped `tool` under its own name the way the shim runs
+        /// it, with the call's JSON arguments read from `LLM_TOOL_RAW_JSON`.
+        fn install_shipped(tool: &str) {
+            install_tool(
+                tool,
+                &format!(
+                    "unset AUTO_CONFIRM LLM_AGENT_VAR_AUTO_CONFIRM\n\
+                     export LLM_PROMPT_UTILS_FILE=\"{HELPER}\"\n\
+                     source \"{TOOLS}/{tool}.sh\"\nmain"
+                ),
+            );
+        }
+
+        fn run_shipped(tool: &str, args: Value, io: ToolIo) -> Value {
+            let mut envs = tool_envs();
+            envs.insert("LLM_TOOL_RAW_JSON".to_string(), args.to_string());
+            run_tool(tool, envs, io)
+        }
+
+        #[test]
+        #[serial]
+        fn shipped_execute_command_session_yes_covers_only_that_command() {
+            require_tools();
+            let _guard = TestConfigDirGuard::new("prompt-shipped-exec-session");
+            install_shipped("execute_command");
+
+            check_session_yes_covers_one_operation(
+                "execute_command",
+                |command, io| run_shipped("execute_command", json!({"command": command}), io),
+                "echo one-x7x",
+                "echo two-x7x",
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn shipped_fs_write_and_fs_patch_session_yes_covers_only_that_path() {
+            require_tools();
+            let _guard = TestConfigDirGuard::new("prompt-shipped-write-session");
+            let dir = scratch_dir("shipped-write-session");
+            let first = dir.join("one-x7x.txt").to_string_lossy().into_owned();
+            let second = dir.join("two-x7x.txt").to_string_lossy().into_owned();
+            install_shipped("fs_write");
+            install_shipped("fs_patch");
+
+            // An existing file takes the overwrite branch.
+            check_session_yes_covers_one_operation(
+                "fs_write",
+                |path, io| {
+                    fs::write(path, "old\n").unwrap();
+                    run_shipped("fs_write", json!({"path": path, "content": "new\n"}), io)
+                },
+                &first,
+                &second,
+            );
+            check_session_yes_covers_one_operation(
+                "fs_patch",
+                |path, io| {
+                    fs::write(path, "old\n").unwrap();
+                    run_shipped(
+                        "fs_patch",
+                        json!({"path": path, "content": "@@\n-old\n+new\n"}),
+                        io,
+                    )
+                },
+                &first,
+                &second,
+            );
+            assert_eq!(fs::read_to_string(&second).unwrap(), "new\n");
+            fs::remove_dir_all(&dir).ok();
         }
 
         #[test]
@@ -4684,6 +4898,105 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert_cancelled(&output, &prompter, "Delete? cancel-ts-x7x");
         }
 
+        /// Runs shim tool `name` with `target` in `GUARD_X7X`.
+        fn run_guarded(name: &'static str) -> impl Fn(&str, ToolIo) -> Value {
+            move |target, io| {
+                let _target = crate::testing::EnvVarGuard::set("GUARD_X7X", target);
+                run_shim_tool(name, io)
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn python_session_yes_covers_only_that_operation_or_path() {
+            if !python_available() {
+                return;
+            }
+            let guard = TestConfigDirGuard::new("prompt-py-session");
+            let _functions = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("functions_dir"),
+                guard.path.join("functions"),
+            );
+            for (tool, call) in [
+                ("op-py-x7x", "guard_operation(\"Run?\", target)"),
+                ("path-py-x7x", "guard_path(target, \"Touch?\")"),
+            ] {
+                install_script_tool(
+                    PY_HELPER,
+                    &format!("{tool}.py"),
+                    &format!(
+                        "#!/usr/bin/env python3\n{PY_IMPORT}\n\
+                         def run(**kwargs):\n\
+                         \x20   os.environ.pop(\"AUTO_CONFIRM\", None)\n\
+                         \x20   os.environ.pop(\"LLM_AGENT_VAR_AUTO_CONFIRM\", None)\n\
+                         \x20   target = os.environ[\"GUARD_X7X\"]\n\
+                         \x20   prompt_utils.{call}\n\
+                         \x20   return \"ok\\n\"\n"
+                    ),
+                );
+            }
+            let outside = std::env::temp_dir();
+
+            check_session_yes_covers_one_operation(
+                "op-py-x7x",
+                run_guarded("op-py-x7x"),
+                "echo one-x7x",
+                "echo two-x7x",
+            );
+            check_session_yes_covers_one_operation(
+                "path-py-x7x",
+                run_guarded("path-py-x7x"),
+                &outside.join("one-x7x.txt").to_string_lossy(),
+                &outside.join("two-x7x.txt").to_string_lossy(),
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn typescript_session_yes_covers_only_that_operation_or_path() {
+            let Some(runtime) = ts_runtime() else {
+                return;
+            };
+            let guard = TestConfigDirGuard::new("prompt-ts-session");
+            let _functions = crate::testing::EnvVarGuard::set(
+                crate::utils::get_env_name("functions_dir"),
+                guard.path.join("functions"),
+            );
+            for (tool, call) in [
+                ("op-ts-x7x", "guardOperation(\"Run?\", target)"),
+                ("path-ts-x7x", "guardPath(target, \"Touch?\")"),
+            ] {
+                install_script_tool(
+                    TS_HELPER,
+                    &format!("{tool}.ts"),
+                    &ts_tool(
+                        runtime,
+                        &format!(
+                            "  delete process.env[\"AUTO_CONFIRM\"];\n\
+                             \x20 delete process.env[\"LLM_AGENT_VAR_AUTO_CONFIRM\"];\n\
+                             \x20 const target = process.env[\"GUARD_X7X\"] ?? \"\";\n\
+                             \x20 prompt.{call};\n\
+                             \x20 return \"ok\\n\";"
+                        ),
+                    ),
+                );
+            }
+            let outside = std::env::temp_dir();
+
+            check_session_yes_covers_one_operation(
+                "op-ts-x7x",
+                run_guarded("op-ts-x7x"),
+                "echo one-x7x",
+                "echo two-x7x",
+            );
+            check_session_yes_covers_one_operation(
+                "path-ts-x7x",
+                run_guarded("path-ts-x7x"),
+                &outside.join("one-x7x.txt").to_string_lossy(),
+                &outside.join("two-x7x.txt").to_string_lossy(),
+            );
+        }
+
         struct Run {
             /// Stdout minus the request lines.
             printed: Vec<String>,
@@ -4887,7 +5200,8 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         /// containment check here is tighter than bash's string-prefix match:
         /// it compares path components, so a sibling sharing the prefix still
         /// asks, and it looks at where a path really lands, so a new file
-        /// under a symlink that points outside asks too.
+        /// under a symlink that points outside asks too. Like bash, a guard's
+        /// question names the operation or the resolved path it guards.
         fn check_guards(eval: GuardEval<'_>, continued: &str, cwd: &Path) {
             fs::create_dir_all(cwd.join("sub")).unwrap();
             let sibling = PathBuf::from(format!("{}-sibling", cwd.display()));
@@ -4929,6 +5243,30 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 );
                 assert_eq!(run.printed, vec![continued], "{var}");
                 assert!(run.stderr.is_empty(), "{var}: {}", run.stderr);
+            }
+
+            let run = eval(
+                "guard_operation(\"Run?\", \"rm -rf build\")",
+                Some(&[json!(true)]),
+                &[],
+                cwd,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(run.wire[0]["question"], "Run?\nrm -rf build");
+
+            let resolved = fs::canonicalize(cwd)
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("outside.txt");
+            for (question, sent) in [
+                ("Touch?", format!("Touch?\n{}", resolved.display())),
+                ("Touch ../outside.txt?", "Touch ../outside.txt?".to_string()),
+            ] {
+                let expr = format!("guard_path(\"../outside.txt\", \"{question}\")");
+                let run = eval(&expr, Some(&[json!(true)]), &[], cwd);
+                assert_eq!(run.code, 0, "{question}: {}", run.stderr);
+                assert_eq!(run.wire[0]["question"], sent.as_str(), "{question}");
             }
 
             let inside = [

@@ -25,7 +25,7 @@ main() {
 
     if [[ -f "$argc_path" ]]; then
         printf "%s" "$argc_contents" | git diff --no-index "$argc_path" - || true
-        guard_operation "Apply changes?"
+        guard_operation "Apply changes?" "$(_to_real_path "$argc_path")"
     else
         guard_path "$argc_path" "Write '$argc_path'?"
         mkdir -p "$(dirname "$argc_path")"

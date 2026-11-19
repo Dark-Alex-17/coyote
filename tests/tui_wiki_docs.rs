@@ -1335,6 +1335,86 @@ fn tool_prompts_are_documented_with_their_label_and_password_gate() {
     );
 }
 
+#[test]
+fn session_yes_is_documented_as_covering_one_operation_or_path() {
+    let sh = asset(&["functions", "utils", "prompt-utils.sh"]);
+    let py = asset(&["functions", "utils", "prompt-utils.py"]);
+    let ts = asset(&["functions", "utils", "prompt-utils.ts"]);
+    assert!(fn_body(&sh, "guard_operation() {").contains("question=\"$question\"$'\\n'\"$2\""));
+    assert!(
+        fn_body(&sh, "guard_path() {")
+            .contains("confirmation_prompt=\"$confirmation_prompt\"$'\\n'\"$path\"")
+    );
+    assert!(py.contains(
+        "def guard_operation(question=\"Are you sure you want to continue?\", operation=None):"
+    ));
+    assert!(fn_body(&ts, "export function guardOperation(").contains("operation?: string,"));
+    for (tool, call) in [
+        (
+            "execute_command.sh",
+            "guard_operation \"Run this command?\" \"$argc_command\"",
+        ),
+        (
+            "fs_write.sh",
+            "guard_operation \"Apply changes?\" \"$(_to_real_path \"$argc_path\")\"",
+        ),
+        (
+            "fs_patch.sh",
+            "guard_operation \"Apply changes?\" \"$(_to_real_path \"$argc_path\")\"",
+        ),
+    ] {
+        assert!(
+            asset(&["functions", "tools", tool]).contains(call),
+            "{tool} names what it guards"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let bash = read(wiki.join("Bash-Prompt-Helpers.md"));
+    let operation = flat(&section(
+        "Bash-Prompt-Helpers.md",
+        &bash,
+        "## guard_operation",
+    ));
+    for needle in [
+        "Usage: `guard_operation [question] [operation]`",
+        "\"Yes for this session\" covers only that exact operation; a different operation asks again",
+    ] {
+        assert!(
+            operation.contains(needle),
+            "Bash-Prompt-Helpers.md says {needle}"
+        );
+    }
+    let path = flat(&section("Bash-Prompt-Helpers.md", &bash, "## guard_path"));
+    for needle in [
+        "Usage: `guard_path <path> <question>`",
+        "\"Yes for this session\" covers only that exact path; a different path asks again",
+    ] {
+        assert!(
+            path.contains(needle),
+            "Bash-Prompt-Helpers.md says {needle}"
+        );
+    }
+    let custom = flat(&section(
+        "Custom-Tools.md",
+        &read(wiki.join("Custom-Tools.md")),
+        PROTOCOL_HEADING,
+    ));
+    for needle in [
+        "`guard_operation(question, operation)` (`guardOperation(question, operation)` in TypeScript) takes an optional operation",
+        "so the answer covers only that exact path. Anything different asks again.",
+    ] {
+        assert!(custom.contains(needle), "Custom-Tools.md says {needle}");
+    }
+    let page = flat(&read(wiki.join(PAGE)));
+    for needle in [
+        "for a guarded tool it covers only that exact command or path, and anything different asks again",
+        "for a guarded tool only for that exact command or path; anything different asks again",
+    ] {
+        assert!(page.contains(needle), "{PAGE} says {needle}");
+    }
+}
+
 /// Every `refuse_non_interactive(` call in `source`: its action format and
 /// its remedy, when the remedy is a literal.
 fn refusal_calls(source: &str) -> Vec<(String, Option<String>)> {
@@ -1493,6 +1573,14 @@ fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
         (
             format!("Bash-Prompt-Helpers.md {CHANNEL_HEADING}"),
             section("Bash-Prompt-Helpers.md", &bash, CHANNEL_HEADING),
+        ),
+        (
+            "Bash-Prompt-Helpers.md ## guard_operation".to_string(),
+            section("Bash-Prompt-Helpers.md", &bash, "## guard_operation"),
+        ),
+        (
+            "Bash-Prompt-Helpers.md ## guard_path".to_string(),
+            section("Bash-Prompt-Helpers.md", &bash, "## guard_path"),
         ),
         (
             format!("Environment-Variables.md {ENV_HEADING}"),

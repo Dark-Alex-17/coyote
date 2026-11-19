@@ -23,6 +23,13 @@
 // their own; typing an option's exact text returns its index, and an empty
 // or whitespace-only answer returns null like a cancel.
 //
+// guardOperation(question?, operation?) and guardPath(target, question)
+// abort the tool unless the user confirms. "Yes for this session" is
+// remembered against the exact question, so a guard names what it guards:
+// guardOperation sends the question, a newline and the operation when one
+// is given, and guardPath appends a newline and the resolved path unless the
+// question already contains the path as given.
+//
 // When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 // writes one request line to the tool's stdout and reads the answer line back
 // from the channel. The request line looks like this, with the marker broken
@@ -422,11 +429,14 @@ function abortUnlessConfirmed(question: string): void {
   }
 }
 
-export function guardOperation(question = "Are you sure you want to continue?"): void {
+export function guardOperation(
+  question = "Are you sure you want to continue?",
+  operation?: string,
+): void {
   if (autoConfirmed()) {
     return;
   }
-  abortUnlessConfirmed(question);
+  abortUnlessConfirmed(operation === undefined ? question : `${question}\n${operation}`);
 }
 
 export function guardPath(target: string, question: string): void {
@@ -438,7 +448,7 @@ export function guardPath(target: string, question: string): void {
   if (resolved === cwd || resolved.startsWith(cwd.replace(/[\\/]+$/, "") + path.sep)) {
     return;
   }
-  abortUnlessConfirmed(question);
+  abortUnlessConfirmed(question.includes(target) ? question : `${question}\n${resolved}`);
 }
 
 function realpathIfExists(target: string): string {

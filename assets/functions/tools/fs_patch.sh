@@ -65,7 +65,7 @@ main() {
 
     printf "%s" "$new_contents" | git diff --no-index "$argc_path" - || true
 
-    guard_operation "Apply changes?"
+    guard_operation "Apply changes?" "$(_to_real_path "$argc_path")"
 
     printf "%s" "$new_contents" > "$argc_path"
 

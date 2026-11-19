@@ -42,8 +42,10 @@
 # with one line on stderr; guard_operation and guard_path then abort the
 # operation they guard.
 #
-# - guard_operation   Prompt for permission to run an operation
-# - guard_path        Prompt for permission to perform path operations
+# - guard_operation   Prompt for permission to run an operation:
+#                     guard_operation [question] [operation]
+# - guard_path        Prompt for permission to perform path operations:
+#                     guard_path <path> <question>
 # - patch_file        Patch a file
 # - error             Log an error
 # - warn              Log a warning
@@ -57,6 +59,11 @@
 # - magenta           Output given text in magenta
 # - cyan              Output given text in cyan
 # - white             Output given text in white
+#
+# "Yes for this session" is remembered against the exact question, so a
+# guard names what it guards: guard_operation sends the question, a newline
+# and the operation when one is given, and guard_path appends a newline and
+# the resolved path unless the question already contains the path as given.
 
 # Without a usable TERM (unset in CI, `dumb` under the full-screen UI) tput
 # fails or complains on stderr; the colours stay empty instead.
@@ -731,16 +738,20 @@ open_link() {
 
 guard_operation() {
 	if [[ -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
+		declare question="${1:-Are you sure you want to continue?}"
+		if [[ "$#" -ge 2 ]]; then
+			question="$question"$'\n'"$2"
+		fi
 		# `|| ans=""`: a cancelled prompt returns 1, which errexit would turn into a silent exit here.
 		if _coyote_prompt_enabled; then
-			ans="$(confirm "${1:-Are you sure you want to continue?}")" || ans=""
+			ans="$(confirm "$question")" || ans=""
 		else
 			# Refused before the redirection below: under the full-screen UI
 			# /dev/tty is the UI's own screen.
 			_coyote_refuse_terminal_under_tui
 			# 2>/dev/tty: keep the prompt off the host-captured stderr pipe so it
 			# can't leak into tool_call_error JSON when the wrapped command fails.
-			ans="$(confirm "${1:-Are you sure you want to continue?}" 2>/dev/tty)" || ans=""
+			ans="$(confirm "$question" 2>/dev/tty)" || ans=""
 		fi
 
 		if [[ "$ans" != 1 ]]; then
@@ -998,6 +1009,9 @@ guard_path() {
 
 	path="$(_to_real_path "$1")"
 	confirmation_prompt="$2"
+	if [[ "$confirmation_prompt" != *"$1"* ]]; then
+		confirmation_prompt="$confirmation_prompt"$'\n'"$path"
+	fi
 
 	if [[ ! "$path" == "$(pwd)"* && -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
 		if _coyote_prompt_enabled; then

@@ -1319,7 +1319,8 @@ fn macro_run_tells_tools_a_human_is_present() {
 
 /// A Python tool run by the real binary finds `LLM_PROMPT_UTILS_PY` naming
 /// an absolute, existing file that the documented import idiom loads with
-/// all seven helpers, and sees `COYOTE_UI=repl` under `--macro`.
+/// all seven helpers, `guard_operation` taking an operation, and sees
+/// `COYOTE_UI=repl` under `--macro`.
 #[test]
 fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
     if which::which("python3").is_err() {
@@ -1341,6 +1342,7 @@ fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
         "fixture_helper_py.py",
         "#!/usr/bin/env python3\n\
          import importlib.util\n\
+         import inspect\n\
          import os\n\
          \n\
          \n\
@@ -1352,7 +1354,8 @@ fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
          \x20   spec.loader.exec_module(prompt_utils)\n\
          \x20   names = (\"confirm\", \"select\", \"checkbox\", \"input\", \"password\", \"guard_operation\", \"guard_path\")\n\
          \x20   helpers = sum(1 for n in names if callable(getattr(prompt_utils, n, None)))\n\
-         \x20   line = f\"fixture py: abs={os.path.isabs(path)} file={os.path.isfile(path)} helpers={helpers} ui={os.environ.get('COYOTE_UI', 'unset')}\"\n\
+         \x20   op = \"operation\" in inspect.signature(prompt_utils.guard_operation).parameters\n\
+         \x20   line = f\"fixture py: abs={os.path.isabs(path)} file={os.path.isfile(path)} helpers={helpers} op={op} ui={os.environ.get('COYOTE_UI', 'unset')}\"\n\
          \x20   print(line, flush=True)\n\
          \x20   return line\n",
     );
@@ -1367,7 +1370,7 @@ fn macro_run_exports_the_python_prompt_helper_to_python_tools() {
         output.status
     );
     assert!(
-        stdout.contains("fixture py: abs=True file=True helpers=7 ui=repl"),
+        stdout.contains("fixture py: abs=True file=True helpers=7 op=True ui=repl"),
         "the python tool did not get a loadable LLM_PROMPT_UTILS_PY and COYOTE_UI=repl\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(fake.served(), 2, "stdout:\n{stdout}");
@@ -1435,7 +1438,8 @@ fn macro_run_cancels_a_python_tools_prompt_when_nobody_can_answer() {
 
 /// The TypeScript twin: `LLM_PROMPT_UTILS_TS` names an absolute, existing
 /// file that `await import(...)` loads with every helper (camelCase and
-/// snake_case guards both), and the tool sees `COYOTE_UI=repl`.
+/// snake_case guards both, the operation guard taking an operation), and the
+/// tool sees `COYOTE_UI=repl`.
 #[test]
 fn macro_run_exports_the_typescript_prompt_helper_to_typescript_tools() {
     let Some(runtime) = ts_runtime() else {
@@ -1468,7 +1472,8 @@ fn macro_run_exports_the_typescript_prompt_helper_to_typescript_tools() {
              \x20 const prompt = await import(pathToFileURL(p).href);\n\
              \x20 const names = [\"confirm\", \"select\", \"checkbox\", \"input\", \"password\", \"guard_operation\", \"guard_path\", \"guardOperation\", \"guardPath\"];\n\
              \x20 const helpers = names.filter((n) => typeof (prompt as any)[n] === \"function\").length;\n\
-             \x20 const line = `fixture ts: abs=${{path.isAbsolute(p)}} file=${{fs.existsSync(p)}} helpers=${{helpers}} ui=${{process.env.COYOTE_UI ?? \"unset\"}}`;\n\
+             \x20 const op = String(prompt.guardOperation).includes(\"operation\") && prompt.guard_operation === prompt.guardOperation;\n\
+             \x20 const line = `fixture ts: abs=${{path.isAbsolute(p)}} file=${{fs.existsSync(p)}} helpers=${{helpers}} op=${{op}} ui=${{process.env.COYOTE_UI ?? \"unset\"}}`;\n\
              \x20 console.log(line);\n\
              \x20 return line;\n\
              }}\n"
@@ -1485,7 +1490,7 @@ fn macro_run_exports_the_typescript_prompt_helper_to_typescript_tools() {
         output.status
     );
     assert!(
-        stdout.contains("fixture ts: abs=true file=true helpers=9 ui=repl"),
+        stdout.contains("fixture ts: abs=true file=true helpers=9 op=true ui=repl"),
         "the typescript tool did not get a loadable LLM_PROMPT_UTILS_TS and COYOTE_UI=repl\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert_eq!(fake.served(), 2, "stdout:\n{stdout}");
