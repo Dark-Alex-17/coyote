@@ -374,11 +374,12 @@ impl SyncSchedule {
     ///
     /// A fetch that deferred a body or filled a page is followed by another soon, so a
     /// backlog drains without waiting an interval per page. Progress is measured in
-    /// delivered messages, the one count a node cannot inflate: while a fetch delivers
-    /// something the short retry stays short; once it delivers nothing the wait doubles
-    /// each time up to the interval, so a node that lists bodies it never serves, or a
-    /// sender that never announces, cannot hold the short cadence. A fetch with nothing
-    /// to come back for resets the backoff. Nothing is armed after `mesh_off`.
+    /// delivered messages and farewells taken as presence, the counts a node cannot
+    /// inflate: while a fetch delivers something the short retry stays short; once it
+    /// delivers nothing the wait doubles each time up to the interval, so a node that
+    /// lists bodies it never serves, or a sender that never announces, cannot hold the
+    /// short cadence. A fetch with nothing to come back for resets the backoff. Nothing
+    /// is armed after `mesh_off`.
     ///
     /// A node that brought no link up, stayed silent to the list request, or whose link
     /// closed while it was asked, is also logged at INFO, at most once per node per
@@ -393,13 +394,14 @@ impl SyncSchedule {
         let line = match outcome {
             Ok(report) => {
                 let more_to_come = report.deferred > 0 || report.wanted == MAX_WANTS_PER_FETCH;
-                if report.delivered > 0 {
+                let progressed = report.delivered + report.presence > 0;
+                if progressed {
                     self.backoff = None;
                 }
                 if !more_to_come {
                     self.backoff = None;
                     self.re_arm(now);
-                } else if report.delivered > 0 {
+                } else if progressed {
                     self.retry_soon(now);
                 } else {
                     self.retry_backed_off(now);
@@ -1147,6 +1149,25 @@ mod tests {
             schedule.due_at(),
             Some(now + Duration::from_secs(300)),
             "a page with room left is the last of the backlog"
+        );
+    }
+
+    #[test]
+    fn a_full_page_of_farewells_is_progress_and_is_followed_by_another_fetch_soon() {
+        let now = Instant::now();
+        let farewells = || FetchReport {
+            presence: MAX_WANTS_PER_FETCH,
+            ..report(MAX_WANTS_PER_FETCH, 0, 0)
+        };
+        let mut schedule = SyncSchedule::new(300, true);
+        for _ in 0..3 {
+            schedule.started(NODE.to_string());
+            schedule.finished(&Ok(farewells()), now);
+        }
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
+            "farewells taken as presence keep the short retry as delivered mail does"
         );
     }
 

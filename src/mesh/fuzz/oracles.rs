@@ -29,9 +29,9 @@ use crate::mesh::pending::{
 };
 use crate::mesh::propagation::lxmf_delivery_hash;
 use crate::mesh::propagation_fetch::{
-    BodyOutcome, BodyPipeline, Discard, FetchStore, HoldPolicy, InboundMessage, InboundSink,
-    MAX_FETCHED_MESSAGE_BYTES, MAX_UNKNOWN_SOURCE_DEFERRALS, MIN_FETCHED_MESSAGE_BYTES, SourceKeys,
-    UNKNOWN_SOURCE_DEFERRAL_HORIZON,
+    BodyOutcome, BodyPipeline, Delivery, Discard, FetchStore, HoldPolicy, InboundMessage,
+    InboundSink, MAX_FETCHED_MESSAGE_BYTES, MAX_UNKNOWN_SOURCE_DEFERRALS,
+    MIN_FETCHED_MESSAGE_BYTES, SourceKeys, UNKNOWN_SOURCE_DEFERRAL_HORIZON,
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
 use crate::mesh::request::{
@@ -1235,8 +1235,9 @@ impl HoldPolicy for TakeAll {
 }
 
 impl InboundSink for CountingSink {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         self.delivered.lock().unwrap().push(message.message_id);
+        Delivery::Delivered
     }
 }
 
@@ -1676,9 +1677,10 @@ impl ReceiptFixture {
             ) if stage == Stage::Decrypt => true,
             _ => expected == observed,
         };
+        let handed_over = matches!(observed, BodyOutcome::Delivered | BodyOutcome::Presence);
         ensure(matches, || {
-            let invariant = if observed == BodyOutcome::Delivered {
-                "(ii) Delivered implies every prior stage passed"
+            let invariant = if handed_over {
+                "(ii) Delivered or Presence implies every prior stage passed"
             } else {
                 "(i) the outcome is the first failing stage of 11.4"
             };
@@ -1692,15 +1694,12 @@ impl ReceiptFixture {
                 )
             },
         )?;
-        ensure(
-            deliveries == usize::from(observed == BodyOutcome::Delivered),
-            || {
-                format!(
-                    "(iii) the sink is reached by a delivered body once and by no discard or deferral: {observed:?}, deliveries {deliveries}"
-                )
-            },
-        )?;
-        if observed == BodyOutcome::Delivered {
+        ensure(deliveries == usize::from(handed_over), || {
+            format!(
+                "(iii) the sink is reached by a delivered body once and by no discard or deferral: {observed:?}, deliveries {deliveries}"
+            )
+        })?;
+        if handed_over {
             bench.delivered_outcomes += 1;
         }
         let message_id = built.sealed.as_ref().map(|sealed| sealed.message_id);

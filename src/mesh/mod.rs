@@ -397,7 +397,7 @@ pub(crate) mod test_support {
     use super::node::arm_destination_caps;
     #[cfg(unix)]
     use super::node::{MeshRuntime, MeshSlot, NodeOptions};
-    pub(crate) use super::peers::LeftMark;
+    pub(crate) use super::peers::{FarewellTime, LeftMark};
     #[cfg(unix)]
     pub(crate) use super::peers::{PEER_TTL, PeerSighting};
     pub(crate) use super::propagation::PropagationNode;
@@ -407,9 +407,9 @@ pub(crate) mod test_support {
     pub(crate) use super::propagation::pn_announce_app_data as propagation_announce_app_data;
     #[cfg(all(test, unix))]
     pub(crate) use super::propagation::test_support::FakeNode as StoringPropagationNode;
+    pub(crate) use super::propagation_fetch::{Delivery, InboundMessage, InboundSink};
     #[cfg(unix)]
     use super::propagation_fetch::{FETCH_TRANSFER_LIMIT_KB, GET_PATH};
-    pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
     #[cfg(all(test, unix))]
     pub(crate) use super::request::network::{

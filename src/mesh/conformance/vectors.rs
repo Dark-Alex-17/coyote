@@ -59,7 +59,7 @@ use crate::mesh::propagation::{
     prepare_envelope,
 };
 use crate::mesh::propagation_fetch::{
-    Discard, FetchError, InboundMessage, InboundSink, MAX_FETCHED_MESSAGE_BYTES,
+    Delivery, Discard, FetchError, InboundMessage, InboundSink, MAX_FETCHED_MESSAGE_BYTES,
     MIN_FETCHED_MESSAGE_BYTES, PROPAGATION_STORE_VERSION, check_bounds,
 };
 use crate::mesh::propagation_nodes::{
@@ -946,8 +946,9 @@ impl RecordingSink {
 }
 
 impl InboundSink for RecordingSink {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         self.0.lock().push(message);
+        Delivery::Delivered
     }
 }
 

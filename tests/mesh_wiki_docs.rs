@@ -8089,6 +8089,48 @@ fn a_held_reply_left_for_the_session_that_asked_reads_on_the_wiki() {
     }
 }
 
+/// A farewell fetched from a propagation node is counted as `presence`, never as a
+/// delivered message: `render_sync` adds the count after `delivered`, the help legend
+/// says what it means, and the Commands page says the same. The pages no longer say a
+/// farewell is never held at a propagation node.
+#[test]
+fn a_fetched_farewell_reads_as_presence_on_the_wiki() {
+    let render = fn_body("src/repl/mesh.rs", "render_sync");
+    let needle = "format!(\", {} presence\", report.presence)";
+    assert!(
+        render.contains(needle),
+        "render_sync no longer builds {needle}:\n{render}"
+    );
+    let legend = fn_body("src/repl/mesh.rs", "group_concepts");
+    let entry = "delivered: put in your inbox; presence: farewells picked up, which mark their sender left and never reach the inbox;";
+    assert!(
+        legend.contains(entry),
+        "the sync counts legend no longer says {entry:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = flat(&read(wiki.join("Mesh-Commands.md")));
+    for needle in [
+        "`presence` counts the farewells a sync picked up",
+        "(with `, N presence` after `N delivered` when it is non-zero",
+    ] {
+        assert!(
+            commands.contains(needle),
+            "Mesh-Commands.md does not say {needle:?}"
+        );
+    }
+    let stale = "dropped, never held at a propagation node";
+    assert!(
+        !commands.contains(stale),
+        "Mesh-Commands.md still says a farewell is {stale:?}"
+    );
+    let mesh = flat(&read(wiki.join("Mesh.md")));
+    assert!(
+        !mesh.contains("goes nowhere"),
+        "Mesh.md still says a farewell goes nowhere"
+    );
+}
+
 /// The Commands page's `.mesh envoy dismiss` section quotes what the verb prints as the code
 /// formats it: the two `Dismissed` lines, the three refusals (an unknown id, an access
 /// id, a question this node asked), the hold refusal, the send-failure sentence, the

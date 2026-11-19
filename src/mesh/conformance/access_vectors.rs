@@ -37,8 +37,8 @@ use crate::mesh::pending::{
 use crate::mesh::request::{ACCESS_PATH, DispatchError};
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::test_support::{
-    AdmittedRequest, Handler, InboundMessage, InboundSink, NAME_HASH_LEN, OriginName, PathHash,
-    RefusalCode, Reply, RequestId, TempDir, TrustList, snapshot_fixture,
+    AdmittedRequest, Delivery, Handler, InboundMessage, InboundSink, NAME_HASH_LEN, OriginName,
+    PathHash, RefusalCode, Reply, RequestId, TempDir, TrustList, snapshot_fixture,
 };
 use crate::mesh::{destination_address, hex_lower, rfc3339_utc};
 
@@ -534,8 +534,9 @@ impl CountingSink {
 }
 
 impl InboundSink for CountingSink {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         self.0.lock().push(message);
+        Delivery::Delivered
     }
 }
 

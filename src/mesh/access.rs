@@ -35,7 +35,7 @@ use crate::mesh::pending::{
     question_not_an_access_request,
 };
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
-use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
+use crate::mesh::propagation_fetch::{Delivery, InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     ACCESS_PATH, AdmittedRequest, DEFAULT_LINK_TIMEOUT, DispatchError, Handler, NAME_HASH_LEN,
@@ -1113,7 +1113,7 @@ pub(crate) struct AccessRouting<'a> {
 }
 
 impl InboundSink for AccessRouting<'_> {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         let id8 = short(&message.source_identity_hash).to_string();
         let (name_hash, request) = match decode_access_message(&message) {
             AccessMessage::NotAnAccess => return self.inner.deliver(message),
@@ -1122,13 +1122,13 @@ impl InboundSink for AccessRouting<'_> {
                     "Propagated access request from {id8} dropped: {}",
                     redact_hashes(why)
                 );
-                return;
+                return Delivery::Dropped;
             }
             AccessMessage::Access { name_hash, request } => (name_hash, request),
         };
         let Ok(identity) = AddressHash::new_from_hex_string(&message.source_identity_hash) else {
             debug!("Propagated access request from {id8} dropped: the signer's hash is malformed");
-            return;
+            return Delivery::Dropped;
         };
         let standing = match self.trust.identity_standing(&message.source_identity_hash) {
             IdentityStanding::Trusted { .. } => None,
@@ -1137,7 +1137,7 @@ impl InboundSink for AccessRouting<'_> {
         };
         if let Some(standing) = standing {
             debug!("Propagated access request from {id8} dropped: {standing} identity");
-            return;
+            return Delivery::Dropped;
         }
         let now = SystemTime::now();
         let OriginVerdict {
@@ -1161,13 +1161,13 @@ impl InboundSink for AccessRouting<'_> {
         }
         if verdict.decision != Decision::Allow {
             debug!("Propagated access request from {id8} dropped: instance {dest8} is not trusted");
-            return;
+            return Delivery::Dropped;
         }
         let Some(surface) = &self.surface else {
             debug!(
                 "Propagated access request from {id8} (instance {dest8}) dropped: the session slot is gone"
             );
-            return;
+            return Delivery::Dropped;
         };
         let asked = request.clone();
         let outcome = surface.admit_access(InboundAccess {
@@ -1189,6 +1189,7 @@ impl InboundSink for AccessRouting<'_> {
                 expires,
             ),
         }
+        Delivery::Delivered
     }
 }
 
@@ -5134,8 +5135,9 @@ mod tests {
     }
 
     impl InboundSink for CountingSink {
-        fn deliver(&self, message: InboundMessage) {
+        fn deliver(&self, message: InboundMessage) -> Delivery {
             self.0.lock().push(message);
+            Delivery::Delivered
         }
     }
 

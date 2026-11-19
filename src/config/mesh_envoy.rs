@@ -1726,8 +1726,8 @@ mod tests {
     };
     use crate::mesh::pending::InboundStore;
     use crate::mesh::test_support::{
-        AdmittedRequest, Handler, InboundMessage, InboundSink, MESSAGE_PATH, NAME_HASH_LEN,
-        OriginName, PathHash, RefusalCode, Reply, RequestId, TempDir, TrustList,
+        AdmittedRequest, Delivery, Handler, InboundMessage, InboundSink, MESSAGE_PATH,
+        NAME_HASH_LEN, OriginName, PathHash, RefusalCode, Reply, RequestId, TempDir, TrustList,
     };
     #[cfg(unix)]
     use crate::mesh::test_support::{
@@ -4501,7 +4501,7 @@ mod tests {
     struct NullSink;
 
     impl InboundSink for NullSink {
-        fn deliver(&self, message: InboundMessage) {
+        fn deliver(&self, message: InboundMessage) -> Delivery {
             panic!("a peer message must not fall through to the plain inbox: {message:?}");
         }
     }

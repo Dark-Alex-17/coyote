@@ -220,8 +220,29 @@ pub(crate) enum LeftMark {
     Unknown,
     /// The row is marked already; the first farewell's time stands.
     AlreadyLeft,
-    /// The farewell was sent no later than the latest presence the row holds.
+    /// The farewell's time is no later than the latest presence the row holds.
     HeardSince,
+}
+
+/// The time a farewell is ordered by against the row's latest presence, which depends on
+/// the route it came by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FarewellTime {
+    /// When this node received it over a live link: the sender's clock plays no part,
+    /// so one running behind cannot age a farewell past a request it sent just before.
+    Arrived(SystemTime),
+    /// When the sender stamped it, never later than this node received it: a farewell
+    /// held at a propagation node arrives long after it was sent, so its arrival says
+    /// nothing about what came first.
+    Stamped(SystemTime),
+}
+
+impl FarewellTime {
+    fn at(self) -> SystemTime {
+        match self {
+            Self::Arrived(at) | Self::Stamped(at) => at,
+        }
+    }
 }
 
 /// Coyote peers seen on the mesh, keyed by destination hash and mirrored to `path` as JSON.
@@ -465,13 +486,13 @@ impl PeerTable {
             .is_some_and(|record| record.served_instances.contains(&own))
     }
 
-    /// Marks the row of `destination_hash` as having said it is leaving the mesh, at
-    /// `sent_at`: when the farewell was sent, never later than this node received it. A
-    /// farewell sent no later than the row's latest presence (its last announce, path
-    /// response or request over a live link) is refused, since the instance has been
-    /// heard since, and so is one for a destination the table does not know, and a repeat
-    /// for a row already marked, which keeps the time of the first.
-    pub(crate) fn mark_left(&self, destination_hash: &str, sent_at: SystemTime) -> LeftMark {
+    /// Marks the row of `destination_hash` as having said it is leaving the mesh, at the
+    /// farewell's time: its arrival for one over a live link, its stamp for one held at a
+    /// propagation node. A farewell whose time is no later than the row's latest presence
+    /// (its last announce, path response or request over a live link) is refused, since
+    /// the instance has been heard since, and so is one for a destination the table does
+    /// not know, and a repeat for a row already marked, which keeps the time of the first.
+    pub(crate) fn mark_left(&self, destination_hash: &str, time: FarewellTime) -> LeftMark {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(destination_hash) else {
             return LeftMark::Unknown;
@@ -484,10 +505,11 @@ impl PeerTable {
             .lock()
             .get(destination_hash)
             .map_or(record.last_seen, |heard| (*heard).max(record.last_seen));
-        if sent_at <= latest {
+        let at = time.at();
+        if at <= latest {
             return LeftMark::HeardSince;
         }
-        record.left_at = Some(sent_at);
+        record.left_at = Some(at);
         self.dirty.store(true, Ordering::Release);
         LeftMark::Marked
     }
@@ -1019,18 +1041,24 @@ mod tests {
             "an unmarked row writes no left_at: {written}"
         );
 
-        assert_eq!(table.mark_left("unknown", t0), LeftMark::Unknown);
         assert_eq!(
-            table.mark_left("aa", t0 - Duration::from_secs(1)),
+            table.mark_left("unknown", FarewellTime::Stamped(t0)),
+            LeftMark::Unknown
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(t0 - Duration::from_secs(1))),
             LeftMark::HeardSince,
             "a farewell received before the latest announce is ignored"
         );
         assert_eq!(table.get("aa").unwrap().left_at, None);
 
         let left = t0 + Duration::from_secs(5);
-        assert_eq!(table.mark_left("aa", left), LeftMark::Marked);
         assert_eq!(
-            table.mark_left("aa", left + Duration::from_secs(1)),
+            table.mark_left("aa", FarewellTime::Stamped(left)),
+            LeftMark::Marked
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(left + Duration::from_secs(1))),
             LeftMark::AlreadyLeft,
             "a repeated farewell is ignored"
         );
@@ -1048,7 +1076,7 @@ mod tests {
             "the next announce clears the mark"
         );
         assert_eq!(
-            table.mark_left("aa", left),
+            table.mark_left("aa", FarewellTime::Stamped(left)),
             LeftMark::HeardSince,
             "the farewell is older than the announce that followed it"
         );
@@ -1068,7 +1096,10 @@ mod tests {
         );
         assert!(!table.clear_left("unknown"));
         let left = t0 + Duration::from_secs(5);
-        assert_eq!(table.mark_left("aa", left), LeftMark::Marked);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(left)),
+            LeftMark::Marked
+        );
         table.persist_if_dirty().unwrap();
 
         assert!(table.clear_left("aa"));
@@ -1091,9 +1122,15 @@ mod tests {
         let at = |secs| t0 + Duration::from_secs(secs);
         table.observe(sighting("aa", None), t0);
 
-        assert_eq!(table.mark_left("aa", at(1)), LeftMark::Marked);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(at(1))),
+            LeftMark::Marked
+        );
         assert_eq!(table.get("aa").unwrap().left_at, Some(at(1)));
-        assert_eq!(table.mark_left("aa", at(2)), LeftMark::AlreadyLeft);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(at(2))),
+            LeftMark::AlreadyLeft
+        );
         assert_eq!(
             table.get("aa").unwrap().left_at,
             Some(at(1)),
@@ -1102,36 +1139,64 @@ mod tests {
 
         table.observe(sighting("aa", None), at(10));
         assert_eq!(
-            table.mark_left("aa", at(10)),
+            table.mark_left("aa", FarewellTime::Stamped(at(10))),
             LeftMark::HeardSince,
             "a farewell sent as the instance announced is not later than the announce"
         );
-        assert_eq!(table.mark_left("aa", at(9)), LeftMark::HeardSince);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(at(9))),
+            LeftMark::HeardSince
+        );
 
         assert!(table.refresh_route(sighting("aa", None), at(20)));
         assert_eq!(table.get("aa").unwrap().last_seen, at(10));
         assert_eq!(
-            table.mark_left("aa", at(15)),
+            table.mark_left("aa", FarewellTime::Stamped(at(15))),
             LeftMark::HeardSince,
             "a farewell sent before a later path response is refused"
         );
 
         table.note_presence("aa", at(30));
         assert_eq!(
-            table.mark_left("aa", at(25)),
+            table.mark_left("aa", FarewellTime::Stamped(at(25))),
             LeftMark::HeardSince,
             "a farewell sent before a later request over a live link is refused"
         );
         table.note_presence("aa", at(28));
         assert_eq!(
-            table.mark_left("aa", at(29)),
+            table.mark_left("aa", FarewellTime::Stamped(at(29))),
             LeftMark::HeardSince,
             "an older presence does not move the latest back"
         );
         assert_eq!(table.get("aa").unwrap().left_at, None);
 
-        assert_eq!(table.mark_left("aa", at(31)), LeftMark::Marked);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(at(31))),
+            LeftMark::Marked
+        );
         assert_eq!(table.get("aa").unwrap().left_at, Some(at(31)));
+    }
+
+    /// A farewell that came over a link is ordered by when it arrived, strictly after the
+    /// latest presence, and marks the row at that arrival.
+    #[test]
+    fn a_direct_farewell_is_ordered_by_its_arrival_not_its_stamp() {
+        let (table, _tmp) = table("peers-left-arrived");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        table.observe(sighting("aa", None), t0);
+        table.note_presence("aa", at(10));
+
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Arrived(at(10))),
+            LeftMark::HeardSince,
+            "a farewell arriving as the request did is not later than it"
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Arrived(at(12))),
+            LeftMark::Marked
+        );
+        assert_eq!(table.get("aa").unwrap().left_at, Some(at(12)));
     }
 
     /// Presence is kept for rows only, and a swept row takes its presence with it, so a
@@ -1143,7 +1208,10 @@ mod tests {
         table.note_presence("unknown", t0);
         table.observe(sighting("unknown", None), t0 - Duration::from_secs(5));
         assert_eq!(
-            table.mark_left("unknown", t0 - Duration::from_secs(1)),
+            table.mark_left(
+                "unknown",
+                FarewellTime::Stamped(t0 - Duration::from_secs(1))
+            ),
             LeftMark::Marked,
             "presence noted before the row existed is not kept"
         );
@@ -1155,7 +1223,7 @@ mod tests {
         let later = t0 + PEER_TTL + Duration::from_secs(1);
         table.observe(sighting("aa", None), later);
         assert_eq!(
-            table.mark_left("aa", later + Duration::from_secs(1)),
+            table.mark_left("aa", FarewellTime::Stamped(later + Duration::from_secs(1))),
             LeftMark::Marked
         );
     }

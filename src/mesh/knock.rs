@@ -17,7 +17,7 @@ use crate::mesh::notify::{NoticeText, Source};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::people::Namer;
 use crate::mesh::propagation::{OutboundMessage, PropagationError};
-use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
+use crate::mesh::propagation_fetch::{Delivery, InboundMessage, InboundSink};
 use crate::mesh::request::{
     DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, RequestError,
     describe_path, redact_hashes, request_remedy, short,
@@ -1069,7 +1069,7 @@ pub(crate) struct KnockRouting<'a> {
 }
 
 impl InboundSink for KnockRouting<'_> {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         let id8 = short(&message.source_identity_hash);
         match decode_knock_message(&message) {
             KnockMessage::NotAKnock => self.inner.deliver(message),
@@ -1078,12 +1078,13 @@ impl InboundSink for KnockRouting<'_> {
                     "Propagated knock from {id8} dropped: {}",
                     redact_hashes(why)
                 );
+                Delivery::Dropped
             }
             KnockMessage::Knock { name_hash, intro } => {
                 let Ok(identity) = AddressHash::new_from_hex_string(&message.source_identity_hash)
                 else {
                     debug!("Propagated knock from {id8} dropped: the signer's hash is malformed");
-                    return;
+                    return Delivery::Dropped;
                 };
                 self.gate.admit(
                     InboundKnock {
@@ -1097,6 +1098,7 @@ impl InboundSink for KnockRouting<'_> {
                     Instant::now(),
                     SystemTime::now(),
                 );
+                Delivery::Delivered
             }
         }
     }
@@ -3101,8 +3103,9 @@ mod tests {
     }
 
     impl InboundSink for CountingSink {
-        fn deliver(&self, message: InboundMessage) {
+        fn deliver(&self, message: InboundMessage) -> Delivery {
             self.messages.lock().push(message);
+            Delivery::Delivered
         }
     }
 

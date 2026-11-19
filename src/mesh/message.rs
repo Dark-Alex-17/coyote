@@ -20,7 +20,7 @@ use crate::mesh::people::WHO_MAX_CHARS;
 use crate::mesh::propagation::{
     OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
-use crate::mesh::propagation_fetch::{HoldPolicy, InboundMessage, InboundSink};
+use crate::mesh::propagation_fetch::{Delivery, HoldPolicy, InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::request::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, NoAnswer,
@@ -1791,15 +1791,6 @@ pub(crate) fn is_farewell(kind: PeerKind, fields: Option<&serde_json::Value>) ->
             == Some(PRESENCE_LEAVING)
 }
 
-/// Whether a message fetched from a propagation node is a peer's farewell, which the
-/// fetch counts as presence rather than mail.
-pub(crate) fn is_fetched_farewell(message: &InboundMessage) -> bool {
-    matches!(
-        decode_peer_lxmf(message),
-        PeerLxmf::Peer(peer) if is_farewell(peer.kind, peer.fields.as_ref())
-    )
-}
-
 /// When a farewell stamped `timestamp` (unix seconds) and received at `received_at` was
 /// sent: the stamp, but never later than its arrival, so a sender whose clock runs ahead
 /// cannot post-date its mark. A missing or unreadable stamp reads as the arrival.
@@ -1819,6 +1810,153 @@ pub(crate) fn farewell_message() -> Result<OutboundPeer, SendError> {
         None,
         Some(serde_json::json!({ "presence": PRESENCE_LEAVING })),
     )
+}
+
+/// One send of a farewell: over a link to `peer` when `direct`, otherwise held at the
+/// propagation node for `peer`'s identity. `covers` is how many trusted rows its outcome
+/// counts for.
+struct FarewellLeg {
+    peer: PeerRecord,
+    hash: AddressHash,
+    direct: bool,
+    covers: usize,
+}
+
+/// The farewell's sends for `candidates`: every trusted row not marked left, with its
+/// address and whether a path to it is known. A row with a path gets a send of its own.
+/// Rows without one share a single held copy per identity, since a propagation node keeps
+/// one mailbox per identity and whichever of its sessions syncs first picks it up; the
+/// copy goes to the most recently heard of them, and the held copies come most recently
+/// heard first, so the budget reaches the likeliest to return before it runs out. A held
+/// copy, or one skipped, counts for every row it covers, so the legs' `covers` add up to
+/// the number of candidates and `FarewellOutcome.audience` stays a count of trusted rows.
+fn farewell_audience(candidates: Vec<(PeerRecord, AddressHash, bool)>) -> Vec<FarewellLeg> {
+    let (with_path, mut pathless): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|(_, _, has_path)| *has_path);
+    let mut legs: Vec<FarewellLeg> = with_path
+        .into_iter()
+        .map(|(peer, hash, _)| FarewellLeg {
+            peer,
+            hash,
+            direct: true,
+            covers: 1,
+        })
+        .collect();
+    pathless.sort_by_key(|(peer, ..)| std::cmp::Reverse(peer.last_seen));
+    let mut held: Vec<FarewellLeg> = Vec::new();
+    for (peer, hash, _) in pathless {
+        match held
+            .iter_mut()
+            .find(|leg| leg.peer.identity_hash == peer.identity_hash)
+        {
+            Some(leg) => leg.covers += 1,
+            None => held.push(FarewellLeg {
+                peer,
+                hash,
+                direct: false,
+                covers: 1,
+            }),
+        }
+    }
+    legs.extend(held);
+    legs
+}
+
+#[cfg(test)]
+mod farewell_audience_tests {
+    use super::*;
+    use crate::mesh::protocol::Compatibility;
+
+    fn row(destination: u8, identity: u8, last_seen: SystemTime) -> (PeerRecord, AddressHash) {
+        let destination_hash = hex_lower(&[destination; 16]);
+        let hash = AddressHash::new_from_hex_string(&destination_hash).unwrap();
+        let record = PeerRecord {
+            destination_hash,
+            identity_hash: hex_lower(&[identity; 16]),
+            name_hash: String::new(),
+            public_key: None,
+            display_name: None,
+            protocol_version: 1,
+            compatibility: Compatibility::Compatible,
+            hops: 1,
+            first_seen: last_seen,
+            last_seen,
+            left_at: None,
+            served_instances: Default::default(),
+        };
+        (record, hash)
+    }
+
+    fn shape(legs: &[FarewellLeg]) -> Vec<(String, bool, usize)> {
+        legs.iter()
+            .map(|leg| {
+                (
+                    leg.peer.destination_hash[..2].to_string(),
+                    leg.direct,
+                    leg.covers,
+                )
+            })
+            .collect()
+    }
+
+    /// Two sessions of one identity without a path share one held copy, addressed to the
+    /// one heard last, while each session with a path still gets its own send, even one
+    /// of that same identity.
+    #[test]
+    fn farewell_audience_hands_one_copy_per_identity_to_the_propagation_node() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let candidate = |destination, identity, seen, has_path| {
+            let (record, hash) = row(destination, identity, at(seen));
+            (record, hash, has_path)
+        };
+
+        let legs = farewell_audience(vec![
+            candidate(0x01, 0xa0, 1, false),
+            candidate(0x02, 0xa0, 5, false),
+            candidate(0x03, 0xa0, 3, true),
+            candidate(0x04, 0xb0, 2, false),
+            candidate(0x05, 0xc0, 4, true),
+        ]);
+
+        assert_eq!(
+            shape(&legs),
+            [
+                ("03".to_string(), true, 1),
+                ("05".to_string(), true, 1),
+                ("02".to_string(), false, 2),
+                ("04".to_string(), false, 1),
+            ]
+        );
+        assert_eq!(legs.iter().map(|leg| leg.covers).sum::<usize>(), 5);
+    }
+
+    /// The held copies go out most recently heard first, whatever order the table
+    /// listed the rows in.
+    #[test]
+    fn farewell_audience_puts_the_most_recently_heard_pathless_peers_first() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let pathless = |destination: u8, seen| {
+            let (record, hash) = row(destination, destination, t0 + Duration::from_secs(seen));
+            (record, hash, false)
+        };
+
+        let legs = farewell_audience(vec![
+            pathless(0x01, 10),
+            pathless(0x02, 30),
+            pathless(0x03, 20),
+        ]);
+
+        assert_eq!(
+            shape(&legs),
+            [
+                ("02".to_string(), false, 1),
+                ("03".to_string(), false, 1),
+                ("01".to_string(), false, 1),
+            ]
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2380,7 +2518,8 @@ impl MeshRuntime {
     /// each, the whole fan-out cut off at `FAREWELL_BUDGET` so a leave never waits longer
     /// on it. An instance this node holds a path to is sent it over a link, and handed to
     /// the propagation node when the link fails as it would for any message; one without a
-    /// path is handed straight to the propagation node, with no path request waited on.
+    /// path is handed straight to the propagation node, with no path request waited on,
+    /// one copy per identity as `farewell_audience` builds them.
     /// Nothing is retried, and an instance that has said it left itself is told nothing.
     /// No hook fires: the farewell is presence, not a bulletin the owner sent.
     pub(crate) async fn send_farewell(&self) -> FarewellOutcome {
@@ -2388,7 +2527,7 @@ impl MeshRuntime {
             return FarewellOutcome::default();
         };
         let trust = self.trust();
-        let mut audience = Vec::new();
+        let mut candidates = Vec::new();
         for peer in self.peers().snapshot() {
             if peer.left_at.is_some()
                 || trust
@@ -2402,11 +2541,13 @@ impl MeshRuntime {
                 continue;
             };
             let has_path = transport.has_path(&hash).await;
-            audience.push((peer, hash, has_path));
+            candidates.push((peer, hash, has_path));
         }
-        if audience.is_empty() {
+        if candidates.is_empty() {
             return FarewellOutcome::default();
         }
+        let audience = candidates.len();
+        let legs = farewell_audience(candidates);
         let message = match farewell_message() {
             Ok(message) => message,
             Err(err) => {
@@ -2417,9 +2558,10 @@ impl MeshRuntime {
                 return FarewellOutcome::default();
             }
         };
-        // The link gets half the budget, so a failed one leaves the other half for the
-        // hand-off to the propagation node. The hand-off's own waits are cut to fit that
-        // half too: the default reject window alone is as long as the whole budget.
+        // The link gets half the budget, so a failed one leaves time to post to the
+        // propagation node. The post's per-phase caps are upper bounds only, cut down
+        // because the default reject window alone is as long as the whole budget; the
+        // outer `tokio::time::timeout(FAREWELL_BUDGET, ..)` is what enforces the budget.
         let options = PeerSendOptions {
             request: RequestOptions {
                 request_timeout: FAREWELL_BUDGET / 2,
@@ -2436,43 +2578,39 @@ impl MeshRuntime {
             store_and_forward: true,
         };
         let (delivered, held) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let fan_out = stream::iter(&audience).for_each_concurrent(
-            FAREWELL_MAX_CONCURRENCY,
-            |(peer, hash, has_path)| {
-                let (delivered, held, message, transport) =
-                    (&delivered, &held, &message, &transport);
-                async move {
-                    let via = if *has_path {
-                        self.send_peer_inner(&peer.destination_hash, message, options)
-                            .await
-                            .ok()
-                            .map(|sent| sent.via)
-                    } else {
-                        let desc = match peer.verified_destination() {
-                            Some(desc) => Some(desc),
-                            None => transport.destination_desc(hash).await,
-                        };
-                        self.hold_farewell(desc, message, &options.propagation)
-                            .await
+        let fan_out = stream::iter(&legs).for_each_concurrent(FAREWELL_MAX_CONCURRENCY, |leg| {
+            let (delivered, held, message, transport) = (&delivered, &held, &message, &transport);
+            async move {
+                let via = if leg.direct {
+                    self.send_peer_inner(&leg.peer.destination_hash, message, options)
+                        .await
+                        .ok()
+                        .map(|sent| sent.via)
+                } else {
+                    let desc = match leg.peer.verified_destination() {
+                        Some(desc) => Some(desc),
+                        None => transport.destination_desc(&leg.hash).await,
                     };
-                    match via {
-                        Some(PeerVia::Direct) => delivered.fetch_add(1, Ordering::Relaxed),
-                        Some(PeerVia::StoreAndForward) => held.fetch_add(1, Ordering::Relaxed),
-                        None => 0,
-                    };
-                }
-            },
-        );
+                    self.hold_farewell(desc, message, &options.propagation)
+                        .await
+                };
+                match via {
+                    Some(PeerVia::Direct) => delivered.fetch_add(leg.covers, Ordering::Relaxed),
+                    Some(PeerVia::StoreAndForward) => held.fetch_add(leg.covers, Ordering::Relaxed),
+                    None => 0,
+                };
+            }
+        });
         let finished = tokio::time::timeout(FAREWELL_BUDGET, fan_out).await.is_ok();
         let (delivered, held) = (
             delivered.load(Ordering::Relaxed),
             held.load(Ordering::Relaxed),
         );
         let outcome = FarewellOutcome {
-            audience: audience.len(),
+            audience,
             delivered,
             held,
-            skipped: audience.len() - delivered - held,
+            skipped: audience - delivered - held,
         };
         debug!(
             "Mesh farewell {} delivered to {}, held for {}, skipped {} of {} trusted peer(s){}",
@@ -2897,7 +3035,9 @@ pub(crate) struct PeerAdmission<'a> {
 /// `source_destination` said it is leaving the mesh. `received_at` is this node's clock
 /// when it arrived, taken before anything else ran. `sent_at` is the time the sender
 /// stamped on it, never later than `received_at`, so a sender whose clock runs ahead
-/// cannot post-date its mark.
+/// cannot post-date its mark. One that came over a link is ordered against the row's
+/// latest presence by `received_at`; one fetched from a propagation node, which arrives
+/// long after it was sent, by `sent_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Farewell {
     pub source_identity: String,
@@ -3084,7 +3224,7 @@ pub(crate) struct PeerRouting<'a> {
 }
 
 impl InboundSink for PeerRouting<'_> {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         let id8 = short(&message.source_identity_hash);
         // The sending instance and the local destination are filled in below, once the
         // signer's identity has been read and the surface found.
@@ -3095,7 +3235,7 @@ impl InboundSink for PeerRouting<'_> {
                     "Propagated peer message from {id8} dropped: {}",
                     redact_hashes(why)
                 );
-                return;
+                return Delivery::Dropped;
             }
             PeerLxmf::Peer(peer) => {
                 let peer = *peer;
@@ -3125,7 +3265,7 @@ impl InboundSink for PeerRouting<'_> {
         let kind = raw.kind;
         let Ok(identity) = AddressHash::new_from_hex_string(&message.source_identity_hash) else {
             debug!("Propagated peer message from {id8} dropped: the signer's hash is malformed");
-            return;
+            return Delivery::Dropped;
         };
         let standing = match self.trust.identity_standing(&message.source_identity_hash) {
             IdentityStanding::Trusted { .. } => None,
@@ -3134,7 +3274,7 @@ impl InboundSink for PeerRouting<'_> {
         };
         if let Some(standing) = standing {
             debug!("Propagated {kind} from {id8} dropped: {standing} identity");
-            return;
+            return Delivery::Dropped;
         }
         let now = SystemTime::now();
         let OriginVerdict {
@@ -3158,13 +3298,13 @@ impl InboundSink for PeerRouting<'_> {
         }
         if verdict.decision != Decision::Allow {
             debug!("Propagated {kind} from {id8} dropped: instance {dest8} is not trusted");
-            return;
+            return Delivery::Dropped;
         }
         let Some(surface) = &self.surface else {
             debug!(
                 "Propagated {kind} from {id8} (instance {dest8}) dropped: the session slot is gone"
             );
-            return;
+            return Delivery::Dropped;
         };
         if is_farewell(kind, raw.fields.as_ref()) {
             debug!(
@@ -3179,7 +3319,7 @@ impl InboundSink for PeerRouting<'_> {
                 received_at: now,
                 via: PeerVia::StoreAndForward,
             });
-            return;
+            return Delivery::Presence;
         }
         let admission = PeerAdmission {
             source_identity: &message.source_identity_hash,
@@ -3204,13 +3344,15 @@ impl InboundSink for PeerRouting<'_> {
                 peer.message_id,
                 refusal.reason.as_str()
             );
-            return surface.file_peer(peer);
+            surface.file_peer(peer);
+            return Delivery::Delivered;
         }
         debug!(
             "Propagated {kind} {} from {id8} (instance {dest8}) received",
             peer.message_id
         );
         surface.deliver_peer(peer);
+        Delivery::Delivered
     }
 }
 
@@ -5557,8 +5699,9 @@ mod tests {
     }
 
     impl InboundSink for CountingSink {
-        fn deliver(&self, message: InboundMessage) {
+        fn deliver(&self, message: InboundMessage) -> Delivery {
             self.messages.lock().push(message);
+            Delivery::Delivered
         }
     }
 

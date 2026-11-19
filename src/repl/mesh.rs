@@ -5108,6 +5108,28 @@ mod sync_ask_line_tests {
             "Propagation node deadbeef lists 3 messages for you and 2 were asked for, but none were served; run .mesh messaging sync again or check its logs. 1 left on the propagation node for another session."
         );
     }
+
+    #[test]
+    fn a_fetched_farewell_is_counted_as_presence_after_delivered() {
+        let report = FetchReport {
+            node: "deadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+            listed: 1,
+            wanted: 1,
+            received: 1,
+            delivered: 0,
+            presence: 1,
+            duplicates: 0,
+            discarded: 0,
+            deferred: 0,
+            deferred_after_ask: 0,
+            acknowledged: 1,
+            left_for_session: 0,
+        };
+        assert_eq!(
+            render_sync(&report),
+            "Fetched from propagation node deadbeef: 1 listed, 1 wanted, 1 received, 0 delivered, 1 presence, 0 duplicates, 0 discarded, 0 deferred.\n`.mesh messaging help` says what the sync counts mean."
+        );
+    }
 }
 
 async fn trust(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
@@ -11025,7 +11047,7 @@ fn group_concepts(group: &str) -> Vec<(String, String)> {
             ),
             (
                 "sync counts",
-                "listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the propagation node: for another of your sessions.",
+                "listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; presence: farewells picked up, which mark their sender left and never reach the inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the propagation node: for another of your sessions.",
             ),
         ],
         "envoy" => &[
@@ -11288,7 +11310,7 @@ mod help_output_tests {
                 "answered, awaiting the model | The answer arrived; the model picks it up with mesh__collect.",
                 "bulletin | One text sent to every trusted session at once with `.mesh messaging broadcast`.",
                 "propagation node | Where messages wait while a session is away; `.mesh messaging sync` fetches them now.",
-                "sync counts | listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the propagation node: for another of your sessions.",
+                "sync counts | listed: held for you; wanted: asked for; received: handed over; delivered: put in your inbox; presence: farewells picked up, which mark their sender left and never reach the inbox; duplicates: already had; discarded: dropped as unreadable or not allowed; deferred: kept until the sender is known; left on the propagation node: for another of your sessions.",
                 "Under the hood: messages travel over Reticulum as LXMF, addressed to the destination a session announces. A propagation node is an LXMF store-and-forward node; your session identifies itself to the nearest one heard when it joins and on a timer, and `.mesh messaging sync` asks it now.",
             ]
         );
@@ -38659,7 +38681,12 @@ mod tests {
                         })
                         .unwrap();
                     assert_eq!(
-                        runtime.peers().mark_left(&peer, now),
+                        runtime.peers().mark_left(
+                            &peer,
+                            crate::mesh::test_support::FarewellTime::Stamped(
+                                SystemTime::now() + Duration::from_millis(1),
+                            )
+                        ),
                         crate::mesh::test_support::LeftMark::Marked
                     );
                     assert!(runtime.path_known(&peer).await);
@@ -38847,9 +38874,13 @@ mod tests {
                     let (stub, mut pn, started, mut ctx, peer) =
                         runtime_with_peer_and_storing_node("repl-mesh-left-held").await;
                     let runtime = started.runtime.clone();
-                    let left_at = SystemTime::now();
                     assert_eq!(
-                        runtime.peers().mark_left(&peer, left_at),
+                        runtime.peers().mark_left(
+                            &peer,
+                            crate::mesh::test_support::FarewellTime::Stamped(
+                                SystemTime::now() + Duration::from_millis(1),
+                            )
+                        ),
                         crate::mesh::test_support::LeftMark::Marked
                     );
                     assert!(
@@ -39146,7 +39177,12 @@ mod tests {
                     let peer = stub.destination_hex();
                     stub.wait_to_be_filed(&runtime.peers(), &peer).await;
                     assert_eq!(
-                        runtime.peers().mark_left(&peer, SystemTime::now()),
+                        runtime.peers().mark_left(
+                            &peer,
+                            crate::mesh::test_support::FarewellTime::Stamped(
+                                SystemTime::now() + Duration::from_millis(1),
+                            )
+                        ),
                         crate::mesh::test_support::LeftMark::Marked
                     );
 
@@ -39177,7 +39213,12 @@ mod tests {
                         })
                         .unwrap();
                     assert_eq!(
-                        runtime.peers().mark_left(&peer, now),
+                        runtime.peers().mark_left(
+                            &peer,
+                            crate::mesh::test_support::FarewellTime::Stamped(
+                                SystemTime::now() + Duration::from_millis(1),
+                            )
+                        ),
                         crate::mesh::test_support::LeftMark::Marked
                     );
                     announce_until(&stub, "the is-back line", || !idle.0.lock().is_empty()).await;

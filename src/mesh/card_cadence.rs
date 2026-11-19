@@ -1184,7 +1184,10 @@ mod network {
         assert_eq!(status_requests(a_rt), 0, "B never served A");
 
         assert_eq!(
-            a_rt.peers().mark_left(&b_dest, SystemTime::now()),
+            a_rt.peers().mark_left(
+                &b_dest,
+                crate::mesh::peers::FarewellTime::Stamped(SystemTime::now())
+            ),
             crate::mesh::peers::LeftMark::Marked
         );
         b_rt.announce_on_connect().await.unwrap();
@@ -1200,7 +1203,10 @@ mod network {
         assert_eq!(status_requests(a_rt), 1);
 
         assert_eq!(
-            a_rt.peers().mark_left(&b_dest, SystemTime::now()),
+            a_rt.peers().mark_left(
+                &b_dest,
+                crate::mesh::peers::FarewellTime::Stamped(SystemTime::now())
+            ),
             crate::mesh::peers::LeftMark::Marked
         );
         assert!(

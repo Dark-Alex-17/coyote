@@ -464,7 +464,7 @@ pub(crate) mod network {
         RecordingEnvoy, SHUTDOWN_GRACE, fail_next_announce_of,
     };
     use crate::mesh::notify::Source;
-    use crate::mesh::peers::{LeftMark, PEER_TTL, PeerSighting, PeerTable};
+    use crate::mesh::peers::{FarewellTime, LeftMark, PEER_TTL, PeerSighting, PeerTable};
     use crate::mesh::pending::{
         CorrelationKind, PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome,
     };
@@ -11275,7 +11275,9 @@ pub(crate) mod network {
         let b_instance = b_hash.to_hex_string();
         let left_at = SystemTime::now();
         assert_eq!(
-            pair.node_a.peers().mark_left(&b_instance, left_at),
+            pair.node_a
+                .peers()
+                .mark_left(&b_instance, FarewellTime::Stamped(left_at)),
             LeftMark::Marked
         );
         let transport = pair.node_a.transport_handle().await.unwrap();
@@ -11322,7 +11324,7 @@ pub(crate) mod network {
         assert_eq!(
             pair.node_a
                 .peers()
-                .mark_left(&b_instance, SystemTime::now()),
+                .mark_left(&b_instance, FarewellTime::Stamped(SystemTime::now())),
             LeftMark::Marked
         );
         let message =
@@ -11446,7 +11448,7 @@ pub(crate) mod network {
         assert_eq!(
             pair.node_a
                 .peers()
-                .mark_left(&b_instance, SystemTime::now()),
+                .mark_left(&b_instance, FarewellTime::Stamped(SystemTime::now())),
             LeftMark::Marked
         );
         let bulletin = OutboundPeer::new(PeerKind::Bulletin, "news", None, None, None).unwrap();
@@ -11514,7 +11516,9 @@ pub(crate) mod network {
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let left_at = SystemTime::now();
         assert_eq!(
-            pair.node_a.peers().mark_left(&b_instance, left_at),
+            pair.node_a
+                .peers()
+                .mark_left(&b_instance, FarewellTime::Stamped(left_at)),
             LeftMark::Marked
         );
         let request = access_request("acc-left", &["src/x.rs"], "need it");
@@ -11551,7 +11555,7 @@ pub(crate) mod network {
         assert_eq!(
             pair.node_a
                 .peers()
-                .mark_left(&b_instance, SystemTime::now()),
+                .mark_left(&b_instance, FarewellTime::Stamped(SystemTime::now())),
             LeftMark::Marked
         );
         let request = access_request("acc-left-none", &["src/x.rs"], "need it");

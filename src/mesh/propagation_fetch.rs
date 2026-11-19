@@ -10,7 +10,6 @@
 //! it; if the key is still unknown, the body is neither recorded nor acknowledged, so the
 //! node keeps it for a later fetch, a bounded number of times.
 
-use crate::mesh::message::is_fetched_farewell;
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash, lxmf_delivery_hash_of};
 use crate::mesh::request::{
@@ -486,8 +485,19 @@ pub(crate) struct InboundMessage {
     pub stamp_value: Option<u32>,
 }
 
+/// What a sink did with a message that passed the fetch's checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    Delivered,
+    /// Taken as presence rather than mail: a farewell, which marks its sender left.
+    Presence,
+    /// Refused by the stage it was routed to, which logs why: an instance the trust list
+    /// does not allow, a malformed payload, or no session slot to take it.
+    Dropped,
+}
+
 pub(crate) trait InboundSink: Send + Sync {
-    fn deliver(&self, message: InboundMessage);
+    fn deliver(&self, message: InboundMessage) -> Delivery;
 }
 
 /// Asked of every message that passed the checks, before anything about it is recorded:
@@ -530,7 +540,7 @@ impl LeftIds {
 pub(crate) struct LoggingInboundSink;
 
 impl InboundSink for LoggingInboundSink {
-    fn deliver(&self, message: InboundMessage) {
+    fn deliver(&self, message: InboundMessage) -> Delivery {
         debug!(
             "Propagated message {} from {} (delivery {}): {} title bytes, {} content bytes, stamp value {}",
             short(&hex_lower(&message.message_id)),
@@ -542,6 +552,7 @@ impl InboundSink for LoggingInboundSink {
                 .stamp_value
                 .map_or_else(|| "none".to_string(), |value| value.to_string())
         );
+        Delivery::Delivered
     }
 }
 
@@ -1236,6 +1247,9 @@ pub(crate) enum Discard {
     UntrustedSource,
     /// The signer is blocked on the trust list.
     BlockedSource,
+    /// Passed every check here but refused by the stage it was routed to. Recorded and
+    /// acknowledged as a delivered body is, since serving it again changes nothing.
+    Dropped,
 }
 
 impl Discard {
@@ -1283,6 +1297,7 @@ impl fmt::Display for Discard {
             }
             Self::UntrustedSource => write!(f, "signer is not trusted"),
             Self::BlockedSource => write!(f, "signer is blocked"),
+            Self::Dropped => write!(f, "refused by the stage it was routed to"),
         }
     }
 }
@@ -1503,13 +1518,11 @@ impl BodyPipeline<'_> {
                 }
                 store.insert(transient_id, now);
                 store.record_delivered(message.message_id, now);
-                let outcome = if is_fetched_farewell(&message) {
-                    BodyOutcome::Presence
-                } else {
-                    BodyOutcome::Delivered
-                };
-                self.sink.deliver(message);
-                Ok(outcome)
+                Ok(match self.sink.deliver(message) {
+                    Delivery::Delivered => BodyOutcome::Delivered,
+                    Delivery::Presence => BodyOutcome::Presence,
+                    Delivery::Dropped => BodyOutcome::Discarded(Discard::Dropped),
+                })
             }
             Err(unknown @ Discard::UnknownSource { asked }) => {
                 match store.defer(transient_id, now, asked) {
@@ -2290,8 +2303,9 @@ mod tests {
     }
 
     impl InboundSink for CountingSink {
-        fn deliver(&self, message: InboundMessage) {
+        fn deliver(&self, message: InboundMessage) -> Delivery {
             self.messages.lock().push(message);
+            Delivery::Delivered
         }
     }
 
@@ -3118,32 +3132,37 @@ mod tests {
         assert_eq!(inbox.count(), 1);
     }
 
-    /// A farewell fetched from the node is handed over as presence, not mail: the report
-    /// counts it under `presence`, round 3 acknowledges it, and its id is recorded, so the
-    /// same body served again, in this fetch or the next, is a duplicate.
-    #[tokio::test]
-    async fn a_fetched_farewell_counts_as_presence_and_is_recorded() {
-        let peer = CorePrivateIdentity::new_from_rand(OsRng);
-        let peer_id = transport_identity_of(&peer);
-        let origin = OriginName::of(&session_destination_name("peer"));
-        let mut bench = Bench::new(
-            "fetch-farewell-presence",
-            TrustList::default().identity(&identity_hex(&peer_id), true),
-        );
-        bench.keys.know(&peer_id);
+    /// Two copies of one farewell from `peer`'s `origin` instance, fetched through the
+    /// peer stage the runtime builds, under `trust`. Returns the report, round 3's acks
+    /// and the body.
+    async fn fetch_farewell_twice(
+        tag: &str,
+        peer: &CorePrivateIdentity,
+        origin: &OriginName,
+        trust: TrustList,
+    ) -> (FetchReport, Vec<TransientId>, Vec<u8>, Bench) {
+        let mut bench = Bench::new(tag, trust);
+        bench.keys.know(&transport_identity_of(peer));
         let me = bench.me();
-        let farewell = peer_lxmf_message(&farewell_message().unwrap(), &origin);
-        let body = build_signed_message(&peer, &lxmf_delivery_hash(&me), &farewell, unix_now())
+        let farewell = peer_lxmf_message(&farewell_message().unwrap(), origin);
+        let body = build_signed_message(peer, &lxmf_delivery_hash(&me), &farewell, unix_now())
             .unwrap()
             .pack_propagation_transient_with_rng(&to_core_identity(&me), OsRng)
             .unwrap()
             .0;
+        let trust = bench.trust.clone();
+        let slot = Arc::new(MeshSlot::default());
+        let peer_stage = PeerRouting {
+            trust: &trust,
+            surface: Some(slot as Arc<dyn PeerSurface>),
+            inner: &bench.sink,
+        };
         let pipeline = BodyPipeline {
             recipient: &bench.recipient,
             delivery: lxmf_delivery_hash(&me),
             keys: &bench.keys,
             trust: &bench.trust,
-            sink: &bench.sink,
+            sink: &peer_stage,
             hold: &TakeAll,
             node: "fake",
             asked: Mutex::default(),
@@ -3161,6 +3180,26 @@ mod tests {
         )
         .await
         .unwrap();
+        (report, acks, body, bench)
+    }
+
+    /// A farewell fetched from the node is handed over as presence, not mail: the report
+    /// counts it under `presence`, round 3 acknowledges it, and its id is recorded, so the
+    /// same body served again, in this fetch or the next, is a duplicate.
+    #[tokio::test]
+    async fn a_fetched_farewell_counts_as_presence_and_is_recorded() {
+        let peer = CorePrivateIdentity::new_from_rand(OsRng);
+        let peer_id = transport_identity_of(&peer);
+        let origin = OriginName::of(&session_destination_name("peer"));
+        let peer_destination =
+            destination_address(&origin.0, &peer_id.address_hash).to_hex_string();
+        let (report, acks, body, mut bench) = fetch_farewell_twice(
+            "fetch-farewell-presence",
+            &peer,
+            &origin,
+            TrustList::default().destination(&peer_destination, &identity_hex(&peer_id)),
+        )
+        .await;
 
         assert_eq!(
             (report.presence, report.delivered, report.duplicates),
@@ -3168,8 +3207,32 @@ mod tests {
         );
         assert_eq!(report.left_received(), 0);
         assert_eq!(acks, vec![transient_id_of(&body)]);
-        assert_eq!(bench.sink.count(), 1, "the farewell reaches the sink once");
+        assert_eq!(bench.sink.count(), 0, "a farewell never reaches the inbox");
         assert_eq!(discarded(bench.process(&body).await), Discard::Duplicate);
+    }
+
+    /// A farewell signed by a known identity but naming an instance the trust list does
+    /// not allow is dropped by the peer stage, so it is a discard and never presence.
+    #[tokio::test]
+    async fn a_farewell_from_an_untrusted_instance_is_not_counted_as_presence() {
+        let peer = CorePrivateIdentity::new_from_rand(OsRng);
+        let peer_id = transport_identity_of(&peer);
+        let origin = OriginName::of(&session_destination_name("peer"));
+        let (report, acks, body, bench) = fetch_farewell_twice(
+            "fetch-farewell-untrusted",
+            &peer,
+            &origin,
+            TrustList::default().identity(&identity_hex(&peer_id), false),
+        )
+        .await;
+
+        assert_eq!(
+            (report.presence, report.delivered, report.discarded),
+            (0, 0, 1),
+            "{report:?}"
+        );
+        assert_eq!(acks, vec![transient_id_of(&body)]);
+        assert_eq!(bench.sink.count(), 0);
     }
 
     /// The hold policy is asked only about a message that passed every check. One it
