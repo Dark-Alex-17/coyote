@@ -2328,8 +2328,8 @@ impl App {
         }
     }
 
-    /// The pager and the key help each cover the whole screen, and the
-    /// pager's keys come first, so the help never stays open under it.
+    /// The pager covers the whole screen, key help pop-up included, and
+    /// its keys come first, so the help never stays open under it.
     fn open_pager(&mut self, pager: Pager) {
         self.help = None;
         self.pager = Some(pager);
@@ -5840,12 +5840,44 @@ mod tests {
         assert_eq!(harness.app.composer_text(), "first line|line\nthird");
     }
 
-    /// Ctrl+_, and Ctrl+/ and Ctrl+7 the way a legacy terminal sends them,
-    /// undo the last edit in the composer and in a question's text field.
+    /// Ctrl+U in a question's text field cuts back to the start of the
+    /// field and leaves the composer alone.
+    #[test]
+    fn ctrl_u_cuts_back_to_the_start_of_an_input_field() {
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut harness = Harness::standalone(80, 24);
+        harness.type_text("draft");
+        let req = PromptRequest::new(PromptAction::Input, "Name:", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.type_text("alpha beta");
+        harness
+            .app
+            .prompts
+            .front_mut()
+            .unwrap()
+            .field
+            .as_mut()
+            .unwrap()
+            .move_cursor(ratatui_textarea::CursorMove::WordBack);
+        assert_eq!(harness.app.handle_key(ctrl('u')), None);
+        let field = harness.app.prompts.front().unwrap().field.as_ref().unwrap();
+        assert_eq!(field.lines(), ["beta"]);
+        assert_eq!(harness.app.composer_text(), "draft");
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
+    /// Ctrl+_, as a legacy terminal sends it (one byte that also stands
+    /// for Ctrl+/ and Ctrl+7) or a kitty-protocol one does (Ctrl+Shift+-),
+    /// undoes the last edit in the composer and in a question's text field.
     #[test]
     fn ctrl_underscore_undoes_in_the_composer_and_the_text_field() {
         let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
-        for undo in [ctrl('_'), ctrl('/'), ctrl('7')] {
+        let kitty = KeyEvent::new(
+            KeyCode::Char('-'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        for undo in [ctrl('_'), ctrl('/'), ctrl('7'), kitty] {
             let mut harness = Harness::standalone(80, 24);
             harness.type_text("alpha beta");
             assert_eq!(harness.app.handle_key(ctrl('w')), None);

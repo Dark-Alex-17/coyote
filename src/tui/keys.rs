@@ -597,6 +597,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('j') if ctrl => Action::Nothing,
             KeyCode::Char('u') if ctrl => Action::DeleteToLineHead,
             KeyCode::Char('_' | '/' | '7') if ctrl => Action::Undo,
+            KeyCode::Char('-') if ctrl && shift => Action::Undo,
             _ => Action::ModalInput(key),
         },
         Some(
@@ -700,8 +701,11 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
             KeyCode::Char('u') if ctrl => Action::DeleteToLineHead,
             // A legacy terminal sends Ctrl+_, Ctrl+/ and Ctrl+7 as one
-            // byte, which crossterm reads as Ctrl+7.
+            // byte, which crossterm reads as Ctrl+7. Under the kitty
+            // protocol Ctrl+_ arrives as its unshifted key, Ctrl+Shift+-;
+            // Ctrl+- without Shift is not bound.
             KeyCode::Char('_' | '/' | '7') if ctrl => Action::Undo,
+            KeyCode::Char('-') if ctrl && shift => Action::Undo,
             KeyCode::Enter
                 if key
                     .modifiers
@@ -1012,6 +1016,27 @@ mod tests {
         assert_eq!(map_key(shifted('Z'), &IDLE), Action::Suspend);
         assert_eq!(map_key(shifted('J'), &IDLE), Action::InsertNewline);
         assert_eq!(map_key(shifted('O'), &IDLE), Action::OpenEditor);
+    }
+
+    /// Ctrl+_ as a kitty-protocol terminal reports it: the unshifted key
+    /// with Shift held.
+    fn kitty_ctrl_underscore() -> KeyEvent {
+        press(
+            KeyCode::Char('-'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
+    }
+
+    #[test]
+    fn kitty_ctrl_underscore_undoes_and_ctrl_minus_does_not() {
+        for ctx in [IDLE, INPUT] {
+            assert_eq!(
+                map_key(kitty_ctrl_underscore(), &ctx),
+                Action::Undo,
+                "{ctx:?}"
+            );
+            assert_ne!(map_key(ctrl('-'), &ctx), Action::Undo, "{ctx:?}");
+        }
     }
 
     #[test]
@@ -2507,6 +2532,8 @@ mod tests {
                     (control(KeyCode::Char('_')), TYPING, Action::Undo),
                     (control(KeyCode::Char('/')), VI_INSERT_TYPING, Action::Undo),
                     (control(KeyCode::Char('7')), CUSTOM_FIELD, Action::Undo),
+                    (kitty_ctrl_underscore(), TYPING, Action::Undo),
+                    (kitty_ctrl_underscore(), INPUT, Action::Undo),
                 ],
             ),
             (
@@ -2955,7 +2982,11 @@ mod tests {
     /// The help's own name for a key, as a label token spells it: the
     /// letter case-folded, Ctrl and Alt kept, and Shift kept only on a
     /// named key, since on a character it is the case or the symbol.
+    /// The kitty protocol's Ctrl+Shift+- is the Ctrl+_ the help names.
     fn normalise(key: KeyEvent) -> (KeyCode, KeyModifiers) {
+        if key == kitty_ctrl_underscore() {
+            return (KeyCode::Char('_'), KeyModifiers::CONTROL);
+        }
         let code = lowercase(key.code);
         let mut modifiers =
             key.modifiers & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);

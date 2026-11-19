@@ -152,8 +152,11 @@ fn wrap_keys(keys: &str, width: usize) -> Vec<String> {
 }
 
 impl Widget for &mut Help {
-    /// `area` is the transcript's; the pop-up sits inside it. Under the
-    /// title a blank row sets the first heading apart from the border.
+    /// `area` is the screen above the status line, the transcript and any
+    /// todo panel; the pop-up sits inside it. Under the title a blank row
+    /// sets the first heading apart from the border. With no row left for
+    /// the body only the frame is drawn, so no position names lines that
+    /// cannot be seen.
     fn render(self, area: Rect, buf: &mut Buffer) {
         let area = area.intersection(*buf.area()).inner(MARGIN);
         if area.is_empty() {
@@ -175,10 +178,14 @@ impl Widget for &mut Help {
         self.page = rows.max(1);
         self.last_total = total;
         self.top = self.top.min(self.bottom());
+        Clear.render(area, buf);
+        if body.is_empty() {
+            block.render(area, buf);
+            return;
+        }
         let start = self.top;
         let end = (start + rows).min(total);
         let position = format!("{}-{end}/{total}", (start + 1).min(end));
-        Clear.render(area, buf);
         block
             .title(Line::styled(position, DIM).right_aligned())
             .render(area, buf);
@@ -334,5 +341,16 @@ mod tests {
         let narrow: Vec<String> = lines(40).iter().map(Line::to_string).collect();
         let at = narrow.iter().position(|line| line == "  Ctrl+Z").unwrap();
         assert_eq!(narrow[at + 1], "    Suspend to the shell");
+    }
+
+    /// With no row left for the body the frame still shows, but no
+    /// position for lines nobody can see.
+    #[test]
+    fn a_frame_with_no_room_for_the_body_shows_no_position() {
+        let mut help = Help::default();
+        let screen = draw(&mut help, 40, CHROME_ROWS as u16);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(rows[1].contains("Keys"), "{:?}", rows[1]);
+        assert!(!rows[1].contains('/'), "{:?}", rows[1]);
     }
 }
