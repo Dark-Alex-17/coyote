@@ -5592,8 +5592,8 @@ impl RequestContext {
     }
 
     /// Completion rows for a command's arguments: the value, its
-    /// description, and the kind of thing the value names when the
-    /// branch knows it (`agent`, `session`, `variable`, ...).
+    /// description, and a kind (`session` or `variable`) on the
+    /// mixed rows offered after `.agent <name> `; other rows have none.
     pub fn repl_complete(
         &self,
         cmd: &str,
@@ -5624,15 +5624,7 @@ impl RequestContext {
             return fuzzy_filter(values, |v| v.0.as_str(), filter);
         }
         let mut values: Vec<(String, Option<String>)> = vec![];
-        let mut kind = None;
         if args.len() == 1 {
-            kind = match cmd {
-                ".role" => Some("role"),
-                ".model" => Some("model"),
-                ".session" => Some("session"),
-                ".agent" => Some("agent"),
-                _ => None,
-            };
             values = match cmd {
                 ".role" => super::map_completion_values(paths::list_roles(true)),
                 ".model" => list_models(app, ModelType::Chat)
@@ -6108,7 +6100,7 @@ impl RequestContext {
         };
         let values = values
             .into_iter()
-            .map(|(value, description)| (value, description, kind))
+            .map(|(value, description)| (value, description, None))
             .collect();
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
@@ -18723,16 +18715,8 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                (
-                    "both".to_string(),
-                    Some("workspace".to_string()),
-                    Some("session")
-                ),
-                (
-                    "only-global".to_string(),
-                    Some("global".to_string()),
-                    Some("session")
-                ),
+                ("both".to_string(), Some("workspace".to_string()), None),
+                ("only-global".to_string(), Some("global".to_string()), None),
             ]
         );
     }
@@ -19065,7 +19049,7 @@ mod tests {
             .repl_complete(".session", &["_/"], "")
             .into_iter()
             .map(|(name, label, kind)| {
-                assert_eq!(kind, Some("session"), "{name}");
+                assert_eq!(kind, None, "{name}");
                 (name, label)
             })
             .collect();
@@ -19414,11 +19398,7 @@ mod tests {
         );
         assert_eq!(
             ctx.repl_complete(".session", &[""], ""),
-            vec![(
-                "solo".to_string(),
-                Some("global".to_string()),
-                Some("session")
-            )]
+            vec![("solo".to_string(), Some("global".to_string()), None)]
         );
 
         // Load existing, save, exit: all global, no workspace dir materialises.
@@ -19690,11 +19670,7 @@ mod tests {
         let values = ctx.repl_complete(".session", &[""], "");
         assert_eq!(
             values,
-            vec![(
-                "evilred".to_string(),
-                Some("workspace".to_string()),
-                Some("session")
-            )]
+            vec![("evilred".to_string(), Some("workspace".to_string()), None)]
         );
     }
 
@@ -24004,13 +23980,11 @@ mod tests {
 
         let agents = ctx.repl_complete(".agent", &[""], "");
         assert!(
-            agents
-                .iter()
-                .any(|(name, _, kind)| *name == agent_name && *kind == Some("agent")),
+            agents.iter().any(|(name, _, _)| *name == agent_name),
             "{agents:?}"
         );
         assert!(
-            agents.iter().all(|(_, _, kind)| *kind == Some("agent")),
+            agents.iter().all(|(_, _, kind)| kind.is_none()),
             "{agents:?}"
         );
 
@@ -24036,6 +24010,26 @@ mod tests {
                 Some("variable")
             )]
         );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_single_kind_first_arguments_carry_no_kind() {
+        let _guard = HelperConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "plain", SessionScope::Global, "messages: []\n");
+
+        let roles = ctx.repl_complete(".role", &[""], "");
+        let sessions = ctx.repl_complete(".session", &[""], "");
+        assert!(!roles.is_empty());
+        assert!(!sessions.is_empty());
+        for cmd in [".role", ".model", ".session"] {
+            let values = ctx.repl_complete(cmd, &[""], "");
+            assert!(
+                values.iter().all(|(_, _, kind)| kind.is_none()),
+                "{cmd}: {values:?}"
+            );
+        }
     }
 
     #[test]
@@ -24081,16 +24075,8 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                (
-                    "global".to_string(),
-                    Some("global".to_string()),
-                    Some("session")
-                ),
-                (
-                    "ws".to_string(),
-                    Some("workspace".to_string()),
-                    Some("session")
-                ),
+                ("global".to_string(), Some("global".to_string()), None),
+                ("ws".to_string(), Some("workspace".to_string()), None),
             ]
         );
     }

@@ -447,7 +447,7 @@ pub(super) fn render_rows(
 }
 
 /// Draws rows of name, kind and description, each column padded to its
-/// widest entry; the kind column is left out when no shown row has one.
+/// widest entry; the kind column is left out when no row has one.
 /// Given fewer rows than the list has, the band keeps the highlight in
 /// view and ends with how many rows are not shown.
 fn render_columns(
@@ -471,7 +471,9 @@ fn render_columns(
         .map(|(name, _, _)| name.width())
         .max()
         .unwrap_or(0);
-    let kind_width = visible
+    // Over every row, not the window, so scrolling does not move the
+    // kind column in or out.
+    let kind_width = rows
         .iter()
         .map(|(_, kind, _)| kind.width())
         .max()
@@ -814,7 +816,7 @@ mod tests {
             agents
                 .rows
                 .iter()
-                .any(|row| row.value == "palette-agent-x" && row.kind == Some("agent")),
+                .any(|row| row.value == "palette-agent-x" && row.kind.is_none()),
             "{agents:?}"
         );
         assert!(agents.rows.iter().all(|row| !row.value.starts_with('/')));
@@ -1070,6 +1072,46 @@ mod tests {
 
         let (_, lines) = rendered(&rows(&["helper"]), 1);
         assert_eq!(lines, vec!["helper  about helper"]);
+    }
+
+    #[test]
+    fn the_kind_column_holds_still_while_scrolling_past_rows_without_one() {
+        let names: Vec<String> = (0..12).map(|i| format!(".c{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut palette = rows(&names);
+        palette.rows[11].kind = Some("variable");
+        let (_, lines) = rendered(&palette, 4);
+        assert_eq!(lines[0], ".c00            about .c00");
+        for _ in 0..12 {
+            palette.move_highlight(1);
+        }
+        let (_, lines) = rendered(&palette, 4);
+        assert_eq!(lines[1], ".c10            about .c10");
+        assert_eq!(lines[2], ".c11  variable  about .c11");
+    }
+
+    /// `.session` and `.role` list one kind of thing, so their rows carry
+    /// no kind and the band shows the value then the description.
+    #[test]
+    #[serial]
+    fn single_kind_argument_lists_show_no_kind_column() {
+        let _guard = TestConfigDirGuard::new("palette-single-kind");
+        let ctx = ctx_with(CommandPrefix::Slash, true);
+        let session = ctx.session_file_for("plain", crate::config::SessionScope::Global);
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, "model: x\nmessages: []\n").unwrap();
+        let snapshot = PaletteSnapshot::from_ctx(&ctx);
+        let sessions =
+            PaletteState::build("/session ", CommandPrefix::Slash, snapshot, &[], Some(&ctx))
+                .expect("the sessions are rows");
+        let (_, lines) = rendered(&sessions, 1);
+        assert_eq!(lines, vec!["plain  global"]);
+
+        let roles = PaletteState::build("/role ", CommandPrefix::Slash, snapshot, &[], Some(&ctx))
+            .expect("the roles are rows");
+        assert!(roles.rows.iter().all(|row| row.kind.is_none()), "{roles:?}");
+        let (_, lines) = rendered(&roles, 2);
+        assert_eq!(lines[0], roles.rows[0].value.trim_end());
     }
 
     #[test]

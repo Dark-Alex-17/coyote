@@ -1029,6 +1029,16 @@ bitflags::bitflags! {
     }
 }
 
+impl StateFlags {
+    /// What the user has entered: a role, session, RAG or agent. The
+    /// other flags are capabilities that are on or off regardless.
+    pub const CONTEXT: Self = Self::ROLE
+        .union(Self::SESSION_EMPTY)
+        .union(Self::SESSION)
+        .union(Self::RAG)
+        .union(Self::AGENT);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AssertState {
     True(StateFlags),
@@ -1044,13 +1054,7 @@ impl AssertState {
     /// No role, session, RAG or agent is active. Capability flags such as
     /// `FUNCTION_CALLING` describe the config, not the context, and are ignored.
     pub fn bare() -> Self {
-        AssertState::False(
-            StateFlags::ROLE
-                | StateFlags::SESSION_EMPTY
-                | StateFlags::SESSION
-                | StateFlags::RAG
-                | StateFlags::AGENT,
-        )
+        AssertState::False(StateFlags::CONTEXT)
     }
 
     pub fn assert(self, flags: StateFlags) -> bool {
@@ -1933,6 +1937,17 @@ hooks:
         ] {
             assert!(!bare.assert(capabilities | flag), "{flag:?}");
         }
+    }
+
+    /// A new flag must be classed as context or capability, or `bare()`
+    /// silently ignores it.
+    #[test]
+    fn assert_state_flags_split_into_context_and_capabilities() {
+        let capabilities =
+            StateFlags::FUNCTION_CALLING | StateFlags::AUTO_CONTINUE | StateFlags::SKILLS_ENABLED;
+
+        assert_eq!(StateFlags::CONTEXT | capabilities, StateFlags::all());
+        assert!(StateFlags::CONTEXT.intersection(capabilities).is_empty());
     }
 
     #[test]

@@ -404,6 +404,34 @@ mod prefix_tests {
     }
 
     #[test]
+    #[serial]
+    fn single_kind_argument_lists_keep_their_plain_descriptions() {
+        let _guard = TestConfigDirGuard::new("completer-single-kind");
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        assert!(!ctx.repl_complete(".role", &[""], "").is_empty());
+        let ctx = Arc::new(RwLock::new(ctx));
+        let mut completer = ReplCompleter::new(ctx.clone());
+        for cmd in [".role", ".model"] {
+            let expected: Vec<(String, Option<String>)> = ctx
+                .read()
+                .repl_complete(cmd, &[""], "")
+                .into_iter()
+                .map(|(value, description, _)| (value, description.filter(|d| !d.is_empty())))
+                .collect();
+            if expected.is_empty() {
+                continue;
+            }
+            let line = format!("{cmd} ");
+            let rows: Vec<(String, Option<String>)> = completer
+                .suggestions_for(&line, line.len())
+                .into_iter()
+                .map(|s| (s.value, s.description))
+                .collect();
+            assert_eq!(rows, expected, "{cmd}");
+        }
+    }
+
+    #[test]
     fn unaccepted_sigil_is_not_completed() {
         assert!(values(CommandPrefix::Dot, "/in").is_empty());
         assert!(values(CommandPrefix::Slash, ".in").is_empty());
