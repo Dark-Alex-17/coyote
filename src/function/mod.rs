@@ -1748,6 +1748,7 @@ impl ToolCall {
 
         let vision = ctx.current_model().supports_vision();
         let mut attachments: Vec<ImageAttachment> = vec![];
+        let global_tool = agent_name.as_deref() != Some(cmd_name.as_str());
         let output = match cmd_name.as_str() {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
                 Self::search_mcp_tools(ctx, &cmd_name, &json_data)
@@ -1927,6 +1928,12 @@ impl ToolCall {
                     Arc::clone(&ctx.prompter),
                     Arc::clone(&ctx.prompt_memory),
                     Origin::from(&*ctx),
+                    ctx.app
+                        .config
+                        .password_prompt_tools
+                        .clone()
+                        .unwrap_or_default(),
+                    global_tool,
                 ),
                 ctx.session_abort.clone(),
             )
@@ -2672,13 +2679,23 @@ impl ToolIo {
     }
 
     /// Lets the tool ask the human; without it no reply channel is offered.
+    /// `password_tools` and `global` decide whether it may ask for a
+    /// password, as [`prompt_channel::ToolPrompter::new`] describes.
     pub(crate) fn with_prompter(
         mut self,
         prompter: Arc<dyn Prompter>,
         memory: Arc<PromptMemory>,
         origin: Origin,
+        password_tools: Vec<String>,
+        global: bool,
     ) -> Self {
-        self.prompter = Some(prompt_channel::ToolPrompter::new(prompter, memory, origin));
+        self.prompter = Some(prompt_channel::ToolPrompter::new(
+            prompter,
+            memory,
+            origin,
+            password_tools,
+            global,
+        ));
         self
     }
 }
@@ -2864,7 +2881,12 @@ pub fn run_llm_function(
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
     if let Some(agent_name) = agent_name {
-        command_name = cmd_args[0].clone();
+        // Only an agent's own function runs through the agent's binary,
+        // with the function's name as the first argument; a global tool
+        // under an agent keeps its own name.
+        if cmd_name == agent_name {
+            command_name = cmd_args[0].clone();
+        }
         let dir = paths::agent_bin_dir(&agent_name);
         if dir.exists() {
             bin_dirs.push(dir);

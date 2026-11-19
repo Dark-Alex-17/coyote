@@ -1294,6 +1294,47 @@ fn tui_page_quotes_the_code() {
     }
 }
 
+#[test]
+fn tool_prompts_are_documented_with_their_label_and_password_gate() {
+    let tui_source = src(&["tui", "mod.rs"]);
+    let asks = literal_with(production(&tui_source), " asks:").replace("{tool}", "<tool>");
+    assert_eq!(asks, "<tool> asks:");
+    let prompt_source = src(&["prompt", "mod.rs"]);
+    assert!(production(&prompt_source).contains("format!(\"{tool} asks: {}\", req.question)"));
+    let key = "password_prompt_tools";
+    assert_eq!(template_value(key), "null");
+    let channel = src(&["function", "prompt_channel.rs"]);
+    assert!(literal_with(production(&channel), "Refused a password prompt").contains(key));
+
+    let Some(wiki) = wiki_dir() else { return };
+    let custom = flat(&section(
+        "Custom-Tools.md",
+        &read(wiki.join("Custom-Tools.md")),
+        PROTOCOL_HEADING,
+    ));
+    for needle in [
+        format!("labels every question a tool asks `{asks}`"),
+        "with the name taken from the tool it ran".to_string(),
+        format!(
+            "A `password` request is refused unless the tool is shipped with Coyote or listed in `{key}`"
+        ),
+        "the answer is `null`, as if the user cancelled".to_string(),
+    ] {
+        assert!(custom.contains(&needle), "Custom-Tools.md says {needle}");
+    }
+    let tools = section(
+        "Tools.md",
+        &read(wiki.join("Tools.md")),
+        "## Global Configuration",
+    );
+    assert_eq!(yaml_value("Tools.md", &tools, key), "null");
+    let page = flat(&read(wiki.join(PAGE)));
+    assert!(
+        page.contains(&format!("`{asks}` for a tool")),
+        "{PAGE} says {asks}"
+    );
+}
+
 /// Every `refuse_non_interactive(` call in `source`: its action format and
 /// its remedy, when the remedy is a literal.
 fn refusal_calls(source: &str) -> Vec<(String, Option<String>)> {

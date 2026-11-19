@@ -42,6 +42,7 @@ pub struct AppConfig {
     #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
     pub enabled_tools: Option<Vec<String>>,
     pub visible_tools: Option<Vec<String>>,
+    pub password_prompt_tools: Option<Vec<String>>,
 
     pub skills_enabled: bool,
     #[serde(default, deserialize_with = "super::deserialize_csv_or_vec")]
@@ -149,6 +150,7 @@ impl Default for AppConfig {
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
+            password_prompt_tools: None,
 
             skills_enabled: true,
             enabled_skills: None,
@@ -263,6 +265,7 @@ impl AppConfig {
             mapping_tools: config.mapping_tools,
             enabled_tools: config.enabled_tools,
             visible_tools: config.visible_tools,
+            password_prompt_tools: config.password_prompt_tools,
 
             skills_enabled: config.skills_enabled,
             enabled_skills: config.enabled_skills,

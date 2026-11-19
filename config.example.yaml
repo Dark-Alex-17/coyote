@@ -139,6 +139,12 @@ visible_tools:                   # Which tools are visible to be compiled (and a
 #  - web_search_coyote.sh
 #  - web_search_perplexity.sh
 #  - web_search_tavily.sh
+password_prompt_tools: null      # Tools (by function name) allowed to ask for a password.
+                                 # Tools shipped with Coyote may always ask; a password prompt from any other
+                                 # tool is refused and answered as cancelled. Every tool prompt names the tool asking.
+                                 # Example:
+                                 #   password_prompt_tools:
+                                 #     - my_vault_tool
 
 # ---- MCP Servers ----
 # See the [MCP Servers documentation](https://github.com/Dark-Alex-17/coyote/wiki/MCP-Servers) for more details

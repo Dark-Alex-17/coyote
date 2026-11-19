@@ -483,11 +483,21 @@ impl InquirePrompter {
         options
     }
 
+    /// The question as the widget shows it: a tool's carries the tool's
+    /// name, so its prompt cannot pass for one of Coyote's own.
+    fn prompt_text(req: &PromptRequest) -> String {
+        match req.tool.as_deref() {
+            Some(tool) => format!("{tool} asks: {}", req.question),
+            None => req.question.clone(),
+        }
+    }
+
     /// A closed command menu is inquire's bare widget; a tool's select,
     /// closed or not, keeps the REPL styling (no type-to-filter, the
     /// movement hint as help), and only an open one offers the custom row.
     fn select(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
-        let select = Select::new(&req.question, Self::select_options(req));
+        let question = Self::prompt_text(req);
+        let select = Select::new(&question, Self::select_options(req));
         if Self::is_command_menu(req) {
             return select.prompt().map(PromptAnswer::Selected);
         }
@@ -511,7 +521,8 @@ impl InquirePrompter {
     fn input(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
         let default = input_default_text(req);
         let hint = default.as_deref().and_then(input_hint);
-        let mut text = Text::new(&req.question);
+        let question = Self::prompt_text(req);
+        let mut text = Text::new(&question);
         match (hint.as_deref(), default.as_deref()) {
             (Some(hint), _) => text = text.with_placeholder(hint),
             (None, Some(default)) => text = text.with_default(default),
@@ -530,7 +541,8 @@ impl InquirePrompter {
     }
 
     fn password(req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
-        let mut password = Password::new(&req.question)
+        let question = Self::prompt_text(req);
+        let mut password = Password::new(&question)
             .without_confirmation()
             .with_display_mode(PasswordDisplayMode::Masked);
         if let Some(help) = req.help.as_deref() {
@@ -549,7 +561,8 @@ impl InquirePrompter {
             let answer = Confirm::new(&req.question).with_default(default).prompt()?;
             return Ok(PromptAnswer::Confirmed(answer));
         };
-        let choice = Select::new(&req.question, TOOL_CONFIRM_ROWS.to_vec())
+        let question = Self::prompt_text(req);
+        let choice = Select::new(&question, TOOL_CONFIRM_ROWS.to_vec())
             .without_filtering()
             .with_starting_cursor(Self::tool_confirm_starting_row(req))
             .prompt()?;
@@ -582,9 +595,11 @@ impl Prompter for InquirePrompter {
             PromptAction::Select => Self::select(&req),
             PromptAction::Confirm => self.confirm(&req),
             PromptAction::Input => Self::input(&req),
-            PromptAction::Checkbox => MultiSelect::new(&req.question, req.options.clone())
-                .prompt()
-                .map(PromptAnswer::Checked),
+            PromptAction::Checkbox => {
+                MultiSelect::new(&Self::prompt_text(&req), req.options.clone())
+                    .prompt()
+                    .map(PromptAnswer::Checked)
+            }
             PromptAction::Password => Self::password(&req),
         };
         match answer {
@@ -827,6 +842,18 @@ mod tests {
             vec!["a", "b", CUSTOM_MULTI_CHOICE_ANSWER_OPTION]
         );
         assert_eq!(InquirePrompter::select_options(&closed), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_tools_prompt_names_the_tool_and_others_show_the_bare_question() {
+        assert_eq!(
+            InquirePrompter::prompt_text(&request(PromptAction::Password, Some("fs_cat"))),
+            "fs_cat asks: proceed? pm-4t8"
+        );
+        assert_eq!(
+            InquirePrompter::prompt_text(&request(PromptAction::Confirm, None)),
+            "proceed? pm-4t8"
+        );
     }
 
     /// Enter alone on a tool's confirm menu answers No; only the tool's

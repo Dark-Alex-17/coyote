@@ -1224,6 +1224,9 @@ fn build_env_snapshot(
     arguments: &Value,
 ) -> Result<JobEnvSnapshot> {
     let agent = ctx.agent.as_ref();
+    let global_tool = !agent
+        .and_then(|agent| agent.functions().find(tool))
+        .is_some_and(|declaration| declaration.agent);
     let (cmd_name, mut cmd_args, mut envs) = match agent {
         Some(agent) => match agent.functions().find(tool) {
             Some(declaration) if declaration.agent => (
@@ -1308,6 +1311,12 @@ fn build_env_snapshot(
             Arc::clone(&ctx.prompter),
             Arc::clone(&ctx.prompt_memory),
             Origin::from(ctx),
+            ctx.app
+                .config
+                .password_prompt_tools
+                .clone()
+                .unwrap_or_default(),
+            global_tool,
         )),
         prompt_reply,
         job_id: job_id.to_string(),

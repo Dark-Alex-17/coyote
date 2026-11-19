@@ -740,7 +740,7 @@ impl PendingPrompt {
     /// Who is asking: the tool, else the agent, else nobody in particular.
     fn origin_line(&self) -> Option<String> {
         if let Some(tool) = &self.req.tool {
-            return Some(format!("tool: {tool}"));
+            return Some(format!("{tool} asks:"));
         }
         self.req
             .origin
@@ -749,13 +749,9 @@ impl PendingPrompt {
             .map(|agent| format!("agent: {agent}"))
     }
 
-    /// Rows the origin takes under the question. A confirm's middle row
-    /// already carries it.
+    /// Rows the origin takes above the question.
     fn origin_rows(&self) -> u16 {
-        match self.kind() {
-            ModalKind::Confirm { .. } => 0,
-            _ => u16::from(self.origin_line().is_some()),
-        }
+        u16::from(self.origin_line().is_some())
     }
 
     /// The legend under the modal; a question that is clipped offers
@@ -829,10 +825,13 @@ impl PendingPrompt {
         height.saturating_sub(fixed).max(1)
     }
 
-    /// Rows of the field, the confirm's tool line, or the list; a list
-    /// longer than the frame allows (one question row, the fixed rows and
-    /// the transcript's minimum kept) scrolls inside what it gets.
+    /// Rows of the field or the list, none for a confirm; a list longer
+    /// than the frame allows (one question row, the fixed rows and the
+    /// transcript's minimum kept) scrolls inside what it gets.
     fn middle_rows(&self, width: u16, height: u16) -> u16 {
+        if matches!(self.kind(), ModalKind::Confirm { .. }) {
+            return 0;
+        }
         let fixed = 3 + TRANSCRIPT_MIN_ROWS + self.hint_rows(width) + self.origin_rows();
         row_count(self.list_len()).clamp(1, height.saturating_sub(fixed).max(1))
     }
@@ -852,22 +851,22 @@ impl PendingPrompt {
         row_count(self.question_lines(width).len()) <= rows
     }
 
-    /// Rows of the whole modal: question, origin, field or list, hint.
+    /// Rows of the whole modal: origin, question, field or list, hint.
     fn rows(&self, width: u16, height: u16) -> u16 {
-        self.question_rows(width, height)
-            + self.origin_rows()
+        self.origin_rows()
+            + self.question_rows(width, height)
             + self.middle_rows(width, height)
             + self.hint_rows(width)
     }
 
-    /// The question, origin, middle and legend rows inside the modal's
+    /// The origin, question, middle and legend rows inside the modal's
     /// `area` on a frame `frame` tall. A frame too short for the layout
     /// squeezes the question first; what it actually received is what
     /// answerability is judged on.
     fn areas(&self, area: Rect, frame: Rect) -> [Rect; 4] {
         Layout::vertical([
-            Constraint::Min(1),
             Constraint::Length(self.origin_rows()),
+            Constraint::Min(1),
             Constraint::Length(self.middle_rows(area.width, frame.height)),
             Constraint::Length(self.hint_rows(area.width)),
         ])
@@ -3283,7 +3282,7 @@ impl App {
 
         self.question_area = match self.prompts.front() {
             Some(prompt) => {
-                let [question, ..] = prompt.areas(bottom.intersection(area), area);
+                let [_, question, ..] = prompt.areas(bottom.intersection(area), area);
                 frame.render_widget(PromptModal(prompt), bottom);
                 Some(question)
             }
@@ -3390,7 +3389,7 @@ impl Widget for FooterBar {
     }
 }
 
-/// A prompt drawn where the composer was: question, origin, the field or
+/// A prompt drawn where the composer was: origin, question, the field or
 /// list, hint. A question taller than its rows is cut with a marker
 /// counting the hidden lines and a legend offering only Esc; the cap
 /// grows with the terminal, so enlarging it shows them.
@@ -3402,7 +3401,7 @@ impl Widget for PromptModal<'_> {
         if area.is_empty() {
             return;
         }
-        let [question, origin, middle, hint] = self.0.areas(area, *buf.area());
+        let [origin, question, middle, hint] = self.0.areas(area, *buf.area());
         let mut lines = self.0.question_lines(area.width);
         let visible = usize::from(question.height);
         let clipped = lines.len() > visible;
@@ -3416,14 +3415,8 @@ impl Widget for PromptModal<'_> {
             )));
         }
         Paragraph::new(lines).render(question, buf);
-        // A confirm's origin sits in its middle row; every other kind
-        // has a row of its own for it above the field or list.
-        let origin_row = match self.0.kind() {
-            ModalKind::Confirm { .. } => middle,
-            _ => origin,
-        };
         if let Some(line) = self.0.origin_line() {
-            Paragraph::new(Line::from(Span::styled(line, DIM))).render(origin_row, buf);
+            Paragraph::new(Line::from(Span::styled(line, DIM))).render(origin, buf);
         }
         match (&self.0.field, self.0.kind()) {
             (Some(field), _) => field.render(middle, buf),
@@ -5693,7 +5686,7 @@ mod tests {
         let req = confirm_request(Some("fs_write"));
         assert_eq!(harness.app.prompt_memory.auto_answer(&req), None);
         let asker = ask_on_a_thread(&mut harness, req.clone());
-        assert!(harness.draw().contains("tool: fs_write"));
+        assert!(harness.draw().contains("fs_write asks:"));
         harness.clock.advance(HOTKEY_IDLE);
         assert_eq!(harness.press(KeyCode::Char('a')), None);
         assert_eq!(
@@ -5954,7 +5947,13 @@ mod tests {
         assert_eq!(harness.press(KeyCode::Down), None);
         let frame = harness.draw();
         assert_welcome_snapshot("select_modal_80x24", &frame);
-        assert!(frame.contains("tool: ask"), "{frame}");
+        assert!(frame.contains("ask asks:"), "{frame}");
+        let row = |needle: &str| frame.lines().position(|line| line.contains(needle));
+        assert_eq!(
+            row("ask asks:").map(|origin| origin + 1),
+            row("Pick one q9d-s"),
+            "{frame}"
+        );
         assert!(frame.contains(CUSTOM_CHOICE_ROW), "{frame}");
         assert_eq!(harness.press(KeyCode::Enter), None);
         assert!(!asker.is_finished());
