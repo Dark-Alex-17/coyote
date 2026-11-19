@@ -15,7 +15,7 @@ mod common;
 use std::time::Duration;
 
 use common::tui_harness::{
-    TempDirGuard, exit_code, fresh_config_dir, spawn_tui_with_args, write_config,
+    TempDirGuard, exit_code, fresh_config_dir, spawn_with_args, write_config,
 };
 use serial_test::serial;
 
@@ -25,9 +25,7 @@ fn info_theme(extra_config: &str, envs: &[(&str, &str)]) -> String {
     let dir = fresh_config_dir("theme-setting");
     let _guard = TempDirGuard(dir.clone());
     write_config(&dir, extra_config);
-    let mut env = vec![("COYOTE_UI", "")];
-    env.extend_from_slice(envs);
-    let mut pty = spawn_tui_with_args(&dir, &env, &["--info"]);
+    let mut pty = spawn_with_args(&dir, envs, &["--info"]);
     let text = pty
         .wait_for("tty-probe-done", Duration::from_secs(30))
         .unwrap();
@@ -85,11 +83,9 @@ fn code_block_colors(
     let dir = fresh_config_dir("theme-render");
     let _guard = TempDirGuard(dir.clone());
     write_config(&dir, extra_config);
-    let mut env = vec![("COYOTE_UI", "")];
-    env.extend_from_slice(envs);
-    let mut pty = spawn_tui_with_args(
+    let mut pty = spawn_with_args(
         &dir,
-        &env,
+        envs,
         &["'```rust\nfn main() { let x = \"hi\"; }\n```'"],
     );
     if let Some(bg) = background {

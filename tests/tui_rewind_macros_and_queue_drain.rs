@@ -200,12 +200,12 @@ fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
     cmd.arg("-c").arg(
         WAIT_WRAPPER
             .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{args}", "")
+            .replace("{args}", " --tui")
             .replace("{stdin}", "/dev/tty")
             .replace("{report}", TTY_REPORT),
     );
     base_env(&mut cmd, dir);
-    cmd.env("COYOTE_UI", "tui").envs(extra_env.iter().copied());
+    cmd.envs(extra_env.iter().copied());
     Pty::spawn(cmd).unwrap()
 }
 

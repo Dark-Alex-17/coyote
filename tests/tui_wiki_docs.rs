@@ -835,13 +835,17 @@ fn config_rows_match_the_template() {
             );
         }
         let ui = table_row(label, text, "`ui`").join(" ");
-        for needle in names.iter().map(|name| format!("`{name}`")).chain([
-            "`COYOTE_UI`".to_string(),
-            format!("`{}`", flags[0]),
-            format!("`{}`", flags[1]),
-        ]) {
+        for needle in names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .chain([format!("`{}`", flags[0]), format!("`{}`", flags[1])])
+        {
             assert!(ui.contains(&needle), "{label} `ui` row names {needle}");
         }
+        assert!(
+            !ui.contains("COYOTE_UI"),
+            "{label} `ui` row names COYOTE_UI, which coyote does not read"
+        );
         let theme = table_row(label, text, "`theme`").join(" ");
         for needle in [
             "`light`",
@@ -1145,8 +1149,12 @@ fn environment_page_documents_the_ui_and_reply_variables() {
     for var in ["`LLM_PROMPT_UTILS_PY`", "`LLM_PROMPT_UTILS_TS`"] {
         table_row("Environment-Variables.md", &vars, var);
     }
-    let setting = table_row("Environment-Variables.md", &page, "`ui`");
-    assert_eq!(setting[1], format!("`{ui_env}`"));
+    assert!(
+        table_rows(&page)
+            .iter()
+            .all(|row| row.first().is_none_or(|cell| cell != "`ui`")),
+        "Environment-Variables.md lists `ui` as a setting {ui_env} overrides"
+    );
 }
 
 #[test]
@@ -1223,7 +1231,6 @@ fn tui_page_quotes_the_code() {
         format!("`{}`", flags[0]),
         format!("`{}`", flags[1]),
         "`ui: tui`".to_string(),
-        "`COYOTE_UI=tui`".to_string(),
         format!("`{custom_row}`"),
         format!("`{mid_turn}`"),
         format!("`{pending}`"),
@@ -1260,6 +1267,10 @@ fn tui_page_quotes_the_code() {
     for needle in needles {
         assert!(page.contains(&needle), "{PAGE} says {needle}");
     }
+    assert!(
+        !page.contains("`COYOTE_UI=tui`"),
+        "{PAGE} shows COYOTE_UI choosing the shell"
+    );
 
     let custom = flat(&section(
         "Custom-Tools.md",
@@ -1460,7 +1471,6 @@ fn edited_texts(wiki: &Path) -> Vec<(String, String)> {
     ];
     let rows = [
         ("Environment-Variables.md", &env, "`COYOTE_TOOL_CALL_ID`"),
-        ("Environment-Variables.md", &env, "`ui`"),
         ("Hooks.md", &hooks, "`tool.started`"),
         ("Hooks.md", &hooks, "`tool.completed`"),
         ("Hooks.md", &hooks, "`tool.failed`"),

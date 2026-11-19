@@ -16,6 +16,8 @@ use uuid::Uuid;
 
 pub(crate) const CUSTOM_MULTI_CHOICE_ANSWER_OPTION: &str = "Other (custom)";
 const YES_FOR_SESSION: &str = "Yes for this session";
+/// The menu a tool's confirm is asked as on the terminal.
+const TOOL_CONFIRM_ROWS: [&str; 3] = ["Yes", "No", YES_FOR_SESSION];
 /// The published answer of a prompt a run with no human refused.
 pub(crate) const NEEDS_HUMAN_MARKER: &str = "<needs_human>";
 
@@ -115,7 +117,12 @@ pub enum PromptAnswer {
     Selected(String),
     Checked(Vec<String>),
     Text(String),
+    /// Closed with Esc: no answer to this question.
     Cancelled,
+    /// Closed with Ctrl-C: no answer, and the human wants the whole
+    /// command stopped. Reads as [`PromptAnswer::Cancelled`] except where
+    /// a cancel would carry on without the answer.
+    Interrupted,
 }
 
 impl PromptAnswer {
@@ -133,7 +140,7 @@ impl PromptAnswer {
                 NEEDS_HUMAN_MARKER.to_string()
             }
             PromptAnswer::Text(text) => text.clone(),
-            PromptAnswer::Cancelled => "<cancelled>".to_string(),
+            PromptAnswer::Cancelled | PromptAnswer::Interrupted => "<cancelled>".to_string(),
         }
     }
 
@@ -167,7 +174,8 @@ impl PromptAnswer {
 
     fn mismatch(self, expected: PromptAction) -> anyhow::Error {
         match self {
-            PromptAnswer::Cancelled => PromptCancelled.into(),
+            PromptAnswer::Cancelled => PromptCancelled { interrupted: false }.into(),
+            PromptAnswer::Interrupted => PromptCancelled { interrupted: true }.into(),
             // Only the headless prompter answers a confirm with text (its
             // `needs_human` JSON), so the refusal is what the caller sees.
             PromptAnswer::Text(_) if expected == PromptAction::Confirm => {
@@ -181,13 +189,26 @@ impl PromptAnswer {
 /// The error a cancelled prompt becomes for a caller that wanted an
 /// answer rather than the cancel itself.
 #[derive(Debug)]
-pub(crate) struct PromptCancelled;
+pub(crate) struct PromptCancelled {
+    interrupted: bool,
+}
 
 impl PromptCancelled {
-    /// Whether `err` is, or wraps through `context`, a cancelled prompt.
+    /// Whether `err` is, or wraps through `context`, a cancelled prompt,
+    /// whichever key closed it.
     pub(crate) fn caused(err: &anyhow::Error) -> bool {
         err.chain()
             .any(|cause| cause.downcast_ref::<PromptCancelled>().is_some())
+    }
+
+    /// Whether `err` is, or wraps through `context`, a prompt closed with
+    /// Ctrl-C.
+    pub(crate) fn interrupted(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause
+                .downcast_ref::<PromptCancelled>()
+                .is_some_and(|cancel| cancel.interrupted)
+        })
     }
 }
 
@@ -302,7 +323,8 @@ pub(crate) fn confirm(
 }
 
 /// [`confirm`] for a question where closing it is itself an answer:
-/// `Ok(None)` when the human cancelled instead of answering.
+/// `Ok(None)` when the human cancelled instead of answering. An
+/// interrupt is still an error, so the command stops.
 pub(crate) fn confirm_or_cancel(
     prompter: &dyn Prompter,
     question: impl Into<String>,
@@ -350,7 +372,8 @@ pub(crate) fn select_closed(
 }
 
 /// [`select_closed`] for a menu where closing the question is itself an
-/// answer: `Ok(None)` when the human cancelled instead of choosing.
+/// answer: `Ok(None)` when the human cancelled instead of choosing. An
+/// interrupt is still an error, so the command stops.
 pub(crate) fn select_closed_or_cancel(
     prompter: &dyn Prompter,
     question: &str,
@@ -526,13 +549,23 @@ impl InquirePrompter {
             let answer = Confirm::new(&req.question).with_default(default).prompt()?;
             return Ok(PromptAnswer::Confirmed(answer));
         };
-        let choice = Select::new(&req.question, vec!["Yes", "No", YES_FOR_SESSION])
+        let choice = Select::new(&req.question, TOOL_CONFIRM_ROWS.to_vec())
             .without_filtering()
+            .with_starting_cursor(Self::tool_confirm_starting_row(req))
             .prompt()?;
         if choice == YES_FOR_SESSION {
             self.memory.remember(tool, &req.question);
         }
         Ok(PromptAnswer::Confirmed(choice != "No"))
+    }
+
+    /// The row of [`TOOL_CONFIRM_ROWS`] the cursor starts on, so Enter
+    /// alone answers No unless the tool asked for a default of yes.
+    fn tool_confirm_starting_row(req: &PromptRequest) -> usize {
+        match req.default.as_ref().and_then(Value::as_bool) {
+            Some(true) => 0,
+            _ => 1,
+        }
     }
 }
 
@@ -544,13 +577,7 @@ impl Default for InquirePrompter {
 
 impl Prompter for InquirePrompter {
     fn prompt(&self, req: PromptRequest) -> Result<PromptAnswer> {
-        // A confirm a tool asks keeps its type-ahead: keys sent before its
-        // Yes / No / Yes for this session menu appears still reach the menu,
-        // so an Enter typed ahead picks Yes. Every other prompt drops stale
-        // input first.
-        if !(req.action == PromptAction::Confirm && req.tool.is_some()) {
-            crate::utils::drain_stale_tty_input();
-        }
+        crate::utils::drain_stale_tty_input();
         let answer = match req.action {
             PromptAction::Select => Self::select(&req),
             PromptAction::Confirm => self.confirm(&req),
@@ -562,9 +589,8 @@ impl Prompter for InquirePrompter {
         };
         match answer {
             Ok(answer) => Ok(answer),
-            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-                Ok(PromptAnswer::Cancelled)
-            }
+            Err(InquireError::OperationCanceled) => Ok(PromptAnswer::Cancelled),
+            Err(InquireError::OperationInterrupted) => Ok(PromptAnswer::Interrupted),
             Err(err) => Err(err.into()),
         }
     }
@@ -801,6 +827,23 @@ mod tests {
             vec!["a", "b", CUSTOM_MULTI_CHOICE_ANSWER_OPTION]
         );
         assert_eq!(InquirePrompter::select_options(&closed), vec!["a", "b"]);
+    }
+
+    /// Enter alone on a tool's confirm menu answers No; only the tool's
+    /// own default of yes starts the cursor on Yes.
+    #[test]
+    fn a_tool_confirm_starts_on_no_unless_the_tool_defaults_to_yes() {
+        let starting_row = |default: Option<Value>| {
+            let req = PromptRequest {
+                default,
+                ..request(PromptAction::Confirm, Some("tool-x"))
+            };
+            TOOL_CONFIRM_ROWS[InquirePrompter::tool_confirm_starting_row(&req)]
+        };
+        assert_eq!(starting_row(None), "No");
+        assert_eq!(starting_row(Some(json!(false))), "No");
+        assert_eq!(starting_row(Some(json!("yes"))), "No");
+        assert_eq!(starting_row(Some(json!(true))), "Yes");
     }
 
     #[test]
@@ -1144,6 +1187,10 @@ mod tests {
             PromptAnswer::Cancelled.summary(PromptAction::Confirm),
             "<cancelled>"
         );
+        assert_eq!(
+            PromptAnswer::Interrupted.summary(PromptAction::Confirm),
+            "<cancelled>"
+        );
     }
 
     #[test]
@@ -1188,9 +1235,18 @@ mod tests {
             PromptAnswer::Cancelled.into_selected().unwrap_err(),
             PromptAnswer::Cancelled.into_checked().unwrap_err(),
             PromptAnswer::Cancelled.into_text().unwrap_err(),
+            PromptAnswer::Interrupted.into_confirmed().unwrap_err(),
+            PromptAnswer::Interrupted.into_text().unwrap_err(),
         ] {
             assert_eq!(err.to_string(), "Operation was canceled by the user");
+            assert!(PromptCancelled::caused(&err));
         }
+        assert!(!PromptCancelled::interrupted(
+            &PromptAnswer::Cancelled.into_text().unwrap_err()
+        ));
+        assert!(PromptCancelled::interrupted(
+            &PromptAnswer::Interrupted.into_text().unwrap_err()
+        ));
     }
 
     #[test]
@@ -1294,6 +1350,26 @@ mod tests {
             select_closed_or_cancel(&prompter, "pick one pm-sc7", options).unwrap(),
             Some("a".to_string())
         );
+    }
+
+    /// Esc is the answer a cancel-accepting menu carries on with; Ctrl-C
+    /// stays an error, so the command asking stops.
+    #[test]
+    #[serial]
+    fn an_interrupted_menu_is_an_error_even_where_a_cancel_is_an_answer() {
+        let options = vec!["a".to_string(), "b".to_string()];
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let err = select_closed_or_cancel(&prompter, "pick one pm-si1", options).unwrap_err();
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Cancelled]);
+        assert_eq!(
+            confirm_or_cancel(&prompter, "go? pm-si2", false).unwrap(),
+            None
+        );
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let err = confirm_or_cancel(&prompter, "go? pm-si3", false).unwrap_err();
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
     }
 
     #[test]

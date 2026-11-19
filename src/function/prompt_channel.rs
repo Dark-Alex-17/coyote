@@ -1334,7 +1334,7 @@ fn fits(action: PromptAction, answer: &PromptAnswer) -> bool {
                 PromptAction::Input | PromptAction::Password,
                 PromptAnswer::Text(_)
             )
-            | (_, PromptAnswer::Cancelled)
+            | (_, PromptAnswer::Cancelled | PromptAnswer::Interrupted)
     )
 }
 
@@ -1343,7 +1343,7 @@ pub(crate) fn answer_value(answer: &Result<PromptAnswer>) -> Value {
         Ok(PromptAnswer::Confirmed(yes)) => json!(yes),
         Ok(PromptAnswer::Selected(choice)) | Ok(PromptAnswer::Text(choice)) => json!(choice),
         Ok(PromptAnswer::Checked(choices)) => json!(choices),
-        Ok(PromptAnswer::Cancelled) | Err(_) => Value::Null,
+        Ok(PromptAnswer::Cancelled | PromptAnswer::Interrupted) | Err(_) => Value::Null,
     }
 }
 
@@ -1950,7 +1950,23 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             json!(["a"])
         );
         assert_eq!(answer_value(&Ok(PromptAnswer::Cancelled)), Value::Null);
+        assert_eq!(answer_value(&Ok(PromptAnswer::Interrupted)), Value::Null);
         assert_eq!(answer_value(&Err(anyhow!("boom"))), Value::Null);
+    }
+
+    /// A tool sees a Ctrl-C exactly as an Esc: either fits every action.
+    #[test]
+    fn a_cancel_or_an_interrupt_fits_every_action() {
+        for action in [
+            PromptAction::Confirm,
+            PromptAction::Select,
+            PromptAction::Checkbox,
+            PromptAction::Input,
+            PromptAction::Password,
+        ] {
+            assert!(fits(action, &PromptAnswer::Cancelled), "{action:?}");
+            assert!(fits(action, &PromptAnswer::Interrupted), "{action:?}");
+        }
     }
 
     #[test]

@@ -873,7 +873,7 @@ fn without_a_tty_on_stdout_the_tui_refuses_to_start() {
     write_dry_run_config(&dir);
     let captured = dir.join("stdout.log");
     let wrapper = format!(
-        "'{{coyote}}' <{{stdin}} >'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
+        "'{{coyote}}'{{args}} <{{stdin}} >'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
         captured.display()
     );
     let mut pty = spawn_tui_under(&dir, &[], &wrapper, "/dev/tty");

@@ -27,7 +27,7 @@ const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
 const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
      echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
 const WAIT_WRAPPER: &str =
-    "'{coyote}' <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 
 struct TempDirGuard(PathBuf);
 
@@ -189,13 +189,13 @@ fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str) -> Pty
         .arg(
             wrapper
                 .replace("{coyote}", built_binary().to_str().unwrap())
+                .replace("{args}", " --tui")
                 .replace("{stdin}", "/dev/tty")
                 .replace("{report}", TTY_REPORT),
         )
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("COYOTE_UI", "tui")
         .env("HOME", &home)
         .env("TERM", "xterm-256color")
         .env("PATH", path)
@@ -425,7 +425,7 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_fires_agent_completed() {
          \x20 - \"*\"\n",
     )
     .unwrap();
-    let wrapper = WAIT_WRAPPER.replace("'{coyote}'", "'{coyote}' --agent probe-agent");
+    let wrapper = WAIT_WRAPPER.replace("{args}", "{args} --agent probe-agent");
     let mut pty = spawn_tui_under(&dir, &[], &wrapper);
 
     let pressed_at = interrupt_a_held_stream(&mut pty, "partial before esc k4h");

@@ -8,7 +8,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, iter, process};
 
@@ -29,7 +29,7 @@ const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
      echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
 const WAIT_WRAPPER: &str =
-    "'{coyote}' <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 /// The user's shell shape: the binary is the foreground job; when it
 /// stops the wrapper reports what it sees and resumes it with `fg` after
 /// a second. A non-interactive bash 3.2 (macOS's `/bin/bash`) never sees
@@ -37,7 +37,7 @@ const WAIT_WRAPPER: &str =
 /// itself as an interactive shell.
 const JOB_CONTROL_WRAPPER: &str = "if [ \"${BASH_VERSINFO[0]}\" -lt 4 ] && [ -z \"${_JOB_CONTROL_SHELL:-}\" ]; then \
      export _JOB_CONTROL_SHELL=1; exec bash --norc --noprofile -i -c \"$BASH_EXECUTION_STRING\"; fi; \
-     set -m; '{coyote}' <{stdin}; rc=$?; \
+     set -m; '{coyote}'{args} <{stdin}; rc=$?; \
      while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";
@@ -188,13 +188,13 @@ fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str) -> Pty
         .arg(
             wrapper
                 .replace("{coyote}", built_binary().to_str().unwrap())
+                .replace("{args}", " --tui")
                 .replace("{stdin}", "/dev/tty")
                 .replace("{report}", TTY_REPORT),
         )
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("COYOTE_UI", "tui")
         .env("HOME", &home)
         .env("TERM", "xterm-256color")
         .env("PATH", path)
@@ -203,38 +203,6 @@ fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str) -> Pty
         .env_remove("NO_COLOR")
         .envs(extra_env.iter().copied());
     Pty::spawn(cmd).unwrap()
-}
-
-/// The binary with no terminal at all (stdin from /dev/null, stdout and
-/// stderr piped), the way a script runs it; `COYOTE_UI` is whatever the
-/// case passes.
-fn run_piped_with_ui(dir: &Path, ui: &str, args: &[&str]) -> std::process::Output {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    // Spawned by its own name so the harness pin sees this spawn paired
-    // with the two config env lines below.
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.args(args)
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("COYOTE_UI", ui)
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    cmd.output().unwrap()
 }
 
 fn assert_tty_restored(transcript: &str) {
@@ -562,42 +530,6 @@ fn enter_on_a_draft_while_a_tool_sleeps_queues_it_and_the_model_gets_it_next_rou
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
     assert_eq!(count(pty.raw(), LEAVE_ALT), 1, "{transcript}");
-}
-
-// ---------------------------------------------------------------------
-// The documented `COYOTE_UI` contract: a value that is neither `repl`
-// nor `tui` is reported by name with the accepted values, and nothing
-// starts (no alternate screen, no REPL banner).
-// ---------------------------------------------------------------------
-
-/// `COYOTE_UI=bogus coyote --info` reports
-/// `Invalid value 'bogus', expected one of: repl, tui` and exits non-zero
-/// without touching the alternate screen: the config layer parses the
-/// variable on startup, so a typo never falls through to either shell.
-#[test]
-#[serial]
-fn an_unknown_coyote_ui_value_is_reported_by_name_with_the_accepted_values() {
-    let dir = fresh_config_dir("bogus-ui");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-
-    let out = run_piped_with_ui(&dir, "bogus", &["--info"]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let all = format!("{stdout}\n{stderr}");
-
-    assert!(
-        find(&out.stdout, ENTER_ALT, 0).is_none() && find(&out.stderr, ENTER_ALT, 0).is_none(),
-        "COYOTE_UI=bogus entered the alternate screen:\n{all}"
-    );
-    assert!(
-        !out.status.success(),
-        "COYOTE_UI=bogus --info exited 0 instead of refusing the value:\n{all}"
-    );
-    assert!(
-        all.contains("Invalid value 'bogus', expected one of: repl, tui"),
-        "the refusal did not name the value and the accepted values:\n{all}"
-    );
 }
 
 // ---------------------------------------------------------------------

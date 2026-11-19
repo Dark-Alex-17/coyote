@@ -285,7 +285,7 @@ fn the_first_run_wizard_creates_the_password_file_at_the_chosen_path_and_says_so
     let chosen = dir.join("chosen-vault-pass");
     let password = "twelve-chars-long";
 
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
     pty.wait_for("create a new one?", PTY_DEADLINE)
         .expect("the first run did not ask to create a config file");
     pty.read_for(Duration::from_millis(300));
@@ -826,14 +826,7 @@ fn a_stdout_loader_reading_stdin_returns_in_command_mode_on_a_tty() {
     let document = dir.join("doc.catstdin");
     fs::write(&document, "document body s7d-body\n").unwrap();
     let args = format!(" -f '{}' 'summarize'", document.display());
-    let mut pty = spawn_binary_under(
-        built_binary(),
-        &dir,
-        &[("COYOTE_UI", "repl")],
-        WAIT_WRAPPER,
-        "/dev/tty",
-        &args,
-    );
+    let mut pty = spawn_binary_under(built_binary(), &dir, &[], WAIT_WRAPPER, "/dev/tty", &args);
     let transcript = pty
         .wait_for("tty-probe-done", PTY_DEADLINE)
         .unwrap_or_else(|e| {
@@ -1059,7 +1052,7 @@ fn dot_file_through_a_file_loader_reading_stdin_returns_at_once_in_the_plain_rep
     );
     let document = dir.join("doc.catstdinfile");
     fs::write(&document, "document body r9f-body\n").unwrap();
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     // Type only once the line editor owns the terminal: input ahead of
     // the prompt is cooked-mode typeahead the editor discards.
@@ -1974,7 +1967,7 @@ fn dot_rag_chunk_size_typed_in_the_plain_repl_replaces_the_default() {
     let dir = fresh_config_dir("rag-input-default-typed-repl");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -2163,7 +2156,7 @@ fn esc_on_the_obsolete_file_select_in_the_plain_repl_keeps_the_file_and_says_so(
     assert!(ok, "{out}");
     let obsolete = make_the_second_role_obsolete(&dir, &repo, name);
 
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
     pty.wait_for(")> ", PTY_DEADLINE).unwrap();
     let update_at = pty.raw().len();
     pty.send(format!(".install {name}\r").as_bytes()).unwrap();
@@ -2295,7 +2288,7 @@ fn dot_update_y_typed_ahead_with_the_command_does_not_accept_the_confirm_modal()
     write_dry_run_config(&dir);
     let binary = cargo_installed_binary(&dir);
     let binary_before = fs::metadata(&binary).unwrap();
-    let mut pty = spawn_binary_under(&binary, &dir, &[], WAIT_WRAPPER, "/dev/tty", "");
+    let mut pty = spawn_binary_under(&binary, &dir, &[], WAIT_WRAPPER, "/dev/tty", " --tui");
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.resize(60, 140).unwrap();

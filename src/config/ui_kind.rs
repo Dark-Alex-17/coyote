@@ -9,9 +9,9 @@ pub(crate) enum UiKind {
 
 impl UiKind {
     /// The environment variable every child process receives: the tool,
-    /// job and script-node env builders export this under `ENV`. On the
-    /// way in, the config layer parses the same variable into `UiMode`,
-    /// where `tui` selects the full-screen UI for an interactive run.
+    /// job and script-node env builders export this under `ENV`. Coyote
+    /// never reads it back as a setting; the `ui:` key and `--tui` /
+    /// `--repl` choose the shell.
     pub(crate) const ENV: &'static str = "COYOTE_UI";
 
     /// The surface of this process right now: no human means headless,

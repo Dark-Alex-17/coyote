@@ -305,6 +305,26 @@ mod tests {
         );
     }
 
+    /// Esc or Ctrl-C at the package-managed question ends the update with
+    /// an error before any download.
+    #[test]
+    #[serial]
+    fn closing_the_package_managed_question_aborts_the_update() {
+        let _tui_on = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        for answer in [PromptAnswer::Cancelled, PromptAnswer::Interrupted] {
+            let prompter = ScriptedPrompter::new(vec![answer.clone()]);
+
+            let err = update_binary_at(PathBuf::from(CARGO_INSTALLED), None, false, &prompter, ".")
+                .unwrap_err();
+
+            assert!(
+                crate::prompt::PromptCancelled::caused(&err),
+                "{answer:?}: {err:#}"
+            );
+            assert_eq!(prompter.requests().len(), 1);
+        }
+    }
+
     /// Off a terminal and without --force, a package-managed update is
     /// refused in the shape every non-interactive menu shares, ending in
     /// the remedy the caller offers.

@@ -404,9 +404,9 @@ mod tests {
         }
     }
 
-    /// Off the UI, the value is only asked for when both stdout and stdin
-    /// are terminals; without them the entry is refused before the
-    /// prompter is consulted and nothing reaches the provider.
+    /// Off the UI, the value is only asked for when stdout is a terminal;
+    /// without one the entry is refused before the prompter is consulted
+    /// and nothing reaches the provider.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
     async fn without_a_terminal_secret_entry_is_refused_before_asking_and_writes_nothing() {

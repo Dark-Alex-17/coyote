@@ -189,7 +189,7 @@ fn fixture_path() -> std::ffi::OsString {
 }
 
 /// Pins `COYOTE_CONFIG_DIR`/`COYOTE_CACHE_DIR`, strips every inherited
-/// `COYOTE_*`, selects the TUI through the provisional env branch.
+/// `COYOTE_*`.
 fn base_env(cmd: &mut Command, dir: &Path) {
     for (key, _) in env::vars_os() {
         if key.to_string_lossy().starts_with("COYOTE_") {
@@ -199,7 +199,6 @@ fn base_env(cmd: &mut Command, dir: &Path) {
     cmd.current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("COYOTE_UI", "tui")
         .env("HOME", dir.join("home"))
         .env("TERM", "xterm-256color")
         .env("PATH", fixture_path())
@@ -212,7 +211,7 @@ const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
      echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
 
 const WAIT_WRAPPER: &str =
-    "'{coyote}' </dev/tty & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+    "'{coyote}' --tui </dev/tty & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 
 /// The binary on a fresh pty under a bash wrapper that reports the exit
 /// code and the tty flags once it is gone.

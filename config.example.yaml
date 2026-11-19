@@ -10,7 +10,7 @@ stream: true                     # Controls whether to use the stream-style APIs
 save: true                       # Indicates whether to persist the conversation to messages.md for posterity
 keybindings: emacs               # Choose keybinding style (emacs, vi)
 command_prefix: dot              # Which sigil starts a REPL command (dot = ".info", slash = "/info", both = either). Set at runtime with .set command_prefix
-ui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl
+ui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl
 tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves
 editor: null                     # Specifies the editor used to edit the input buffer or session. (e.g. vim, emacs, nano, hx). Defaults to $VISUAL, then $EDITOR
 wrap: no                         # Controls text wrapping (no, auto, <max-width>)

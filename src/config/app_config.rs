@@ -3,7 +3,7 @@ use crate::hooks::HooksMap;
 use crate::render::{MarkdownRender, RenderOptions};
 use crate::utils::{IS_STDOUT_TERMINAL, NO_COLOR, decode_bin, drain_stale_tty_input, get_env_name};
 
-use super::{CommandPrefix, RoundChains, UiKind, UiMode, paths};
+use super::{CommandPrefix, RoundChains, UiMode, paths};
 use anyhow::{Context, Result, anyhow, bail};
 use gman::providers::SupportedProvider;
 use indexmap::IndexMap;
@@ -337,7 +337,7 @@ impl AppConfig {
 
             clients: config.clients,
         };
-        app_config.load_envs()?;
+        app_config.load_envs();
         app_config.validate_visible_skills()?;
         if let Some(wrap) = app_config.wrap.clone() {
             app_config.set_wrap(&wrap)?;
@@ -550,10 +550,7 @@ impl AppConfig {
         }
     }
 
-    /// Applied after the file and before the `--tui`/`--repl` override in
-    /// `main`. Only the `ui` arm can fail; every other arm ignores a value
-    /// it cannot parse.
-    pub fn load_envs(&mut self) -> Result<()> {
+    pub fn load_envs(&mut self) {
         if let Ok(v) = env::var(get_env_name("model")) {
             self.model_id = v;
         }
@@ -585,11 +582,6 @@ impl AppConfig {
             && let Ok(v) = v.trim().parse()
         {
             self.command_prefix = v;
-        }
-        if let Ok(v) = env::var(UiKind::ENV)
-            && let Some(ui) = Self::ui_from_env(&v)?
-        {
-            self.ui = ui;
         }
         if let Some(v) = super::read_env_value::<String>(&get_env_name("editor")) {
             self.editor = v;
@@ -762,19 +754,6 @@ impl AppConfig {
         {
             self.sync_models_ttl_hours = v;
         }
-        Ok(())
-    }
-
-    /// The shell `COYOTE_UI` asks for: `None` when it states no preference.
-    /// A nested coyote under a headless parent inherits the parent's
-    /// `headless` from the child-env builders; that is a fact about the
-    /// parent, not a choice of shell, so it leaves the file value alone.
-    fn ui_from_env(value: &str) -> Result<Option<UiMode>> {
-        let value = value.trim();
-        if value.is_empty() || value == UiKind::Headless.as_str() {
-            return Ok(None);
-        }
-        Ok(Some(value.parse()?))
     }
 }
 
@@ -828,7 +807,7 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, UiKind};
 
     fn cached_editor() -> Option<String> {
         super::super::EDITOR.get().cloned().flatten()
@@ -927,15 +906,15 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { env::set_var(&env_name, serde_json::to_string(&hooks).unwrap()) };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.hooks, hooks);
 
         unsafe { env::set_var(&env_name, "[not json") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.hooks, hooks);
 
         unsafe { env::remove_var(&env_name) };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.hooks, hooks);
 
         unsafe {
@@ -1023,23 +1002,23 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { std::env::set_var(&env_name, "a,b") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(
             app.enabled_macros,
             Some(vec!["a".to_string(), "b".to_string()])
         );
 
         unsafe { std::env::set_var(&env_name, "") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.enabled_macros, Some(vec![]));
 
         unsafe { std::env::set_var(&env_name, "null") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.enabled_macros, None);
 
         unsafe { std::env::remove_var(&env_name) };
         app.enabled_macros = Some(vec!["keep".to_string()]);
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.enabled_macros, Some(vec!["keep".to_string()]));
 
         unsafe {
@@ -1073,16 +1052,16 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { env::set_var(&env_name, "7") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.max_concurrent_jobs, Some(7));
 
         unsafe { env::set_var(&env_name, "0") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.max_concurrent_jobs, Some(0));
 
         unsafe { env::remove_var(&env_name) };
         app.max_concurrent_jobs = Some(2);
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.max_concurrent_jobs, Some(2));
 
         unsafe {
@@ -1116,16 +1095,16 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { env::set_var(&env_name, "90") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.tool_timeout, Some(90));
 
         unsafe { env::set_var(&env_name, "0") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.tool_timeout, Some(0));
 
         unsafe { env::remove_var(&env_name) };
         app.tool_timeout = Some(60);
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.tool_timeout, Some(60));
 
         unsafe {
@@ -1159,20 +1138,20 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { env::set_var(&env_name, "slash") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.command_prefix, CommandPrefix::Slash);
 
         unsafe { env::set_var(&env_name, "either") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.command_prefix, CommandPrefix::Both);
 
         unsafe { env::set_var(&env_name, "bogus") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.command_prefix, CommandPrefix::Both);
 
         unsafe { env::remove_var(&env_name) };
         app.command_prefix = CommandPrefix::Dot;
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.command_prefix, CommandPrefix::Dot);
 
         unsafe {
@@ -1186,10 +1165,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn from_config_copies_ui_and_tui_dump_on_exit() {
-        let env_name = UiKind::ENV;
-        let prev = env::var_os(env_name);
-        unsafe { env::remove_var(env_name) };
-
         let cfg = Config {
             model_id: "test-model".to_string(),
             ui: UiMode::Tui,
@@ -1200,70 +1175,26 @@ mod tests {
 
         let app = AppConfig::from_config(cfg).unwrap();
 
-        unsafe {
-            match prev {
-                Some(v) => env::set_var(env_name, v),
-                None => env::remove_var(env_name),
-            }
-        }
-
         assert_eq!(app.ui, UiMode::Tui);
         assert!(!app.tui_dump_on_exit);
     }
 
-    #[test]
-    fn ui_from_env_accepts_the_shells_and_skips_no_preference() {
-        assert_eq!(AppConfig::ui_from_env("tui").unwrap(), Some(UiMode::Tui));
-        assert_eq!(AppConfig::ui_from_env("repl").unwrap(), Some(UiMode::Repl));
-        assert_eq!(AppConfig::ui_from_env(" tui ").unwrap(), Some(UiMode::Tui));
-        assert_eq!(AppConfig::ui_from_env("").unwrap(), None);
-        assert_eq!(
-            AppConfig::ui_from_env(UiKind::Headless.as_str()).unwrap(),
-            None
-        );
-        let err = AppConfig::ui_from_env("bogus").unwrap_err().to_string();
-        assert_eq!(err, "Invalid value 'bogus', expected one of: repl, tui");
-    }
-
+    /// `COYOTE_UI` is what coyote exports to its tools, not a setting:
+    /// whatever it holds, loading the environment leaves the file's `ui`
+    /// alone and does not fail.
     #[test]
     #[serial_test::serial]
-    fn load_envs_overrides_ui_except_for_headless_and_empty() {
-        let env_name = UiKind::ENV;
-        let prev = env::var_os(env_name);
+    fn load_envs_ignores_coyote_ui() {
+        for value in ["foo", "tui"] {
+            let _env = crate::testing::EnvVarGuard::set(UiKind::ENV, value);
+            let mut app = AppConfig {
+                ui: UiMode::Repl,
+                ..AppConfig::default()
+            };
 
-        let mut app = AppConfig::default();
+            app.load_envs();
 
-        unsafe { env::set_var(env_name, "tui") };
-        app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Tui);
-
-        unsafe { env::set_var(env_name, "repl") };
-        app.ui = UiMode::Tui;
-        app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Repl);
-
-        unsafe { env::set_var(env_name, " tui ") };
-        app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Tui);
-
-        unsafe { env::set_var(env_name, "headless") };
-        app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Tui);
-
-        unsafe { env::set_var(env_name, "") };
-        app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Tui);
-
-        unsafe { env::remove_var(env_name) };
-        app.ui = UiMode::Repl;
-        app.load_envs().unwrap();
-        assert_eq!(app.ui, UiMode::Repl);
-
-        unsafe {
-            match prev {
-                Some(v) => env::set_var(env_name, v),
-                None => env::remove_var(env_name),
-            }
+            assert_eq!(app.ui, UiMode::Repl, "COYOTE_UI={value}");
         }
     }
 
@@ -1327,16 +1258,16 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { env::set_var(&env_name, "false") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert!(!app.sync_models_auto);
 
         unsafe { env::set_var(&env_name, "true") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert!(app.sync_models_auto);
 
         unsafe { env::remove_var(&env_name) };
         app.sync_models_auto = false;
-        app.load_envs().unwrap();
+        app.load_envs();
         assert!(!app.sync_models_auto);
 
         unsafe {
@@ -1356,12 +1287,12 @@ mod tests {
         let mut app = AppConfig::default();
 
         unsafe { env::set_var(&env_name, "6") };
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.sync_models_ttl_hours, 6);
 
         unsafe { env::remove_var(&env_name) };
         app.sync_models_ttl_hours = 48;
-        app.load_envs().unwrap();
+        app.load_envs();
         assert_eq!(app.sync_models_ttl_hours, 48);
 
         unsafe {

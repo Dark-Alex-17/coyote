@@ -615,15 +615,18 @@ impl PendingPrompt {
 
     fn kind(&self) -> ModalKind {
         match self.req.action {
-            PromptAction::Confirm => ModalKind::Confirm {
-                default: self
+            PromptAction::Confirm => {
+                let tool = self.req.tool.is_some();
+                // A tool's confirm only starts on yes when the tool asked
+                // for it; Enter alone must not approve a tool call.
+                let default = self
                     .req
                     .default
                     .as_ref()
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true),
-                tool: self.req.tool.is_some(),
-            },
+                    .unwrap_or(!tool);
+                ModalKind::Confirm { default, tool }
+            }
             PromptAction::Input => ModalKind::Input,
             PromptAction::Password => ModalKind::Password,
             PromptAction::Select => ModalKind::Select {
@@ -2506,7 +2509,7 @@ impl App {
                 Err(mpsc::TryRecvError::Disconnected) => false,
             });
         for (id, action, answer) in answered {
-            if !matches!(answer, PromptAnswer::Cancelled) {
+            if !matches!(answer, PromptAnswer::Cancelled | PromptAnswer::Interrupted) {
                 self.reply_escalation(&id, &answer.summary(action));
             }
         }
@@ -4965,6 +4968,54 @@ mod tests {
         }
     }
 
+    /// Enter on a tool's confirm answers no unless the tool itself asked
+    /// for a default of yes.
+    #[test]
+    fn enter_on_a_tool_confirm_answers_no_unless_the_tool_defaults_to_yes() {
+        for (default, expected) in [
+            (None, PromptAnswer::Confirmed(false)),
+            (
+                Some(serde_json::json!(false)),
+                PromptAnswer::Confirmed(false),
+            ),
+            (Some(serde_json::json!(true)), PromptAnswer::Confirmed(true)),
+        ] {
+            let mut harness = Harness::standalone(80, 24);
+            let req = PromptRequest {
+                default: default.clone(),
+                ..confirm_request(Some("fs_write"))
+            };
+            let asker = ask_on_a_thread(&mut harness, req);
+            harness.clock.advance(HOTKEY_IDLE);
+            assert_eq!(harness.press(KeyCode::Enter), None);
+            assert_eq!(asker.join().unwrap().unwrap(), expected, "{default:?}");
+        }
+    }
+
+    /// Keys typed ahead of a tool's confirm never answer it, Enter and the
+    /// yes hotkeys alike: neither one pressed before the question nor one
+    /// still arriving as it comes up. It waits for a key pressed after it
+    /// has been up for the idle second.
+    #[test]
+    fn keys_typed_before_a_tool_confirm_do_not_answer_it() {
+        for key in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Char('a')] {
+            let mut harness = Harness::standalone(80, 24);
+            harness.clock.advance(10 * HOTKEY_IDLE);
+            harness.press(KeyCode::Char('y'));
+            let asker = ask_on_a_thread(&mut harness, confirm_request(Some("fs_write")));
+            assert_eq!(harness.press(key), None);
+            assert_eq!(harness.app.prompts.len(), 1, "{key:?} answered");
+            harness.clock.advance(HOTKEY_IDLE);
+            assert!(!asker.is_finished(), "{key:?}");
+            assert_eq!(harness.press(KeyCode::Char('n')), None);
+            assert_eq!(
+                asker.join().unwrap().unwrap(),
+                PromptAnswer::Confirmed(false),
+                "{key:?}"
+            );
+        }
+    }
+
     /// A user idle for longer than the gate who taps a hotkey just as the
     /// modal comes up has not seen it: the gate counts from the modal's
     /// appearance, so the tap is dropped and the same key answers once
@@ -6661,7 +6712,7 @@ mod tests {
         let rendered = harness.draw();
         insta::assert_snapshot!("wrapped_narration_and_question_40x20", &rendered);
         let shown = squeezed(&rendered);
-        let hint = confirm_hint(true, true);
+        let hint = confirm_hint(false, true);
         for text in [narration.as_str(), question, hint.as_str()] {
             assert!(
                 shown.contains(&squeezed(text)),
@@ -9996,7 +10047,8 @@ mod tests {
 
     /// With a modal up the strip's interrupt hint would contradict the
     /// modal's own `Esc = cancel`. The hint also names what Enter answers,
-    /// which follows the request's default.
+    /// which follows the request's default; a tool's confirm without one
+    /// answers no.
     #[test]
     fn the_interrupt_hint_yields_to_an_open_modal() {
         let mut harness = Harness::standalone(80, 24);
@@ -10015,7 +10067,7 @@ mod tests {
         assert!(
             harness
                 .draw()
-                .contains("y = yes  n = no  a = yes for this session  Enter = yes  Esc = cancel")
+                .contains("y = yes  n = no  a = yes for this session  Enter = no  Esc = cancel")
         );
         harness.press(KeyCode::Esc);
         let no_by_default = PromptRequest {
@@ -10512,8 +10564,8 @@ mod tests {
     /// the terminal: no spinner polls the keyboard, no stale-input drain
     /// toggles raw mode under the event stream, and no cursor query waits
     /// for a reply the event stream would take. The inquire prompter's
-    /// drain also skips tool approvals, so `y<Enter>` typed ahead of a tool
-    /// approval still answers it.
+    /// drain runs before every widget, tool approvals included, so keys
+    /// typed ahead of a tool approval never answer it.
     #[test]
     fn every_other_stdin_reader_checks_the_tui_flag() {
         let spinner = include_str!("../utils/spinner.rs");
@@ -10527,9 +10579,7 @@ mod tests {
         let prompt = include_str!("../prompt/mod.rs");
         let prompter = fn_body(prompt, "impl Prompter for InquirePrompter");
         assert!(prompter.contains("drain_stale_tty_input()"));
-        assert!(
-            prompter.contains("if !(req.action == PromptAction::Confirm && req.tool.is_some()) {")
-        );
+        assert!(!prompter.contains("req.tool.is_some()"), "{prompter}");
     }
 
     /// Registers a lender on its own thread that runs every job it is

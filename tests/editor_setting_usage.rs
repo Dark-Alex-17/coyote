@@ -15,7 +15,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::tui_harness::{TempDirGuard, exit_code, fresh_config_dir, spawn_tui, write_config};
+use common::tui_harness::{
+    TempDirGuard, WAIT_WRAPPER, exit_code, fresh_config_dir, spawn_repl_under, write_config,
+};
 use serial_test::serial;
 
 const EDITORS: [&str; 3] = ["visual", "editor", "configured"];
@@ -50,14 +52,14 @@ fn editors_run(config_editor: bool, visual: bool, editor: bool) -> Vec<String> {
         "save_session: false\n".to_string()
     };
     write_config(&dir, &extra);
-    let mut env = vec![("COYOTE_UI", "repl")];
+    let mut env = Vec::new();
     if visual {
         env.push(("VISUAL", paths[0].as_str()));
     }
     if editor {
         env.push(("EDITOR", paths[1].as_str()));
     }
-    let mut repl = spawn_tui(&dir, &env);
+    let mut repl = spawn_repl_under(&dir, &env, WAIT_WRAPPER, "/dev/tty");
     repl.wait_for("dry-model)>", Duration::from_secs(30))
         .unwrap();
     repl.read_for(Duration::from_millis(300));

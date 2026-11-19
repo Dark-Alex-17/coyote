@@ -34,6 +34,11 @@ fn fresh_config_dir(label: &str) -> PathBuf {
 }
 
 fn probe_inspection_flag(flag: &str, require_stdout: bool) {
+    probe_inspection_flag_with_env(flag, require_stdout, &[]);
+}
+
+/// [`probe_inspection_flag`] with `extra_env` set on the child.
+fn probe_inspection_flag_with_env(flag: &str, require_stdout: bool, extra_env: &[(&str, &str)]) {
     let label = flag.trim_start_matches("--");
     let tmp_dir = fresh_config_dir(label);
     let home_dir = fresh_config_dir(&format!("{label}-home"));
@@ -61,6 +66,7 @@ fn probe_inspection_flag(flag: &str, require_stdout: bool) {
         // Workspace mcp.json discovery resolves from the CWD, so pin it to
         // the isolated fake HOME to keep host state out of the probe.
         .current_dir(&home_dir)
+        .envs(extra_env.iter().copied())
         .stdin(Stdio::null())
         .output()
         .unwrap();
@@ -110,6 +116,13 @@ fn info_on_empty_config_dir_writes_nothing() {
 #[test]
 fn list_models_on_empty_config_dir_writes_nothing() {
     probe_inspection_flag("--list-models", false);
+}
+
+/// `COYOTE_UI` is what coyote exports to its tools, not a setting, so a
+/// value no shell is named after never stops an inspection run.
+#[test]
+fn list_models_ignores_an_unknown_coyote_ui_in_the_environment() {
+    probe_inspection_flag_with_env("--list-models", false, &[("COYOTE_UI", "foo")]);
 }
 
 #[test]

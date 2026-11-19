@@ -327,7 +327,7 @@ fn stderr_redirected_to_a_file_is_not_a_tty_refusal() {
     write_dry_run_config(&dir);
     let captured = dir.join("stderr.log");
     let wrapper = format!(
-        "'{{coyote}}' <{{stdin}} 2>'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
+        "'{{coyote}}'{{args}} <{{stdin}} 2>'{}' & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {{report}}",
         captured.display()
     );
     let mut pty = spawn_tui_under(&dir, &[], &wrapper, "/dev/tty");
@@ -1713,12 +1713,13 @@ fn clipped_question_confirm_tool() -> String {
 }
 
 /// Every token of the modal's hint once the question fits, whitespace
-/// squeezed out.
+/// squeezed out. A tool confirm with no default of its own starts on No,
+/// so Enter answers no.
 const HINT_TOKENS: [&str; 5] = [
     "y=yes",
     "n=no",
     "a=yesforthissession",
-    "Enter=yes",
+    "Enter=no",
     "Esc=cancel",
 ];
 

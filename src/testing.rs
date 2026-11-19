@@ -609,6 +609,50 @@ pub(crate) fn read_all(reader: &mut File) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// Puts the original fd 0 back when dropped.
+#[cfg(unix)]
+pub(crate) struct SavedStdin {
+    fd: OwnedFd,
+}
+
+#[cfg(unix)]
+impl Drop for SavedStdin {
+    fn drop(&mut self) {
+        // SAFETY: both descriptors are open; dup2 takes no pointers.
+        assert_ne!(
+            unsafe { libc::dup2(self.fd.as_raw_fd(), libc::STDIN_FILENO) },
+            -1
+        );
+    }
+}
+
+/// Points fd 0 at the read end of a pipe with no writer, so stdin is not
+/// a terminal and reads see EOF until the guard drops, wherever the
+/// tests run. Callers must be `#[serial]`: fd 0 is process-global.
+#[cfg(unix)]
+pub(crate) fn pipe_stdin() -> SavedStdin {
+    // SAFETY: fcntl with F_DUPFD_CLOEXEC takes no pointers; the result is checked.
+    let saved = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+    assert_ne!(saved, -1);
+    // SAFETY: `saved` was just created by fcntl and nothing else owns it.
+    let saved = SavedStdin {
+        fd: unsafe { OwnedFd::from_raw_fd(saved) },
+    };
+
+    let mut fds = [0; 2];
+    // SAFETY: `fds` is a valid two-element array for pipe to fill.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: both ends were just created by pipe and nothing else owns them.
+    let (reader, writer) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+    drop(writer);
+    // SAFETY: both descriptors are open; dup2 takes no pointers.
+    assert_ne!(
+        unsafe { libc::dup2(reader.as_raw_fd(), libc::STDIN_FILENO) },
+        -1
+    );
+    saved
+}
+
 mod tests {
     use super::{
         ScratchDirGuard, TempLocalVault, TempNeedleGuard, TestConfigDirGuard, is_outside_system32,

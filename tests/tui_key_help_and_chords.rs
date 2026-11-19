@@ -330,7 +330,7 @@ fn the_plain_repl_does_not_know_dot_keys() {
     let dir = fresh_config_dir("repl-keys");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
     let at = pty.raw().len();

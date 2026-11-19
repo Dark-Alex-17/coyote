@@ -623,10 +623,10 @@ fn resolve_obsolete(
         return Ok(action);
     }
 
-    // No answer keeps everything, whether there is no terminal, the
-    // question is cancelled or nobody is there to answer it: apply_plan
-    // has already written the update, so refusing would leave it half
-    // done.
+    // No terminal, an Esc or nobody there to answer keeps the file:
+    // apply_plan has already written the update, so refusing here would
+    // leave it half done. A Ctrl-C still stops the update at this point,
+    // because the user asked for that.
     if !conflict::menu_can_use_terminal() {
         return Ok(ObsoleteAction::Keep);
     }
@@ -2606,6 +2606,7 @@ fn offer_secret(
     match vault.add_secret(name, prompter) {
         Ok(()) => Ok(SecretOffer::Added),
         Err(err) if left_unanswered(&err) => Ok(SecretOffer::Unanswered),
+        Err(err) if PromptCancelled::interrupted(&err) => Err(err),
         Err(err) => {
             eprintln!("Failed to add '{name}' to vault: {err:#}");
             Ok(SecretOffer::Deferred)
@@ -2614,9 +2615,10 @@ fn offer_secret(
 }
 
 /// Whether `err` is a question that got no answer: cancelled, or asked
-/// on a run with no human to ask.
+/// on a run with no human to ask. An interrupt is not one of them; it
+/// stops the install.
 fn left_unanswered(err: &anyhow::Error) -> bool {
-    PromptCancelled::caused(err) || NeedsHuman::caused(err)
+    (PromptCancelled::caused(err) && !PromptCancelled::interrupted(err)) || NeedsHuman::caused(err)
 }
 
 fn print_secret_summary(added: &[String], deferred: &[String], prefix: CommandPrefix) {
@@ -3406,6 +3408,31 @@ mod tests {
         assert_eq!(prompter.requests().len(), 1);
     }
 
+    /// Ctrl-C at the MCP conflict menu is not a cancel: the merge stops
+    /// with an error instead of keeping the local server and carrying on.
+    #[test]
+    #[serial]
+    fn interrupting_the_mcp_conflict_question_aborts_the_merge() {
+        let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let mut unanswered = false;
+        let mut notes = Vec::new();
+
+        let err = resolve_mcp_conflict(
+            "alpha",
+            false,
+            false,
+            dot_io(&prompter),
+            &mut unanswered,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert!(!unanswered);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
     /// An unanswered MCP conflict question sticks for the rest of the
     /// merge: the next conflicting server keeps its local copy without a
     /// second question or a second note.
@@ -3901,6 +3928,46 @@ mod tests {
         );
     }
 
+    /// Ctrl-C is not a cancel, at the vault offer or inside the wizard it
+    /// opens: the install stops with an error instead of deferring the
+    /// secrets, and nothing more is asked.
+    #[test]
+    #[serial]
+    fn interrupting_the_vault_questions_aborts_the_install() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let guard = TestVaultConfigGuard::new("secrets-interrupt");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", &guard.path);
+        let password_file = guard.path.join("vault-pass");
+        fs::write(
+            guard.path.join("config.yaml"),
+            format!("vault_password_file: {}\n", password_file.display()),
+        )
+        .unwrap();
+        let missing = vec![
+            "INTERRUPT_SECRET_ONE".to_string(),
+            "INTERRUPT_SECRET_TWO".to_string(),
+        ];
+
+        for answers in [
+            vec![PromptAnswer::Interrupted],
+            vec![
+                PromptAnswer::Confirmed(true),
+                PromptAnswer::Confirmed(true),
+                PromptAnswer::Interrupted,
+            ],
+        ] {
+            let asked = answers.len();
+            let prompter = ScriptedPrompter::new(answers);
+
+            let err = prompt_for_each_secret(&missing, &prompter).unwrap_err();
+
+            assert!(PromptCancelled::interrupted(&err), "{err:#}");
+            assert_eq!(prompter.requests().len(), asked);
+            assert!(!password_file.exists());
+        }
+    }
+
     /// Under the full-screen UI a modified obsolete file is a closed
     /// select through the prompter, and the sticky answers still stick.
     #[test]
@@ -4027,6 +4094,27 @@ mod tests {
             ["Kept the obsolete files: the question was cancelled."]
         );
         assert_eq!(prompter.requests().len(), 1);
+    }
+
+    /// Ctrl-C at the obsolete-file question stops the update with an
+    /// error; nothing is kept on its behalf and no note is written.
+    #[test]
+    #[serial]
+    fn interrupting_the_obsolete_file_question_aborts_the_update() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let mut notes = Vec::new();
+
+        let err = resolve_obsolete("macros/old.yaml", &mut sticky, &prompter, &mut |note| {
+            notes.push(note.to_string())
+        })
+        .unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert_eq!(sticky, None);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     fn write_manifest(root: &Path, yaml: &str) {
@@ -7129,6 +7217,31 @@ mod tests {
             notes,
             ["Kept the locally modified items: the question was cancelled."]
         );
+    }
+
+    /// Ctrl-C at the uninstall question stops the uninstall with an error
+    /// instead of keeping the file and moving on.
+    #[test]
+    #[serial]
+    fn interrupting_the_uninstall_question_aborts_the_uninstall() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _script = conflict::prompt_script::install(&[]);
+        let mut sticky = None;
+        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Interrupted]);
+        let mut notes = Vec::new();
+
+        let err = resolve_uninstall_action(
+            "File macros/a.yaml was modified locally after install",
+            false,
+            &mut sticky,
+            &prompter,
+            &mut |note| notes.push(note.to_string()),
+        )
+        .unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert_eq!(sticky, None);
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]

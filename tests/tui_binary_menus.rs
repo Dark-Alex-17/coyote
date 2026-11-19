@@ -1,15 +1,16 @@
 //! Real-process checks of the command menus the prompter routes: the
 //! questions `.vault`, `.rag`, `.agent`, `.install`, `.update` and
 //! `.session` raise become modals on a real tty and inquire prompts in
-//! the plain REPL, keys typed ahead of a confirm settle or do not settle
-//! it, and a run with no human to ask (no terminal at all, a terminal
-//! with stdin from a pipe or /dev/null, a headless `--agent`) refuses in
-//! the shared shape, skips the optional knowledge base or lists the
-//! unset variables instead of hanging on a prompt; a cold start picks
-//! the plain REPL or the full-screen UI from the `ui:` key, `COYOTE_UI`
-//! and `--tui` / `--repl`. Each case runs the binary on a pseudo-terminal
-//! under a bash wrapper that reports the exit code and `stty -a`
-//! afterwards, so the file is unix-only. The cases run one at a time:
+//! the plain REPL, keys typed ahead of a confirm never settle it, a
+//! terminal on stdout with stdin from a pipe or /dev/null still asks
+//! (inquire reads the terminal), and a run with no human to ask (stdout
+//! not a terminal, a headless `--agent`) refuses in the shared shape,
+//! skips the optional knowledge base or lists the unset variables
+//! instead of hanging on a prompt; a cold start picks
+//! the plain REPL or the full-screen UI from the `ui:` key and `--tui` /
+//! `--repl`, never from `COYOTE_UI`. Each case runs the binary on a
+//! pseudo-terminal under a bash wrapper that reports the exit code and
+//! `stty -a` afterwards, so the file is unix-only. The cases run one at a time:
 //! each spawn forks a session leader and takes a controlling tty, and a
 //! fork landing between another test's `openpty` and its `exec` has
 //! failed the spawn with a garbled errno.
@@ -223,7 +224,7 @@ fn dot_update_on_a_cargo_install_asks_in_the_confirm_modal_and_n_cancels() {
     write_dry_run_config(&dir);
     let binary = cargo_installed_binary(&dir);
     let binary_before = fs::metadata(&binary).unwrap();
-    let mut pty = spawn_binary_under(&binary, &dir, &[], WAIT_WRAPPER, "/dev/tty", "");
+    let mut pty = spawn_binary_under(&binary, &dir, &[], WAIT_WRAPPER, "/dev/tty", " --tui");
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.resize(60, 140).unwrap();
@@ -799,15 +800,14 @@ fn dot_session_after_a_turn_asks_in_the_modal_and_y_seats_the_session() {
 // with no human reports when it skips or refuses a knowledge base.
 // ---------------------------------------------------------------------------
 
-/// A tool's `confirm` question in the plain REPL keeps taking a `y` and
-/// Enter typed before the question renders: the prompt and the answer go
-/// down the tty in one write, the question still shows, the typed-ahead
-/// answer settles it as a yes and the tool records it. (Only the command
-/// menus drain what was typed ahead of them; a tool's confirm does not.)
-#[test]
-#[serial]
-fn a_tools_confirm_question_in_the_plain_repl_takes_a_y_typed_ahead_of_it() {
-    let dir = fresh_config_dir("tool-confirm-typeahead-repl");
+/// A tool's `confirm` question in the plain REPL drops a `y` and Enter
+/// typed before it renders: the prompt and that answer go down the tty in
+/// one write, the question shows and stays open with nothing recorded,
+/// and Enter sent once it is on screen takes the `No` it starts on. With
+/// `stdin` a non-tty the keys still come from the terminal, so the stale
+/// ones are dropped the same way.
+fn assert_tool_confirm_drops_typeahead_and_enter_answers_no(scenario: &str, stdin: &str) {
+    let dir = fresh_config_dir(scenario);
     let _guard = TempDirGuard(dir.clone());
     let out = dir.join("confirm-answer");
     let fake = FakeLlm::start(vec![
@@ -819,25 +819,34 @@ fn a_tools_confirm_question_in_the_plain_repl_takes_a_y_typed_ahead_of_it() {
     ]);
     write_fake_llm_config(&dir, &fake);
     write_tool(&dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, stdin);
 
     pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
     let asked_at = pty.raw().len();
-    // The prompt and the answer to the question it will raise, in one write.
     pty.send(b"call the confirm tool\ry\r").unwrap();
     pty.wait_for_after("q9d-q", asked_at, PTY_DEADLINE)
         .expect("the tool's confirm question never reached the terminal");
+    pty.read_for(Duration::from_millis(1500));
+    let shown = strip_ansi(&String::from_utf8_lossy(&pty.raw()[asked_at..]));
+    assert!(
+        fs::read_to_string(&out).is_err(),
+        "[{stdin}] the `y` and Enter typed ahead of the tool's confirm answered it with {:?}:\n{shown}",
+        fs::read_to_string(&out)
+    );
+    assert_eq!(fake.served(), 1, "[{stdin}] {shown}");
+
+    pty.send(b"\r").unwrap();
     wait_for_file(&mut pty, &out, "the tool's recorded answer");
     let transcript = wait_for_squeezed(&mut pty, "fixture done t4a", "the reply after the tool");
     assert_eq!(
         fs::read_to_string(&out).unwrap().trim(),
-        "1",
-        "`y` and Enter typed ahead of the tool's confirm did not reach the tool as a yes:\n{transcript}"
+        "0",
+        "[{stdin}] Enter on the open tool confirm did not reach the tool as a no:\n{transcript}"
     );
     assert!(
-        squeezed(&transcript).contains("q9d-qYes"),
-        "the confirm did not echo the typed-ahead `Yes`:\n{transcript}"
+        squeezed(&transcript).contains("q9d-qNo"),
+        "[{stdin}] the confirm did not echo `No`:\n{transcript}"
     );
     assert_eq!(fake.served(), 2, "{transcript}");
     assert!(
@@ -852,6 +861,25 @@ fn a_tools_confirm_question_in_the_plain_repl_takes_a_y_typed_ahead_of_it() {
     assert_tty_restored(&transcript);
 }
 
+#[test]
+#[serial]
+fn a_tools_confirm_question_in_the_plain_repl_drops_a_y_typed_ahead_of_it() {
+    assert_tool_confirm_drops_typeahead_and_enter_answers_no(
+        "tool-confirm-typeahead-repl",
+        "/dev/tty",
+    );
+}
+
+#[test]
+#[serial]
+fn a_tools_confirm_question_in_the_plain_repl_with_stdin_from_dev_null_drops_a_y_typed_ahead_of_it()
+{
+    assert_tool_confirm_drops_typeahead_and_enter_answers_no(
+        "tool-confirm-typeahead-repl-null-stdin",
+        "/dev/null",
+    );
+}
+
 /// `.install macros` in the plain REPL with `y` and Enter typed ahead of
 /// its `Continue?` question, in the same write as the command: the stale
 /// keystrokes are drained before the question opens, so it still waits
@@ -864,7 +892,7 @@ fn dot_install_macros_in_the_plain_repl_drains_a_y_typed_ahead_of_its_confirm() 
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let macros_dir = dir.join("macros");
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1087,11 +1115,7 @@ fn a_run_with_nobody_to_ask_about_rag_logs_the_skip_at_debug_and_prints_nothing(
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[
-            ("COYOTE_UI", "repl"),
-            ("COYOTE_LOG_LEVEL", "debug"),
-            ("COYOTE_LOG_PATH", log_path),
-        ],
+        &[("COYOTE_LOG_LEVEL", "debug"), ("COYOTE_LOG_PATH", log_path)],
         WAIT_WRAPPER,
         "/dev/tty",
         " --agent docs-agent-t4e --headless 'say hello-sentinel-t4e'",
@@ -1214,10 +1238,10 @@ fn update_with_a_piped_stdout_and_a_tty_on_stdin_is_refused_in_the_shared_shape(
     let mut pty = spawn_binary_under(
         &cargo_copy,
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/tty",
-        &format!(" --update >'{}'", captured.display()),
+        &format!(" --repl --update >'{}'", captured.display()),
     );
     let on_tty = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let on_stdout = fs::read_to_string(&captured).unwrap_or_default();
@@ -1261,7 +1285,7 @@ fn dot_agent_needing_a_variable_in_the_plain_repl_reasks_a_blank_answer_with_the
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     write_agent_needing_a_variable(&dir, "vars-agent-p3r");
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1368,17 +1392,14 @@ fn a_tty_less_bare_dot_rag_is_refused_before_the_temp_rag_is_removed() {
 }
 
 /// Agents started with a terminal on stdout but stdin redirected from
-/// `/dev/null` (a pipeline feeding the command): a graph agent whose
-/// `rag` node is not fully specified is refused in the shared shape
-/// naming the node, the agent and the three fields, exactly as with no
-/// terminal at all, with nothing written; and an agent with documents
-/// skips its optional knowledge base silently (no question painted, one
-/// `[DEBUG]` skip line, exit 0, the model reached). Neither run touches
-/// the controlling terminal: the piped stdin is what decides.
+/// `/dev/null` (a pipeline feeding the command) still ask on the
+/// terminal, which is where the answer is read from: a graph agent whose
+/// `rag` node is not fully specified asks whether to build it and `n`
+/// stops the run with nothing written; an agent with documents asks
+/// `init RAG?` and `n` starts it without one, reaching the model.
 #[test]
 #[serial]
-fn agents_with_a_tty_on_stdout_but_a_piped_stdin_refuse_the_unbuilt_rag_node_and_skip_the_optional_rag()
- {
+fn agents_with_a_tty_on_stdout_but_a_piped_stdin_ask_their_rag_questions_on_the_terminal() {
     let dir = fresh_config_dir("agents-piped-stdin");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
@@ -1390,33 +1411,27 @@ fn agents_with_a_tty_on_stdout_but_a_piped_stdin_refuse_the_unbuilt_rag_node_and
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/null",
         &format!(" --agent {graph} hi"),
     );
+    pty.wait_for(
+        "Initialize RAG knowledge base for rag node 'retrieve'?",
+        PTY_DEADLINE,
+    )
+    .expect("the piped-stdin graph agent did not ask to build its rag node");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"n\r").unwrap();
     let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_ne!(exit_code(&plain), 0, "{plain}");
-    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
-        panic!("the piped-stdin graph agent is not refused in the shared shape:\n{plain}")
-    });
     assert!(
-        action.contains("'retrieve'") && action.contains(graph),
-        "the refusal does not name the rag node and its agent: {action:?}\n{plain}"
-    );
-    for field in ["embedding_model", "chunk_size", "chunk_overlap"] {
-        assert!(
-            remedy.contains(field),
-            "the remedy does not name `{field}`: {remedy:?}\n{plain}"
-        );
-    }
-    assert!(
-        !plain.contains("Select") && !plain.contains("? "),
-        "a widget was painted with nothing to read an answer from:\n{plain}"
+        squeezed(&plain).contains("RAGinitializationisrequiredforthisagent"),
+        "`n` on the rag node question did not stop the graph agent:\n{plain}"
     );
     assert!(
-        !plain.contains("Load ") && !plain.contains("Initializing RAG"),
-        "the refused run went on to load documents:\n{plain}"
+        refusal_shape(&plain).is_none(),
+        "the piped-stdin graph agent was refused instead of asked:\n{plain}"
     );
     assert_tty_restored(&plain);
     let written: Vec<PathBuf> = walk(&dir)
@@ -1426,23 +1441,21 @@ fn agents_with_a_tty_on_stdout_but_a_piped_stdin_refuse_the_unbuilt_rag_node_and
         .collect();
     assert!(
         written.is_empty(),
-        "the refused run wrote under the agent or rags: {written:?}\n{plain}"
+        "the declined run wrote under the agent or rags: {written:?}\n{plain}"
     );
 
-    let log = dir.join("probe.log");
-    let log_path = log.to_str().unwrap();
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[
-            ("COYOTE_UI", "repl"),
-            ("COYOTE_LOG_LEVEL", "debug"),
-            ("COYOTE_LOG_PATH", log_path),
-        ],
+        &[],
         WAIT_WRAPPER,
         "/dev/null",
         " --agent docs-p9r 'say hello-sentinel-p9r'",
     );
+    pty.wait_for(INIT_RAG_QUESTION, PTY_DEADLINE)
+        .expect("the piped-stdin agent with documents did not ask `init RAG?`");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"n\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(
         exit_code(&transcript),
@@ -1453,24 +1466,10 @@ fn agents_with_a_tty_on_stdout_but_a_piped_stdin_refuse_the_unbuilt_rag_node_and
         transcript.contains("hello-sentinel-p9r"),
         "the run never reached the dry-run model:\n{transcript}"
     );
-    assert!(
-        !transcript.contains(INIT_RAG_QUESTION) && !transcript.contains("starting without"),
-        "the run painted the question or a notice instead of logging the skip:\n{transcript}"
-    );
-    let skips = rag_skip_lines(&log, "docs-p9r");
-    assert_eq!(
-        skips.len(),
-        1,
-        "expected one debug line recording the skipped rag, got {skips:?}:\n{transcript}"
-    );
-    assert!(
-        skips[0].contains("no terminal") && skips[0].contains("starting without it"),
-        "the debug line does not record a terminal-less skip: {skips:?}"
-    );
     let written = new_files_named(&dir, &files_before, "/rags/");
     assert!(
         written.is_empty(),
-        "the run built a rag without asking: {written:?}\n{transcript}"
+        "`n` on `init RAG?` still built a rag: {written:?}\n{transcript}"
     );
     assert_tty_restored(&transcript);
 }
@@ -1610,7 +1609,7 @@ fn dot_vault_add_in_the_plain_repl_asks_once_reasks_on_empty_and_stores_the_valu
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     secure_vault_password_file(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1873,7 +1872,7 @@ fn dot_install_with_conflicting_local_files_in_the_plain_repl_asks_with_inquire(
     let name = "bundle-c3r";
     let repo = write_bundle_repo(&dir, name, &[]);
     let locals = write_conflicting_local_roles(&dir, name);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.resize(60, 200).unwrap();
@@ -2125,114 +2124,28 @@ fn a_tty_less_install_of_a_bundle_with_secrets_defers_them_all_and_still_lands_t
     );
 }
 
-/// `--update` on a Cargo install with a terminal on stdout but stdin
-/// redirected from `/dev/null` (a pipeline feeding the command): the
-/// inquire confirm could paint but never read, so the update is refused
-/// in the shared shape naming `--force`, exits non-zero, and no widget
-/// error reaches the terminal.
-#[test]
-#[serial]
-fn update_with_a_tty_on_stdout_but_a_piped_stdin_is_refused_cleanly() {
-    let dir = fresh_config_dir("update-piped-stdin");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let cargo_copy = cargo_installed_binary(&dir);
-
-    let mut pty = spawn_binary_under(
-        &cargo_copy,
-        &dir,
-        &[("COYOTE_UI", "repl")],
-        WAIT_WRAPPER,
-        "/dev/null",
-        " --update",
-    );
-    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-
-    assert_ne!(exit_code(&plain), 0, "{plain}");
-    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
-        panic!("the piped-stdin update is not refused in the shared shape:\n{plain}")
-    });
-    assert_eq!(action, "update a Cargo install", "{plain}");
-    assert_eq!(remedy, " or pass --force.", "{plain}");
-    assert!(
-        !plain.contains("Update anyway?"),
-        "the confirm was asked with nothing to read it from:\n{plain}"
-    );
-    assert!(
-        !plain.to_lowercase().contains("raw mode") && !plain.contains("IO error"),
-        "the widget failed on the piped stdin instead of the refusal running first:\n{plain}"
-    );
-    assert_tty_restored(&plain);
-}
-
-/// `--add-secret <name>` with a terminal on stdout but stdin redirected
-/// from `/dev/null`: the Password prompt could paint but never read, so
-/// the vault refuses in the shared shape with nothing but a terminal as
-/// the remedy, exits non-zero, paints no prompt and writes no vault file.
-#[test]
-#[serial]
-fn add_secret_with_a_tty_on_stdout_but_a_piped_stdin_is_refused_in_the_shared_shape() {
-    let dir = fresh_config_dir("add-secret-piped-stdin");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    secure_vault_password_file(&dir);
-    let files_before = walk(&dir);
-
-    let mut pty = spawn_binary_under(
-        built_binary(),
-        &dir,
-        &[("COYOTE_UI", "repl")],
-        WAIT_WRAPPER,
-        "/dev/null",
-        " --add-secret piped-secret-k2v",
-    );
-    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-
-    assert_ne!(exit_code(&plain), 0, "{plain}");
-    assert_eq!(
-        refusal_shape(&plain),
-        Some(("add secret 'piped-secret-k2v'".into(), ".".into())),
-        "the piped-stdin `--add-secret` is not refused in the shared shape:\n{plain}"
-    );
-    assert!(
-        !plain.contains("Enter the secret value") && !plain.contains("Secret?"),
-        "the secret prompt was painted with nothing to read it from:\n{plain}"
-    );
-    for name in ["vault", "piped-secret-k2v"] {
-        let written = new_files_named(&dir, &files_before, name);
-        assert!(
-            written.is_empty(),
-            "the refused `--add-secret` still wrote {written:?}:\n{plain}"
-        );
-    }
-    assert_tty_restored(&plain);
-}
-
 // ---------------------------------------------------------------------
 // A terminal on stdout with stdin redirected from a pipe or /dev/null:
-// the command-line menus and the plain REPL's wizards cannot read an
-// answer, so they refuse in the shared shape before painting a widget,
-// consume nothing from the pipe and change nothing on disk.
+// the command-line menus and the plain REPL's wizards still ask, on the
+// terminal, which is where inquire and the line editor read keys from.
+// Nothing is read from the pipe and no question is refused.
 // ---------------------------------------------------------------------
 
 /// A bash `{stdin}` slot carrying a would-be answer on a real pipe, so a
-/// prompt that read it anyway would be answered. The leading space keeps
-/// the wrapper's `<` from gluing onto `<(` as a heredoc.
+/// prompt that read it would be answered. The leading space keeps the
+/// wrapper's `<` from gluing onto `<(` as a heredoc.
 fn piped_answer(text: &str) -> String {
     format!(" <(printf '{text}\\n')")
 }
 
-/// `--update-secret <name>` fed a value on a pipe, and `--install` of a
-/// bundle whose roles conflict with local files, once from `/dev/null`
-/// and once fed `replace-all` on a pipe, all with a terminal on stdout:
-/// each refuses in the shared shape (the secret with nothing but a
-/// terminal as the remedy, the install with the CLI remedy word for word),
-/// exits non-zero, paints neither the secret prompt nor a conflict row,
-/// leaves the piped answer unconsumed (the local roles keep their text)
-/// and writes no vault file.
+/// With a terminal on stdout and stdin from `/dev/null` or a pipe:
+/// `--update` on a Cargo install asks `Update anyway?` and `n` cancels
+/// it with exit 0; `--add-secret` asks for the value and Esc leaves the
+/// piped value unstored; `--install` fed `replace-all` on a pipe paints
+/// the conflict menu and Esc aborts with the local roles untouched.
 #[test]
 #[serial]
-fn cli_menus_with_a_tty_on_stdout_but_a_piped_stdin_refuse_without_reading_the_pipe() {
+fn cli_menus_with_a_tty_on_stdout_but_a_piped_stdin_ask_on_the_terminal() {
     let dir = fresh_config_dir("cli-menus-piped-stdin");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
@@ -2240,90 +2153,107 @@ fn cli_menus_with_a_tty_on_stdout_but_a_piped_stdin_refuse_without_reading_the_p
     let name = "bundle-p7s";
     let repo = write_bundle_repo(&dir, name, &[]);
     let locals = write_conflicting_local_roles(&dir, name);
+    let cargo_copy = cargo_installed_binary(&dir);
     let files_before = walk(&dir);
+
+    let mut pty = spawn_binary_under(
+        &cargo_copy,
+        &dir,
+        &[],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --repl --update",
+    );
+    pty.wait_for("Update anyway?", PTY_DEADLINE)
+        .expect("the piped-stdin `--update` did not ask `Update anyway?`");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"n\r").unwrap();
+    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&plain), 0, "{plain}");
+    assert!(
+        plain.contains("Update cancelled."),
+        "`n` on `Update anyway?` did not cancel the update:\n{plain}"
+    );
+    assert!(
+        refusal_shape(&plain).is_none(),
+        "the piped-stdin `--update` was refused:\n{plain}"
+    );
+    assert_tty_restored(&plain);
 
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
-        &piped_answer("piped-value-p7s"),
-        " --update-secret piped-secret-p7s",
+        &piped_answer("piped-value-k2v"),
+        " --add-secret piped-secret-k2v",
     );
+    pty.wait_for("Enter the secret value:", PTY_DEADLINE)
+        .expect("the piped-stdin `--add-secret` did not ask for the value");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\x1b").unwrap();
     let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_ne!(exit_code(&plain), 0, "{plain}");
-    assert_eq!(
-        refusal_shape(&plain),
-        Some(("update secret 'piped-secret-p7s'".into(), ".".into())),
-        "the piped-stdin `--update-secret` is not refused in the shared shape:\n{plain}"
+    assert!(
+        refusal_shape(&plain).is_none(),
+        "the piped-stdin `--add-secret` was refused:\n{plain}"
     );
     assert!(
-        !plain.contains("Enter the secret value") && !plain.contains("Secret?"),
-        "the secret prompt was painted with only a pipe to read it from:\n{plain}"
+        !squeezed(&plain).contains("addedtothevault"),
+        "Esc on the secret prompt still stored a value:\n{plain}"
     );
     assert_tty_restored(&plain);
 
-    for (what, stdin) in [
-        ("install from /dev/null", "/dev/null".to_string()),
-        ("install fed `replace-all`", piped_answer("replace-all")),
-    ] {
-        let mut pty = spawn_binary_under(
-            built_binary(),
-            &dir,
-            &[("COYOTE_UI", "repl")],
-            WAIT_WRAPPER,
-            &stdin,
-            &format!(" --install {}", repo.display()),
-        );
-        let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-        assert_ne!(exit_code(&plain), 0, "{what}:\n{plain}");
-        let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
-            panic!("{what}: the conflict is not refused in the shared shape:\n{plain}")
-        });
-        assert!(
-            action.starts_with("overwrite local file "),
-            "{what}: the refusal names the action {action:?}:\n{plain}"
-        );
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[],
+        WAIT_WRAPPER,
+        &piped_answer("replace-all"),
+        &format!(" --install {}", repo.display()),
+    );
+    pty.wait_for("Conflict at", PTY_DEADLINE)
+        .expect("the piped-stdin `--install` did not paint the conflict menu");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\x1b").unwrap();
+    let plain = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "Esc on the conflict menu did not abort the install:\n{plain}"
+    );
+    assert!(
+        refusal_shape(&plain).is_none(),
+        "the piped-stdin `--install` was refused:\n{plain}"
+    );
+    for path in &locals {
         assert_eq!(
-            remedy, CLI_INSTALL_REMEDY,
-            "{what}: the remedy is not word for word the documented one:\n{plain}"
+            fs::read_to_string(path).ok().as_deref(),
+            Some(LOCAL_ROLE_TEXT),
+            "the piped `replace-all` or the aborted install changed {}:\n{plain}",
+            path.display()
         );
-        for row in ["keep-all", "replace-all", "abort"] {
-            assert!(
-                !plain.contains(row),
-                "{what}: the conflict menu row `{row}` was painted with nothing to read an answer from:\n{plain}"
-            );
-        }
-        for path in &locals {
-            assert_eq!(
-                fs::read_to_string(path).ok().as_deref(),
-                Some(LOCAL_ROLE_TEXT),
-                "{what}: the refused install changed {}:\n{plain}",
-                path.display()
-            );
-        }
-        assert_tty_restored(&plain);
     }
+    assert_tty_restored(&plain);
 
-    for needle in ["vault", "piped-secret-p7s"] {
+    for needle in ["vault", "piped-secret-k2v"] {
         let written = new_files_named(&dir, &files_before, needle);
         assert!(
             written.is_empty(),
-            "the refused secret entry still wrote {written:?}"
+            "the cancelled secret entry still wrote {written:?}"
         );
     }
 }
 
 /// The plain REPL started on a terminal with stdin redirected from
-/// `/dev/null` (its line editor still reads the terminal) and its
-/// wizards typed in: bare `.rag`, `.vault add`, `.install` of a bundle
-/// at conflicting local files and `.uninstall` of an installed bundle
-/// each refuse in the shared shape, nothing is painted to answer, the
-/// REPL keeps taking commands, and `.exit` leaves with the tty restored;
-/// no rag, vault file or role changes, and the installed bundle stays.
+/// `/dev/null` asks its wizards on the terminal, where its line editor
+/// reads too: bare `.rag`, `.vault add`, `.install` of a bundle at
+/// conflicting local files and `.uninstall` of an installed bundle each
+/// paint their first question without a refusal, Esc closes it, the REPL
+/// keeps taking commands and `.exit` leaves with the tty restored; no
+/// rag, vault file or role changes, and the installed bundle stays.
 #[test]
 #[serial]
-fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_shared_shape() {
+fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_asks_its_wizards_on_the_terminal() {
     let dir = fresh_config_dir("repl-wizards-stdin-null");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
@@ -2343,47 +2273,37 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
     let locals = write_conflicting_local_roles(&dir, conflicting);
     let files_before = walk(&dir);
 
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/null");
     pty.wait_for(")> ", PTY_DEADLINE).unwrap();
-    let mut shapes = Vec::new();
-    for (command, action_prefix, expected_remedy) in [
-        (".rag".to_string(), "initialize RAG knowledge base", "."),
+    pty.resize(60, 200).unwrap();
+    for (command, question) in [
+        (".rag".to_string(), "Select embedding model:".to_string()),
         (
             ".vault add repl-secret-r7k".to_string(),
-            "add secret 'repl-secret-r7k'",
-            ".",
+            "Enter the secret value:".to_string(),
         ),
         (
             format!(".install {}", conflicting_repo.display()),
-            "overwrite local file ",
-            REPL_CONFLICT_REMEDY,
+            "Conflict at".to_string(),
         ),
         (
             format!(".uninstall {installed}"),
-            "uninstall bundle 'bundle-r7k'",
-            " or pass --yes.",
+            format!("Uninstall bundle '{installed}'?"),
         ),
     ] {
+        pty.read_for(Duration::from_millis(300));
         let from = pty.raw().len();
         pty.send(format!("{command}\r").as_bytes()).unwrap();
-        let since = pty
-            .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
-            .unwrap_or_else(|err| panic!("`{command}` did not refuse: {err}"));
-        let (action, remedy) = refusal_shape(&since)
-            .unwrap_or_else(|| panic!("`{command}` is not refused in the shared shape:\n{since}"));
+        pty.wait_for_after(&question, from, PTY_DEADLINE)
+            .unwrap_or_else(|err| panic!("`{command}` did not ask `{question}`: {err}"));
+        pty.read_for(Duration::from_millis(500));
+        pty.send(b"\x1b").unwrap();
+        pty.read_for(Duration::from_millis(1000));
+        let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
         assert!(
-            action.starts_with(action_prefix),
-            "`{command}` names the action {action:?}, not `{action_prefix}...`:\n{since}"
+            !since.contains("Re-run in a terminal"),
+            "`{command}` was refused instead of asked:\n{since}"
         );
-        assert_eq!(remedy, expected_remedy, "`{command}`:\n{since}");
-        for widget in ["Enter the secret value", "keep-all", "Continue?", "? "] {
-            assert!(
-                !since.contains(widget),
-                "`{command}` painted `{widget}` with nothing to read an answer from:\n{since}"
-            );
-        }
-        shapes.push((command, action, remedy));
-        pty.read_for(Duration::from_millis(300));
     }
     pty.send(b".exit\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
@@ -2394,20 +2314,20 @@ fn a_plain_repl_on_a_tty_with_stdin_from_dev_null_refuses_its_wizards_in_the_sha
         let written = new_files_named(&dir, &files_before, needle);
         assert!(
             written.is_empty(),
-            "a refused REPL wizard still wrote {written:?}:\n{shapes:?}"
+            "a cancelled REPL wizard still wrote {written:?}:\n{transcript}"
         );
     }
     for path in &locals {
         assert_eq!(
             fs::read_to_string(path).ok().as_deref(),
             Some(LOCAL_ROLE_TEXT),
-            "the refused `.install` changed {}:\n{shapes:?}",
+            "the cancelled `.install` changed {}:\n{transcript}",
             path.display()
         );
     }
     assert!(
         installed_role.exists(),
-        "the refused `.uninstall` still removed a bundle file:\n{shapes:?}"
+        "the cancelled `.uninstall` still removed a bundle file:\n{transcript}"
     );
 }
 
@@ -2468,12 +2388,13 @@ fn a_tty_less_install_builtins_with_yes_reinstalls_every_bundled_file_without_as
 }
 
 /// `--mcp-add` of a server whose env references a vault secret the vault
-/// does not hold, with no terminal at all and again with a terminal on
-/// stdout but stdin from /dev/null: refused in the shared shape before
-/// any `to the vault now?` question, the remedy naming
-/// `coyote --add-secret <NAME>`, and the server is not written. The same
-/// command without the placeholder succeeds, so the refusal is the
-/// secret's, not the vault's.
+/// does not hold, with no terminal at all: refused in the shared shape
+/// before any `to the vault now?` question, the remedy naming
+/// `coyote --add-secret <NAME>`, and the server is not written. With a
+/// terminal on stdout but stdin from /dev/null the question is asked
+/// instead, and `n` aborts naming the same command. The same command
+/// without the placeholder succeeds, so the refusal is the secret's, not
+/// the vault's.
 #[test]
 #[serial]
 fn a_tty_less_mcp_add_needing_a_vault_secret_is_refused_naming_add_secret_before_any_question() {
@@ -2523,33 +2444,33 @@ fn a_tty_less_mcp_add_needing_a_vault_secret_is_refused_naming_add_secret_before
         "the refused `--mcp-add` still wrote the server into {mentions:?}:\n{out}"
     );
 
-    // A terminal on stdout, stdin from /dev/null: the same refusal.
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/null",
-        " --mcp-add probe-srv-m4d --env TOKEN={{PROBE_MCP_TOKEN_M4D}} -- echo hi",
+        " --repl --mcp-add probe-srv-m4d --env TOKEN={{PROBE_MCP_TOKEN_M4D}} -- echo hi",
     );
+    pty.wait_for("to the vault now?", PTY_DEADLINE)
+        .expect("the piped-stdin `--mcp-add` did not ask to add the secret");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"n\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let plain = strip_ansi(&transcript);
     assert_ne!(
         exit_code(&plain),
         0,
-        "the piped-stdin `--mcp-add` exited 0:\n{plain}"
-    );
-    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
-        panic!("the piped-stdin `--mcp-add` is not refused in the shared shape:\n{plain}")
-    });
-    assert!(
-        action.contains("probe-srv-m4d")
-            && remedy.contains("coyote --add-secret PROBE_MCP_TOKEN_M4D"),
-        "the piped-stdin refusal names {action:?} / {remedy:?}:\n{plain}"
+        "`n` on the secret question did not stop `--mcp-add`:\n{plain}"
     );
     assert!(
-        !plain.contains("to the vault now?"),
-        "the piped-stdin run asked on the terminal:\n{plain}"
+        refusal_shape(&plain).is_none()
+            && plain.contains("coyote --add-secret PROBE_MCP_TOKEN_M4D"),
+        "the piped-stdin `--mcp-add` was refused, or its abort does not name the remedy:\n{plain}"
+    );
+    assert!(
+        !fs::read_to_string(dir.join("mcp.json")).is_ok_and(|s| s.contains("probe-srv-m4d")),
+        "the aborted `--mcp-add` still wrote the server:\n{plain}"
     );
     assert_tty_restored(&plain);
 
@@ -2570,13 +2491,14 @@ fn a_tty_less_mcp_add_needing_a_vault_secret_is_refused_naming_add_secret_before
 }
 
 /// The first run ever with no config file and nobody to ask: with a
-/// terminal on stdout but stdin from /dev/null, and in the sandbox with
-/// no terminal at all, the run refuses to create the config file in the
-/// shared shape, paints no `create a new one?` question, and writes
-/// neither a config file nor a vault password file.
+/// in the sandbox with no terminal at all, the run refuses to create the
+/// config file in the shared shape, paints no `create a new one?`
+/// question, and writes neither a config file nor a vault password file.
+/// With a terminal on stdout but stdin from /dev/null there is someone to
+/// ask: the question is painted and `n` leaves with nothing written.
 #[test]
 #[serial]
-fn a_first_run_with_no_human_refuses_to_create_the_config_file_and_writes_nothing() {
+fn a_first_run_with_no_human_refuses_to_create_the_config_file_and_a_piped_stdin_still_asks() {
     let dir = fresh_config_dir("first-run-no-human");
     let _guard = TempDirGuard(dir.clone());
     assert!(!dir.join("config.yaml").exists());
@@ -2601,27 +2523,17 @@ fn a_first_run_with_no_human_refuses_to_create_the_config_file_and_writes_nothin
         );
     };
 
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/null");
+    pty.wait_for("create a new one?", PTY_DEADLINE)
+        .expect("the first run with stdin from /dev/null did not ask to create the config");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"n\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let plain = strip_ansi(&transcript);
-    assert_ne!(
-        exit_code(&plain),
-        0,
-        "the first run with stdin from /dev/null exited 0:\n{plain}"
-    );
-    let (action, remedy) = refusal_shape(&plain)
-        .unwrap_or_else(|| panic!("the first run is not refused in the shared shape:\n{plain}"));
+    assert_eq!(exit_code(&plain), 0, "`n` on `create a new one?`:\n{plain}");
     assert!(
-        action.starts_with("create the config file at '") && action.contains("config.yaml"),
-        "the refusal does not name the config file: {action:?}\n{plain}"
-    );
-    assert_eq!(
-        remedy, ".",
-        "the first-run refusal carries a remedy: {remedy:?}\n{plain}"
-    );
-    assert!(
-        !plain.contains("create a new one?"),
-        "the first run asked on the terminal anyway:\n{plain}"
+        refusal_shape(&plain).is_none(),
+        "the first run with stdin from /dev/null was refused:\n{plain}"
     );
     assert_tty_restored(&plain);
     nothing_written("stdout tty, stdin /dev/null", &plain);
@@ -2771,10 +2683,10 @@ fn install_builtins_hooks_with_yes_on_a_terminal_asks_no_question_and_keeps_the_
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/tty",
-        " --install-builtins hooks --yes",
+        " --repl --install-builtins hooks --yes",
     );
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let plain = strip_ansi(&transcript);
@@ -2934,7 +2846,7 @@ fn a_headless_macro_bare_dot_rag_on_a_terminal_is_refused_with_the_typed_select_
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/tty",
         " --headless --macro bare-rag probe-h7r",
@@ -2976,7 +2888,8 @@ fn a_headless_macro_bare_dot_rag_on_a_terminal_is_refused_with_the_typed_select_
 /// the shared shape (`remove MCP server '<name>'` / `overwrite MCP server
 /// '<name>'`, remedy ` or pass --mcp-force.`), exit non-zero and leave
 /// mcp.json byte-for-byte as it was. A terminal on stdout with stdin from
-/// /dev/null is refused the same way.
+/// /dev/null asks instead, and Enter takes the `No` default with mcp.json
+/// untouched.
 #[test]
 #[serial]
 fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mcp_json_alone() {
@@ -3040,27 +2953,25 @@ fn tty_less_mcp_remove_and_re_add_of_an_existing_server_are_refused_and_leave_mc
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/null",
-        " --mcp-remove probe-srv-r7m",
+        " --repl --mcp-remove probe-srv-r7m",
     );
+    pty.wait_for("Remove MCP server", PTY_DEADLINE)
+        .expect("the piped-stdin `--mcp-remove` did not ask");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let plain = strip_ansi(&transcript);
-    assert_ne!(
-        exit_code(&plain),
-        0,
-        "the piped-stdin `--mcp-remove` exited 0:\n{plain}"
+    assert!(
+        refusal_shape(&plain).is_none(),
+        "the piped-stdin `--mcp-remove` was refused:\n{plain}"
     );
-    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
-        panic!("the piped-stdin `--mcp-remove` is not refused in the shared shape:\n{plain}")
-    });
-    assert_eq!(action, "remove MCP server 'probe-srv-r7m'", "{plain}");
-    assert_eq!(remedy, " or pass --mcp-force.", "{plain}");
     assert_eq!(
         fs::read(&mcp_json).unwrap(),
         before,
-        "the piped-stdin remove changed mcp.json:\n{plain}"
+        "Enter on `Remove MCP server` changed mcp.json:\n{plain}"
     );
     assert_tty_restored(&plain);
 }
@@ -3204,8 +3115,8 @@ fn tty_less_authenticate_with_two_oauth_clients_is_refused_naming_both_and_the_f
 
 // ---------------------------------------------------------------------
 // The `--install-builtins` help sentence and the clap errors around it,
-// `.update` typed into a plain REPL whose stdin is /dev/null, and a
-// tty-less `--uninstall --yes` of a bundle with several modified items.
+// and a tty-less `--uninstall --yes` of a bundle with several modified
+// items.
 // ---------------------------------------------------------------------
 
 /// The `--install-builtins` flag's help sentence as a first-time user
@@ -3259,66 +3170,6 @@ fn install_builtins_help_sentence_and_the_clap_errors_around_install_with_yes() 
         walk(&dir),
         files_before,
         "a rejected argument set still changed the config dir"
-    );
-}
-
-/// `.update` typed into the plain REPL on a terminal whose stdin is
-/// /dev/null (the line editor still reads the terminal): the Cargo
-/// install's `Update anyway?` has nothing to read an answer from, so it
-/// is refused in the shared shape with the REPL remedy (a bare period,
-/// not ` or pass --force.`), the confirm is never painted, the REPL goes
-/// on taking commands, `.exit` leaves with the tty restored and the
-/// binary is untouched.
-#[test]
-#[serial]
-fn dot_update_in_a_plain_repl_with_stdin_from_dev_null_is_refused_with_the_bare_remedy() {
-    let dir = fresh_config_dir("repl-update-stdin-null");
-    let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let cargo_copy = cargo_installed_binary(&dir);
-    let binary_before = fs::metadata(&cargo_copy).unwrap();
-
-    let mut pty = spawn_binary_under(
-        &cargo_copy,
-        &dir,
-        &[("COYOTE_UI", "repl")],
-        WAIT_WRAPPER,
-        "/dev/null",
-        " --repl",
-    );
-    pty.wait_for(")> ", PTY_DEADLINE).unwrap();
-    let from = pty.raw().len();
-    pty.send(b".update\r").unwrap();
-    let since = pty
-        .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
-        .expect("`.update` with stdin from /dev/null did not refuse");
-    assert_eq!(
-        refusal_shape(&since),
-        Some(("update a Cargo install".into(), ".".into())),
-        "the REPL `.update` refusal is not the shared shape with the bare remedy:\n{since}"
-    );
-    assert!(
-        !since.contains("Update anyway?") && !since.contains("--force"),
-        "the REPL `.update` painted the confirm or named the CLI flag:\n{since}"
-    );
-
-    // Let the line editor re-arm its prompt before the next command, so
-    // the keys are read by it rather than echoed by the cooked tty.
-    pty.read_for(Duration::from_millis(500));
-    let info_at = pty.raw().len();
-    pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", info_at, PTY_DEADLINE)
-        .expect("the REPL stopped taking commands after the refused `.update`");
-    pty.read_for(Duration::from_millis(500));
-    pty.send(b".exit\r").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    assert_tty_restored(&transcript);
-    let binary_after = fs::metadata(&cargo_copy).unwrap();
-    assert!(
-        binary_after.len() == binary_before.len()
-            && binary_after.modified().unwrap() == binary_before.modified().unwrap(),
-        "the refused `.update` touched the binary:\n{transcript}"
     );
 }
 
@@ -3428,14 +3279,13 @@ fn a_tty_less_uninstall_with_yes_keeps_every_modified_item_and_prints_no_questio
     );
 }
 
-/// `--uninstall <bundle>` without `--yes` and without a human: with no
-/// terminal at all, and again with a tty on stdout but stdin from
-/// /dev/null, the refusal is the shared shape whose remedy is exactly
+/// `--uninstall <bundle>` without `--yes` and with no terminal at all:
+/// the refusal is the shared shape whose remedy is exactly
 /// ` or pass --yes.`, the exit code is non-zero, no `Uninstall bundle?`
 /// is painted, and every owned file and the record stay.
 #[test]
 #[serial]
-fn a_tty_less_uninstall_refusal_ends_with_the_yes_remedy_whatever_stdout_is() {
+fn a_tty_less_uninstall_refusal_ends_with_the_yes_remedy() {
     let dir = fresh_config_dir("ttyless-uninstall-remedy");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
@@ -3464,39 +3314,13 @@ fn a_tty_less_uninstall_refusal_ends_with_the_yes_remedy_whatever_stdout_is() {
     );
     assert_eq!(
         refusal_shape(&out),
-        Some(expected.clone()),
+        Some(expected),
         "the tty-less uninstall refusal is not the shared shape with the `--yes` remedy:\n{out}"
     );
     assert!(
         !out.contains("Uninstall bundle") && !out.contains("owns"),
         "the refused run painted the question or its footprint line:\n{out}"
     );
-
-    let mut pty = spawn_binary_under(
-        built_binary(),
-        &dir,
-        &[("COYOTE_UI", "repl")],
-        WAIT_WRAPPER,
-        "/dev/null",
-        &format!(" --uninstall {name}"),
-    );
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    let plain = strip_ansi(&transcript);
-    assert_ne!(
-        exit_code(&plain),
-        0,
-        "`--uninstall` with a tty on stdout but no tty on stdin exited 0:\n{plain}"
-    );
-    assert_eq!(
-        refusal_shape(&plain),
-        Some(expected),
-        "the stdout-tty/stdin-pipe uninstall refusal is not the shared shape with the `--yes` remedy:\n{plain}"
-    );
-    assert!(
-        !plain.contains("Uninstall bundle '") && !plain.contains("(y/N)"),
-        "a tty on stdout alone was enough to paint the question:\n{plain}"
-    );
-    assert_tty_restored(&plain);
     assert_eq!(
         walk(&dir),
         files_before,
@@ -3506,8 +3330,9 @@ fn a_tty_less_uninstall_refusal_ends_with_the_yes_remedy_whatever_stdout_is() {
 
 // ---------------------------------------------------------------------
 // Cold start: which shell an interactive run gets is decided by the
-// `ui:` key, then `COYOTE_UI`, then `--tui` / `--repl`, in that order of
-// increasing precedence; a prompt run never starts the full-screen UI.
+// `ui:` key, then `--tui` / `--repl`, in that order of increasing
+// precedence; `COYOTE_UI` in the environment is what coyote exports to
+// its tools, not a choice. A prompt run never starts the full-screen UI.
 // ---------------------------------------------------------------------
 mod cold_start {
     use super::*;
@@ -3544,43 +3369,55 @@ mod cold_start {
         assert_tty_restored(&transcript);
     }
 
-    /// `--tui` alone picks the full-screen UI; an empty `COYOTE_UI` states
-    /// no preference, so nothing else is choosing here.
+    /// `--tui` alone picks the full-screen UI.
     #[test]
     #[serial]
-    fn the_tui_flag_starts_the_full_screen_ui_without_the_env() {
+    fn the_tui_flag_starts_the_full_screen_ui() {
         let dir = fresh_config_dir("tui-flag");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
-        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "")], &["--tui"]);
+        let mut pty = spawn_with_args(&dir, &[], &["--tui"]);
 
         assert_full_screen_ui_then_ctrl_d(&mut pty, "--tui");
     }
 
-    /// `ui: tui` in the config picks the full-screen UI with no env and
-    /// no flag.
+    /// `ui: tui` in the config picks the full-screen UI with no flag.
     #[test]
     #[serial]
     fn a_tui_config_key_starts_the_full_screen_ui() {
         let dir = fresh_config_dir("tui-key");
         let _guard = TempDirGuard(dir.clone());
         write_config(&dir, "save_session: false\nui: tui\n");
-        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "")]);
+        let mut pty = spawn_with_args(&dir, &[], &[]);
 
         assert_full_screen_ui_then_ctrl_d(&mut pty, "ui: tui");
     }
 
-    /// `COYOTE_UI=repl` picks the plain REPL for an interactive run, which
+    /// `COYOTE_UI` in the environment chooses nothing: `ui: tui` still
+    /// starts the full-screen UI under `COYOTE_UI=repl` or `headless`, and
+    /// with no `ui:` key `COYOTE_UI=tui` still gets the plain REPL, which
     /// never touches the alternate screen.
     #[test]
     #[serial]
-    fn coyote_ui_repl_starts_the_plain_repl() {
-        let dir = fresh_config_dir("repl-branch");
+    fn coyote_ui_in_the_environment_does_not_choose_the_shell() {
+        for env_value in ["repl", "headless"] {
+            let dir = fresh_config_dir(&format!("env-ignored-{env_value}"));
+            let _guard = TempDirGuard(dir.clone());
+            write_config(&dir, "save_session: false\nui: tui\n");
+            let mut pty = spawn_with_args(&dir, &[("COYOTE_UI", env_value)], &[]);
+
+            assert_full_screen_ui_then_ctrl_d(
+                &mut pty,
+                &format!("ui: tui under COYOTE_UI={env_value}"),
+            );
+        }
+
+        let dir = fresh_config_dir("env-ignored-tui");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
-        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "repl")]);
+        let mut pty = spawn_with_args(&dir, &[("COYOTE_UI", "tui")], &[]);
 
-        assert_plain_repl_then_ctrl_d(&mut pty, "COYOTE_UI=repl");
+        assert_plain_repl_then_ctrl_d(&mut pty, "no ui: key under COYOTE_UI=tui");
     }
 
     /// `--repl` overrides `ui: tui` in the config.
@@ -3590,58 +3427,9 @@ mod cold_start {
         let dir = fresh_config_dir("repl-flag");
         let _guard = TempDirGuard(dir.clone());
         write_config(&dir, "save_session: false\nui: tui\n");
-        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "")], &["--repl"]);
+        let mut pty = spawn_with_args(&dir, &[], &["--repl"]);
 
         assert_plain_repl_then_ctrl_d(&mut pty, "--repl over ui: tui");
-    }
-
-    /// `COYOTE_UI=repl` overrides `ui: tui` in the config.
-    #[test]
-    #[serial]
-    fn the_env_beats_the_config_key() {
-        let dir = fresh_config_dir("env-over-key");
-        let _guard = TempDirGuard(dir.clone());
-        write_config(&dir, "save_session: false\nui: tui\n");
-        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "repl")]);
-
-        assert_plain_repl_then_ctrl_d(&mut pty, "COYOTE_UI=repl over ui: tui");
-    }
-
-    /// `--tui` overrides `COYOTE_UI=repl`.
-    #[test]
-    #[serial]
-    fn the_tui_flag_beats_the_env() {
-        let dir = fresh_config_dir("flag-over-env");
-        let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
-        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "repl")], &["--tui"]);
-
-        assert_full_screen_ui_then_ctrl_d(&mut pty, "--tui over COYOTE_UI=repl");
-    }
-
-    /// `--repl` overrides `COYOTE_UI=tui`.
-    #[test]
-    #[serial]
-    fn the_repl_flag_beats_a_tui_env() {
-        let dir = fresh_config_dir("repl-flag-over-env");
-        let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
-        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "tui")], &["--repl"]);
-
-        assert_plain_repl_then_ctrl_d(&mut pty, "--repl over COYOTE_UI=tui");
-    }
-
-    /// `COYOTE_UI=headless` is not a shell choice, so the config key
-    /// still decides.
-    #[test]
-    #[serial]
-    fn a_headless_env_value_leaves_the_config_key_in_charge() {
-        let dir = fresh_config_dir("headless-env");
-        let _guard = TempDirGuard(dir.clone());
-        write_config(&dir, "save_session: false\nui: tui\n");
-        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "headless")]);
-
-        assert_full_screen_ui_then_ctrl_d(&mut pty, "ui: tui under COYOTE_UI=headless");
     }
 
     /// [`WAIT_WRAPPER`] with the binary's stdout and stderr sent to files
@@ -3670,7 +3458,7 @@ mod cold_start {
             let mut pty = spawn_binary_under(
                 built_binary(),
                 &dir,
-                &[("COYOTE_UI", "")],
+                &[],
                 STDOUT_TO_FILE_WRAPPER,
                 "/dev/tty",
                 args,
@@ -3705,15 +3493,15 @@ mod cold_start {
         }
     }
 
-    /// With no `ui:` key, no `COYOTE_UI` and no flag, an interactive start
-    /// is the plain REPL it always was.
+    /// With no `ui:` key and no flag, an interactive start is the plain
+    /// REPL it always was.
     #[test]
     #[serial]
     fn an_interactive_start_with_no_preference_is_the_plain_repl() {
         let dir = fresh_config_dir("no-ui-preference");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
-        let mut pty = spawn_tui(&dir, &[("COYOTE_UI", "")]);
+        let mut pty = spawn_with_args(&dir, &[], &[]);
 
         assert_plain_repl_then_ctrl_d(&mut pty, "no ui preference");
     }
@@ -3727,7 +3515,7 @@ mod cold_start {
         let dir = fresh_config_dir("set-ui-key");
         let _guard = TempDirGuard(dir.clone());
         write_dry_run_config(&dir);
-        let mut pty = spawn_tui_with_args(&dir, &[("COYOTE_UI", "")], &["--repl"]);
+        let mut pty = spawn_with_args(&dir, &[], &["--repl"]);
 
         pty.wait_for("Welcome to", PTY_DEADLINE).unwrap();
         pty.read_for(Duration::from_millis(500));
@@ -3835,21 +3623,19 @@ fn a_tty_less_cli_install_at_a_role_or_mcp_conflict_ends_with_the_install_force_
 }
 
 /// `.install <bundle>` in the plain REPL on a terminal with stdin from
-/// /dev/null, at an MCP server conflict: refused in the shared shape with
-/// the REPL's remedy word for word, `, with --force (installs).` (no
-/// `--install-force`, no `--yes`), the local mcp.json untouched, and the
-/// REPL goes on to `.exit` cleanly.
+/// /dev/null, at an MCP server conflict: the conflict menu is painted on
+/// the terminal rather than refused, Esc keeps the local server with
+/// its definition unchanged, and the REPL goes on to `.exit` cleanly.
 #[test]
 #[serial]
-fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_ends_with_the_force_remedy()
-{
+fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_asks_and_esc_keeps_local() {
     let dir = fresh_config_dir("repl-install-mcp-remedy");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     write_bundle_repo(&dir, "bundle-k7s", &[]);
     let local_before = write_conflicting_local_mcp_server(&dir);
 
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/null");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/null");
     pty.wait_for(")> ", PTY_DEADLINE).unwrap();
     let from = pty.raw().len();
     // The line editor repaints the prompt once per typed key, about 100 ms
@@ -3857,34 +3643,24 @@ fn a_plain_repl_dot_install_at_an_mcp_conflict_with_stdin_from_dev_null_ends_wit
     // of the deadline; the binary runs in `dir`, where the relative path
     // names the same repository.
     pty.send(b".install ./bundle-src\r").unwrap();
-    let since = pty
-        .wait_for_after("Re-run in a terminal", from, PTY_DEADLINE)
-        .unwrap_or_else(|err| panic!("`.install` at an MCP conflict did not refuse: {err}"));
-    let (action, remedy) = refusal_shape(&since)
-        .unwrap_or_else(|| panic!("`.install` is not refused in the shared shape:\n{since}"));
-    assert_eq!(
-        action, "merge the already-installed MCP server 'bundle-k7s-server'",
-        "{since}"
-    );
-    assert_eq!(
-        remedy, REPL_CONFLICT_REMEDY,
-        "the REPL MCP conflict remedy is not word for word the documented one:\n{since}"
-    );
-    assert!(
-        !since.contains("Conflict on MCP server") && !since.contains("keep local"),
-        "`.install` painted the conflict menu with nothing to read an answer from:\n{since}"
-    );
-    // Let the line editor re-arm its prompt before the next command, so
-    // the keys are read by it rather than echoed by the cooked tty.
+    pty.wait_for_after("Conflict on MCP server", from, PTY_DEADLINE)
+        .unwrap_or_else(|err| panic!("`.install` at an MCP conflict did not ask: {err}"));
     pty.read_for(Duration::from_millis(500));
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(1500));
+    let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
+    assert!(
+        refusal_shape(&since).is_none(),
+        "`.install` at an MCP conflict was refused:\n{since}"
+    );
     pty.send(b".exit\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     assert_eq!(exit_code(&transcript), 0, "{transcript}");
     assert_tty_restored(&transcript);
     assert_eq!(
-        fs::read_to_string(dir.join("mcp.json")).unwrap(),
-        local_before,
-        "the refused `.install` changed the local mcp.json:\n{transcript}"
+        squeezed(&fs::read_to_string(dir.join("mcp.json")).unwrap()),
+        squeezed(&local_before),
+        "Esc on the MCP conflict did not keep the local server:\n{transcript}"
     );
 }
 
@@ -3918,7 +3694,7 @@ fn a_headless_macro_dot_install_at_an_mcp_conflict_keeps_the_local_server_saying
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         WAIT_WRAPPER,
         "/dev/tty",
         " --headless --macro install-k7s macro-m10",
@@ -3973,14 +3749,13 @@ fn a_headless_macro_dot_install_at_an_mcp_conflict_keeps_the_local_server_saying
 /// `coyote --mcp-add x --url 'https://h/{{TOK}}' --mcp-force` typed at a
 /// terminal with stdin a pipe (`printf '' | coyote ...`), the vault
 /// configured and `x` already present: `--mcp-force` skips the overwrite
-/// question, the missing secret still needs a human, so the run is
-/// refused in the shared shape (`provision the MCP secrets for 'x'`,
-/// remedy naming `coyote --add-secret TOK`) before anything is asked or
-/// written: exit non-zero, mcp.json byte-for-byte as before, nothing
-/// painted to answer, the tty left cooked.
+/// question, the missing secret is asked for on the terminal (the pipe
+/// is not what answers), and `n` aborts naming `coyote --add-secret TOK`
+/// before anything is written: exit non-zero, mcp.json byte-for-byte as
+/// before, the tty left cooked.
 #[test]
 #[serial]
-fn a_piped_stdin_forced_mcp_add_with_a_secret_on_a_terminal_is_refused_before_touching_mcp_json() {
+fn a_piped_stdin_forced_mcp_add_with_a_secret_on_a_terminal_asks_and_n_leaves_mcp_json_alone() {
     let dir = fresh_config_dir("piped-mcp-add-secret-force");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
@@ -3999,45 +3774,38 @@ fn a_piped_stdin_forced_mcp_add_with_a_secret_on_a_terminal_is_refused_before_to
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         piped_wrapper,
         "/dev/null",
-        " --mcp-add x --url 'https://h/{{TOK}}' --mcp-force",
+        " --repl --mcp-add x --url 'https://h/{{TOK}}' --mcp-force",
     );
+    pty.wait_for("to the vault now?", PTY_DEADLINE)
+        .expect("the piped-stdin forced `--mcp-add` did not ask for the secret");
+    pty.read_for(Duration::from_millis(500));
+    pty.send(b"n\r").unwrap();
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
     let plain = strip_ansi(&transcript);
     assert_ne!(
         exit_code(&plain),
         0,
-        "the piped-stdin forced `--mcp-add` exited 0:\n{plain}"
+        "`n` on the secret question did not stop the forced `--mcp-add`:\n{plain}"
     );
-    let (action, remedy) = refusal_shape(&plain).unwrap_or_else(|| {
-        panic!("the piped-stdin forced `--mcp-add` is not refused in the shared shape:\n{plain}")
-    });
-    assert_eq!(action, "provision the MCP secrets for 'x'", "{plain}");
     assert!(
-        remedy.contains("coyote --add-secret TOK"),
-        "the remedy does not name `coyote --add-secret TOK`: {remedy:?}\n{plain}"
+        refusal_shape(&plain).is_none() && plain.contains("coyote --add-secret TOK"),
+        "the forced add was refused, or its abort does not name the remedy:\n{plain}"
     );
-    for widget in [
-        "Overwrite",
-        "to the vault now?",
-        "Enter the secret value",
-        "? ",
-    ] {
-        assert!(
-            !plain.contains(widget),
-            "the piped-stdin run painted `{widget}` with nothing to read an answer from:\n{plain}"
-        );
-    }
+    assert!(
+        !plain.contains("Overwrite"),
+        "`--mcp-force` still asked to overwrite:\n{plain}"
+    );
     assert_eq!(
         fs::read(&mcp_json).unwrap(),
         before,
-        "the refused forced add changed mcp.json:\n{plain}"
+        "the aborted forced add changed mcp.json:\n{plain}"
     );
     assert!(
         !String::from_utf8_lossy(&fs::read(&mcp_json).unwrap()).contains("TOK"),
-        "the refused forced add wrote the new definition:\n{plain}"
+        "the aborted forced add wrote the new definition:\n{plain}"
     );
     assert_tty_restored(&plain);
 }
@@ -4057,7 +3825,7 @@ fn a_blank_answer_in_the_first_run_vault_provider_wizard_is_reasked_with_this_fi
     let _guard = TempDirGuard(dir.clone());
     assert!(!dir.join("config.yaml").exists());
 
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
     pty.wait_for("create a new one?", PTY_DEADLINE)
         .expect("the first run did not ask to create a config file");
     pty.read_for(Duration::from_millis(300));
@@ -4153,7 +3921,8 @@ fn a_tty_less_auth_mcp_is_refused_in_the_shared_shape() {
 
 // ---------------------------------------------------------------------
 // Esc on the agent's `init RAG?` question cancels the agent in both
-// interfaces, and `--auth-mcp` typed at a terminal with stdin piped.
+// interfaces, and `--auth-mcp` typed at a terminal with stdin from
+// /dev/null.
 // ---------------------------------------------------------------------
 
 /// The error a cancelled question surfaces as.
@@ -4215,7 +3984,7 @@ fn esc_on_init_rag_in_the_plain_repl_cancels_the_agent_with_the_canceled_by_user
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
     write_agent_with_documents(&dir, "docs-agent-e2r");
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -4250,122 +4019,40 @@ fn esc_on_init_rag_in_the_plain_repl_cancels_the_agent_with_the_canceled_by_user
     assert_tty_restored(&transcript);
 }
 
-/// The exact refusal `--auth-mcp` gives when nobody can answer it.
-const AUTH_MCP_OAUTH_REFUSAL: &str =
-    "Refusing to sign in to 'oauth-srv-p1d' with OAuth non-interactively. Re-run in a terminal.";
-
 /// `coyote --auth-mcp <server> </dev/null` typed at a terminal (stdout a
-/// tty, stdin not), in both the plain REPL and the UI mode: refused with
-/// exactly the documented sentence before any widget or discovery (the
-/// server URL points nowhere, so reaching discovery would surface as a
-/// connection error), exit non-zero, no alternate screen, tty cooked.
+/// tty, stdin not) is not refused: the sign-in goes on to discovery,
+/// which fails because the server URL points nowhere, so the run exits
+/// non-zero without the non-interactive refusal and leaves the tty
+/// cooked.
 #[test]
 #[serial]
-fn auth_mcp_on_a_terminal_with_stdin_from_dev_null_is_refused_with_the_oauth_sentence() {
-    for ui in ["repl", "tui"] {
-        let dir = fresh_config_dir(&format!("auth-mcp-piped-stdin-{ui}"));
-        let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir);
-        fs::write(
-            dir.join("mcp.json"),
-            r#"{"mcpServers": {"oauth-srv-p1d": {"type": "http", "url": "http://127.0.0.1:9/mcp", "oauth": {"clientId": "cid-p1d"}}}}"#,
-        )
-        .unwrap();
-        let mut pty = spawn_binary_under(
-            built_binary(),
-            &dir,
-            &[("COYOTE_UI", ui)],
-            WAIT_WRAPPER,
-            "/dev/null",
-            " --auth-mcp oauth-srv-p1d",
-        );
-        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-        let plain = strip_ansi(&transcript);
-        assert!(
-            plain
-                .lines()
-                .any(|line| line.trim().trim_start_matches("Error: ") == AUTH_MCP_OAUTH_REFUSAL),
-            "[{ui}] `--auth-mcp` with stdin piped is not refused with the exact sentence:\n{plain}"
-        );
-        assert_ne!(
-            exit_code(&plain),
-            0,
-            "[{ui}] the refused `--auth-mcp` exited 0:\n{plain}"
-        );
-        assert!(
-            !plain.contains("Open this URL")
-                && !plain.contains("Enter the OAuth client ID")
-                && !plain.to_lowercase().contains("connection refused"),
-            "[{ui}] `--auth-mcp` with stdin piped started the sign-in anyway:\n{plain}"
-        );
-        assert!(
-            find(pty.raw(), ENTER_ALT, 0).is_none(),
-            "[{ui}] the refused `--auth-mcp` entered the alternate screen:\n{plain}"
-        );
-        assert_tty_restored(&plain);
-    }
-}
-
-// ---------------------------------------------------------------------
-// `--authenticate` for a client whose sign-in ends in pasting a code,
-// typed at a terminal with stdin piped.
-// ---------------------------------------------------------------------
-
-/// A Claude client signing in with OAuth: its redirect is the provider's
-/// own page, so the sign-in ends with the user pasting the code back.
-const PASTE_FLOW_CLIENT: &str = "\x20 - type: claude\n\
-    \x20   name: claude-paste-k4\n\
-    \x20   auth: oauth\n\
-    save_session: false\n";
-
-/// The exact refusal for that client when nobody can paste the code.
-const PASTE_FLOW_REFUSAL: &str =
-    "Refusing to sign in to 'claude-paste-k4' with OAuth non-interactively. Re-run in a terminal.";
-
-/// `printf code | coyote --authenticate claude-paste-k4` typed at a
-/// terminal (stdout a tty, stdin a pipe), in both interfaces: refused
-/// with the OAuth sentence before the authorize URL is printed (and so
-/// before a browser could be opened for it), exit non-zero, no alternate
-/// screen, tty cooked.
-#[test]
-#[serial]
-fn authenticate_a_paste_flow_client_with_stdin_piped_is_refused_before_printing_the_url() {
-    let piped = WAIT_WRAPPER.replace(
-        "'{coyote}'{args} <{stdin}",
-        "printf 'abc#def\\n' | '{coyote}'{args}",
+fn auth_mcp_on_a_terminal_with_stdin_from_dev_null_goes_past_the_terminal_gate() {
+    let dir = fresh_config_dir("auth-mcp-piped-stdin");
+    let _guard = TempDirGuard(dir.clone());
+    write_dry_run_config(&dir);
+    fs::write(
+        dir.join("mcp.json"),
+        r#"{"mcpServers": {"oauth-srv-p1d": {"type": "http", "url": "http://127.0.0.1:9/mcp", "oauth": {"clientId": "cid-p1d"}}}}"#,
+    )
+    .unwrap();
+    let mut pty = spawn_binary_under(
+        built_binary(),
+        &dir,
+        &[],
+        WAIT_WRAPPER,
+        "/dev/null",
+        " --repl --auth-mcp oauth-srv-p1d",
     );
-    for ui in ["repl", "tui"] {
-        let dir = fresh_config_dir(&format!("authenticate-paste-piped-{ui}"));
-        let _guard = TempDirGuard(dir.clone());
-        write_config(&dir, PASTE_FLOW_CLIENT);
-        let mut pty = spawn_binary_under(
-            built_binary(),
-            &dir,
-            &[("COYOTE_UI", ui)],
-            &piped,
-            "/dev/null",
-            " --authenticate claude-paste-k4",
-        );
-        let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-        let plain = strip_ansi(&transcript);
-        assert!(
-            plain
-                .lines()
-                .any(|line| line.trim().trim_start_matches("Error: ") == PASTE_FLOW_REFUSAL),
-            "[{ui}] the piped paste-flow `--authenticate` is not refused with the exact \
-             sentence:\n{plain}"
-        );
-        assert_ne!(exit_code(&plain), 0, "[{ui}] {plain}");
-        assert!(
-            !plain.contains("Open this URL")
-                && !plain.contains("oauth/authorize")
-                && !plain.contains("Paste the authorization code"),
-            "[{ui}] the refused `--authenticate` printed the sign-in URL or asked anyway:\n{plain}"
-        );
-        assert!(
-            find(pty.raw(), ENTER_ALT, 0).is_none(),
-            "[{ui}] the refused `--authenticate` entered the alternate screen:\n{plain}"
-        );
-        assert_tty_restored(&plain);
-    }
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    let plain = strip_ansi(&transcript);
+    assert!(
+        refusal_shape(&plain).is_none(),
+        "`--auth-mcp` with stdin from /dev/null was refused:\n{plain}"
+    );
+    assert_ne!(
+        exit_code(&plain),
+        0,
+        "`--auth-mcp` against a server that is not there exited 0:\n{plain}"
+    );
+    assert_tty_restored(&plain);
 }

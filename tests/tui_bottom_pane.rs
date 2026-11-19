@@ -143,9 +143,16 @@ fn built_binary() -> &'static Path {
 }
 
 /// Runs the binary in the background of a bash wrapper on a fresh pty with
-/// the tty on stdin.
+/// the tty on stdin, in the full-screen UI.
 fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    spawn_binary_under(built_binary(), dir, extra_env, WAIT_WRAPPER, "/dev/tty", "")
+    spawn_binary_under(
+        built_binary(),
+        dir,
+        extra_env,
+        WAIT_WRAPPER,
+        "/dev/tty",
+        " --tui",
+    )
 }
 
 fn spawn_binary_under(
@@ -165,7 +172,7 @@ fn spawn_binary_under(
             .replace("{report}", TTY_REPORT),
     );
     base_env(&mut cmd, dir);
-    cmd.env("COYOTE_UI", "tui").envs(extra_env.iter().copied());
+    cmd.envs(extra_env.iter().copied());
     Pty::spawn(cmd).unwrap()
 }
 

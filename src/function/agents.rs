@@ -15166,9 +15166,14 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A reply that reaches no one is an error, and `escalation.answered`
+    /// does not fire for it.
     #[test]
+    #[serial]
     fn replying_after_the_asker_stopped_waiting_is_an_error() {
-        let mut ctx = ctx_with_supervisor(4, 3);
+        let _sink = hooks::test_sink::install();
+        let marker = "answered_after_asker_left_k4p";
+        let mut ctx = ctx_with_answered_hook(marker);
         let queue = Arc::new(EscalationQueue::new());
         let (tx, rx) = tokio::sync::oneshot::channel();
         queue.submit(EscalationRequest {
@@ -15191,6 +15196,27 @@ mod tests {
             })
         );
         assert!(queue.take("esc_gone").is_none());
+        assert!(
+            hook_captures_named(marker).is_empty(),
+            "an undelivered reply must not fire escalation.answered"
+        );
+    }
+
+    fn ctx_with_answered_hook(marker: &str) -> RequestContext {
+        let mut hooks_map = hooks::HooksMap::default();
+        hooks_map.insert(
+            "escalation.answered".to_string(),
+            vec![hooks::HookDef {
+                name: marker.to_string(),
+                command: "true".to_string(),
+            }],
+        );
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            hooks: hooks_map,
+            ..Default::default()
+        });
+        RequestContext::new(Arc::new(app), WorkingMode::Cmd)
     }
 
     #[tokio::test]
@@ -15217,20 +15243,7 @@ mod tests {
     fn reply_escalation_fires_answered_once_and_never_on_failure_arms() {
         let _sink = hooks::test_sink::install();
         let marker = "t049_answered_once";
-        let mut hooks_map = hooks::HooksMap::default();
-        hooks_map.insert(
-            "escalation.answered".to_string(),
-            vec![hooks::HookDef {
-                name: marker.to_string(),
-                command: "true".to_string(),
-            }],
-        );
-        let mut app = AppState::test_default();
-        app.config = Arc::new(AppConfig {
-            hooks: hooks_map,
-            ..Default::default()
-        });
-        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut ctx = ctx_with_answered_hook(marker);
         let queue = Arc::new(EscalationQueue::new());
         let (tx, rx) = tokio::sync::oneshot::channel();
         queue.submit(EscalationRequest {

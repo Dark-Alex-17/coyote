@@ -194,7 +194,7 @@ fn the_transcript_printed_on_exit_renders_the_reply_like_the_repl() {
     let _repl_guard = TempDirGuard(repl_dir.clone());
     let fake = FakeLlm::start(vec![Reply::Text(MARKDOWN_REPLY.to_string())]);
     write_fake_llm_config(&repl_dir, &fake);
-    let mut repl = spawn_tui(&repl_dir, &[("COYOTE_UI", "repl")]);
+    let mut repl = spawn_repl_under(&repl_dir, &[], WAIT_WRAPPER, "/dev/tty");
     repl.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     repl.read_for(Duration::from_millis(300));
     let from = repl.raw().len();

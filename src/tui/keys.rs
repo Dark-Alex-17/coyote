@@ -547,7 +547,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             let answerable = ctx.idle_ok && ctx.question_fully_shown;
             match code {
                 KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
-                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Interrupted),
                 _ if !answerable => Action::Nothing,
                 KeyCode::Enter => Action::Answer(PromptAnswer::Confirmed(default)),
                 KeyCode::Char('y') if !ctrl => Action::Answer(PromptAnswer::Confirmed(true)),
@@ -564,7 +564,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             },
         ) => match code {
             KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
-            KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+            KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Interrupted),
             // The field is one line, so the composer's newline chords have
             // nothing to insert: Enter submits however it is held, once
             // the modal has settled; a gated Enter is swallowed rather
@@ -584,7 +584,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             let checkbox = ctx.modal == Some(ModalKind::Checkbox);
             match code {
                 KeyCode::Esc => Action::Answer(PromptAnswer::Cancelled),
-                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Cancelled),
+                KeyCode::Char('c') if ctrl => Action::Answer(PromptAnswer::Interrupted),
                 KeyCode::Up => Action::ModalMove(-1),
                 KeyCode::Down => Action::ModalMove(1),
                 _ if !answerable => Action::Nothing,
@@ -919,6 +919,47 @@ mod tests {
         ];
         for (key, ctx, expected) in cases {
             assert_eq!(map_key(key, &ctx), expected, "{key:?} in {ctx:?}");
+        }
+    }
+
+    /// Esc closes the question; Ctrl-C closes it as an interrupt, in every
+    /// modal kind, so a caller that carries on after a cancel can still
+    /// stop on Ctrl-C.
+    #[test]
+    fn esc_cancels_and_ctrl_c_interrupts_every_modal() {
+        for modal in [
+            ModalKind::Confirm {
+                default: false,
+                tool: true,
+            },
+            ModalKind::Confirm {
+                default: true,
+                tool: false,
+            },
+            ModalKind::Input,
+            ModalKind::Password,
+            ModalKind::Select {
+                custom_field_open: false,
+            },
+            ModalKind::Select {
+                custom_field_open: true,
+            },
+            ModalKind::Checkbox,
+        ] {
+            let ctx = KeyContext {
+                modal: Some(modal),
+                ..IDLE
+            };
+            assert_eq!(
+                map_key(plain(KeyCode::Esc), &ctx),
+                Action::Answer(PromptAnswer::Cancelled),
+                "{modal:?}"
+            );
+            assert_eq!(
+                map_key(ctrl('c'), &ctx),
+                Action::Answer(PromptAnswer::Interrupted),
+                "{modal:?}"
+            );
         }
     }
 
@@ -1585,8 +1626,12 @@ mod tests {
                 clipped,
                 Action::Answer(PromptAnswer::Cancelled),
             ),
-            (ctrl('c'), clipped, Action::Answer(PromptAnswer::Cancelled)),
-            (ctrl('c'), modal, Action::Answer(PromptAnswer::Cancelled)),
+            (
+                ctrl('c'),
+                clipped,
+                Action::Answer(PromptAnswer::Interrupted),
+            ),
+            (ctrl('c'), modal, Action::Answer(PromptAnswer::Interrupted)),
             (plain(KeyCode::Char('x')), modal, Action::Nothing),
         ];
         for (key, ctx, expected) in cases {
@@ -1672,7 +1717,7 @@ mod tests {
                 (
                     ctrl('c'),
                     unsettled,
-                    Action::Answer(PromptAnswer::Cancelled),
+                    Action::Answer(PromptAnswer::Interrupted),
                 ),
             ];
             for (key, ctx, expected) in cases {
@@ -1742,7 +1787,7 @@ mod tests {
             (
                 ctrl('c'),
                 checkbox_busy,
-                Action::Answer(PromptAnswer::Cancelled),
+                Action::Answer(PromptAnswer::Interrupted),
             ),
             (ctrl('z'), select, Action::Suspend),
             (plain(KeyCode::PageUp), checkbox, Action::ScrollPage(-1)),
@@ -2517,7 +2562,11 @@ mod tests {
                 "Esc / Ctrl+C",
                 vec![
                     (plain(KeyCode::Esc), PASSWORD, cancelled()),
-                    (ctrl('c'), CUSTOM_FIELD, cancelled()),
+                    (
+                        ctrl('c'),
+                        CUSTOM_FIELD,
+                        Action::Answer(PromptAnswer::Interrupted),
+                    ),
                     (plain(KeyCode::Esc), CONFIRM, cancelled()),
                 ],
             ),

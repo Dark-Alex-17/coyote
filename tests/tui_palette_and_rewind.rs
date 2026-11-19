@@ -186,7 +186,7 @@ fn spawn_ui(dir: &Path, ui: &str, extra_env: &[(&str, &str)]) -> Pty {
     cmd.arg("-c").arg(
         WAIT_WRAPPER
             .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{args}", "")
+            .replace("{args}", &format!(" --{ui}"))
             .replace("{stdin}", "/dev/tty")
             .replace("{report}", TTY_REPORT),
     );
@@ -206,7 +206,6 @@ fn spawn_ui(dir: &Path, ui: &str, extra_env: &[(&str, &str)]) -> Pty {
         .env("HOME", dir.join("home"))
         .env("TERM", "xterm-256color")
         .env("PATH", path)
-        .env("COYOTE_UI", ui)
         .env_remove("IS_SANDBOX")
         .env_remove("COLORTERM")
         .env_remove("NO_COLOR")

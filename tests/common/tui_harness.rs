@@ -83,17 +83,24 @@ pub fn write_config(dir: &Path, extra: &str) {
 }
 
 /// Runs the binary in the background of a bash wrapper on a fresh pty with
-/// the tty on stdin. The wrapper names the child's pid, waits for it, and
-/// then reports its exit code and the tty flags so a test can check both
-/// after any exit path.
+/// the tty on stdin, in the full-screen UI. The wrapper names the child's
+/// pid, waits for it, and then reports its exit code and the tty flags so
+/// a test can check both after any exit path.
 pub fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
     spawn_tui_under(dir, extra_env, WAIT_WRAPPER, "/dev/tty")
 }
 
-/// [`spawn_tui`] with command-line flags after the binary; `args` are
-/// plain ASCII flags, so they go into the wrapper unquoted.
+/// [`spawn_tui`] with command-line flags after `--tui`; `args` are plain
+/// ASCII flags, so they go into the wrapper unquoted.
 pub fn spawn_tui_with_args(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> Pty {
-    let args = format!(" {}", args.join(" "));
+    spawn_with_args(dir, extra_env, &[&["--tui"], args].concat())
+}
+
+/// [`spawn_tui_with_args`] without `--tui`: the config's `ui:` key, or a
+/// shell flag in `args`, decides the shell, and a prompt in `args` makes
+/// a one-shot run.
+pub fn spawn_with_args(dir: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> Pty {
+    let args: String = args.iter().map(|arg| format!(" {arg}")).collect();
     spawn_binary_under(
         built_binary(),
         dir,
@@ -147,14 +154,21 @@ pub fn built_binary() -> &'static Path {
 
 /// [`spawn_binary_under`] for the build's own binary: `wrapper` is one of
 /// the bash scripts above and `stdin` the path the binary's stdin is
-/// redirected from.
+/// redirected from. `--tui` selects the full-screen UI.
 pub fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
-    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, "")
+    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, " --tui")
+}
+
+/// [`spawn_tui_under`] with `--repl`: the plain REPL on the same pty.
+pub fn spawn_repl_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str, stdin: &str) -> Pty {
+    spawn_binary_under(built_binary(), dir, extra_env, wrapper, stdin, " --repl")
 }
 
 /// [`spawn_tui_under`] for a copy of the binary living elsewhere (the
 /// self-update path classifies the install by where the executable is);
-/// `args` fills the wrapper's `{args}` slot right after the binary.
+/// `args` fills the wrapper's `{args}` slot right after the binary. No
+/// shell flag is added: `args` carries `--tui` or `--repl` when the run
+/// needs one, and without either the config's `ui:` key decides.
 pub fn spawn_binary_under(
     binary: &Path,
     dir: &Path,
@@ -173,7 +187,7 @@ pub fn spawn_binary_under(
     );
     base_env(&mut cmd, dir);
     assert_env_stays_under_dir(extra_env);
-    cmd.env("COYOTE_UI", "tui").envs(extra_env.iter().copied());
+    cmd.envs(extra_env.iter().copied());
     Pty::spawn(cmd).unwrap()
 }
 
@@ -219,15 +233,13 @@ pub fn base_env(cmd: &mut Command, dir: &Path) {
 
 /// The binary at `binary` set up to run with no terminal at all: the
 /// shared environment under `dir`, detached from the test runner's
-/// controlling tty, the plain REPL selected and stdin at /dev/null. The
-/// caller adds its arguments and chooses what to do with stdout and
-/// stderr.
+/// controlling tty and stdin at /dev/null. The caller adds its arguments
+/// (with `--repl` or `--tui` when the shell matters) and chooses what to
+/// do with stdout and stderr.
 pub fn ttyless_command(binary: &Path, dir: &Path) -> Command {
     let mut cmd = Command::new(binary);
     base_env(&mut cmd, dir);
-    detached(&mut cmd)
-        .env("COYOTE_UI", "repl")
-        .stdin(Stdio::null());
+    detached(&mut cmd).stdin(Stdio::null());
     cmd
 }
 

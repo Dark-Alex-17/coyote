@@ -3064,6 +3064,88 @@ nodes: {}
         assert!(prompter.requests().is_empty());
     }
 
+    /// Off the UI, a terminal on stdout is enough to ask the RAG question:
+    /// with stdin piped, accepting it still builds the knowledge base and
+    /// the agent's `rag.sync.*` hooks fire.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial_test::serial]
+    async fn with_piped_stdin_the_rag_question_is_asked_and_the_sync_hooks_fire() {
+        let _guard = TestConfigDirGuard::new("agent-rag-piped-stdin");
+        let _tui_off = AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _stdout_tty = crate::config::conflict::prompt_script::install(&[]);
+        let _stdin = testing::pipe_stdin();
+        let _sink = crate::hooks::test_sink::install();
+        crate::hooks::test_sink::drain();
+        let marker = "agent-rag-piped-h3k";
+        let name = unique("rag_piped");
+        let agent_dir = paths::agent_data_dir(&name);
+        create_dir_all(&agent_dir).unwrap();
+        fs::write(agent_dir.join("notes.md"), "").unwrap();
+        let hooks: String = ["started", "completed", "failed"]
+            .iter()
+            .map(|event| {
+                format!(
+                    "  rag.sync.{event}:\n    - name: {marker}-{event}\n      command: \"true\"\n"
+                )
+            })
+            .collect();
+        fs::write(
+            agent_dir.join("config.yaml"),
+            format!("name: {name}\ninstructions: hi\ndocuments:\n  - notes.md\nhooks:\n{hooks}"),
+        )
+        .unwrap();
+
+        let mut client = crate::client::ClientConfig::default();
+        if let crate::client::ClientConfig::OpenAIConfig(config) = &mut client {
+            config.name = Some("test-seeded".to_string());
+            let mut embedder = crate::client::ModelData::new("test-embedder");
+            embedder.model_type = "embedding".to_string();
+            config.models = vec![embedder];
+        }
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            clients: vec![client],
+            rag_embedding_model: Some("test-seeded:test-embedder".to_string()),
+            rag_chunk_size: Some(1000),
+            rag_chunk_overlap: Some(100),
+            ..Default::default()
+        });
+        let mut answers = vec![PromptAnswer::Confirmed(true)];
+        if cfg!(not(target_env = "musl")) {
+            let yaml_row = "yaml   — portable, in-memory HNSW; usable from several Coyote processes at once (default)"; // debris-exempt: inquire label kept verbatim
+            answers.push(PromptAnswer::Selected(yaml_row.to_string()));
+        }
+        let prompter = Arc::new(ScriptedPrompter::new(answers));
+
+        let agent = Agent::init(
+            &app_state.config,
+            &app_state,
+            &Model::default(),
+            false,
+            &name,
+            create_abort_signal(),
+            Arc::clone(&prompter) as Arc<dyn Prompter>,
+        )
+        .await
+        .unwrap();
+
+        assert!(agent.rag().is_some());
+        assert_eq!(
+            prompter.requests()[0].question,
+            "The agent has documents attached, init RAG?"
+        );
+        let fired: Vec<String> = crate::hooks::test_sink::drain()
+            .into_iter()
+            .map(|capture| capture.hook_name)
+            .filter(|hook| hook.starts_with(marker))
+            .collect();
+        assert_eq!(
+            fired,
+            [format!("{marker}-started"), format!("{marker}-completed")]
+        );
+    }
+
     /// With no human attached the optional RAG question cannot be
     /// answered; the agent starts without its knowledge base instead of
     /// failing on the refusal.

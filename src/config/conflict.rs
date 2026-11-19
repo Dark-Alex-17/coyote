@@ -9,7 +9,6 @@ use crate::prompt::{Prompter, select_closed};
 use crate::utils::IS_STDOUT_TERMINAL;
 
 use anyhow::{Context, Result, anyhow, bail};
-use is_terminal::IsTerminal;
 use std::fs;
 use std::path::Path;
 
@@ -116,15 +115,14 @@ pub(crate) fn resolve_conflict(
 }
 
 /// Whether a question has somewhere to be shown: the full-screen UI's
-/// modal, or a terminal on both stdout and stdin for an inquire widget.
-/// The widget paints stdout and reads its answer from stdin, so a tty on
-/// one side with a pipe on the other would hang or fall over mid-prompt.
+/// modal, or a terminal on stdout for an inquire widget. Stdin does not
+/// matter: when it is not a terminal the widget reads its keys from
+/// `/dev/tty` instead.
 pub(crate) fn menu_can_use_terminal() -> bool {
     #[cfg(test)]
-    let on_tty = prompt_script::forced_tty()
-        .unwrap_or_else(|| *IS_STDOUT_TERMINAL && std::io::stdin().is_terminal());
+    let on_tty = prompt_script::forced_stdout_tty().unwrap_or(*IS_STDOUT_TERMINAL);
     #[cfg(not(test))]
-    let on_tty = *IS_STDOUT_TERMINAL && std::io::stdin().is_terminal();
+    let on_tty = *IS_STDOUT_TERMINAL;
     crate::tui::active() || on_tty
 }
 
@@ -217,7 +215,9 @@ pub(crate) mod prompt_script {
         ASKED.load(Ordering::SeqCst)
     }
 
-    pub(super) fn forced_tty() -> Option<bool> {
+    /// The stdout terminal the script stands in for. Stdin is left real, so
+    /// a test pipes fd 0 itself when it needs a non-terminal stdin.
+    pub(super) fn forced_stdout_tty() -> Option<bool> {
         match STATE.load(Ordering::SeqCst) {
             TTY => Some(true),
             NON_TTY => Some(false),
@@ -374,17 +374,13 @@ mod tests {
         assert!(!menu_can_use_terminal());
     }
 
-    /// Outside the UI an inquire widget needs stdout to paint and stdin to
-    /// read, so the gate is the conjunction of the two; the test seam
-    /// forces both legs at once.
+    /// Outside the UI the gate follows stdout alone; a piped stdin does not
+    /// close it, since inquire then reads its keys from `/dev/tty`.
     #[test]
     #[serial]
-    fn menu_can_use_terminal_needs_both_ttys_outside_the_tui() {
+    fn menu_can_use_terminal_needs_only_a_stdout_tty_outside_the_tui() {
         let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
-        assert_eq!(
-            menu_can_use_terminal(),
-            *IS_STDOUT_TERMINAL && std::io::stdin().is_terminal()
-        );
+        assert_eq!(menu_can_use_terminal(), *IS_STDOUT_TERMINAL);
 
         let forced_on = prompt_script::install(&[]);
         assert!(menu_can_use_terminal());
@@ -394,6 +390,17 @@ mod tests {
         assert!(!menu_can_use_terminal());
 
         let _tui_on = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, true);
+        assert!(menu_can_use_terminal());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn menu_can_use_terminal_stays_open_with_a_stdout_tty_and_piped_stdin() {
+        let _tui_off = crate::testing::AtomicFlagGuard::set(&crate::tui::TUI_ACTIVE, false);
+        let _stdout_tty = prompt_script::install(&[]);
+        let _stdin = crate::testing::pipe_stdin();
+
         assert!(menu_can_use_terminal());
     }
 

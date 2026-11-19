@@ -511,10 +511,10 @@ fn an_install_with_stdout_redirected_and_a_conflicting_mcp_server_is_refused_nam
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         &wait_wrapper_with_stdout_to(&captured),
         "/dev/tty",
-        &format!(" --install '{}'", repo.display()),
+        &format!(" --repl --install '{}'", repo.display()),
     );
 
     let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
@@ -610,7 +610,7 @@ fn a_tools_list_question_in_the_plain_repl_is_an_open_select_keeping_the_arrow_h
     let dir = fresh_config_dir("tool-list-repl");
     let _guard = TempDirGuard(dir.clone());
     let (fake, out) = list_tool_turn(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -785,7 +785,7 @@ fn dot_install_of_a_builtin_category_in_the_plain_repl_confirms_on_enter_not_on_
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let macros_dir = dir.join("macros");
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -880,7 +880,7 @@ fn a_tools_list_question_in_the_plain_repl_opens_custom_response_and_passes_the_
     let dir = fresh_config_dir("tool-list-repl-custom");
     let _guard = TempDirGuard(dir.clone());
     let (fake, out) = list_tool_turn(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1130,7 +1130,7 @@ fn esc_on_the_first_of_two_mcp_conflicts_in_the_plain_repl_keeps_both_local_with
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config(&dir);
     let (repo, local_before) = two_mcp_conflicts(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.resize(60, 140).unwrap();
@@ -1221,7 +1221,7 @@ fn a_tools_input_question_with_an_empty_default_shows_no_default_hint_in_the_pla
     let dir = fresh_config_dir("tool-input-empty-default-repl");
     let _guard = TempDirGuard(dir.clone());
     let (fake, out) = empty_default_turn(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1341,7 +1341,14 @@ fn a_tools_checkbox_question_stays_closed_with_no_custom_row_in_either_interface
         ]);
         write_fake_llm_config(&dir, &fake);
         write_tool(&dir, "fixture_checkbox_rec.sh", RECORDING_CHECKBOX_TOOL);
-        let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", ui)], WAIT_WRAPPER, "/dev/tty");
+        let mut pty = spawn_binary_under(
+            built_binary(),
+            &dir,
+            &[],
+            WAIT_WRAPPER,
+            "/dev/tty",
+            &format!(" --{ui}"),
+        );
         if ui == "repl" {
             pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
         } else {
@@ -1511,7 +1518,7 @@ fn dot_agent_with_documents_in_the_plain_repl_asks_init_rag_with_inquire() {
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
     write_agent_with_documents(&dir, "docs-agent-r7q");
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1574,7 +1581,7 @@ fn headless_agent_with_documents_starts_without_rag_silently() {
     let mut pty = spawn_binary_under(
         built_binary(),
         &dir,
-        &[("COYOTE_UI", "repl")],
+        &[],
         &wait_wrapper_with_stdout_to(&captured),
         "/dev/null",
         " --agent docs-agent-h7q --headless 'say hello-sentinel-h7q'",
@@ -1801,7 +1808,7 @@ fn dot_rag_for_a_new_rag_in_the_plain_repl_asks_with_inquire_and_esc_writes_noth
     let dir = fresh_config_dir("rag-create-repl");
     let _guard = TempDirGuard(dir.clone());
     write_dry_run_config_with_embeddings(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("dry-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -1948,7 +1955,7 @@ fn a_blank_custom_response_in_the_plain_repl_cancels_the_list_with_status_one() 
     let dir = fresh_config_dir("tool-list-repl-blank");
     let _guard = TempDirGuard(dir.clone());
     let (fake, out) = list_tool_turn(&dir);
-    let mut pty = spawn_tui_under(&dir, &[("COYOTE_UI", "repl")], WAIT_WRAPPER, "/dev/tty");
+    let mut pty = spawn_repl_under(&dir, &[], WAIT_WRAPPER, "/dev/tty");
 
     pty.wait_for("fake-model)>", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));

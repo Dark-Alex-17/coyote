@@ -30,7 +30,7 @@ const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
      echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
 const WAIT_WRAPPER: &str =
-    "'{coyote}' <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
+    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
 /// The user's shell shape: the binary is the foreground job; when it
 /// stops the wrapper reports what it sees and resumes it with `fg` after
 /// a second. A non-interactive bash 3.2 (macOS's `/bin/bash`) never sees
@@ -38,7 +38,7 @@ const WAIT_WRAPPER: &str =
 /// itself as an interactive shell.
 const JOB_CONTROL_WRAPPER: &str = "if [ \"${BASH_VERSINFO[0]}\" -lt 4 ] && [ -z \"${_JOB_CONTROL_SHELL:-}\" ]; then \
      export _JOB_CONTROL_SHELL=1; exec bash --norc --noprofile -i -c \"$BASH_EXECUTION_STRING\"; fi; \
-     set -m; '{coyote}' <{stdin}; rc=$?; \
+     set -m; '{coyote}'{args} <{stdin}; rc=$?; \
      while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
      echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
      sleep 1; fg %1; rc=$?; done; {report}";
@@ -190,13 +190,13 @@ fn spawn_tui_with_path(
         .arg(
             wrapper
                 .replace("{coyote}", built_binary().to_str().unwrap())
+                .replace("{args}", " --tui")
                 .replace("{stdin}", "/dev/tty")
                 .replace("{report}", TTY_REPORT),
         )
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
         .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("COYOTE_UI", "tui")
         .env("HOME", &home)
         .env("TERM", "xterm-256color")
         .env("PATH", path)

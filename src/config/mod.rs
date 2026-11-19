@@ -1618,7 +1618,7 @@ clients:
     #[test]
     fn config_template_documents_ui() {
         assert!(CONFIG_TEMPLATE.contains(
-            "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl"
+            "ui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
         ));
         assert!(CONFIG_TEMPLATE.contains(
             "tui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
@@ -1630,6 +1630,16 @@ clients:
             "\ntheme: null                      # null = ask the terminal for its background and use the matching built-in theme (dark when\n                                 # the terminal does not answer); `light` or `dark` picks one. COYOTE_THEME is used while theme is null.\n"
         ));
         assert!(!CONFIG_TEMPLATE.to_ascii_lowercase().contains("light_theme"));
+        let example = include_str!("../../config.example.yaml");
+        for (label, text) in [
+            ("config-template.yaml", CONFIG_TEMPLATE),
+            ("config.example.yaml", example),
+        ] {
+            assert!(
+                !text.contains("COYOTE_UI"),
+                "{label} names COYOTE_UI, which coyote does not read"
+            );
+        }
     }
 
     #[test]
@@ -1666,7 +1676,7 @@ clients:
         assert!(example.contains("command_prefix: dot"));
         assert!(example.contains("\nmemory_round_chains: supersede"));
         assert!(example.contains(
-            "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also COYOTE_UI or --tui / --repl"
+            "\nui: repl                         # Which shell starts for an interactive run (repl, tui). Also --tui / --repl"
         ));
         assert!(example.contains(
             "\ntui_dump_on_exit: true           # Print the conversation on the normal screen when the full-screen UI leaves"
