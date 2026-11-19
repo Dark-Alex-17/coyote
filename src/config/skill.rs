@@ -162,11 +162,7 @@ impl Skill {
     }
 
     pub fn is_compatible(&self, mcp_enabled: bool) -> bool {
-        if self.declares_mcp_servers() && !mcp_enabled {
-            return false;
-        }
-
-        true
+        mcp_enabled || !self.declares_mcp_servers()
     }
 
     fn declares_mcp_servers(&self) -> bool {

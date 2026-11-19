@@ -57,6 +57,10 @@ impl ScriptExecutor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
         cmd.kill_on_drop(true);
+        // Script stdout is parsed as JSON, so colour forced by the parent
+        // environment would corrupt it; NO_COLOR comes from the default envs.
+        cmd.env_remove("CLICOLOR_FORCE");
+        cmd.env_remove("FORCE_COLOR");
         cmd.envs(&self.extra_envs);
         cmd.env("AUTO_CONFIRM", "true");
         // A graph run nested inside another graph's script node inherits that
@@ -185,8 +189,7 @@ fn build_default_envs(agent_data_dir: &Path) -> HashMap<String, String> {
         "LLM_AGENT_DATA_DIR".to_string(),
         agent_data_dir.to_string_lossy().into_owned(),
     );
-    envs.insert("CLICOLOR_FORCE".to_string(), "1".to_string());
-    envs.insert("FORCE_COLOR".to_string(), "1".to_string());
+    envs.insert("NO_COLOR".to_string(), "1".to_string());
 
     if let Ok(current_path) = env::var("PATH") {
         let bin_dir = paths::functions_bin_dir();
@@ -721,6 +724,52 @@ printf '{"file_env": "%s", "inline_set": %s}' "${GRAPH_STATE_FILE:-UNSET}" "$([ 
         assert_eq!(state.state().get("file_env"), Some(&json!("UNSET")));
         assert_eq!(state.state().get("inline_set"), Some(&json!(true)));
         let _ = fs::remove_file(&parent_state);
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn colour_aware_command_writes_plain_output_even_when_parent_forces_colour() {
+        if !cmd_available("bash") {
+            return;
+        }
+        let _clicolor = crate::testing::EnvVarGuard::set("CLICOLOR_FORCE", "1");
+        let _force = crate::testing::EnvVarGuard::set("FORCE_COLOR", "1");
+        let _no_color = crate::testing::EnvVarGuard::unset("NO_COLOR");
+
+        // Follows the CLICOLOR_FORCE / FORCE_COLOR / NO_COLOR conventions that
+        // gh and Node CLIs honour when stdout is a pipe.
+        let (dir, path) = write_script(
+            r#"#!/bin/bash
+label() {
+  if [ -n "${NO_COLOR:-}" ]; then
+    printf '%s' "$1"
+  elif [ "${CLICOLOR_FORCE:-0}" != "0" ] || [ -n "${FORCE_COLOR:-}" ]; then
+    printf '\033[1;32m%s\033[0m' "$1"
+  else
+    printf '%s' "$1"
+  fi
+}
+printf '{"label": "%s", "clicolor_force": "%s", "force_color": "%s", "no_color": "%s"}' \
+  "$(label plain)" "${CLICOLOR_FORCE:-UNSET}" "${FORCE_COLOR:-UNSET}" "${NO_COLOR:-UNSET}"
+"#,
+            "sh",
+        );
+        let mut state = StateManager::new(HashMap::new());
+        let executor = ScriptExecutor::new(&dir);
+
+        executor
+            .execute(
+                &node_for(path.file_name().unwrap().to_str().unwrap(), 5),
+                &mut state,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("coloured output broke the JSON merge: {e:#}"));
+
+        assert_eq!(state.state().get("label"), Some(&json!("plain")));
+        assert_eq!(state.state().get("clicolor_force"), Some(&json!("UNSET")));
+        assert_eq!(state.state().get("force_color"), Some(&json!("UNSET")));
+        assert_eq!(state.state().get("no_color"), Some(&json!("1")));
         cleanup(&dir);
     }
 
