@@ -15,6 +15,7 @@
 mod bottom_pane;
 mod cells;
 mod composer;
+mod control;
 mod dump;
 mod events;
 mod help;
@@ -26,33 +27,36 @@ mod pager;
 mod queued;
 mod redirect;
 mod render;
+mod rewind;
 mod roster;
 mod sink;
 mod terminal;
 mod todo;
 mod transcript;
 
-use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
+use crate::config::child_sessions::ChildSessionRoot;
 use crate::config::{AppConfig, RequestContext, jobs_enabled};
 use crate::events::{EventSink, NoticeKind, SubscriptionId};
 use crate::function::agents::CANCEL_CLEANUP_WAIT;
 use crate::function::jobs::JOB_KILL_GRACE;
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory};
-use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command, run_repl_command};
+use crate::repl::{EXIT_CANCEL_WAIT, EXIT_HOOK_DRAIN_TIMEOUT, is_command};
 use crate::supervisor::notification::NotificationQueue;
-use crate::supervisor::{TaskKind, TaskRow};
-use crate::utils::process::ProcessStamp;
 use crate::utils::{AbortSignal, create_abort_signal};
 use anyhow::{Result, bail};
 use bottom_pane::{
-    PaletteSnapshot, PaletteState, PaletteView, RewindState, RewindTarget, RewindView, SearchState,
-    SearchView, View,
+    PaletteSnapshot, PaletteState, PaletteView, RewindTarget, RewindView, SearchState, SearchView,
+    View,
 };
 use cells::{
-    AgentStatus, Cell, FoldedCall, FullOutput, JobStatus, LineCache, OutputTarget, RewindBarrier,
-    ToolStatus, append_output,
+    AgentStatus, Cell, FoldedCall, FullOutput, JobStatus, LineCache, OutputTarget, ToolStatus,
+    append_output,
 };
 use composer::{Composer, field_background};
+use control::{
+    ControlRequest, TurnOutcome, cancel_report, is_plain_session_id, spawn_control_request,
+    spawn_exit, spawn_turn,
+};
 use crossterm::event::{EventStream, KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, SystemClock, TermInput};
 use futures_util::StreamExt;
@@ -62,7 +66,7 @@ use keys::{Action, KeyContext, PagerMode, PopupKind, ViMode};
 pub(crate) use lend::{TtyHandles, ensure_terminal_lendable, lend_terminal, notice};
 use lend::{remember_tty, set_lender};
 use modal::{PendingPrompt, PromptModal};
-use pager::{Pager, PagerView, ThreadRow};
+use pager::{Pager, PagerView};
 use queued::{
     QueuedLine, QueuedPreview, carry_over, reconcile_queue, remove_sent, take_user_messages,
 };
@@ -73,9 +77,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui_textarea::TextArea;
-use redirect::FdRedirect;
 pub(crate) use render::plain_text;
 use render::{RenderCache, Renderer};
+use rewind::{apply_rewind, opens_exchange};
 use roster::{RosterRow, RosterSources, RosterState, RosterView};
 use serde_json::Value;
 use sink::{AgentOutcome, LendJob, TuiPrompter, TuiSink, UiMsg, unattended_answer};
@@ -123,8 +127,6 @@ const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
 /// counts as a modal answer, so a keystroke meant for the composer never
 /// confirms a prompt that appeared under it.
 const HOTKEY_IDLE: Duration = Duration::from_secs(1);
-/// How close two idle Escs must come to open the rewind picker.
-const REWIND_ESC_GAP: Duration = Duration::from_secs(1);
 /// How long the exit work waits for the roster's and the pager's control
 /// tasks before it takes the context; those still running are aborted.
 /// A roster cancel of an agent waits up to `CANCEL_CLEANUP_WAIT` for the
@@ -248,135 +250,6 @@ impl Drop for BusSubscription {
     }
 }
 
-/// What one line produced on the work task.
-#[derive(Debug, Default)]
-pub(crate) struct TurnOutcome {
-    /// `run_repl_command` asked to leave (`.exit`).
-    pub(crate) exit: bool,
-    pub(crate) error: Option<String>,
-    /// Everything the turn printed to fds 1 and 2.
-    pub(crate) captured: String,
-}
-
-fn late_output(tx: UnboundedSender<UiMsg>) -> impl Fn(String) + Send + 'static {
-    move |text| {
-        let _ = tx.send(UiMsg::Notice {
-            kind: NoticeKind::Routing,
-            text: render::plain_text(&text),
-        });
-    }
-}
-
-/// Drives a work-task future to completion on a blocking-pool thread.
-/// The returned handle joins like a `tokio::spawn` one, but the future
-/// may block its thread freely; see [`spawn_turn`] for why it must.
-fn spawn_work<F>(future: F) -> JoinHandle<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || handle.block_on(future))
-}
-
-/// Runs one line the way the REPL would, on its own task, with fds 1 and 2
-/// captured. The context comes back with the outcome.
-///
-/// Runtime rule: the work task must never sit on a runtime worker. The
-/// turn blocks its thread for the whole of a tool call and of a sync
-/// prompt, and on the multi-thread runtime the time driver is serviced
-/// by parked workers, never by the UI loop's `block_on` thread. A worker
-/// blocked in the turn can hold the driver up with it, and every
-/// timer-driven frame then waits for the turn to end. So the body runs on
-/// the blocking pool under a nested `block_on` ([`spawn_work`]).
-pub(crate) fn spawn_turn(
-    mut ctx: RequestContext,
-    abort: AbortSignal,
-    line: String,
-    ui: UnboundedSender<UiMsg>,
-) -> JoinHandle<(RequestContext, TurnOutcome)> {
-    spawn_work(async move {
-        let guard = match FdRedirect::begin(late_output(ui.clone())) {
-            Ok(guard) => Some(guard),
-            Err(err) => {
-                let _ = ui.send(UiMsg::Notice {
-                    kind: NoticeKind::ToolWarning,
-                    text: format!("Running the turn without output capture: {err}"),
-                });
-                None
-            }
-        };
-        let result = Box::pin(run_repl_command(&mut ctx, abort, &line)).await;
-        let captured = guard.map(FdRedirect::finish).unwrap_or_default();
-        #[cfg(debug_assertions)]
-        if std::env::var(STUBBORN_TURN_ENV).as_deref() == Ok("1") {
-            std::thread::sleep(2 * EXIT_CANCEL_WAIT);
-        }
-        let outcome = match result {
-            Ok(exit) => TurnOutcome {
-                exit,
-                error: None,
-                captured,
-            },
-            Err(err) => TurnOutcome {
-                exit: false,
-                // The REPL's shape: message, then its causes.
-                error: Some(crate::utils::pretty_error(&err)),
-                captured,
-            },
-        };
-        (ctx, outcome)
-    })
-}
-
-/// The REPL's teardown on the work task, under the same runtime rule as
-/// [`spawn_turn`]: settles background agents, exits the session (which
-/// may ask to save it) and closes the agent bracket.
-fn spawn_exit(
-    mut ctx: RequestContext,
-    controls: JoinSet<()>,
-    abort: AbortSignal,
-    ui: UnboundedSender<UiMsg>,
-) -> JoinHandle<(RequestContext, Result<()>, String)> {
-    spawn_work(async move {
-        settle_control_tasks(controls, CONTROL_TASK_WAIT).await;
-        // Late output (a panic's message among it) reaches the UI the way
-        // a turn's does instead of dying in a discarded pipe.
-        let guard = match FdRedirect::begin(late_output(ui.clone())) {
-            Ok(guard) => Some(guard),
-            Err(err) => {
-                let _ = ui.send(UiMsg::Notice {
-                    kind: NoticeKind::ToolWarning,
-                    text: format!("Leaving without output capture: {err}"),
-                });
-                None
-            }
-        };
-        #[cfg(debug_assertions)]
-        if std::env::var(PANIC_AT_EXIT_ENV).as_deref() == Ok("1") {
-            panic!("{PANIC_AT_EXIT_ENV} requested a panic inside the exit work");
-        }
-        ctx.cancel_background_tasks_and_wait(EXIT_CANCEL_WAIT).await;
-        let result = ctx.exit_session();
-        ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort));
-        let captured = guard.map(FdRedirect::finish).unwrap_or_default();
-        (ctx, result, captured)
-    })
-}
-
-/// Waits up to `wait` for every task in `controls` to end, then aborts
-/// the ones still running, so no cancel or child read acts on a fork of
-/// the context once the exit work owns it. Aborted tasks are not joined:
-/// a child read that already started on a blocking thread cannot be
-/// stopped, and joining it would hold the exit past its bound.
-async fn settle_control_tasks(mut controls: JoinSet<()>, wait: Duration) {
-    let drained = async { while controls.join_next().await.is_some() {} };
-    if tokio::time::timeout(wait, drained).await.is_err() {
-        controls.abort_all();
-        controls.detach_all();
-    }
-}
-
 /// The footer's left half, read from the context only while the UI holds
 /// it; the task counts after it are read live when it is drawn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -432,87 +305,6 @@ struct TurnStatus {
     requested: bool,
 }
 
-/// The command word of a submitted line under the active prefix, in its
-/// dot form.
-fn command_word(line: &str, prefix: crate::config::CommandPrefix) -> Option<String> {
-    prefix
-        .normalize(line.trim())
-        .and_then(|command| command.split_whitespace().next().map(str::to_string))
-}
-
-/// Whether a submitted command line is `.undo` under the active prefix.
-fn is_undo(line: &str, prefix: crate::config::CommandPrefix) -> bool {
-    command_word(line, prefix).as_deref() == Some(".undo")
-}
-
-/// Commands whose reply rewrites the exchange they follow instead of
-/// opening one: `Session::add_message` appends to the last assistant
-/// message for `.continue` and replaces it for `.regenerate`, so the
-/// exchange `.undo` removes after either is the one before the command.
-/// Every other command whose request reached the model (`.file`, `.run`,
-/// `.starter`, `.prompt`, a macro, ...) recorded a fresh exchange the
-/// way a prompt does.
-const EXCHANGE_MODIFYING_COMMANDS: [&str; 2] = [".continue", ".regenerate"];
-
-/// Whether the cell opened an exchange `.undo` would take back: a user
-/// line or a command turn whose request reached the model, the command
-/// not in `EXCHANGE_MODIFYING_COMMANDS`. A request that failed or was
-/// interrupted before any reply still counts: the session keeps the user
-/// message with an interrupted-response marker. A turn that failed
-/// before the request (no API key, a usage bail on bare `.file`) or
-/// never asks the model (`.info`) recorded nothing, so it is looked past.
-fn opens_exchange(cell: &Cell, prefix: crate::config::CommandPrefix) -> bool {
-    match cell {
-        Cell::User { opened, .. } => *opened,
-        Cell::Command { name, opened, .. } => {
-            *opened
-                && command_word(name, prefix)
-                    .is_some_and(|word| !EXCHANGE_MODIFYING_COMMANDS.contains(&word.as_str()))
-        }
-        _ => false,
-    }
-}
-
-/// Index of the cell that opened the exchange a `.undo` at `undo` takes
-/// back: the latest opener before it, scanning back past any reply.
-fn undo_opener(cells: &[Cell], undo: usize, prefix: crate::config::CommandPrefix) -> Option<usize> {
-    cells[..undo]
-        .iter()
-        .rposition(|cell| opens_exchange(cell, prefix))
-}
-
-/// What stops the rewind picker at a command line, under the macros
-/// enabled when it ran: a macro (`.<name>` or `.macro <name>`, not the
-/// enable/disable toggles) stands for exchanges the transcript never
-/// counted; `.session`, `.agent <name>`, `.fork`, `.undo`, `.edit
-/// session` and the session and agent forms of `.exit`, `.empty` and
-/// `.compress` leave the context holding history the transcript never
-/// showed. A bare `.agent` only prints its usage, and `.macro <name>`
-/// for a name the list had not got, with the model never asked, created
-/// the macro in the editor rather than running one.
-fn rewind_barrier(
-    line: &str,
-    prefix: crate::config::CommandPrefix,
-    macros: &[(String, String)],
-    asked_model: bool,
-) -> Option<RewindBarrier> {
-    let line = prefix.normalize(line.trim())?;
-    let mut words = line.split_whitespace();
-    let known = |word: &str| macros.iter().any(|(name, _)| name == word);
-    match (words.next()?, words.next()) {
-        (".macro", Some(first)) => (!matches!(first, "enable" | "disable")
-            && (asked_model || known(first)))
-        .then_some(RewindBarrier::Macro),
-        (".session" | ".fork" | ".undo", _) | (".agent", Some(_)) => Some(RewindBarrier::Session),
-        (".exit", Some("session" | "agent"))
-        | (".empty" | ".compress" | ".edit", Some("session")) => Some(RewindBarrier::Session),
-        (word, _) => word
-            .strip_prefix('.')
-            .filter(|word| known(word))
-            .map(|_| RewindBarrier::Macro),
-    }
-}
-
 /// Something the loop, not the app, has to do.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
@@ -537,137 +329,6 @@ pub(crate) enum Command {
     Rewind(RewindTarget),
 }
 
-/// Work the roster or the pager asks of the control context. The loop
-/// runs it on a task of its own and the result comes back as a `UiMsg`:
-/// an agent's cancel waits seconds for the agent to stop, and a child's
-/// session file is parsed whole.
-#[derive(Debug, PartialEq, Eq)]
-enum ControlRequest {
-    Cancel {
-        id: String,
-        kind: TaskKind,
-        /// The child session root the UI holds, which a turn that spawned
-        /// its first child resolved after the control context was taken.
-        child_root: Option<Arc<ChildSessionRoot>>,
-    },
-    LoadChild {
-        session_id: String,
-        file: PathBuf,
-        generation: u64,
-    },
-}
-
-/// The fork of the control context a roster cancel runs on: it carries
-/// the child session root the UI holds, so cancelling a child the running
-/// turn spawned finishes that child's record under the right root.
-fn cancel_context(
-    control: &RequestContext,
-    child_root: Option<Arc<ChildSessionRoot>>,
-) -> RequestContext {
-    let mut ctx = control.fork_for_branch();
-    if child_root.is_some() {
-        ctx.child_session_root = child_root;
-    }
-    ctx
-}
-
-/// Runs `request` off the loop on a fork of the control context.
-fn spawn_control_request(
-    request: ControlRequest,
-    control: Arc<RequestContext>,
-    tx: UnboundedSender<UiMsg>,
-    tasks: &mut JoinSet<()>,
-) {
-    while tasks.try_join_next().is_some() {}
-    match request {
-        ControlRequest::Cancel {
-            id,
-            kind,
-            child_root,
-        } => {
-            let mut ctx = cancel_context(&control, child_root);
-            tasks.spawn(async move {
-                let args = serde_json::json!({ "id": id });
-                let result = catch_cancel(async {
-                    match kind {
-                        TaskKind::Job => {
-                            crate::function::jobs::handle_job_tool(&mut ctx, "job__cancel", &args)
-                                .await
-                        }
-                        TaskKind::Agent => {
-                            crate::function::agents::handle_agent_tool(
-                                &mut ctx,
-                                "agent__cancel",
-                                &args,
-                            )
-                            .await
-                        }
-                    }
-                })
-                .await;
-                // A closed inbox means the UI is gone; nobody is left to
-                // tell.
-                let _ = tx.send(UiMsg::TaskCancelled { id, result });
-            });
-        }
-        ControlRequest::LoadChild {
-            session_id,
-            file,
-            generation,
-        } => {
-            tasks.spawn_blocking(move || {
-                let result = catch_child_load(|| pager::load_child(&file, &control));
-                let _ = tx.send(UiMsg::ChildLoaded {
-                    session_id,
-                    generation,
-                    result,
-                });
-            });
-        }
-    }
-}
-
-/// Runs a child load, a panic inside it reported as the error the pager
-/// shows rather than lost with the task.
-fn catch_child_load(
-    load: impl FnOnce() -> Result<Vec<pager::ChildEntry>>,
-) -> Result<Vec<pager::ChildEntry>, String> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)) {
-        Ok(result) => result.map_err(|err| format!("{err:#}")),
-        Err(_) => Err("child load panicked".to_string()),
-    }
-}
-
-/// Runs a roster cancel, a panic inside it reported as the error the UI
-/// shows rather than lost with the task.
-async fn catch_cancel(cancel: impl Future<Output = Result<Value>>) -> Result<Value, String> {
-    use futures_util::FutureExt;
-    match std::panic::AssertUnwindSafe(cancel).catch_unwind().await {
-        Ok(result) => result.map_err(|err| format!("{err:#}")),
-        Err(payload) => {
-            let reason = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("no message");
-            Err(format!("cancel task panicked: {reason}"))
-        }
-    }
-}
-
-/// A session id that can name a file under the child session root and
-/// nowhere else: letters, digits, `_`, `.` and `-` only, never `..`, and
-/// one plain path component on every platform (so not `C:x` either).
-fn is_plain_session_id(session_id: &str) -> bool {
-    let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-');
-    let mut components = Path::new(session_id).components();
-    !session_id.is_empty()
-        && session_id.chars().all(allowed)
-        && !session_id.contains("..")
-        && matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none()
-}
-
 /// The kind of question an escalated `question` asks, from the `[kind] `
 /// an agent's user tool puts in front of it, and the question without it.
 fn escalation_kind(question: &str) -> (Option<PromptAction>, &str) {
@@ -686,33 +347,6 @@ fn escalation_kind(question: &str) -> (Option<PromptAction>, &str) {
             .map(|rest| (Some(action), rest))
     })
     .unwrap_or((None, question))
-}
-
-/// The notice a roster cancel ends with: the tool's message when it
-/// gave one, and a warning when it refused.
-fn cancel_report(id: &str, result: &Result<Value, String>) -> (NoticeKind, String) {
-    match result {
-        Ok(value) => {
-            let message = value.get("message").and_then(Value::as_str);
-            match value.get("status").and_then(Value::as_str) {
-                Some("ok" | "cancelled") => (
-                    NoticeKind::Interrupted,
-                    message.map_or_else(|| format!("Cancelled {id}"), str::to_string),
-                ),
-                _ => (
-                    NoticeKind::ToolWarning,
-                    format!(
-                        "Cancel of {id} refused: {}",
-                        message.unwrap_or("no reason given")
-                    ),
-                ),
-            }
-        }
-        Err(err) => (
-            NoticeKind::ToolWarning,
-            format!("Cancel of {id} failed: {err}"),
-        ),
-    }
 }
 
 fn new_textarea() -> TextArea<'static> {
@@ -986,141 +620,9 @@ impl App {
         self.schedule_frame();
     }
 
-    /// Records that a line left for the work task. A command gets its cell
-    /// now, so the transcript shows what is running under a modal the
-    /// command raises; the output fills in when the turn ends. The view
-    /// follows again so the line just sent is not out of sight, and a
-    /// focused row lets go: the line opens a new context.
-    pub(crate) fn begin_turn(&mut self, line: &str, command: bool) {
-        self.transcript.clear_welcome();
-        self.transcript.scroll_to_bottom();
-        self.transcript.clear_focus();
-        let first_cell = self.transcript.len();
-        self.transcript.push(if command {
-            Cell::command(line)
-        } else {
-            Cell::user(line)
-        });
-        self.turn = Some(TurnStatus {
-            started: self.clock.now(),
-            busy: None,
-            thinking_since: None,
-            tool: None,
-            first_cell,
-            requested: false,
-        });
-        self.schedule_frame();
-    }
-
-    /// Commits what the work task brought back.
-    pub(crate) fn end_turn(&mut self, command: bool, outcome: &TurnOutcome) {
-        let turn = self.turn.take();
-        self.close_stream();
-        if let Some(turn) = &turn {
-            self.fail_unreported_tools(turn.first_cell);
-        }
-        if command {
-            let turn = turn.expect("end_turn follows begin_turn");
-            let index = turn.first_cell;
-            let prefix = self.config.command_prefix;
-            let Some(Cell::Command {
-                name,
-                output,
-                opened,
-                rewind_barrier: barrier,
-                ..
-            }) = self.transcript.cell_mut(index)
-            else {
-                panic!("begin_turn pushed a Command cell for a command turn");
-            };
-            *output = outcome.captured.clone();
-            *opened = turn.requested;
-            // A command that failed before asking the model changed
-            // nothing the picker has to stop at; a macro that failed at a
-            // later step already recorded the exchanges before it.
-            *barrier = (outcome.error.is_none() || turn.requested)
-                .then(|| rewind_barrier(name, prefix, &self.macros, turn.requested))
-                .flatten();
-            // `.undo` took the last exchange out of the context; the
-            // transcript drops it too, back to the cell that opened it,
-            // and the command cell with it.
-            if outcome.error.is_none()
-                && is_undo(name, prefix)
-                && let Some(opener) = undo_opener(self.transcript.cells(), index, prefix)
-            {
-                self.transcript.truncate(opener);
-            }
-        } else {
-            if let Some(turn) = &turn
-                && let Some(Cell::User { opened, .. }) = self.transcript.cell_mut(turn.first_cell)
-            {
-                *opened = turn.requested;
-            }
-            if !outcome.captured.trim().is_empty() {
-                self.transcript.push(Cell::notice(
-                    NoticeKind::Routing,
-                    render::plain_text(&outcome.captured).trim_end().to_string(),
-                ));
-            }
-        }
-        if let Some(error) = &outcome.error {
-            // Errors arrive painted for the REPL like notices do.
-            self.transcript.push(Cell::Error {
-                text: render::plain_text(error),
-                cache: LineCache::default(),
-            });
-        }
-        self.schedule_frame();
-    }
-
-    pub(crate) fn begin_exit(&mut self) {
-        // Called again (a signal while the exit work already runs) it
-        // keeps the first call's start, or the exit's late output so far
-        // would fall before it.
-        if !self.exiting {
-            self.exiting = true;
-            self.transcript.clear_welcome();
-            self.exit_first_cell = self.transcript.len();
-            self.committed_end = self
-                .turn
-                .as_ref()
-                .map_or(self.exit_first_cell, |turn| turn.first_cell);
-            // The teardown owns the context now; nothing may act beside it.
-            self.control = None;
-            self.roster_sources = RosterSources::default();
-        }
-        self.schedule_frame();
-    }
-
     fn close_stream(&mut self) {
         if let Some(Cell::Assistant { done, .. }) = self.transcript.close_stream() {
             *done = true;
-        }
-    }
-
-    /// A tool row still running when its turn ends never got its
-    /// finish hook: the turn was interrupted or the task died under it.
-    /// Job and agent rows are left alone; their work goes on in the
-    /// background.
-    fn fail_unreported_tools(&mut self, first_cell: usize) {
-        let now = self.clock.now();
-        for index in first_cell..self.transcript.len() {
-            let running = matches!(
-                self.transcript.cells()[index],
-                Cell::Tool {
-                    status: ToolStatus::Running { .. },
-                    ..
-                }
-            );
-            if running
-                && let Some(Cell::Tool { status, .. }) = self.transcript.cell_mut(index)
-                && let ToolStatus::Running { since } = *status
-            {
-                *status = ToolStatus::Failed {
-                    elapsed: now.duration_since(since),
-                    error: "interrupted".to_string(),
-                };
-            }
         }
     }
 
@@ -1344,30 +846,6 @@ impl App {
                 NoticeKind::Interrupted,
                 format!("Dropped {dropped} queued line(s)"),
             );
-        }
-    }
-
-    /// A second idle Esc within the gap opens the rewind picker, when
-    /// the transcript holds an exchange to go back to.
-    fn idle_esc(&mut self) {
-        let now = self.clock.now();
-        let second = self
-            .last_esc
-            .is_some_and(|at| now.duration_since(at) <= REWIND_ESC_GAP);
-        self.last_esc = (!second).then_some(now);
-        if !second {
-            return;
-        }
-        let (rewind, barrier) =
-            RewindState::from_cells(self.transcript.cells(), self.config.command_prefix);
-        if let Some(barrier) = barrier {
-            self.push_notice(
-                NoticeKind::ToolWarning,
-                format!("Rewind stops at the last {}", barrier.kind_name()),
-            );
-        }
-        if let Some(rewind) = rewind {
-            self.view = View::Rewind(rewind);
         }
     }
 
@@ -1833,166 +1311,6 @@ impl App {
     fn open_pager(&mut self, pager: Pager) {
         self.help = None;
         self.pager = Some(pager);
-    }
-
-    fn take_control_requests(&mut self) -> Vec<ControlRequest> {
-        std::mem::take(&mut self.control_requests)
-    }
-
-    fn queue_control(&mut self, request: ControlRequest) {
-        if self.control.is_none() {
-            self.push_notice(
-                NoticeKind::ToolWarning,
-                "Tasks cannot be reached while the session is ending".to_string(),
-            );
-            return;
-        }
-        self.control_requests.push(request);
-    }
-
-    fn focused_task(&self) -> Option<TaskRow> {
-        match &self.view {
-            View::Roster(roster) => match roster.focused() {
-                Some(RosterRow::Task(task)) => Some(task.clone()),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    fn cancel_focused_task(&mut self) {
-        if let Some(task) = self.focused_task() {
-            self.queue_control(ControlRequest::Cancel {
-                id: task.id,
-                kind: task.kind,
-                child_root: self.child_root.clone(),
-            });
-        }
-    }
-
-    /// Shows the highlighted task in the pager: an agent's own session,
-    /// or the root thread from a job's row.
-    fn open_focused_task(&mut self) {
-        let Some(task) = self.focused_task() else {
-            return;
-        };
-        match task.kind {
-            TaskKind::Agent => match task.session_id {
-                Some(session_id) => self.open_child(session_id, task.name),
-                None => self.push_notice(
-                    NoticeKind::ToolWarning,
-                    format!("Agent {} keeps no session to show", task.id),
-                ),
-            },
-            TaskKind::Job => {
-                let row = self.transcript.cells().iter().rposition(
-                    |cell| matches!(cell, Cell::Job { job_id, .. } if *job_id == task.id),
-                );
-                match row {
-                    Some(index) => self.open_pager(Pager::root_at(index)),
-                    None => self.push_notice(
-                        NoticeKind::ToolWarning,
-                        format!("Job {} has no row in this transcript", task.id),
-                    ),
-                }
-            }
-        }
-    }
-
-    /// Opens a child's thread in the pager and asks for its first read.
-    fn open_child(&mut self, session_id: String, agent: String) {
-        if self.control.is_none() {
-            self.push_notice(
-                NoticeKind::ToolWarning,
-                "Transcripts cannot be read while the session is ending".to_string(),
-            );
-            return;
-        }
-        if !is_plain_session_id(&session_id) {
-            warn!("Refused to read a child session with the id {session_id:?}");
-            self.push_notice(
-                NoticeKind::ToolWarning,
-                format!(
-                    "Cannot read the session of {agent}: its id {} is not a plain name",
-                    render::plain_text(&session_id)
-                ),
-            );
-            return;
-        }
-        let Some(root) = self.child_root.as_ref() else {
-            self.push_notice(
-                NoticeKind::ToolWarning,
-                format!("The session of {agent} has not been written yet"),
-            );
-            return;
-        };
-        let file = root.child_session_file(&session_id);
-        if self.pager.as_ref().is_some_and(Pager::shows_root) {
-            cells::release_full_output_caches(self.transcript.cells_for_layout().0);
-        }
-        self.open_pager(Pager::child(session_id.clone(), agent, file.clone()));
-        self.read_open_child(session_id, file);
-    }
-
-    /// Asks for a read of the child on show. Nothing is read once the
-    /// exit has begun; the pager keeps what it has.
-    fn read_open_child(&mut self, session_id: String, file: PathBuf) {
-        let Some(pager) = self.pager.as_mut() else {
-            return;
-        };
-        if self.control.is_none() {
-            return;
-        }
-        self.child_reads += 1;
-        pager.child_load_started(self.child_reads);
-        self.control_requests.push(ControlRequest::LoadChild {
-            session_id,
-            file,
-            generation: self.child_reads,
-        });
-    }
-
-    fn open_thread_picker(&mut self) {
-        let mut rows = vec![ThreadRow::root()];
-        let none_yet = || Some("No child sessions yet".to_string());
-        let note = match self.child_root.as_deref() {
-            None => none_yet(),
-            Some(root) => match root.list_children() {
-                Ok(children) if children.is_empty() => none_yet(),
-                Ok(children) => {
-                    let running: Vec<ProcessStamp> = children
-                        .iter()
-                        .filter(|meta| meta.status == ChildStatus::Running)
-                        .map(ChildMeta::stamp)
-                        .collect();
-                    let alive = ProcessStamp::alive_set(&running);
-                    rows.extend(children.iter().map(|meta| {
-                        ThreadRow::child(
-                            meta,
-                            meta.effective_status_with(|stamp| alive.contains(stamp)),
-                        )
-                    }));
-                    None
-                }
-                Err(err) => {
-                    warn!("Failed to list the child sessions: {err:#}");
-                    Some(format!("Cannot list the child sessions: {err:#}"))
-                }
-            },
-        };
-        if let Some(pager) = self.pager.as_mut() {
-            pager.open_picker(rows, note);
-        }
-    }
-
-    fn choose_thread(&mut self) {
-        let Some(row) = self.pager.as_mut().and_then(Pager::take_picked) else {
-            return;
-        };
-        match row.session_id {
-            Some(session_id) => self.open_child(session_id, row.agent),
-            None => self.open_pager(Pager::root()),
-        }
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
@@ -2507,37 +1825,6 @@ impl App {
                 _ => false,
             })?;
         self.transcript.cell_mut(index)?.output_for("")
-    }
-
-    /// What the running turn printed past its capture, already taken in
-    /// as notices. Nothing draws the app once the turn's task is lost,
-    /// so a panic message that came this way is handed back to be printed
-    /// on the restored terminal.
-    fn turn_late_output(&self) -> Vec<String> {
-        let Some(turn) = &self.turn else {
-            return Vec::new();
-        };
-        self.late_output_since(turn.first_cell)
-    }
-
-    /// The exit work's late output: every routing notice since `begin_exit`.
-    fn exit_late_output(&self) -> Vec<String> {
-        self.late_output_since(self.exit_first_cell)
-    }
-
-    fn late_output_since(&self, first_cell: usize) -> Vec<String> {
-        let cells = self.transcript.cells();
-        cells[first_cell.min(cells.len())..]
-            .iter()
-            .filter_map(|cell| match cell {
-                Cell::Notice {
-                    kind: NoticeKind::Routing,
-                    text,
-                    ..
-                } => Some(text.clone()),
-                _ => None,
-            })
-            .collect()
     }
 
     /// The cells of the turns that ended: none of the exit's own, nor of
@@ -3325,53 +2612,6 @@ fn quit_abort(abort: &AbortSignal, turn_running: bool) {
 fn purge_turn_queue(task: &Option<Task>) {
     if let Some(Task::Turn { queue, .. }) = task {
         take_user_messages(queue);
-    }
-}
-
-/// Takes the `pops` newest exchanges out of the session, stopping at
-/// the first that cannot be undone: how many came out, and what stopped
-/// it short.
-fn rewind_exchanges(ctx: &mut RequestContext, pops: usize) -> (usize, Option<anyhow::Error>) {
-    for popped in 0..pops {
-        if let Err(err) = ctx.undo_last_exchange() {
-            return (popped, Some(err));
-        }
-    }
-    (pops, None)
-}
-
-/// Takes the chosen exchanges out of the session and the transcript and
-/// gives the oldest one's prompt back to the composer. Every offered row
-/// sits above the newest macro turn, so each one is a single exchange
-/// and popping one per row keeps the session and the transcript in
-/// step; the transcript goes back only as far as the session did, and a
-/// stop short of the choice is said. Without a session there is nothing
-/// to pop and the transcript is the whole of the rewind. The composer
-/// gets the row's own text, not the session's prefill: a command row
-/// holds the command, which the session never did.
-fn apply_rewind(app: &mut App, ctx: &mut RequestContext, target: RewindTarget) {
-    let chosen = target.rows.len();
-    let (cut, stopped) = if ctx.session.is_some() {
-        rewind_exchanges(ctx, chosen)
-    } else {
-        (chosen, None)
-    };
-    app.sync_from_ctx(ctx);
-    if let Some(row) = cut
-        .checked_sub(1)
-        .and_then(|oldest| target.rows.get(oldest))
-    {
-        app.transcript.truncate(row.opener);
-        app.set_composer_text(&row.title);
-    }
-    app.refresh_palette(Some(ctx));
-    // The notice is a transcript cell, so it goes in after the cut or
-    // the cut would take it with the exchanges.
-    if let Some(err) = stopped {
-        app.handle_msg(UiMsg::Notice {
-            kind: NoticeKind::ToolWarning,
-            text: format!("Rewind stopped: {err}"),
-        });
     }
 }
 
