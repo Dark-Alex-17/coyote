@@ -13496,11 +13496,11 @@ mod tests {
     fn exit_session_clears_prompt_memory() {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
-        ctx.prompt_memory.remember("fake_tool", "again? mem-9c");
         let req = PromptRequest {
             tool: Some("fake_tool".to_string()),
             ..ctx.prompt_request(PromptAction::Confirm, "again? mem-9c", Vec::new(), None)
         };
+        ctx.prompt_memory.remember(&req);
         assert_eq!(ctx.prompt_memory.auto_answer(&req), Some(true));
 
         ctx.exit_session().unwrap();
@@ -13511,11 +13511,11 @@ mod tests {
     #[test]
     fn exit_session_without_a_session_keeps_prompt_memory() {
         let mut ctx = create_test_ctx();
-        ctx.prompt_memory.remember("fake_tool", "again? mem-2v");
         let req = PromptRequest {
             tool: Some("fake_tool".to_string()),
             ..ctx.prompt_request(PromptAction::Confirm, "again? mem-2v", Vec::new(), None)
         };
+        ctx.prompt_memory.remember(&req);
 
         ctx.exit_session().unwrap();
 
@@ -13526,11 +13526,11 @@ mod tests {
         let mut ctx = create_test_ctx();
         configure(&mut ctx);
         ctx.session = Some(Session::default());
-        ctx.prompt_memory.remember("fake_tool", "again? mem-own-5p");
         let req = PromptRequest {
             tool: Some("fake_tool".to_string()),
             ..ctx.prompt_request(PromptAction::Confirm, "again? mem-own-5p", Vec::new(), None)
         };
+        ctx.prompt_memory.remember(&req);
 
         ctx.exit_session().unwrap();
 
@@ -13581,7 +13581,7 @@ mod tests {
         let mut ctx = create_test_ctx();
         ctx.session = Some(Session::default());
         ctx.prompter = Arc::new(ScriptedPrompter::refusing());
-        ctx.prompt_memory.remember("fake_tool", "run it? ysf-3m1");
+        ctx.prompt_memory.remember(&remembered_request(&ctx));
 
         let answer = ctx.prompt(remembered_request(&ctx)).unwrap();
         assert_eq!(answer, PromptAnswer::Confirmed(true));

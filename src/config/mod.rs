@@ -86,6 +86,7 @@ pub use self::tool_scope::{
     McpPromptCompletion, McpRuntime, flatten_prompt_messages, resolve_prompt_args,
     sanitize_display_text,
 };
+pub(crate) use self::tool_scope::{escape_display_text, is_format_char};
 pub(crate) use self::ui_kind::UiKind;
 pub use self::ui_mode::UiMode;
 pub use self::update::run_self_update;

@@ -63,7 +63,7 @@
 # "Yes for this session" is remembered against the exact question, so a
 # guard names what it guards: guard_operation sends the question, a newline
 # and the operation when one is given, and guard_path appends a newline and
-# the resolved path unless the question already contains the path as given.
+# the resolved path unless the question already contains that resolved path.
 
 # Without a usable TERM (unset in CI, `dumb` under the full-screen UI) tput
 # fails or complains on stderr; the colours stay empty instead.
@@ -1009,11 +1009,13 @@ guard_path() {
 
 	path="$(_to_real_path "$1")"
 	confirmation_prompt="$2"
-	if [[ "$confirmation_prompt" != *"$1"* ]]; then
+	if [[ "$confirmation_prompt" != *"$path"* ]]; then
 		confirmation_prompt="$confirmation_prompt"$'\n'"$path"
 	fi
 
-	if [[ ! "$path" == "$(pwd)"* && -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
+	declare cwd
+	cwd="$(pwd)"
+	if [[ "$path" != "$cwd" && "$path" != "${cwd%/}"/* && -z "${AUTO_CONFIRM:-}" && -z "${LLM_AGENT_VAR_AUTO_CONFIRM:-}" ]]; then
 		if _coyote_prompt_enabled; then
 			ans="$(confirm "$confirmation_prompt")" || ans=""
 		else
@@ -1068,7 +1070,7 @@ _to_real_path() {
 
       for (i = 1; i <= newPartsLength; i++) {
         newPart = newParts[i]
-        printf newPart
+        printf "%s", newPart
         if (i < newPartsLength) {
           printf "/"
         }

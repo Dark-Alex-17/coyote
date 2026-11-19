@@ -81,6 +81,11 @@ pub struct PromptRequest {
     /// while typed. Its default is withheld from the published request
     /// too.
     pub sensitive: bool,
+    /// The question exactly as a tool sent it, before it was escaped for
+    /// display; `None` for Coyote's own prompts. "Yes for this session"
+    /// matches on it, so two lines that display alike are still told
+    /// apart. Not published.
+    pub raw_question: Option<String>,
 }
 
 impl PromptRequest {
@@ -99,6 +104,7 @@ impl PromptRequest {
             help: None,
             closed: false,
             sensitive: false,
+            raw_question: None,
         }
     }
 
@@ -258,23 +264,30 @@ pub trait Prompter: Send + Sync + fmt::Debug {
 }
 
 /// Confirms a tool already waved through with "Yes for this session", keyed
-/// by tool and question. Shared by the context that consults it and the
-/// prompter that records into it; cleared when the session exits.
+/// by tool and the question as the tool sent it. Shared by the context that
+/// consults it and the prompter that records into it; cleared when the
+/// session exits.
 #[derive(Debug, Default)]
 pub struct PromptMemory {
     remembered: Mutex<HashMap<String, bool>>,
 }
 
 impl PromptMemory {
-    fn key(tool: &str, question: &str) -> String {
-        format!("{tool}\u{1f}{question}")
+    fn key(req: &PromptRequest) -> Option<String> {
+        let tool = req.tool.as_deref()?;
+        let question = req.raw_question.as_deref().unwrap_or(&req.question);
+        Some(format!("{tool}\u{1f}{question}"))
     }
 
-    pub fn remember(&self, tool: &str, question: &str) {
+    /// Records a yes for `req`; a request with no tool is not remembered.
+    pub fn remember(&self, req: &PromptRequest) {
+        let Some(key) = Self::key(req) else {
+            return;
+        };
         self.remembered
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(Self::key(tool, question), true);
+            .insert(key, true);
     }
 
     /// The remembered answer for a tool confirm; `None` for any other prompt
@@ -283,11 +296,11 @@ impl PromptMemory {
         if req.action != PromptAction::Confirm {
             return None;
         }
-        let tool = req.tool.as_deref()?;
+        let key = Self::key(req)?;
         self.remembered
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&Self::key(tool, &req.question))
+            .get(&key)
             .copied()
     }
 
@@ -302,6 +315,18 @@ impl PromptMemory {
 pub fn new_prompt_id() -> String {
     let short = &Uuid::new_v4().to_string()[..8];
     format!("prompt_{short}")
+}
+
+/// `text` without the whitespace-only lines it starts with.
+pub(crate) fn trim_leading_blank_lines(text: &str) -> &str {
+    let mut rest = text;
+    while let Some((line, tail)) = rest.split_once('\n') {
+        if !line.trim().is_empty() {
+            break;
+        }
+        rest = tail;
+    }
+    rest
 }
 
 /// Asks through `prompter` and publishes the prompt as requested and as
@@ -531,10 +556,11 @@ impl InquirePrompter {
     }
 
     /// The question as the widget shows it: a tool's carries the tool's
-    /// name, so its prompt cannot pass for one of Coyote's own.
+    /// name, so its prompt cannot pass for one of Coyote's own. Leading
+    /// blank lines are dropped so the label sits next to the text.
     fn prompt_text(req: &PromptRequest) -> String {
         match req.tool.as_deref() {
-            Some(tool) => format!("{tool} asks: {}", req.question),
+            Some(tool) => format!("{tool} asks: {}", trim_leading_blank_lines(&req.question)),
             None => req.question.clone(),
         }
     }
@@ -599,7 +625,7 @@ impl InquirePrompter {
     }
 
     fn confirm(&self, req: &PromptRequest) -> Result<PromptAnswer, InquireError> {
-        let Some(tool) = req.tool.as_deref() else {
+        if req.tool.is_none() {
             let default = req
                 .default
                 .as_ref()
@@ -607,14 +633,14 @@ impl InquirePrompter {
                 .unwrap_or(true);
             let answer = Confirm::new(&req.question).with_default(default).prompt()?;
             return Ok(PromptAnswer::Confirmed(answer));
-        };
+        }
         let question = Self::prompt_text(req);
         let choice = Select::new(&question, TOOL_CONFIRM_ROWS.to_vec())
             .without_filtering()
             .with_starting_cursor(Self::tool_confirm_starting_row(req))
             .prompt()?;
         if choice == YES_FOR_SESSION {
-            self.memory.remember(tool, &req.question);
+            self.memory.remember(req);
         }
         Ok(PromptAnswer::Confirmed(choice != "No"))
     }
@@ -900,6 +926,22 @@ mod tests {
         assert_eq!(
             InquirePrompter::prompt_text(&request(PromptAction::Confirm, None)),
             "proceed? pm-4t8"
+        );
+    }
+
+    #[test]
+    fn a_tools_prompt_drops_leading_blank_lines_and_keeps_the_others() {
+        let req = PromptRequest {
+            tool: Some("fs_rm".to_string()),
+            ..PromptRequest::new(
+                PromptAction::Confirm,
+                "\n  \nDelete?\n\n/tmp/q4b",
+                Origin::detached(),
+            )
+        };
+        assert_eq!(
+            InquirePrompter::prompt_text(&req),
+            "fs_rm asks: Delete?\n\n/tmp/q4b"
         );
     }
 
@@ -1191,7 +1233,7 @@ mod tests {
         let req = request(PromptAction::Confirm, Some("fake_tool"));
         assert_eq!(memory.auto_answer(&req), None);
 
-        memory.remember("fake_tool", "proceed? pm-4t8");
+        memory.remember(&req);
         assert_eq!(memory.auto_answer(&req), Some(true));
         assert_eq!(
             memory.auto_answer(&request(PromptAction::Confirm, None)),
@@ -1208,6 +1250,37 @@ mod tests {
 
         memory.clear();
         assert_eq!(memory.auto_answer(&req), None);
+    }
+
+    /// Two tool lines that display alike are told apart by what the tool
+    /// sent; a request with no raw text is keyed on its question.
+    #[test]
+    fn memory_keys_a_tool_confirm_on_the_raw_question() {
+        let memory = PromptMemory::default();
+        let shown = PromptRequest {
+            raw_question: Some("Run? \u{1b}[8mrm -rf ~".to_string()),
+            ..request(PromptAction::Confirm, Some("fake_tool"))
+        };
+        memory.remember(&shown);
+        assert_eq!(memory.auto_answer(&shown), Some(true));
+
+        let same_display = PromptRequest {
+            raw_question: Some("Run? \u{1b}[8mls".to_string()),
+            ..shown.clone()
+        };
+        assert_eq!(memory.auto_answer(&same_display), None);
+        assert_eq!(
+            memory.auto_answer(&request(PromptAction::Confirm, Some("fake_tool"))),
+            None
+        );
+
+        let own = request(PromptAction::Confirm, Some("other_tool"));
+        memory.remember(&own);
+        let raw_equal = PromptRequest {
+            raw_question: Some(own.question.clone()),
+            ..own.clone()
+        };
+        assert_eq!(memory.auto_answer(&raw_equal), Some(true));
     }
 
     #[test]

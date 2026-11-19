@@ -2053,10 +2053,8 @@ impl App {
                 None
             }
             Action::AnswerYesForSession => {
-                if let Some(prompt) = self.prompts.front()
-                    && let Some(tool) = prompt.req.tool.as_deref()
-                {
-                    self.prompt_memory.remember(tool, &prompt.req.question);
+                if let Some(prompt) = self.prompts.front() {
+                    self.prompt_memory.remember(&prompt.req);
                 }
                 self.answer_front(PromptAnswer::Confirmed(true));
                 None
@@ -5707,6 +5705,56 @@ mod tests {
         assert_eq!(harness.app.prompt_memory.auto_answer(&req), Some(true));
     }
 
+    /// A tool confirm as the prompt channel builds it from a protocol line.
+    fn tool_line_confirm(tool: &str, question: &str) -> PromptRequest {
+        let line = serde_json::json!({"coyote_prompt": {
+            "id": "p-ysr", "action": "confirm", "question": question
+        }})
+        .to_string();
+        crate::function::prompt_channel::parse_request(
+            line.as_bytes(),
+            tool,
+            None,
+            None,
+            Origin::detached(),
+        )
+        .unwrap()
+        .req
+    }
+
+    /// "Yes for this session" is kept for the bytes the tool sent: a line
+    /// that only displays like the approved one, because its escape is
+    /// spelled out as text, is asked again.
+    #[test]
+    fn yes_for_this_session_is_remembered_for_the_raw_question() {
+        let mut harness = Harness::standalone(80, 24);
+        let req = tool_line_confirm(
+            "execute_command",
+            "Run this command?\necho hi\u{1b}]0;x\u{7}",
+        );
+        let asker = ask_on_a_thread(&mut harness, req.clone());
+        let rendered = harness.draw();
+        assert!(rendered.contains("echo hi\\x1b]0;x\\x07"), "{rendered}");
+        harness.clock.advance(HOTKEY_IDLE);
+        assert_eq!(harness.press(KeyCode::Char('a')), None);
+        assert_eq!(
+            asker.join().unwrap().unwrap(),
+            PromptAnswer::Confirmed(true)
+        );
+
+        let lookalike = tool_line_confirm(
+            "execute_command",
+            "Run this command?\necho hi\\x1b]0;x\\x07",
+        );
+        assert_eq!(lookalike.question, req.question);
+        assert_eq!(harness.app.prompt_memory.auto_answer(&lookalike), None);
+        let again = tool_line_confirm(
+            "execute_command",
+            "Run this command?\necho hi\u{1b}]0;x\u{7}",
+        );
+        assert_eq!(harness.app.prompt_memory.auto_answer(&again), Some(true));
+    }
+
     /// Enter on the field settles from the modal's appearance: the
     /// answer is typed, so typing must not push the send out. Enter a
     /// millisecond short of the second is dropped, more typing right
@@ -7097,20 +7145,22 @@ mod tests {
     }
 
     /// A tool-authored question carrying bidi overrides and zero-width
-    /// characters is drawn without them, so what the user reads is what
-    /// is approved.
+    /// characters reaches the modal with each one spelled out, so none of
+    /// them can reorder or hide what the user approves.
     #[test]
-    fn a_question_with_format_characters_is_drawn_without_them() {
-        let mut harness = Harness::standalone(60, 20);
+    fn a_question_with_format_characters_shows_them_spelled_out() {
+        let mut harness = Harness::standalone(100, 20);
         harness.app.begin_turn("remove it", false);
-        let question = "Delete \u{202E}txt.safe\u{202C} \u{200B}k7m\u{200F}\u{FEFF}?";
-        let req = PromptRequest {
-            tool: Some("fs_rm".to_string()),
-            ..PromptRequest::new(PromptAction::Confirm, question, Origin::detached())
-        };
+        let req = tool_line_confirm(
+            "fs_rm",
+            "Delete \u{202E}txt.safe\u{202C} \u{200B}k7m\u{200F}\u{FEFF}?",
+        );
         let asker = ask_on_a_thread(&mut harness, req);
         let rendered = harness.draw();
-        assert!(rendered.contains("Delete txt.safe k7m?"), "{rendered}");
+        assert!(
+            rendered.contains("Delete \\u{202e}txt.safe\\u{202c} \\u{200b}k7m\\u{200f}\\u{feff}?"),
+            "{rendered}"
+        );
         for hidden in ['\u{202E}', '\u{202C}', '\u{200B}', '\u{200F}', '\u{FEFF}'] {
             assert!(
                 !rendered.contains(hidden),

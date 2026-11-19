@@ -1300,7 +1300,10 @@ fn tool_prompts_are_documented_with_their_label() {
     let asks = literal_with(production(&tui_source), " asks:").replace("{}", "<tool>");
     assert_eq!(asks, "<tool> asks:");
     let prompt_source = src(&["prompt", "mod.rs"]);
-    assert!(production(&prompt_source).contains("format!(\"{tool} asks: {}\", req.question)"));
+    assert!(
+        production(&prompt_source)
+            .contains("format!(\"{tool} asks: {}\", trim_leading_blank_lines(&req.question))")
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let custom = flat(&section(
@@ -1313,6 +1316,10 @@ fn tool_prompts_are_documented_with_their_label() {
         "with the name taken from the tool it ran".to_string(),
         "never from the request line".to_string(),
         "any tool may ask any kind of question, `password` included".to_string(),
+        "a newline is a line break".to_string(),
+        "every other control or escape character is written out as a visible escape such as `\\x1b`"
+            .to_string(),
+        "\"Yes for this session\" is kept for the exact question the tool sent".to_string(),
     ] {
         assert!(custom.contains(&needle), "Custom-Tools.md says {needle}");
     }
@@ -1376,6 +1383,7 @@ fn session_yes_is_documented_as_covering_one_operation_or_path() {
     let path = flat(&section("Bash-Prompt-Helpers.md", &bash, "## guard_path"));
     for needle in [
         "Usage: `guard_path <path> <question>`",
+        "The resolved path is added on the line after the question unless the question already names it",
         "\"Yes for this session\" covers only that exact path; a different path asks again",
     ] {
         assert!(
@@ -1390,7 +1398,9 @@ fn session_yes_is_documented_as_covering_one_operation_or_path() {
     ));
     for needle in [
         "`guard_operation(question, operation)` (`guardOperation(question, operation)` in TypeScript) takes an optional operation",
+        "unless the question already names that resolved path",
         "so the answer covers only that exact path. Anything different asks again.",
+        "An empty question is the default one",
     ] {
         assert!(custom.contains(needle), "Custom-Tools.md says {needle}");
     }

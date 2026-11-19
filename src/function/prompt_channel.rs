@@ -5,7 +5,7 @@
 //! opens by path on Windows. Lines that are not requests flow through as
 //! ordinary output.
 
-use crate::config::sanitize_display_text;
+use crate::config::escape_display_text;
 use crate::events::{self, Origin};
 use crate::prompt::{PromptAction, PromptAnswer, PromptMemory, PromptRequest, Prompter};
 use anyhow::{Result, anyhow};
@@ -1387,10 +1387,10 @@ pub(crate) fn parse_request(
         req: PromptRequest {
             id: wire.id,
             action,
-            question: sanitize_display_text(&wire.question),
+            question: escape_display_text(&wire.question),
             options: raw_options
                 .iter()
-                .map(|option| sanitize_display_text(option))
+                .map(|option| escape_display_text(option))
                 .collect(),
             default: wire.default,
             tool: Some(tool.to_string()),
@@ -1402,6 +1402,7 @@ pub(crate) fn parse_request(
             // custom row's typed text goes back to the tool verbatim.
             closed: false,
             sensitive: false,
+            raw_question: Some(wire.question),
         },
         raw_options,
     })
@@ -1981,7 +1982,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     }
 
     #[test]
-    fn parse_request_strips_terminal_escapes_from_tool_text() {
+    fn parse_request_shows_terminal_escapes_in_tool_text_visibly() {
         let line = json!({"coyote_prompt": {
             "id": "p1", "action": "select", "question": "\u{1b}[2Jwhich?",
             "options": ["\u{1b}[31ma", "b"]
@@ -1990,8 +1991,9 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
 
         let parsed = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
 
-        assert_eq!(parsed.req.question, "which?");
-        assert_eq!(parsed.req.options, vec!["a", "b"]);
+        assert_eq!(parsed.req.question, "\\x1b[2Jwhich?");
+        assert_eq!(parsed.req.raw_question.as_deref(), Some("\u{1b}[2Jwhich?"));
+        assert_eq!(parsed.req.options, vec!["\\x1b[31ma", "b"]);
         assert_eq!(parsed.raw_options, vec!["\u{1b}[31ma", "b"]);
     }
 
@@ -2142,10 +2144,11 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         }})
         .to_string();
         let parsed = parse_request(line.as_bytes(), "t", None, None, Origin::detached()).unwrap();
-        assert_eq!(parsed.req.options, vec!["red", "b"]);
+        let shown = "\\x1b[31mred\\x1b[0m";
+        assert_eq!(parsed.req.options, vec![shown, "b"]);
 
         let reply = reply_for_parsed(
-            ScriptedPrompter::new(vec![PromptAnswer::Selected("red".to_string())]),
+            ScriptedPrompter::new(vec![PromptAnswer::Selected(shown.to_string())]),
             parsed,
         );
 
@@ -2454,7 +2457,10 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             r#"ans="$(confirm "Delete? mem-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         );
         let memory = Arc::new(PromptMemory::default());
-        memory.remember("ask-x7x", "Delete? mem-x7x");
+        memory.remember(&PromptRequest {
+            tool: Some("ask-x7x".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, "Delete? mem-x7x", Origin::detached())
+        });
         let prompter = Arc::new(ScriptedPrompter::refusing());
         let sink = RecordingSink::install();
 
@@ -2513,7 +2519,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         assert_eq!(asked.len(), 1, "{tool}: {asked:?}");
         let question = asked[0].question.clone();
         assert!(question.contains(&leaf(first)), "{tool}: {question:?}");
-        memory.remember(tool, &question);
+        memory.remember(&asked[0]);
 
         let sink = RecordingSink::install();
         let output = run(first, io_with(&prompter, Arc::clone(&memory)));
@@ -2581,6 +2587,50 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             &outside.join("one-x7x.txt").to_string_lossy(),
             &outside.join("two-x7x.txt").to_string_lossy(),
         );
+    }
+
+    /// A remembered command covers its exact bytes: one that differs only
+    /// by an escape sequence or by a newline for a space asks again, and
+    /// the escape is spelled out where the user can see it.
+    #[test]
+    #[serial]
+    fn session_yes_tells_apart_commands_that_differ_by_control_bytes() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-session-yes-raw");
+        install_tool(
+            "op-x7x",
+            "unset AUTO_CONFIRM LLM_AGENT_VAR_AUTO_CONFIRM\nguard_operation \"Run?\" \"$GUARD_X7X\"\necho ok >> \"$LLM_OUTPUT\"",
+        );
+        let run = |command: &str, io: ToolIo| {
+            let mut envs = tool_envs();
+            envs.insert("GUARD_X7X".to_string(), command.to_string());
+            run_tool("op-x7x", envs, io)
+        };
+        let memory = Arc::new(PromptMemory::default());
+        let prompter = Arc::new(ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Confirmed(true),
+        ]));
+
+        run("echo one", io_with(&prompter, Arc::clone(&memory)));
+        memory.remember(&prompter.requests()[0]);
+        run("echo one", io_with(&prompter, Arc::clone(&memory)));
+        assert_eq!(
+            prompter.requests().len(),
+            1,
+            "the approved command asked again"
+        );
+
+        run(
+            "echo one\u{1b}]0;x\u{7}",
+            io_with(&prompter, Arc::clone(&memory)),
+        );
+        run("echo\none", io_with(&prompter, memory));
+        let asked = prompter.requests();
+        assert_eq!(asked.len(), 3, "{asked:?}");
+        assert_eq!(asked[1].question, "Run?\necho one\\x1b]0;x\\x07");
+        assert_eq!(asked[2].question, "Run?\necho\none");
     }
 
     /// A tool that drew a progress line without a newline and then prompts
@@ -2771,7 +2821,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
         // Yes-for-session lives on the context; remembering it there alone
         // must be enough for the next call to go through unasked.
-        ctx.prompt_memory.remember("evalask-x7x", "Go? eval-x7x");
+        ctx.prompt_memory.remember(&requests[0]);
         let second = ToolCall::new(
             "evalask-x7x".to_string(),
             json!({}),
@@ -3463,21 +3513,24 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let outside = std::env::temp_dir().join("coyote-prompt-utils-named.txt");
             let outside = outside.to_string_lossy().into_owned();
             let body = format!(
-                "guard_operation \"Run?\" \"rm -rf build\"; \
+                "echo \"$PWD\"; \
+                 guard_operation \"Run?\" \"rm -rf build\"; \
                  guard_operation \"\" \"ls\"; \
                  guard_operation \"Run?\"; \
                  guard_path \"{outside}\" \"Remove '{outside}'?\"; \
-                 guard_path \"{outside}\" \"Touch?\"; echo done"
+                 guard_path \"{outside}\" \"Touch?\"; \
+                 guard_path \"$PWD/../files.txt\" \"Remove $PWD/../files.txt?\"; \
+                 guard_path \"$PWD-other/f\" \"Touch?\"; echo done"
             );
-            let yes = [
-                json!(true),
-                json!(true),
-                json!(true),
-                json!(true),
-                json!(true),
-            ];
+            let yes = vec![json!(true); 7];
             let run = run_helper(&dir, Some(&yes), &body, false);
             assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+            let other = run.other_lines();
+            let [cwd, done] = other.as_slice() else {
+                panic!("{other:?}");
+            };
+            assert_eq!(*done, "done");
+            let parent = Path::new(cwd).parent().unwrap().display().to_string();
             let questions: Vec<Value> = run
                 .request_lines()
                 .iter()
@@ -3491,9 +3544,10 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                     json!("Run?"),
                     json!(format!("Remove '{outside}'?")),
                     json!(format!("Touch?\n{outside}")),
+                    json!(format!("Remove {cwd}/../files.txt?\n{parent}/files.txt")),
+                    json!(format!("Touch?\n{cwd}-other/f")),
                 ]
             );
-            assert_eq!(run.other_lines(), vec!["done"]);
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -3787,6 +3841,17 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 &second,
             );
             assert_eq!(fs::read_to_string(&second).unwrap(), "new\n");
+
+            // A `%` in a name is shown as it is, so two such names differ.
+            check_session_yes_covers_one_operation(
+                "fs_write",
+                |path, io| {
+                    fs::write(path, "old\n").unwrap();
+                    run_shipped("fs_write", json!({"path": path, "content": "new\n"}), io)
+                },
+                &dir.join("100%s.txt").to_string_lossy(),
+                &dir.join("100%d.txt").to_string_lossy(),
+            );
             fs::remove_dir_all(&dir).ok();
         }
 
@@ -5144,12 +5209,12 @@ echo "$ans" >> "$LLM_OUTPUT""#,
         /// The bash guards' contract: the auto-confirm variables short-circuit
         /// before any request is sent, anything but an exact `true` aborts
         /// with exit 1 and `Operation aborted!` on stderr, and `guard_path`
-        /// stays silent for paths inside the working directory. The
-        /// containment check here is tighter than bash's string-prefix match:
-        /// it compares path components, so a sibling sharing the prefix still
-        /// asks, and it looks at where a path really lands, so a new file
-        /// under a symlink that points outside asks too. Like bash, a guard's
-        /// question names the operation or the resolved path it guards.
+        /// stays silent for paths inside the working directory. Like bash's,
+        /// the containment check compares path components, so a sibling
+        /// sharing the prefix still asks; unlike bash's it looks at where a
+        /// path really lands, so a new file under a symlink that points
+        /// outside asks too. Like bash, a guard's question names the
+        /// operation or the resolved path it guards.
         fn check_guards(eval: GuardEval<'_>, continued: &str, cwd: &Path) {
             fs::create_dir_all(cwd.join("sub")).unwrap();
             let sibling = PathBuf::from(format!("{}-sibling", cwd.display()));
@@ -5157,6 +5222,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             let _sibling_guard = RemoveOnDrop(sibling.clone());
             std::os::unix::fs::symlink(&sibling, cwd.join("link")).unwrap();
             std::os::unix::fs::symlink(sibling.join("missing.txt"), cwd.join("dangling")).unwrap();
+            std::os::unix::fs::symlink(&sibling, cwd.join("files")).unwrap();
             let op = "guard_operation(\"Really?\")";
 
             let run = eval(op, Some(&[json!(true)]), &[], cwd);
@@ -5202,20 +5268,54 @@ echo "$ans" >> "$LLM_OUTPUT""#,
             assert_eq!(run.code, 0, "{}", run.stderr);
             assert_eq!(run.wire[0]["question"], "Run?\nrm -rf build");
 
+            let run = eval(
+                "guard_operation(\"\", \"ls\")",
+                Some(&[json!(true)]),
+                &[],
+                cwd,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(
+                run.wire[0]["question"],
+                "Are you sure you want to continue?\nls"
+            );
+
             let resolved = fs::canonicalize(cwd)
                 .unwrap()
                 .parent()
                 .unwrap()
                 .join("outside.txt");
+            let named = format!("Touch {}?", resolved.display());
             for (question, sent) in [
                 ("Touch?", format!("Touch?\n{}", resolved.display())),
-                ("Touch ../outside.txt?", "Touch ../outside.txt?".to_string()),
+                (
+                    "Touch ../outside.txt?",
+                    format!("Touch ../outside.txt?\n{}", resolved.display()),
+                ),
+                (named.as_str(), named.clone()),
             ] {
                 let expr = format!("guard_path(\"../outside.txt\", \"{question}\")");
                 let run = eval(&expr, Some(&[json!(true)]), &[], cwd);
                 assert_eq!(run.code, 0, "{question}: {}", run.stderr);
                 assert_eq!(run.wire[0]["question"], sent.as_str(), "{question}");
             }
+
+            // `files` is a link out of the working directory, and the
+            // wording happens to contain the argument as given.
+            let run = eval(
+                "guard_path(\"files\", \"Delete files?\")",
+                Some(&[json!(true)]),
+                &[],
+                cwd,
+            );
+            assert_eq!(run.code, 0, "{}", run.stderr);
+            assert_eq!(
+                run.wire[0]["question"],
+                format!(
+                    "Delete files?\n{}",
+                    fs::canonicalize(&sibling).unwrap().display()
+                )
+            );
 
             let inside = [
                 "sub/file.txt".to_string(),

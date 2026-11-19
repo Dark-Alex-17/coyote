@@ -28,7 +28,8 @@
 // remembered against the exact question, so a guard names what it guards:
 // guardOperation sends the question, a newline and the operation when one
 // is given, and guardPath appends a newline and the resolved path unless the
-// question already contains the path as given.
+// question already contains that resolved path. An empty question is the
+// default one, as in the bash helpers.
 //
 // When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 // writes one request line to the tool's stdout and reads the answer line back
@@ -430,13 +431,14 @@ function abortUnlessConfirmed(question: string): void {
 }
 
 export function guardOperation(
-  question = "Are you sure you want to continue?",
+  question?: string,
   operation?: string,
 ): void {
   if (autoConfirmed()) {
     return;
   }
-  abortUnlessConfirmed(operation === undefined ? question : `${question}\n${operation}`);
+  const asked = question || "Are you sure you want to continue?";
+  abortUnlessConfirmed(operation === undefined ? asked : `${asked}\n${operation}`);
 }
 
 export function guardPath(target: string, question: string): void {
@@ -448,7 +450,7 @@ export function guardPath(target: string, question: string): void {
   if (resolved === cwd || resolved.startsWith(cwd.replace(/[\\/]+$/, "") + path.sep)) {
     return;
   }
-  abortUnlessConfirmed(question.includes(target) ? question : `${question}\n${resolved}`);
+  abortUnlessConfirmed(question.includes(resolved) ? question : `${question}\n${resolved}`);
 }
 
 function realpathIfExists(target: string): string {

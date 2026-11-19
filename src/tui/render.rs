@@ -5,6 +5,7 @@
 //! streaming reply is split into a stable part, rendered once per width,
 //! and a live tail.
 
+use crate::config::is_format_char;
 use crate::render::{MarkdownRender, RenderOptions};
 use ansi_to_tui::IntoText;
 use anyhow::Result;
@@ -31,31 +32,6 @@ pub(crate) fn plain_text(text: &str) -> String {
 /// Introducers of the control strings that run until ST (`ESC \`) or BEL:
 /// OSC, DCS, SOS, PM and APC.
 const STRING_INTRODUCERS: [char; 5] = [']', 'P', 'X', '^', '_'];
-
-/// Invisible format characters that reorder or hide what is around them:
-/// bidi embeddings, overrides, isolates and marks, the zero-width space
-/// and non-joiner, the byte-order mark, the soft hyphen, the word joiner
-/// and the tag characters. Text the user approves must read the way it is
-/// stored, so none of them is drawn. The zero-width joiner stays: it only
-/// binds an emoji sequence together and cannot move or hide a glyph.
-fn is_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200C}'
-            | '\u{200E}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0001}'
-            | '\u{E0020}'..='\u{E007F}'
-    )
-}
 
 fn scrub(text: &str, keep_sgr: bool) -> String {
     let chars: Vec<char> = text.chars().collect();

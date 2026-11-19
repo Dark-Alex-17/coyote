@@ -22,7 +22,8 @@
 # "Yes for this session" is remembered against the exact question, so a
 # guard names what it guards: guard_operation sends the question, a newline
 # and the operation when one is given, and guard_path appends a newline and
-# the resolved path unless the question already contains the path as given.
+# the resolved path unless the question already contains that resolved path.
+# An empty question is the default one, as in the bash helpers.
 #
 # When Coyote offers a prompt channel (COYOTE_PROMPT_REPLY is set) a helper
 # writes one request line to the tool's stdout and reads the answer line back
@@ -273,6 +274,7 @@ def _abort_unless_confirmed(question):
 def guard_operation(question="Are you sure you want to continue?", operation=None):
     if _auto_confirmed():
         return
+    question = question or "Are you sure you want to continue?"
     if operation is not None:
         question = f"{question}\n{operation}"
     _abort_unless_confirmed(question)
@@ -285,6 +287,6 @@ def guard_path(path, question):
     cwd = os.path.realpath(os.getcwd())
     if target == cwd or target.startswith(cwd.rstrip(os.sep) + os.sep):
         return
-    if os.fspath(path) not in question:
+    if target not in question:
         question = f"{question}\n{target}"
     _abort_unless_confirmed(question)

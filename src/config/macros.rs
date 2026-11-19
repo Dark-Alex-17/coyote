@@ -1261,11 +1261,11 @@ variables:
         );
         let mut ctx = test_ctx();
         ctx.prompter = Arc::new(ScriptedPrompter::refusing());
-        ctx.prompt_memory.remember("fake_tool", "again? mac-mem-7r");
         let req = PromptRequest {
             tool: Some("fake_tool".to_string()),
             ..ctx.prompt_request(PromptAction::Confirm, "again? mac-mem-7r", Vec::new(), None)
         };
+        ctx.prompt_memory.remember(&req);
 
         run_async(macro_execute(
             &mut ctx,
