@@ -114,7 +114,7 @@ impl PromptRequest {
             action: self.action,
             question: self.question.clone(),
             options: self.options.clone(),
-            default: if self.sensitive {
+            default: if self.sensitive || self.action == PromptAction::Password {
                 None
             } else {
                 self.default.clone()
@@ -1132,7 +1132,10 @@ mod tests {
     fn ask_returns_a_password_but_publishes_it_redacted() {
         let sink = RecordingSink::install();
         let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("hunter2".to_string())]);
-        let req = PromptRequest::new(PromptAction::Password, "secret? pw-4j", Origin::detached());
+        let req = PromptRequest {
+            default: Some(json!("dflt-pw-4j")),
+            ..PromptRequest::new(PromptAction::Password, "secret? pw-4j", Origin::detached())
+        };
 
         let answer = ask(&prompter, req).unwrap();
 
@@ -1151,6 +1154,10 @@ mod tests {
             }]
         );
         assert!(!format!("{requested:?}{answered:?}").contains("hunter2"));
+        assert!(
+            !format!("{requested:?}").contains("dflt-pw-4j"),
+            "{requested:?}"
+        );
     }
 
     /// A sensitive input is typed in the clear but published like a
