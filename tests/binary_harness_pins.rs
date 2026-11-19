@@ -45,7 +45,7 @@ const BARE_SPAWNS: [&str; 2] = [
     concat!("env!(\"CARGO_BIN_", "EXE_"),
     concat!("Pty::", "spawn("),
 ];
-const HARNESS_USERS: [&str; 12] = [
+const HARNESS_USERS: [&str; 24] = [
     "editor_setting_usage.rs",
     "theme_setting_usage.rs",
     "tui_binary.rs",
@@ -55,17 +55,29 @@ const HARNESS_USERS: [&str; 12] = [
     "tui_binary_threads.rs",
     "tui_binary_tools.rs",
     "tui_binary_wizards.rs",
+    "tui_editor_status_history_reset_and_bare_agent.rs",
+    "tui_footer_counts_help_popup_completion_and_scroll.rs",
+    "tui_hidden_verbs_history_and_barriers.rs",
     "tui_key_help_and_chords.rs",
     "tui_key_help_discovery.rs",
+    "tui_mid_turn_barriers_typeahead_and_queue_swap.rs",
+    "tui_palette_and_rewind.rs",
+    "tui_popup_colours_scroll_hold_and_child_jobs.rs",
+    "tui_queue_vi_and_headless.rs",
     "tui_readline_and_text_field_keys.rs",
+    "tui_rewind_macros_and_queue_drain.rs",
+    "tui_scroll_bursts_and_cell_boundaries.rs",
+    "tui_sent_line_failed_macro_and_sigterm.rs",
+    "tui_success_gated_barriers_band_close_and_headless_create.rs",
+    "tui_zombie_hold_editor_parity_and_creation_barriers.rs",
 ];
 // Files that spawn the binary outside the shared harness's import, as of
-// 2026-11-10: 29 self-contained suites plus the shared harness itself.
+// 2026-11-10: 22 self-contained suites plus the shared harness itself.
 // Files with no spawn and no dir pin at all are skipped before they are
 // counted, so this is the number of spawning files, not of files scanned.
 // A floor rather than an exact count, so adding a suite does not require
 // touching this pin.
-const SELF_CONTAINED_FLOOR: usize = 30;
+const SELF_CONTAINED_FLOOR: usize = 23;
 const PATH_PIN: &str = ".env(\"PATH\", pinned_path(";
 const MEMORY_ROOT_SCRUB: &str = ".env_remove(TEST_WORKSPACE_MEMORY_ROOT_ENV)";
 const MEMORY_ROOT_MIRROR: &str = "const TEST_WORKSPACE_MEMORY_ROOT_ENV: &str = ";

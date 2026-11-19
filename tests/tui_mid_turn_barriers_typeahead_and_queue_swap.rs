@@ -13,157 +13,12 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::fs;
+use std::time::{Duration, Instant};
 
 use common::fake_llm::{FakeLlm, Reply};
-use common::pty::{Pty, strip_ansi};
+use common::tui_harness::*;
 use serial_test::serial;
-
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Past both idle gates (1 s from the last keystroke, 1 s from a modal's
-/// appearance).
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-const REPAINT_SETTLE: Duration = Duration::from_millis(500);
-const MACRO_STOP_NOTICE: &str = "Rewind stops at the last macro turn";
-const MID_TURN_MARKER: &str = "(sent mid-turn)";
-/// xterm's legacy encoding of Alt+Up.
-const ALT_UP: &[u8] = b"\x1b[1;3A";
-const DOWN: &[u8] = b"\x1b[B";
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-tui-queue-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    fs::create_dir_all(dir.join("sessions")).unwrap();
-    dir
-}
-
-/// Dry-run config; `extra` is appended as top-level YAML.
-fn write_dry_run_config(dir: &Path, extra: &str) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             {extra}\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
-
-fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: fake:fake-model\n\
-             function_calling_support: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai-compatible\n\
-             \x20   name: fake\n\
-             \x20   api_base: '{api_base}'\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: fake-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-            api_base = fake.api_base(),
-        ),
-    )
-    .unwrap();
-}
-
-fn write_tool(dir: &Path, file: &str, body: &str) {
-    let tools = dir.join("functions").join("tools");
-    fs::create_dir_all(&tools).unwrap();
-    fs::write(tools.join(file), body).unwrap();
-}
-
-/// A non-isolated macro of two plain prompts: two exchanges recorded on
-/// the live session under one transcript row.
-fn write_two_prompt_macro(dir: &Path, name: &str) {
-    let macros = dir.join("macros");
-    fs::create_dir_all(&macros).unwrap();
-    fs::write(
-        macros.join(format!("{name}.yaml")),
-        "description: two prompts on the live session\n\
-         isolated: false\n\
-         steps:\n\
-         \x20 - macro-prompt-one\n\
-         \x20 - macro-prompt-two\n",
-    )
-    .unwrap();
-}
-
-/// Marks `<marker>-started`, then waits (at most eight seconds) for
-/// `<marker>-release` before finishing.
-const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
-    \n\
-    # @describe Wait until released.\n\
-    # @option --marker! Path prefix for the start and release files.\n\
-    \n\
-    # @env LLM_OUTPUT=/dev/stdout The output path\n\
-    \n\
-    main() {\n\
-    \x20   local marker\n\
-    \x20   marker=\"$(jq -r '.marker' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
-    \x20   : > \"${marker}-started\"\n\
-    \x20   for _ in $(seq 1 160); do\n\
-    \x20       [ -e \"${marker}-release\" ] && break\n\
-    \x20       sleep 0.05\n\
-    \x20   done\n\
-    \x20   echo \"fixture slept\" >> \"$LLM_OUTPUT\"\n\
-    }\n";
-
-fn sleep_call(marker: &Path) -> Reply {
-    Reply::ToolCall {
-        name: "fixture_sleep".to_string(),
-        arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
-    }
-}
 
 /// A tool that asks through one of the prompt helpers (`call` is the
 /// helper invocation) and records the answer it got at `out`.
@@ -187,132 +42,6 @@ fn recording_prompt_tool(call: &str) -> String {
          \x20   echo \"fixture prompt answered k7p\" >> \"$LLM_OUTPUT\"\n\
          }}\n"
     )
-}
-
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-const WAIT_WRAPPER: &str =
-    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-/// The environment every spawn shares: config, cache and HOME under
-/// `dir`, the fixture bin first on PATH, no inherited COYOTE_* or colour
-/// variables.
-fn base_env(cmd: &mut Command, dir: &Path) {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR");
-}
-
-fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(
-        WAIT_WRAPPER
-            .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{args}", " --tui")
-            .replace("{stdin}", "/dev/tty")
-            .replace("{report}", TTY_REPORT),
-    );
-    base_env(&mut cmd, dir);
-    cmd.envs(extra_env.iter().copied());
-    Pty::spawn(cmd).unwrap()
-}
-
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn assert_tty_restored(transcript: &str) {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
-        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .collect();
-    for flag in ["echo", "icanon", "isig", "opost"] {
-        assert!(
-            tokens.contains(&flag),
-            "stty did not report {flag} after the UI left:\n{transcript}"
-        );
-        let off = format!("-{flag}");
-        assert!(
-            !tokens.contains(&off.as_str()),
-            "the terminal was left with {flag} off:\n{transcript}"
-        );
-    }
-}
-
-fn since(pty: &Pty, from: usize) -> String {
-    strip_ansi(&String::from_utf8_lossy(
-        &pty.raw()[from.min(pty.raw().len())..],
-    ))
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    haystack[from.min(haystack.len())..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|at| from + at)
-}
-
-/// Every SGR parameter list (`ESC [ ... m`) in the raw output, split into
-/// its numeric parameters.
-fn sgr_params(raw: &[u8]) -> Vec<Vec<u16>> {
-    let text = String::from_utf8_lossy(raw);
-    let mut out = Vec::new();
-    let mut rest: &str = &text;
-    while let Some(start) = rest.find("\x1b[") {
-        rest = &rest[start + 2..];
-        let end = rest
-            .find(|c: char| !(('\x30'..='\x3f').contains(&c) || ('\x20'..='\x2f').contains(&c)));
-        let Some(end) = end else { break };
-        if rest.as_bytes()[end] == b'm' {
-            let params = &rest[..end];
-            if params.is_empty() {
-                out.push(vec![0]);
-            } else {
-                out.push(
-                    params
-                        .split([';', ':'])
-                        .map(|p| p.parse::<u16>().unwrap_or(u16::MAX))
-                        .collect(),
-                );
-            }
-        }
-        let final_byte = rest[end..].chars().next().map_or(1, char::len_utf8);
-        rest = &rest[end + final_byte..];
-    }
-    out
 }
 
 /// The SGR parameter lists written from the start of a repaint up to
@@ -360,149 +89,6 @@ fn ends_dim_reads_an_extended_colours_arguments_as_arguments() {
     assert!(ends_dim(&[vec![38, 2, 10, 20, 30, 2]]));
 }
 
-/// Forces a full repaint by resizing and returns the raw offset it starts
-/// after.
-fn repaint(pty: &mut Pty, rows: u16, cols: u16) -> usize {
-    let at = pty.raw().len();
-    pty.resize(rows, cols).unwrap();
-    pty.read_for(REPAINT_SETTLE);
-    at
-}
-
-fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
-    let at = repaint(pty, rows, cols);
-    since(pty, at)
-}
-
-fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    let wanted = squeezed(marker);
-    loop {
-        pty.read_for(Duration::from_millis(200));
-        let text = since(pty, from);
-        if squeezed(&text).contains(&wanted) {
-            return text;
-        }
-        assert!(Instant::now() < deadline, "{what} never appeared:\n{text}");
-    }
-}
-
-fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    while !path.exists() {
-        let text = pty.read_for(Duration::from_millis(100));
-        assert!(
-            Instant::now() < deadline,
-            "{what} ({}) never appeared:\n{}",
-            path.display(),
-            text
-        );
-    }
-}
-
-/// Pumps until a Ctrl+L repaint shows no `pending:` strip.
-fn wait_until_no_pending(pty: &mut Pty) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        pty.read_for(Duration::from_millis(300));
-        let repaint_at = pty.raw().len();
-        pty.send(b"\x0c").unwrap();
-        pty.read_for(Duration::from_millis(500));
-        let repainted = since(pty, repaint_at);
-        if !repainted.contains("pending:") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the queue strip outlived the turn:\n{repainted}"
-        );
-    }
-}
-
-/// Quit from a composer that may hold a draft: Ctrl+C clears a draft (or
-/// quits an idle empty composer); Ctrl+D follows if still up.
-fn quit_clearing_any_draft(pty: &mut Pty) -> String {
-    pty.send(b"\x03").unwrap();
-    let after = pty.read_for(HOTKEY_GAP);
-    if !after.contains("tty-probe-done") {
-        pty.send(b"\x04").unwrap();
-    }
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    transcript
-}
-
-/// The composer's text in a repainted frame: what sits between the
-/// field's rule and the footer, runs of blanks folded to one space.
-fn composer_row(frame: &str, footer_marker: &str) -> String {
-    let rule = frame
-        .rfind('\u{2500}')
-        .map_or(0, |at| at + '\u{2500}'.len_utf8());
-    let after = &frame[rule..];
-    let footer = after.find(footer_marker).unwrap_or(after.len());
-    after[..footer]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// What sits above the composer's rule in a repainted frame: transcript
-/// rows and, while a turn runs, the status strip with the queue preview.
-fn above_rule(frame: &str) -> String {
-    let rule = frame.rfind('\u{2500}').unwrap_or(frame.len());
-    frame[..rule].to_string()
-}
-
-/// The placeholder is on screen: the composer holds no draft.
-fn shows_placeholder(flat: &str) -> bool {
-    flat.contains("Typeapromptora.command") || flat.contains("Typeapromptora/command")
-}
-
-/// Clears a prefilled draft without risking the idle-empty Ctrl+C quit.
-fn clear_any_draft(pty: &mut Pty) {
-    static TOGGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let odd = TOGGLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
-    let frame = repainted_frame(pty, 60, if odd { 98 } else { 99 });
-    if !shows_placeholder(&squeezed(&frame)) {
-        pty.send(b"\x03").unwrap();
-        pty.read_for(Duration::from_millis(500));
-    }
-}
-
-/// Esc Esc on the idle empty composer; returns the offset the picker was
-/// asked at, with the band on screen.
-fn open_rewind_picker(pty: &mut Pty) -> usize {
-    let picker_at = pty.raw().len();
-    pty.send(b"\x1b").unwrap();
-    pty.read_for(Duration::from_millis(150));
-    pty.send(b"\x1b").unwrap();
-    pty.wait_for_after("Rewind to", picker_at, PTY_DEADLINE)
-        .expect("Esc Esc did not open the rewind picker");
-    pty.read_for(HOTKEY_GAP);
-    picker_at
-}
-
-/// The picker's band below its header in a repainted frame.
-fn picker_band(frame: &str) -> String {
-    frame.split("Rewind to").nth(1).unwrap_or("").to_string()
-}
-
-/// Runs a dry-run exchange and waits for its user cell.
-fn dry_run_exchange(pty: &mut Pty, prompt: &str) {
-    let at = pty.raw().len();
-    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
-    wait_for_squeezed_after(pty, &format!("> {prompt}"), at, "the exchange");
-    pty.read_for(Duration::from_millis(2500));
-}
-
-/// The composer takes a command again: `.info` renders its table.
-fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
-    pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", after, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("keys were not handled after {what}: {e}"));
-    pty.read_for(Duration::from_millis(300));
-}
-
 // ---------------------------------------------------------------------
 // The mid-turn cell: dim in colour, a rewind non-entity.
 // ---------------------------------------------------------------------
@@ -548,7 +134,7 @@ fn a_mid_turn_cell_is_dim_and_neither_a_rewind_row_nor_a_barrier() {
     pty.read_for(Duration::from_millis(300));
     pty.send(b"ghost-k7m\r").unwrap();
     pty.read_for(Duration::from_millis(800));
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     assert!(
         squeezed(&frame).contains("pending:1"),
         "the line queued while the tool slept did not show `pending: 1`:\n{frame}"
@@ -595,7 +181,7 @@ fn a_mid_turn_cell_is_dim_and_neither_a_rewind_row_nor_a_barrier() {
 
     // Esc Esc: the picker offers the opener and the older prompt only.
     let picker_at = open_rewind_picker(&mut pty);
-    let picker = repainted_frame(&mut pty, 40, 101);
+    let picker = repainted_frame_after_resize(&mut pty, 40, 101);
     let band_flat = squeezed(&picker_band(&picker));
     if band_flat.contains("ghost-k7m") {
         misses.push(format!("the mid-turn line is a rewind row:\n{picker}"));
@@ -619,7 +205,7 @@ fn a_mid_turn_cell_is_dim_and_neither_a_rewind_row_nor_a_barrier() {
     // Enter on the first row (the opener): the tool turn goes whole.
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(1500));
-    let frame = repainted_frame(&mut pty, 40, 100);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 100);
     let flat = squeezed(&frame);
     if flat.contains("Rewindto") {
         misses.push(format!("the picker is still up after Enter:\n{frame}"));
@@ -637,7 +223,7 @@ fn a_mid_turn_cell_is_dim_and_neither_a_rewind_row_nor_a_barrier() {
     if !flat.contains(">older-k7m") || !flat.contains("older-reply-k7m") {
         misses.push(format!("the older exchange was popped too:\n{frame}"));
     }
-    let row = composer_row(&frame, "fake:fake-model");
+    let row = composer_row_with_footer(&frame, "fake:fake-model");
     if row != "opener-k7m" {
         misses.push(format!(
             "the opener was not prefilled (composer: `{row}`):\n{frame}"
@@ -675,7 +261,7 @@ fn a_mid_turn_cell_is_dim_and_neither_a_rewind_row_nor_a_barrier() {
 fn disabling_a_macro_after_it_ran_does_not_move_the_rewind_barrier() {
     let dir = fresh_config_dir("barrier-disable-after");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     write_two_prompt_macro(&dir, "two-step");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -700,7 +286,7 @@ fn disabling_a_macro_after_it_ran_does_not_move_the_rewind_barrier() {
 
     let mut misses: Vec<String> = Vec::new();
     let picker_at = open_rewind_picker(&mut pty);
-    let picker = repainted_frame(&mut pty, 60, 101);
+    let picker = repainted_frame_after_resize(&mut pty, 60, 101);
     let band_flat = squeezed(&picker_band(&picker));
     if !band_flat.contains("after-two-k7b") || !band_flat.contains("after-one-k7b") {
         misses.push(format!(
@@ -728,7 +314,7 @@ fn disabling_a_macro_after_it_ran_does_not_move_the_rewind_barrier() {
     pty.read_for(Duration::from_millis(400));
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(1500));
-    let frame = repainted_frame(&mut pty, 60, 100);
+    let frame = repainted_frame_after_resize(&mut pty, 60, 100);
     let flat = squeezed(&frame);
     if flat.contains("Rewindto") {
         misses.push(format!("the picker is still up after Enter:\n{frame}"));
@@ -741,7 +327,7 @@ fn disabling_a_macro_after_it_ran_does_not_move_the_rewind_barrier() {
     if !flat.contains(">before-k7b") || !flat.contains("macro-prompt-two") {
         misses.push(format!("the rewind went past the macro turn:\n{frame}"));
     }
-    let row = composer_row(&frame, "dryrun:dry-model");
+    let row = composer_row_with_footer(&frame, "dryrun:dry-model");
     if row != "after-one-k7b" {
         misses.push(format!(
             "the chosen prompt was not prefilled (composer: `{row}`):\n{frame}"
@@ -773,7 +359,7 @@ fn disabling_a_macro_after_it_ran_does_not_move_the_rewind_barrier() {
 fn a_disabled_macro_typed_later_commits_no_barrier_and_enabling_it_is_not_retroactive() {
     let dir = fresh_config_dir("barrier-disable-before");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     write_two_prompt_macro(&dir, "two-step");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -798,7 +384,7 @@ fn a_disabled_macro_typed_later_commits_no_barrier_and_enabling_it_is_not_retroa
 
     let mut misses: Vec<String> = Vec::new();
     let picker_at = open_rewind_picker(&mut pty);
-    let picker = repainted_frame(&mut pty, 60, 101);
+    let picker = repainted_frame_after_resize(&mut pty, 60, 101);
     let band_flat = squeezed(&picker_band(&picker));
     if !band_flat.contains("after-k7d") || !band_flat.contains("before-k7d") {
         misses.push(format!(
@@ -816,7 +402,7 @@ fn a_disabled_macro_typed_later_commits_no_barrier_and_enabling_it_is_not_retroa
     pty.read_for(Duration::from_millis(400));
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(1500));
-    let frame = repainted_frame(&mut pty, 60, 100);
+    let frame = repainted_frame_after_resize(&mut pty, 60, 100);
     let flat = squeezed(&frame);
     if flat.contains("Rewindto") {
         misses.push(format!("the picker is still up after Enter:\n{frame}"));
@@ -826,7 +412,7 @@ fn a_disabled_macro_typed_later_commits_no_barrier_and_enabling_it_is_not_retroa
             "choosing `before` did not pop both exchanges:\n{frame}"
         ));
     }
-    let row = composer_row(&frame, "dryrun:dry-model");
+    let row = composer_row_with_footer(&frame, "dryrun:dry-model");
     if misses.is_empty() && row != "before-k7d" {
         misses.push(format!(
             "the chosen prompt was not prefilled (composer: `{row}`):\n{frame}"
@@ -896,7 +482,7 @@ fn typeahead_space_as_a_checkbox_modal_appears_ticks_nothing() {
     pty.send(b" ").unwrap();
     pty.read_for(HOTKEY_GAP);
     let mut misses: Vec<String> = Vec::new();
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     let flat = squeezed(&frame);
     if !flat.contains("[]alpha") || !flat.contains("[]beta") || !flat.contains("[]gamma") {
         misses.push(format!(
@@ -915,7 +501,7 @@ fn typeahead_space_as_a_checkbox_modal_appears_ticks_nothing() {
     // Past both gates, Space ticks the highlighted row.
     pty.send(b" ").unwrap();
     pty.read_for(Duration::from_millis(400));
-    let frame = repainted_frame(&mut pty, 40, 100);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 100);
     if !squeezed(&frame).contains("[x]alpha") {
         misses.push(format!(
             "an idle Space did not tick the first row:\n{frame}"
@@ -986,13 +572,13 @@ fn alt_up_over_a_draft_swaps_it_with_the_newest_queued_line() {
     pty.read_for(Duration::from_millis(500));
     pty.send(b"draft-b-k7s").unwrap();
     pty.read_for(Duration::from_millis(400));
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     assert!(
         squeezed(&frame).contains("pending:1"),
         "the line queued while the tool slept did not show `pending: 1`:\n{frame}"
     );
     assert_eq!(
-        composer_row(&frame, "fake:fake-model"),
+        composer_row_with_footer(&frame, "fake:fake-model"),
         "draft-b-k7s",
         "the draft is not in the composer before Alt+Up:\n{frame}"
     );
@@ -1000,9 +586,9 @@ fn alt_up_over_a_draft_swaps_it_with_the_newest_queued_line() {
     let mut misses: Vec<String> = Vec::new();
     pty.send(ALT_UP).unwrap();
     pty.read_for(Duration::from_millis(600));
-    let frame = repainted_frame(&mut pty, 40, 100);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 100);
     let flat = squeezed(&frame);
-    let row = composer_row(&frame, "fake:fake-model");
+    let row = composer_row_with_footer(&frame, "fake:fake-model");
     if row != "queued-a-k7s" {
         misses.push(format!(
             "Alt+Up did not bring the queued line back for editing (composer: `{row}`):\n{frame}"
@@ -1021,9 +607,9 @@ fn alt_up_over_a_draft_swaps_it_with_the_newest_queued_line() {
     // Swap back.
     pty.send(ALT_UP).unwrap();
     pty.read_for(Duration::from_millis(600));
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     let flat = squeezed(&frame);
-    let row = composer_row(&frame, "fake:fake-model");
+    let row = composer_row_with_footer(&frame, "fake:fake-model");
     if row != "draft-b-k7s" {
         misses.push(format!(
             "a second Alt+Up did not swap the lines back (composer: `{row}`):\n{frame}"
@@ -1070,8 +656,8 @@ fn alt_up_over_a_draft_swaps_it_with_the_newest_queued_line() {
             bodies[2]
         ));
     }
-    let frame = repainted_frame(&mut pty, 40, 100);
-    let row = composer_row(&frame, "fake:fake-model");
+    let frame = repainted_frame_after_resize(&mut pty, 40, 100);
+    let row = composer_row_with_footer(&frame, "fake:fake-model");
     if row != "draft-b-k7s" {
         misses.push(format!(
             "the draft did not survive the turn (composer: `{row}`):\n{frame}"
@@ -1135,7 +721,7 @@ fn ctrl_d_purges_the_turn_queue_even_when_the_tool_is_released_right_after() {
     pty.read_for(Duration::from_millis(300));
     pty.send(b"ghost-q-k7q\r").unwrap();
     pty.read_for(Duration::from_millis(800));
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     assert!(
         squeezed(&frame).contains("pending:1"),
         "the line queued while the tool slept did not show `pending: 1`:\n{frame}"

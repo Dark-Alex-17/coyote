@@ -8,111 +8,14 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use common::fake_llm::{FakeLlm, Reply};
-use common::pty::{Pty, strip_ansi};
+use common::pty::Pty;
+use common::tui_harness::*;
 use serial_test::serial;
-
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Past both idle gates (1 s from the last keystroke, 1 s from a modal's
-/// appearance).
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-const ENTER_ALT: &[u8] = b"\x1b[?1049h";
-const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
-const PASTE_ON: &[u8] = b"\x1b[?2004h";
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-palette-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    fs::create_dir_all(dir.join("sessions")).unwrap();
-    dir
-}
-
-/// Dry-run config; `extra` is appended as top-level YAML.
-fn write_dry_run_config(dir: &Path, extra: &str) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             {extra}\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
-
-fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: fake:fake-model\n\
-             function_calling_support: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai-compatible\n\
-             \x20   name: fake\n\
-             \x20   api_base: '{api_base}'\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: fake-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-            api_base = fake.api_base(),
-        ),
-    )
-    .unwrap();
-}
-
-fn write_tool(dir: &Path, file: &str, body: &str) {
-    let tools = dir.join("functions").join("tools");
-    fs::create_dir_all(&tools).unwrap();
-    fs::write(tools.join(file), body).unwrap();
-}
 
 /// A tool that asks through one prompt helper and records what the helper
 /// printed (or `cancelled` when it printed nothing, the fail-closed path).
@@ -140,7 +43,7 @@ fn recording_prompt_tool(call: &str) -> String {
 
 /// Marks `<marker>-started`, then waits (at most eight seconds) for
 /// `<marker>-release` before finishing.
-const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+const PALETTE_SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
     # @option --marker! Path prefix for the start and release files.\n\
@@ -168,148 +71,6 @@ fn tool_call_then_done(tool: &str, out: &Path) -> FakeLlm {
     ])
 }
 
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-const WAIT_WRAPPER: &str =
-    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    spawn_ui(dir, "tui", extra_env)
-}
-
-fn spawn_ui(dir: &Path, ui: &str, extra_env: &[(&str, &str)]) -> Pty {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(
-        WAIT_WRAPPER
-            .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{args}", &format!(" --{ui}"))
-            .replace("{stdin}", "/dev/tty")
-            .replace("{report}", TTY_REPORT),
-    );
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR")
-        .envs(extra_env.iter().copied());
-    Pty::spawn(cmd).unwrap()
-}
-
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn since(pty: &Pty, from: usize) -> String {
-    strip_ansi(&String::from_utf8_lossy(
-        &pty.raw()[from.min(pty.raw().len())..],
-    ))
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
-}
-
-fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    while !path.exists() {
-        let text = pty.read_for(Duration::from_millis(100));
-        assert!(
-            Instant::now() < deadline,
-            "{what} ({}) never appeared:\n{}",
-            path.display(),
-            text
-        );
-    }
-}
-
-fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    let wanted = squeezed(marker);
-    loop {
-        pty.read_for(Duration::from_millis(200));
-        let text = since(pty, from);
-        if squeezed(&text).contains(&wanted) {
-            return text;
-        }
-        assert!(Instant::now() < deadline, "{what} never appeared:\n{text}");
-    }
-}
-
-/// Lend-and-return: the alternate screen is left after `from`, then
-/// re-entered with bracketed paste back on; returns the re-entry offset.
-fn wait_for_lend_and_return(pty: &mut Pty, from: usize, what: &str) -> usize {
-    let left = pty
-        .wait_for_raw(LEAVE_ALT, from, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("{what} did not release the terminal: {e}"));
-    let re_entered = pty
-        .wait_for_raw(ENTER_ALT, left, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("after {what} the alternate screen was not re-entered: {e}"));
-    pty.wait_for_raw(PASTE_ON, re_entered, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("after {what} bracketed paste was not re-enabled: {e}"));
-    pty.read_for(Duration::from_millis(300));
-    re_entered
-}
-
-/// The composer takes a command again: `.info` renders its table.
-fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
-    pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", after, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("keys were not handled after {what}: {e}"));
-    pty.read_for(Duration::from_millis(300));
-}
-
-fn quit_and_check(pty: &mut Pty) -> String {
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    transcript
-}
-
-/// Quit from a composer that may or may not hold a draft: Ctrl+C clears
-/// a draft, or on an idle empty composer ends the session outright;
-/// Ctrl+D follows only when the session is still up.
-fn quit_clearing_any_draft(pty: &mut Pty) -> String {
-    pty.send(b"\x03").unwrap();
-    let after = pty.read_for(HOTKEY_GAP);
-    if !after.contains("tty-probe-done") {
-        pty.send(b"\x04").unwrap();
-    }
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    transcript
-}
-
 fn finish_after_tool(pty: &mut Pty, from: usize) {
     wait_for_squeezed_after(pty, "fixture done z2s", from, "the reply after the tool");
     quit_and_check(pty);
@@ -327,7 +88,7 @@ fn finish_after_tool(pty: &mut Pty, from: usize) {
 fn two_bang_lines_in_one_session_both_return_to_the_composer() {
     let dir = fresh_config_dir("bang-twice");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -359,7 +120,7 @@ fn two_bang_lines_in_one_session_both_return_to_the_composer() {
 fn dot_edit_then_a_bang_line_both_return_to_the_composer() {
     let dir = fresh_config_dir("edit-then-bang");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let editor = if Path::new("/usr/bin/true").exists() {
         "/usr/bin/true"
     } else {
@@ -571,7 +332,7 @@ fn two_drafts_while_a_tool_sleeps_show_pending_two_and_drain_after_release() {
         Reply::Text("fixture done r12-c".to_string()),
     ]);
     write_fake_llm_config(&dir, &fake);
-    write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+    write_tool(&dir, "fixture_sleep.sh", PALETTE_SLEEP_TOOL);
     let mut pty = spawn_tui(&dir, &[]);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -589,7 +350,7 @@ fn two_drafts_while_a_tool_sleeps_show_pending_two_and_drain_after_release() {
     pty.read_for(Duration::from_millis(1000));
     // The strip is repainted cell by cell (`pending: 1` -> `pending: 2`
     // paints one digit), so a full frame is forced before reading it.
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     let flat = squeezed(&frame);
     let mid = since(&pty, typed_at);
     assert!(
@@ -666,7 +427,7 @@ struct Candidate {
 /// macros, which both UIs offer. The menu is one entry per row and
 /// stops at the terminal's height, so the pty grows past the set first.
 fn repl_completer_candidates(dir: &Path, sigil: char) -> Vec<Candidate> {
-    let mut pty = spawn_ui(dir, "repl", &[]);
+    let mut pty = spawn_repl_under(dir, &[], WAIT_WRAPPER, "/dev/tty");
     // Grown before the line editor starts reading: a resize mid-read is
     // a signal the editor repaints on, and the keys behind it are lost.
     pty.resize(100, 100).unwrap();
@@ -733,14 +494,6 @@ fn parse_sigil_rows(text: &str, sigil: char) -> Vec<Candidate> {
         }
     }
     out
-}
-
-/// Forces a repaint by nudging the width and returns the frame painted.
-fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
-    let at = pty.raw().len();
-    pty.resize(rows, cols).unwrap();
-    pty.read_for(Duration::from_millis(500));
-    since(pty, at)
 }
 
 /// The screen `raw` leaves behind, replayed cell by cell. The painter
@@ -825,7 +578,7 @@ fn palette_frame_for(pty: &mut Pty, sigil: char, name: &str, toggle: &mut bool) 
     pty.send(format!("{sigil}{name}").as_bytes()).unwrap();
     pty.read_for(Duration::from_millis(400));
     *toggle = !*toggle;
-    repainted_frame(pty, 60, if *toggle { 141 } else { 140 });
+    repainted_frame_after_resize(pty, 60, if *toggle { 141 } else { 140 });
     let frame = painted_screen(&pty.raw()[typed_at..]);
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(200));
@@ -871,12 +624,12 @@ fn palette_rows(frame: &str, sigil: char, typed: &str) -> Vec<Candidate> {
 fn assert_palette_matches_completer(prefix_yaml: &str, sigil: char, scenario: &str) {
     let repl_dir = fresh_config_dir(&format!("{scenario}-repl"));
     let _repl_guard = TempDirGuard(repl_dir.clone());
-    write_dry_run_config(&repl_dir, prefix_yaml);
+    write_dry_run_config_with(&repl_dir, prefix_yaml);
     let listed = repl_completer_candidates(&repl_dir, sigil);
 
     let dir = fresh_config_dir(&format!("{scenario}-tui"));
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, prefix_yaml);
+    write_dry_run_config_with(&dir, prefix_yaml);
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.resize(60, 140).unwrap();
@@ -970,7 +723,7 @@ fn palette_set_equals_the_repl_completer_set_under_dot() {
 fn tool_verbs_are_offered_by_the_palette_cold_and_warm() {
     let dir = fresh_config_dir("palette-warm");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.resize(60, 140).unwrap();
@@ -1029,7 +782,7 @@ fn rewriting_editor(dir: &Path, text: &str) -> String {
 fn the_editor_shrinking_the_line_under_an_open_palette_does_not_crash_enter() {
     let dir = fresh_config_dir("palette-editor-shrink");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let editor = rewriting_editor(&dir, ".i");
     let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1068,7 +821,7 @@ fn the_editor_shrinking_the_line_under_an_open_palette_does_not_crash_enter() {
 fn esc_esc_then_the_second_row_rewinds_two_exchanges() {
     let dir = fresh_config_dir("rewind-two");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
@@ -1124,7 +877,7 @@ fn esc_esc_then_the_second_row_rewinds_two_exchanges() {
 fn choosing_a_rewind_row_prefills_the_composer_with_that_prompt() {
     let dir = fresh_config_dir("rewind-prefill");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
@@ -1143,7 +896,7 @@ fn choosing_a_rewind_row_prefills_the_composer_with_that_prompt() {
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(1500));
 
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     let flat = squeezed(&frame);
     assert!(
         !flat.contains(">helloonep4f"),

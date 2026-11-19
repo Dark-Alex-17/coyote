@@ -1440,3 +1440,440 @@ pub fn open_the_init_rag_modal(dir: &Path, name: &str) -> (Pty, usize) {
     );
     (pty, before)
 }
+
+pub const REPAINT_SETTLE: Duration = Duration::from_millis(500);
+pub const STOP_NOTICE: &str = "Rewind stops at the last";
+pub const MACRO_STOP_NOTICE: &str = "Rewind stops at the last macro turn";
+pub const MID_TURN_MARKER: &str = "(sent mid-turn)";
+/// xterm's legacy encoding of Alt+Up.
+pub const ALT_UP: &[u8] = b"\x1b[1;3A";
+pub const DOWN: &[u8] = b"\x1b[B";
+pub const CTRL_C: &[u8] = b"\x03";
+pub const CTRL_D: &[u8] = b"\x04";
+pub const CTRL_R: &[u8] = b"\x12";
+pub const CTRL_O: &[u8] = b"\x0f";
+pub const ESC: &[u8] = b"\x1b";
+
+/// [`write_dry_run_config`] with `extra` appended as top-level YAML.
+pub fn write_dry_run_config_with(dir: &Path, extra: &str) {
+    let vault_pass = dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        dir.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             dry_run: true\n\
+             stream: true\n\
+             save_session: false\n\
+             vault_password_file: '{vault_pass}'\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: dryrun\n\
+             \x20   auth: none\n\
+             \x20   api_key: 'unused'\n\
+             \x20   models:\n\
+             \x20     - name: dry-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             {extra}\
+             workspace_instructions: false\n\
+             memory: false\n",
+            vault_pass = vault_pass.display(),
+        ),
+    )
+    .unwrap();
+}
+
+/// A non-isolated macro whose steps run on the live session.
+pub fn write_macro(dir: &Path, name: &str, steps: &[&str]) {
+    let macros = dir.join("macros");
+    fs::create_dir_all(&macros).unwrap();
+    let mut body = String::from("description: a live-session macro\nisolated: false\nsteps:\n");
+    for step in steps {
+        body.push_str(&format!("  - {step}\n"));
+    }
+    fs::write(macros.join(format!("{name}.yaml")), body).unwrap();
+}
+
+/// A non-isolated macro of two plain prompts: two exchanges recorded on
+/// the live session under one transcript row.
+pub fn write_two_prompt_macro(dir: &Path, name: &str) {
+    let macros = dir.join("macros");
+    fs::create_dir_all(&macros).unwrap();
+    fs::write(
+        macros.join(format!("{name}.yaml")),
+        "description: two prompts on the live session\n\
+         isolated: false\n\
+         steps:\n\
+         \x20 - macro-prompt-one\n\
+         \x20 - macro-prompt-two\n",
+    )
+    .unwrap();
+}
+
+/// Writes an executable shell script at `dir/<name>` and returns its path.
+pub fn write_script(dir: &Path, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join(name);
+    fs::write(&script, body).unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script.to_str().unwrap().to_string()
+}
+
+/// Marks `<marker>-started`, then waits (at most eight seconds) for
+/// `<marker>-release` before finishing.
+pub const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    \n\
+    # @describe Wait until released.\n\
+    # @option --marker! Path prefix for the start and release files.\n\
+    \n\
+    # @env LLM_OUTPUT=/dev/stdout The output path\n\
+    \n\
+    main() {\n\
+    \x20   local marker\n\
+    \x20   marker=\"$(jq -r '.marker' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
+    \x20   : > \"${marker}-started\"\n\
+    \x20   for _ in $(seq 1 160); do\n\
+    \x20       [ -e \"${marker}-release\" ] && break\n\
+    \x20       sleep 0.05\n\
+    \x20   done\n\
+    \x20   echo \"fixture slept\" >> \"$LLM_OUTPUT\"\n\
+    }\n";
+
+pub fn sleep_call(marker: &Path) -> Reply {
+    Reply::ToolCall {
+        name: "fixture_sleep".to_string(),
+        arguments: format!("{{\"marker\": \"{}\"}}", marker.display()),
+    }
+}
+
+pub fn since(pty: &Pty, from: usize) -> String {
+    strip_ansi(&String::from_utf8_lossy(
+        &pty.raw()[from.min(pty.raw().len())..],
+    ))
+}
+
+/// Forces a full repaint by resizing and returns the raw offset it starts
+/// after.
+pub fn repaint(pty: &mut Pty, rows: u16, cols: u16) -> usize {
+    let at = pty.raw().len();
+    pty.resize(rows, cols).unwrap();
+    pty.read_for(REPAINT_SETTLE);
+    at
+}
+
+/// [`repaint`] and the stripped frame it painted. Unlike
+/// [`repainted_frame`] nothing is read before the resize, and the frame
+/// is read for [`REPAINT_SETTLE`] after it.
+pub fn repainted_frame_after_resize(pty: &mut Pty, rows: u16, cols: u16) -> String {
+    let at = repaint(pty, rows, cols);
+    since(pty, at)
+}
+
+/// A fresh full frame on every call: the width alternates so the resize
+/// is never coalesced away.
+pub fn next_frame(pty: &mut Pty, toggle: &mut bool) -> String {
+    *toggle = !*toggle;
+    repainted_frame_after_resize(pty, 40, if *toggle { 101 } else { 100 })
+}
+
+pub fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let wanted = squeezed(marker);
+    loop {
+        pty.read_for(Duration::from_millis(200));
+        let text = since(pty, from);
+        if squeezed(&text).contains(&wanted) {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what} never appeared:\n{text}"
+        );
+    }
+}
+
+/// Repaints with Ctrl+L until the `pending:` strip is gone (a queued line
+/// still running) or the deadline passes.
+pub fn wait_until_no_pending(pty: &mut Pty) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        pty.read_for(Duration::from_millis(300));
+        let repaint_at = pty.raw().len();
+        pty.send(b"\x0c").unwrap();
+        pty.read_for(Duration::from_millis(500));
+        let repainted = since(pty, repaint_at);
+        if !repainted.contains("pending:") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the queue strip outlived the turn:\n{repainted}"
+        );
+    }
+}
+
+/// Quit from a composer that may hold a draft: Ctrl+C clears a draft (or
+/// quits an idle empty composer); Ctrl+D follows if still up.
+pub fn quit_clearing_any_draft(pty: &mut Pty) -> String {
+    pty.send(CTRL_C).unwrap();
+    let after = pty.read_for(HOTKEY_GAP);
+    if !after.contains("tty-probe-done") {
+        pty.send(CTRL_D).unwrap();
+    }
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    transcript
+}
+
+pub fn quit_and_check(pty: &mut Pty) -> String {
+    pty.send(b"\x04").unwrap();
+    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
+    assert_eq!(exit_code(&transcript), 0, "{transcript}");
+    transcript
+}
+
+/// Exit from a composer that may hold a draft and a session that may be
+/// dirty: the draft is cleared, and a save question is answered no.
+pub fn quit_declining_save(pty: &mut Pty) -> String {
+    clear_any_draft(pty);
+    pty.send(CTRL_D).unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        let text = pty.read_for(Duration::from_millis(300));
+        if text.contains("tty-probe-done") {
+            assert_eq!(exit_code(&text), 0, "{text}");
+            return text;
+        }
+        if text.contains("Save session?") {
+            pty.read_for(HOTKEY_GAP);
+            pty.send(b"n").unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session did not end:\n{text}"
+        );
+    }
+}
+
+/// The composer's text in a repainted frame: what sits between the
+/// field's rule and the footer, runs of blanks folded to one space.
+pub fn composer_row_with_footer(frame: &str, footer_marker: &str) -> String {
+    let rule = frame
+        .rfind('\u{2500}')
+        .map_or(0, |at| at + '\u{2500}'.len_utf8());
+    let after = &frame[rule..];
+    let footer = after.find(footer_marker).unwrap_or(after.len());
+    after[..footer]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// What sits above the composer's rule in a repainted frame: transcript
+/// rows and, while a turn runs, the status strip with the queue preview.
+pub fn above_rule(frame: &str) -> String {
+    let rule = frame.rfind('\u{2500}').unwrap_or(frame.len());
+    frame[..rule].to_string()
+}
+
+/// The placeholder is on screen: the composer holds no draft.
+pub fn shows_placeholder(flat: &str) -> bool {
+    flat.contains("Typeapromptora.command") || flat.contains("Typeapromptora/command")
+}
+
+/// Clears a prefilled draft without risking the idle-empty Ctrl+C quit.
+/// The frame is read after a real resize (a width the tests never park
+/// on, alternating so two calls in a row both repaint).
+pub fn clear_any_draft(pty: &mut Pty) {
+    static TOGGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let odd = TOGGLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+    let frame = repainted_frame_after_resize(pty, 60, if odd { 98 } else { 99 });
+    if !shows_placeholder(&squeezed(&frame)) {
+        pty.send(CTRL_C).unwrap();
+        pty.read_for(Duration::from_millis(500));
+    }
+}
+
+/// Esc Esc on the idle empty composer; returns the offset the picker was
+/// asked at, with the band on screen.
+pub fn open_rewind_picker(pty: &mut Pty) -> usize {
+    let picker_at = pty.raw().len();
+    pty.send(b"\x1b").unwrap();
+    pty.read_for(Duration::from_millis(150));
+    pty.send(b"\x1b").unwrap();
+    pty.wait_for_after("Rewind to", picker_at, PTY_DEADLINE)
+        .expect("Esc Esc did not open the rewind picker");
+    pty.read_for(HOTKEY_GAP);
+    picker_at
+}
+
+/// The picker's band below its header in a repainted frame.
+pub fn picker_band(frame: &str) -> String {
+    frame.split("Rewind to").nth(1).unwrap_or("").to_string()
+}
+
+/// A frame with the picker on it: a forced repaint at `cols`, or what
+/// the picker painted when it opened if the resize was coalesced away.
+pub fn picker_frame(pty: &mut Pty, picker_at: usize, cols: u16) -> String {
+    let frame = repainted_frame_after_resize(pty, 60, cols);
+    if frame.contains("Rewind to") {
+        frame
+    } else {
+        since(pty, picker_at)
+    }
+}
+
+/// Runs a dry-run exchange and waits for its user cell.
+pub fn dry_run_exchange(pty: &mut Pty, prompt: &str) {
+    let at = pty.raw().len();
+    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
+    wait_for_squeezed_after(pty, &format!("> {prompt}"), at, "the exchange");
+    pty.read_for(Duration::from_millis(2500));
+}
+
+/// Runs an exchange against the fake model and waits for its reply.
+pub fn fake_exchange(pty: &mut Pty, prompt: &str, reply: &str) {
+    let at = pty.raw().len();
+    pty.send(format!("{prompt}\r").as_bytes()).unwrap();
+    wait_for_squeezed_after(pty, reply, at, &format!("the reply to `{prompt}`"));
+    pty.read_for(Duration::from_millis(1200));
+}
+
+/// `.session <name>` on the idle composer. After an exchange the REPL
+/// asks whether the new session should incorporate the last question and
+/// answer: that Confirm is answered `n` past the idle gate. Returns once
+/// a fully repainted footer carries the name (an incremental repaint
+/// skips the cells the old footer shared with the new one).
+pub fn start_session(pty: &mut Pty, name: &str) {
+    static TOGGLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let at = pty.raw().len();
+    pty.send(format!(".session {name}\r").as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    let question = squeezed("incorporates the last question and answer?");
+    let token = squeezed(&format!("{name} . agents"));
+    let mut answered = false;
+    loop {
+        pty.read_for(Duration::from_millis(300));
+        let text = squeezed(&since(pty, at));
+        if !answered && text.contains(&question) {
+            pty.read_for(HOTKEY_GAP);
+            pty.send(b"n").unwrap();
+            answered = true;
+            pty.read_for(Duration::from_millis(800));
+        }
+        let odd = TOGGLE.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        let frame = repainted_frame_after_resize(pty, 60, if odd { 100 } else { 101 });
+        let flat = squeezed(&frame);
+        if flat.contains(&token) {
+            assert!(
+                !flat.contains(&question) && shows_placeholder(&flat),
+                "the session question is still up or the composer is not idle after `.session {name}`:\n{frame}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the footer's `{name}` session token never appeared:\n{}",
+            since(pty, at)
+        );
+    }
+    pty.read_for(Duration::from_millis(400));
+}
+
+/// The composer takes a command again: `.info` renders its table.
+pub fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
+    pty.send(b".info\r").unwrap();
+    pty.wait_for_after("log_path", after, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("keys were not handled after {what}: {e}"));
+    pty.read_for(Duration::from_millis(300));
+}
+
+/// Waits for the terminal to be handed away and taken back: alt-screen
+/// leave, re-enter and bracketed paste back on. Returns the re-entry
+/// offset.
+pub fn wait_for_lend_and_return(pty: &mut Pty, from: usize, what: &str) -> usize {
+    let left = pty
+        .wait_for_raw(LEAVE_ALT, from, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("{what} did not release the terminal: {e}"));
+    let re_entered = pty
+        .wait_for_raw(ENTER_ALT, left, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("after {what} the alternate screen was not re-entered: {e}"));
+    pty.wait_for_raw(PASTE_ON, re_entered, PTY_DEADLINE)
+        .unwrap_or_else(|e| panic!("after {what} bracketed paste was not re-enabled: {e}"));
+    pty.read_for(Duration::from_millis(300));
+    re_entered
+}
+
+/// Sends one key and lets the parser see it alone (Esc must not be
+/// glued to the next byte).
+pub fn key(pty: &mut Pty, bytes: &[u8]) {
+    pty.send(bytes).unwrap();
+    pty.read_for(Duration::from_millis(250));
+}
+
+/// Files under `dir` (outside the cache) carrying `name` in their path.
+pub fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    walk(dir)
+        .into_iter()
+        .filter(|path| !path.to_string_lossy().contains("/cache/"))
+        .filter(|path| path.to_string_lossy().contains(name))
+        .collect()
+}
+
+/// The pid a script wrote to `path`. The file is created empty before
+/// the pid lands in it, so an empty or partial read is retried until the
+/// deadline.
+pub fn wait_for_pid_in(pty: &mut Pty, path: &Path, what: &str) -> i32 {
+    let deadline = std::time::Instant::now() + PTY_DEADLINE;
+    loop {
+        if let Some(pid) = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        let text = pty.read_for(Duration::from_millis(50));
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: no pid landed in {}:\n{text}",
+            path.display()
+        );
+    }
+}
+
+/// Waits up to `limit` for `pid` to be gone; true when it is.
+pub fn wait_for_process_gone(pid: i32, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    while alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    true
+}
+
+/// The sleepers a test forked and has not yet seen die. A pid proven
+/// gone is taken out at once, since a freed pid may be someone else's
+/// by now; the rest are killed only when the test panics, so a failed
+/// assertion leaves none behind.
+pub struct SleeperPids(pub Vec<i32>);
+
+impl SleeperPids {
+    pub fn forget(&mut self, pid: i32) {
+        self.0.retain(|&held| held != pid);
+    }
+}
+
+impl Drop for SleeperPids {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        for &pid in &self.0 {
+            // SAFETY: kill takes a pid and a signal number and touches no memory.
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}

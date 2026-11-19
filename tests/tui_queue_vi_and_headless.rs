@@ -7,128 +7,16 @@
 
 mod common;
 
+use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use common::fake_llm::{Chunk, FakeLlm, Reply};
-use common::pty::{Pty, strip_ansi};
+use common::pty::Pty;
+use common::tui_harness::*;
 use serial_test::serial;
-
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Past both idle gates (1 s from the last keystroke, 1 s from a modal's
-/// appearance).
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-const REPAINT_SETTLE: Duration = Duration::from_millis(500);
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The sleepers a test forked and has not yet seen die. A pid proven
-/// gone is taken out at once, since a freed pid may be someone else's
-/// by now; the rest are killed only when the test panics, so a failed
-/// assertion leaves none behind.
-struct Sleepers(Vec<i32>);
-
-impl Sleepers {
-    fn forget(&mut self, pid: i32) {
-        self.0.retain(|&held| held != pid);
-    }
-}
-
-impl Drop for Sleepers {
-    fn drop(&mut self) {
-        if !std::thread::panicking() {
-            return;
-        }
-        for &pid in &self.0 {
-            // SAFETY: kill takes a pid and a signal number and touches no memory.
-            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-queue-vi-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    fs::create_dir_all(dir.join("sessions")).unwrap();
-    dir
-}
-
-/// Dry-run config; `extra` is appended as top-level YAML.
-fn write_dry_run_config(dir: &Path, extra: &str) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             {extra}\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
-
-fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: fake:fake-model\n\
-             function_calling_support: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai-compatible\n\
-             \x20   name: fake\n\
-             \x20   api_base: '{api_base}'\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: fake-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-            api_base = fake.api_base(),
-        ),
-    )
-    .unwrap();
-}
 
 /// An agent with nothing to ask for, so `.agent <name>` switches at once.
 fn write_plain_agent(dir: &Path, name: &str) {
@@ -145,85 +33,6 @@ fn write_plain_agent(dir: &Path, name: &str) {
         ),
     )
     .unwrap();
-}
-
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-const WAIT_WRAPPER: &str =
-    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-/// The environment every spawn shares: config, cache and HOME under
-/// `dir`, the fixture bin first on PATH, no inherited COYOTE_* or colour
-/// variables.
-fn base_env(cmd: &mut Command, dir: &Path) {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR");
-}
-
-fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(
-        WAIT_WRAPPER
-            .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{args}", " --tui")
-            .replace("{stdin}", "/dev/tty")
-            .replace("{report}", TTY_REPORT),
-    );
-    base_env(&mut cmd, dir);
-    cmd.envs(extra_env.iter().copied());
-    Pty::spawn(cmd).unwrap()
-}
-
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn since(pty: &Pty, from: usize) -> String {
-    strip_ansi(&String::from_utf8_lossy(
-        &pty.raw()[from.min(pty.raw().len())..],
-    ))
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    haystack[from.min(haystack.len())..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|at| from + at)
-}
-
-fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
 /// The last `CSI r;c H` before `at`: its offset and the position it set.
@@ -246,35 +55,6 @@ fn cursor_position_before(haystack: &[u8], at: usize) -> Option<(usize, u16, u16
         end = start;
     }
     None
-}
-
-/// Every SGR parameter list (`ESC [ ... m`) in `raw`, split into numbers.
-fn sgr_params(raw: &[u8]) -> Vec<Vec<u16>> {
-    let text = String::from_utf8_lossy(raw);
-    let mut out = Vec::new();
-    let mut rest: &str = &text;
-    while let Some(start) = rest.find("\x1b[") {
-        rest = &rest[start + 2..];
-        let end = rest
-            .find(|c: char| !(('\x30'..='\x3f').contains(&c) || ('\x20'..='\x2f').contains(&c)));
-        let Some(end) = end else { break };
-        if rest.as_bytes()[end] == b'm' {
-            let params = &rest[..end];
-            if params.is_empty() {
-                out.push(vec![0]);
-            } else {
-                out.push(
-                    params
-                        .split([';', ':'])
-                        .map(|p| p.parse::<u16>().unwrap_or(u16::MAX))
-                        .collect(),
-                );
-            }
-        }
-        let final_byte = rest[end..].chars().next().map_or(1, char::len_utf8);
-        rest = &rest[end + final_byte..];
-    }
-    out
 }
 
 /// The SGR lists between the cursor move that started the run of cells
@@ -309,101 +89,6 @@ fn sets_a_foreground(params: &[Vec<u16>]) -> bool {
 
 const GREEN: u16 = 2;
 const RED: u16 = 1;
-
-/// Forces a full repaint by resizing and returns the raw offset it starts
-/// after.
-fn repaint(pty: &mut Pty, rows: u16, cols: u16) -> usize {
-    let at = pty.raw().len();
-    pty.resize(rows, cols).unwrap();
-    pty.read_for(REPAINT_SETTLE);
-    at
-}
-
-fn repainted_frame(pty: &mut Pty, rows: u16, cols: u16) -> String {
-    let at = repaint(pty, rows, cols);
-    since(pty, at)
-}
-
-/// Alternates the width (101/100) so every call is a real resize from
-/// the 100-column terminal the pty starts on, and returns the frame.
-fn next_frame(pty: &mut Pty, toggle: &mut bool) -> String {
-    *toggle = !*toggle;
-    repainted_frame(pty, 40, if *toggle { 101 } else { 100 })
-}
-
-fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    let wanted = squeezed(marker);
-    loop {
-        pty.read_for(Duration::from_millis(200));
-        let text = since(pty, from);
-        if squeezed(&text).contains(&wanted) {
-            return text;
-        }
-        assert!(Instant::now() < deadline, "{what} never appeared:\n{text}");
-    }
-}
-
-fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    while !path.exists() {
-        let text = pty.read_for(Duration::from_millis(100));
-        assert!(
-            Instant::now() < deadline,
-            "{what} ({}) never appeared:\n{}",
-            path.display(),
-            text
-        );
-    }
-}
-
-/// The composer takes a command again: `.info` renders its table.
-fn assert_composer_takes_keys(pty: &mut Pty, after: usize, what: &str) {
-    pty.send(b".info\r").unwrap();
-    pty.wait_for_after("log_path", after, PTY_DEADLINE)
-        .unwrap_or_else(|e| panic!("keys were not handled after {what}: {e}"));
-    pty.read_for(Duration::from_millis(300));
-}
-
-fn quit_and_check(pty: &mut Pty) -> String {
-    pty.send(b"\x04").unwrap();
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    transcript
-}
-
-/// Quit from a composer that may hold a draft: Ctrl+C clears a draft (or
-/// quits an idle empty composer); Ctrl+D follows if still up.
-fn quit_clearing_any_draft(pty: &mut Pty) -> String {
-    pty.send(b"\x03").unwrap();
-    let after = pty.read_for(HOTKEY_GAP);
-    if !after.contains("tty-probe-done") {
-        pty.send(b"\x04").unwrap();
-    }
-    let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
-    assert_eq!(exit_code(&transcript), 0, "{transcript}");
-    transcript
-}
-
-/// Repaints with Ctrl+L until the `pending:` strip is gone (a queued line
-/// still running) or the deadline passes.
-fn wait_until_no_pending(pty: &mut Pty) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        pty.read_for(Duration::from_millis(300));
-        let repaint_at = pty.raw().len();
-        pty.send(b"\x0c").unwrap();
-        pty.read_for(Duration::from_millis(500));
-        let repainted = since(pty, repaint_at);
-        if !repainted.contains("pending:") {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the queue strip outlived the turn:\n{repainted}"
-        );
-    }
-}
 
 /// Files under `root` (recursively) whose contents contain `needle`.
 fn files_containing(root: &Path, needle: &str) -> Vec<PathBuf> {
@@ -467,7 +152,7 @@ fn a_text_line_queued_behind_a_dot_agent_command_still_reaches_the_model() {
     pty.read_for(Duration::from_millis(500));
     pty.send(b"hello-after-agent-kq7\r").unwrap();
     pty.read_for(Duration::from_millis(800));
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     assert!(
         squeezed(&frame).contains("pending:2"),
         "the command and the text queued while the model streamed did not show `pending: 2`:\n{frame}"
@@ -542,7 +227,7 @@ fn a_text_line_queued_behind_a_dot_agent_command_still_reaches_the_model() {
 fn a_headless_macro_save_role_on_a_temp_role_writes_no_role_file() {
     let dir = fresh_config_dir("headless-save-role");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let macros = dir.join("macros");
     fs::create_dir_all(&macros).unwrap();
     fs::write(
@@ -556,8 +241,7 @@ fn a_headless_macro_save_role_on_a_temp_role_writes_no_role_file() {
     let roles = dir.join("roles");
     fs::create_dir_all(&roles).unwrap();
 
-    let mut cmd = Command::new(built_binary());
-    base_env(&mut cmd, &dir);
+    let mut cmd = ttyless_command(built_binary(), &dir);
     cmd.args(["--headless", "--macro", "temp-save", "go"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -645,7 +329,7 @@ fn a_command_prefix_followed_by_more_letters_is_painted_red_not_green() {
     for (prefix_yaml, sigil) in [("", '.'), ("command_prefix: slash\n", '/')] {
         let dir = fresh_config_dir(&format!("word-boundary-{}", sigil as u8));
         let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir, prefix_yaml);
+        write_dry_run_config_with(&dir, prefix_yaml);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
@@ -717,7 +401,7 @@ fn a_command_prefix_followed_by_more_letters_is_painted_red_not_green() {
 fn ctrl_r_recalls_an_earlier_prompt_into_the_composer_and_esc_backs_out() {
     let dir = fresh_config_dir("ctrl-r");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
@@ -742,7 +426,7 @@ fn ctrl_r_recalls_an_earlier_prompt_into_the_composer_and_esc_backs_out() {
     let opened = since(&pty, search_at);
     pty.send(b"\x1b").unwrap();
     pty.read_for(Duration::from_millis(400));
-    let frame = repainted_frame(&mut pty, 40, 101);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 101);
     assert!(
         squeezed(&frame).contains("Typeapromptora.command"),
         "after Ctrl+R then Esc the composer is not back to its empty placeholder \
@@ -762,7 +446,7 @@ fn ctrl_r_recalls_an_earlier_prompt_into_the_composer_and_esc_backs_out() {
     );
     pty.send(b"\r").unwrap();
     pty.read_for(Duration::from_millis(800));
-    let frame = repainted_frame(&mut pty, 40, 102);
+    let frame = repainted_frame_after_resize(&mut pty, 40, 102);
     let flat = squeezed(&frame);
     assert!(
         !flat.contains("Typeapromptora.command"),
@@ -801,27 +485,6 @@ fn ctrl_r_recalls_an_earlier_prompt_into_the_composer_and_esc_backs_out() {
 // The vi layer's minimum set.
 // ---------------------------------------------------------------------
 
-/// Sends one key and lets the parser see it alone (Esc must not be
-/// glued to the next byte).
-fn key(pty: &mut Pty, bytes: &[u8]) {
-    pty.send(bytes).unwrap();
-    pty.read_for(Duration::from_millis(250));
-}
-
-/// The composer's text in a repainted frame: what sits between the
-/// field's rule and the footer, runs of blanks folded to one space.
-fn composer_row(frame: &str) -> String {
-    let rule = frame
-        .rfind('\u{2500}')
-        .map_or(0, |at| at + '\u{2500}'.len_utf8());
-    let after = &frame[rule..];
-    let footer = after.find("dryrun:dry-model").unwrap_or(after.len());
-    after[..footer]
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// `keybindings: vi`: Esc leaves insert mode; `0 x` deletes the first
 /// character, `$ x` the last, `A` appends, `dd` clears the line, `i`
 /// returns to insert. Every step is observed before the verdict so one
@@ -831,7 +494,7 @@ fn composer_row(frame: &str) -> String {
 fn vi_keybindings_edit_the_composer_in_normal_mode() {
     let dir = fresh_config_dir("vi-layer");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "keybindings: vi\n");
+    write_dry_run_config_with(&dir, "keybindings: vi\n");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     let mut misses: Vec<String> = Vec::new();
@@ -922,7 +585,7 @@ fn vi_keybindings_edit_the_composer_in_normal_mode() {
 fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
     let dir = fresh_config_dir("backtick-doc");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
@@ -954,7 +617,7 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
         .trim()
         .parse()
         .unwrap();
-    let mut sleepers = Sleepers(vec![pid]);
+    let mut sleepers = SleeperPids(vec![pid]);
     pty.read_for(Duration::from_millis(1500));
     pty.send(b"\x1b").unwrap();
     let esc_at = Instant::now();
@@ -986,7 +649,7 @@ fn backtick_document_commands_never_read_the_tty_and_esc_aborts_them() {
 fn the_palette_offers_a_config_dir_macro_as_a_dot_macro_argument_cold() {
     let dir = fresh_config_dir("macro-args");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir, "");
+    write_dry_run_config_with(&dir, "");
     let macros = dir.join("macros");
     fs::create_dir_all(&macros).unwrap();
     fs::write(
@@ -1037,10 +700,10 @@ fn the_placeholder_names_the_configured_command_prefix() {
     for (prefix_yaml, sigil) in [("command_prefix: slash\n", '/'), ("", '.')] {
         let dir = fresh_config_dir(&format!("placeholder-{}", sigil as u8));
         let _guard = TempDirGuard(dir.clone());
-        write_dry_run_config(&dir, prefix_yaml);
+        write_dry_run_config_with(&dir, prefix_yaml);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
-        let frame = repainted_frame(&mut pty, 40, 101);
+        let frame = repainted_frame_after_resize(&mut pty, 40, 101);
         let flat = squeezed(&frame);
         let other = if sigil == '/' { '.' } else { '/' };
         assert!(
