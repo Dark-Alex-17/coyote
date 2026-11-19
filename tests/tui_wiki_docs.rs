@@ -1374,12 +1374,21 @@ fn session_yes_is_documented_as_covering_one_operation_or_path() {
             "fs_patch.sh",
             "guard_operation \"Apply changes?\" \"$(_to_real_path \"$argc_path\")\"",
         ),
+        (
+            "execute_sql_code.sh",
+            "guard_operation \"Execute SQL?\" \"$argc_code\"",
+        ),
     ] {
         assert!(
             asset(&["functions", "tools", tool]).contains(call),
             "{tool} names what it guards"
         );
     }
+    assert!(
+        asset(&["agents", "sql", "tools.sh"])
+            .contains("guard_operation \"Execute SQL?\" \"$argc_query\""),
+        "the sql agent's write_query names the query it guards"
+    );
 
     let Some(wiki) = wiki_dir() else { return };
     let bash = read(wiki.join("Bash-Prompt-Helpers.md"));

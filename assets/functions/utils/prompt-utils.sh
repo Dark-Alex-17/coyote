@@ -345,11 +345,13 @@ _new_line_foreach_item() {
 }
 
 # The question is printed as data, never read for backslash escapes, and with
-# control bytes other than a newline dropped, so a guarded command cannot cut
-# its own prompt short or repaint it.
+# control characters other than a newline and the bidi overrides and isolates
+# dropped, as the Python and TypeScript helpers do, so a guarded command
+# cannot cut its own prompt short, repaint it or reorder it.
 _prompt_text() {
   declare text
-  text="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\011\013-\037\177')"
+  text="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\011\013-\037\177' |
+    LC_ALL=C sed -e $'s/\xc2[\x80-\x9f]//g' -e $'s/\xe2\x80[\xaa-\xae]//g' -e $'s/\xe2\x81[\xa6-\xa9]//g')"
   printf '\033[32m?\033[0m\033[1m %s\033[0m ' "$text" >&2
 }
 
@@ -1043,8 +1045,12 @@ _to_real_path() {
     path="$(cygpath -u "$path")"
   fi
 
-  awk -v path="$path" -v pwd="$PWD" '
+  # ENVIRON, not -v: awk reads backslash escapes in a -v value, which would
+  # turn two different paths into one.
+  _TO_REAL_PATH="$path" awk '
     BEGIN {
+      path = ENVIRON["_TO_REAL_PATH"]
+      pwd = ENVIRON["PWD"]
       if (path !~ /^\//) {
         path = pwd "/" path
       }

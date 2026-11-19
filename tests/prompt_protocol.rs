@@ -116,7 +116,7 @@ fn bash_confirm_without_channel_shows_a_command_in_full() {
         .arg(format!(
             "exec </dev/null; source \"{HELPER}\"; v=\"$(confirm \"$GUARD_Q\")\"; echo \"confirm-result=$v\""
         ))
-        .env("GUARD_Q", "Run? sh-x7x\ntrue \\c; rm -rf gone-x7x")
+        .env("GUARD_Q", "Run? sh-x7x\ntrue \\c; rm \u{202E}-rf\u{0085} gone-x7x")
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -127,7 +127,11 @@ fn bash_confirm_without_channel_shows_a_command_in_full() {
     let shown = pty
         .wait_for("gone-x7x (y/N)", PTY_DEADLINE)
         .expect("the command was cut short");
-    assert!(shown.contains("true \\c; rm -rf"), "{shown}");
+    assert!(shown.contains("true \\c; rm -rf gone-x7x"), "{shown}");
+    assert!(
+        !shown.contains('\u{202E}') && !shown.contains('\u{0085}'),
+        "{shown}"
+    );
     assert!(!shown.contains("sh-x7xtrue"), "{shown}");
     pty.send(b"\x1b[5;1R").unwrap();
     pty.send(b"y").unwrap();
@@ -208,6 +212,46 @@ fn typescript_confirm_without_channel_reads_the_controlling_terminal() {
         !transcript.contains("coyote_prompt"),
         "confirm wrote a protocol line without a channel:\n{transcript}"
     );
+}
+
+/// The TypeScript guard's terminal fallback keeps the operation on its own
+/// line under the question, like the Python one.
+#[test]
+fn typescript_guard_without_channel_keeps_the_operation_on_its_own_line() {
+    let Some(runtime) = ts_runtime() else {
+        return;
+    };
+    let dir = fresh_config_dir("tty-ts-guard");
+    let _guard = TempDirGuard(dir.clone());
+    let helper = dir.join("prompt-utils.ts");
+    fs::copy(TS_HELPER, &helper).unwrap();
+    let driver = dir.join("driver.ts");
+    fs::write(
+        &driver,
+        "import { pathToFileURL } from \"node:url\";\n\
+         const prompt = await import(pathToFileURL(process.argv[2]).href);\n\
+         prompt.guardOperation(\"Run? ts-x7x\", \"ls op-x7x\");\n\
+         console.log(\"guard-passed\");\n",
+    )
+    .unwrap();
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
+            driver.display(),
+            helper.display()
+        ))
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let shown = pty.wait_for("op-x7x (y/N)", PTY_DEADLINE).unwrap();
+    assert!(!shown.contains("ts-x7xls"), "{shown}");
+    pty.send(b"y\n").unwrap();
+    pty.wait_for("guard-passed", PTY_DEADLINE).unwrap();
 }
 
 const TUI_NO_CHANNEL: &str = "prompts are not available in the TUI without the reply channel";

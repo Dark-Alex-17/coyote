@@ -3853,7 +3853,43 @@ echo "$ans" >> "$LLM_OUTPUT""#,
                 &dir.join("100%s.txt").to_string_lossy(),
                 &dir.join("100%d.txt").to_string_lossy(),
             );
+
+            // A backslash in a name is kept, not read as an escape, so
+            // `a\qb` and `aqb` are two paths.
+            check_session_yes_covers_one_operation(
+                "fs_write",
+                |path, io| {
+                    fs::write(path, "old\n").unwrap();
+                    run_shipped("fs_write", json!({"path": path, "content": "new\n"}), io)
+                },
+                &dir.join("a\\qb.txt").to_string_lossy(),
+                &dir.join("aqb.txt").to_string_lossy(),
+            );
             fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        #[serial]
+        fn shipped_execute_sql_code_session_yes_covers_only_that_statement() {
+            require_tools();
+            let _guard = TestConfigDirGuard::new("prompt-shipped-sql-session");
+            // A stand-in for the database client, so only the guard runs.
+            install_tool(
+                "execute_sql_code",
+                &format!(
+                    "unset AUTO_CONFIRM LLM_AGENT_VAR_AUTO_CONFIRM\n\
+                     export LLM_PROMPT_UTILS_FILE=\"{HELPER}\"\n\
+                     usql() {{ echo ran; }}\n\
+                     source \"{TOOLS}/execute_sql_code.sh\"\nmain"
+                ),
+            );
+
+            check_session_yes_covers_one_operation(
+                "execute_sql_code",
+                |code, io| run_shipped("execute_sql_code", json!({"code": code}), io),
+                "delete from one_x7x",
+                "delete from two_x7x",
+            );
         }
 
         #[test]
