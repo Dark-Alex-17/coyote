@@ -74,12 +74,23 @@ impl ReplCompleter {
             let span = Span::new(parts[parts_len - 1].1, pos);
             let args_line = &line[parts[1].1..];
             let args: Vec<&str> = parts.iter().skip(1).map(|(v, _)| *v).collect();
-            suggestions.extend(ctx.repl_complete(cmd, &args, args_line).iter().map(
-                |(value, description)| {
-                    let description = description.as_deref().unwrap_or_default();
-                    create_suggestion(value, description, span)
-                },
-            ))
+            let values = ctx.repl_complete(cmd, &args, args_line);
+            let kind_width = values
+                .iter()
+                .filter_map(|(_, _, kind)| kind.map(str::len))
+                .max();
+            suggestions.extend(values.iter().map(|(value, description, kind)| {
+                let description = description.as_deref().unwrap_or_default();
+                // The columnar menu draws only the value and the description,
+                // so the kind leads the description, padded to line up.
+                let description = match kind_width {
+                    Some(width) => format!("{:width$}  {description}", kind.unwrap_or_default())
+                        .trim_end()
+                        .to_string(),
+                    None => description.to_string(),
+                };
+                create_suggestion(value, &description, span)
+            }))
         }
 
         if suggestions.is_empty() {
@@ -335,6 +346,61 @@ mod prefix_tests {
     fn dot_token_keeps_dot_under_both() {
         let values = values(CommandPrefix::Both, ".in");
         assert!(values.contains(&".info ".to_string()), "{values:?}");
+    }
+
+    #[test]
+    fn agent_is_offered_with_function_calling_in_the_state() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            command_prefix: CommandPrefix::Slash,
+            function_calling_support: true,
+            ..Default::default()
+        });
+        let ctx = RequestContext::new(Arc::new(app), WorkingMode::Repl);
+        assert!(ctx.state().contains(StateFlags::FUNCTION_CALLING));
+        let mut completer = ReplCompleter::new(Arc::new(RwLock::new(ctx)));
+        let values: Vec<String> = completer
+            .suggestions_for("/ag", 3)
+            .into_iter()
+            .map(|s| s.value)
+            .collect();
+        assert!(values.contains(&"/agent ".to_string()), "{values:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn agent_argument_descriptions_lead_with_the_padded_kind() {
+        let _guard = TestConfigDirGuard::new("completer-agent-kinds");
+        let agent = "kinds-agent";
+        let graph = crate::config::paths::agent_graph_file(agent);
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        std::fs::write(
+            &graph,
+            "name: kinds-agent\nsession:\n  chat:\n    instructions: Answer.\nvariables:\n  - name: topic\n    description: What to cover\nstart: done\nnodes:\n  done:\n    type: end\n    output: done\n",
+        )
+        .unwrap();
+        let sessions = crate::config::paths::agent_sessions_dir(agent);
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("s.yaml"), "model: x\n").unwrap();
+
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        let mut completer = ReplCompleter::new(Arc::new(RwLock::new(ctx)));
+        let line = format!(".agent {agent} ");
+        let rows: Vec<(String, Option<String>)> = completer
+            .suggestions_for(&line, line.len())
+            .into_iter()
+            .map(|s| (s.value, s.description))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("s".to_string(), Some("session   global".to_string())),
+                (
+                    "topic=".to_string(),
+                    Some("variable  What to cover".to_string())
+                ),
+            ]
+        );
     }
 
     #[test]

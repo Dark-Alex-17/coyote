@@ -1034,7 +1034,6 @@ pub enum AssertState {
     True(StateFlags),
     False(StateFlags),
     TrueFalse(StateFlags, StateFlags),
-    Equal(StateFlags),
 }
 
 impl AssertState {
@@ -1042,8 +1041,16 @@ impl AssertState {
         AssertState::False(StateFlags::empty())
     }
 
+    /// No role, session, RAG or agent is active. Capability flags such as
+    /// `FUNCTION_CALLING` describe the config, not the context, and are ignored.
     pub fn bare() -> Self {
-        AssertState::Equal(StateFlags::empty())
+        AssertState::False(
+            StateFlags::ROLE
+                | StateFlags::SESSION_EMPTY
+                | StateFlags::SESSION
+                | StateFlags::RAG
+                | StateFlags::AGENT,
+        )
     }
 
     pub fn assert(self, flags: StateFlags) -> bool {
@@ -1054,7 +1061,6 @@ impl AssertState {
                 (true_flags & flags != StateFlags::empty())
                     && (false_flags & flags == StateFlags::empty())
             }
-            AssertState::Equal(check_flags) => check_flags == flags,
         }
     }
 }
@@ -1897,12 +1903,36 @@ hooks:
     }
 
     #[test]
-    fn assert_state_bare_only_empty() {
+    fn assert_state_bare_rejects_any_context() {
         let bare = AssertState::bare();
 
         assert!(bare.assert(StateFlags::empty()));
-        assert!(!bare.assert(StateFlags::ROLE));
-        assert!(!bare.assert(StateFlags::SESSION));
+        for flag in [
+            StateFlags::ROLE,
+            StateFlags::SESSION_EMPTY,
+            StateFlags::SESSION,
+            StateFlags::AGENT,
+            StateFlags::RAG,
+        ] {
+            assert!(!bare.assert(flag), "{flag:?}");
+        }
+    }
+
+    #[test]
+    fn assert_state_bare_ignores_capability_flags() {
+        let bare = AssertState::bare();
+        let capabilities =
+            StateFlags::FUNCTION_CALLING | StateFlags::AUTO_CONTINUE | StateFlags::SKILLS_ENABLED;
+
+        assert!(bare.assert(capabilities));
+        for flag in [
+            StateFlags::ROLE,
+            StateFlags::SESSION,
+            StateFlags::AGENT,
+            StateFlags::RAG,
+        ] {
+            assert!(!bare.assert(capabilities | flag), "{flag:?}");
+        }
     }
 
     #[test]
@@ -1956,16 +1986,6 @@ hooks:
         assert!(!state.assert(StateFlags::empty()));
         assert!(!state.assert(StateFlags::SESSION));
         assert!(!state.assert(StateFlags::ROLE | StateFlags::SESSION));
-    }
-
-    #[test]
-    fn assert_state_equal_exact_match() {
-        let state = AssertState::Equal(StateFlags::ROLE | StateFlags::SESSION);
-
-        assert!(state.assert(StateFlags::ROLE | StateFlags::SESSION));
-        assert!(!state.assert(StateFlags::ROLE));
-        assert!(!state.assert(StateFlags::SESSION));
-        assert!(!state.assert(StateFlags::empty()));
     }
 
     #[tokio::test]

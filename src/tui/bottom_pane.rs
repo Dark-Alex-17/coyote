@@ -4,10 +4,10 @@
 //! prompt modal is not a view: a question outranks all of them and closes
 //! whatever is open.
 
-use super::DIM;
 use super::cells::{Cell, RewindBarrier};
 use super::history::ComposerHistory;
 use super::roster::RosterState;
+use super::{DIM, PALETTE_DESCRIPTION, PALETTE_KIND, PALETTE_NAME, PALETTE_SELECTED};
 use crate::config::{CommandPrefix, RequestContext, StateFlags};
 use crate::repl::{command_candidates, macro_candidates, split_line};
 use ratatui::buffer::Buffer;
@@ -101,6 +101,8 @@ impl PaletteSnapshot {
 pub(super) struct PaletteRow {
     /// The text that replaces the typed token when the row is accepted.
     pub(super) value: String,
+    /// What the value names (`agent`, `session`, ...), when known.
+    pub(super) kind: Option<&'static str>,
     pub(super) description: String,
 }
 
@@ -160,8 +162,9 @@ impl PaletteState {
             let args_line = &line[parts[1].1..];
             let args: Vec<&str> = parts.iter().skip(1).map(|(v, _)| *v).collect();
             rows.extend(ctx.repl_complete(cmd, &args, args_line).into_iter().map(
-                |(value, description)| PaletteRow {
+                |(value, description, kind)| PaletteRow {
                     value,
+                    kind,
                     description: description.unwrap_or_default(),
                 },
             ));
@@ -183,6 +186,7 @@ impl PaletteState {
                         let verb = command.name().strip_prefix(group.as_str())?;
                         Some(PaletteRow {
                             value: format!("{verb} "),
+                            kind: None,
                             description: command.description().to_string(),
                         })
                     }),
@@ -193,6 +197,7 @@ impl PaletteState {
                     .into_iter()
                     .map(|command| PaletteRow {
                         value: format!("{} ", with_sigil(command.name())),
+                        kind: None,
                         description: command.description().to_string(),
                     }),
             );
@@ -205,6 +210,7 @@ impl PaletteState {
             );
             rows.extend(macros.into_iter().map(|(name, description)| PaletteRow {
                 value: format!("{} ", with_sigil(&name)),
+                kind: None,
                 description: description.to_string(),
             }));
         }
@@ -403,12 +409,50 @@ impl RewindState {
     }
 }
 
+/// How a list's columns and its highlighted row are painted.
+struct RowStyles {
+    name: Style,
+    kind: Style,
+    description: Style,
+    highlight: Style,
+}
+
+const PLAIN_ROWS: RowStyles = RowStyles {
+    name: Style::new(),
+    kind: DIM,
+    description: DIM,
+    highlight: Style::new().add_modifier(Modifier::REVERSED),
+};
+
+const PALETTE_ROWS: RowStyles = RowStyles {
+    name: PALETTE_NAME,
+    kind: PALETTE_KIND,
+    description: PALETTE_DESCRIPTION,
+    highlight: PALETTE_SELECTED,
+};
+
 /// Draws a list's rows: the first column padded to its widest entry,
-/// the second dim after it, the highlighted row reversed. Given fewer
-/// rows than the list has, the band keeps the highlight in view and
-/// ends with how many rows are not shown.
+/// the second dim after it, the highlighted row reversed.
 pub(super) fn render_rows(
     rows: &[(&str, &str)],
+    highlight: Option<usize>,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    let rows: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|&(name, description)| (name, "", description))
+        .collect();
+    render_columns(&rows, &PLAIN_ROWS, highlight, area, buf);
+}
+
+/// Draws rows of name, kind and description, each column padded to its
+/// widest entry; the kind column is left out when no shown row has one.
+/// Given fewer rows than the list has, the band keeps the highlight in
+/// view and ends with how many rows are not shown.
+fn render_columns(
+    rows: &[(&str, &str, &str)],
+    styles: &RowStyles,
     highlight: Option<usize>,
     area: Rect,
     buf: &mut Buffer,
@@ -424,22 +468,32 @@ pub(super) fn render_rows(
     let visible = &rows[start..(start + shown).min(rows.len())];
     let name_width = visible
         .iter()
-        .map(|(name, _)| name.width())
+        .map(|(name, _, _)| name.width())
         .max()
         .unwrap_or(0);
-    for (offset, (name, description)) in visible.iter().enumerate() {
+    let kind_width = visible
+        .iter()
+        .map(|(_, kind, _)| kind.width())
+        .max()
+        .unwrap_or(0);
+    for (offset, (name, kind, description)) in visible.iter().enumerate() {
         let y = area.y + u16::try_from(offset).unwrap_or(u16::MAX);
         let line_area = Rect::new(area.x, y, area.width, 1);
         // `{:<n$}` pads by characters; a wide glyph takes two columns.
         let pad = name_width.saturating_sub(name.width());
-        let line = Line::from(vec![
-            Span::raw(format!("{name}{:pad$}", "")),
+        let mut spans = vec![
+            Span::styled(format!("{name}{:pad$}", ""), styles.name),
             Span::raw("  "),
-            Span::styled(*description, DIM),
-        ]);
-        Paragraph::new(line).render(line_area, buf);
+        ];
+        if kind_width > 0 {
+            let pad = kind_width.saturating_sub(kind.width());
+            spans.push(Span::styled(format!("{kind}{:pad$}", ""), styles.kind));
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*description, styles.description));
+        Paragraph::new(Line::from(spans)).render(line_area, buf);
         if highlight == Some(start + offset) {
-            buf.set_style(line_area, Style::new().add_modifier(Modifier::REVERSED));
+            buf.set_style(line_area, styles.highlight);
         }
     }
     if clipped {
@@ -461,19 +515,34 @@ pub(super) fn render_header(line: Line<'_>, area: Rect, buf: &mut Buffer) -> Rec
     Rect::new(area.x, area.y + 1, area.width, area.height - 1)
 }
 
-/// The palette's band: `name` padded to a column, the description dim
-/// after it.
-pub(super) struct PaletteView<'a>(pub(super) &'a PaletteState);
+/// The palette's band: `name` padded to a column, then the kind when a
+/// row has one, then the description, in the REPL's colours unless
+/// `no_color` is set.
+pub(super) struct PaletteView<'a> {
+    pub(super) state: &'a PaletteState,
+    pub(super) no_color: bool,
+}
 
 impl Widget for PaletteView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let rows: Vec<(&str, &str)> = self
-            .0
+        let rows: Vec<(&str, &str, &str)> = self
+            .state
             .rows
             .iter()
-            .map(|row| (row.value.trim_end(), row.description.as_str()))
+            .map(|row| {
+                (
+                    row.value.trim_end(),
+                    row.kind.unwrap_or_default(),
+                    row.description.as_str(),
+                )
+            })
             .collect();
-        render_rows(&rows, self.0.highlight, area, buf);
+        let styles = if self.no_color {
+            &PLAIN_ROWS
+        } else {
+            &PALETTE_ROWS
+        };
+        render_columns(&rows, styles, self.state.highlight, area, buf);
     }
 }
 
@@ -529,6 +598,7 @@ mod tests {
     use crate::repl::ReplCompleter;
     use crate::testing::TestConfigDirGuard;
     use parking_lot::RwLock;
+    use ratatui::style::Color;
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -538,6 +608,7 @@ mod tests {
                 .iter()
                 .map(|value| PaletteRow {
                     value: format!("{value} "),
+                    kind: None,
                     description: format!("about {value}"),
                 })
                 .collect(),
@@ -719,6 +790,40 @@ mod tests {
         assert!(set.contains("highlight"), "{set:?}");
     }
 
+    /// Function calling is in the state of a default context, and `.agent`
+    /// is still offered: once it is complete, a space moves the palette
+    /// to its argument, the agent names.
+    #[test]
+    #[serial]
+    fn the_palette_offers_agent_and_then_its_agents() {
+        let _guard = TestConfigDirGuard::new("palette-agent");
+        let agent_dir = crate::config::paths::agent_data_dir("palette-agent-x");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let ctx = ctx_with(CommandPrefix::Slash, true);
+        assert!(ctx.state().contains(StateFlags::FUNCTION_CALLING));
+
+        let names = palette_names(&ctx, "/ag");
+        assert!(names.contains("/agent"), "{names:?}");
+
+        let snapshot = PaletteSnapshot::from_ctx(&ctx);
+        let agents =
+            PaletteState::build("/agent ", CommandPrefix::Slash, snapshot, &[], Some(&ctx))
+                .expect("the agents are rows");
+        assert_eq!(agents.token_range, 7..7);
+        assert!(
+            agents
+                .rows
+                .iter()
+                .any(|row| row.value == "palette-agent-x" && row.kind == Some("agent")),
+            "{agents:?}"
+        );
+        assert!(agents.rows.iter().all(|row| !row.value.starts_with('/')));
+        assert!(
+            PaletteState::build("/agent ", CommandPrefix::Slash, snapshot, &[], None).is_none(),
+            "at the argument position no command rows come back"
+        );
+    }
+
     /// `.keys` is the TUI's own command, not the REPL's, so the palette
     /// built from the REPL's table does not offer it, while a prefix of a
     /// REPL command still finds that command. A macro named `keys` takes
@@ -863,6 +968,7 @@ mod tests {
         palette.token_range = 6..7;
         palette.rows[1] = PaletteRow {
             value: "coder".to_string(),
+            kind: None,
             description: String::new(),
         };
         assert_eq!(palette.accept(".role c").as_deref(), Some(".role coder"));
@@ -882,35 +988,88 @@ mod tests {
         assert_eq!(palette.accept(".info"), None);
     }
 
-    fn rendered(palette: &PaletteState, height: u16) -> (Buffer, Vec<String>) {
+    fn rendered_with(palette: &PaletteState, height: u16, no_color: bool) -> (Buffer, Vec<String>) {
         let area = Rect::new(0, 0, 30, height);
         let mut buf = Buffer::empty(area);
-        PaletteView(palette).render(area, &mut buf);
-        let lines = (0..height)
-            .map(|y| {
-                (0..30)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect();
+        PaletteView {
+            state: palette,
+            no_color,
+        }
+        .render(area, &mut buf);
+        let lines = buffer_lines(&buf, 30, height);
         (buf, lines)
     }
 
+    fn rendered(palette: &PaletteState, height: u16) -> (Buffer, Vec<String>) {
+        rendered_with(palette, height, false)
+    }
+
     #[test]
-    fn rows_pad_the_name_column_and_reverse_the_highlight() {
+    fn rows_pad_the_name_column_in_the_repl_colours() {
         let mut palette = rows(&[".a", ".bbb"]);
         palette.move_highlight(1);
         palette.move_highlight(1);
         assert_eq!(palette.highlight, Some(1));
         let (buf, lines) = rendered(&palette, 2);
         assert_eq!(lines, vec![".a    about .a", ".bbb  about .bbb"]);
-        assert!(!buf[(0, 0)].modifier.contains(Modifier::REVERSED));
-        assert!(buf[(0, 1)].modifier.contains(Modifier::REVERSED));
-        assert!(buf[(29, 1)].modifier.contains(Modifier::REVERSED));
-        assert!(buf[(6, 0)].modifier.contains(Modifier::DIM));
-        assert!(!buf[(0, 0)].modifier.contains(Modifier::DIM));
+        let name = &buf[(0, 0)];
+        assert_eq!(name.fg, Color::Green);
+        assert!(name.modifier.is_empty(), "{:?}", name.modifier);
+        let description = &buf[(6, 0)];
+        assert_eq!(description.fg, Color::Yellow);
+        assert!(
+            description.modifier.is_empty(),
+            "{:?}",
+            description.modifier
+        );
+        for x in [0, 6, 29] {
+            let selected = &buf[(x, 1)];
+            assert_eq!(selected.fg, Color::Green, "column {x}");
+            assert!(
+                selected
+                    .modifier
+                    .contains(Modifier::BOLD | Modifier::REVERSED),
+                "column {x}: {:?}",
+                selected.modifier
+            );
+        }
+    }
+
+    #[test]
+    fn no_color_rows_keep_the_dim_description_and_reversed_highlight() {
+        let mut palette = rows(&[".a", ".bbb"]);
+        palette.move_highlight(1);
+        let (buf, _) = rendered_with(&palette, 2, true);
+        assert_eq!(buf[(0, 1)].fg, Color::Reset);
+        assert_eq!(buf[(6, 1)].fg, Color::Reset);
+        assert!(buf[(6, 1)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::DIM));
+        assert!(buf[(0, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(buf[(29, 0)].modifier.contains(Modifier::REVERSED));
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn a_kind_column_sits_between_the_value_and_the_description() {
+        let mut palette = rows(&["helper", "model=", "x"]);
+        palette.rows[0].kind = Some("session");
+        palette.rows[1].kind = Some("variable");
+        let (buf, lines) = rendered(&palette, 3);
+        assert_eq!(
+            lines,
+            vec![
+                "helper  session   about helper",
+                "model=  variable  about model=",
+                "x                 about x",
+            ]
+        );
+        assert_eq!(buf[(8, 0)].fg, Color::Cyan);
+        assert_eq!(buf[(8, 1)].fg, Color::Cyan);
+        assert_eq!(buf[(18, 0)].fg, Color::Yellow);
+        assert_eq!(buf[(0, 0)].fg, Color::Green);
+
+        let (_, lines) = rendered(&rows(&["helper"]), 1);
+        assert_eq!(lines, vec!["helper  about helper"]);
     }
 
     #[test]

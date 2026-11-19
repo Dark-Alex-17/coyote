@@ -1651,7 +1651,9 @@ pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
     Vec::new()
 }
 
-pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
+pub fn complete_agent_variables(
+    agent_name: &str,
+) -> Vec<(String, Option<String>, Option<&'static str>)> {
     load_agent_variables(agent_name)
         .iter()
         .map(|v| {
@@ -1659,7 +1661,7 @@ pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>
                 Some(default) => format!("{} [default: {default}]", v.description),
                 None => v.description.clone(),
             };
-            (format!("{}=", v.name), Some(description))
+            (format!("{}=", v.name), Some(description), Some("variable"))
         })
         .collect()
 }

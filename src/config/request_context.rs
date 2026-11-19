@@ -5591,16 +5591,48 @@ impl RequestContext {
         }
     }
 
+    /// Completion rows for a command's arguments: the value, its
+    /// description, and the kind of thing the value names when the
+    /// branch knows it (`agent`, `session`, `variable`, ...).
     pub fn repl_complete(
         &self,
         cmd: &str,
         args: &[&str],
         _line: &str,
-    ) -> Vec<(String, Option<String>)> {
+    ) -> Vec<(String, Option<String>, Option<&'static str>)> {
         let app = self.app.config.as_ref();
-        let mut values: Vec<(String, Option<String>)> = vec![];
         let filter = args.last().unwrap_or(&"");
+        if cmd == ".agent" && args.len() >= 2 {
+            let mut values = vec![];
+            if args.len() == 2
+                && (!graph::agent_has_graph(args[0]) || graph::graph_supports_sessions(args[0]))
+            {
+                let (workspace_dir, global_dir) = session_scope_dirs(Some(args[0]));
+                values.extend(
+                    labeled_session_names(&workspace_dir, &global_dir)
+                        .into_iter()
+                        .map(|(name, scope)| {
+                            (
+                                sanitize_display_text(&name),
+                                Some(scope.to_string()),
+                                Some("session"),
+                            )
+                        }),
+                );
+            }
+            values.extend(super::complete_agent_variables(args[0]));
+            return fuzzy_filter(values, |v| v.0.as_str(), filter);
+        }
+        let mut values: Vec<(String, Option<String>)> = vec![];
+        let mut kind = None;
         if args.len() == 1 {
+            kind = match cmd {
+                ".role" => Some("role"),
+                ".model" => Some("model"),
+                ".session" => Some("session"),
+                ".agent" => Some("agent"),
+                _ => None,
+            };
             values = match cmd {
                 ".role" => super::map_completion_values(paths::list_roles(true)),
                 ".model" => list_models(app, ModelType::Chat)
@@ -6058,17 +6090,6 @@ impl RequestContext {
                 .into_iter()
                 .map(|v| (v, None))
                 .collect();
-        } else if cmd == ".agent" {
-            if args.len() == 2
-                && (!graph::agent_has_graph(args[0]) || graph::graph_supports_sessions(args[0]))
-            {
-                let (workspace_dir, global_dir) = session_scope_dirs(Some(args[0]));
-                values = labeled_session_names(&workspace_dir, &global_dir)
-                    .into_iter()
-                    .map(|(name, scope)| (sanitize_display_text(&name), Some(scope.to_string())))
-                    .collect();
-            }
-            values.extend(super::complete_agent_variables(args[0]));
         } else if cmd == ".save" && args.first() == Some(&"session") {
             if !args.contains(&"--workspace") && !args.contains(&"--global") {
                 values.push((
@@ -6085,6 +6106,10 @@ impl RequestContext {
         } else if args.len() >= 2 {
             values = self.macro_variable_completions(cmd, &args[..args.len() - 1]);
         };
+        let values = values
+            .into_iter()
+            .map(|(value, description)| (value, description, kind))
+            .collect();
         fuzzy_filter(values, |v| v.0.as_str(), filter)
     }
 
@@ -9099,7 +9124,7 @@ mod tests {
 
         assert!(SET_COMPLETION_KEYS.contains(&"command_prefix"));
         let values = ctx.repl_complete(".set", &["command_prefix", ""], "command_prefix ");
-        let names: Vec<&str> = values.iter().map(|(v, _)| v.as_str()).collect();
+        let names: Vec<&str> = values.iter().map(|(v, _, _)| v.as_str()).collect();
         assert_eq!(names, ["dot", "slash", "both"]);
     }
 
@@ -12007,7 +12032,7 @@ mod tests {
         let values = ctx.repl_complete(".uninstall", &[""], "");
 
         assert!(
-            values.iter().any(|(name, _)| name == "omc"),
+            values.iter().any(|(name, _, _)| name == "omc"),
             "got: {values:?}"
         );
     }
@@ -12036,7 +12061,7 @@ mod tests {
 
         for expected in ["agents", "omc"] {
             assert!(
-                values.iter().any(|(name, _)| name == expected),
+                values.iter().any(|(name, _, _)| name == expected),
                 "missing '{expected}'; got: {values:?}"
             );
         }
@@ -18698,8 +18723,16 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("both".to_string(), Some("workspace".to_string())),
-                ("only-global".to_string(), Some("global".to_string())),
+                (
+                    "both".to_string(),
+                    Some("workspace".to_string()),
+                    Some("session")
+                ),
+                (
+                    "only-global".to_string(),
+                    Some("global".to_string()),
+                    Some("session")
+                ),
             ]
         );
     }
@@ -18712,7 +18745,7 @@ mod tests {
             let mut names: Vec<String> = ctx
                 .repl_complete(".save", args, "")
                 .into_iter()
-                .map(|(name, _)| name)
+                .map(|(name, _, _)| name)
                 .collect();
             names.sort_unstable();
             names
@@ -18723,7 +18756,7 @@ mod tests {
         assert!(names(&["session", "--workspace", ""]).is_empty());
         assert!(names(&["session", "notes", "--global", ""]).is_empty());
 
-        for (name, description) in ctx.repl_complete(".save", &["session", ""], "") {
+        for (name, description, _) in ctx.repl_complete(".save", &["session", ""], "") {
             assert!(
                 description.as_deref().is_some_and(|d| !d.is_empty()),
                 "{name} has no description"
@@ -18967,8 +19000,16 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("both".to_string(), Some("workspace".to_string())),
-                ("only-global".to_string(), Some("global".to_string())),
+                (
+                    "both".to_string(),
+                    Some("workspace".to_string()),
+                    Some("session")
+                ),
+                (
+                    "only-global".to_string(),
+                    Some("global".to_string()),
+                    Some("session")
+                ),
             ]
         );
     }
@@ -19020,7 +19061,14 @@ mod tests {
         assert_eq!(ctx.labeled_autoname_sessions(), expected);
 
         // The fuzzy filter re-sorts by score, so only membership is checked here.
-        let mut completed = ctx.repl_complete(".session", &["_/"], "");
+        let mut completed: Vec<(String, Option<String>)> = ctx
+            .repl_complete(".session", &["_/"], "")
+            .into_iter()
+            .map(|(name, label, kind)| {
+                assert_eq!(kind, Some("session"), "{name}");
+                (name, label)
+            })
+            .collect();
         completed.sort_unstable();
         let mut expected_sorted = expected;
         expected_sorted.sort_unstable();
@@ -19366,7 +19414,11 @@ mod tests {
         );
         assert_eq!(
             ctx.repl_complete(".session", &[""], ""),
-            vec![("solo".to_string(), Some("global".to_string()))]
+            vec![(
+                "solo".to_string(),
+                Some("global".to_string()),
+                Some("session")
+            )]
         );
 
         // Load existing, save, exit: all global, no workspace dir materialises.
@@ -19638,7 +19690,11 @@ mod tests {
         let values = ctx.repl_complete(".session", &[""], "");
         assert_eq!(
             values,
-            vec![("evilred".to_string(), Some("workspace".to_string()))]
+            vec![(
+                "evilred".to_string(),
+                Some("workspace".to_string()),
+                Some("session")
+            )]
         );
     }
 
@@ -23861,13 +23917,6 @@ mod tests {
         );
     }
 
-    fn scoped_session_rows(values: &[(String, Option<String>)]) -> Vec<&(String, Option<String>)> {
-        values
-            .iter()
-            .filter(|(_, label)| matches!(label.as_deref(), Some("workspace") | Some("global")))
-            .collect()
-    }
-
     #[test]
     #[serial]
     fn repl_complete_agent_sessions_lists_both_scopes_for_a_block_graph_agent() {
@@ -23889,8 +23938,16 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("global".to_string(), Some("global".to_string())),
-                ("ws".to_string(), Some("workspace".to_string())),
+                (
+                    "global".to_string(),
+                    Some("global".to_string()),
+                    Some("session")
+                ),
+                (
+                    "ws".to_string(),
+                    Some("workspace".to_string()),
+                    Some("session")
+                ),
             ]
         );
     }
@@ -23915,10 +23972,69 @@ mod tests {
 
         let values = ctx.repl_complete(".agent", &[&agent_name, ""], "");
 
-        assert!(scoped_session_rows(&values).is_empty(), "{values:?}");
         assert!(
-            values.contains(&("topic=".to_string(), Some("What to cover".to_string()))),
+            values.iter().all(|(_, _, kind)| *kind != Some("session")),
             "{values:?}"
+        );
+        assert!(
+            values.contains(&(
+                "topic=".to_string(),
+                Some("What to cover".to_string()),
+                Some("variable")
+            )),
+            "{values:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_rows_carry_their_kind() {
+        let _guard = HelperConfigDirGuard::new();
+        let agent_name = unique_name("test_kinds_graph_agent");
+        write_graph_agent(
+            &agent_name,
+            &format!(
+                "{GRAPH_SESSION_BLOCK}variables:\n  - name: topic\n    description: What to cover\n"
+            ),
+        );
+        let ctx = create_test_ctx();
+        let dir = paths::agent_sessions_dir(&agent_name);
+        create_dir_all(&dir).unwrap();
+        write(dir.join("s.yaml"), "model: x\n").unwrap();
+
+        let agents = ctx.repl_complete(".agent", &[""], "");
+        assert!(
+            agents
+                .iter()
+                .any(|(name, _, kind)| *name == agent_name && *kind == Some("agent")),
+            "{agents:?}"
+        );
+        assert!(
+            agents.iter().all(|(_, _, kind)| *kind == Some("agent")),
+            "{agents:?}"
+        );
+
+        let values = ctx.repl_complete(".agent", &[&agent_name, ""], "");
+        assert_eq!(
+            values,
+            vec![
+                ("s".to_string(), Some("global".to_string()), Some("session")),
+                (
+                    "topic=".to_string(),
+                    Some("What to cover".to_string()),
+                    Some("variable")
+                ),
+            ]
+        );
+
+        let narrowed = ctx.repl_complete(".agent", &[&agent_name, "top"], "");
+        assert_eq!(
+            narrowed,
+            vec![(
+                "topic=".to_string(),
+                Some("What to cover".to_string()),
+                Some("variable")
+            )]
         );
     }
 
@@ -23965,8 +24081,16 @@ mod tests {
         assert_eq!(
             values,
             vec![
-                ("global".to_string(), Some("global".to_string())),
-                ("ws".to_string(), Some("workspace".to_string())),
+                (
+                    "global".to_string(),
+                    Some("global".to_string()),
+                    Some("session")
+                ),
+                (
+                    "ws".to_string(),
+                    Some("workspace".to_string()),
+                    Some("session")
+                ),
             ]
         );
     }
@@ -35023,11 +35147,11 @@ mod tests {
         let values = ctx.repl_complete(".info", &["mcp-server", ""], "");
 
         assert!(
-            values.iter().any(|(name, _)| name == "fixture"),
+            values.iter().any(|(name, _, _)| name == "fixture"),
             "running server must be offered, got: {values:?}"
         );
         assert!(
-            !values.iter().any(|(name, _)| name == "gh"),
+            !values.iter().any(|(name, _, _)| name == "gh"),
             "configured-but-not-running server must not be offered, got: {values:?}"
         );
     }

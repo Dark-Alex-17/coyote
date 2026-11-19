@@ -320,6 +320,16 @@ const IDLE_STATUS_WITH_HELP: &str = "? = keys  Alt+T = tasks  Ctrl+X = todo";
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
 const IDLE_HINT: Style = DIM.add_modifier(Modifier::ITALIC);
+/// The completion popup in the REPL's colours: command names green as its
+/// highlighter paints a known command, descriptions yellow and the
+/// selected row green, bold and reversed as its completion menu draws them.
+const PALETTE_NAME: Style = Style::new().fg(Color::Green);
+const PALETTE_KIND: Style = Style::new().fg(Color::Cyan);
+const PALETTE_DESCRIPTION: Style = Style::new().fg(Color::Yellow);
+const PALETTE_SELECTED: Style = Style::new()
+    .fg(Color::Green)
+    .add_modifier(Modifier::BOLD)
+    .add_modifier(Modifier::REVERSED);
 
 /// The UI's own fixed colours. `no_color` keeps the attributes and drops
 /// the colour, which is what `NO_COLOR` asks for.
@@ -3284,7 +3294,13 @@ impl App {
                 .areas(bottom);
                 match &self.view {
                     View::Composer => frame.render_widget(QueuedPreview(&self.queued), band),
-                    View::Palette(palette) => frame.render_widget(PaletteView(palette), band),
+                    View::Palette(palette) => frame.render_widget(
+                        PaletteView {
+                            state: palette,
+                            no_color: self.renderer.no_color,
+                        },
+                        band,
+                    ),
                     View::HistorySearch(search) => frame.render_widget(SearchView(search), band),
                     View::Rewind(rewind) => frame.render_widget(RewindView(rewind), band),
                     View::Roster(roster) => frame.render_widget(
@@ -8732,7 +8748,13 @@ mod tests {
             ),
             (
                 "palette band",
-                Box::new(|area, buf| PaletteView(&palette).render(area, buf)),
+                Box::new(|area, buf| {
+                    PaletteView {
+                        state: &palette,
+                        no_color: false,
+                    }
+                    .render(area, buf)
+                }),
             ),
             (
                 "search band",
@@ -8941,8 +8963,9 @@ mod tests {
 
     /// Seeded from the context, the first `.` lists what the context
     /// allows, the rows the REPL completer gives: the tool and skill
-    /// commands a bare state hides, and not the `.agent` a bare state
-    /// alone offers.
+    /// commands a state without function calling hides, and `.agent`,
+    /// since function calling and skills are capabilities, not an active
+    /// role, session, RAG or agent.
     #[test]
     fn the_palette_seeded_from_the_context_lists_what_the_context_allows() {
         let mut ctx = chat_ctx();
@@ -8957,10 +8980,9 @@ mod tests {
             .iter()
             .map(|row| row.value.trim_end())
             .collect();
-        for present in [".info tools", ".skill load", ".tool enable"] {
+        for present in [".info tools", ".skill load", ".tool enable", ".agent"] {
             assert!(rows.contains(&present), "{present} missing from {rows:?}");
         }
-        assert!(!rows.contains(&".agent"), "{rows:?}");
     }
 
     #[test]
