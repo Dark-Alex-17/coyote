@@ -4,14 +4,21 @@
 //! below, and a chip offers the way back (and counts them) until the
 //! view follows again.
 
-use super::cells::Cell;
+use super::cells::{
+    self, AgentStatus, Cell, FoldedCall, FullOutput, JobStatus, LineCache, OutputTarget,
+    ToolStatus, append_output,
+};
 use super::render::Renderer;
+use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
 use crate::config::CommandPrefix;
+use crate::events::NoticeKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
+use serde_json::Value;
+use std::time::{Duration, Instant};
 
 const REVERSED: Style = Style::new().add_modifier(Modifier::REVERSED);
 /// Lines one wheel notch moves the view.
@@ -536,6 +543,328 @@ impl Transcript {
             centre,
             chip,
         }
+    }
+
+    /// The tool row a hook's call id names: the row with that id, or,
+    /// for a model that gave no id, the newest running row without one.
+    fn tool_row(&self, first_cell: usize, call_id: &str) -> Option<usize> {
+        let cells = self.cells();
+        (first_cell..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id: id,
+                    status,
+                    ..
+                } if call_id.is_empty() => {
+                    id.is_empty() && matches!(status, ToolStatus::Running { .. })
+                }
+                Cell::Tool { call_id: id, .. } => id == call_id,
+                _ => false,
+            })
+    }
+
+    /// The job or agent row a `job__*` or `agent__*` call addresses by
+    /// the id in its arguments.
+    fn addressed_row(&self, name: &str, args: Option<&Value>) -> Option<usize> {
+        let id = args?.get("id")?.as_str()?;
+        let job = matches!(name, "job__check" | "job__collect" | "job__cancel");
+        let agent = matches!(
+            name,
+            "agent__check" | "agent__collect" | "agent__send_message" | "agent__cancel"
+        );
+        self.cells().iter().rposition(|cell| match cell {
+            Cell::Job { job_id, .. } => job && job_id == id,
+            Cell::Agent { agent_id, .. } => agent && agent_id == id,
+            _ => false,
+        })
+    }
+
+    /// Names the row the narration opened. A call that checks on a job
+    /// or agent folds into that job's or agent's row instead, so the
+    /// transcript shows one row per background task rather than one per
+    /// look at it.
+    pub(super) fn tool_started(
+        &mut self,
+        first_cell: usize,
+        call_id: String,
+        name: String,
+        args: Option<Value>,
+    ) {
+        let Some(mut row) = self.addressed_row(&name, args.as_ref()) else {
+            if let Some(index) = self.tool_row(first_cell, &call_id)
+                && let Some(Cell::Tool {
+                    name: current,
+                    args: short,
+                    bookkeeping,
+                    ..
+                }) = self.cell_mut(index)
+            {
+                *bookkeeping = cells::is_bookkeeping(&name);
+                *current = name;
+                if let Some(args) = &args {
+                    *short = cells::short_args(&args.to_string());
+                }
+            }
+            return;
+        };
+        if let Some(index) = self.tool_row(first_cell, &call_id) {
+            self.remove(index);
+            if index < row {
+                row -= 1;
+            }
+        }
+        if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) = self.cell_mut(row) {
+            calls.push(FoldedCall::new(call_id, name));
+        }
+    }
+
+    pub(super) fn tool_finished(
+        &mut self,
+        first_cell: usize,
+        now: Instant,
+        call_id: &str,
+        ok: bool,
+        error: Option<String>,
+        duration_ms: Option<u64>,
+    ) {
+        let Some(index) = self.tool_row(first_cell, call_id) else {
+            return;
+        };
+        let Some(Cell::Tool { status, full, .. }) = self.cell_mut(index) else {
+            return;
+        };
+        let grew = full.settle();
+        if let ToolStatus::Running { since } = *status {
+            // The hook's own measurement when it has one; the UI's clock
+            // otherwise, so a failed call still shows how long it took.
+            let elapsed =
+                duration_ms.map_or_else(|| now.duration_since(since), Duration::from_millis);
+            *status = if ok {
+                ToolStatus::Ok { elapsed }
+            } else {
+                ToolStatus::Failed {
+                    elapsed,
+                    error: error.unwrap_or_default(),
+                }
+            };
+        }
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+    }
+
+    /// A job or agent row takes the place of the running `starter` call
+    /// that made it, keeping that call folded so its output still routes
+    /// to the row; without one the row is appended.
+    pub(super) fn start_row(&mut self, first_cell: usize, row: Cell, starter: &str) {
+        let cells = self.cells();
+        let running = (first_cell..cells.len()).rev().find(|&index| {
+            matches!(
+                &cells[index],
+                Cell::Tool {
+                    status: ToolStatus::Running { .. },
+                    ..
+                }
+            )
+        });
+        match running {
+            Some(index) if matches!(&cells[index], Cell::Tool { name, .. } if name == starter) => {
+                let Cell::Tool {
+                    call_id,
+                    name,
+                    output,
+                    open_line,
+                    pending,
+                    full,
+                    ..
+                } = self.replace(index, row)
+                else {
+                    unreachable!("the index was found holding a tool row");
+                };
+                let moved = full.text().len();
+                if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) =
+                    self.cell_mut(index)
+                {
+                    calls.push(FoldedCall {
+                        call_id,
+                        name,
+                        output,
+                        open_line,
+                        pending,
+                        full,
+                    });
+                    self.account_full_output(
+                        isize::try_from(moved).unwrap_or(isize::MAX),
+                        FULL_OUTPUT_BUDGET,
+                    );
+                }
+            }
+            _ => self.push(row),
+        }
+    }
+
+    pub(super) fn set_job_status(&mut self, job_id: &str, status: JobStatus) {
+        let row = self
+            .cells()
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::Job { job_id: id, .. } if id == job_id));
+        if let Some(Cell::Job {
+            status: current, ..
+        }) = row.and_then(|row| self.cell_mut(row))
+        {
+            *current = status;
+        }
+    }
+
+    pub(super) fn set_agent_status(&mut self, agent_id: &str, status: AgentStatus) {
+        let row = self
+            .cells()
+            .iter()
+            .rposition(|cell| matches!(cell, Cell::Agent { agent_id: id, .. } if id == agent_id));
+        if let Some(Cell::Agent {
+            status: current, ..
+        }) = row.and_then(|row| self.cell_mut(row))
+        {
+            *current = status;
+        }
+    }
+
+    /// Late command output arrives one pipe read at a time; consecutive
+    /// chunks join the trailing Routing cell instead of each taking a
+    /// cell of their own, and the cell keeps only its newest text.
+    pub(super) fn push_notice(&mut self, merge_from: usize, kind: NoticeKind, mut text: String) {
+        if kind != NoticeKind::Routing {
+            self.push(Cell::notice(kind, text));
+            return;
+        }
+        text.truncate(text.trim_end_matches('\n').len());
+        if self.len() > merge_from
+            && let Some(Cell::Notice {
+                kind: NoticeKind::Routing,
+                text: tail,
+                ..
+            }) = self.last_mut()
+        {
+            if !tail.is_empty() && !text.is_empty() {
+                tail.push('\n');
+            }
+            tail.push_str(&text);
+            if tail.len() > LATE_OUTPUT_LIMIT {
+                let cut = tail.len() - LATE_OUTPUT_LIMIT;
+                let cut = (cut..=tail.len())
+                    .find(|at| tail.is_char_boundary(*at))
+                    .unwrap_or(tail.len());
+                tail.drain(..cut);
+            }
+            return;
+        }
+        self.push(Cell::notice(kind, text));
+    }
+
+    pub(super) fn append_tool_output(
+        &mut self,
+        first_cell: usize,
+        in_turn: bool,
+        call_id: Option<String>,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        // Output of a call the transcript has a row for (or has folded
+        // into a job's or agent's row) belongs to that row. The pump of a
+        // call the model gave no id reports `None`; its row is the one
+        // the narration opened with an empty id.
+        let target = match call_id.as_deref() {
+            Some(id) => self.tool_output_target(first_cell, id),
+            None if in_turn => self.anonymous_tool_output_target(first_cell),
+            None => None,
+        };
+        if let Some((target, full)) = target {
+            let grew = full.push(&append_output(target, bytes));
+            self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+            return;
+        }
+        // Inside a turn the output never merges into a cell from before
+        // the turn; outside one (a background job still writing) every
+        // chunk of the same call shares the trailing cell, so a chatty
+        // job cannot grow the transcript by a cell per read.
+        let cells = self.cells();
+        let last = cells.len().checked_sub(1);
+        let continues_last = last.is_some_and(|index| {
+            index >= first_cell
+                && matches!(&cells[index], Cell::Text { call_id: id, .. } if *id == call_id)
+        });
+        if !continues_last {
+            self.push(Cell::Text {
+                call_id,
+                lines: Vec::new(),
+                open_line: false,
+                pending: Vec::new(),
+                full: FullOutput::default(),
+                cache: LineCache::default(),
+            });
+        }
+        let Some(Cell::Text {
+            lines,
+            open_line,
+            pending,
+            full,
+            ..
+        }) = self.last_mut()
+        else {
+            return;
+        };
+        let grew = full.push(&append_output((lines, open_line, pending), bytes));
+        self.account_full_output(grew, FULL_OUTPUT_BUDGET);
+    }
+
+    /// The output lines of the call `call_id`: a tool row's own, within
+    /// this turn, or those of a call folded into a job's or agent's row,
+    /// which a later turn's check reaches back to.
+    fn tool_output_target(
+        &mut self,
+        first_cell: usize,
+        call_id: &str,
+    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
+        let index = self
+            .cells()
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(index, cell)| {
+                *index >= first_cell || matches!(cell, Cell::Job { .. } | Cell::Agent { .. })
+            })
+            .find(|(_, cell)| cell.takes_output_of(call_id))?
+            .0;
+        self.cell_mut(index)?.output_for(call_id)
+    }
+
+    /// The output lines of a call without an id, within this turn: the
+    /// newest running tool row without one (a finished one has had all
+    /// its output), or the newest such call folded into a running job's
+    /// or agent's row; a finished job or agent takes nothing more.
+    fn anonymous_tool_output_target(
+        &mut self,
+        first_cell: usize,
+    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
+        let cells = self.cells();
+        let index = (first_cell..cells.len())
+            .rev()
+            .find(|&index| match &cells[index] {
+                Cell::Tool {
+                    call_id, status, ..
+                } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
+                Cell::Job { calls, status, .. } => {
+                    matches!(status, JobStatus::Running)
+                        && calls.iter().any(|call| call.call_id.is_empty())
+                }
+                Cell::Agent { calls, status, .. } => {
+                    matches!(status, AgentStatus::Running)
+                        && calls.iter().any(|call| call.call_id.is_empty())
+                }
+                _ => false,
+            })?;
+        self.cell_mut(index)?.output_for("")
     }
 }
 

@@ -159,7 +159,8 @@ impl App {
         let (rewind, barrier) =
             RewindState::from_cells(self.transcript.cells(), self.config.command_prefix);
         if let Some(barrier) = barrier {
-            self.push_notice(
+            self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 format!("Rewind stops at the last {}", barrier.kind_name()),
             );

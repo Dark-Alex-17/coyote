@@ -451,7 +451,8 @@ impl App {
 
     fn queue_control(&mut self, request: ControlRequest) {
         if self.control.is_none() {
-            self.push_notice(
+            self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 "Tasks cannot be reached while the session is ending".to_string(),
             );
@@ -489,7 +490,8 @@ impl App {
         match task.kind {
             TaskKind::Agent => match task.session_id {
                 Some(session_id) => self.open_child(session_id, task.name),
-                None => self.push_notice(
+                None => self.transcript.push_notice(
+                    self.notice_merge_from(),
                     NoticeKind::ToolWarning,
                     format!("Agent {} keeps no session to show", task.id),
                 ),
@@ -500,7 +502,8 @@ impl App {
                 );
                 match row {
                     Some(index) => self.open_pager(Pager::root_at(index)),
-                    None => self.push_notice(
+                    None => self.transcript.push_notice(
+                        self.notice_merge_from(),
                         NoticeKind::ToolWarning,
                         format!("Job {} has no row in this transcript", task.id),
                     ),
@@ -512,7 +515,8 @@ impl App {
     /// Opens a child's thread in the pager and asks for its first read.
     pub(super) fn open_child(&mut self, session_id: String, agent: String) {
         if self.control.is_none() {
-            self.push_notice(
+            self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 "Transcripts cannot be read while the session is ending".to_string(),
             );
@@ -520,7 +524,8 @@ impl App {
         }
         if !is_plain_session_id(&session_id) {
             warn!("Refused to read a child session with the id {session_id:?}");
-            self.push_notice(
+            self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 format!(
                     "Cannot read the session of {agent}: its id {} is not a plain name",
@@ -530,7 +535,8 @@ impl App {
             return;
         }
         let Some(root) = self.child_root.as_ref() else {
-            self.push_notice(
+            self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 format!("The session of {agent} has not been written yet"),
             );

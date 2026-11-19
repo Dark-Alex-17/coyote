@@ -12,6 +12,7 @@ use crate::prompt::{PromptRequest, Prompter};
 use crate::repl::EXIT_CANCEL_WAIT;
 use crate::supervisor::notification::NotificationQueue;
 use crate::testing::TestConfigDirGuard;
+use crate::tui::cells::ToolStatus;
 use crate::tui::control::{
     TurnOutcome, late_output, spawn_control_request, spawn_turn, spawn_work,
 };
@@ -25,6 +26,7 @@ use events::ManualClock;
 use keys::ModalKind;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use serde_json::Value;
 use serial_test::serial;
 use std::future::Future;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -264,16 +266,24 @@ where
 fn a_newline_free_tool_stream_keeps_a_bounded_tail() {
     let mut harness = Harness::standalone(80, 24);
     harness.app.begin_turn("explain", false);
-    harness
-        .app
-        .append_tool_output(Some("c1".to_string()), b"head-m3z-");
-    harness.app.append_tool_output(
+    harness.app.transcript.append_tool_output(
+        harness.app.turn_first_cell(),
+        harness.app.turn.is_some(),
+        Some("c1".to_string()),
+        b"head-m3z-",
+    );
+    harness.app.transcript.append_tool_output(
+        harness.app.turn_first_cell(),
+        harness.app.turn.is_some(),
         Some("c1".to_string()),
         "y".repeat(LATE_OUTPUT_LIMIT).as_bytes(),
     );
-    harness
-        .app
-        .append_tool_output(Some("c1".to_string()), "tail-m3z".as_bytes());
+    harness.app.transcript.append_tool_output(
+        harness.app.turn_first_cell(),
+        harness.app.turn.is_some(),
+        Some("c1".to_string()),
+        "tail-m3z".as_bytes(),
+    );
     let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
         panic!("the tool output did not land in a text cell");
     };
@@ -1196,12 +1206,18 @@ fn out_of_turn_tool_output_shares_one_bounded_cell() {
     harness.app.begin_turn("explain", false);
     harness.app.end_turn(false, &TurnOutcome::default());
     let cells_before = harness.app.transcript.len();
-    harness
-        .app
-        .append_tool_output(Some("bg".to_string()), b"first-q7k\n");
-    harness
-        .app
-        .append_tool_output(Some("bg".to_string()), b"second-q7k\n");
+    harness.app.transcript.append_tool_output(
+        harness.app.turn_first_cell(),
+        harness.app.turn.is_some(),
+        Some("bg".to_string()),
+        b"first-q7k\n",
+    );
+    harness.app.transcript.append_tool_output(
+        harness.app.turn_first_cell(),
+        harness.app.turn.is_some(),
+        Some("bg".to_string()),
+        b"second-q7k\n",
+    );
     assert_eq!(harness.app.transcript.len(), cells_before + 1);
     let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
         panic!("the output did not land in a text cell");
@@ -1210,9 +1226,12 @@ fn out_of_turn_tool_output_shares_one_bounded_cell() {
 
     let line = format!("{}\n", "z".repeat(LATE_OUTPUT_LIMIT / 4));
     for _ in 0..12 {
-        harness
-            .app
-            .append_tool_output(Some("bg".to_string()), line.as_bytes());
+        harness.app.transcript.append_tool_output(
+            harness.app.turn_first_cell(),
+            harness.app.turn.is_some(),
+            Some("bg".to_string()),
+            line.as_bytes(),
+        );
     }
     assert_eq!(harness.app.transcript.len(), cells_before + 1);
     let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
@@ -5107,9 +5126,11 @@ fn the_dump_covers_the_committed_turns_only() {
     );
     harness.app.end_turn(false, &TurnOutcome::default());
     harness.app.begin_exit();
-    harness
-        .app
-        .push_notice(NoticeKind::Routing, "Saved the session".to_string());
+    harness.app.transcript.push_notice(
+        harness.app.notice_merge_from(),
+        NoticeKind::Routing,
+        "Saved the session".to_string(),
+    );
     let text = dump::transcript_text(harness.app.committed_cells(), &harness.app.config);
     assert_eq!(render::plain_text(&text), "> hello there\ngeneral kenobi\n");
 }

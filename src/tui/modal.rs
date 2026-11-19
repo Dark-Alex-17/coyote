@@ -485,7 +485,8 @@ impl App {
 
     fn reply_escalation(&mut self, id: &str, reply: &str) {
         let Some(control) = &self.control else {
-            self.push_notice(
+            self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 "The reply was not delivered: the session is ending".to_string(),
             );
@@ -494,7 +495,8 @@ impl App {
         let mut ctx = control.fork_for_branch();
         match crate::function::agents::reply_escalation(&mut ctx, id, reply) {
             Ok(result) if result.get("status").and_then(Value::as_str) == Some("ok") => {}
-            Ok(result) => self.push_notice(
+            Ok(result) => self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 result
                     .get("message")
@@ -502,7 +504,8 @@ impl App {
                     .unwrap_or("The reply was not delivered")
                     .to_string(),
             ),
-            Err(err) => self.push_notice(
+            Err(err) => self.transcript.push_notice(
+                self.notice_merge_from(),
                 NoticeKind::ToolWarning,
                 format!("The reply was not delivered: {err:#}"),
             ),

@@ -450,7 +450,8 @@ pub async fn run(mut ctx: RequestContext) -> Result<()> {
 
     // Fd 1 is still the terminal here; a turn's capture takes it over.
     if let Some(reason) = remember_tty() {
-        app.push_notice(NoticeKind::ToolWarning, reason);
+        app.transcript
+            .push_notice(app.notice_merge_from(), NoticeKind::ToolWarning, reason);
     }
     let mut screen = Screen::enter()?;
     // Armed only once the terminal is ours. Entering blocks on the
