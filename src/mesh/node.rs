@@ -48,8 +48,8 @@ use crate::mesh::message::{
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
-    FarewellTime, LeftMark, PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting,
-    PeerTable,
+    AnnounceStamp, FarewellTime, LeftMark, PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange,
+    PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
     Answered, CorrelationKind, Correlations, InboundKind, InboundRecord, InboundStore,
@@ -3335,6 +3335,55 @@ struct AnnounceFiler<'a> {
 }
 
 impl AnnounceFiler<'_> {
+    /// Files a heard announce by what its stamp says. A fresh one files as `file`, or as
+    /// `file_path_response` for a path response, and its stamp is noted against the row.
+    /// A replay, which a relay may send long after the instance left, files route facts
+    /// only and reads `None`: it is no sighting.
+    fn file_stamped(
+        &mut self,
+        announced: AnnouncedDestination,
+        app_data: &[u8],
+        hops: u8,
+        path_response: bool,
+        stamp: AnnounceStamp,
+        now: SystemTime,
+    ) -> Option<PeerChange> {
+        let destination_hash = announced.destination_hash.clone();
+        if self.peers.is_replay(&destination_hash, &stamp) {
+            self.follow_replay(announced, app_data, hops);
+            return None;
+        }
+        let change = if path_response {
+            self.file_path_response(announced, app_data, hops, now)
+        } else {
+            self.file(announced, app_data, hops, now)
+        }?;
+        self.peers
+            .note_stamp(&destination_hash, stamp, !path_response, now);
+        Some(change)
+    }
+
+    fn follow_replay(&self, announced: AnnouncedDestination, app_data: &[u8], hops: u8) {
+        let Some(decoded) = decode_announce(&announced.destination_hash, app_data, hops) else {
+            return;
+        };
+        let followed = self.peers.follow_route(PeerSighting {
+            destination_hash: announced.destination_hash.clone(),
+            identity_hash: announced.identity_hash,
+            name_hash: announced.name_hash,
+            public_key: announced.public_key,
+            display_name: decoded.display_name,
+            protocol_version: decoded.version,
+            hops,
+        });
+        if followed {
+            debug!(
+                "Followed the route to mesh peer {} from a replayed announce",
+                short(&announced.destination_hash)
+            );
+        }
+    }
+
     /// Files an announce the peer sent as a path response. Keyed on the announced
     /// destination, never on the identity: a path response says where the peer is, not
     /// that it is there, so for a known row it moves no sighting time and fires no
@@ -3568,17 +3617,23 @@ async fn receive_announces(
         let known = peers.get(&destination);
         let had_left = known.as_ref().is_some_and(|row| row.left_at.is_some());
         let unrouted = had_left || peers.link_failed(&destination);
-        let filed = if event.is_path_response {
-            filer
-                .file_path_response(announced, app_data, event.hops, now)
-                .is_some()
-        } else {
-            let filed = filer.file(announced, app_data, event.hops, now).is_some();
-            if had_left && filed {
-                note_return(&runtime, &destination);
-            }
-            filed
+        let stamp = AnnounceStamp {
+            emitted: event.emitted,
+            blob: event.random_blob,
         };
+        let filed = filer
+            .file_stamped(
+                announced,
+                app_data,
+                event.hops,
+                event.is_path_response,
+                stamp,
+                now,
+            )
+            .is_some();
+        if had_left && filed && !event.is_path_response {
+            note_return(&runtime, &destination);
+        }
         if filed && let Some(runtime) = runtime.upgrade() {
             // Your own sessions are named from the registry, never a card, so only another
             // user's session is heard again; that test reads nothing from disk.
@@ -13198,6 +13253,103 @@ mod tests {
         );
     }
 
+    /// The announce receiver's filing of a stamp it has filed before, as a relay replays
+    /// its stored copy in answer to a path request, after the instance's farewell marked
+    /// it left: the hops follow it, but the mark, `last_seen`, the trust list's sighting
+    /// and the latest presence stay, and nothing fires. A fresh stamp lifts the mark.
+    #[test]
+    fn a_replayed_announce_stamp_files_route_facts_only_and_keeps_the_left_mark() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + secs);
+        let origin = OriginName([0x5e_u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let a_hex = identity.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: Some("Ada".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let tmp = TempDir::new("node-replayed-stamp");
+        let peers = PeerTable::load(tmp.path.join("peers.json"), at(1_000)).unwrap();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .open("node-replayed-stamp-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let announced = || {
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            )
+        };
+        let stamp_at = |secs: u64, tag: u8| AnnounceStamp {
+            emitted: 1_790_000_000 + secs,
+            blob: [tag; 10],
+        };
+        let trust_seen = || {
+            trust
+                .records()
+                .into_iter()
+                .find(|record| record.hash == a_destination)
+                .expect("the trusted record is listed")
+                .last_seen_at
+        };
+
+        let heard = stamp_at(2_000, 1);
+        assert_eq!(
+            filer.file_stamped(announced(), &app_data, 2, false, heard, at(2_000)),
+            Some(PeerChange::Added)
+        );
+        sink.drain();
+        let left = at(2_010);
+        assert_eq!(
+            peers.mark_left(&a_destination, FarewellTime::Stamped(left)),
+            LeftMark::Marked
+        );
+
+        for path_response in [true, false] {
+            assert_eq!(
+                filer.file_stamped(announced(), &app_data, 4, path_response, heard, at(2_100)),
+                None,
+                "a replay is no sighting"
+            );
+        }
+        let row = peers.get(&a_destination).unwrap();
+        assert_eq!(row.left_at, Some(left), "a replay does not lift the mark");
+        assert_eq!(row.last_seen, at(2_000));
+        assert_eq!(row.hops, 4, "the route facts follow the replay");
+        assert_eq!(trust_seen(), at(2_000));
+        assert!(sink.drain().is_empty(), "a replay fires nothing");
+        assert!(peers.clear_left(&a_destination));
+        assert_eq!(
+            peers.mark_left(&a_destination, FarewellTime::Stamped(at(2_050))),
+            LeftMark::Marked,
+            "a replayed path response records no presence"
+        );
+
+        assert_eq!(
+            filer.file_stamped(
+                announced(),
+                &app_data,
+                4,
+                false,
+                stamp_at(2_200, 2),
+                at(2_200)
+            ),
+            Some(PeerChange::Refreshed)
+        );
+        assert_eq!(peers.get(&a_destination).unwrap().left_at, None);
+    }
+
     /// An announce the peer sent as a path response says where a known peer is, not that
     /// it is alive: the row's route facts follow it, its `last_seen` and the trust list's
     /// sighting do not, and no discovery fires. A plain announce after it is a sighting
@@ -16750,6 +16902,40 @@ mod tests {
 
             assert!(pair.slot_a.stop().await.unwrap());
             assert!(pair.slot_b.stop().await.unwrap());
+            pair.relay.stop().await;
+        }
+
+        /// After B's farewell, A drops its path to B and asks again: the relay answers
+        /// from the announce it stored, the same blob A already heard, and B still reads
+        /// left on A.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_replayed_path_response_after_the_farewell_does_not_clear_left() {
+            let pair = Pair::start("node-farewell-replay").await;
+            let to_b = pair.to_b();
+            assert!(pair.slot_b.stop().await.unwrap());
+            wait_until("A to mark B left", || pair.left_at_on_a().is_some()).await;
+            let left_at = pair.left_at_on_a();
+
+            let b = AddressHash::new_from_hex_string(&to_b).unwrap();
+            let transport = pair.a.runtime.transport_handle().await.unwrap();
+            assert!(transport.expire_path(&b).await, "A held a path to B");
+            transport.request_path(&b, None, None).await;
+            let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+            while !transport.has_path(&b).await {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for the relay to answer with B's stored announce"
+                );
+                sleep(POLL).await;
+            }
+            sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                pair.left_at_on_a(),
+                left_at,
+                "a replayed announce does not lift the mark"
+            );
+
+            assert!(pair.slot_a.stop().await.unwrap());
             pair.relay.stop().await;
         }
 

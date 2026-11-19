@@ -3,6 +3,7 @@
 //! transport; a `local` rnsd is asked over the RPC listener its shared instance opens,
 //! as rnstatus asks it, and its AutoInterfaces are summed.
 
+use crate::mesh::redact_hashes;
 use async_trait::async_trait;
 use log::debug;
 use rns_transport::hash::AddressHash;
@@ -370,8 +371,9 @@ impl RnsdLanReader {
             *target = RpcTarget::Unavailable;
         } else {
             debug!(
-                "Mesh read no LAN count from the rnsd configured in {} this time: {err}",
-                dir.display()
+                "Mesh read no LAN count from the rnsd configured in {} this time: {}",
+                dir.display(),
+                redact_hashes(&err.to_string())
             );
         }
         Some(LanReading::Unknown)
@@ -385,7 +387,8 @@ impl RnsdLanReader {
 
 fn tell_unavailable(reason: &str) {
     debug!(
-        "Mesh could not read the local rnsd's interface stats: {reason}; the silent-LAN check falls back to hosts heard"
+        "Mesh could not read the local rnsd's interface stats: {}; the silent-LAN check falls back to hosts heard",
+        redact_hashes(reason)
     );
 }
 

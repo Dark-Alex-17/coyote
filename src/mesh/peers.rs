@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use rns_transport::destination::{DestinationDesc, DestinationName};
 use rns_transport::identity::Identity;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,9 @@ pub(crate) const PEER_TTL: Duration =
 pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_PERIOD_SECS);
 
 pub(crate) const PEER_TABLE_VERSION: u64 = 2;
+
+/// How many of a row's latest announce blobs are remembered to know a replay by.
+const SEEN_ANNOUNCE_BLOBS: usize = 32;
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`.
@@ -206,6 +209,64 @@ pub(crate) struct PeerSighting {
     pub hops: u8,
 }
 
+/// When an announce was made, by the emitter's clock: its Unix seconds and the random
+/// blob that carries them. A relay answering a path request from its stored copy sends
+/// both unchanged; the instance answering for itself, or announcing, makes new ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AnnounceStamp {
+    pub emitted: u64,
+    pub blob: [u8; 10],
+}
+
+/// What this run learnt of one row's instance from its fresh announces.
+struct AnnounceClock {
+    /// The newest `emitted` of a fresh announce or path response.
+    latest_emitted: u64,
+    /// The blobs of the latest fresh ones, oldest first.
+    blobs: VecDeque<[u8; 10]>,
+    /// The least (receipt here minus `emitted` there) over plain announces, in ms: this
+    /// node's clock less the instance's, plus the quickest transit. A path response is
+    /// left out, since a relay may answer it from a copy it held.
+    offset_ms: Option<i64>,
+}
+
+impl AnnounceClock {
+    /// `offset_ms` as the offset to apply. `emitted` drops the part second, so the
+    /// offset is known only to within the second below it; the value in that window
+    /// nearest zero is taken, so clocks that agree are not read as apart.
+    fn offset(&self) -> Option<i64> {
+        self.offset_ms
+            .map(|measured| 0.clamp(measured.saturating_sub(1000), measured))
+    }
+
+    /// Whether the instance was heard at or after `sent`, its own clock: by an announce
+    /// it made then or later, or by a presence here that, moved onto its clock, is no
+    /// earlier. Until a plain announce has taught the offset, the presence is taken as
+    /// it stands, as it is with no announce time at all.
+    fn heard_since(&self, sent: SystemTime, presence: Option<SystemTime>) -> bool {
+        let sent = unix_millis(sent);
+        if sent <= emitted_millis(self.latest_emitted) {
+            return true;
+        }
+        presence.is_some_and(|heard| {
+            sent <= unix_millis(heard).saturating_sub(self.offset().unwrap_or(0))
+        })
+    }
+}
+
+fn unix_millis(at: SystemTime) -> i64 {
+    match at.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => i64::try_from(before.duration().as_millis()).map_or(i64::MIN, |ms| -ms),
+    }
+}
+
+fn emitted_millis(emitted: u64) -> i64 {
+    i64::try_from(emitted)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(1000)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerChange {
     Added,
@@ -233,7 +294,9 @@ pub(crate) enum FarewellTime {
     Arrived(SystemTime),
     /// When the sender stamped it, never later than this node received it: a farewell
     /// held at a propagation node arrives long after it was sent, so its arrival says
-    /// nothing about what came first.
+    /// nothing about what came first. Once this run holds an announce's `emitted` for
+    /// the row it is ordered on the sender's clock, since this node's would misorder it
+    /// by however far the two clocks differ.
     Stamped(SystemTime),
 }
 
@@ -260,6 +323,10 @@ pub(crate) struct PeerTable {
     /// shape older sessions read; after a restart a row's latest presence is its
     /// `last_seen` until it is heard again.
     presence: Mutex<BTreeMap<String, SystemTime>>,
+    /// Each row's announce times and blobs from this run, held in memory only like
+    /// `presence`, so a replay is known and a fetched farewell is ordered on its
+    /// sender's clock.
+    announce_clocks: Mutex<BTreeMap<String, AnnounceClock>>,
     /// The node this table marks `served_instances` for, set by `claim_served`; until
     /// then nothing is marked.
     own_instance: Mutex<Option<String>>,
@@ -318,6 +385,7 @@ impl PeerTable {
             dirty: AtomicBool::new(false),
             link_failed: Mutex::new(BTreeSet::new()),
             presence: Mutex::new(BTreeMap::new()),
+            announce_clocks: Mutex::new(BTreeMap::new()),
             own_instance: Mutex::new(None),
             served_previous_run: Mutex::new(BTreeSet::new()),
             #[cfg(test)]
@@ -386,6 +454,7 @@ impl PeerTable {
             peers.remove(&oldest);
             self.link_failed.lock().remove(&oldest);
             self.presence.lock().remove(&oldest);
+            self.announce_clocks.lock().remove(&oldest);
         }
         self.dirty.store(true, Ordering::Release);
         change
@@ -404,6 +473,65 @@ impl PeerTable {
         record.follow(sighting);
         self.dirty.store(true, Ordering::Release);
         true
+    }
+
+    /// Route facts from a replayed announce: what `refresh_route` sets, with nothing
+    /// that says the instance is there, since a relay may replay it long after the
+    /// instance left. A destination without a row is not followed.
+    pub(crate) fn follow_route(&self, sighting: PeerSighting) -> bool {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(&sighting.destination_hash) else {
+            return false;
+        };
+        record.follow(sighting);
+        self.dirty.store(true, Ordering::Release);
+        true
+    }
+
+    /// Whether `stamp` repeats what the row's instance already said this run: a blob
+    /// heard before, or an emission older than the newest held, as a stored copy is. A
+    /// destination with nothing held, such as one heard for the first time, never is.
+    pub(crate) fn is_replay(&self, destination_hash: &str, stamp: &AnnounceStamp) -> bool {
+        self.announce_clocks
+            .lock()
+            .get(destination_hash)
+            .is_some_and(|clock| {
+                stamp.emitted < clock.latest_emitted || clock.blobs.contains(&stamp.blob)
+            })
+    }
+
+    /// Notes a fresh announce (`plain`) or path response for `destination_hash` received
+    /// at `now`. A destination the table does not know is left unknown.
+    pub(crate) fn note_stamp(
+        &self,
+        destination_hash: &str,
+        stamp: AnnounceStamp,
+        plain: bool,
+        now: SystemTime,
+    ) {
+        let peers = self.inner.lock();
+        if !peers.contains_key(destination_hash) {
+            return;
+        }
+        let mut clocks = self.announce_clocks.lock();
+        let clock = clocks
+            .entry(destination_hash.to_string())
+            .or_insert_with(|| AnnounceClock {
+                latest_emitted: stamp.emitted,
+                blobs: VecDeque::new(),
+                offset_ms: None,
+            });
+        clock.latest_emitted = clock.latest_emitted.max(stamp.emitted);
+        if !clock.blobs.contains(&stamp.blob) {
+            clock.blobs.push_back(stamp.blob);
+            if clock.blobs.len() > SEEN_ANNOUNCE_BLOBS {
+                clock.blobs.pop_front();
+            }
+        }
+        if plain {
+            let offset = unix_millis(now).saturating_sub(emitted_millis(stamp.emitted));
+            clock.offset_ms = Some(clock.offset_ms.map_or(offset, |held| held.min(offset)));
+        }
     }
 
     /// Notes that `destination_hash` was heard over a live link at `now`. A destination
@@ -492,6 +620,9 @@ impl PeerTable {
     /// (its last announce, path response or request over a live link) is refused, since
     /// the instance has been heard since, and so is one for a destination the table does
     /// not know, and a repeat for a row already marked, which keeps the time of the first.
+    /// A stamped farewell for a row with an announce time held this run is weighed on the
+    /// sender's clock: against that announce's `emitted`, and against the latest presence
+    /// here less the learnt clock offset; `last_seen`, this node's clock, plays no part.
     pub(crate) fn mark_left(&self, destination_hash: &str, time: FarewellTime) -> LeftMark {
         let mut peers = self.inner.lock();
         let Some(record) = peers.get_mut(destination_hash) else {
@@ -500,13 +631,13 @@ impl PeerTable {
         if record.left_at.is_some() {
             return LeftMark::AlreadyLeft;
         }
-        let latest = self
-            .presence
-            .lock()
-            .get(destination_hash)
-            .map_or(record.last_seen, |heard| (*heard).max(record.last_seen));
+        let presence = self.presence.lock().get(destination_hash).copied();
         let at = time.at();
-        if at <= latest {
+        let heard_since = match (time, self.announce_clocks.lock().get(destination_hash)) {
+            (FarewellTime::Stamped(sent), Some(clock)) => clock.heard_since(sent, presence),
+            _ => at <= presence.map_or(record.last_seen, |heard| heard.max(record.last_seen)),
+        };
+        if heard_since {
             return LeftMark::HeardSince;
         }
         record.left_at = Some(at);
@@ -538,10 +669,12 @@ impl PeerTable {
             .collect();
         let mut link_failed = self.link_failed.lock();
         let mut presence = self.presence.lock();
+        let mut announce_clocks = self.announce_clocks.lock();
         for hash in &expired {
             peers.remove(hash);
             link_failed.remove(hash);
             presence.remove(hash);
+            announce_clocks.remove(hash);
         }
         if !expired.is_empty() {
             self.dirty.store(true, Ordering::Release);
@@ -1197,6 +1330,189 @@ mod tests {
             LeftMark::Marked
         );
         assert_eq!(table.get("aa").unwrap().left_at, Some(at(12)));
+    }
+
+    fn stamp(emitted: SystemTime, tag: u8) -> AnnounceStamp {
+        let emitted = emitted
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        AnnounceStamp {
+            emitted,
+            blob: [tag; 10],
+        }
+    }
+
+    /// An announce from an instance whose clock runs an hour behind, heard here at `heard`:
+    /// filed, then its stamp noted, as the announce receiver does.
+    fn hear_behind(table: &PeerTable, heard: SystemTime, tag: u8) -> AnnounceStamp {
+        let stamp = stamp(heard - Duration::from_secs(3600), tag);
+        assert!(!table.is_replay("aa", &stamp));
+        table.observe(sighting("aa", None), heard);
+        table.note_stamp("aa", stamp, true, heard);
+        stamp
+    }
+
+    /// A fetched farewell is weighed on the sender's clock once an announce time is held:
+    /// sent ten seconds after the sender's last announce it counts, though this node heard
+    /// that announce an hour later by its own clock; sent at or before it, it does not.
+    #[test]
+    fn a_fetched_farewell_is_ordered_against_the_senders_own_announce_time() {
+        let (table, _tmp) = table("peers-left-emitted");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let emitted = hear_behind(&table, t0, 1).emitted;
+        let sender = |secs: i64| {
+            SystemTime::UNIX_EPOCH + Duration::from_secs(emitted.checked_add_signed(secs).unwrap())
+        };
+
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(sender(0))),
+            LeftMark::HeardSince,
+            "a farewell sent as the sender announced is not later than the announce"
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(sender(-5))),
+            LeftMark::HeardSince
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(sender(10))),
+            LeftMark::Marked,
+            "this node's later last_seen is on another clock"
+        );
+        assert_eq!(table.get("aa").unwrap().left_at, Some(sender(10)));
+    }
+
+    /// A request over a live link is moved onto the sender's clock by the offset its
+    /// announces taught, so a fetched farewell sent before that request is refused.
+    #[test]
+    fn a_fetched_farewell_sent_before_a_link_request_is_refused_by_the_learnt_offset() {
+        let (table, _tmp) = table("peers-left-offset");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let behind = |at: SystemTime| at - Duration::from_secs(3600);
+        hear_behind(&table, t0, 1);
+        table.note_presence("aa", t0 + Duration::from_secs(100));
+
+        assert_eq!(
+            table.mark_left(
+                "aa",
+                FarewellTime::Stamped(behind(t0 + Duration::from_secs(50)))
+            ),
+            LeftMark::HeardSince,
+            "the request came after this farewell on the sender's clock"
+        );
+        assert_eq!(
+            table.mark_left(
+                "aa",
+                FarewellTime::Stamped(behind(t0 + Duration::from_secs(110)))
+            ),
+            LeftMark::Marked
+        );
+    }
+
+    /// An announce's time drops its part second, so an offset that small reads as clocks
+    /// that agree: a farewell sent just before a request over a live link is refused.
+    #[test]
+    fn a_sub_second_offset_reads_as_clocks_that_agree() {
+        let (table, _tmp) = table("peers-left-agreeing");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let heard = t0 + Duration::from_millis(300);
+        table.observe(sighting("aa", None), heard);
+        table.note_stamp("aa", stamp(t0, 1), true, heard);
+        table.note_presence("aa", t0 + Duration::from_secs(10));
+
+        assert_eq!(
+            table.mark_left(
+                "aa",
+                FarewellTime::Stamped(t0 + Duration::from_millis(9_950))
+            ),
+            LeftMark::HeardSince
+        );
+        assert_eq!(
+            table.mark_left(
+                "aa",
+                FarewellTime::Stamped(t0 + Duration::from_millis(10_050))
+            ),
+            LeftMark::Marked
+        );
+    }
+
+    /// With no announce time held this run, as after a restart, a fetched farewell keeps
+    /// the rule on this node's clock.
+    #[test]
+    fn a_fetched_farewell_without_an_announce_time_keeps_the_local_rule() {
+        let (table, _tmp) = table("peers-left-no-emitted");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        table.observe(sighting("aa", None), t0);
+        table.note_stamp("unknown", stamp(t0, 1), true, t0);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(t0 - Duration::from_secs(3590))),
+            LeftMark::HeardSince
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(t0 + Duration::from_secs(1))),
+            LeftMark::Marked
+        );
+    }
+
+    /// A replay, the same blob again or an older emission under a new one, is not
+    /// presence: it leaves the mark, `last_seen` and the latest presence alone. A fresh
+    /// stamp lifts the mark. A destination first heard is never a replay.
+    #[test]
+    fn a_replayed_announce_neither_lifts_the_mark_nor_counts_as_presence() {
+        let (table, _tmp) = table("peers-left-replay");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let first = stamp(t0, 1);
+        assert!(!table.is_replay("aa", &first), "a first sighting is fresh");
+        table.observe(sighting("aa", None), t0);
+        table.note_stamp("aa", first, true, t0);
+        let newer = stamp(t0 + Duration::from_secs(20), 2);
+        table.observe(sighting("aa", None), t0 + Duration::from_secs(20));
+        table.note_stamp("aa", newer, true, t0 + Duration::from_secs(20));
+        let left = t0 + Duration::from_secs(30);
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(left)),
+            LeftMark::Marked
+        );
+
+        assert!(table.is_replay("aa", &newer), "the same blob is a replay");
+        let older_copy = stamp(t0 + Duration::from_secs(10), 3);
+        assert!(
+            table.is_replay("aa", &older_copy),
+            "an emission older than the newest held is a replay"
+        );
+        let mut moved = sighting("aa", None);
+        moved.hops = 5;
+        assert!(table.follow_route(moved));
+        let row = table.get("aa").unwrap();
+        assert_eq!(row.left_at, Some(left), "a replay does not lift the mark");
+        assert_eq!(row.last_seen, t0 + Duration::from_secs(20));
+        assert_eq!(row.hops, 5, "a replay still says where the instance was");
+        assert!(table.clear_left("aa"));
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(t0 + Duration::from_secs(25))),
+            LeftMark::Marked,
+            "a replay records no presence"
+        );
+
+        let fresh = stamp(t0 + Duration::from_secs(40), 4);
+        assert!(!table.is_replay("aa", &fresh));
+        table.observe(sighting("aa", None), t0 + Duration::from_secs(40));
+        table.note_stamp("aa", fresh, true, t0 + Duration::from_secs(40));
+        assert_eq!(table.get("aa").unwrap().left_at, None, "a fresh one does");
+    }
+
+    /// The announce times go with the row: a swept or evicted row's next sighting is
+    /// a first one, never a replay.
+    #[test]
+    fn announce_times_are_swept_with_their_rows() {
+        let (table, _tmp) = table("peers-emitted-swept");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let heard = stamp(t0, 1);
+        table.observe(sighting("aa", None), t0);
+        table.note_stamp("aa", heard, true, t0);
+        assert!(table.is_replay("aa", &heard));
+        table.sweep(t0 + PEER_TTL);
+        assert!(!table.is_replay("aa", &heard));
     }
 
     /// Presence is kept for rows only, and a swept row takes its presence with it, so a
