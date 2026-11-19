@@ -3966,6 +3966,19 @@ mod tests {
             assert_eq!(prompter.requests().len(), asked);
             assert!(!password_file.exists());
         }
+
+        // With a password file in place the offer goes straight to the
+        // secret's value, and Ctrl-C there ends the install too.
+        fs::write(&password_file, "pw\n").unwrap();
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Confirmed(true),
+            PromptAnswer::Interrupted,
+        ]);
+
+        let err = prompt_for_each_secret(&missing, &prompter).unwrap_err();
+
+        assert!(PromptCancelled::interrupted(&err), "{err:#}");
+        assert_eq!(prompter.requests().len(), 2);
     }
 
     /// Under the full-screen UI a modified obsolete file is a closed

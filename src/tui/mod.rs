@@ -11645,6 +11645,15 @@ mod tests {
         harness.draw();
         harness.press(KeyCode::Enter);
         harness.clock.advance(HOTKEY_IDLE);
+        harness.app.handle_key(ctrl(KeyCode::Char('c')));
+        harness.draw();
+        assert!(queue.has_pending(), "Ctrl-C answered the question");
+        assert!(reply.try_recv().is_err());
+
+        harness.app.handle_key(alt(KeyCode::Char('t')));
+        harness.draw();
+        harness.press(KeyCode::Enter);
+        harness.clock.advance(HOTKEY_IDLE);
         harness.press(KeyCode::Down);
         harness.press(KeyCode::Enter);
         assert_eq!(reply.try_recv().as_deref(), Ok("dev"));
