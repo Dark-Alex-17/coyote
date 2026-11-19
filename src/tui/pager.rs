@@ -958,7 +958,9 @@ mod tests {
     use crate::config::CommandPrefix;
     use crate::config::child_sessions::ChildStatus;
     use crate::tui::TOOL_OUTPUT_TAIL;
-    use crate::tui::cells::{AgentStatus, FoldedCall, JobStatus, ToolStatus, append_output};
+    use crate::tui::cells::{
+        AgentStatus, FoldedCall, JobStatus, LineCache, ToolStatus, append_output,
+    };
     use crate::tui::transcript::Transcript;
     use chrono::{TimeZone, Utc};
     use ratatui::Terminal;
@@ -1393,6 +1395,7 @@ mod tests {
                 ),
                 calls: vec![folded("c1", "job__check", "job", lines)],
                 expanded: false,
+                cache: LineCache::default(),
             },
             Cell::Agent {
                 agent_id: "agent_reviewer_4e5f6a7b".to_string(),
@@ -1403,6 +1406,7 @@ mod tests {
                     folded("c3", "agent__collect", "verdict", 2),
                 ],
                 expanded: false,
+                cache: LineCache::default(),
             },
         ];
         let mut renderer = renderer();

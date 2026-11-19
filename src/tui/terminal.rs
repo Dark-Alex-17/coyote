@@ -12,19 +12,20 @@
 use anyhow::Result;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::execute;
 use crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, EnterAlternateScreen,
     LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
 };
+use crossterm::{Command, execute};
 use ratatui::Terminal;
 use ratatui::backend::{Backend, ClearType as BackendClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::layout::{Position, Size};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::io::{self, Write};
 use std::sync::Once;
 #[cfg(unix)]
@@ -109,7 +110,7 @@ impl TerminalStep {
             Self::CursorHidden(false) => execute!(writer, Show),
             Self::BracketedPaste(true) => execute!(writer, EnableBracketedPaste),
             Self::BracketedPaste(false) => execute!(writer, DisableBracketedPaste),
-            Self::MouseCapture(true) => execute!(writer, EnableMouseCapture),
+            Self::MouseCapture(true) => execute!(writer, EnableClickAndWheelReports),
             Self::MouseCapture(false) => execute!(writer, DisableMouseCapture),
             Self::KeyboardEnhancement(true) => execute!(
                 writer,
@@ -117,6 +118,29 @@ impl TerminalStep {
             ),
             Self::KeyboardEnhancement(false) => execute!(writer, PopKeyboardEnhancementFlags),
         }
+    }
+}
+
+/// Mouse reports for presses, releases and the wheel only (?1000), in SGR
+/// encoding (?1006). crossterm's `EnableMouseCapture` also turns on drag
+/// and any-motion tracking, so every pointer move becomes an event the UI
+/// reads and drops. `DisableMouseCapture` still undoes it: it resets the
+/// modes asked for here and the ones a crossterm enable would have left.
+struct EnableClickAndWheelReports;
+
+impl Command for EnableClickAndWheelReports {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        crossterm::event::EnableMouseCapture.execute_winapi()
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        crossterm::event::EnableMouseCapture.is_ansi_code_supported()
     }
 }
 
@@ -1163,6 +1187,21 @@ mod tests {
                 .iter()
                 .any(|step| matches!(step, TerminalStep::KeyboardEnhancement(_)))
         );
+    }
+
+    /// The UI reads presses and the wheel, so motion tracking stays off;
+    /// leaving switches off both modes entering asked for.
+    #[cfg(unix)]
+    #[test]
+    fn mouse_capture_asks_for_clicks_and_the_wheel_only() {
+        let mut enter = Vec::new();
+        TerminalStep::MouseCapture(true).apply(&mut enter).unwrap();
+        assert_eq!(enter, b"\x1b[?1000h\x1b[?1006h");
+        let mut leave = Vec::new();
+        TerminalStep::MouseCapture(false).apply(&mut leave).unwrap();
+        for mode in [&b"\x1b[?1000l"[..], b"\x1b[?1006l"] {
+            assert_eq!(count(&leave, mode), 1, "{leave:?}");
+        }
     }
 
     /// Without an `enter` on record there is nothing to undo, so `leave`

@@ -10,6 +10,7 @@ use crate::events::NoticeKind;
 use ratatui::style::{Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
+use std::borrow::Cow;
 use std::fmt;
 use std::time::{Duration, Instant};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -421,6 +422,7 @@ pub(super) enum Cell {
         open_line: bool,
         pending: Vec<u8>,
         full: FullOutput,
+        cache: LineCache,
     },
     /// A tool call: a one-line `name(args)` header, then the narration
     /// line and the tail of its output while it runs or when opened. A
@@ -441,6 +443,7 @@ pub(super) enum Cell {
         full: FullOutput,
         expanded: bool,
         bookkeeping: bool,
+        cache: LineCache,
     },
     Job {
         job_id: String,
@@ -448,6 +451,7 @@ pub(super) enum Cell {
         status: JobStatus,
         calls: Vec<FoldedCall>,
         expanded: bool,
+        cache: LineCache,
     },
     Agent {
         agent_id: String,
@@ -455,6 +459,7 @@ pub(super) enum Cell {
         status: AgentStatus,
         calls: Vec<FoldedCall>,
         expanded: bool,
+        cache: LineCache,
     },
     /// The boxed greeting an empty transcript shows until a line is
     /// submitted.
@@ -598,6 +603,7 @@ impl Cell {
             full: FullOutput::default(),
             expanded: false,
             bookkeeping,
+            cache: LineCache::default(),
         }
     }
 
@@ -623,11 +629,17 @@ impl Cell {
             Cell::Tool {
                 expanded,
                 bookkeeping: false,
+                cache,
                 ..
             }
-            | Cell::Job { expanded, .. }
-            | Cell::Agent { expanded, .. } => {
+            | Cell::Job {
+                expanded, cache, ..
+            }
+            | Cell::Agent {
+                expanded, cache, ..
+            } => {
                 *expanded = !*expanded;
+                *cache = LineCache::default();
             }
             _ => {}
         }
@@ -717,67 +729,92 @@ impl Cell {
             | Cell::Notice { cache, .. }
             | Cell::Error { cache, .. }
             | Cell::Command { cache, .. }
-            | Cell::Welcome { cache, .. } => *cache = LineCache::default(),
-            Cell::Text { .. } | Cell::Tool { .. } | Cell::Job { .. } | Cell::Agent { .. } => {}
+            | Cell::Welcome { cache, .. }
+            | Cell::Text { cache, .. }
+            | Cell::Tool { cache, .. }
+            | Cell::Job { cache, .. }
+            | Cell::Agent { cache, .. } => *cache = LineCache::default(),
+        }
+    }
+
+    /// Drops the wrapped lines of a tool, job, agent or stray-output row,
+    /// whose content changes in place; the transcript calls this on every
+    /// change to a cell.
+    pub(super) fn forget_wrapped_lines(&mut self) {
+        if let Cell::Text { cache, .. }
+        | Cell::Tool { cache, .. }
+        | Cell::Job { cache, .. }
+        | Cell::Agent { cache, .. } = self
+        {
+            *cache = LineCache::default();
         }
     }
 
     pub(super) fn lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
+        self.cached_lines(width, renderer).into_owned()
+    }
+
+    /// The cell's lines at `width`, borrowed from its cache where it
+    /// keeps them whole; a reply's come back owned.
+    pub(super) fn cached_lines(
+        &mut self,
+        width: u16,
+        renderer: &mut Renderer,
+    ) -> Cow<'_, [Line<'static>]> {
         let no_color = renderer.no_color;
-        match self {
+        Cow::Borrowed(match self {
             Cell::User {
                 text,
                 mid_turn: false,
                 cache,
                 ..
-            } => cache
-                .get(width, || {
-                    render::plain_lines(
-                        &format!("> {text}"),
-                        width,
-                        Style::new().add_modifier(Modifier::BOLD),
-                    )
-                })
-                .to_vec(),
-            Cell::User { text, cache, .. } => cache
-                .get(width, || {
-                    render::plain_lines(&format!("> {text} (sent mid-turn)"), width, DIM)
-                })
-                .to_vec(),
+            } => cache.get(width, || {
+                render::plain_lines(
+                    &format!("> {text}"),
+                    width,
+                    Style::new().add_modifier(Modifier::BOLD),
+                )
+            }),
+            Cell::User { text, cache, .. } => cache.get(width, || {
+                render::plain_lines(&format!("> {text} (sent mid-turn)"), width, DIM)
+            }),
             Cell::Assistant {
                 source,
                 done,
                 cache,
-            } => cache.lines(without_think_spans(source, *done), *done, width, renderer),
+            } => {
+                return Cow::Owned(cache.lines(
+                    without_think_spans(source, *done),
+                    *done,
+                    width,
+                    renderer,
+                ));
+            }
             Cell::Notice { kind, text, cache } => {
                 let style = chrome_style(ChromeKind::Notice(*kind), no_color);
-                cache
-                    .get(width, || render::plain_lines(text, width, style))
-                    .to_vec()
+                cache.get(width, || render::plain_lines(text, width, style))
             }
-            Cell::Error { text, cache } => cache
-                .get(width, || {
-                    render::plain_lines(text, width, chrome_style(ChromeKind::Error, no_color))
-                })
-                .to_vec(),
+            Cell::Error { text, cache } => cache.get(width, || {
+                render::plain_lines(text, width, chrome_style(ChromeKind::Error, no_color))
+            }),
             Cell::Command {
                 name,
                 output,
                 cache,
                 ..
-            } => cache
-                .get(width, || {
-                    // The header is the typed line; scrubbed like a User
-                    // cell's, so a pasted escape cannot paint through it.
-                    let header = render::plain_text(&format!("> {name}"));
-                    let mut lines = vec![Line::from(Span::styled(header, DIM))];
-                    if !output.is_empty() {
-                        lines.extend(render::preformatted_lines(output));
-                    }
-                    lines
-                })
-                .to_vec(),
-            Cell::Text { lines, .. } => dim_wrapped(output_lines(lines), width),
+            } => cache.get(width, || {
+                // The header is the typed line; scrubbed like a User
+                // cell's, so a pasted escape cannot paint through it.
+                let header = render::plain_text(&format!("> {name}"));
+                let mut lines = vec![Line::from(Span::styled(header, DIM))];
+                if !output.is_empty() {
+                    lines.extend(render::preformatted_lines(output));
+                }
+                lines
+            }),
+            Cell::Text { lines, cache, .. } => {
+                cache.get(width, || dim_wrapped(output_lines(lines), width))
+            }
             Cell::Tool {
                 name,
                 args,
@@ -786,8 +823,9 @@ impl Cell {
                 output,
                 expanded,
                 bookkeeping,
+                cache,
                 ..
-            } => {
+            } => cache.get(width, || {
                 let state = tool_state(status);
                 // The header is one row; the view clips what does not
                 // fit, so the arguments give way to the state. The
@@ -808,41 +846,41 @@ impl Cell {
                     lines.extend(dim_wrapped(body, width));
                 }
                 lines
-            }
+            }),
             Cell::Job {
                 job_id,
                 tool,
                 status,
                 calls,
                 expanded,
-            } => {
+                cache,
+            } => cache.get(width, || {
                 let (state, error) = job_state(status);
                 let reserved = "job   ".len() + state.width();
                 let subject = fit_to_row(&format!("{tool} {job_id}"), reserved, width);
                 let header = format!("job {subject}  {state}");
                 row_lines(header, error, calls, *expanded, width)
-            }
+            }),
             Cell::Agent {
                 agent_id,
                 name,
                 status,
                 calls,
                 expanded,
-            } => {
+                cache,
+            } => cache.get(width, || {
                 let (state, error) = agent_state(status);
                 let reserved = "agent   ".len() + state.width();
                 let subject = fit_to_row(&format!("{name} {agent_id}"), reserved, width);
                 let header = format!("agent {subject}  {state}");
                 row_lines(header, error, calls, *expanded, width)
-            }
+            }),
             Cell::Welcome {
                 model,
                 prefix,
                 cache,
-            } => cache
-                .get(width, || welcome_lines(model, *prefix, width))
-                .to_vec(),
-        }
+            } => cache.get(width, || welcome_lines(model, *prefix, width)),
+        })
     }
 
     /// The cell as the pager shows it: a tool, job or agent row open,
@@ -1318,6 +1356,7 @@ mod tests {
             status: JobStatus::Running,
             calls,
             expanded: false,
+            cache: LineCache::default(),
         };
         let each = "call 1 out\n".len();
         assert_eq!(cell.full_output_bytes(), 3 * each);
@@ -1593,6 +1632,7 @@ mod tests {
         *status = ToolStatus::Ok {
             elapsed: Duration::from_millis(1200),
         };
+        cell.forget_wrapped_lines();
         let lines = cell.lines(80, &mut renderer);
         assert_eq!(lines.len(), 1, "a collapsed row took more than one line");
         assert_eq!(lines[0].to_string(), format!("{header}  1.2s  ok"));
@@ -1657,6 +1697,7 @@ mod tests {
                 status: JobStatus::Failed(error.clone()),
                 calls: vec![FoldedCall::new("c1".to_string(), "job__check".to_string())],
                 expanded: false,
+                cache: LineCache::default(),
             },
             Cell::Agent {
                 agent_id: "agent-1".to_string(),
@@ -1664,6 +1705,7 @@ mod tests {
                 status: AgentStatus::Failed(error.clone()),
                 calls: Vec::new(),
                 expanded: false,
+                cache: LineCache::default(),
             },
         ];
         for cell in &mut rows {

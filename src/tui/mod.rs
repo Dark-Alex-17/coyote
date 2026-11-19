@@ -2633,6 +2633,7 @@ impl App {
                     status: JobStatus::Running,
                     calls: Vec::new(),
                     expanded: false,
+                    cache: LineCache::default(),
                 },
                 "job__start",
             ),
@@ -2658,6 +2659,7 @@ impl App {
                     status: AgentStatus::Running,
                     calls: Vec::new(),
                     expanded: false,
+                    cache: LineCache::default(),
                 },
                 "agent__spawn",
             ),
@@ -3045,6 +3047,7 @@ impl App {
                 open_line: false,
                 pending: Vec::new(),
                 full: FullOutput::default(),
+                cache: LineCache::default(),
             });
         }
         let Some(Cell::Text {
@@ -11292,6 +11295,58 @@ mod tests {
         assert!(harness.app.transcript.scrolled());
         harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
         assert!(!harness.app.transcript.scrolled());
+    }
+
+    /// One wheel notch moves the key help, the pager and the transcript
+    /// by one row: a row in the middle of the screen is found one row
+    /// further along after it.
+    #[test]
+    fn a_wheel_notch_moves_one_row() {
+        let mut harness = Harness::standalone(80, 24);
+        counted_turn(&mut harness, 60);
+        harness.app.end_turn(false, &TurnOutcome::default());
+        harness.draw();
+        let wheel = |kind: MouseEventKind| {
+            TermInput::Mouse(MouseEvent {
+                kind,
+                column: 4,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let row = |frame: &str, at: usize| frame.lines().nth(at).unwrap_or_default().to_string();
+
+        harness.press(KeyCode::Char('?'));
+        let top = harness.draw();
+        harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
+        let scrolled = harness.draw();
+        assert_eq!(
+            row(&scrolled, 9),
+            row(&top, 10),
+            "the key help\n{top}\n{scrolled}"
+        );
+        harness.press(KeyCode::Esc);
+
+        press_ctrl(&mut harness, 't');
+        harness.press(KeyCode::Char('g'));
+        let top = harness.draw();
+        harness.app.handle_input(wheel(MouseEventKind::ScrollDown));
+        let scrolled = harness.draw();
+        assert_eq!(
+            row(&scrolled, 9),
+            row(&top, 10),
+            "the pager\n{top}\n{scrolled}"
+        );
+        harness.press(KeyCode::Char('q'));
+
+        let bottom = harness.draw();
+        harness.app.handle_input(wheel(MouseEventKind::ScrollUp));
+        let scrolled = harness.draw();
+        assert_eq!(
+            row(&scrolled, 11),
+            row(&bottom, 10),
+            "the transcript\n{bottom}\n{scrolled}"
+        );
     }
 
     /// The key help is a pop-up inside the transcript's rows: the composer
