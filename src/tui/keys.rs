@@ -422,7 +422,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         ),
         row(
             ComposerEditing,
-            "Ctrl+W / Alt+Backspace / Alt+H",
+            "Ctrl+W / Alt+Backspace",
             "Cut the word before the cursor",
         ),
         row(
@@ -598,6 +598,10 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('u') if ctrl => Action::DeleteToLineHead,
             KeyCode::Char('_' | '/' | '7') if ctrl => Action::Undo,
             KeyCode::Char('-') if ctrl && shift => Action::Undo,
+            // The text area cuts a word on Alt+H as well as Ctrl+W, but
+            // Zellij takes Alt+H even when locked, so it is swallowed
+            // here and in the composer rather than offered.
+            KeyCode::Char('h') if alt && !ctrl => Action::Nothing,
             _ => Action::ModalInput(key),
         },
         Some(
@@ -723,6 +727,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
                 Action::ToggleHelp
             }
             KeyCode::Char(_) if !ctrl && ctx.vi == Some(ViMode::Normal) => vi_normal(key.code),
+            KeyCode::Char('h') if alt && !ctrl => Action::Nothing,
             _ => Action::ComposerInput(key),
         },
     }
@@ -2500,11 +2505,10 @@ mod tests {
             ),
             (
                 H::ComposerEditing,
-                "Ctrl+W / Alt+Backspace / Alt+H",
+                "Ctrl+W / Alt+Backspace",
                 vec![
                     typed(ctrl('w'), TYPING),
                     typed(alt(KeyCode::Backspace), TYPING),
-                    typed(alt(KeyCode::Char('h')), TYPING),
                 ],
             ),
             (
@@ -3187,6 +3191,27 @@ mod tests {
         }
     }
 
+    /// Alt+H reaches neither the composer's nor a question field's text
+    /// area, which would cut the word before the cursor.
+    #[test]
+    fn alt_h_cuts_nothing() {
+        let key = press(KeyCode::Char('h'), KeyModifiers::ALT);
+        assert_eq!(map_key(key, &TYPING), Action::Nothing);
+        for modal in [ModalKind::Input, ModalKind::Password] {
+            let ctx = KeyContext {
+                modal: Some(modal),
+                ..IDLE
+            };
+            assert_eq!(map_key(key, &ctx), Action::Nothing, "{modal:?}");
+        }
+        let mut composer = primed_composer();
+        let before = composer.text();
+        if let Action::ComposerInput(typed) = map_key(key, &TYPING) {
+            composer.input(typed);
+        }
+        assert_eq!(composer.text(), before);
+    }
+
     /// Every binding the key map reaches, in every swept context, is
     /// that key with that action among the replays of a help row
     /// applying there; modifiers the key map ignores for the key do not
@@ -3408,6 +3433,7 @@ mod tests {
             "Ctrl+C",
             "Ctrl+U",
             "Ctrl+X",
+            "Alt+H",
             "Shift+Up",
             "Shift+Down",
             "PgUp",
