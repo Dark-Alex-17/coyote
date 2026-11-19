@@ -7117,6 +7117,13 @@ mod tests {
                     labelled || !answered,
                     "40x{height} {action:?} was answered with no origin row:\n{rendered}"
                 );
+                assert!(
+                    labelled
+                        || !["y = yes", "Enter = answer", "Enter = choose"]
+                            .iter()
+                            .any(|offer| rendered.contains(offer)),
+                    "40x{height} {action:?} offered answers with no origin row:\n{rendered}"
+                );
                 if !answered {
                     harness.press(KeyCode::Esc);
                 }
