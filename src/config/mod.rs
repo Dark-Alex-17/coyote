@@ -103,7 +103,7 @@ pub use self::skill::Skill;
 #[allow(unused_imports)]
 pub use self::skill_policy::SkillPolicy;
 #[allow(unused_imports)]
-pub use self::skill_registry::SkillRegistry;
+pub use self::skill_registry::{AgentToolGate, SkillRegistry};
 #[cfg(test)]
 pub(crate) use self::tool_scope::test_fixtures;
 pub use self::tool_scope::{

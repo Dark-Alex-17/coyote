@@ -372,14 +372,16 @@ nodes:
   # `_next` key (if present) overrides routing.
   #
   # The script also receives these env vars (parity with bash tools called
-  # from normal agents):
+  # from normal agents, except that colour is never forced):
   #   GRAPH_STATE / GRAPH_STATE_FILE  state payload (one of the two is set)
   #   LLM_ROOT_DIR                    coyote config dir
   #   LLM_PROMPT_UTILS_FILE           path to .shared/prompt-utils.sh
   #   LLM_AGENT_DATA_DIR              this agent's data directory
   #   LLM_AGENT_VAR_<NAME>            one per declared `variables:` entry
   #   PATH                            with coyote's functions bin dir prepended
-  #   CLICOLOR_FORCE / FORCE_COLOR    so child tools emit ANSI colors
+  #   NO_COLOR=1                      stdout is parsed as JSON, so child tools
+  #                                   stay plain; an inherited CLICOLOR_FORCE /
+  #                                   FORCE_COLOR is removed
   # The script's working directory is coyote's invocation CWD (not the agent
   # directory), matching the behavior of bash tools.
   #

@@ -9,7 +9,8 @@ use super::{
     UnavailableReason, WorkingMode, builtin_agent_dir, paths,
 };
 use crate::function::{
-    Functions, builtin_agent_child_env, builtin_agent_env, inherited_process_env, run_llm_function,
+    Functions, ToolAgent, builtin_agent_child_env, builtin_agent_env, inherited_process_env,
+    run_llm_function,
 };
 use crate::testing::{EnvVarGuard, TestConfigDirGuard};
 use crate::utils::{create_abort_signal, get_env_name, temp_file};
@@ -879,7 +880,10 @@ fn the_production_path_pins_the_root_to_the_process_cwd() {
             fx.shim.display().to_string(),
             vec!["fs_read".into(), json!({"path": path}).to_string()],
             HashMap::new(),
-            Some(ENVOY_AGENT_NAME.to_string()),
+            Some(ToolAgent {
+                name: ENVOY_AGENT_NAME.to_string(),
+                script: true,
+            }),
             None,
             false,
             None,

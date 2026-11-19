@@ -9,7 +9,7 @@ use super::{
     FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result, timeout_hint,
 };
 use crate::config::{
-    Agent, McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
+    Agent, McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
@@ -196,6 +196,7 @@ pub struct JobEnvSnapshot {
     cmd_name: String,
     display_name: String,
     cmd_args: Vec<String>,
+    bin_dirs: Vec<PathBuf>,
     envs: HashMap<String, String>,
     env_clear: bool,
     output_file: PathBuf,
@@ -555,6 +556,13 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
             .strip_prefix(&format!("{MCP_INVOKE_META_FUNCTION_NAME_PREFIX}_"))
             .ok_or_else(|| anyhow!("Malformed MCP invoke function name: {tool}"))?
             .to_string();
+        if let Some(refusal) = ctx.mcp_server_refusal(&server) {
+            warn!("{refusal}");
+            return Ok(json!({
+                "status": "error",
+                "message": refusal,
+            }));
+        }
         let Some(server_handle) = ctx.tool_scope.mcp_runtime.get(&server) else {
             return Ok(json!({
                 "status": "error",
@@ -1213,30 +1221,29 @@ fn build_env_snapshot(
     arguments: &Value,
 ) -> Result<JobEnvSnapshot> {
     let agent = ctx.agent.as_ref();
-    let (cmd_name, mut cmd_args, mut envs) = match agent {
+    let (cmd_name, mut cmd_args, mut envs, agent_script) = match agent {
         Some(agent) => match agent.functions().find(tool) {
             Some(declaration) if declaration.agent => (
                 agent.name().to_string(),
                 vec![tool.to_string()],
                 agent.variable_envs(),
+                true,
             ),
-            Some(_) => (tool.to_string(), vec![], agent.variable_envs()),
-            None => (tool.to_string(), vec![], HashMap::new()),
+            Some(_) => (tool.to_string(), vec![], agent.variable_envs(), false),
+            None => bail!(super::undeclared_tool_error(tool, agent.name())),
         },
-        None => (tool.to_string(), vec![], HashMap::new()),
+        None => (tool.to_string(), vec![], HashMap::new(), false),
     };
 
-    let mut bin_dirs: Vec<PathBuf> = vec![];
-    if let Some(agent) = agent {
-        let dir = paths::agent_bin_dir(agent.name());
-        if dir.exists() {
-            bin_dirs.push(dir);
-        }
-        if graph::agent_has_graph(agent.name()) {
-            envs.insert("AUTO_CONFIRM".into(), "true".into());
-        }
-    } else {
-        bin_dirs.push(paths::functions_bin_dir());
+    let tool_agent = agent.map(|agent| super::ToolAgent {
+        name: agent.name().to_string(),
+        script: agent_script,
+    });
+    let bin_dirs = super::tool_bin_dirs(tool_agent.as_ref());
+    if let Some(agent) = agent
+        && graph::agent_has_graph(agent.name())
+    {
+        envs.insert("AUTO_CONFIRM".into(), "true".into());
     }
     let current_path = env::var("PATH").context("No PATH environment variable")?;
     let prepend_path = bin_dirs
@@ -1307,6 +1314,7 @@ fn build_env_snapshot(
         cmd_name,
         display_name: tool.to_string(),
         cmd_args,
+        bin_dirs,
         envs,
         env_clear,
         output_file,
@@ -1390,9 +1398,14 @@ async fn run_process_job(
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = command
-        .spawn()
-        .map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    let mut child = command.spawn().map_err(|err| {
+        super::spawn_error(
+            &snapshot.display_name,
+            &snapshot.cmd_name,
+            &snapshot.bin_dirs,
+            &err,
+        )
+    })?;
     debug!(
         "Spawned job process '{}' pid {:?}",
         snapshot.display_name,
@@ -1630,7 +1643,7 @@ fn tail_chars(text: &str, max_chars: usize) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::test_fixtures::{FixtureServer, fixture_runtime};
-    use crate::config::{AppConfig, AppState, WorkingMode};
+    use crate::config::{AppConfig, AppState, WorkingMode, paths};
     use crate::config::{LayerSource, ToolFilter};
     use crate::function::agents::{
         GuardrailAction, check_pending_tasks_guardrail, handle_agent_tool,
@@ -1654,6 +1667,138 @@ mod tests {
 
     fn plain_ctx() -> RequestContext {
         RequestContext::new(default_app_state(), WorkingMode::Cmd)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_snapshot_refuses_a_global_tool_the_agent_does_not_declare() {
+        let _guard = crate::testing::TestConfigDirGuard::new("job-skill-granted-tool");
+        let agent_name = "job-skill-granted-agent";
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        }));
+
+        let Err(err) = build_env_snapshot(&ctx, "grantedglob", &json!({})) else {
+            panic!("an undeclared tool must not be runnable as a job");
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Tool 'grantedglob' is not enabled for agent 'job-skill-granted-agent'. To use it, add grantedglob to job-skill-granted-agent's global_tools in the agent definition."
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn env_snapshot_runs_agent_script_tool_as_agent_binary() {
+        let _guard = crate::testing::TestConfigDirGuard::new("job-agent-script-tool");
+        let agent_name = "job-script-agent";
+        let mut agent = crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        });
+        agent
+            .functions_mut()
+            .append_declaration(FunctionDeclaration {
+                name: "scripted".into(),
+                description: String::new(),
+                parameters: Default::default(),
+                agent: true,
+            });
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(agent);
+
+        let snapshot = build_env_snapshot(&ctx, "scripted", &json!({})).unwrap();
+
+        assert_eq!(snapshot.cmd_name, agent_name);
+        assert_eq!(snapshot.cmd_args[0], "scripted");
+        let functions_bin = crate::config::paths::functions_bin_dir()
+            .display()
+            .to_string();
+        let path = &snapshot.envs["PATH"];
+        assert!(
+            !path.split(PATH_SEP).any(|dir| dir == functions_bin),
+            "{path}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn job_runs_a_declared_global_tool_inside_an_agent_and_names_a_missing_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("job-runs-granted-tool");
+        let agent_name = "job-granted-agent";
+        let agent_bin = crate::config::paths::agent_bin_dir(agent_name);
+        fs::create_dir_all(&agent_bin).unwrap();
+        let tool = agent_bin.join("jobglob");
+        fs::write(
+            &tool,
+            "#!/usr/bin/env bash\nprintf globbed >> \"$LLM_OUTPUT\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut agent = crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: agent_name.into(),
+            ..Default::default()
+        });
+        for name in ["jobglob", "jobmissing"] {
+            agent
+                .functions_mut()
+                .append_declaration(FunctionDeclaration {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: Default::default(),
+                    agent: false,
+                });
+        }
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(agent);
+        let new_state = || {
+            Arc::new(Mutex::new(JobState {
+                status: JobStatus::Running,
+                pgid: None,
+            }))
+        };
+
+        run_async(async {
+            // A freshly written script can still be open for writing in a
+            // forked child elsewhere in the process, making exec fail with
+            // ETXTBSY.
+            let mut attempts = 0;
+            let result = loop {
+                let snapshot = build_env_snapshot(&ctx, "jobglob", &json!({})).unwrap();
+                let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+                match run_process_job(snapshot, new_state(), output_buf).await {
+                    Err(err) if err.to_string().contains("Text file busy") && attempts < 10 => {
+                        attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    result => break result.unwrap(),
+                }
+            };
+            assert_eq!(result.exit_code, Some(0));
+            assert_eq!(result.output, json!({"output": "globbed"}));
+
+            let snapshot =
+                build_env_snapshot(&ctx, "jobmissing", &json!({"pattern": "*.rs"})).unwrap();
+            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+            let Err(err) = run_process_job(snapshot, new_state(), output_buf).await else {
+                panic!("a missing job tool must fail to spawn");
+            };
+            let err = err.to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "Unable to run jobmissing: 'jobmissing' failed to start; the executable or its interpreter may be missing (searched [{}] and PATH)",
+                    agent_bin.display()
+                )),
+                "{err}"
+            );
+            assert!(!err.contains("pattern"), "{err}");
+        });
     }
 
     fn ctx_with_job_supervisor(max_jobs: usize) -> RequestContext {
@@ -1711,6 +1856,7 @@ mod tests {
             cmd_name: cmd.to_string(),
             display_name: cmd.to_string(),
             cmd_args: args.iter().map(|s| s.to_string()).collect(),
+            bin_dirs: vec![],
             envs,
             env_clear: false,
             output_file,
@@ -2143,6 +2289,32 @@ mod tests {
             );
             assert_eq!(call_tool_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         });
+    }
+
+    #[test]
+    fn handle_start_refuses_an_mcp_server_the_agent_does_not_declare() {
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(crate::config::Agent::test_new(crate::config::AgentConfig {
+            name: "job-mcp-agent".into(),
+            mcp_servers: vec!["github".into()],
+            ..Default::default()
+        }));
+        ctx.declared_function_names
+            .insert("mcp_invoke_skillsrv".into());
+
+        let result = run_async(handle_start(
+            &mut ctx,
+            &json!({"tool": "mcp_invoke_skillsrv", "arguments": {"tool": "search"}}),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            result,
+            json!({
+                "status": "error",
+                "message": "MCP server 'skillsrv' is not enabled for agent 'job-mcp-agent'. To use it, add skillsrv to job-mcp-agent's mcp_servers in the agent definition.",
+            })
+        );
     }
 
     #[test]

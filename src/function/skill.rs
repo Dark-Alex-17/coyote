@@ -1,5 +1,6 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::{Agent, RequestContext, Skill, SkillPolicy, paths};
+use crate::config::{Agent, AgentToolGate, RequestContext, Skill, SkillPolicy, paths};
+use crate::utils::muted_warning_text;
 
 use anyhow::{Result, bail};
 use indexmap::IndexMap;
@@ -194,6 +195,11 @@ async fn handle_load(
         }));
     }
 
+    let warnings = ctx
+        .agent
+        .as_ref()
+        .map(|agent| AgentToolGate::new(agent, &ctx.app.config).warnings(&skill))
+        .unwrap_or_default();
     if let Err(e) = ctx.skill_registry.insert(skill) {
         return Ok(json!({"error": e.to_string()}));
     }
@@ -208,11 +214,28 @@ async fn handle_load(
         }));
     }
 
-    Ok(json!({
+    report_withheld_tools(&warnings, ctx.current_depth == 0);
+    let mut result = json!({
         "status": "ok",
         "loaded": name,
         "message": format!("Skill '{name}' loaded")
-    }))
+    });
+    if !warnings.is_empty() {
+        result["message"] = json!(format!(
+            "Skill '{name}' loaded, but some of the tools it grants are not enabled for this agent and are not available; do not call them"
+        ));
+        result["warnings"] = json!(warnings);
+    }
+    Ok(result)
+}
+
+pub(crate) fn report_withheld_tools(warnings: &[String], to_stderr: bool) {
+    for warning in warnings {
+        warn!("{warning}");
+        if to_stderr {
+            eprintln!("{}", muted_warning_text(warning));
+        }
+    }
 }
 
 async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
