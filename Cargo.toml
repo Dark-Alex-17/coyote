@@ -195,7 +195,11 @@ arc-swap = "1.9.2"
 # LAN interface lives in rnsd), `AnnounceEvent::emitted` and `AnnounceEvent::random_blob`
 # (the emitter's own clock for one announce, and the blob that identifies it, so a
 # replayed announce is told apart from a fresh one), and
-# `Transport::latest_announce_emitted`. Coyote reads all of them.
+# `Transport::latest_announce_emitted`. Coyote reads all but the last: it keeps its own
+# record of the emission times and blobs each session heard, since the path table's
+# newest blob does not say which of them this session already heard. The RPC client's
+# handshake brings `md-5` and `sha3` (with `keccak`) into the lock, for the HMAC digests
+# Python's `multiprocessing.connection` offers.
 #
 # The fork re-exports `rand_core` and `rmpv`, so Coyote names the RNG its constructors
 # take as `rns_transport::rand_core::OsRng` and needs no `rand_core` entry of its own.

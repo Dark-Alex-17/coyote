@@ -36,6 +36,10 @@ pub(crate) const PEER_TABLE_VERSION: u64 = 2;
 
 /// How many of a row's latest announce blobs are remembered to know a replay by.
 const SEEN_ANNOUNCE_BLOBS: usize = 32;
+/// How far behind this node's clock, once moved onto it by the learnt offset, a path
+/// response's emission may be and still be taken as the instance answering for itself
+/// now rather than a relay answering from a copy it stored.
+const CURRENT_EMISSION_MS: i64 = 10_000;
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`.
@@ -497,6 +501,30 @@ impl PeerTable {
             .get(destination_hash)
             .is_some_and(|clock| {
                 stamp.emitted < clock.latest_emitted || clock.blobs.contains(&stamp.blob)
+            })
+    }
+
+    /// Whether a fresh path response stamped `stamp` was made by the instance about now:
+    /// its emission, moved onto this node's clock by the offset plain announces taught,
+    /// is within `CURRENT_EMISSION_MS` of `now`. Only such a response says the instance is
+    /// there; one a relay answers from a copy it stored, perhaps from before the
+    /// instance left, says only where it was. Without a learnt offset, as after a
+    /// restart, nothing can tell the two apart, so none is.
+    pub(crate) fn emission_is_current(
+        &self,
+        destination_hash: &str,
+        stamp: &AnnounceStamp,
+        now: SystemTime,
+    ) -> bool {
+        self.announce_clocks
+            .lock()
+            .get(destination_hash)
+            .and_then(AnnounceClock::offset)
+            .is_some_and(|offset| {
+                unix_millis(now)
+                    .saturating_sub(emitted_millis(stamp.emitted))
+                    .saturating_sub(offset)
+                    <= CURRENT_EMISSION_MS
             })
     }
 
@@ -1351,6 +1379,35 @@ mod tests {
         table.observe(sighting("aa", None), heard);
         table.note_stamp("aa", stamp, true, heard);
         stamp
+    }
+
+    /// A direct farewell keeps its arrival time once an announce time is held, even from
+    /// a sender whose clock runs an hour behind: it is weighed on this node's clock, where
+    /// the same time, stamped, is weighed on the sender's.
+    #[test]
+    fn a_direct_farewell_stays_on_its_arrival_with_an_announce_time_held() {
+        let (table, _tmp) = table("peers-left-arrived-clock");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let at = |secs| t0 + Duration::from_secs(secs);
+        hear_behind(&table, t0, 1);
+        table.note_presence("aa", at(10));
+
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Arrived(at(10))),
+            LeftMark::HeardSince,
+            "a farewell arriving as the request did is not later than it"
+        );
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Stamped(at(10))),
+            LeftMark::Marked,
+            "stamped, the same time is an hour after the request on the sender's clock"
+        );
+        assert!(table.clear_left("aa"));
+        assert_eq!(
+            table.mark_left("aa", FarewellTime::Arrived(at(12))),
+            LeftMark::Marked
+        );
+        assert_eq!(table.get("aa").unwrap().left_at, Some(at(12)));
     }
 
     /// A fetched farewell is weighed on the sender's clock once an announce time is held:

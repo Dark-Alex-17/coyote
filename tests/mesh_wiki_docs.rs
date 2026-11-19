@@ -10992,3 +10992,71 @@ fn the_mesh_page_names_the_short_hash_refusal_and_the_sibling_message_kind() {
         assert!(!page.contains(gone), "Mesh.md still says {gone:?}");
     }
 }
+
+/// The text under the `heading` line of `page` (`## When ...`, `### ...`), up to the next
+/// heading of any level, with every run of whitespace folded to one space so a needle may
+/// cross a line break.
+fn folded_section(page: &str, heading: &str) -> String {
+    let start = page
+        .find(&format!("\n{heading}\n"))
+        .unwrap_or_else(|| panic!("no `{heading}` section"));
+    let body = &page[start + heading.len() + 2..];
+    let body = body.find("\n#").map_or(body, |end| &body[..end]);
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The silent-LAN section says how the LAN host count is read, in the order and with the
+/// keys the code uses, and when the line comes; the `.mesh status` page quotes the LAN
+/// line in the words `.mesh status` prints.
+#[test]
+fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
+    let repl = read(repo_root().join("src/repl/mesh.rs"));
+    let lan_count = read(repo_root().join("src/mesh/lan_count.rs"));
+    for literal in [
+        "\"LAN: 1 host reachable\"",
+        "\"LAN: {hosts} hosts reachable\"",
+    ] {
+        assert!(
+            repl.contains(literal),
+            "src/repl/mesh.rs no longer prints {literal}"
+        );
+    }
+    for literal in [
+        "\"/etc/reticulum\"",
+        "join(\".config\").join(\"reticulum\")",
+        "join(\".reticulum\")",
+        "\"rpc_key\"",
+        "join(\"storage\").join(\"transport_identity\")",
+    ] {
+        assert!(
+            lan_count.contains(literal),
+            "src/mesh/lan_count.rs no longer reads {literal}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let silent = folded_section(
+        &read(wiki.join("Mesh-Deployment.md")),
+        "## When the LAN is silent",
+    );
+    for needle in [
+        "`/etc/reticulum`, then `~/.config/reticulum`, then `~/.reticulum`",
+        "its `rpc_key` or the key rnsd derives from its transport identity",
+        "`.mesh status` shows it as `LAN: N hosts reachable`",
+        "whose every LAN interface reaches 0 hosts says so once",
+        "whatever other interfaces it has",
+        "One LAN host is enough to keep the line away",
+        "no `private` relay is configured and no other session has been heard at all",
+    ] {
+        assert!(
+            silent.contains(needle),
+            "Mesh-Deployment.md's silent-LAN section does not say {needle:?}"
+        );
+    }
+    let status = folded_section(&read(wiki.join("Mesh-Commands.md")), "### `.mesh status`");
+    let needle = "`LAN: N hosts reachable` (`LAN: 1 host reachable`)";
+    assert!(
+        status.contains(needle),
+        "Mesh-Commands.md's `.mesh status` section does not say {needle:?}"
+    );
+}

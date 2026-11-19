@@ -103,6 +103,10 @@ impl RnsdLocator {
         if let Some(dir) = &self.dir_override {
             return Some(dir.clone());
         }
+        // A test that names no rnsd of its own never reads the developer's.
+        if cfg!(test) {
+            return None;
+        }
         dirs::home_dir().map(|home| default_config_dir(Path::new(ETC_CONFIG_DIR), &home))
     }
 }
@@ -529,6 +533,32 @@ mod tests {
         let reader = reader_at(&dir.path, source.clone());
         assert_eq!(reader.read().await, Some(LanReading::Count(0)));
         assert_eq!(source.calls(), 1);
+    }
+
+    /// The rnsd's zero count reaches the silent-LAN check through the same readings the
+    /// watcher takes, and tells the line where the hosts-heard signal would not: a host
+    /// was heard and a `private` relay is configured.
+    #[tokio::test]
+    async fn the_rnsd_zero_count_tells_the_silent_lan_line() {
+        use crate::mesh::node::{LanVerdict, lan_silent_verdict};
+        let dir = keyed_dir("lan-count-rnsd-verdict");
+        let source = Scripted::new([Ok(vec![auto(0)]), Ok(vec![auto(1)])]);
+        let reader = reader_at(&dir.path, source);
+        let grace = Duration::from_secs(120);
+
+        let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
+        assert_eq!(readings, [LanReading::Count(0)]);
+        assert_eq!(
+            lan_silent_verdict(grace, &readings, true, true),
+            LanVerdict::Tell
+        );
+
+        let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
+        assert_eq!(readings, [LanReading::Count(1)]);
+        assert_eq!(
+            lan_silent_verdict(grace, &readings, false, false),
+            LanVerdict::Settle
+        );
     }
 
     #[tokio::test]

@@ -117,7 +117,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::{interval, interval_at, sleep, timeout, timeout_at};
+use tokio::time::{MissedTickBehavior, interval, interval_at, sleep, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 /// Budget for each join and lock wait around the node's lifecycle: `stop` gives the node's
@@ -3338,7 +3338,10 @@ impl AnnounceFiler<'_> {
     /// Files a heard announce by what its stamp says. A fresh one files as `file`, or as
     /// `file_path_response` for a path response, and its stamp is noted against the row.
     /// A replay, which a relay may send long after the instance left, files route facts
-    /// only and reads `None`: it is no sighting.
+    /// only and reads `None`: it is no sighting. A path response for a known row that the
+    /// instance did not make about now, by the learnt clock offset, refreshes the route
+    /// without counting as presence: a relay may answer from a copy this run never heard,
+    /// stored before the instance left.
     fn file_stamped(
         &mut self,
         announced: AnnouncedDestination,
@@ -3353,7 +3356,14 @@ impl AnnounceFiler<'_> {
             self.follow_replay(announced, app_data, hops);
             return None;
         }
-        let change = if path_response {
+        let change = if path_response
+            && self.peers.get(&destination_hash).is_some()
+            && !self
+                .peers
+                .emission_is_current(&destination_hash, &stamp, now)
+        {
+            self.follow_path_response(announced, app_data, hops, now)
+        } else if path_response {
             self.file_path_response(announced, app_data, hops, now)
         } else {
             self.file(announced, app_data, hops, now)
@@ -3361,6 +3371,36 @@ impl AnnounceFiler<'_> {
         self.peers
             .note_stamp(&destination_hash, stamp, !path_response, now);
         Some(change)
+    }
+
+    /// `file_path_response` for a known row without the presence: route facts and the
+    /// key-change check only.
+    fn follow_path_response(
+        &mut self,
+        announced: AnnouncedDestination,
+        app_data: &[u8],
+        hops: u8,
+        now: SystemTime,
+    ) -> Option<PeerChange> {
+        let decoded = decode_announce(&announced.destination_hash, app_data, hops)?;
+        let followed = self.peers.follow_route(PeerSighting {
+            destination_hash: announced.destination_hash.clone(),
+            identity_hash: announced.identity_hash.clone(),
+            name_hash: announced.name_hash.clone(),
+            public_key: announced.public_key.clone(),
+            display_name: decoded.display_name,
+            protocol_version: decoded.version,
+            hops,
+        });
+        if !followed {
+            return self.file(announced, app_data, hops, now);
+        }
+        debug!(
+            "Followed the route to mesh peer {} from a path response it may not have made now",
+            short(&announced.destination_hash)
+        );
+        self.note_key_change(&announced.identity_hash, &announced.name_hash, now);
+        Some(PeerChange::Refreshed)
     }
 
     fn follow_replay(&self, announced: AnnouncedDestination, app_data: &[u8], hops: u8) {
@@ -4041,6 +4081,8 @@ async fn watch_interfaces(
     };
     let grace = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
     let mut lan_silent_ticks = interval_at(tokio::time::Instant::now() + grace, grace);
+    // A host waking from sleep reads the LAN once, not once per tick it slept through.
+    lan_silent_ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut lan_silent = LanSilentHint::default();
     loop {
         let mut transitions = Vec::new();
@@ -13250,6 +13292,99 @@ mod tests {
         assert!(
             sink.drain().is_empty(),
             "a non-Coyote announce fires nothing"
+        );
+    }
+
+    /// A path response a relay answers from a copy it stored, with a blob this run never
+    /// heard, as after a restart, refreshes the route but is no presence: a farewell the
+    /// instance sent after that copy was made, fetched later, still marks it left. Once a
+    /// plain announce has taught the clock offset, a path response the instance makes
+    /// about now is presence again.
+    #[test]
+    fn a_path_response_from_a_stored_copy_is_no_presence_for_a_fetched_farewell() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + secs);
+        let origin = OriginName([0x5f_u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let a_hex = identity.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: Some("Ada".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let tmp = TempDir::new("node-stored-copy-presence");
+        let peers = PeerTable::load(tmp.path.join("peers.json"), at(1_000)).unwrap();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .open("node-stored-copy-presence-trust");
+        let hooks = MeshHooks::default();
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let announced = || {
+            AnnouncedDestination::without_key(
+                a_destination.clone(),
+                a_hex.clone(),
+                name_hex.clone(),
+            )
+        };
+        let stamp_at = |secs: u64, tag: u8| AnnounceStamp {
+            emitted: 1_790_000_000 + secs,
+            blob: [tag; 10],
+        };
+
+        assert_eq!(
+            filer.file(announced(), &app_data, 2, at(2_000)),
+            Some(PeerChange::Added),
+            "the row is held from before this run's announce times"
+        );
+        assert_eq!(
+            filer.file_stamped(
+                announced(),
+                &app_data,
+                3,
+                true,
+                stamp_at(1_900, 1),
+                at(3_000)
+            ),
+            Some(PeerChange::Refreshed)
+        );
+        assert_eq!(peers.get(&a_destination).unwrap().hops, 3);
+        assert_eq!(
+            peers.mark_left(&a_destination, FarewellTime::Stamped(at(2_500))),
+            LeftMark::Marked,
+            "the stored copy, though it arrived later, is no presence"
+        );
+
+        assert!(peers.clear_left(&a_destination));
+        filer.file_stamped(
+            announced(),
+            &app_data,
+            2,
+            false,
+            stamp_at(4_000, 2),
+            at(4_000),
+        );
+        assert_eq!(
+            filer.file_stamped(
+                announced(),
+                &app_data,
+                2,
+                true,
+                stamp_at(4_100, 3),
+                at(4_100)
+            ),
+            Some(PeerChange::Refreshed)
+        );
+        assert_eq!(
+            peers.mark_left(&a_destination, FarewellTime::Arrived(at(4_050))),
+            LeftMark::HeardSince,
+            "a path response the instance made now is presence"
         );
     }
 
