@@ -22,6 +22,7 @@ use common::tui_harness::*;
 use serial_test::serial;
 
 const CTRL_L: &[u8] = b"\x0c";
+const END: &[u8] = b"\x1b[F";
 const WHEEL_UP: &[u8] = b"\x1b[<64;20;5M";
 const WHEEL_DOWN: &[u8] = b"\x1b[<65;20;5M";
 
@@ -169,14 +170,18 @@ fn visible_rows(frame: &str) -> Vec<u32> {
     out
 }
 
-/// The topmost transcript row of a full repaint that leaves the scroll
-/// position alone.
-fn top_row(pty: &mut Pty) -> u32 {
+/// A full repaint, which leaves the scroll position alone.
+fn repaint(pty: &mut Pty) -> String {
     pty.read_for(Duration::from_millis(400));
     let from = pty.raw().len();
     pty.send(CTRL_L).unwrap();
     pty.read_for(Duration::from_millis(600));
-    let frame = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
+    strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]))
+}
+
+/// The topmost transcript row of a full repaint.
+fn top_row(pty: &mut Pty) -> u32 {
+    let frame = repaint(pty);
     *visible_rows(&frame)
         .iter()
         .min()
@@ -253,15 +258,30 @@ fn a_view_scrolled_up_holds_still_while_the_reply_keeps_streaming() {
         "six notches up did not scroll six rows mid-stream"
     );
     fs::write(&gate, "").unwrap();
+    // The status row offers Esc to interrupt only while the turn runs, so
+    // its absence means the whole reply has arrived under the held view.
     let deadline = Instant::now() + PTY_DEADLINE;
-    while fake.served() < 1 && Instant::now() < deadline {
-        pty.read_for(Duration::from_millis(200));
+    loop {
+        let frame = repaint(&mut pty);
+        if !squeezed(&frame).contains("Esctointerrupt") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the reply never finished:\n{frame}"
+        );
     }
-    pty.read_for(Duration::from_millis(2000));
     let after = top_row(&mut pty);
     assert_eq!(
         after, held,
         "the scrolled view moved while the reply streamed on: row-{held:03} -> row-{after:03}"
+    );
+    pty.send(END).unwrap();
+    let bottom = repaint(&mut pty);
+    let bottom = squeezed(&bottom);
+    assert!(
+        bottom.contains("row-160") && bottom.contains("allrowssent"),
+        "End did not show the end of the reply:\n{bottom}"
     );
     leave(pty);
 }
