@@ -5593,8 +5593,9 @@ impl RequestContext {
     }
 
     /// Completion rows for a command's arguments: the value, its
-    /// description, and a kind (`session` or `variable`) on the
-    /// mixed rows offered after `.agent <name> `; other rows have none.
+    /// description, and a kind (`session` or `variable`) on the rows
+    /// offered after `.agent <name> `, where sessions and variables
+    /// share a list; other rows have none.
     pub fn repl_complete(
         &self,
         cmd: &str,
