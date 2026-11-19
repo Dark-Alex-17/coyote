@@ -189,6 +189,14 @@ arc-swap = "1.9.2"
 # `reticulum-rs-core = "0.14.0"` from crates.io and `lxmf-wire` pulls the same crate, so
 # the lock resolves one core only while both stay on a core line that unifies.
 #
+# The 0.18.3 release adds `Transport::interface_peer_count` (how many hosts an
+# AutoInterface currently reaches on the LAN), `transport::shared_instance_rpc` (a client
+# for the local rnsd's `get_interface_stats` RPC, so the same count is readable when the
+# LAN interface lives in rnsd), `AnnounceEvent::emitted` and `AnnounceEvent::random_blob`
+# (the emitter's own clock for one announce, and the blob that identifies it, so a
+# replayed announce is told apart from a fresh one), and
+# `Transport::latest_announce_emitted`. Coyote reads all of them.
+#
 # The fork re-exports `rand_core` and `rmpv`, so Coyote names the RNG its constructors
 # take as `rns_transport::rand_core::OsRng` and needs no `rand_core` entry of its own.
 #
@@ -209,7 +217,7 @@ arc-swap = "1.9.2"
 # re-exports surface this crate does not use, and it covers only the `rns-*` crates and
 # not `lxmf-wire`, so it cannot replace both entries anyway. Depending on the two
 # directly keeps one mechanism instead of two.
-coyote-rns-transport = "0.18.2"
+coyote-rns-transport = "0.18.3"
 lxmf-wire = "0.14.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the

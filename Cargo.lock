@@ -1844,9 +1844,9 @@ dependencies = [
 
 [[package]]
 name = "coyote-rns-transport"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2609de80a2ac523bdecce64b228f8f2bb7e7b20d9587dbf63a80c9f1cecec989"
+checksum = "b3ea95e3daae8dfbbc05076b03e267b5a06d946b6d5c577a4c1b04ac846ebc89"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -1859,6 +1859,7 @@ dependencies = [
  "hmac 0.12.1",
  "if-addrs",
  "log",
+ "md-5",
  "rand_core 0.6.4",
  "reticulum-rs-core",
  "rmp",
@@ -1869,6 +1870,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
+ "sha3",
  "shlex 2.0.1",
  "socket2 0.5.10",
  "thiserror 1.0.69",
@@ -4035,6 +4037,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"
+dependencies = [
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4343,6 +4354,16 @@ name = "matchit"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
+
+[[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest 0.10.7",
+]
 
 [[package]]
 name = "memchr"
@@ -6544,6 +6565,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
  "digest 0.11.3",
+]
+
+[[package]]
+name = "sha3"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
+dependencies = [
+ "digest 0.10.7",
+ "keccak",
 ]
 
 [[package]]
