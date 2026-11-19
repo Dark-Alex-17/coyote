@@ -1762,18 +1762,26 @@ mod tests {
     #[serial]
     fn a_required_variable_value_is_never_published() {
         let sink = RecordingSink::install();
-        let prompter = ScriptedPrompter::new(vec![PromptAnswer::Text("key-2h9d".to_string())]);
+        let prompter = ScriptedPrompter::new(vec![
+            PromptAnswer::Text(String::new()),
+            PromptAnswer::Text("key-2h9d".to_string()),
+        ]);
 
         let value = ask_required_variable(&prompter, "api_key", "Service key av-2h9d").unwrap();
 
         assert_eq!(value, "key-2h9d");
+        let asked = prompter.requests();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|req| req.sensitive), "{asked:?}");
         let events = sink.drain();
-        let (requested, answered) = prompt_events(events.clone(), "api_key (Service key av-2h9d):");
-        assert_eq!(requested.len(), 1, "{requested:?}");
-        assert!(
-            matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
-            "{answered:?}"
-        );
+        for req in &asked {
+            let (requested, answered) = prompt_events(events.clone(), &req.question);
+            assert_eq!(requested.len(), 1, "{requested:?}");
+            assert!(
+                matches!(answered.as_slice(), [Event::PromptAnswered { answer, .. }] if answer == "<redacted>"),
+                "{answered:?}"
+            );
+        }
         let published = format!("{events:?}");
         assert!(!published.contains("key-2h9d"), "{published}");
     }
