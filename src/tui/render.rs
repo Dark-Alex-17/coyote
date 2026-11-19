@@ -382,6 +382,8 @@ pub(crate) struct RenderCache {
 }
 
 impl RenderCache {
+    /// A reply's lines: the cached stable part copied, with a streaming
+    /// tail past it rendered anew.
     pub(crate) fn lines(
         &mut self,
         source: &str,
@@ -394,6 +396,31 @@ impl RenderCache {
         } else {
             split_stable_tail(source)
         };
+        let mut lines = self.stable(source, split, width, renderer).to_vec();
+        if split < source.len() {
+            lines.extend(renderer.markdown(&source[split..], width));
+        }
+        lines
+    }
+
+    /// A finished reply's lines, borrowed from the cache: the whole
+    /// source is its stable part.
+    pub(crate) fn finished_lines(
+        &mut self,
+        source: &str,
+        width: u16,
+        renderer: &mut Renderer,
+    ) -> &[Line<'static>] {
+        self.stable(source, source.len(), width, renderer)
+    }
+
+    fn stable(
+        &mut self,
+        source: &str,
+        split: usize,
+        width: u16,
+        renderer: &mut Renderer,
+    ) -> &[Line<'static>] {
         let entry = match self.entries.iter().position(|e| e.width == width) {
             Some(index) => self.entries.remove(index),
             None => {
@@ -409,15 +436,12 @@ impl RenderCache {
         };
         self.entries.push(entry);
         let index = self.entries.len() - 1;
-        if self.entries[index].stable_len != split {
-            self.entries[index].lines = renderer.markdown(&source[..split], width);
-            self.entries[index].stable_len = split;
+        let entry = &mut self.entries[index];
+        if entry.stable_len != split {
+            entry.lines = renderer.markdown(&source[..split], width);
+            entry.stable_len = split;
         }
-        let mut lines = self.entries[index].lines.clone();
-        if split < source.len() {
-            lines.extend(renderer.markdown(&source[split..], width));
-        }
-        lines
+        &entry.lines
     }
 }
 
@@ -740,5 +764,7 @@ mod tests {
             "{done:?}"
         );
         assert_eq!(cache.entries.last().unwrap().stable_len, longer.len());
+        assert_eq!(cache.finished_lines(&longer, 80, &mut renderer), done);
+        assert_eq!(cache.entries.len(), 2);
     }
 }

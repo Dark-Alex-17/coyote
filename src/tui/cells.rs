@@ -723,25 +723,22 @@ impl Cell {
 
     /// Drops the cell's cached lines so the next layout styles it anew.
     pub(super) fn forget_layout(&mut self) {
-        match self {
-            Cell::Assistant { cache, .. } => *cache = RenderCache::default(),
-            Cell::User { cache, .. }
-            | Cell::Notice { cache, .. }
-            | Cell::Error { cache, .. }
-            | Cell::Command { cache, .. }
-            | Cell::Welcome { cache, .. }
-            | Cell::Text { cache, .. }
-            | Cell::Tool { cache, .. }
-            | Cell::Job { cache, .. }
-            | Cell::Agent { cache, .. } => *cache = LineCache::default(),
+        if let Cell::Assistant { cache, .. } = self {
+            *cache = RenderCache::default();
         }
+        self.forget_wrapped_lines();
     }
 
-    /// Drops the wrapped lines of a tool, job, agent or stray-output row,
-    /// whose content changes in place; the transcript calls this on every
+    /// Drops the wrapped lines of every cell but a reply, whose cache
+    /// already follows its source; the transcript calls this on every
     /// change to a cell.
     pub(super) fn forget_wrapped_lines(&mut self) {
-        if let Cell::Text { cache, .. }
+        if let Cell::User { cache, .. }
+        | Cell::Notice { cache, .. }
+        | Cell::Error { cache, .. }
+        | Cell::Command { cache, .. }
+        | Cell::Welcome { cache, .. }
+        | Cell::Text { cache, .. }
         | Cell::Tool { cache, .. }
         | Cell::Job { cache, .. }
         | Cell::Agent { cache, .. } = self
@@ -754,8 +751,8 @@ impl Cell {
         self.cached_lines(width, renderer).into_owned()
     }
 
-    /// The cell's lines at `width`, borrowed from its cache where it
-    /// keeps them whole; a reply's come back owned.
+    /// The cell's lines at `width`, borrowed from its cache; only a reply
+    /// still streaming comes back owned, as its tail is rendered anew.
     pub(super) fn cached_lines(
         &mut self,
         width: u16,
@@ -778,6 +775,11 @@ impl Cell {
             Cell::User { text, cache, .. } => cache.get(width, || {
                 render::plain_lines(&format!("> {text} (sent mid-turn)"), width, DIM)
             }),
+            Cell::Assistant {
+                source,
+                done: true,
+                cache,
+            } => cache.finished_lines(without_think_spans(source, true), width, renderer),
             Cell::Assistant {
                 source,
                 done,

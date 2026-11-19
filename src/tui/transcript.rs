@@ -50,6 +50,10 @@ pub(super) struct Transcript {
     /// it, so a cell above the view or on it growing or shrinking leaves
     /// the lines on screen where they were.
     anchor: Option<Anchor>,
+    /// The line count the last frame laid out. A scrolled view with no
+    /// anchor to go back to takes what the count grew by as output
+    /// arrived below it.
+    last_total: usize,
     /// Cells appended while the view was scrolled away from the bottom.
     unseen: usize,
     /// The row Ctrl+Up/Down or a click put the cursor on; only a cell
@@ -84,6 +88,7 @@ impl Transcript {
             offset_from_bottom: 0,
             last_offset: 0,
             anchor: None,
+            last_total: 0,
             unseen: 0,
             focus: None,
             stream: None,
@@ -235,7 +240,14 @@ impl Transcript {
         self.focus = shift(self.focus);
         self.stream = shift(self.stream);
         self.anchor = match self.anchor {
-            Some(anchor) if anchor.cell == index => None,
+            Some(anchor) if anchor.cell == index && index < self.cells.len() => Some(Anchor {
+                cell: index,
+                row: 0,
+            }),
+            Some(anchor) if anchor.cell == index => index.checked_sub(1).map(|cell| Anchor {
+                cell,
+                row: usize::MAX,
+            }),
             Some(anchor) if anchor.cell > index => Some(Anchor {
                 cell: anchor.cell - 1,
                 ..anchor
@@ -397,17 +409,18 @@ impl Transcript {
     /// The scroll offset is clamped to what the transcript can show, and
     /// the rows each cell received are kept so a click can find its cell.
     pub(super) fn view(&mut self, area: Rect, renderer: &mut Renderer) -> TranscriptView {
-        let previous = std::mem::replace(&mut self.last_area, area);
-        let resized = area.width != previous.width;
+        // An empty area lays nothing out, so the frame after it is
+        // compared with the last one that did and keeps its anchor.
         if area.is_empty() {
             self.last_layout.clear();
-            self.anchor = None;
             return TranscriptView {
                 lines: Vec::new(),
                 centre: false,
                 chip: None,
             };
         }
+        let previous = std::mem::replace(&mut self.last_area, area);
+        let resized = area.width != previous.width;
         let centre = self.welcome_only();
         // A blank line separates each cell from the one before; `headers`
         // holds the line each cell starts on.
@@ -427,17 +440,20 @@ impl Transcript {
         let height = usize::from(area.height);
         // A new width re-wraps every cell, so a row inside one no longer
         // names the same text; the offset is kept as it was instead.
-        if self.offset_from_bottom > 0
-            && !resized
-            && let Some(top) = self.anchor.and_then(|anchor| anchor.line(&headers, total))
-        {
-            self.offset_from_bottom = anchored_offset(
-                self.last_offset,
-                self.offset_from_bottom,
-                top + usize::from(previous.height),
-                total,
-            );
+        if self.offset_from_bottom > 0 && !resized {
+            match self.anchor.and_then(|anchor| anchor.line(&headers, total)) {
+                Some(top) => {
+                    self.offset_from_bottom = anchored_offset(
+                        self.last_offset,
+                        self.offset_from_bottom,
+                        top + usize::from(previous.height),
+                        total,
+                    );
+                }
+                None => self.offset_from_bottom += total.saturating_sub(self.last_total),
+            }
         }
+        self.last_total = total;
         self.offset_from_bottom = self.offset_from_bottom.min(total.saturating_sub(height));
         if std::mem::take(&mut self.reveal_focus)
             && let Some(header) = self.focus.map(|focus| headers[focus])
@@ -520,11 +536,13 @@ fn revealed(offset: usize, header: usize, total: usize, height: usize) -> usize 
 /// The offset that ends the view at line `end`, where the last frame
 /// drawn at `last_offset` ended, moved by the scroll that has taken the
 /// offset to `offset` since. Ending where it ended keeps the bottom row
-/// still when the view changes height, as it stays following.
+/// still when the view changes height, as it stays following. It is at
+/// least 1: cells below the view shrinking can bring the bottom up past
+/// that line, and the view stays scrolled until the user returns.
 fn anchored_offset(last_offset: usize, offset: usize, end: usize, total: usize) -> usize {
     let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
     let end = wide(end) + wide(last_offset) - wide(offset);
-    usize::try_from(wide(total) - end).unwrap_or(0)
+    usize::try_from(wide(total) - end).unwrap_or(0).max(1)
 }
 
 impl Anchor {
@@ -1041,9 +1059,103 @@ mod tests {
         assert!(view.lines.is_empty());
         assert_eq!(view.chip, None);
         assert!(transcript.last_layout.is_empty());
-        assert_eq!(transcript.last_area, Rect::ZERO);
         transcript.click(0, 0);
         assert_eq!(transcript.focus, None);
+    }
+
+    /// Ten user lines, scrolled 6 lines up a 5-line view, which then
+    /// starts on `> line 4`.
+    fn scrolled_users() -> (Transcript, Renderer, Vec<String>) {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-6);
+        let before = rows(&transcript.view(area(5), &mut renderer));
+        assert_eq!(before[0], "> line 4", "{before:?}");
+        (transcript, renderer, before)
+    }
+
+    /// Removing the cell the view starts on puts the view on the cell
+    /// after it, and output arriving below then leaves it there.
+    #[test]
+    fn removing_the_top_cell_of_a_scrolled_view_holds_it_on_the_next() {
+        let (mut transcript, mut renderer, before) = scrolled_users();
+        transcript.remove(4);
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view)[0], before[2], "{:?}", rows(&view));
+        assert_eq!(view.chip.as_deref(), Some("3 new below  End = follow"));
+    }
+
+    /// Output arriving while the view had no room (the todo panel took
+    /// it) leaves the lines it showed where they were once it is back.
+    #[test]
+    fn output_arriving_while_the_view_is_hidden_does_not_move_it() {
+        let (mut transcript, mut renderer, before) = scrolled_users();
+        transcript.view(Rect::ZERO, &mut renderer);
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view), before);
+        assert_eq!(view.chip.as_deref(), Some("3 new below  End = follow"));
+    }
+
+    /// With no anchor to go back to, as after a rewind cut the cell the
+    /// view started on, what the line count grew by still counts as
+    /// output below.
+    #[test]
+    fn a_scrolled_view_without_an_anchor_still_makes_room_for_output_below() {
+        let (mut transcript, mut renderer, before) = scrolled_users();
+        transcript.anchor = None;
+        for i in 0..3 {
+            transcript.push(Cell::user(&format!("late {i}")));
+        }
+        let view = transcript.view(area(5), &mut renderer);
+        assert_eq!(rows(&view), before);
+    }
+
+    /// A running row below the view closing brings the bottom up past
+    /// the view's last line; the view stays scrolled, with its count,
+    /// rather than going back to following.
+    #[test]
+    fn a_row_closing_below_a_scrolled_view_keeps_it_scrolled() {
+        let (mut transcript, mut renderer) = transcript();
+        for i in 0..10 {
+            transcript.push(Cell::user(&format!("line {i}")));
+        }
+        transcript.push(tool("b"));
+        grow_tool(&mut transcript, 10, "b", 5);
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-2);
+        transcript.view(area(5), &mut renderer);
+        transcript.push(Cell::user("late"));
+        transcript.view(area(5), &mut renderer);
+        finish_tool(&mut transcript, 10);
+        let view = transcript.view(area(5), &mut renderer);
+        assert!(transcript.scrolled());
+        assert_eq!(view.chip.as_deref(), Some("1 new below  End = follow"));
+        transcript.push(Cell::user("later"));
+        let view = transcript.view(area(5), &mut renderer);
+        assert!(transcript.scrolled(), "output below scrolled the view");
+        assert_eq!(view.chip.as_deref(), Some("2 new below  End = follow"));
+    }
+
+    /// A transcript shorter than the view has nowhere to scroll to, so
+    /// a scroll up leaves it following.
+    #[test]
+    fn a_transcript_shorter_than_the_view_stays_following() {
+        let (mut transcript, mut renderer) = transcript();
+        transcript.push(Cell::user("hi"));
+        transcript.view(area(5), &mut renderer);
+        transcript.scroll_lines(-1);
+        let view = transcript.view(area(5), &mut renderer);
+        assert!(!transcript.scrolled());
+        assert_eq!(view.chip, None);
     }
 
     /// Focusing a row that is scrolled out of view brings its header

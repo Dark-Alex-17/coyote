@@ -1509,7 +1509,7 @@ impl App {
                 output,
                 opened,
                 rewind_barrier: barrier,
-                cache,
+                ..
             }) = self.transcript.cell_mut(index)
             else {
                 panic!("begin_turn pushed a Command cell for a command turn");
@@ -1522,7 +1522,6 @@ impl App {
             *barrier = (outcome.error.is_none() || turn.requested)
                 .then(|| rewind_barrier(name, prefix, &self.macros, turn.requested))
                 .flatten();
-            *cache = LineCache::default();
             // `.undo` took the last exchange out of the context; the
             // transcript drops it too, back to the cell that opened it,
             // and the command cell with it.
@@ -2990,7 +2989,7 @@ impl App {
             && let Some(Cell::Notice {
                 kind: NoticeKind::Routing,
                 text: tail,
-                cache,
+                ..
             }) = self.transcript.last_mut()
         {
             if !tail.is_empty() && !text.is_empty() {
@@ -3004,7 +3003,6 @@ impl App {
                     .unwrap_or(tail.len());
                 tail.drain(..cut);
             }
-            *cache = LineCache::default();
             return;
         }
         self.transcript.push(Cell::notice(kind, text));
