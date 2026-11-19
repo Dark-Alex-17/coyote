@@ -1024,8 +1024,7 @@ fn parse_paste_input(input: &str) -> Result<(String, Option<String>)> {
     }
 
     if input.starts_with("http://") || input.starts_with("https://") {
-        let parsed =
-            Url::parse(input).with_context(|| format!("Failed to parse pasted URL: {input}"))?;
+        let parsed = Url::parse(input).context("Failed to parse the pasted callback URL")?;
         let code = parsed
             .query_pairs()
             .find(|(k, _)| k == "code")
@@ -2075,6 +2074,12 @@ echo_pkce_in_token_exchange: true
         let (code, state) = parse_paste_input("abc123").unwrap();
         assert_eq!(code, "abc123");
         assert!(state.is_none());
+    }
+
+    #[test]
+    fn a_malformed_pasted_url_is_not_echoed_in_the_error() {
+        let err = parse_paste_input("https://[bad?code=code-3q8z").unwrap_err();
+        assert!(!format!("{err:#}").contains("code-3q8z"), "{err:#}");
     }
 
     #[test]
