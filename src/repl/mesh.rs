@@ -55,9 +55,10 @@ use crate::mesh::{
     HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, HUMAN_DECLINED, InstanceSession, InterfaceState,
     InterfaceStatus, LocalEndpoint, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON,
     MeshPaths, MeshRuntime, NameTarget, NodeOptions, PATH_REQUEST_TIMEOUT, PEER_STALE_AFTER,
-    PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
-    loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short, span_text,
+    PEER_TTL, PROPAGATION_NODE_TTL, PeerRecord, PropagationNodeRecord, ReadEffort, age_text,
+    canonical_hash, canonicalize, decode_hex, destination_address, display_text, hex_lower,
+    human_size, known_host_total, loopback_endpoint, parse_rfc3339, redact_hashes, refuse_symlink,
+    rfc3339_utc, short, span_text,
 };
 use crate::render::{QuotingError, error_notice};
 use crate::repl::printer::terminal_width;
@@ -399,7 +400,7 @@ pub(crate) async fn run(
     match (group, verb) {
         ("", "on") => turn_on(ctx, rest).await,
         ("", "off") => turn_off(ctx, rest).await,
-        ("", "status") => status(ctx, rest),
+        ("", "status") => status(ctx, rest).await,
         ("", "session") => match split_verb(rest) {
             None | Some(("name", Some("--help"))) => {
                 out_text(&render_verb_help("", "session"));
@@ -1199,7 +1200,7 @@ async fn info(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&st
     Ok(())
 }
 
-fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     match classify_status(rest) {
         StatusArg::Own => {
             let runtime = live(ctx)?;
@@ -1207,6 +1208,10 @@ fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let card = StatusHandler::new(Arc::downgrade(&source)).card(SystemTime::now());
             out_text(&render_for_human(&card, SystemTime::now()));
             out_text(&format!("envoy memory: {}", envoy_memory_text(&runtime)));
+            let readings = runtime.lan_readings(ReadEffort::Quick).await;
+            if let Some(line) = render_lan_line(known_host_total(&readings)) {
+                out_text(&line);
+            }
         }
         StatusArg::Set(objective) => {
             ctx.app
@@ -13657,6 +13662,15 @@ fn envoy_memory_text(runtime: &MeshRuntime) -> String {
     }
 }
 
+/// The `.mesh status` line for the hosts the LAN interfaces reach together; `None`, and
+/// no line, when no LAN interface is configured or none could be read.
+fn render_lan_line(hosts: Option<u64>) -> Option<String> {
+    hosts.map(|hosts| match hosts {
+        1 => "LAN: 1 host reachable".to_string(),
+        hosts => format!("LAN: {hosts} hosts reachable"),
+    })
+}
+
 /// `None` with nothing retired; a file that cannot be read is reported, not hidden.
 fn predecessors_text(
     predecessors: Result<&[Predecessor], &anyhow::Error>,
@@ -14713,6 +14727,23 @@ mod tests {
     use rns_transport::rand_core::OsRng;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    #[test]
+    fn the_status_lan_line_counts_hosts_and_is_left_out_without_a_count() {
+        assert_eq!(
+            render_lan_line(Some(0)).as_deref(),
+            Some("LAN: 0 hosts reachable")
+        );
+        assert_eq!(
+            render_lan_line(Some(1)).as_deref(),
+            Some("LAN: 1 host reachable")
+        );
+        assert_eq!(
+            render_lan_line(Some(12)).as_deref(),
+            Some("LAN: 12 hosts reachable")
+        );
+        assert_eq!(render_lan_line(None), None);
+    }
 
     mod turn_off_line_tests {
         use super::*;

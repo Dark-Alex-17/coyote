@@ -5,16 +5,17 @@
 //! `TcpClient`, the production relay topology.
 
 use crate::config::Session;
-use crate::config::mesh_config::{MeshConfig, MeshInterface};
+use crate::config::mesh_config::{DEFAULT_LOCAL_RNSD_INSTANCE, MeshConfig, MeshInterface};
 use crate::hooks::HookEvent;
 use crate::mesh::announce::ANNOUNCE_MAGIC;
 use crate::mesh::envoy::EnvoySink;
 use crate::mesh::events::RecordingHookSink;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
+use crate::mesh::lan_count::{LanReading, ReadEffort, RnsdLanReader, RnsdLocator};
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
 use crate::mesh::node::{
-    FullEnvoy, InterfaceState, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy,
-    session_destination_name,
+    FullEnvoy, InterfaceState, LanVerdict, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy,
+    lan_silent_verdict, session_destination_name,
 };
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::propagation_nodes::PROPAGATION_NODE_TABLE_FILE;
@@ -689,6 +690,25 @@ fn unix_nanos() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos()
+}
+
+/// A `discovery_port` and `data_port` for an rnsd AutoInterface of this run's own: the
+/// host's own rnsd or `lan` interface holds the defaults. AutoInterface also binds the
+/// port after `discovery_port` for unicast discovery, so that one is held free too, and
+/// all three are bound before any is released.
+fn auto_interface_ports() -> (u16, u16) {
+    loop {
+        let discovery = std::net::UdpSocket::bind("[::]:0").unwrap();
+        let port = discovery.local_addr().unwrap().port();
+        let Some(_unicast) = port
+            .checked_add(1)
+            .and_then(|next| std::net::UdpSocket::bind(("::", next)).ok())
+        else {
+            continue;
+        };
+        let data = std::net::UdpSocket::bind("[::]:0").unwrap();
+        return (port, data.local_addr().unwrap().port());
+    }
 }
 
 /// This crate's node joined to the reference's relay port, with a slot installed so
@@ -2567,6 +2587,105 @@ async fn two_sessions_of_one_user_dialing_a_transport_relay_directly_over_tcp() 
     sessions.knocks_land_on_the_session_they_name().await;
 
     sessions.stop().await;
+    let status = rnsd.terminate();
+    assert!(status.success(), "rnsd exited {status} on SIGTERM");
+}
+
+/// A node attached to an rnsd that runs an AutoInterface reads that rnsd's LAN host
+/// count over its RPC listener: 0, on a discovery group no other host joins. Read with a
+/// wrong `rpc_key` the same rnsd is unavailable for the run and told at debug only, and
+/// the silent-LAN check falls back to hosts heard rather than telling a silent LAN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn a_node_reads_the_lan_host_count_of_its_rnsd() {
+    let (instance, entry) = Rnsd::instance();
+    let mut group = [0u8; 8];
+    OsRng.fill_bytes(&mut group);
+    let (discovery_port, data_port) = auto_interface_ports();
+    let config = format!(
+        "[reticulum]\nenable_transport = No\nshare_instance = Yes\n{instance}[logging]\nloglevel = 6\n[interfaces]\n  [[Default Interface]]\n    type = AutoInterface\n    enabled = Yes\n    group_id = coyote-interop-{}\n    discovery_port = {discovery_port}\n    data_port = {data_port}\n",
+        hex_lower(&group)
+    );
+    let Some(mut rnsd) = Rnsd::spawn_with("interop-rnsd-lan-count", &config, entry).await else {
+        return;
+    };
+    let rnsd_dir = rnsd.config_dir.path.clone();
+    let identity = rnsd_dir.join("storage").join("transport_identity");
+    wait_until("rnsd to write its transport identity", || {
+        identity.is_file()
+    })
+    .await;
+
+    let tmp = TempDir::new("interop-rnsd-lan-count-node");
+    let mut session = Session::default();
+    let runtime = MeshRuntime::start(
+        &MeshConfig {
+            interfaces: vec![rnsd.entry()],
+            ..MeshConfig::default()
+        },
+        true,
+        &mut session,
+        mesh_paths(&tmp),
+        NodeOptions {
+            rnsd: RnsdLocator {
+                dir_override: Some(rnsd_dir.clone()),
+            },
+            ..NodeOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let slot = Arc::new(MeshSlot::default());
+    slot.install(runtime.clone()).unwrap();
+    // rnsd binds its RPC listener a few seconds after the shared instance answers.
+    let deadline = Instant::now() + LINK_TIMEOUT;
+    loop {
+        let readings = runtime.lan_readings(ReadEffort::Patient).await;
+        if readings == [LanReading::Count(0)] {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rnsd's AutoInterface did not read 0 hosts within {LINK_TIMEOUT:?}: {readings:?}"
+        );
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    let wrong_key_dir = TempDir::new("interop-rnsd-lan-count-wrong-key");
+    let wrong_key = format!("[reticulum]\nrpc_key = {}\n", "ab".repeat(32));
+    fs::write(
+        wrong_key_dir.path.join("config"),
+        config.replacen("[reticulum]\n", &wrong_key, 1),
+    )
+    .unwrap();
+    let MeshInterface::Local { instance, .. } = rnsd.entry() else {
+        unreachable!("a shared instance is joined with a local entry")
+    };
+    let reader = RnsdLanReader::new(
+        RnsdLocator {
+            dir_override: Some(wrong_key_dir.path.clone()),
+        },
+        instance.as_deref().unwrap_or(DEFAULT_LOCAL_RNSD_INSTANCE),
+    );
+    let reading = reader.read().await;
+    assert_eq!(reading, Some(LanReading::Unknown));
+    assert!(reader.unavailable().await);
+    let readings: Vec<LanReading> = reading.into_iter().collect();
+    assert_eq!(
+        lan_silent_verdict(Duration::from_secs(600), &readings, true, false),
+        LanVerdict::Settle
+    );
+    let wrong_key_path = wrong_key_dir.path.display().to_string();
+    let told = |lines: Vec<String>| {
+        lines
+            .iter()
+            .filter(|line| line.contains("interface stats") && line.contains(&wrong_key_path))
+            .count()
+    };
+    assert_eq!(told(crate::testing::debug_snapshot()), 1);
+    assert_eq!(told(crate::testing::warn_snapshot()), 0);
+
+    assert!(slot.stop().await.unwrap());
     let status = rnsd.terminate();
     assert!(status.success(), "rnsd exited {status} on SIGTERM");
 }

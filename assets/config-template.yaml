@@ -295,6 +295,8 @@ mesh:
     #   instance: default        # The rnsd instance whose abstract socket @rns/<instance> is dialed on Linux and Android; ignored elsewhere
     # - type: lan                # lan = link-local only (Reticulum AutoInterface), the no-daemon fallback. Does not cross sbx, WireGuard, Tailscale or
                                  # OpenVPN; only one process per host can bind it
+                                 # On local or lan, Coyote reads the LAN host count (`.mesh status`, the silent-LAN hint) from the lan interface or from
+                                 # the local rnsd's interface stats (its config dir found as rnsd finds it), and falls back to hosts heard when it cannot
     # - type: private            # private = TCP client to a relay your team runs; requires host + port
     #   host: relay.example.com
     #   port: 4242

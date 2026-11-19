@@ -21,6 +21,7 @@ pub(crate) mod inbox;
 mod instances;
 pub(crate) mod knock;
 pub(crate) mod knocks;
+mod lan_count;
 pub(crate) mod limits;
 mod lock;
 pub(crate) mod message;
@@ -46,6 +47,7 @@ pub(crate) mod wire_path;
 
 pub(crate) use announce::{HEARTBEAT_PERIOD_SECS, HEARTBEAT_SECS, PATH_REQUEST_TIMEOUT};
 pub(crate) use instances::InstanceSession;
+pub(crate) use lan_count::{ReadEffort, known_host_total};
 #[cfg(test)]
 pub(crate) use node::MESH_PROGRESS_MIN_INTERVAL;
 #[cfg(test)]
