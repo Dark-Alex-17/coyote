@@ -740,7 +740,7 @@ impl PendingPrompt {
     /// Who is asking: the tool, else the agent, else nobody in particular.
     fn origin_line(&self) -> Option<String> {
         if let Some(tool) = &self.req.tool {
-            return Some(format!("{tool} asks:"));
+            return Some(format!("{} asks:", render::plain_text(tool)));
         }
         self.req
             .origin
@@ -1249,6 +1249,9 @@ pub(crate) struct App {
     /// The rows the front prompt's question received in the last frame,
     /// None until it has been drawn.
     question_area: Option<Rect>,
+    /// The rows the front prompt's origin received in the last frame,
+    /// None until it has been drawn.
+    origin_area: Option<Rect>,
     clock: Arc<dyn Clock>,
     frames: FrameScheduler,
     renderer: Renderer,
@@ -1353,6 +1356,7 @@ impl App {
             front_since: None,
             frame_area: None,
             question_area: None,
+            origin_area: None,
             frames: FrameScheduler::new(Arc::clone(&clock)),
             clock,
             renderer,
@@ -1618,13 +1622,17 @@ impl App {
             .is_some_and(|at| now.duration_since(at) >= HOTKEY_IDLE);
         // The cap says what the frame should allow; the rows the last
         // draw actually gave the question say what it got. A frame too
-        // short for the layout squeezes the question below its cap.
+        // short for the layout squeezes the question below its cap, or
+        // drops the origin row that says a tool is asking.
         let question_fully_shown = match (self.prompts.front(), self.frame_area) {
             (Some(prompt), Some(area)) => {
                 prompt.question_fits_cap(area.width, area.height)
                     && self
                         .question_area
                         .is_none_or(|given| prompt.question_fits_rows(given.width, given.height))
+                    && self
+                        .origin_area
+                        .is_none_or(|given| given.height >= prompt.origin_rows())
             }
             _ => true,
         };
@@ -2310,6 +2318,7 @@ impl App {
         self.last_keystroke = Some(now);
         self.front_since = (!self.prompts.is_empty()).then_some(now);
         self.question_area = None;
+        self.origin_area = None;
     }
 
     fn with_pager(&mut self, f: impl FnOnce(&mut Pager)) -> Option<Command> {
@@ -3280,11 +3289,11 @@ impl App {
 
         frame.render_widget(StatusStrip(self.status_text()), status);
 
-        self.question_area = match self.prompts.front() {
+        let modal_areas = match self.prompts.front() {
             Some(prompt) => {
-                let [_, question, ..] = prompt.areas(bottom.intersection(area), area);
+                let [origin, question, ..] = prompt.areas(bottom.intersection(area), area);
                 frame.render_widget(PromptModal(prompt), bottom);
-                Some(question)
+                Some((origin, question))
             }
             None => {
                 let [band, field] = Layout::vertical([
@@ -3326,6 +3335,8 @@ impl App {
                 None
             }
         };
+        self.origin_area = modal_areas.map(|(origin, _)| origin);
+        self.question_area = modal_areas.map(|(_, question)| question);
 
         frame.render_widget(
             FooterBar {
@@ -7027,6 +7038,62 @@ mod tests {
             asker.join().unwrap().unwrap(),
             PromptAnswer::Confirmed(true)
         );
+    }
+
+    /// The `<tool> asks:` row is the only sign a tool, not Coyote, is
+    /// asking, so on the smallest frames a tool's question is either
+    /// drawn with that row or cannot be answered.
+    #[test]
+    fn a_tool_question_is_never_answerable_without_its_origin_row() {
+        for height in 3..=6 {
+            for action in [PromptAction::Confirm, PromptAction::Password] {
+                let mut harness = Harness::standalone(40, height);
+                harness.app.begin_turn("clean up", false);
+                let req = PromptRequest {
+                    tool: Some("ask_x7x".to_string()),
+                    ..PromptRequest::new(action, "Go on?", Origin::detached())
+                };
+                let asker = ask_on_a_thread(&mut harness, req);
+                let rendered = harness.draw();
+                let labelled = rendered.contains("ask_x7x asks:");
+                harness.clock.advance(HOTKEY_IDLE);
+                let keys: &[KeyCode] = match action {
+                    PromptAction::Confirm => &[KeyCode::Char('y')],
+                    _ => &[KeyCode::Char('p'), KeyCode::Enter],
+                };
+                for key in keys {
+                    harness.press(*key);
+                }
+                let answered = harness.app.prompts.is_empty();
+                assert!(
+                    labelled || !answered,
+                    "40x{height} {action:?} was answered with no origin row:\n{rendered}"
+                );
+                if !answered {
+                    harness.press(KeyCode::Esc);
+                }
+                asker.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    /// The tool name is drawn as plain text, like the question, so a
+    /// name cannot carry terminal escapes onto the origin row.
+    #[test]
+    fn a_tool_name_is_drawn_without_escape_sequences() {
+        let mut harness = Harness::standalone(60, 20);
+        harness.app.begin_turn("clean up", false);
+        let req = PromptRequest {
+            tool: Some("\u{1b}]0;title-x7x\u{7}ask_\u{1b}[2Jx7x".to_string()),
+            ..PromptRequest::new(PromptAction::Confirm, "Go on?", Origin::detached())
+        };
+        let asker = ask_on_a_thread(&mut harness, req);
+        let rendered = harness.draw();
+        assert!(rendered.contains("ask_x7x asks:"), "{rendered}");
+        assert!(!rendered.contains("title-x7x"), "{rendered}");
+        harness.clock.advance(HOTKEY_IDLE);
+        harness.press(KeyCode::Esc);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
     }
 
     /// A tool-authored question carrying bidi overrides and zero-width

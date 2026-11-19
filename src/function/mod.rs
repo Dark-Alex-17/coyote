@@ -1748,7 +1748,6 @@ impl ToolCall {
 
         let vision = ctx.current_model().supports_vision();
         let mut attachments: Vec<ImageAttachment> = vec![];
-        let global_tool = agent_name.as_deref() != Some(cmd_name.as_str());
         let output = match cmd_name.as_str() {
             _ if cmd_name.starts_with(MCP_SEARCH_META_FUNCTION_NAME_PREFIX) => {
                 Self::search_mcp_tools(ctx, &cmd_name, &json_data)
@@ -1928,12 +1927,6 @@ impl ToolCall {
                     Arc::clone(&ctx.prompter),
                     Arc::clone(&ctx.prompt_memory),
                     Origin::from(&*ctx),
-                    ctx.app
-                        .config
-                        .password_prompt_tools
-                        .clone()
-                        .unwrap_or_default(),
-                    global_tool,
                 ),
                 ctx.session_abort.clone(),
             )
@@ -2679,23 +2672,13 @@ impl ToolIo {
     }
 
     /// Lets the tool ask the human; without it no reply channel is offered.
-    /// `password_tools` and `global` decide whether it may ask for a
-    /// password, as [`prompt_channel::ToolPrompter::new`] describes.
     pub(crate) fn with_prompter(
         mut self,
         prompter: Arc<dyn Prompter>,
         memory: Arc<PromptMemory>,
         origin: Origin,
-        password_tools: Vec<String>,
-        global: bool,
     ) -> Self {
-        self.prompter = Some(prompt_channel::ToolPrompter::new(
-            prompter,
-            memory,
-            origin,
-            password_tools,
-            global,
-        ));
+        self.prompter = Some(prompt_channel::ToolPrompter::new(prompter, memory, origin));
         self
     }
 }

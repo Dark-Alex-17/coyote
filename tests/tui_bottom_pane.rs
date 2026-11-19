@@ -605,10 +605,9 @@ fn a_tools_checkbox_request_ticks_rows_and_sends_them() {
     finish_after_tool(&mut pty);
 }
 
-/// A password request from a tool listed in `password_prompt_tools`
-/// names the tool and masks what is typed: the screen shows a run of
-/// mask characters and never the text, which still reaches the tool
-/// whole on Enter.
+/// A tool's password request names the tool and masks what is typed:
+/// the screen shows a run of mask characters and never the text, which
+/// still reaches the tool whole on Enter.
 #[test]
 #[serial]
 fn a_tools_password_request_masks_the_field_and_sends_the_text() {
@@ -617,13 +616,6 @@ fn a_tools_password_request_masks_the_field_and_sends_the_text() {
     let out = dir.join("password-answer");
     let fake = tool_call_then_done("fixture_password_rec", &out);
     write_fake_llm_config(&dir, &fake);
-    let config = dir.join("config.yaml");
-    let yaml = fs::read_to_string(&config).unwrap();
-    fs::write(
-        &config,
-        format!("{yaml}password_prompt_tools:\n  - fixture_password_rec\n"),
-    )
-    .unwrap();
     write_tool(
         &dir,
         "fixture_password_rec.sh",

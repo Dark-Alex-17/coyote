@@ -274,7 +274,6 @@ pub struct Config {
     #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
     pub enabled_tools: Option<Vec<String>>,
     pub visible_tools: Option<Vec<String>>,
-    pub password_prompt_tools: Option<Vec<String>>,
 
     pub skills_enabled: bool,
     #[serde(default, deserialize_with = "deserialize_csv_or_vec")]
@@ -379,7 +378,6 @@ impl Default for Config {
             mapping_tools: Default::default(),
             enabled_tools: None,
             visible_tools: None,
-            password_prompt_tools: None,
 
             skills_enabled: true,
             enabled_skills: None,
@@ -1580,24 +1578,6 @@ clients:
         assert!(example.contains("Spawned children and graph nodes always use 5m"));
         let cfg = Config::load_from_str(example).unwrap();
         assert_eq!(cfg.prompt_cache_ttl, None);
-    }
-
-    #[test]
-    fn config_template_documents_password_prompt_tools() {
-        let documented = "\npassword_prompt_tools: null      # Tools (by function name) allowed to ask for a password.";
-        let example = include_str!("../../config.example.yaml");
-        for file in [CONFIG_TEMPLATE, example] {
-            assert!(file.contains(documented));
-            assert!(file.contains("Tools shipped with Coyote may always ask"));
-            assert!(file.contains("#   password_prompt_tools:\n"));
-        }
-        let cfg = Config::load_from_str(example).unwrap();
-        assert_eq!(cfg.password_prompt_tools, None);
-        let cfg = Config::load_from_str("password_prompt_tools:\n  - my_vault_tool\n").unwrap();
-        assert_eq!(
-            cfg.password_prompt_tools,
-            Some(vec!["my_vault_tool".to_string()])
-        );
     }
 
     #[test]

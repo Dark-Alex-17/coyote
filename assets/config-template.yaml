@@ -88,12 +88,6 @@ visible_tools: null              # Which tools are visible to be compiled (and a
                                  #     - execute_command.sh
                                  #     - fs_cat.sh
                                  #     - fs_ls.sh
-password_prompt_tools: null      # Tools (by function name) allowed to ask for a password.
-                                 # Tools shipped with Coyote may always ask; a password prompt from any other
-                                 # tool is refused and answered as cancelled. Every tool prompt names the tool asking.
-                                 # Example:
-                                 #   password_prompt_tools:
-                                 #     - my_vault_tool
 
 # ---- Skills ----
 # Skills are modular knowledge or capability packs the LLM can load and unload mid-conversation.

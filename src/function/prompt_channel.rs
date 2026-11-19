@@ -1188,33 +1188,23 @@ pub(crate) struct ToolPrompter {
     prompter: Arc<dyn Prompter>,
     memory: Arc<PromptMemory>,
     origin: Origin,
-    password_tools: Vec<String>,
-    global: bool,
 }
 
 impl ToolPrompter {
-    /// `password_tools` names the tools allowed to ask for a password
-    /// besides the shipped ones; `global` is false for an agent's own
-    /// function, which never counts as shipped.
     pub(crate) fn new(
         prompter: Arc<dyn Prompter>,
         memory: Arc<PromptMemory>,
         origin: Origin,
-        password_tools: Vec<String>,
-        global: bool,
     ) -> Self {
         Self {
             prompter,
             memory,
             origin,
-            password_tools,
-            global,
         }
     }
 
     /// The request on a protocol line, or `None` for a line that carries the
-    /// marker but no well-formed request, or asks for a password the tool
-    /// may not ask for; the caller echoes that line.
+    /// marker but no well-formed request; the caller echoes that line.
     pub(crate) fn parse_line(
         &self,
         line: &[u8],
@@ -1223,25 +1213,12 @@ impl ToolPrompter {
         job_id: Option<String>,
     ) -> Option<ParsedRequest> {
         match parse_request(line, tool, call_id, job_id, self.origin.clone()) {
-            Ok(parsed)
-                if parsed.req.action == PromptAction::Password
-                    && !self.may_ask_for_password(tool) =>
-            {
-                warn!(
-                    "Refused a password prompt from tool '{tool}': it is not shipped with Coyote or listed in password_prompt_tools"
-                );
-                None
-            }
             Ok(parsed) => Some(parsed),
             Err(err) => {
                 warn!("Malformed prompt line from tool '{tool}': {err}");
                 None
             }
         }
-    }
-
-    fn may_ask_for_password(&self, tool: &str) -> bool {
-        is_shipped_tool(tool, self.global) || self.password_tools.iter().any(|name| name == tool)
     }
 
     pub(crate) fn answer(&self, req: PromptRequest) -> Result<PromptAnswer> {
@@ -1323,24 +1300,15 @@ pub(crate) fn handle_prompt_line(prompter: &ToolPrompter, reply: &Server, parsed
 }
 
 /// Replies `null` to a marker line that names a request id but does not
-/// parse as a request or was refused, so the tool fails closed instead of
-/// blocking on the reply pipe. Lines without a readable id get nothing:
-/// the tool never asked under a name it could wait for. The parse failure
-/// or refusal itself is already logged by `parse_line`.
+/// parse as a request, so the tool fails closed instead of blocking on the
+/// reply pipe. Lines without a readable id get nothing: the tool never
+/// asked under a name it could wait for. The parse failure itself is
+/// already logged by `parse_line`.
 pub(crate) fn reject_line(reply: &Server, tool: &str, line: &[u8]) {
     if let Some(id) = wire_id(line) {
         debug!("Tool '{tool}' prompt '{id}' answered null");
         reply.reply(&id, &Value::Null);
     }
-}
-
-/// Whether `tool` is a global tool whose script ships with Coyote. An
-/// agent's own function may carry a shipped tool's name, so it never is.
-fn is_shipped_tool(tool: &str, global: bool) -> bool {
-    global
-        && ["sh", "py", "ts"]
-            .iter()
-            .any(|ext| super::FunctionAssets::get(&format!("tools/{tool}.{ext}")).is_some())
 }
 
 pub(crate) fn wire_id(line: &[u8]) -> Option<String> {
@@ -1583,8 +1551,11 @@ mod tests {
     /// Installs a bash tool that sources the shipped helper on the
     /// functions bin dir the active config guard points at.
     fn install_tool(name: &str, body: &str) {
-        let bin = crate::config::paths::functions_bin_dir();
-        fs::create_dir_all(&bin).unwrap();
+        install_tool_in(&crate::config::paths::functions_bin_dir(), name, body);
+    }
+
+    fn install_tool_in(bin: &std::path::Path, name: &str, body: &str) {
+        fs::create_dir_all(bin).unwrap();
         let path = bin.join(name);
         fs::write(
             &path,
@@ -1602,21 +1573,10 @@ mod tests {
     }
 
     fn io_with(prompter: &Arc<ScriptedPrompter>, memory: Arc<PromptMemory>) -> ToolIo {
-        io_allowing_password(prompter, memory, &[])
-    }
-
-    /// `io_with`, with `tools` listed as allowed to ask for a password.
-    fn io_allowing_password(
-        prompter: &Arc<ScriptedPrompter>,
-        memory: Arc<PromptMemory>,
-        tools: &[&str],
-    ) -> ToolIo {
         ToolIo::new(Arc::new(SilentSink), Some("call-x7x".to_string()), 0).with_prompter(
             Arc::clone(prompter) as Arc<dyn Prompter>,
             memory,
             Origin::detached(),
-            tools.iter().map(|tool| tool.to_string()).collect(),
-            true,
         )
     }
 
@@ -1671,8 +1631,6 @@ mod tests {
             Arc::new(prompter),
             Arc::new(PromptMemory::default()),
             Origin::detached(),
-            vec![],
-            true,
         );
         handle_prompt_line(&prompter, &server, parsed);
         let mut line = String::new();
@@ -1715,7 +1673,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
         let output = run_tool(
             "ask-x7x",
             tool_envs(),
-            io_allowing_password(&prompter, Arc::new(PromptMemory::default()), &["ask-x7x"]),
+            io_with(&prompter, Arc::new(PromptMemory::default())),
         );
 
         assert_eq!(output["output"], "1\n1\n0 2\nhello\ns3cret\n");
@@ -1749,9 +1707,9 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
 
     #[test]
     #[serial]
-    fn a_password_prompt_from_an_unlisted_tool_is_refused_unasked() {
+    fn any_tool_may_ask_for_a_password_under_its_own_name() {
         require_tools();
-        let _guard = TestConfigDirGuard::new("prompt-pw-refused");
+        let _guard = TestConfigDirGuard::new("prompt-pw-user-tool");
         install_tool("ask-x7x", PASSWORD_TOOL);
         let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Text(
             "s3cret".to_string(),
@@ -1763,26 +1721,6 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             io_with(&prompter, Arc::new(PromptMemory::default())),
         );
 
-        assert_eq!(output["output"], "refused\n");
-        assert!(prompter.requests().is_empty(), "{:?}", prompter.requests());
-    }
-
-    #[test]
-    #[serial]
-    fn a_password_prompt_from_a_listed_tool_is_asked() {
-        require_tools();
-        let _guard = TestConfigDirGuard::new("prompt-pw-listed");
-        install_tool("ask-x7x", PASSWORD_TOOL);
-        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Text(
-            "s3cret".to_string(),
-        )]));
-
-        let output = run_tool(
-            "ask-x7x",
-            tool_envs(),
-            io_allowing_password(&prompter, Arc::new(PromptMemory::default()), &["ask-x7x"]),
-        );
-
         assert_eq!(output["output"], "got=s3cret\n");
         let requests = prompter.requests();
         assert_eq!(requests.len(), 1, "{requests:?}");
@@ -1791,38 +1729,60 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     }
 
     #[test]
-    fn only_a_global_tool_can_count_as_shipped() {
-        assert!(is_shipped_tool("fs_cat", true));
-        assert!(is_shipped_tool("execute_py_code", true));
-        assert!(!is_shipped_tool("fs_cat", false));
-        assert!(!is_shipped_tool("ask-x7x", true));
+    fn a_tool_named_on_the_line_does_not_replace_the_spawning_tool() {
+        let prompter = ToolPrompter::new(
+            Arc::new(ScriptedPrompter::refusing()),
+            Arc::new(PromptMemory::default()),
+            Origin::detached(),
+        );
+        let line = json!({
+            "tool": "fs_cat",
+            "coyote_prompt": {
+                "id": "pw1", "action": "password", "question": "Secret? forged-x7x",
+                "tool": "fs_cat"
+            }
+        })
+        .to_string();
 
-        let line = request_line("pw1", "password", "Secret? shipped-x7x");
-        let prompter = |global| {
-            ToolPrompter::new(
-                Arc::new(ScriptedPrompter::refusing()),
-                Arc::new(PromptMemory::default()),
-                Origin::detached(),
-                vec![],
-                global,
-            )
-        };
-        assert!(
-            prompter(true)
-                .parse_line(&line, "fs_cat", None, None)
-                .is_some()
+        let parsed = prompter
+            .parse_line(line.as_bytes(), "ask-x7x", None, None)
+            .expect("a line with extra fields still parses");
+
+        assert_eq!(parsed.req.tool.as_deref(), Some("ask-x7x"));
+    }
+
+    #[test]
+    #[serial]
+    fn a_global_tool_run_under_an_agent_asks_under_its_own_name() {
+        require_tools();
+        let _guard = TestConfigDirGuard::new("prompt-global-under-agent");
+        let agent = "agent-x7x";
+        install_tool_in(
+            &crate::config::paths::agent_bin_dir(agent),
+            "ask-x7x",
+            PASSWORD_TOOL,
         );
-        assert!(
-            prompter(false)
-                .parse_line(&line, "fs_cat", None, None)
-                .is_none()
-        );
-        let input = request_line("in1", "input", "Name? shipped-x7x");
-        assert!(
-            prompter(false)
-                .parse_line(&input, "fs_cat", None, None)
-                .is_some()
-        );
+        let prompter = Arc::new(ScriptedPrompter::new(vec![PromptAnswer::Text(
+            "s3cret".to_string(),
+        )]));
+
+        let output = run_llm_function(
+            "ask-x7x".to_string(),
+            vec![r#"{"path":"args-x7x"}"#.to_string()],
+            tool_envs(),
+            Some(agent.to_string()),
+            None,
+            io_with(&prompter, Arc::new(PromptMemory::default())),
+            None,
+        )
+        .unwrap()
+        .output
+        .unwrap_or_default();
+
+        assert_eq!(output, "got=s3cret\n");
+        let requests = prompter.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert_eq!(requests[0].tool.as_deref(), Some("ask-x7x"));
     }
 
     #[test]
@@ -2097,8 +2057,6 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
             scripted.clone(),
             Arc::new(PromptMemory::default()),
             Origin::detached(),
-            vec![],
-            true,
         );
         let req = PromptRequest::new(
             PromptAction::Input,
@@ -2245,8 +2203,6 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
                 Arc::new(crate::prompt::HeadlessPrompter),
                 Arc::new(PromptMemory::default()),
                 Origin::detached(),
-                vec![],
-                true,
             );
 
         let output = run_tool("hl-x7x", tool_envs(), io);
@@ -4768,11 +4724,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
             let output = run_shim_tool(
                 "ask-py-x7x",
-                io_allowing_password(
-                    &prompter,
-                    Arc::new(PromptMemory::default()),
-                    &["ask-py-x7x"],
-                ),
+                io_with(&prompter, Arc::new(PromptMemory::default())),
             );
 
             // Python reprs: bool, index, list of indices, then the two texts.
@@ -4816,11 +4768,7 @@ echo "$ans" >> "$LLM_OUTPUT""#,
 
             let output = run_shim_tool(
                 "ask-ts-x7x",
-                io_allowing_password(
-                    &prompter,
-                    Arc::new(PromptMemory::default()),
-                    &["ask-ts-x7x"],
-                ),
+                io_with(&prompter, Arc::new(PromptMemory::default())),
             );
 
             // JSON: bool, index, array of indices, then the two quoted texts.
