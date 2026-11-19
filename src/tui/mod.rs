@@ -1903,7 +1903,8 @@ impl App {
                     self.schedule_frame();
                     return None;
                 }
-                // Nothing under the help is in sight to take it.
+                // The help has the keyboard, so a paste reaches nothing
+                // under it, as a typed key would not.
                 if self.help.is_some() {
                     return None;
                 }
@@ -1993,6 +1994,26 @@ impl App {
             }
             Action::ClearComposer => {
                 self.set_composer_text("");
+                None
+            }
+            Action::DeleteToLineHead => {
+                if let Some(field) = self.prompts.front_mut().and_then(|p| p.field.as_mut()) {
+                    self.last_keystroke = Some(self.clock.now());
+                    field.delete_line_by_head();
+                } else {
+                    self.composer.delete_line_by_head();
+                    self.palette_dirty = true;
+                }
+                None
+            }
+            Action::Undo => {
+                if let Some(field) = self.prompts.front_mut().and_then(|p| p.field.as_mut()) {
+                    self.last_keystroke = Some(self.clock.now());
+                    field.undo();
+                } else {
+                    self.composer.undo();
+                    self.palette_dirty = true;
+                }
                 None
             }
             Action::Interrupt => {
@@ -3144,7 +3165,8 @@ impl App {
             return Some(Span::styled("Leaving...", DIM));
         }
         let Some(turn) = self.turn.as_ref() else {
-            if !self.prompts.is_empty() {
+            // The key help takes the chords the idle hint names.
+            if !self.prompts.is_empty() || self.help.is_some() {
                 return None;
             }
             let status = if self.key_context().question_mark_opens_help() {
@@ -3167,7 +3189,7 @@ impl App {
                 secs(turn.started)
             )
         };
-        if self.prompts.is_empty() {
+        if self.prompts.is_empty() && self.help.is_none() {
             Some(Span::styled(format!("{state}  Esc to interrupt"), DIM))
         } else {
             Some(Span::styled(state, DIM))
@@ -3212,16 +3234,12 @@ impl App {
             frame.render_widget(PagerView { pager, text: &text }, area);
             return;
         }
-        if let Some(help) = self.help.as_mut() {
-            frame.render_widget(help, area);
-            return;
-        }
         // The roster is read on every frame it is up: the tasks move on
         // whether or not the context is in hand.
         if let View::Roster(roster) = &mut self.view {
             roster.refresh(self.roster_sources.rows());
         }
-        let [transcript, status, bottom, footer] = Layout::vertical([
+        let [upper, status, bottom, footer] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(self.bottom_pane_rows(area)),
@@ -3232,19 +3250,22 @@ impl App {
         // The todo panel shares the transcript's rows: beside it on a
         // wide frame, in its place on a narrow one.
         let (transcript, todo) = match (self.todo.visible(), TodoPanel::width_beside(area.width)) {
-            (false, _) => (transcript, None),
+            (false, _) => (upper, None),
             (true, Some(width)) => {
                 let [transcript, todo] =
                     Layout::horizontal([Constraint::Min(0), Constraint::Length(width)])
-                        .areas(transcript);
+                        .areas(upper);
                 (transcript, Some(todo))
             }
-            (true, None) => (Rect::ZERO, Some(transcript)),
+            (true, None) => (Rect::ZERO, Some(upper)),
         };
         let view = self.transcript.view(transcript, &mut self.renderer);
         frame.render_widget(view, transcript);
         if let Some(todo) = todo {
             frame.render_widget(&self.todo, todo);
+        }
+        if let Some(help) = self.help.as_mut() {
+            frame.render_widget(help, upper);
         }
 
         frame.render_widget(StatusStrip(self.status_text()), status);
@@ -3302,12 +3323,10 @@ impl App {
     /// Records the draw; while a turn runs the elapsed-time row asks for
     /// its next tick here, after the scheduler has forgotten the frame
     /// that was just drawn, and so does an open roster for its next read
-    /// unless the pager or the help covers it.
+    /// unless the pager covers it.
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
-        if self.turn.is_some()
-            || (self.pager.is_none() && self.help.is_none() && matches!(self.view, View::Roster(_)))
-        {
+        if self.turn.is_some() || (self.pager.is_none() && matches!(self.view, View::Roster(_))) {
             self.frames.schedule_frame_in(STATUS_TICK);
         }
     }
@@ -5767,6 +5786,93 @@ mod tests {
         for chord in chords {
             assert_ne!(field_after(Some(chord)), unmoved, "{chord:?} in the field");
         }
+        assert_eq!(harness.press(KeyCode::Esc), None);
+        assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+    }
+
+    /// Ctrl+U cuts from the cursor back to the start of its own line of a
+    /// multi-line draft, leaving the other lines alone, and at the start
+    /// of a line joins it to the one above; Ctrl+Y pastes the cut back.
+    #[test]
+    fn ctrl_u_cuts_back_to_the_start_of_the_cursor_line() {
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut harness = Harness::standalone(80, 24);
+        harness
+            .app
+            .composer
+            .set_text("first line\nsecond line\nthird");
+        harness.app.composer.move_cursor(keys::ViMotion::Up);
+        harness.app.composer.move_cursor(keys::ViMotion::Head);
+        harness
+            .app
+            .composer
+            .move_cursor(keys::ViMotion::WordForward);
+        assert_eq!(harness.app.handle_key(ctrl('u')), None);
+        assert_eq!(harness.app.composer_text(), "first line\nline\nthird");
+        assert_eq!(harness.app.handle_key(ctrl('u')), None);
+        assert_eq!(harness.app.composer_text(), "first lineline\nthird");
+        harness.type_text("|");
+        assert_eq!(harness.app.composer_text(), "first line|line\nthird");
+    }
+
+    /// Ctrl+_, and Ctrl+/ and Ctrl+7 the way a legacy terminal sends them,
+    /// undo the last edit in the composer and in a question's text field.
+    #[test]
+    fn ctrl_underscore_undoes_in_the_composer_and_the_text_field() {
+        let ctrl = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        for undo in [ctrl('_'), ctrl('/'), ctrl('7')] {
+            let mut harness = Harness::standalone(80, 24);
+            harness.type_text("alpha beta");
+            assert_eq!(harness.app.handle_key(ctrl('w')), None);
+            assert_eq!(harness.app.composer_text(), "alpha ");
+            assert_eq!(harness.app.handle_key(undo), None, "{undo:?}");
+            assert_eq!(harness.app.composer_text(), "alpha beta", "{undo:?}");
+
+            let req = PromptRequest::new(PromptAction::Input, "Name:", Origin::detached());
+            let asker = ask_on_a_thread(&mut harness, req);
+            harness.type_text("gamma delta");
+            assert_eq!(harness.app.handle_key(ctrl('w')), None);
+            assert_eq!(harness.app.handle_key(undo), None, "{undo:?}");
+            let field = harness.app.prompts.front().unwrap().field.as_ref().unwrap();
+            assert_eq!(field.lines(), ["gamma delta"], "{undo:?}");
+            assert_eq!(harness.app.composer_text(), "alpha beta", "{undo:?}");
+            assert_eq!(harness.press(KeyCode::Esc), None);
+            assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
+        }
+    }
+
+    /// Alt+D cuts the word after the cursor in the composer, in Vim insert
+    /// mode, and in a question's text field.
+    #[test]
+    fn alt_d_cuts_the_next_word_in_the_composer_vim_insert_and_the_text_field() {
+        let alt_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        for (mut harness, mode) in [
+            (Harness::standalone(80, 24), None),
+            (vi_harness(), Some(ViMode::Insert)),
+        ] {
+            harness.type_text("alpha beta gamma");
+            harness.app.composer.move_cursor(keys::ViMotion::Head);
+            assert_eq!(harness.app.handle_key(alt_d), None);
+            assert_eq!(harness.app.composer_text(), " beta gamma");
+            assert_eq!(harness.app.vi_mode, mode);
+        }
+
+        let mut harness = Harness::standalone(80, 24);
+        let req = PromptRequest::new(PromptAction::Input, "Name:", Origin::detached());
+        let asker = ask_on_a_thread(&mut harness, req);
+        harness.type_text("alpha beta");
+        let field = harness
+            .app
+            .prompts
+            .front_mut()
+            .unwrap()
+            .field
+            .as_mut()
+            .unwrap();
+        field.move_cursor(ratatui_textarea::CursorMove::Head);
+        assert_eq!(harness.app.handle_key(alt_d), None);
+        let field = harness.app.prompts.front().unwrap().field.as_ref().unwrap();
+        assert_eq!(field.lines(), [" beta"]);
         assert_eq!(harness.press(KeyCode::Esc), None);
         assert_eq!(asker.join().unwrap().unwrap(), PromptAnswer::Cancelled);
     }
@@ -11007,8 +11113,8 @@ mod tests {
         assert!(harness.draw().contains("Proceed? tui-x7x"));
     }
 
-    /// `?` on an empty composer covers the screen with the key help and
-    /// Esc gives the screen back; typed after text, `?` is just typing.
+    /// `?` on an empty composer pops the key help up over the transcript
+    /// and Esc closes it; typed after text, `?` is just typing.
     #[test]
     fn question_mark_opens_the_key_help_and_esc_closes_it() {
         let mut harness = Harness::standalone(80, 24);
@@ -11017,7 +11123,6 @@ mod tests {
         let frame = harness.draw();
         assert!(frame.contains("Keys"), "{frame}");
         assert!(frame.contains("Suspend to the shell"), "{frame}");
-        assert!(!frame.contains(IDLE_STATUS), "{frame}");
         harness.press(KeyCode::PageDown);
         assert!(!harness.draw().contains("Suspend to the shell"));
         harness
@@ -11167,18 +11272,44 @@ mod tests {
         assert!(!harness.app.transcript.scrolled());
     }
 
+    /// The key help is a pop-up inside the transcript's rows: the composer
+    /// and the footer stay as they were, the status row names no chord
+    /// since the help takes them all, and the transcript shows in the
+    /// margin around it.
     #[test]
-    fn the_key_help_fills_the_screen_wide_and_narrow() {
+    fn the_key_help_pops_up_over_the_transcript_wide_and_narrow() {
         for (width, height, name) in [
             (80, 24, "help_overlay_80x24"),
             (40, 20, "help_overlay_40x20"),
         ] {
             let mut harness = Harness::standalone(width, height);
+            let closed: Vec<String> = harness.draw().lines().map(str::to_string).collect();
             harness.press(KeyCode::Char('?'));
             let frame = harness.draw();
             assert!(frame.contains("Suspend to the shell"), "{frame}");
+            let open: Vec<&str> = frame.lines().collect();
+            let below = usize::from(harness.app.composer.rows()) + 1;
+            let first_below = open.len() - below;
+            assert_eq!(open[first_below..], closed[first_below..], "{frame}");
+            let status = open[first_below - 1];
+            assert!(status.trim_matches(['"', ' ']).is_empty(), "{frame}");
+            assert_eq!(open[0], closed[0], "{frame}");
+            assert_eq!(open[first_below - 2], closed[first_below - 2], "{frame}");
             insta::assert_snapshot!(name, &frame);
         }
+    }
+
+    /// While the key help is up the status row keeps the turn's progress
+    /// but not `Esc to interrupt`: Esc closes the help.
+    #[test]
+    fn the_status_row_under_the_key_help_offers_no_interrupt() {
+        let mut harness = Harness::standalone(80, 24);
+        harness.app.begin_turn("work", false);
+        assert!(harness.draw().contains("Esc to interrupt"));
+        harness.press(KeyCode::Char('?'));
+        let frame = harness.draw();
+        assert!(frame.contains("Working . 0s"), "{frame}");
+        assert!(!frame.contains("Esc to interrupt"), "{frame}");
     }
 
     /// `.keys` opens the key help under the active prefix, between turns

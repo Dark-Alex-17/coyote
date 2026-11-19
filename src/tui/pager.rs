@@ -116,7 +116,7 @@ pub(super) fn load_child(file: &Path, ctx: &RequestContext) -> Result<Vec<ChildE
         .len();
     if size > CHILD_FILE_LIMIT {
         bail!(
-            "{} holds {size} bytes, more than the {CHILD_FILE_LIMIT} the pager reads",
+            "{} holds {size} bytes, more than the {CHILD_FILE_LIMIT} the transcript view reads",
             file.display()
         );
     }
@@ -1585,7 +1585,7 @@ mod tests {
         assert_eq!(
             error,
             format!(
-                "{} holds {} bytes, more than the {CHILD_FILE_LIMIT} the pager reads",
+                "{} holds {} bytes, more than the {CHILD_FILE_LIMIT} the transcript view reads",
                 file.display(),
                 CHILD_FILE_LIMIT + 1
             )

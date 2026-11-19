@@ -54,12 +54,12 @@ const KEY_CONTEXTS: [&str; 14] = [
     "Composer",
     "Roster",
     "Popup",
-    "Vi insert",
-    "Vi normal",
+    "Vim insert",
+    "Vim mode",
     "Key help",
-    "Pager find",
+    "Transcript view find",
     "Thread picker",
-    "Pager",
+    "Transcript view",
 ];
 /// The settings whose README and Getting-Started rows this lint checks.
 const SETTINGS: [&str; 4] = ["ui", "tui_dump_on_exit", "editor", "theme"];
@@ -70,7 +70,8 @@ const PLANNING_WORDS: [&str; 8] = [
 ];
 const CHANGELOG_WORDS: [&str; 2] = ["new", "now"];
 
-/// A key binding: the keys table context and the chord, e.g. `("Pager", "G")`.
+/// A key binding: the keys table context and the chord, e.g.
+/// `("Transcript view", "G")`.
 type Binding = (String, String);
 
 fn repo_root() -> PathBuf {
@@ -524,11 +525,11 @@ fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'stat
         "None => match code {" => Some("Composer"),
         _ if line.starts_with("_ if ctx.popup == Some(PopupKind::Roster)") => Some("Roster"),
         "}," if current == Some("Roster") => Some("Composer"),
-        _ if line.starts_with("fn vi_normal(") => Some("Vi normal"),
+        _ if line.starts_with("fn vi_normal(") => Some("Vim mode"),
         _ if line.starts_with("fn help_key(") => Some("Key help"),
-        _ if line.starts_with("PagerMode::Find =>") => Some("Pager find"),
+        _ if line.starts_with("PagerMode::Find =>") => Some("Transcript view find"),
         _ if line.starts_with("PagerMode::Picker =>") => Some("Thread picker"),
-        _ if line.starts_with("PagerMode::Browse =>") => Some("Pager"),
+        _ if line.starts_with("PagerMode::Browse =>") => Some("Transcript view"),
         _ if line.starts_with("fn pager_key(") || line.starts_with("fn lowercase(") => {
             return Some(None);
         }
@@ -537,13 +538,13 @@ fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'stat
     Some(opened)
 }
 
-/// A composer arm's guard that names a popup or vi insert mode moves the
+/// A composer arm's guard that names a popup or Vim insert mode moves the
 /// arm to that table context.
 fn composer_subcontext(guard: &str) -> &'static str {
     if guard.contains("ctx.popup") {
         "Popup"
     } else if guard.contains("ViMode::Insert") {
-        "Vi insert"
+        "Vim insert"
     } else {
         "Composer"
     }
@@ -742,16 +743,21 @@ fn key_scraper_reads_every_context_of_the_key_map() {
         ("Composer", "Shift+G"),
         ("Popup", "Shift+Tab"),
         ("Roster", "x"),
-        ("Vi insert", "Esc"),
-        ("Vi normal", "A"),
+        ("Vim insert", "Esc"),
+        ("Vim mode", "A"),
         ("Key help", "?"),
         ("Key help", "Ctrl+C"),
         ("Key help", "Ctrl+D"),
-        ("Pager", "G"),
-        ("Pager", "N"),
+        ("Transcript view", "G"),
+        ("Transcript view", "N"),
         ("Thread picker", "q"),
-        ("Pager find", "Backspace"),
+        ("Transcript view find", "Backspace"),
         ("Composer", "Ctrl+J"),
+        ("Composer", "Ctrl+U"),
+        ("Composer", "Ctrl+_"),
+        ("Composer", "Ctrl+7"),
+        ("Text field", "Ctrl+U"),
+        ("Text field", "Ctrl+/"),
     ] {
         assert!(
             bindings.contains(&(context.to_string(), chord.to_string())),
@@ -1184,11 +1190,14 @@ fn tui_page_quotes_the_code() {
     let running = literal_with(tui, "Running {tool}").replace("{tool}", "<tool>");
     let thinking = literal_with(tui, "Thinking for ").replace("{}", "<n>");
     let interrupt = literal_with(tui, "Esc to interrupt").replace("{state}  ", "");
-    let footer_text = fn_body(tui, "fn text(&self) -> String {");
+    let footer_text = fn_body(
+        tui,
+        "fn text(&self, (agents, jobs): (usize, usize)) -> String {",
+    );
     let mut footer: Vec<String> = string_literals(&footer_text)
         .iter()
         .filter(|literal| literal.chars().any(char::is_alphabetic))
-        .map(|literal| literal.replace("{}", "<n>"))
+        .map(|literal| literal.replace("{agents}", "<n>").replace("{jobs}", "<n>"))
         .collect();
     footer.sort();
     assert_eq!(footer, ["agents <n>", "jobs <n>", "no session"]);

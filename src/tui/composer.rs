@@ -128,6 +128,14 @@ impl Composer {
         self.textarea.insert_newline();
     }
 
+    pub(super) fn delete_line_by_head(&mut self) {
+        self.textarea.delete_line_by_head();
+    }
+
+    pub(super) fn undo(&mut self) {
+        self.textarea.undo();
+    }
+
     /// The cursor's column and the count of characters on its line.
     fn cursor_in_line(&self) -> (usize, usize) {
         let cursor = self.textarea.cursor();

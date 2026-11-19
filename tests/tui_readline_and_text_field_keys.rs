@@ -1,10 +1,10 @@
 //! Real-process checks of the readline chords and a question's text field,
 //! sent as the terminal encodes them: Ctrl+W, Ctrl+Y, Alt+B, Ctrl+K, Alt+F,
-//! Ctrl+U and Alt+D edit the composer; in a question's text field `?` is
-//! typed rather than opening the key help, F1-F12 type nothing, and Ctrl+X
-//! shows the todo panel without eating the field's text or closing the
-//! question. Each case runs the binary on a pseudo-terminal, so the file
-//! is unix-only, and the cases run one at a time.
+//! Ctrl+_, Alt+D and Ctrl+U edit the composer; in a question's text field
+//! `?` is typed rather than opening the key help, F1-F12 type nothing, and
+//! Ctrl+X shows the todo panel without eating the field's text or closing
+//! the question. Each case runs the binary on a pseudo-terminal, so the
+//! file is unix-only, and the cases run one at a time.
 #![cfg(unix)]
 
 mod common;
@@ -18,10 +18,13 @@ use serial_test::serial;
 /// A row only the key help shows.
 const HELP_MARK: &str = "Suspend to the shell";
 
+const CTRL_E: &[u8] = b"\x05";
 const CTRL_K: &[u8] = b"\x0b";
 const CTRL_U: &[u8] = b"\x15";
 const CTRL_W: &[u8] = b"\x17";
 const CTRL_Y: &[u8] = b"\x19";
+/// What a terminal sends for Ctrl+_ and, in most, for Ctrl+/ as well.
+const CTRL_UNDERSCORE: &[u8] = b"\x1f";
 const ALT_B: &[u8] = b"\x1bb";
 const ALT_D: &[u8] = b"\x1bd";
 const ALT_F: &[u8] = b"\x1bf";
@@ -115,9 +118,9 @@ fn readline_chords_edit_the_composer() {
         "Alt+F did not move one word forward: {moved:?}"
     );
     assert_eq!(
-        step(&mut pty, CTRL_U),
+        step(&mut pty, CTRL_UNDERSCORE),
         "alpha beta gamma",
-        "Ctrl+U did not undo the typed Z"
+        "Ctrl+_ did not undo the typed Z"
     );
     pty.send(HOME).unwrap();
     pty.read_for(Duration::from_millis(150));
@@ -125,6 +128,15 @@ fn readline_chords_edit_the_composer() {
         step(&mut pty, ALT_D),
         "beta gamma",
         "Alt+D did not cut the word after the cursor"
+    );
+    pty.send(CTRL_E).unwrap();
+    pty.read_for(Duration::from_millis(150));
+    pty.send(ALT_B).unwrap();
+    pty.read_for(Duration::from_millis(150));
+    assert_eq!(
+        step(&mut pty, CTRL_U),
+        "gamma",
+        "Ctrl+U did not cut back to the start of the line"
     );
     leave(pty);
 }

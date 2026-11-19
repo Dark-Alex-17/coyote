@@ -194,7 +194,7 @@ fn dot_keys_lists_ctrl_chords_and_no_function_key_scrolls_and_closes_on_every_cl
     }
     for group in [
         "Composer and text field editing",
-        "Pager find",
+        "Transcript view find",
         "Thread picker",
     ] {
         assert!(

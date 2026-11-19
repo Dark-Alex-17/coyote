@@ -140,6 +140,11 @@ pub(crate) enum Action {
     EditQueued,
     InsertNewline,
     ClearComposer,
+    /// Cut from the cursor back to the start of its line, in the composer
+    /// or a question's text field; at the start, join the line above.
+    DeleteToLineHead,
+    /// Undo the last edit of the composer or a question's text field.
+    Undo,
     /// Soft-interrupt the running turn.
     Interrupt,
     /// An Esc with nothing to cancel on an empty composer; two of them
@@ -269,9 +274,9 @@ impl HelpContext {
             HelpContext::Question => "Question",
             HelpContext::Bands => "Palette, history search and rewind",
             HelpContext::Roster => "Tasks (the roster)",
-            HelpContext::ViNormal => "Vi normal mode",
-            HelpContext::Pager => "Pager",
-            HelpContext::PagerFind => "Pager find",
+            HelpContext::ViNormal => "Vim mode",
+            HelpContext::Pager => "Transcript view",
+            HelpContext::PagerFind => "Transcript view find",
             HelpContext::ThreadPicker => "Thread picker",
             HelpContext::KeyHelp => "This help",
         }
@@ -346,7 +351,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Ctrl+O",
             "Edit the line in $VISUAL or $EDITOR, between turns",
         ),
-        row(Composer, "Ctrl+T", "Open the pager on the whole transcript"),
+        row(Composer, "Ctrl+T", "Open the transcript view"),
         row(Composer, "Alt+T", "Show or hide tasks (the roster)"),
         row(Composer, "?", "Show this help, on an empty composer"),
         row(
@@ -362,7 +367,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(
             Composer,
             "Esc",
-            "Leave the focused row, or vi insert mode; twice on an empty composer, rewind",
+            "Leave the focused row, or Vim insert mode; twice on an empty composer, rewind",
         ),
         row(
             Composer,
@@ -426,8 +431,13 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Cut the word after the cursor",
         ),
         row(ComposerEditing, "Ctrl+K", "Cut to the end of the line"),
+        row(
+            ComposerEditing,
+            "Ctrl+U",
+            "Cut to the start of the line; at its start, join the line above",
+        ),
         row(ComposerEditing, "Ctrl+Y", "Paste what was last cut"),
-        row(ComposerEditing, "Ctrl+U", "Undo"),
+        row(ComposerEditing, "Ctrl+_ / Ctrl+/ / Ctrl+7", "Undo"),
         row(
             ComposerEditing,
             "Shift+Left / Shift+Right",
@@ -453,7 +463,16 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "1-9",
             "Choose that option, in a single-choice list",
         ),
-        row(Question, "Esc / Ctrl+C", "Cancel the question"),
+        row(
+            Question,
+            "Esc",
+            "Cancel the question; the command that asked it may carry on",
+        ),
+        row(
+            Question,
+            "Ctrl+C",
+            "Cancel the question and stop the command that asked it",
+        ),
         row(Bands, "Up / Down / Tab / Shift+Tab", "Move the highlight"),
         row(Bands, "Enter", "Take the highlighted row"),
         row(Bands, "Backspace", "Delete a history search character"),
@@ -464,9 +483,13 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
             "Move between the rows",
         ),
         row(Roster, "x", "Cancel the highlighted task"),
-        row(Roster, "o", "Show the highlighted task in the pager"),
+        row(
+            Roster,
+            "o",
+            "Show the highlighted task in the transcript view",
+        ),
         row(Roster, "Enter", "Answer the highlighted question"),
-        row(Roster, "Ctrl+T", "Open the pager on the whole transcript"),
+        row(Roster, "Ctrl+T", "Open the transcript view"),
         row(
             Roster,
             "Esc / Ctrl+C / Ctrl+D / Alt+T",
@@ -492,7 +515,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(
             Pager,
             "q / Esc / Ctrl+C / Ctrl+D / Ctrl+T",
-            "Close the pager",
+            "Close the transcript view",
         ),
         row(PagerFind, "Enter", "Search and keep the text for n and N"),
         row(PagerFind, "Backspace", "Delete a character"),
@@ -502,7 +525,7 @@ pub(crate) const KEY_HELP: &[HelpRow] = {
         row(
             ThreadPicker,
             "q / Esc / Tab / Ctrl+C / Ctrl+D",
-            "Back to the pager",
+            "Back to the transcript view",
         ),
         row(KeyHelp, "j / k / Up / Down", "Scroll a line"),
         row(KeyHelp, "PgUp / PgDn", "Scroll a page"),
@@ -572,6 +595,8 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Enter if !(ctx.field_settled && ctx.question_fully_shown) => Action::Nothing,
             KeyCode::Enter => Action::SubmitModalInput,
             KeyCode::Char('j') if ctrl => Action::Nothing,
+            KeyCode::Char('u') if ctrl => Action::DeleteToLineHead,
+            KeyCode::Char('_' | '/' | '7') if ctrl => Action::Undo,
             _ => Action::ModalInput(key),
         },
         Some(
@@ -673,6 +698,10 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
             KeyCode::Char('o') if ctrl => Action::OpenEditor,
             KeyCode::Char('r') if ctrl => Action::OpenHistorySearch,
             KeyCode::Char('j') if ctrl => Action::InsertNewline,
+            KeyCode::Char('u') if ctrl => Action::DeleteToLineHead,
+            // A legacy terminal sends Ctrl+_, Ctrl+/ and Ctrl+7 as one
+            // byte, which crossterm reads as Ctrl+7.
+            KeyCode::Char('_' | '/' | '7') if ctrl => Action::Undo,
             KeyCode::Enter
                 if key
                     .modifiers
@@ -2146,7 +2175,7 @@ mod tests {
     fn swept_contexts() -> Vec<(KeyContext, Vec<HelpContext>)> {
         use HelpContext as H;
         let composer = [H::Anywhere, H::Transcript, H::Composer, H::ComposerEditing];
-        let groups: [(&[KeyContext], Vec<HelpContext>); 9] = [
+        let groups: [(&[KeyContext], Vec<HelpContext>); 10] = [
             (
                 &[
                     IDLE,
@@ -2164,17 +2193,12 @@ mod tests {
                 [&composer[..], &[H::TurnRunning]].concat(),
             ),
             (
-                &[
-                    CONFIRM,
-                    CONFIRM_NO_TOOL,
-                    SCROLLED_CONFIRM,
-                    INPUT,
-                    PASSWORD,
-                    SELECT,
-                    CUSTOM_FIELD,
-                    CHECKBOX,
-                ],
+                &[CONFIRM, CONFIRM_NO_TOOL, SCROLLED_CONFIRM, SELECT, CHECKBOX],
                 vec![H::Anywhere, H::Transcript, H::Question],
+            ),
+            (
+                &[INPUT, PASSWORD, CUSTOM_FIELD],
+                vec![H::Anywhere, H::Transcript, H::Question, H::ComposerEditing],
             ),
             (
                 &[PALETTE, RUNNING_PALETTE, SEARCH, REWIND],
@@ -2467,8 +2491,24 @@ mod tests {
                 ],
             ),
             (H::ComposerEditing, "Ctrl+K", vec![typed(ctrl('k'), TYPING)]),
+            (
+                H::ComposerEditing,
+                "Ctrl+U",
+                vec![
+                    (ctrl('u'), MULTI_LINE, Action::DeleteToLineHead),
+                    (ctrl('u'), INPUT, Action::DeleteToLineHead),
+                ],
+            ),
             (H::ComposerEditing, "Ctrl+Y", vec![typed(ctrl('y'), IDLE)]),
-            (H::ComposerEditing, "Ctrl+U", vec![typed(ctrl('u'), TYPING)]),
+            (
+                H::ComposerEditing,
+                "Ctrl+_ / Ctrl+/ / Ctrl+7",
+                vec![
+                    (control(KeyCode::Char('_')), TYPING, Action::Undo),
+                    (control(KeyCode::Char('/')), VI_INSERT_TYPING, Action::Undo),
+                    (control(KeyCode::Char('7')), CUSTOM_FIELD, Action::Undo),
+                ],
+            ),
             (
                 H::ComposerEditing,
                 "Shift+Left / Shift+Right",
@@ -2559,15 +2599,28 @@ mod tests {
             ),
             (
                 H::Question,
-                "Esc / Ctrl+C",
+                "Esc",
                 vec![
                     (plain(KeyCode::Esc), PASSWORD, cancelled()),
+                    (plain(KeyCode::Esc), CONFIRM, cancelled()),
+                    (plain(KeyCode::Esc), CHECKBOX, cancelled()),
+                ],
+            ),
+            (
+                H::Question,
+                "Ctrl+C",
+                vec![
                     (
                         ctrl('c'),
                         CUSTOM_FIELD,
                         Action::Answer(PromptAnswer::Interrupted),
                     ),
-                    (plain(KeyCode::Esc), CONFIRM, cancelled()),
+                    (
+                        ctrl('c'),
+                        CONFIRM,
+                        Action::Answer(PromptAnswer::Interrupted),
+                    ),
+                    (ctrl('c'), SELECT, Action::Answer(PromptAnswer::Interrupted)),
                 ],
             ),
             (
@@ -2992,8 +3045,9 @@ mod tests {
     /// Each help row names a key that, in a context the row applies to,
     /// does what the row says, and no row documents a key that does
     /// nothing. A composer editing key must reach the text area as
-    /// typed; any other row may also hand its key to the text area, as
-    /// Ctrl+D does with a draft, so long as it binds the key somewhere.
+    /// typed, or be one of the edits the app makes on it itself; any
+    /// other row may also hand its key to the text area, as Ctrl+D does
+    /// with a draft, so long as it binds the key somewhere.
     #[test]
     fn every_help_row_replays_through_the_key_map() {
         let swept = swept_contexts();
@@ -3019,8 +3073,13 @@ mod tests {
                         .any(|(swept, applies)| swept == ctx && applies.contains(&row.context)),
                     "{row:?}: {ctx:?} is not a swept context the row applies to"
                 );
-                if row.context == HelpContext::ComposerEditing || passes_through(expected) {
+                if passes_through(expected) {
                     assert_eq!(*expected, Action::ComposerInput(*key), "{row:?}");
+                } else if row.context == HelpContext::ComposerEditing {
+                    assert!(
+                        matches!(expected, Action::DeleteToLineHead | Action::Undo),
+                        "{row:?}: {expected:?} is not a text edit"
+                    );
                 }
                 assert_eq!(map_key(*key, ctx), *expected, "{row:?}: {key:?} in {ctx:?}");
             }
@@ -3071,8 +3130,8 @@ mod tests {
 
     /// Every key a help row hands to the text area edits the draft or
     /// moves its cursor there, so no row names a key the text area
-    /// ignores. A marker typed after the key shows where the cursor
-    /// went.
+    /// ignores; the edits the app makes itself are applied the same
+    /// way. A marker typed after the key shows where the cursor went.
     #[test]
     fn every_key_the_help_hands_to_the_text_area_changes_the_draft() {
         let marker = plain(KeyCode::Char('|'));
@@ -3080,11 +3139,13 @@ mod tests {
         unmoved.input(marker);
         for (context, keys, replays) in help_examples() {
             for (key, _, action) in replays {
-                if action != Action::ComposerInput(key) {
-                    continue;
-                }
                 let mut composer = primed_composer();
-                composer.input(key);
+                match action {
+                    Action::ComposerInput(typed) if typed == key => composer.input(key),
+                    Action::DeleteToLineHead => composer.delete_line_by_head(),
+                    Action::Undo => composer.undo(),
+                    _ => continue,
+                }
                 composer.input(marker);
                 assert_ne!(
                     composer.text(),
@@ -3314,6 +3375,7 @@ mod tests {
             "Enter",
             "Ctrl+J",
             "Ctrl+C",
+            "Ctrl+U",
             "Ctrl+X",
             "Shift+Up",
             "Shift+Down",
@@ -3348,26 +3410,32 @@ mod tests {
     }
 
     /// The readline chords users reach for first are handed on whole, so
-    /// they edit the composer and a question's text field.
+    /// they edit the composer and a question's text field; Ctrl+U is cut
+    /// to the line start, which the text area alone would take as undo.
     #[test]
     fn readline_chords_reach_the_composer_and_the_text_field() {
         let alt = |c: char| press(KeyCode::Char(c), KeyModifiers::ALT);
         let chords = [
             alt('f'),
             alt('b'),
+            alt('d'),
             ctrl('w'),
-            ctrl('u'),
             ctrl('k'),
             ctrl('y'),
             ctrl('e'),
         ];
+        let composers = [IDLE, TYPING, MULTI_LINE, VI_INSERT_TYPING, RUNNING_TYPING];
+        let fields = [INPUT, PASSWORD, CUSTOM_FIELD];
         for key in chords {
-            for ctx in [IDLE, TYPING, MULTI_LINE, VI_INSERT_TYPING, RUNNING_TYPING] {
+            for ctx in composers {
                 assert_eq!(map_key(key, &ctx), Action::ComposerInput(key), "{ctx:?}");
             }
-            for ctx in [INPUT, PASSWORD, CUSTOM_FIELD] {
+            for ctx in fields {
                 assert_eq!(map_key(key, &ctx), Action::ModalInput(key), "{ctx:?}");
             }
+        }
+        for ctx in composers.iter().chain(&fields) {
+            assert_eq!(map_key(ctrl('u'), ctx), Action::DeleteToLineHead, "{ctx:?}");
         }
     }
 

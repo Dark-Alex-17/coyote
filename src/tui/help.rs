@@ -1,21 +1,25 @@
 //! The key help: every binding of the key map grouped by where it
-//! applies, drawn over the whole screen the way the pager is. `?` on an
-//! empty composer and the `.keys` command open it. The rows come from
-//! `keys::KEY_HELP`, the table the key map's tests hold to the bindings.
+//! applies, drawn as a bordered pop-up over the transcript, so the
+//! composer and the rows around it stay in view. `?` on an empty composer
+//! and the `.keys` command open it. The rows come from `keys::KEY_HELP`,
+//! the table the key map's tests hold to the bindings.
 
 use super::DIM;
 use super::keys::{HelpRow, KEY_HELP};
 use super::render;
 use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 const TITLE: &str = "Keys";
-/// Fits the 40 columns of the narrowest frame the help is drawn at.
-const HINT: &str = "j/k scroll  PgUp/Dn page  q/?/Esc close";
+/// Fits the bottom border of the pop-up on the 40 columns of the
+/// narrowest frame the help is drawn at.
+const HINT: &str = "j/k scroll  PgUp/Dn page  Esc close";
+/// The transcript left showing around the pop-up.
+const MARGIN: Margin = Margin::new(1, 1);
 /// Columns before a row's keys.
 const INDENT: usize = 2;
 /// Columns between the keys and what they do.
@@ -148,35 +152,36 @@ fn wrap_keys(keys: &str, width: usize) -> Vec<String> {
 }
 
 impl Widget for &mut Help {
+    /// `area` is the transcript's; the pop-up sits inside it. Under the
+    /// title a blank row sets the first heading apart from the border.
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let area = area.intersection(*buf.area());
+        let area = area.intersection(*buf.area()).inner(MARGIN);
         if area.is_empty() {
             return;
         }
-        let text = lines(area.width);
+        let block = Block::bordered()
+            .title(Span::styled(TITLE, BOLD))
+            .title_bottom(Line::styled(HINT, DIM));
+        let inner = block.inner(area);
+        let body = Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(1),
+        );
+        let text = lines(body.width);
         let total = text.len();
-        let chrome = area.height >= 3;
-        let body = if chrome {
-            Rect::new(area.x, area.y + 1, area.width, area.height - 2)
-        } else {
-            area
-        };
         let rows = usize::from(body.height);
         self.page = rows.max(1);
         self.last_total = total;
         self.top = self.top.min(self.bottom());
         let start = self.top;
         let end = (start + rows).min(total);
-        if chrome {
-            let title = Rect::new(area.x, area.y, area.width, 1);
-            Paragraph::new(Line::from(Span::styled(TITLE, BOLD))).render(title, buf);
-            let position = format!("{}-{end}/{total}", (start + 1).min(end));
-            Paragraph::new(Line::from(Span::styled(position, DIM)))
-                .right_aligned()
-                .render(title, buf);
-            let hint = Rect::new(area.x, area.y + area.height - 1, area.width, 1);
-            Paragraph::new(Line::from(Span::styled(HINT, DIM))).render(hint, buf);
-        }
+        let position = format!("{}-{end}/{total}", (start + 1).min(end));
+        Clear.render(area, buf);
+        block
+            .title(Line::styled(position, DIM).right_aligned())
+            .render(area, buf);
         let visible: Vec<Line<'static>> = text.into_iter().skip(start).take(rows).collect();
         Paragraph::new(visible).render(body, buf);
     }
@@ -187,6 +192,11 @@ mod tests {
     use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    /// What the margin, the border and the blank row under the title take
+    /// from the area the pop-up is drawn over.
+    const CHROME_COLUMNS: u16 = 4;
+    const CHROME_ROWS: usize = 5;
 
     fn draw(help: &mut Help, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -208,9 +218,10 @@ mod tests {
                 seen.push_str(&draw(&mut help, width, height));
                 help.page(1);
             }
-            let text: Vec<String> = lines(width).iter().map(Line::to_string).collect();
+            let body_width = width - CHROME_COLUMNS;
+            let text: Vec<String> = lines(body_width).iter().map(Line::to_string).collect();
             for line in &text {
-                assert!(line.width() <= usize::from(width), "{width}: {line:?}");
+                assert!(line.width() <= usize::from(body_width), "{width}: {line:?}");
                 assert!(seen.contains(line.trim_end()), "{width}: {line:?}");
             }
             let trimmed: Vec<&str> = text.iter().map(|line| line.trim()).collect();
@@ -233,17 +244,18 @@ mod tests {
     /// step moves by the rows the last frame showed less one.
     #[test]
     fn scrolling_stays_within_the_text() {
+        let rows = 24 - CHROME_ROWS;
+        let total = lines(80 - CHROME_COLUMNS).len();
         let mut help = Help::default();
         help.scroll(-5);
         let top = draw(&mut help, 80, 24);
         assert_eq!(help.top, 0);
-        assert!(top.contains(&format!("1-22/{}", lines(80).len())), "{top}");
+        assert!(top.contains(&format!("1-{rows}/{total}")), "{top}");
         help.page(1);
-        assert_eq!(help.top, 21);
+        assert_eq!(help.top, rows - 1);
         help.scroll(10_000);
         let bottom = draw(&mut help, 80, 24);
-        let total = lines(80).len();
-        assert_eq!(help.top, total - 22);
+        assert_eq!(help.top, total - rows);
         assert!(bottom.contains(&format!("/{total}")), "{bottom}");
         assert!(bottom.contains("Close the help"), "{bottom}");
     }
@@ -254,8 +266,8 @@ mod tests {
     fn a_step_up_after_scrolling_past_the_end_moves_at_once() {
         let mut help = Help::default();
         draw(&mut help, 80, 24);
-        let total = lines(80).len();
-        let bottom = total - 22;
+        let total = lines(80 - CHROME_COLUMNS).len();
+        let bottom = total - (24 - CHROME_ROWS);
         for _ in 0..50 {
             help.page(1);
             help.scroll(3);
@@ -266,6 +278,48 @@ mod tests {
         let frame = draw(&mut help, 80, 24);
         let position = format!("{bottom}-{}/{total}", total - 1);
         assert!(frame.contains(&position), "{frame}");
+    }
+
+    /// The pop-up leaves a row and a column of what it is drawn over on
+    /// each side, names itself and its position on the top border and the
+    /// keys that move and close it on the bottom one, and keeps a blank
+    /// row under the title before the first heading.
+    #[test]
+    fn the_pop_up_is_bordered_inside_a_margin_with_a_blank_row_under_the_title() {
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                Paragraph::new(vec![Line::from("x".repeat(40)); 12])
+                    .render(area, frame.buffer_mut());
+                frame.render_widget(&mut Help::default(), area);
+            })
+            .unwrap();
+        let rows: Vec<String> = (0..12)
+            .map(|y| {
+                let buffer = terminal.backend().buffer();
+                (0..40).map(|x| buffer[(x, y)].symbol()).collect()
+            })
+            .collect();
+        assert_eq!(rows[0], "x".repeat(40));
+        assert_eq!(rows[11], "x".repeat(40));
+        for row in &rows[1..11] {
+            assert!(row.starts_with('x') && row.ends_with('x'), "{row:?}");
+        }
+        let total = lines(40 - CHROME_COLUMNS).len();
+        assert!(rows[1].starts_with("x\u{250c}Keys"), "{:?}", rows[1]);
+        assert!(
+            rows[1].ends_with(&format!("1-7/{total}\u{2510}x")),
+            "{:?}",
+            rows[1]
+        );
+        assert_eq!(rows[2], format!("x\u{2502}{}\u{2502}x", " ".repeat(36)));
+        assert!(rows[3].starts_with("x\u{2502}Anywhere "), "{:?}", rows[3]);
+        assert!(
+            rows[10].starts_with(&format!("x\u{2514}{HINT}")),
+            "{:?}",
+            rows[10]
+        );
     }
 
     #[test]
