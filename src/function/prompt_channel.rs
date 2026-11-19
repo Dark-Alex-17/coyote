@@ -1356,8 +1356,9 @@ struct WireRequest {
 }
 
 /// A request as the prompter sees it plus the option text as the tool sent
-/// it. Question and options are sanitised before the prompter paints them,
-/// but a chosen option must go back verbatim or the tool cannot match it.
+/// it. Question and options are escaped for display before the prompter
+/// paints them, but a chosen option must go back verbatim or the tool cannot
+/// match it.
 pub(crate) struct ParsedRequest {
     pub(crate) req: PromptRequest,
     raw_options: Vec<String>,

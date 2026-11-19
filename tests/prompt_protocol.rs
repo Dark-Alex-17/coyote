@@ -106,6 +106,68 @@ fn python_confirm_without_channel_reads_the_controlling_terminal() {
     );
 }
 
+/// Without a channel the bash helper prints a guarded command as data: a
+/// `\c` in it cannot cut the prompt short, and the command keeps its own
+/// line under the question.
+#[test]
+fn bash_confirm_without_channel_shows_a_command_in_full() {
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; source \"{HELPER}\"; v=\"$(confirm \"$GUARD_Q\")\"; echo \"confirm-result=$v\""
+        ))
+        .env("GUARD_Q", "Run? sh-x7x\ntrue \\c; rm -rf gone-x7x")
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let shown = pty
+        .wait_for("gone-x7x (y/N)", PTY_DEADLINE)
+        .expect("the command was cut short");
+    assert!(shown.contains("true \\c; rm -rf"), "{shown}");
+    assert!(!shown.contains("sh-x7xtrue"), "{shown}");
+    pty.send(b"\x1b[5;1R").unwrap();
+    pty.send(b"y").unwrap();
+    pty.wait_for("confirm-result=1", PTY_DEADLINE).unwrap();
+}
+
+/// The Python guard's terminal fallback keeps the operation on its own
+/// line under the question instead of running the two together.
+#[test]
+fn python_guard_without_channel_keeps_the_operation_on_its_own_line() {
+    if which::which("python3").is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    let driver = "import importlib.util, sys\n\
+        sys.dont_write_bytecode = True\n\
+        spec = importlib.util.spec_from_file_location(\"prompt_utils\", sys.argv[1])\n\
+        m = importlib.util.module_from_spec(spec)\n\
+        spec.loader.exec_module(m)\n\
+        m.guard_operation(\"Run? py-x7x\", \"ls op-x7x\")\n\
+        print(\"guard-passed\")\n";
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(format!(
+            "exec </dev/null; python3 -c '{driver}' \"{PY_HELPER}\""
+        ))
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env_remove("COYOTE_PROMPT_REPLY")
+        .env_remove("_COYOTE_PROMPT_OUT")
+        .env_remove("AUTO_CONFIRM")
+        .env_remove("LLM_AGENT_VAR_AUTO_CONFIRM")
+        .env_remove("COYOTE_UI")
+        .env("TERM", "xterm");
+    let mut pty = Pty::spawn(cmd).unwrap();
+    let shown = pty.wait_for("op-x7x (y/N)", PTY_DEADLINE).unwrap();
+    assert!(!shown.contains("py-x7xls"), "{shown}");
+    pty.send(b"y\n").unwrap();
+    pty.wait_for("guard-passed", PTY_DEADLINE).unwrap();
+}
+
 /// The TypeScript helper in the same situation, driven by whichever
 /// runtime can execute `.ts` files here.
 #[test]

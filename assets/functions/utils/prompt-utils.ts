@@ -261,9 +261,10 @@ function stripCr(line: string | null): string | null {
 
 // Question and option text reaches the terminal unescaped in fallback mode,
 // so control and bidi-override characters (which could repaint or reorder
-// the prompt) are dropped from each piece before it is formatted.
+// the prompt) are dropped from each piece before it is formatted. A newline
+// stays: a guard puts its operation on the line after the question.
 function stripControl(text: string): string {
-  return text.replace(/[\x00-\x1f\x7f\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "");
+  return text.replace(/[\x00-\x09\x0b-\x1f\x7f\u0080-\u009f\u202a-\u202e\u2066-\u2069]/g, "");
 }
 
 function stty(tty: Terminal, mode: string): boolean {

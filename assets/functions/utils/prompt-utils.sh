@@ -344,8 +344,13 @@ _new_line_foreach_item() {
   done
 }
 
+# The question is printed as data, never read for backslash escapes, and with
+# control bytes other than a newline dropped, so a guarded command cannot cut
+# its own prompt short or repaint it.
 _prompt_text() {
-  echo -en "\033[32m?\033[0m\033[1m ${1}\033[0m " >&2
+  declare text
+  text="$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\011\013-\037\177')"
+  printf '\033[32m?\033[0m\033[1m %s\033[0m ' "$text" >&2
 }
 
 _decrement_selected() {

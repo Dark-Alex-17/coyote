@@ -60,7 +60,7 @@ import sys
 
 REPLY_ENV = "COYOTE_PROMPT_REPLY"
 OUT_FD_ENV = "_COYOTE_PROMPT_OUT"
-CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f\u0080-\u009f\u202a-\u202e\u2066-\u2069]")
+CONTROL_CHARS = re.compile(r"[\x00-\x09\x0b-\x1f\x7f\u0080-\u009f\u202a-\u202e\u2066-\u2069]")
 
 
 def _show_error(message):
@@ -173,7 +173,8 @@ def _open_tty():
 
 # Question and option text reaches the terminal unescaped in fallback mode,
 # so control and bidi-override characters (which could repaint or reorder
-# the prompt) are dropped from each piece before it is formatted.
+# the prompt) are dropped from each piece before it is formatted. A newline
+# stays: a guard puts its operation on the line after the question.
 def _clean(text):
     return CONTROL_CHARS.sub("", str(text))
 

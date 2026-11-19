@@ -58,14 +58,14 @@ fn format_character_confirm_tool() -> String {
 }
 
 /// A tool-authored question carrying bidi overrides and zero-width
-/// characters is drawn in its stored order without them: the modal reads
-/// `Delete txt.safe k7m?`, none of the characters reaches the terminal
-/// (where a real emulator would reorder or hide the text around them),
-/// `y` still answers the tool as a yes, and nothing of them is left on
-/// the normal screen after the UI leaves.
+/// characters is drawn in its stored order with each one spelled out as
+/// `\u{...}`: none of the characters reaches the terminal (where a real
+/// emulator would reorder or hide the text around them), `y` still
+/// answers the tool as a yes, and nothing of them is left on the normal
+/// screen after the UI leaves.
 #[test]
 #[serial]
-fn a_tools_confirm_question_with_format_characters_is_drawn_without_them() {
+fn a_tools_confirm_question_with_format_characters_shows_them_spelled_out() {
     let dir = fresh_config_dir("tool-confirm-format-chars");
     let _guard = TempDirGuard(dir.clone());
     let out = dir.join("confirm-answer");
@@ -92,8 +92,9 @@ fn a_tools_confirm_question_with_format_characters_is_drawn_without_them() {
     pty.read_for(HOTKEY_GAP);
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[submitted_at..]));
     assert!(
-        squeezed(&since).contains("Deletetxt.safek7m?q9d-q"),
-        "the question was not drawn in its stored order with the format characters dropped:\n{since}"
+        squeezed(&since)
+            .contains(r"Delete\u{202e}txt.safe\u{202c}\u{200b}k7m\u{200f}\u{feff}?q9d-q"),
+        "the question was not drawn in its stored order with the format characters spelled out:\n{since}"
     );
     for (name, bytes) in FORMAT_CHARACTERS {
         assert!(
