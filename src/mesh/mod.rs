@@ -397,6 +397,7 @@ pub(crate) mod test_support {
     use super::node::arm_destination_caps;
     #[cfg(unix)]
     use super::node::{MeshRuntime, MeshSlot, NodeOptions};
+    #[cfg(unix)]
     pub(crate) use super::peers::{FarewellTime, LeftMark};
     #[cfg(unix)]
     pub(crate) use super::peers::{PEER_TTL, PeerSighting};
