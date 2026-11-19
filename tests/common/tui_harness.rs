@@ -1877,3 +1877,45 @@ impl Drop for SleeperPids {
         }
     }
 }
+
+/// [`spawn_tui_under`] with the tty on stdin, for a case that only swaps
+/// the wrapper.
+pub fn spawn_tui_under_wrapper(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str) -> Pty {
+    spawn_tui_under(dir, extra_env, wrapper, "/dev/tty")
+}
+
+/// Drives Ctrl-Z under the job-control wrapper up to the point where the
+/// shell has the terminal back: alternate screen and bracketed paste gone
+/// before the shell spoke, cooked tty. Returns the raw offset of the
+/// shell's `job-stopped` line.
+pub fn suspend_and_check_handback(pty: &mut Pty, before_suspend: usize) -> usize {
+    pty.send(b"\x1a").unwrap();
+    let stopped = pty
+        .wait_for("stopped-probe-done", PTY_DEADLINE)
+        .expect("Ctrl-Z did not stop the job (the shell never regained the terminal)");
+    let left_at = find(pty.raw(), LEAVE_ALT, before_suspend)
+        .unwrap_or_else(|| panic!("Ctrl-Z stopped the job without leaving the alternate screen"));
+    let stopped_marker = find(pty.raw(), b"job-stopped", before_suspend).unwrap();
+    assert!(
+        left_at < stopped_marker,
+        "the alternate screen was left only after the shell regained the terminal"
+    );
+    assert!(
+        find(pty.raw(), PASTE_OFF, before_suspend).is_some_and(|off| off < stopped_marker),
+        "bracketed paste was still enabled when the shell got the terminal back"
+    );
+    let flags = stopped
+        .lines()
+        .find_map(|line| line.strip_prefix("stopped-tty-flags: "))
+        .unwrap();
+    let tokens: Vec<&str> = flags
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .collect();
+    for flag in ["echo", "icanon"] {
+        assert!(
+            tokens.contains(&flag),
+            "the suspended UI left the shell with {flag} off:\n{stopped}"
+        );
+    }
+    stopped_marker
+}

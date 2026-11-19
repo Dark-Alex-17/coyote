@@ -7,79 +7,14 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::fs;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use common::fake_llm::{Chunk, FakeLlm, HOLD_LIMIT, Reply};
 use common::pty::{Pty, strip_ansi};
+use common::tui_harness::*;
 use serial_test::serial;
-
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys on a modal count only once both the last keystroke and the
-/// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles
-/// both.
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-const ENTER_ALT: &[u8] = b"\x1b[?1049h";
-const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
-
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-const WAIT_WRAPPER: &str =
-    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-tui-interrupt-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    fs::create_dir_all(dir.join("sessions")).unwrap();
-    dir
-}
-
-fn write_dry_run_config(dir: &Path) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
 
 /// The fake-LLM config; `save_session` is written only when `prompt_free`
 /// is set, so a dirty session asks "Save session?" on the way out otherwise.
@@ -115,12 +50,6 @@ fn write_fake_llm_config(dir: &Path, fake: &FakeLlm, prompt_free: bool) {
         ),
     )
     .unwrap();
-}
-
-fn write_tool(dir: &Path, file: &str, body: &str) {
-    let tools = dir.join("functions").join("tools");
-    fs::create_dir_all(&tools).unwrap();
-    fs::write(tools.join(file), body).unwrap();
 }
 
 /// Marks `<out>.asked` the moment it asks, records the answer at `<out>`.
@@ -163,187 +92,6 @@ const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   done\n\
     \x20   echo \"fixture slept k4s\" >> \"$LLM_OUTPUT\"\n\
     }\n";
-
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    spawn_tui_under(dir, extra_env, WAIT_WRAPPER)
-}
-
-fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str) -> Pty {
-    let home = dir.join("home");
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    let mut cmd = Command::new("bash");
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.arg("-c")
-        .arg(
-            wrapper
-                .replace("{coyote}", built_binary().to_str().unwrap())
-                .replace("{args}", " --tui")
-                .replace("{stdin}", "/dev/tty")
-                .replace("{report}", TTY_REPORT),
-        )
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR")
-        .envs(extra_env.iter().copied());
-    Pty::spawn(cmd).unwrap()
-}
-
-fn assert_tty_restored(transcript: &str) {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
-        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .collect();
-    for flag in ["echo", "icanon", "isig", "opost"] {
-        assert!(
-            tokens.contains(&flag),
-            "stty did not report {flag} after the UI left:\n{transcript}"
-        );
-        let off = format!("-{flag}");
-        assert!(
-            !tokens.contains(&off.as_str()),
-            "the terminal was left with {flag} off:\n{transcript}"
-        );
-    }
-}
-
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn child_pid(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("cpid="))
-        .unwrap_or_else(|| panic!("no cpid= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    let from = from.min(haystack.len());
-    haystack[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|at| from + at)
-}
-
-fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).rposition(|w| w == needle)
-}
-
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-/// The 1-based (row, col) of the cursor-position sequence that placed each
-/// occurrence of `needle` from `from` on: the screen row it was drawn on.
-fn painted_at(haystack: &[u8], needle: &[u8], from: usize) -> Vec<(u16, u16)> {
-    let mut positions = Vec::new();
-    let mut at = from;
-    while let Some(hit) = find(haystack, needle, at) {
-        let mut end = hit;
-        while let Some(start) = rfind(&haystack[..end], b"\x1b[") {
-            let params: Vec<u8> = haystack[start + 2..hit]
-                .iter()
-                .copied()
-                .take_while(|b| b.is_ascii_digit() || *b == b';')
-                .collect();
-            if haystack.get(start + 2 + params.len()) == Some(&b'H')
-                && let Some((row, col)) = std::str::from_utf8(&params)
-                    .ok()
-                    .and_then(|p| p.split_once(';'))
-                && let (Ok(row), Ok(col)) = (row.parse(), col.parse())
-            {
-                positions.push((row, col));
-                break;
-            }
-            end = start;
-        }
-        at = hit + 1;
-    }
-    positions
-}
-
-fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    let wanted = squeezed(marker);
-    loop {
-        pty.read_for(Duration::from_millis(200));
-        let text = strip_ansi(&String::from_utf8_lossy(
-            &pty.raw()[from.min(pty.raw().len())..],
-        ));
-        if squeezed(&text).contains(&wanted) {
-            return text;
-        }
-        assert!(Instant::now() < deadline, "{what} never appeared:\n{text}");
-    }
-}
-
-fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    while !path.exists() {
-        let text = pty.read_for(Duration::from_millis(100));
-        assert!(
-            Instant::now() < deadline,
-            "{what} ({}) never appeared:\n{text}",
-            path.display()
-        );
-    }
-}
-
-fn walk(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    out
-}
 
 /// Streams a first delta, holds the rest behind `release`, then streams a
 /// tail; `.session` is opened first so an interrupt keeps the partial
@@ -426,7 +174,7 @@ fn an_idle_quit_after_an_esc_interrupted_turn_still_fires_agent_completed() {
     )
     .unwrap();
     let wrapper = WAIT_WRAPPER.replace("{args}", "{args} --agent probe-agent");
-    let mut pty = spawn_tui_under(&dir, &[], &wrapper);
+    let mut pty = spawn_tui_under_wrapper(&dir, &[], &wrapper);
 
     let pressed_at = interrupt_a_held_stream(&mut pty, "partial before esc k4h");
     let since = strip_ansi(&String::from_utf8_lossy(&pty.raw()[pressed_at..]));
@@ -636,7 +384,7 @@ fn a_hotkey_typed_as_the_confirm_modal_appears_is_dropped_until_it_has_been_up_a
 fn a_second_sigterm_during_teardown_changes_nothing() {
     let dir = fresh_config_dir("double-sigterm");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -905,7 +653,7 @@ fn assert_stacked_once(pty: &Pty, before: usize, first: &str, second: &str, sep:
 fn a_crlf_paste_is_one_line_break_and_enter_sends_both_lines() {
     let dir = fresh_config_dir("paste-crlf");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 
@@ -959,7 +707,7 @@ fn a_crlf_paste_is_one_line_break_and_enter_sends_both_lines() {
 fn dot_undo_after_a_dry_run_turn_keeps_the_ui_live() {
     let dir = fresh_config_dir("undo");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
 

@@ -6,11 +6,13 @@
 //! each spawn forks a session leader and takes a controlling tty, and a
 //! fork landing between another test's `openpty` and its `exec` has
 //! failed the spawn with a garbled errno.
+//! Next to them, a source scan: every `tui_*.rs` suite that spawns goes
+//! through the shared pty harness rather than a copy of it.
 #![cfg(unix)]
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
@@ -19,6 +21,24 @@ use common::pty::Pty;
 use serial_test::serial;
 
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Spelled in halves: `binary_harness_pins.rs` counts every file whose
+/// code names the harness module as one of its importers.
+const HARNESS_IMPORT: &str = concat!("common::tui_", "harness");
+/// What a suite writes to start a process or open a pty, on its own or
+/// through the harness.
+const SPAWN_NEEDLES: [&str; 7] = [
+    "Pty",
+    "Command",
+    "spawn_tui",
+    "spawn_repl_under",
+    "spawn_binary_under",
+    "spawn_with_args",
+    "ttyless",
+];
+/// `tui_wiki_docs.rs` only reads sources and docs. `tui_cli_cold_start.rs`
+/// runs on every CI leg, Windows included, and the harness is unix-only.
+const HARNESS_EXEMPT: [&str; 2] = ["tui_cli_cold_start.rs", "tui_wiki_docs.rs"];
 
 struct TempDirGuard(PathBuf);
 
@@ -118,4 +138,82 @@ fn the_pty_pair_is_close_on_exec_on_both_sides() {
         "the master lost FD_CLOEXEC across the spawn"
     );
     pty.wait_for("spawned-ok", PTY_DEADLINE).unwrap();
+}
+
+/// The `tui_*.rs` suites directly under `tests/`; the harness itself,
+/// under `tests/common/`, is the one place that spawns for them.
+fn tui_suites(tests_dir: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(tests_dir)
+        .expect("tests dir is readable")
+        .map(|entry| entry.expect("tests dir entry").path())
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "rs")
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("tui_"))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+/// The source without its comment lines, so a doc comment naming the
+/// harness or a spawn is neither an import nor a spawn.
+fn code_only(source: &str) -> String {
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Every `tui_*.rs` suite that starts a process or opens a pty imports
+/// the shared harness, so it cannot carry a private copy of the spawn
+/// that pins the config and cache dirs. The count of importers is checked
+/// against the suites found, so a scan that matched nothing cannot pass.
+/// It runs serially as well: the files it opens would shift the descriptor
+/// numbers the fd-leak case relies on.
+#[test]
+#[serial]
+fn every_spawning_tui_suite_imports_the_shared_harness() {
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut suites = Vec::new();
+    let mut harness_users = Vec::new();
+    let mut unharnessed = Vec::new();
+    for path in tui_suites(&tests_dir) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let code = code_only(&read(&path));
+        if code.contains(HARNESS_IMPORT) {
+            harness_users.push(name.clone());
+        } else if !HARNESS_EXEMPT.contains(&name.as_str())
+            && SPAWN_NEEDLES.iter().any(|needle| code.contains(needle))
+        {
+            unharnessed.push(name.clone());
+        }
+        suites.push(name);
+    }
+    assert!(
+        unharnessed.is_empty(),
+        "these suites spawn without importing the shared harness: {unharnessed:?}"
+    );
+    let exempt: Vec<&String> = suites
+        .iter()
+        .filter(|name| HARNESS_EXEMPT.contains(&name.as_str()))
+        .collect();
+    assert_eq!(
+        exempt.len(),
+        HARNESS_EXEMPT.len(),
+        "an exempt suite is gone from tests/: found {exempt:?} of {HARNESS_EXEMPT:?}"
+    );
+    assert!(
+        !suites.is_empty() && harness_users.len() >= suites.len() - exempt.len(),
+        "{} harness users among {} suites, {} of them exempt\nusers: {harness_users:?}\nsuites: {suites:?}",
+        harness_users.len(),
+        suites.len(),
+        exempt.len()
+    );
 }

@@ -10,129 +10,13 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::time::{Duration, Instant};
+use std::{env, fs, iter};
 
 use common::fake_llm::{Chunk, FakeLlm, Reply};
-use common::pty::{Pty, strip_ansi};
+use common::pty::Pty;
+use common::tui_harness::*;
 use serial_test::serial;
-
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys on a modal count only once both the last keystroke and the
-/// modal's appearance are at least a second old; 1200 ms settles both.
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-const ENTER_ALT: &[u8] = b"\x1b[?1049h";
-const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
-const PASTE_ON: &[u8] = b"\x1b[?2004h";
-const PASTE_OFF: &[u8] = b"\x1b[?2004l";
-
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-const WAIT_WRAPPER: &str =
-    "'{coyote}'{args} <{stdin} & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-/// The user's shell shape: the binary is the foreground job; when it
-/// stops the wrapper reports what it sees and resumes it with `fg` after
-/// a second. A non-interactive bash 3.2 (macOS's `/bin/bash`) never sees
-/// its foreground job stop, so under bash 3 the wrapper first re-runs
-/// itself as an interactive shell.
-const JOB_CONTROL_WRAPPER: &str = "if [ \"${BASH_VERSINFO[0]}\" -lt 4 ] && [ -z \"${_JOB_CONTROL_SHELL:-}\" ]; then \
-     export _JOB_CONTROL_SHELL=1; exec bash --norc --noprofile -i -c \"$BASH_EXECUTION_STRING\"; fi; \
-     set -m; '{coyote}'{args} <{stdin}; rc=$?; \
-     while [ -n \"$(jobs -s)\" ]; do echo; echo job-stopped; \
-     echo \"stopped-tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo stopped-probe-done; \
-     sleep 1; fg %1; rc=$?; done; {report}";
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-tui-corners-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    fs::create_dir_all(dir.join("sessions")).unwrap();
-    dir
-}
-
-fn write_dry_run_config(dir: &Path) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
-
-/// The fake-LLM config, prompt-free on every exit path.
-fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: fake:fake-model\n\
-             function_calling_support: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai-compatible\n\
-             \x20   name: fake\n\
-             \x20   api_base: '{api_base}'\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: fake-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-            api_base = fake.api_base(),
-        ),
-    )
-    .unwrap();
-}
-
-/// Drops one bash tool into the config's `functions/tools` dir; the binary
-/// builds its shim on startup. No `set -e`: the fixture `tput` on PATH
-/// exits 1 for everything but `cols`/`lines`.
-fn write_tool(dir: &Path, file: &str, body: &str) {
-    let tools = dir.join("functions").join("tools");
-    fs::create_dir_all(&tools).unwrap();
-    fs::write(tools.join(file), body).unwrap();
-}
 
 /// Asks one yes/no question through the prompt protocol, records its
 /// own pid at `<out>.pid` first and the answer at `<out>` afterwards.
@@ -155,77 +39,21 @@ const RECORDING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   echo \"fixture confirm: ${v:-cancelled} m6r\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    spawn_tui_under(dir, extra_env, WAIT_WRAPPER)
-}
-
-fn spawn_tui_under(dir: &Path, extra_env: &[(&str, &str)], wrapper: &str) -> Pty {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    let path = env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap();
-    spawn_tui_with_path(dir, extra_env, wrapper, &path)
-}
-
-/// Like `spawn_tui_under`, with `path` as the child's whole PATH.
+/// Like [`spawn_tui_under_wrapper`], with `path` as the child's whole
+/// PATH.
 fn spawn_tui_with_path(
     dir: &Path,
     extra_env: &[(&str, &str)],
     wrapper: &str,
     path: &std::ffi::OsStr,
 ) -> Pty {
-    let home = dir.join("home");
-    let mut cmd = Command::new("bash");
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.arg("-c")
-        .arg(
-            wrapper
-                .replace("{coyote}", built_binary().to_str().unwrap())
-                .replace("{args}", " --tui")
-                .replace("{stdin}", "/dev/tty")
-                .replace("{report}", TTY_REPORT),
-        )
-        .current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", &home)
-        .env("TERM", "xterm-256color")
-        .env("PATH", path)
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR")
-        .envs(extra_env.iter().copied());
-    Pty::spawn(cmd).unwrap()
-}
-
-fn assert_tty_restored(transcript: &str) {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
-        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
+    let path = path.to_str().unwrap();
+    let env: Vec<(&str, &str)> = extra_env
+        .iter()
+        .copied()
+        .chain(iter::once(("PATH", path)))
         .collect();
-    for flag in ["echo", "icanon", "isig", "opost"] {
-        assert!(
-            tokens.contains(&flag),
-            "stty did not report {flag} after the UI left:\n{transcript}"
-        );
-        let off = format!("-{flag}");
-        assert!(
-            !tokens.contains(&off.as_str()),
-            "the terminal was left with {flag} off:\n{transcript}"
-        );
-    }
+    spawn_tui_under(dir, &env, wrapper, "/dev/tty")
 }
 
 /// Every entry into the alternate screen has exactly one matching exit:
@@ -239,132 +67,8 @@ fn assert_alt_screen_mirrored(pty: &Pty, transcript: &str) {
     );
 }
 
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn child_pid(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("cpid="))
-        .unwrap_or_else(|| panic!("no cpid= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    let from = from.min(haystack.len());
-    haystack[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|at| from + at)
-}
-
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
-        .windows(needle.len())
-        .filter(|w| *w == needle)
-        .count()
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn since(pty: &Pty, from: usize) -> String {
-    strip_ansi(&String::from_utf8_lossy(
-        &pty.raw()[from.min(pty.raw().len())..],
-    ))
-}
-
-fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    let wanted = squeezed(marker);
-    loop {
-        pty.read_for(Duration::from_millis(200));
-        let text = since(pty, from);
-        if squeezed(&text).contains(&wanted) {
-            return text;
-        }
-        assert!(Instant::now() < deadline, "{what} never appeared:\n{text}");
-    }
-}
-
-fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
-    let deadline = Instant::now() + PTY_DEADLINE;
-    while !path.exists() {
-        let text = pty.read_for(Duration::from_millis(100));
-        assert!(
-            Instant::now() < deadline,
-            "{what} ({}) never appeared:\n{}",
-            path.display(),
-            text
-        );
-    }
-}
-
-fn process_alive(pid: i32) -> bool {
-    // SAFETY: kill with signal 0 touches no memory; it only checks the pid.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
 fn pid_in(path: &Path) -> i32 {
     fs::read_to_string(path).unwrap().trim().parse().unwrap()
-}
-
-/// Drives Ctrl-Z under the job-control wrapper up to the point where the
-/// shell has the terminal back: alternate screen and bracketed paste gone
-/// before the shell spoke, cooked tty. Returns the raw offset of the
-/// shell's `job-stopped` line.
-fn suspend_and_check_handback(pty: &mut Pty, before_suspend: usize) -> usize {
-    pty.send(b"\x1a").unwrap();
-    let stopped = pty
-        .wait_for("stopped-probe-done", PTY_DEADLINE)
-        .expect("Ctrl-Z did not stop the job (the shell never regained the terminal)");
-    let left_at = find(pty.raw(), LEAVE_ALT, before_suspend)
-        .unwrap_or_else(|| panic!("Ctrl-Z stopped the job without leaving the alternate screen"));
-    let stopped_marker = find(pty.raw(), b"job-stopped", before_suspend).unwrap();
-    assert!(
-        left_at < stopped_marker,
-        "the alternate screen was left only after the shell regained the terminal"
-    );
-    assert!(
-        find(pty.raw(), PASTE_OFF, before_suspend).is_some_and(|off| off < stopped_marker),
-        "bracketed paste was still enabled when the shell got the terminal back"
-    );
-    let flags = stopped
-        .lines()
-        .find_map(|line| line.strip_prefix("stopped-tty-flags: "))
-        .unwrap();
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .collect();
-    for flag in ["echo", "icanon"] {
-        assert!(
-            tokens.contains(&flag),
-            "the suspended UI left the shell with {flag} off:\n{stopped}"
-        );
-    }
-    stopped_marker
-}
-
-/// Waits for the alternate screen to be re-entered after `from` and gives
-/// raw mode the moment it needs to be re-applied before any key is sent.
-fn wait_for_re_entry(pty: &mut Pty, from: usize) -> usize {
-    let re_entered = pty
-        .wait_for_raw(ENTER_ALT, from, PTY_DEADLINE)
-        .expect("the alternate screen was not re-entered");
-    pty.wait_for_raw(PASTE_ON, re_entered, PTY_DEADLINE)
-        .expect("bracketed paste was not re-enabled on re-entry");
-    pty.read_for(Duration::from_millis(300));
-    re_entered
 }
 
 /// The screen the UI comes back to shows its chrome again: the model and
@@ -438,7 +142,7 @@ fn ctrl_z_under_a_tools_confirm_modal_hands_the_terminal_back_and_fg_redraws_the
     let dir = fresh_config_dir("ctrl-z-confirm");
     let _guard = TempDirGuard(dir.clone());
     let fake = confirm_fixture(&dir);
-    let mut pty = spawn_tui_under(&dir, &[], JOB_CONTROL_WRAPPER);
+    let mut pty = spawn_tui_under_wrapper(&dir, &[], JOB_CONTROL_WRAPPER);
 
     let out = open_confirm_modal(&mut pty, &dir);
     pty.read_for(Duration::from_millis(300));
@@ -503,10 +207,7 @@ fn two_sigterms_under_a_tools_confirm_modal_leave_once_and_take_the_tool_along()
 
     let out = open_confirm_modal(&mut pty, &dir);
     let tool_pid = pid_in(&out.with_extension("pid"));
-    assert!(
-        process_alive(tool_pid),
-        "the tool was gone before the signal"
-    );
+    assert!(alive(tool_pid), "the tool was gone before the signal");
     let pid = child_pid(&since(&pty, 0));
     pty.read_for(Duration::from_millis(300));
     let signalled = Instant::now();
@@ -536,11 +237,11 @@ fn two_sigterms_under_a_tools_confirm_modal_leave_once_and_take_the_tool_along()
         "the teardown under a blocked prompt panicked:\n{transcript}"
     );
     let deadline = Instant::now() + Duration::from_secs(5);
-    while process_alive(tool_pid) && Instant::now() < deadline {
+    while alive(tool_pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        !process_alive(tool_pid),
+        !alive(tool_pid),
         "the tool blocked on its confirm question outlived the UI (pid {tool_pid}):\n{transcript}"
     );
 }
@@ -722,7 +423,7 @@ fn assert_back_with_draft_and_quit(mut pty: Pty, re_entered: usize, draft: &str,
 fn an_editor_that_exits_non_zero_brings_the_draft_back_and_the_ui_stays_live() {
     let dir = fresh_config_dir("editor-fails");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let editor = script(&dir, "failing-editor.sh", "#!/bin/sh\nexit 3\n");
     let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
 
@@ -765,7 +466,7 @@ fn path_without_an_editor(dir: &Path) -> std::ffi::OsString {
 fn ctrl_o_without_any_resolvable_editor_refuses_on_screen_and_keeps_the_draft() {
     let dir = fresh_config_dir("editor-missing");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let editor = dir.join("no-such-editor-m6e").to_str().unwrap().to_string();
     let path = path_without_an_editor(&dir);
     let mut pty = spawn_tui_with_path(
@@ -806,7 +507,7 @@ fn ctrl_o_without_any_resolvable_editor_refuses_on_screen_and_keeps_the_draft() 
 fn an_editor_killed_by_a_signal_brings_the_draft_back_and_the_ui_stays_live() {
     let dir = fresh_config_dir("editor-killed");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let editor = script(&dir, "self-killing-editor.sh", "#!/bin/sh\nkill -KILL $$\n");
     let mut pty = spawn_tui(&dir, &[("EDITOR", &editor), ("VISUAL", &editor)]);
 

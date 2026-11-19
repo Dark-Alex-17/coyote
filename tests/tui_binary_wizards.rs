@@ -437,12 +437,6 @@ fn esc_on_the_uninstall_modified_file_select_modal_keeps_the_file_and_says_so() 
     assert_ui_alive_then_quit(&mut pty, "the cancelled modified-file question");
 }
 
-/// Whether `pid` still exists (signal 0 is checked, not delivered).
-fn process_alive(pid: i32) -> bool {
-    // SAFETY: kill with signal 0 touches no memory; it only checks the pid.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
 /// Reads the pid a loader fixture wrote next to its input.
 fn loader_pid(path: &Path) -> i32 {
     fs::read_to_string(path).unwrap().trim().parse().unwrap()
@@ -514,7 +508,7 @@ fn esc_interrupts_a_slow_loader(scenario: &str, file_branch: bool) {
         .unwrap();
     wait_for_file(&mut pty, &pid_file, "the slow loader's pid file");
     let pid = loader_pid(&pid_file);
-    assert!(process_alive(pid), "the loader exited before Esc");
+    assert!(alive(pid), "the loader exited before Esc");
     pty.read_for(Duration::from_millis(500));
     let pressed_at = pty.raw().len();
     let pressed = std::time::Instant::now();
@@ -525,7 +519,7 @@ fn esc_interrupts_a_slow_loader(scenario: &str, file_branch: bool) {
     let deadline = pressed + Duration::from_secs(8);
     while (gone_after.is_none() || ended_after.is_none()) && std::time::Instant::now() < deadline {
         pty.read_for(Duration::from_millis(100));
-        if gone_after.is_none() && !process_alive(pid) {
+        if gone_after.is_none() && !alive(pid) {
             gone_after = Some(pressed.elapsed());
         }
         if ended_after.is_none() {

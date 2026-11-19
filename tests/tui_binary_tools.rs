@@ -2222,60 +2222,6 @@ fn the_pager_finds_a_line_and_tab_lists_the_root_thread() {
     assert_tty_restored(&transcript);
 }
 
-/// A tool that records its pid at `pid_file` and then becomes a sleep far
-/// longer than a test runs, so the recorded pid is the sleeper's.
-fn sleeping_tool(pid_file: &Path) -> String {
-    format!(
-        "#!/usr/bin/env bash\n\
-         \n\
-         # @describe Sleep for a long time.\n\
-         \n\
-         # @env LLM_OUTPUT=/dev/stdout The output path\n\
-         \n\
-         main() {{\n\
-         \x20   echo $$ > \"{}\"\n\
-         \x20   exec sleep 300\n\
-         }}\n",
-        pid_file.display()
-    )
-}
-
-fn alive(pid: i32) -> bool {
-    // SAFETY: kill with signal 0 only checks the pid and touches no memory.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
-/// Whether `pid` is still a `sleep`; a recorded pid that has exited may
-/// since belong to some other process.
-fn still_sleeping(pid: i32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .is_ok_and(|out| {
-            let comm = String::from_utf8_lossy(&out.stdout);
-            Path::new(comm.trim()).file_name() == Some("sleep".as_ref())
-        })
-}
-
-/// Kills the recorded sleepers when the test ends, so a failed assertion
-/// does not leave them running for five minutes.
-struct Sleepers(Vec<PathBuf>);
-
-impl Drop for Sleepers {
-    fn drop(&mut self) {
-        for file in &self.0 {
-            if let Some(pid) = fs::read_to_string(file)
-                .ok()
-                .and_then(|text| text.trim().parse::<i32>().ok())
-                .filter(|&pid| alive(pid) && still_sleeping(pid))
-            {
-                // SAFETY: kill takes a pid and a signal number and touches no memory.
-                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-            }
-        }
-    }
-}
-
 /// A job the model started in the background and the user left running
 /// by interrupting the turn shows on the Alt+T roster as running; `x` on its
 /// row cancels it, so its process goes away and the row stops saying

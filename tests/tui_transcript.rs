@@ -53,216 +53,25 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
 
 use common::fake_llm::{Chunk, FakeLlm, HOLD_LIMIT, Reply};
 use common::pty::{Pty, strip_ansi};
+use common::tui_harness::*;
 use serial_test::serial;
 
-/// Covers the keyboard-enhancement probe, which waits two seconds for an
-/// answer a pseudo-terminal never gives.
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys count only once the last keystroke is at least HOTKEY_IDLE
-/// (1 s) old; 1200 ms settles it.
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-
-/// The todo panel's chord.
-const CTRL_X: &[u8] = b"\x18";
 const PAGE_UP: &[u8] = b"\x1b[5~";
 const PAGE_DOWN: &[u8] = b"\x1b[6~";
 const END: &[u8] = b"\x1b[F";
 const SHIFT_UP: &[u8] = b"\x1b[1;2A";
 const CTRL_UP: &[u8] = b"\x1b[1;5A";
-const ESC: &[u8] = b"\x1b";
 const CTRL_L: &[u8] = b"\x0c";
-const CTRL_D: &[u8] = b"\x04";
-const CTRL_C: &[u8] = b"\x03";
 /// One SGR-encoded wheel-up notch at column 50, row 5.
 const WHEEL_UP: &[u8] = b"\x1b[<64;50;5M";
 
 const CHIP: &str = "End=follow";
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-tui-transcript-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    dir
-}
-
-/// A model-free config: a dry-run model, streaming on, nothing that could
-/// prompt on exit.
-fn write_dry_run_config(dir: &Path) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
-
-/// The dry-run config with its only client pointed at `fake` instead, so
-/// a turn is answered by the scripted endpoint and recorded in the session.
-fn write_fake_llm_config(dir: &Path, fake: &FakeLlm) {
-    write_fake_llm_config_with(dir, fake, "");
-}
-
-/// [`write_fake_llm_config`] with `extra` top-level YAML lines appended
-/// (each line newline-terminated).
-fn write_fake_llm_config_with(dir: &Path, fake: &FakeLlm, extra: &str) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: fake:fake-model\n\
-             function_calling_support: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai-compatible\n\
-             \x20   name: fake\n\
-             \x20   api_base: '{api_base}'\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: fake-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n{extra}",
-            vault_pass = vault_pass.display(),
-            api_base = fake.api_base(),
-            extra = extra,
-        ),
-    )
-    .unwrap();
-}
-
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-fn fixture_path() -> std::ffi::OsString {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap()
-}
-
-/// Pins `COYOTE_CONFIG_DIR`/`COYOTE_CACHE_DIR`, strips every inherited
-/// `COYOTE_*`.
-fn base_env(cmd: &mut Command, dir: &Path) {
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", fixture_path())
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR");
-}
-
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-
-const WAIT_WRAPPER: &str =
-    "'{coyote}' --tui </dev/tty & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-
-/// The binary on a fresh pty under a bash wrapper that reports the exit
-/// code and the tty flags once it is gone.
-fn spawn_tui(dir: &Path, extra_env: &[(&str, &str)]) -> Pty {
-    let mut cmd = Command::new("bash");
-    base_env(&mut cmd, dir);
-    for (key, value) in extra_env {
-        cmd.env(key, value);
-    }
-    cmd.arg("-c").arg(
-        WAIT_WRAPPER
-            .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{report}", TTY_REPORT),
-    );
-    Pty::spawn(cmd).unwrap()
-}
-
-fn assert_tty_restored(transcript: &str) {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
-        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .collect();
-    for flag in ["echo", "icanon", "isig", "opost"] {
-        assert!(
-            tokens.contains(&flag),
-            "stty did not report {flag} after the UI left:\n{transcript}"
-        );
-        let off = format!("-{flag}");
-        assert!(
-            !tokens.contains(&off.as_str()),
-            "the terminal was left with {flag} off:\n{transcript}"
-        );
-    }
-}
-
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
-}
 
 /// Waits until the whitespace-squeezed screen text contains `marker` at
 /// or after raw offset `from`.
@@ -352,7 +161,7 @@ fn repaint_rows(pty: &mut Pty) -> Vec<(u16, String)> {
 fn boot(scenario: &str, extra_env: &[(&str, &str)]) -> (TempDirGuard, Pty) {
     let dir = fresh_config_dir(scenario);
     let guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, extra_env);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -417,7 +226,7 @@ fn has_colour_sgr(raw: &[u8]) -> Option<String> {
 fn the_welcome_block_leaves_after_the_first_reply() {
     let dir = fresh_config_dir("welcome");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     let mut pty = spawn_tui(&dir, &[]);
 
     let booted = pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -1676,28 +1485,6 @@ const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \x20   echo \"fixture slept p3t\" >> \"$LLM_OUTPUT\"\n\
     }\n";
 
-/// Drops one bash tool into the config's `functions/tools` dir; the binary
-/// builds its shim on startup.
-fn write_tool(dir: &Path, file: &str, body: &str) {
-    let tools = dir.join("functions").join("tools");
-    fs::create_dir_all(&tools).unwrap();
-    fs::write(tools.join(file), body).unwrap();
-}
-
-/// Pumps the pty until `path` exists, so the child's output never backs up
-/// while the test waits on a side effect.
-fn wait_for_file(pty: &mut Pty, path: &Path, what: &str) {
-    let deadline = std::time::Instant::now() + PTY_DEADLINE;
-    while !path.exists() {
-        let text = pty.read_for(Duration::from_millis(100));
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{what} ({}) never appeared:\n{text}",
-            path.display()
-        );
-    }
-}
-
 // ---------------------------------------------------------------------
 // A tool call is one cell: its start and end events land in the same
 // row. Observable from the outside: while the tool runs its cell names
@@ -2244,24 +2031,6 @@ fn esc_with_a_focused_row_interrupts_the_running_turn_first() {
 // there to answer afterwards.
 // ---------------------------------------------------------------------
 
-const CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
-    \n\
-    # @describe Ask the user before continuing and record the answer.\n\
-    # @option --out! Where to write the answer.\n\
-    \n\
-    # @env LLM_OUTPUT=/dev/stdout The output path\n\
-    \n\
-    # shellcheck disable=SC1090\n\
-    source \"$LLM_PROMPT_UTILS_FILE\"\n\
-    \n\
-    main() {\n\
-    \x20   local out v\n\
-    \x20   out=\"$(jq -r '.out' <<< \"$LLM_TOOL_RAW_JSON\")\"\n\
-    \x20   v=\"$(confirm \"Really do it? q9d-q\")\"\n\
-    \x20   printf '%s' \"${v:-cancelled}\" > \"$out\"\n\
-    \x20   echo \"fixture confirm: ${v:-cancelled} q9d-r\" >> \"$LLM_OUTPUT\"\n\
-    }\n";
-
 #[test]
 #[serial]
 fn view_keys_work_under_a_tools_confirm_modal() {
@@ -2278,7 +2047,7 @@ fn view_keys_work_under_a_tools_confirm_modal() {
     replies.push(Reply::Text("fixture done z2v".to_string()));
     let fake = FakeLlm::start(replies);
     write_fake_llm_config(&dir, &fake);
-    write_tool(&dir, "fixture_confirm_rec.sh", CONFIRM_TOOL);
+    write_tool(&dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -2383,7 +2152,7 @@ fn write_agent_needing_a_variable(dir: &Path, name: &str) {
 fn view_keys_work_under_the_input_modal() {
     let dir = fresh_config_dir("input-view-keys");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
+    write_dry_run_config_with(&dir, "");
     write_agent_needing_a_variable(&dir, "vars-agent-g4r");
     let mut pty = spawn_tui(&dir, &[]);
     pty.wait_for("no session", PTY_DEADLINE).unwrap();

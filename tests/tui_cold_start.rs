@@ -9,178 +9,15 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::{env, fs, iter, process};
+use std::path::Path;
+use std::time::Duration;
 
 use common::pty::{Pty, strip_ansi};
+use common::tui_harness::*;
 use serial_test::serial;
 
-/// Covers the keyboard-enhancement probe, which waits two seconds for an
-/// answer a pseudo-terminal never gives.
-const PTY_DEADLINE: Duration = Duration::from_secs(20);
-/// Hotkeys on a modal count only once both the last keystroke and the
-/// modal's appearance are at least HOTKEY_IDLE (1 s) old; 1200 ms settles
-/// both.
-const HOTKEY_GAP: Duration = Duration::from_millis(1200);
-
-const ENTER_ALT: &[u8] = b"\x1b[?1049h";
-const LEAVE_ALT: &[u8] = b"\x1b[?1049l";
-
-struct TempDirGuard(PathBuf);
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fresh_config_dir(scenario: &str) -> PathBuf {
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = env::temp_dir().join(format!(
-        "coyote-tui-cold-start-{scenario}-{}-{unique}-{sequence}",
-        process::id()
-    ));
-    fs::create_dir_all(dir.join("home")).unwrap();
-    dir
-}
-
-/// A model-free config: a dry-run model, streaming on, nothing that could
-/// prompt on exit.
-fn write_dry_run_config(dir: &Path) {
-    let vault_pass = dir.join("vault-pass");
-    fs::write(&vault_pass, "test-password\n").unwrap();
-    fs::write(
-        dir.join("config.yaml"),
-        format!(
-            "model: dryrun:dry-model\n\
-             dry_run: true\n\
-             stream: true\n\
-             save_session: false\n\
-             vault_password_file: '{vault_pass}'\n\
-             clients:\n\
-             \x20 - type: openai\n\
-             \x20   name: dryrun\n\
-             \x20   auth: none\n\
-             \x20   api_key: 'unused'\n\
-             \x20   models:\n\
-             \x20     - name: dry-model\n\
-             \x20       max_input_tokens: 100000\n\
-             \x20       supports_function_calling: true\n\
-             workspace_instructions: false\n\
-             memory: false\n",
-            vault_pass = vault_pass.display(),
-        ),
-    )
-    .unwrap();
-}
-
-fn built_binary() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_coyote"))
-}
-
-fn fixture_path() -> std::ffi::OsString {
-    let fixture_bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin");
-    env::join_paths(
-        iter::once(fixture_bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .unwrap()
-}
-
-/// Pins `COYOTE_CONFIG_DIR`/`COYOTE_CACHE_DIR`, strips every inherited
-/// `COYOTE_*`.
-fn base_env(cmd: &mut Command, dir: &Path) {
-    for (key, _) in env::vars_os() {
-        if key.to_string_lossy().starts_with("COYOTE_") {
-            cmd.env_remove(&key);
-        }
-    }
-    cmd.current_dir(dir)
-        .env("COYOTE_CONFIG_DIR", dir)
-        .env("COYOTE_CACHE_DIR", dir.join("cache"))
-        .env("HOME", dir.join("home"))
-        .env("TERM", "xterm-256color")
-        .env("PATH", fixture_path())
-        .env_remove("IS_SANDBOX")
-        .env_remove("COLORTERM")
-        .env_remove("NO_COLOR");
-}
-
-const TTY_REPORT: &str = "echo; echo \"exit=$rc\"; \
-     echo \"tty-flags: $(stty -a </dev/tty | tr -s '\\n\\t' '  ')\"; echo tty-probe-done";
-
-const WAIT_WRAPPER: &str =
-    "'{coyote}' --tui </dev/tty & cpid=$!; echo \"cpid=$cpid\"; wait $cpid; rc=$?; {report}";
-
-/// The binary on a fresh pty under a bash wrapper that reports the exit
-/// code and the tty flags once it is gone.
-fn spawn_tui(dir: &Path) -> Pty {
-    let mut cmd = Command::new("bash");
-    base_env(&mut cmd, dir);
-    cmd.arg("-c").arg(
-        WAIT_WRAPPER
-            .replace("{coyote}", built_binary().to_str().unwrap())
-            .replace("{report}", TTY_REPORT),
-    );
-    Pty::spawn(cmd).unwrap()
-}
-
-fn assert_tty_restored(transcript: &str) {
-    let flags = transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("tty-flags: "))
-        .unwrap_or_else(|| panic!("no tty-flags line in the transcript:\n{transcript}"));
-    let tokens: Vec<&str> = flags
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .collect();
-    for flag in ["echo", "icanon", "isig", "opost"] {
-        assert!(
-            tokens.contains(&flag),
-            "stty did not report {flag} after the UI left:\n{transcript}"
-        );
-        let off = format!("-{flag}");
-        assert!(
-            !tokens.contains(&off.as_str()),
-            "the terminal was left with {flag} off:\n{transcript}"
-        );
-    }
-}
-
-fn exit_code(transcript: &str) -> i32 {
-    transcript
-        .lines()
-        .find_map(|line| line.strip_prefix("exit="))
-        .unwrap_or_else(|| panic!("no exit= line in the transcript:\n{transcript}"))
-        .trim()
-        .parse()
-        .unwrap()
-}
-
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    haystack[from.min(haystack.len())..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|at| from + at)
-}
-
-fn count(haystack: &[u8], needle: &[u8]) -> usize {
-    let mut n = 0;
-    let mut from = 0;
-    while let Some(at) = find(haystack, needle, from) {
-        n += 1;
-        from = at + needle.len();
-    }
-    n
-}
-
-fn squeezed(text: &str) -> String {
-    text.chars().filter(|c| !c.is_whitespace()).collect()
+fn spawn_tui_bare(dir: &Path) -> Pty {
+    spawn_tui(dir, &[])
 }
 
 /// Waits until the whitespace-squeezed screen text contains `marker` at
@@ -252,8 +89,8 @@ fn quit_and_check(mut pty: Pty, what: &str) -> String {
 fn malformed_input_bytes_neither_panic_the_ui_nor_leave_it_deaf() {
     let dir = fresh_config_dir("garbage");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir);
+    write_dry_run_config_with(&dir, "");
+    let mut pty = spawn_tui_bare(&dir);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -303,8 +140,8 @@ fn malformed_input_bytes_neither_panic_the_ui_nor_leave_it_deaf() {
 fn wide_graphemes_typed_into_the_composer_come_back_in_the_rendered_reply() {
     let dir = fresh_config_dir("wide");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir);
+    write_dry_run_config_with(&dir, "");
+    let mut pty = spawn_tui_bare(&dir);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -336,8 +173,8 @@ fn wide_graphemes_typed_into_the_composer_come_back_in_the_rendered_reply() {
 fn a_draft_longer_than_the_row_submits_and_its_reply_renders() {
     let dir = fresh_config_dir("long-draft");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir);
+    write_dry_run_config_with(&dir, "");
+    let mut pty = spawn_tui_bare(&dir);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -375,8 +212,8 @@ fn a_draft_longer_than_the_row_submits_and_its_reply_renders() {
 fn two_dot_info_turns_yield_two_tables_and_the_ui_stays_live() {
     let dir = fresh_config_dir("info-twice");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir);
+    write_dry_run_config_with(&dir, "");
+    let mut pty = spawn_tui_bare(&dir);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -418,8 +255,8 @@ fn two_dot_info_turns_yield_two_tables_and_the_ui_stays_live() {
 fn a_burst_of_resizes_leaves_the_ui_live_and_painted_once_per_size_at_most() {
     let dir = fresh_config_dir("resize-burst");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir);
+    write_dry_run_config_with(&dir, "");
+    let mut pty = spawn_tui_bare(&dir);
 
     pty.wait_for("no session", PTY_DEADLINE).unwrap();
     pty.read_for(Duration::from_millis(300));
@@ -473,8 +310,8 @@ fn a_burst_of_resizes_leaves_the_ui_live_and_painted_once_per_size_at_most() {
 fn a_cold_start_on_a_tiny_terminal_comes_up_and_leaves_clean() {
     let dir = fresh_config_dir("tiny-start");
     let _guard = TempDirGuard(dir.clone());
-    write_dry_run_config(&dir);
-    let mut pty = spawn_tui(&dir);
+    write_dry_run_config_with(&dir, "");
+    let mut pty = spawn_tui_bare(&dir);
     // Shrink before the first frame: startup probes the keyboard for two
     // seconds, so the resize lands well before anything is drawn.
     pty.resize(4, 20).unwrap();
