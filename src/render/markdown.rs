@@ -34,6 +34,8 @@ static HRULE_RE: LazyLock<Regex> =
 static TABLE_SEPARATOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*\|(\s*:?-+:?\s*\|)+\s*$").unwrap());
 static TABLE_ROW_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*\|.*\|\s*$").unwrap());
+static TABLE_CELL_BREAK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(`[^`\n]+`)|<br\s*/?>").unwrap());
 
 static INLINE_CODE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]+)`").unwrap());
 static IMAGE_RE: LazyLock<Regex> =
@@ -119,6 +121,31 @@ fn parse_table_row(line: &str) -> Vec<String> {
         cells.push(current);
     }
     cells.into_iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// Splits a table cell on HTML line breaks (`<br>`, `<br/>`, `<br />`), leaving
+/// any that appear inside inline code spans untouched.
+fn split_cell_lines(cell: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for caps in TABLE_CELL_BREAK_RE.captures_iter(cell).flatten() {
+        if caps.get(1).is_some() {
+            continue;
+        }
+        let Some(br) = caps.get(0) else { continue };
+        lines.push(cell[line_start..br.start()].trim());
+        line_start = br.end();
+    }
+    lines.push(cell[line_start..].trim());
+    lines
+}
+
+fn style_cell(cell: &str, style_line: impl Fn(&str) -> String) -> String {
+    split_cell_lines(cell)
+        .into_iter()
+        .map(style_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn parse_alignments(separator_row: &str) -> Vec<CellAlignment> {
@@ -856,7 +883,11 @@ impl MarkdownRender {
         let (heading_color, _) = self.styles.heading;
         let styled_header: Vec<String> = header
             .iter()
-            .map(|c| apply_base_style(&apply_inline(c, &self.styles), heading_color, true))
+            .map(|c| {
+                style_cell(c, |line| {
+                    apply_base_style(&apply_inline(line, &self.styles), heading_color, true)
+                })
+            })
             .collect();
         table.set_header(styled_header);
 
@@ -867,8 +898,10 @@ impl MarkdownRender {
         }
 
         for row in rows {
-            let styled_row: Vec<String> =
-                row.iter().map(|c| apply_inline(c, &self.styles)).collect();
+            let styled_row: Vec<String> = row
+                .iter()
+                .map(|c| style_cell(c, |line| apply_inline(line, &self.styles)))
+                .collect();
             table.add_row(styled_row);
         }
 
@@ -1797,6 +1830,68 @@ std::error::Error>> {
         assert!(
             output.starts_with("\x1b["),
             "output starts with border color SGR: {output:?}",
+        );
+    }
+
+    #[test]
+    fn split_cell_lines_breaks_on_br_variants() {
+        assert_eq!(
+            split_cell_lines("a<br>b<br/>c<br />d<BR>e"),
+            vec!["a", "b", "c", "d", "e"]
+        );
+        assert_eq!(split_cell_lines("no breaks"), vec!["no breaks"]);
+        assert_eq!(split_cell_lines("a <br> b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn split_cell_lines_keeps_br_inside_code_spans() {
+        assert_eq!(
+            split_cell_lines("use `<br>` here<br>next"),
+            vec!["use `<br>` here", "next"]
+        );
+    }
+
+    #[test]
+    fn render_table_splits_br_into_separate_lines() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["Field".into(), "Value".into()];
+        let alignments = vec![CellAlignment::Left, CellAlignment::Left];
+        let rows = vec![vec!["Repos".into(), "first<br>**second**<br/>third".into()]];
+
+        let output = strip_ansi(&render.render_table(header, alignments, rows));
+
+        assert!(!output.contains("<br"), "no literal br tags: {output:?}");
+        let line_with = |needle: &str| {
+            output
+                .lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} in output: {output:?}"))
+        };
+        let (first, second, third) = (line_with("first"), line_with("second"), line_with("third"));
+        assert_eq!(second, first + 1, "second on next line: {output:?}");
+        assert_eq!(third, second + 1, "third on next line: {output:?}");
+        assert!(
+            !output.contains("**second**"),
+            "inline style applied: {output:?}"
+        );
+    }
+
+    #[test]
+    fn render_table_header_cell_with_br_is_multiline() {
+        let options = RenderOptions::default();
+        let render = MarkdownRender::init(options).unwrap();
+        let header = vec!["top<br>bottom".into()];
+        let alignments = vec![CellAlignment::Left];
+
+        let output = strip_ansi(&render.render_table(header, alignments, vec![vec!["b".into()]]));
+
+        assert!(!output.contains("<br"), "no literal br tags: {output:?}");
+        let lines: Vec<&str> = output.lines().collect();
+        let top = lines.iter().position(|l| l.contains("top")).unwrap();
+        assert!(
+            lines[top + 1].contains("bottom"),
+            "bottom on next line: {output:?}"
         );
     }
 
