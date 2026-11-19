@@ -1295,6 +1295,23 @@ fn tui_page_quotes_the_code() {
 }
 
 #[test]
+fn the_word_cut_keys_on_the_page_match_the_key_help() {
+    let keys = src(&["tui", "keys.rs"]);
+    let label = "\"Ctrl+W / Alt+Backspace\",";
+    assert!(production(&keys).contains(label), "keys.rs lost {label}");
+    assert!(
+        !production(&keys).contains("Alt+H\""),
+        "keys.rs offers Alt+H"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = flat(&read(wiki.join(PAGE)));
+    let sentence = "`Ctrl+W`, `Alt+Backspace`: cut the word before the cursor";
+    assert!(page.contains(sentence), "{PAGE} says {sentence}");
+    assert!(!page.contains("`Alt+H`"), "{PAGE} still offers Alt+H");
+}
+
+#[test]
 fn tool_prompts_are_documented_with_their_label() {
     let tui_source = src(&["tui", "mod.rs"]);
     let asks = literal_with(production(&tui_source), " asks:").replace("{}", "<tool>");

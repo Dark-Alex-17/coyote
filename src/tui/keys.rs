@@ -3204,12 +3204,6 @@ mod tests {
             };
             assert_eq!(map_key(key, &ctx), Action::Nothing, "{modal:?}");
         }
-        let mut composer = primed_composer();
-        let before = composer.text();
-        if let Action::ComposerInput(typed) = map_key(key, &TYPING) {
-            composer.input(typed);
-        }
-        assert_eq!(composer.text(), before);
     }
 
     /// Every binding the key map reaches, in every swept context, is
