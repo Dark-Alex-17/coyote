@@ -1391,7 +1391,8 @@ pub(crate) fn parse_request(
             question: escape_display_text(&wire.question),
             options: raw_options
                 .iter()
-                .map(|option| escape_display_text(option))
+                // An option is one row, so its newlines are spelled out too.
+                .map(|option| escape_display_text(option).replace('\n', "\\x0a"))
                 .collect(),
             default: wire.default,
             tool: Some(tool.to_string()),
@@ -1986,7 +1987,7 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
     fn parse_request_shows_terminal_escapes_in_tool_text_visibly() {
         let line = json!({"coyote_prompt": {
             "id": "p1", "action": "select", "question": "\u{1b}[2Jwhich?",
-            "options": ["\u{1b}[31ma", "b"]
+            "options": ["\u{1b}[31ma", "b", "keep\n  delete all"]
         }})
         .to_string();
 
@@ -1994,8 +1995,14 @@ ans="$(password "Secret? rt-x7x")"; echo "$ans" >> "$LLM_OUTPUT""#,
 
         assert_eq!(parsed.req.question, "\\x1b[2Jwhich?");
         assert_eq!(parsed.req.raw_question.as_deref(), Some("\u{1b}[2Jwhich?"));
-        assert_eq!(parsed.req.options, vec!["\\x1b[31ma", "b"]);
-        assert_eq!(parsed.raw_options, vec!["\u{1b}[31ma", "b"]);
+        assert_eq!(
+            parsed.req.options,
+            vec!["\\x1b[31ma", "b", "keep\\x0a  delete all"]
+        );
+        assert_eq!(
+            parsed.raw_options,
+            vec!["\u{1b}[31ma", "b", "keep\n  delete all"]
+        );
     }
 
     #[test]

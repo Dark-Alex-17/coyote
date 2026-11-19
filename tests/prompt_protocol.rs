@@ -111,12 +111,18 @@ fn python_confirm_without_channel_reads_the_controlling_terminal() {
 /// line under the question.
 #[test]
 fn bash_confirm_without_channel_shows_a_command_in_full() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    // The doubled sequences re-form a C1 CSI and a right-to-left override
+    // once their inner copies are stripped.
+    let question: &[u8] =
+        b"Run? sh-x7x\ntrue \\c; rm \xe2\x80\xae\xc2\xc2\x9b\x9b-rf\xc2\x85\xe2\x80\xe2\x80\xae\xae gone-x7x";
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
         .arg(format!(
             "exec </dev/null; source \"{HELPER}\"; v=\"$(confirm \"$GUARD_Q\")\"; echo \"confirm-result=$v\""
         ))
-        .env("GUARD_Q", "Run? sh-x7x\ntrue \\c; rm \u{202E}-rf\u{0085} gone-x7x")
+        .env("GUARD_Q", OsStr::from_bytes(question))
         .env_remove("COYOTE_PROMPT_REPLY")
         .env_remove("_COYOTE_PROMPT_OUT")
         .env_remove("AUTO_CONFIRM")
@@ -129,7 +135,9 @@ fn bash_confirm_without_channel_shows_a_command_in_full() {
         .expect("the command was cut short");
     assert!(shown.contains("true \\c; rm -rf gone-x7x"), "{shown}");
     assert!(
-        !shown.contains('\u{202E}') && !shown.contains('\u{0085}'),
+        ['\u{202E}', '\u{0085}', '\u{009B}']
+            .iter()
+            .all(|hidden| !shown.contains(*hidden)),
         "{shown}"
     );
     assert!(!shown.contains("sh-x7xtrue"), "{shown}");
