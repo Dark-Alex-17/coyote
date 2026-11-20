@@ -5212,7 +5212,7 @@ fn ui_comments_carry_no_planning_vocabulary() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = rust_files(&root.join("src/tui"));
     files.extend(rust_files(&root.join("tests/common")));
-    // Every UI suite: `tui_tools.rs` and each `tui_*.rs` beside it.
+    // Every UI suite: each `tui_*.rs` under `tests/`.
     let mut suites: Vec<_> = rust_files(&root.join("tests"))
         .into_iter()
         .filter(|path| {
