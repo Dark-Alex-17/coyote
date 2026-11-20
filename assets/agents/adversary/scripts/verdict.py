@@ -7,7 +7,12 @@ blocking holistic complaints, zero pipeline faults, zero blocking red
 verification runs, and zero implementation-debris hits from debris_lint.py.
 A red run (nonzero exit or timeout) blocks unless run_checks.py found the
 same failure on the diff base (baseline status "pre-existing"); those are
-reported in their own section. A command the runner's deadline skipped is
+reported in their own section. A red run whose baseline status is
+"tree-state" (it exits 0 on a snapshot of the live tree) does not block, and
+neither does one whose pass condition, recomputed from the criteria and the
+request by pass_condition.py, is stated as something other than exit 0, when
+no parsed criterion names it or every criterion naming it ends MET or
+INSPECTED; both are reported as advisory red runs. A command the runner's deadline skipped is
 reported as not run and does not block by itself: the criterion checks judge
 the criteria it covers. An ENVIRONMENT runner-error marker blocks when
 commands were declared, since the declared commands never ran.
@@ -313,12 +318,20 @@ def declared_nonempty(declared):
     return any(isinstance(c, str) and c.strip() for c in declared)
 
 
-def exec_run_complaints(exec_results, declared):
-    """One complaint per blocking red verification run recorded by run_checks.py.
+def exec_run_complaints(exec_results, declared, criteria=None, request="", verdicts=()):
+    """(complaints, advisory): one complaint per blocking red verification run
+    recorded by run_checks.py, and one report line per red run that does not block.
 
     A red run is a record that exited nonzero (including the -1 TIMEOUT
-    sentinel). It blocks unless its baseline status is "pre-existing"; the
-    complaint names the baseline outcome. A record the deadline skipped is
+    sentinel). A "pre-existing" one is reported in its own section and a
+    "tree-state" one is advisory. For the rest the pass condition is recomputed
+    from `criteria` and `request`, never read from the record, so a recorded
+    run replays the same. A red run held to exit 0 blocks and the complaint
+    names the baseline outcome. One whose pass condition a parsed criterion
+    states blocks unless every criterion naming it has a final status MET or
+    INSPECTED in `verdicts`, and is otherwise advisory with their evidence as
+    the reason; one named only in the request is advisory, left to the
+    holistic pass. A record the deadline skipped is
     not a run and yields nothing here. An "ENVIRONMENT: ..." runner-error
     marker with a non-empty declaration is one complaint: the declared
     commands never ran. Other string markers ("none declared",
@@ -327,16 +340,22 @@ def exec_run_complaints(exec_results, declared):
     if isinstance(exec_results, str):
         marker = exec_results.strip().replace("\n", " ")
         if not marker.startswith("ENVIRONMENT:") or not declared_nonempty(declared):
-            return []
+            return [], []
         if len(marker) > MAX_MARKER_CHARS:
             marker = marker[: MAX_MARKER_CHARS - 1] + "…"
         return [
             f"Verification runner error — the declared command(s) never ran ({marker}); "
             "unproven runs block CONFORMS"
-        ]
+        ], []
     if not isinstance(exec_results, list):
-        return []
+        return [], []
+    from pass_condition import STATED, resolve
+
+    by_id = {}
+    for v in verdicts:
+        by_id.setdefault(v.get("id"), v)
     out = []
+    advisory = []
     for r in exec_results:
         if not isinstance(r, dict) or r.get("skipped") or pre_existing(r):
             continue
@@ -345,16 +364,54 @@ def exec_run_complaints(exec_results, declared):
         if code == 0:
             continue
         outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
+        if baseline_status(r) == "tree-state":
+            advisory.append(f"- `{cmd}` -- {outcome} -- {baseline_text(r)}")
+            continue
+        condition = resolve(cmd, criteria, request)
+        if condition["condition"] == STATED:
+            blocks, text = stated_red(r, outcome, condition["criteria"], by_id)
+            (out if blocks else advisory).append(text)
+            continue
         out.append(
             f"Verification run `{cmd}` — {outcome} (recorded FAIL; a red declared "
             f"command that did not already fail on the diff base blocks CONFORMS; {baseline_text(r)})"
         )
-    return out
+    return out, advisory
+
+
+def stated_red(record, outcome, ids, by_id):
+    """(blocks, text) for a red run whose pass condition is stated as something other than
+    exit 0 by the parsed criteria `ids`, or only by the request when `ids` is empty."""
+    cmd = record.get("cmd", "?")
+    if not ids:
+        return False, (
+            f"- `{cmd}` -- {outcome} -- its pass condition is stated only in the request, "
+            f"judged by the holistic pass -- {baseline_text(record)}"
+        )
+    naming = [(cid, final_status(by_id.get(cid))) for cid in ids]
+    if all(status in ("MET", "INSPECTED") for _, status in naming):
+        reasons = "; ".join(f"{cid} {status}: {str_field(by_id[cid], 'evidence')}" for cid, status in naming)
+        return False, f"- `{cmd}` -- {outcome} -- {reasons} -- {baseline_text(record)}"
+    statuses = ", ".join(f"{cid} {status}" for cid, status in naming)
+    return True, (
+        f"Verification run `{cmd}` -- {outcome} (recorded FAIL; the criteria naming it state a "
+        f"pass condition other than exit 0 and are not all met: {statuses}; {baseline_text(record)})"
+    )
+
+
+def final_status(verdict):
+    if verdict is None:
+        return "no verdict"
+    return "DIED" if died(verdict) else str(verdict.get("status", "?"))
 
 
 def pre_existing(record):
+    return baseline_status(record) == "pre-existing"
+
+
+def baseline_status(record):
     baseline = record.get("baseline")
-    return isinstance(baseline, dict) and baseline.get("status") == "pre-existing"
+    return baseline.get("status") if isinstance(baseline, dict) else None
 
 
 def baseline_text(record):
@@ -480,8 +537,12 @@ def main():
             extra.append(c)
     observations = (state.get("observations") or "").strip()
     faults = collect_pipeline_faults(state) + unverified_faults(verdicts)
-    reds = exec_run_complaints(
-        state.get("exec_results"), state.get("verification_commands")
+    reds, advisory_reds = exec_run_complaints(
+        state.get("exec_results"),
+        state.get("verification_commands"),
+        state.get("criteria"),
+        state.get("initial_prompt"),
+        verdicts,
     )
     n_debris, debris_hits = debris_complaints(state)
     not_run = skipped_note(state.get("exec_results"))
@@ -624,6 +685,11 @@ def main():
         for r in old_failures:
             lines.append(f"- `{r.get('cmd', '?')}` -- exit {r.get('exit', '?')} -- {baseline_text(r)}")
             lines.extend(render_tail(r))
+
+    if advisory_reds:
+        lines.append("")
+        lines.append("Advisory red runs (not blocking):")
+        lines.extend(advisory_reds)
 
     lines.append("")
     lines.append("Verification runs:")
