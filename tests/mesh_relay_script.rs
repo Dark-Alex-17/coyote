@@ -527,6 +527,10 @@ const STALE_CONFIG: &str = "[reticulum]\n  enable_transport = no\n  share_instan
 
 const PUBLIC_DIALS_NOTE: &str = "Note: this config also dials 3 public Reticulum nodes; your announces reach them (see mesh.display_name_on_public).";
 
+/// The line a `--relay` run ends with, pointing at the config key that pins the relay's
+/// propagation node.
+const PROPAGATION_NODE_POINTER: &str = "[coyote-mesh] If that relay is also a propagation node, add its hash to mesh.propagation_nodes in config.yaml so this host files it at join; .mesh config show lists the nodes heard.\n";
+
 /// An existing `~/.config/reticulum/config` that carries neither the 4242 listener nor
 /// `enable_transport` stops the run with exit 2 right after the printed stanzas, on a real
 /// run and a dry run, on Linux and macOS: no unit or plist is written, no service manager is
@@ -789,6 +793,18 @@ fn relay_on_the_scripts_own_config_replaces_the_stanza_and_restarts_the_linux_se
         "{}",
         recorded(&log)
     );
+    assert!(
+        out.ends_with(&format!(
+            "[coyote-mesh] Next: start coyote and run `.mesh on`\n{PROPAGATION_NODE_POINTER}"
+        )),
+        "a --relay run ends with the propagation-node pointer:\n{out}"
+    );
+    let (code, plain, _) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0);
+    assert!(
+        !plain.contains("mesh.propagation_nodes"),
+        "a run without --relay does not point at it:\n{plain}"
+    );
 
     fs::write(&log, "").unwrap();
     let (code, out, err) = run(home
@@ -930,7 +946,7 @@ fn relay_on_a_foreign_config_writes_nothing_and_names_the_path_and_the_restart()
         );
         assert!(
             out.ends_with(&format!(
-                "[coyote-mesh] Next: add the [[Team Relay]] stanza above to {}, then {restart}\n",
+                "[coyote-mesh] Next: add the [[Team Relay]] stanza above to {}, then {restart}\n{PROPAGATION_NODE_POINTER}",
                 config.display()
             )),
             "{os}:\n{out}"

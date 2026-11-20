@@ -10799,6 +10799,53 @@ fn mesh_deployment_says_why_the_shipped_propagation_node_announces_every_61_minu
     }
 }
 
+/// `mesh.propagation_nodes` is described where an owner looks for it: the propagation-node
+/// section of the deployment page names the key and the wait of up to an hour it avoids,
+/// and the configuration page carries its yaml line, its table row, its refusal as
+/// validate bails it and a section on what `.mesh config show` prints for it.
+#[test]
+fn the_configured_propagation_nodes_key_is_described_on_the_deployment_and_configuration_pages() {
+    let source = read(repo_root().join("src/config/mesh_config.rs"));
+    let refusal = "which is not a propagation node hash; use the 32 hex characters of the node's destination hash, as .mesh config show lists them";
+    assert!(
+        source.contains(refusal),
+        "src/config/mesh_config.rs no longer refuses a bad propagation_nodes entry with {refusal:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let deployment = read(wiki.join("Mesh-Deployment.md"));
+    let nodes = flat(&section(
+        "Mesh-Deployment.md",
+        &deployment,
+        "## Propagation nodes",
+    ));
+    for needle in [
+        "To skip that wait of up to an hour, list the node's destination hash under [`mesh.propagation_nodes`](Mesh-Configuration#propagation_nodes)",
+        "the path response carries the node's announce, which files the node as if it had been heard, and the join-time sync then runs",
+        "is logged once per run and not filed",
+        "`(configured, not resolved yet)`",
+    ] {
+        assert!(
+            nodes.contains(needle),
+            "Mesh-Deployment.md's propagation-node section lacks {needle:?}"
+        );
+    }
+
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    for needle in [
+        "\n  propagation_nodes: []          # Destination hashes (32 hex characters each)",
+        "| `propagation_nodes` ",
+        &format!("`mesh.propagation_nodes[<i>] is '<value>', {refusal}`"),
+        "## `propagation_nodes`",
+        "`(configured, 2 hop(s), 3m ago)`",
+    ] {
+        assert!(
+            configuration.contains(needle),
+            "Mesh-Configuration.md lacks {needle:?}"
+        );
+    }
+}
+
 /// The line a silent peer leaves opens `no answer from "<user> / <session>" (<dest8>)`,
 /// the peer named by `named_peer`, and the pages that explain trust quote that opening;
 /// the line a busy peer sends back ends on the one-at-a-time rule the Commands page
@@ -11006,8 +11053,9 @@ fn folded_section(page: &str, heading: &str) -> String {
 }
 
 /// The silent-LAN section says how the LAN host count is read, in the order and with the
-/// keys the code uses, and when the line comes; the `.mesh status` page quotes the LAN
-/// line in the words `.mesh status` prints.
+/// keys the code uses, and when the line comes or stays quiet: a known peer or a relay
+/// keeps it away. The `.mesh status` page quotes the LAN line in the words `.mesh status`
+/// prints.
 #[test]
 fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
     let repl = read(repo_root().join("src/repl/mesh.rs"));
@@ -11043,14 +11091,28 @@ fn the_silent_lan_section_and_the_status_page_describe_the_lan_host_count() {
         "`/etc/reticulum`, then `~/.config/reticulum`, then `~/.reticulum`",
         "its `rpc_key` or the key rnsd derives from its transport identity",
         "`.mesh status` shows it as `LAN: N hosts reachable`",
-        "whose every LAN interface reaches 0 hosts says so once",
-        "whatever other interfaces it has",
+        "whose every LAN interface reaches 0 hosts, or reads no count at all",
         "One LAN host is enough to keep the line away",
-        "no `private` relay is configured and no other session has been heard at all",
+        "when it knows peers, that is any row in its peer table heard within the last three hourly announces",
+        "the rows kept from an earlier run included",
+        "a `private` or `public` interface of its own is connected, or the local rnsd reports a `TCPClientInterface` online",
+        "A relay that is configured but not connected does not count.",
+        "A session with an empty peer table on a LAN-only rnsd, with no relay up, still gets the line.",
+        "files the node from a path request at join, instead of waiting up to an hour for the node's next hourly announce",
     ] {
         assert!(
             silent.contains(needle),
             "Mesh-Deployment.md's silent-LAN section does not say {needle:?}"
+        );
+    }
+    for stale in [
+        "whatever other interfaces it has",
+        "does not make the LAN reach anyone",
+        "no `private` relay is configured",
+    ] {
+        assert!(
+            !silent.contains(stale),
+            "Mesh-Deployment.md's silent-LAN section still says {stale:?}"
         );
     }
     let status = folded_section(&read(wiki.join("Mesh-Commands.md")), "### `.mesh status`");

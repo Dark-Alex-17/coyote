@@ -1208,8 +1208,8 @@ async fn status(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             let card = StatusHandler::new(Arc::downgrade(&source)).card(SystemTime::now());
             out_text(&render_for_human(&card, SystemTime::now()));
             out_text(&format!("envoy memory: {}", envoy_memory_text(&runtime)));
-            let readings = runtime.lan_readings(ReadEffort::Quick).await;
-            if let Some(line) = render_lan_line(known_host_total(&readings)) {
+            let lan = runtime.lan_readings(ReadEffort::Quick).await;
+            if let Some(line) = render_lan_line(known_host_total(&lan.readings)) {
                 out_text(&line);
             }
         }
@@ -13611,6 +13611,7 @@ fn node_fact_rows(
     row("envoy memory", envoy_memory_text(runtime));
     rows.extend(propagation_node_rows(
         runtime.propagation_nodes().snapshot(),
+        runtime.configured_propagation_nodes().hashes(),
         now,
     ));
     rows
@@ -13696,15 +13697,26 @@ fn predecessors_text(
 
 /// Nearest first, the most recently heard breaking ties, so the row the node picks for
 /// store-and-forward is the top one. A node the pickers skip as aged out is not listed.
+/// A node `configured` lists says so beside its hops and age, and one not filed is listed
+/// after the filed ones as not resolved yet, in place of the none-heard row.
 fn propagation_node_rows(
     mut nodes: Vec<PropagationNodeRecord>,
+    configured: &[String],
     now: SystemTime,
 ) -> Vec<(String, String)> {
     let heard = nodes.len();
     nodes.retain(|node| !node.is_expired(now));
     nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
+    let filed: Vec<String> = nodes
+        .iter()
+        .map(|record| record.node.destination.address_hash.to_hex_string())
+        .collect();
+    let unresolved: Vec<&String> = configured
+        .iter()
+        .filter(|hash| !filed.contains(hash))
+        .collect();
     let mut rows = Vec::new();
-    if nodes.is_empty() {
+    if nodes.is_empty() && unresolved.is_empty() {
         let none = if heard == 0 {
             "none heard yet".to_string()
         } else {
@@ -13715,15 +13727,25 @@ fn propagation_node_rows(
         };
         rows.push(("propagation_nodes".to_string(), none));
     }
-    for (i, record) in nodes.iter().enumerate() {
+    for (i, (record, hash)) in nodes.iter().zip(&filed).enumerate() {
+        let mark = if configured.contains(hash) {
+            "configured, "
+        } else {
+            ""
+        };
         rows.push((
             format!("propagation_nodes[{i}]"),
             format!(
-                "{} ({} hop(s), {})",
-                record.node.destination.address_hash.to_hex_string(),
+                "{hash} ({mark}{} hop(s), {})",
                 record.hops,
                 age_text(now, record.last_seen),
             ),
+        ));
+    }
+    for (i, hash) in unresolved.into_iter().enumerate() {
+        rows.push((
+            format!("propagation_nodes[{}]", filed.len() + i),
+            format!("{hash} (configured, not resolved yet)"),
         ));
     }
     rows
@@ -18143,7 +18165,7 @@ mod tests {
     #[test]
     fn propagation_node_rows_list_nearest_first_or_say_none() {
         let now = SystemTime::now();
-        let none = propagation_node_rows(Vec::new(), now);
+        let none = propagation_node_rows(Vec::new(), &[], now);
         assert_eq!(
             none,
             vec![(
@@ -18173,7 +18195,7 @@ mod tests {
         let aged_out = record(0, "aged", now - Duration::from_secs(365 * 24 * 60 * 60));
         let far_hex = far.node.destination.address_hash.to_hex_string();
         let near_hex = near.node.destination.address_hash.to_hex_string();
-        let rows = propagation_node_rows(vec![far, near, aged_out], now);
+        let rows = propagation_node_rows(vec![far, near, aged_out], &[], now);
         assert_eq!(
             rows.len(),
             2,
@@ -18192,6 +18214,7 @@ mod tests {
         let stale = now - PROPAGATION_NODE_TTL - Duration::from_secs(60);
         let rows = propagation_node_rows(
             vec![record(1, "old", stale), record(2, "older", stale)],
+            &[],
             now,
         );
         assert_eq!(
@@ -18202,6 +18225,50 @@ mod tests {
                     .to_string()
             )],
             "nodes that all aged out are counted, not reported as never heard"
+        );
+
+        let configured = record(2, "configured", now);
+        let configured_hex = configured.node.destination.address_hash.to_hex_string();
+        let heard_only = record(1, "heard", heard);
+        let heard_hex = heard_only.node.destination.address_hash.to_hex_string();
+        let unresolved_hex = "ab".repeat(16);
+        let rows = propagation_node_rows(
+            vec![configured, heard_only, record(5, "aged", stale)],
+            &[configured_hex.clone(), unresolved_hex.clone()],
+            now,
+        );
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(
+            rows[0],
+            (
+                "propagation_nodes[0]".to_string(),
+                format!("{heard_hex} (1 hop(s), 1m ago)")
+            ),
+            "a node heard but not configured reads as before"
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "propagation_nodes[1]".to_string(),
+                format!("{configured_hex} (configured, 2 hop(s), 0s ago)")
+            ),
+            "a configured node that is filed says so beside its hops and age"
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "propagation_nodes[2]".to_string(),
+                format!("{unresolved_hex} (configured, not resolved yet)")
+            ),
+            "a configured hash not filed is listed and flagged"
+        );
+        assert_eq!(
+            propagation_node_rows(Vec::new(), std::slice::from_ref(&unresolved_hex), now),
+            vec![(
+                "propagation_nodes[0]".to_string(),
+                format!("{unresolved_hex} (configured, not resolved yet)")
+            )],
+            "with nothing filed the configured hash still shows, in place of none heard yet"
         );
     }
 

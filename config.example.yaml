@@ -419,6 +419,9 @@ mesh:
   propagation_sync_interval_secs: 300 # Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a
                                       # propagation node is heard after the node joins (default: 300; 0 = fetch only on `.mesh sync`; at most 31536000); off
                                       # while `announce` is false
+  propagation_nodes: []          # Destination hashes (32 hex characters each) of propagation nodes to ask the mesh for by path request at join, and again
+                                 # whenever none is filed at a post or a sync, rather than waiting up to an hour for the node's next announce: a team relay
+                                 # that is also a propagation node, or a first run before the node's hourly announce (default: [] = none)
   fetch:                         # File sharing between trusted peers; see the mesh.fetch keys below
     inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to
                                  # 98304, the per-message total)

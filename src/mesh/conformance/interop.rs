@@ -2640,7 +2640,7 @@ async fn a_node_reads_the_lan_host_count_of_its_rnsd() {
     // rnsd binds its RPC listener a few seconds after the shared instance answers.
     let deadline = Instant::now() + LINK_TIMEOUT;
     loop {
-        let readings = runtime.lan_readings(ReadEffort::Patient).await;
+        let readings = runtime.lan_readings(ReadEffort::Patient).await.readings;
         if readings == [LanReading::Count(0)] {
             break;
         }
@@ -2667,7 +2667,7 @@ async fn a_node_reads_the_lan_host_count_of_its_rnsd() {
         },
         instance.as_deref().unwrap_or(DEFAULT_LOCAL_RNSD_INSTANCE),
     );
-    let reading = reader.read().await;
+    let reading = reader.read().await.lan;
     assert_eq!(reading, Some(LanReading::Unknown));
     assert!(reader.unavailable().await);
     let readings: Vec<LanReading> = reading.into_iter().collect();

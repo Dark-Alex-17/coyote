@@ -36,7 +36,9 @@ use crate::mesh::knock::{
     drain_knocks, knock_message,
 };
 use crate::mesh::knocks::KnockCache;
-use crate::mesh::lan_count::{LanReading, ReadEffort, RnsdLanReader, RnsdLocator, lan_readings};
+use crate::mesh::lan_count::{
+    LanReading, LanReadings, ReadEffort, RnsdLanReader, RnsdLocator, lan_readings,
+};
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
@@ -48,8 +50,8 @@ use crate::mesh::message::{
 };
 use crate::mesh::notify::{NoticeText, Notification, NotificationSink, Source};
 use crate::mesh::peers::{
-    AnnounceStamp, FarewellTime, LeftMark, PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PeerChange,
-    PeerSighting, PeerTable,
+    AnnounceStamp, FarewellTime, LeftMark, PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TTL,
+    PeerChange, PeerSighting, PeerTable,
 };
 use crate::mesh::pending::{
     Answered, CorrelationKind, Correlations, InboundKind, InboundRecord, InboundStore,
@@ -61,7 +63,7 @@ use crate::mesh::propagation::{
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::{
-    PROPAGATION_NODE_TABLE_FILE, PersistTrigger, PropagationNodeTable,
+    ConfiguredPropagationNodes, PROPAGATION_NODE_TABLE_FILE, PersistTrigger, PropagationNodeTable,
 };
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(all(test, unix))]
@@ -801,6 +803,7 @@ pub(crate) struct MeshRuntime {
     instance_row: parking_lot::Mutex<InstanceRow>,
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
+    configured_propagation_nodes: Arc<ConfiguredPropagationNodes>,
     trust: Arc<TrustStore>,
     request_handler: Arc<LibraryHandler>,
     dispatcher: Arc<Dispatcher>,
@@ -1111,6 +1114,9 @@ impl MeshRuntime {
             instance_row: parking_lot::Mutex::new(instance_row),
             peers,
             propagation_nodes,
+            configured_propagation_nodes: Arc::new(ConfiguredPropagationNodes::new(
+                config.propagation_node_hashes(),
+            )),
             trust,
             request_handler,
             dispatcher,
@@ -1760,8 +1766,9 @@ impl MeshRuntime {
 
     /// What each LAN interface of this node reads now: the in-process `lan` interface
     /// and the local rnsd's AutoInterfaces, read one caller at a time; an rnsd that runs
-    /// no AutoInterface adds nothing. `effort` says how long the rnsd read may take.
-    pub(crate) async fn lan_readings(&self, effort: ReadEffort) -> Vec<LanReading> {
+    /// no AutoInterface adds nothing. With them, whether the local rnsd has a TCP client
+    /// interface online. `effort` says how long the rnsd read may take.
+    pub(crate) async fn lan_readings(&self, effort: ReadEffort) -> LanReadings {
         let lan_hosts: Vec<AddressHash> = self
             .interfaces
             .lock()
@@ -1831,6 +1838,52 @@ impl MeshRuntime {
     /// The LXMF propagation nodes heard so far, as `fetch_propagated` chooses among them.
     pub(crate) fn propagation_nodes(&self) -> Arc<PropagationNodeTable> {
         self.propagation_nodes.clone()
+    }
+
+    /// The propagation nodes `mesh.propagation_nodes` lists.
+    pub(crate) fn configured_propagation_nodes(&self) -> &ConfiguredPropagationNodes {
+        &self.configured_propagation_nodes
+    }
+
+    /// One round of `resolve_configured_nodes`, waited on. Whether a node was filed.
+    #[cfg(test)]
+    pub(crate) async fn resolve_configured_propagation_nodes(&self) -> bool {
+        let Some(transport) = self.transport_handle().await else {
+            return false;
+        };
+        resolve_configured_nodes(
+            &transport,
+            &self.configured_propagation_nodes,
+            &self.propagation_nodes,
+            &self.cancel,
+        )
+        .await
+    }
+
+    /// One round of `resolve_configured_nodes` in the background, with `filed` run when it
+    /// filed a node. Nothing starts while the table holds every configured node.
+    pub(crate) async fn resolve_configured_propagation_nodes_in_background(
+        &self,
+        filed: impl FnOnce() + Send + 'static,
+    ) {
+        if self
+            .configured_propagation_nodes
+            .missing(&self.propagation_nodes, SystemTime::now())
+            .is_empty()
+        {
+            return;
+        }
+        let Some(transport) = self.transport_handle().await else {
+            return;
+        };
+        let configured = self.configured_propagation_nodes.clone();
+        let table = self.propagation_nodes.clone();
+        let cancel = self.cancellation_token();
+        tokio::spawn(async move {
+            if resolve_configured_nodes(&transport, &configured, &table, &cancel).await {
+                filed();
+            }
+        });
     }
 
     pub(crate) fn trust(&self) -> Arc<TrustStore> {
@@ -2214,7 +2267,12 @@ impl MeshRuntime {
             .await
             .clone()
             .ok_or(FetchError::Link(RequestError::NotRunning))?;
-        let node = self.propagation_nodes.select()?;
+        let selected = self.propagation_nodes.select();
+        if selected.is_err() {
+            self.resolve_configured_propagation_nodes_in_background(|| {})
+                .await;
+        }
+        let node = selected?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
         let cancel = self.cancellation_token();
         let asked = request_path_to_node(&transport, &node, &cancel, FetchError::Cancelled).await?;
@@ -4093,14 +4151,15 @@ async fn watch_interfaces(
                     return;
                 };
                 let joined_at = runtime.joined_at();
-                let has_private = runtime.interface_states().iter().any(|status| status.kind == "private");
-                let any_peer_heard = runtime.peers().snapshot().iter().any(|peer| peer.last_seen >= joined_at);
-                let readings = tokio::select! {
+                let now = SystemTime::now();
+                let peers_known = knows_peers(runtime.peers().snapshot().iter().map(|peer| peer.last_seen), now);
+                let lan = tokio::select! {
                     () = cancel.cancelled() => return,
-                    readings = runtime.lan_readings(ReadEffort::Patient) => readings,
+                    lan = runtime.lan_readings(ReadEffort::Patient) => lan,
                 };
+                let relayed = on_relay(&runtime.interface_states(), lan.relay_online);
                 let elapsed = joined_at.elapsed().unwrap_or_default();
-                if let Some(hint) = lan_silent.tick(elapsed, &readings, any_peer_heard, has_private) {
+                if let Some(hint) = lan_silent.tick(elapsed, &lan.readings, peers_known, relayed) {
                     info!("Mesh heard no other host on the LAN within {LAN_PEERLESS_GRACE_SECS}s; suggested a TCP relay");
                     slot.push_idle(IdleNotify {
                         source: Source::Relay,
@@ -4240,29 +4299,44 @@ pub(super) enum LanVerdict {
 }
 
 /// Whether `LAN_SILENT_HINT` is due, from one reading per LAN interface. A count above
-/// zero anywhere settles it, heard hosts or not. Once `LAN_PEERLESS_GRACE_SECS` are up it
-/// is told when every LAN interface counts zero, whatever else is configured, or reads
-/// `Unknown` and is silent by the signal used where no count can be read: no host heard
-/// since join and no `private` relay configured. A host heard settles an `Unknown`
-/// interface, since it can never be silent by that signal again; so does a node with
-/// no LAN interface at all.
+/// zero anywhere settles it, and so does a node that knows a peer (`knows_peers`) or
+/// sits on a relay (`on_relay`), since it already reaches the mesh, and a node with no
+/// LAN interface at all. Otherwise, once `LAN_PEERLESS_GRACE_SECS` are up, it is told
+/// when every LAN interface counts zero or reads `Unknown`.
 pub(super) fn lan_silent_verdict(
     elapsed: Duration,
     readings: &[LanReading],
-    any_heard: bool,
-    has_private: bool,
+    knows_peers: bool,
+    on_relay: bool,
 ) -> LanVerdict {
     let counted_a_host = readings
         .iter()
         .any(|reading| matches!(reading, LanReading::Count(hosts) if *hosts > 0));
-    let unknown = readings.contains(&LanReading::Unknown);
-    if counted_a_host || readings.is_empty() || (unknown && any_heard) {
+    if counted_a_host || readings.is_empty() || knows_peers || on_relay {
         return LanVerdict::Settle;
     }
-    if elapsed < Duration::from_secs(LAN_PEERLESS_GRACE_SECS) || (unknown && has_private) {
+    if elapsed < Duration::from_secs(LAN_PEERLESS_GRACE_SECS) {
         return LanVerdict::Wait;
     }
     LanVerdict::Tell
+}
+
+/// Whether the peer table holds a row heard within `PEER_TTL` of `now`, from `last_seen`
+/// of every row, the ones loaded from disk included.
+fn knows_peers(last_seen: impl IntoIterator<Item = SystemTime>, now: SystemTime) -> bool {
+    last_seen
+        .into_iter()
+        .any(|seen| now.duration_since(seen).map_or(true, |age| age <= PEER_TTL))
+}
+
+/// Whether this node sits on a relay: a `private` or `public` interface of its own is
+/// connected, or `rnsd_relay_online` says the local rnsd has a TCP client online. A relay
+/// configured but not connected does not count.
+fn on_relay(interfaces: &[InterfaceStatus], rnsd_relay_online: bool) -> bool {
+    rnsd_relay_online
+        || interfaces.iter().any(|status| {
+            matches!(status.kind, "private" | "public") && status.state == InterfaceState::Connected
+        })
 }
 
 /// Whether `LAN_SILENT_HINT` is still to be told. It settles for good once it is told or
@@ -4283,13 +4357,13 @@ impl LanSilentHint {
         &mut self,
         elapsed: Duration,
         readings: &[LanReading],
-        any_heard: bool,
-        has_private: bool,
+        knows_peers: bool,
+        on_relay: bool,
     ) -> Option<&'static str> {
         if self.settled {
             return None;
         }
-        match lan_silent_verdict(elapsed, readings, any_heard, has_private) {
+        match lan_silent_verdict(elapsed, readings, knows_peers, on_relay) {
             LanVerdict::Wait => None,
             LanVerdict::Settle => {
                 self.settled = true;
@@ -4676,6 +4750,91 @@ async fn request_path_to_node<E>(
         }
     }
     Ok(true)
+}
+
+/// Asks the mesh for a path to each configured propagation node `table` does not hold and
+/// files the announce each path response carries through `observe_announce`, as any
+/// heard one, waiting up to `PATH_REQUEST_TIMEOUT` for them all. A hash answered by an
+/// announce that is not a usable propagation node's, or not answered at all, is logged
+/// once per run and not filed. Whether a node was filed; `false` at once while another
+/// round is out or one began within `CONFIGURED_NODE_ASK_GAP`, and as soon as `cancel`
+/// fires.
+async fn resolve_configured_nodes(
+    transport: &Transport,
+    configured: &ConfiguredPropagationNodes,
+    table: &PropagationNodeTable,
+    cancel: &CancellationToken,
+) -> bool {
+    let mut pending: HashSet<String> = configured
+        .missing(table, SystemTime::now())
+        .into_iter()
+        .collect();
+    if pending.is_empty() {
+        return false;
+    }
+    let Some(_round) = configured.begin_round(Instant::now()) else {
+        return false;
+    };
+    let mut announces = transport.recv_announces().await;
+    for hash in &pending {
+        let Ok(address) = AddressHash::new_from_hex_string(hash) else {
+            continue;
+        };
+        debug!(
+            "Mesh asking for a path to configured propagation node {}",
+            short(hash)
+        );
+        transport.request_path(&address, None, None).await;
+    }
+    let mut filed = false;
+    let deadline = sleep(PATH_REQUEST_TIMEOUT);
+    tokio::pin!(deadline);
+    while !pending.is_empty() {
+        let event = tokio::select! {
+            () = cancel.cancelled() => return filed,
+            () = &mut deadline => break,
+            event = announces.recv() => match event {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        };
+        let desc = event.destination.lock().await.desc;
+        let hash = desc.address_hash.to_hex_string();
+        if !pending.remove(&hash) {
+            continue;
+        }
+        let now = SystemTime::now();
+        table.observe_announce(
+            &desc,
+            event.app_data.as_slice(),
+            event.hops,
+            event.is_path_response,
+            now,
+        );
+        if table.holds(&hash, now) {
+            debug!(
+                "Mesh filed configured propagation node {} from its path response",
+                short(&hash)
+            );
+            filed = true;
+        } else if configured.first_telling(&hash) {
+            info!(
+                "Mesh configured propagation node {} answered its path request, but not as a propagation node; it is not filed",
+                short(&hash)
+            );
+        }
+    }
+    for hash in pending {
+        if configured.first_telling(&hash) {
+            info!(
+                "Mesh configured propagation node {} did not answer its path request within {} s; it is not filed",
+                short(&hash),
+                PATH_REQUEST_TIMEOUT.as_secs()
+            );
+        }
+    }
+    filed
 }
 
 async fn persist_tables_periodically(
@@ -5093,6 +5252,20 @@ impl MeshSlot {
             runtime.cancellation_token(),
         )));
         self.request_sync();
+        // `install` cannot wait on the transport lock the round needs, so a task starts it.
+        let (slot, joined) = (Arc::downgrade(self), Arc::downgrade(&runtime));
+        tokio::spawn(async move {
+            let Some(runtime) = joined.upgrade() else {
+                return;
+            };
+            runtime
+                .resolve_configured_propagation_nodes_in_background(move || {
+                    if let Some(slot) = slot.upgrade() {
+                        slot.request_sync();
+                    }
+                })
+                .await;
+        });
         Ok(())
     }
 
@@ -7349,6 +7522,9 @@ impl PeerSurface for MeshSlot {
         debug!(
             "Mesh instance {dest8} said it is leaving the mesh; marked left until it announces again or is heard over a link"
         );
+        runtime
+            .card_cadence()
+            .drop_deferred(&farewell.source_destination);
         self.hooks.fire(MeshEvent::BulletinReceived {
             id: farewell.message_id,
             identity: farewell.source_identity,
@@ -17225,6 +17401,7 @@ mod tests {
                 delivered: 1,
                 held: 0,
                 skipped: 0,
+                skip_reasons: Default::default(),
             };
             assert_eq!(pair.b.runtime.send_farewell().await, farewell);
             let first = pair.left_at_on_a();
@@ -19274,8 +19451,8 @@ mod tests {
 
         const GRACE: Duration = Duration::from_secs(LAN_PEERLESS_GRACE_SECS);
 
-        /// Every LAN interface counting no host, or reading `Unknown` on a node that
-        /// heard nobody and has no `private` relay, tells the hint at the grace and later.
+        /// Every LAN interface counting no host or reading `Unknown`, on a node that
+        /// knows no peer and sits on no relay, tells the hint at the grace and later.
         #[test]
         fn the_hint_is_due_at_the_grace_when_every_lan_interface_is_silent() {
             assert_eq!(LAN_PEERLESS_GRACE_SECS, 120);
@@ -19310,34 +19487,34 @@ mod tests {
             assert!(!hint.settled());
         }
 
-        /// A count of zero is told even beside a `private` or `public` relay and after a
-        /// host was heard over one: the relay does not make the LAN reach anyone.
+        /// A count of zero is not told on a node that knows a peer or sits on a relay:
+        /// either one already reaches the mesh, so the LAN being silent is no news.
         #[test]
-        fn a_zero_count_tells_the_hint_whatever_else_is_configured_or_heard() {
-            for (any_heard, has_private) in [(false, true), (true, false), (true, true)] {
+        fn a_zero_count_is_kept_quiet_by_a_known_peer_or_a_relay() {
+            for (knows_peers, on_relay) in [(false, true), (true, false), (true, true)] {
+                let mut hint = LanSilentHint::default();
                 assert_eq!(
-                    LanSilentHint::default().tick(GRACE, &[Count(0)], any_heard, has_private),
-                    Some(LAN_SILENT_HINT),
-                    "heard {any_heard}, private {has_private}"
+                    hint.tick(GRACE, &[Count(0)], knows_peers, on_relay),
+                    None,
+                    "peers {knows_peers}, relay {on_relay}"
                 );
+                assert!(hint.settled(), "peers {knows_peers}, relay {on_relay}");
             }
         }
 
-        /// Where no count can be read, a `private` relay keeps the hint away as it did
-        /// before counts were read, until a count says the LAN is silent.
+        /// A relay settles the hint whatever the LAN interfaces read: unknown, unknown
+        /// beside zero, or zero.
         #[test]
-        fn a_private_interface_keeps_the_hint_away_only_from_an_unknown_count() {
-            let mut hint = LanSilentHint::default();
-            assert_eq!(hint.tick(GRACE, &[Unknown], false, true), None);
-            assert_eq!(
-                hint.tick(GRACE * 2, &[Count(0), Unknown], false, true),
-                None
-            );
-            assert!(!hint.settled());
-            assert_eq!(
-                hint.tick(GRACE * 3, &[Count(0)], false, true),
-                Some(LAN_SILENT_HINT)
-            );
+        fn a_relay_keeps_the_hint_away_from_an_unknown_or_a_zero_count() {
+            for (elapsed, readings) in [
+                (GRACE, &[Unknown][..]),
+                (GRACE * 2, &[Count(0), Unknown]),
+                (GRACE * 3, &[Count(0)]),
+            ] {
+                let mut hint = LanSilentHint::default();
+                assert_eq!(hint.tick(elapsed, readings, false, true), None);
+                assert!(hint.settled(), "{readings:?}");
+            }
         }
 
         #[test]
@@ -19367,8 +19544,7 @@ mod tests {
             }
         }
 
-        /// Where a count cannot be read, a heard host settles it as before counts were
-        /// read.
+        /// A known peer settles it where a count cannot be read too.
         #[test]
         fn a_heard_peer_keeps_the_hint_away_from_an_unknown_count() {
             for readings in [&[Unknown][..], &[Unknown, Unknown], &[Count(0), Unknown]] {
@@ -19424,7 +19600,10 @@ mod tests {
             let host = channel.address;
             assert_eq!(
                 lan_readings(Some(&transport), &[host], None, ReadEffort::Patient).await,
-                [Unknown]
+                LanReadings {
+                    readings: vec![Unknown],
+                    relay_online: false,
+                }
             );
 
             let counter = Arc::new(AtomicU64::new(0));
@@ -19435,15 +19614,23 @@ mod tests {
                     .await
                     .set_peer_counter(&host, counter.clone())
             );
-            let readings = lan_readings(Some(&transport), &[host], None, ReadEffort::Patient).await;
+            let readings = lan_readings(Some(&transport), &[host], None, ReadEffort::Patient)
+                .await
+                .readings;
             assert_eq!(readings, [Count(0)]);
             assert_eq!(
-                LanSilentHint::default().tick(GRACE, &readings, true, true),
+                LanSilentHint::default().tick(GRACE, &readings, false, false),
                 Some(LAN_SILENT_HINT)
+            );
+            assert_eq!(
+                LanSilentHint::default().tick(GRACE, &readings, true, true),
+                None
             );
 
             counter.store(2, Ordering::Release);
-            let readings = lan_readings(Some(&transport), &[host], None, ReadEffort::Quick).await;
+            let readings = lan_readings(Some(&transport), &[host], None, ReadEffort::Quick)
+                .await
+                .readings;
             assert_eq!(readings, [Count(2)]);
             let mut hint = LanSilentHint::default();
             assert_eq!(hint.tick(GRACE, &readings, false, false), None);
@@ -19452,9 +19639,84 @@ mod tests {
             assert!(
                 lan_readings(None, &[host], None, ReadEffort::Patient)
                     .await
+                    .readings
                     .is_empty()
             );
             drop(channel);
+        }
+
+        /// Every row the peer table holds counts while it is within `PEER_TTL` of now,
+        /// one loaded from disk as much as one heard in this run; an older one does not.
+        #[test]
+        fn a_peer_row_within_the_ttl_counts_as_known_and_an_older_one_does_not() {
+            let now = SystemTime::now();
+            assert!(!knows_peers([], now));
+            assert!(knows_peers([now - PEER_TTL / 2], now));
+            assert!(knows_peers([now - PEER_TTL], now));
+            assert!(!knows_peers([now - PEER_TTL - Duration::from_secs(1)], now));
+            assert!(knows_peers(
+                [now - PEER_TTL * 2, now - Duration::from_secs(5)],
+                now
+            ));
+            assert!(
+                knows_peers([now + Duration::from_secs(5)], now),
+                "a row stamped ahead of this clock is fresh"
+            );
+        }
+
+        /// A `private` or `public` interface counts as a relay once it is connected, one
+        /// configured but not connected does not, nor does `lan` or `local`; rnsd's TCP
+        /// client online counts by itself.
+        #[test]
+        fn a_connected_relay_or_an_online_rnsd_tcp_client_counts_as_on_a_relay() {
+            let status = |kind: &'static str, state: InterfaceState| InterfaceStatus {
+                label: kind.to_string(),
+                kind,
+                endpoint: None,
+                state,
+            };
+            let down = || InterfaceState::Unreachable {
+                reason: "refused".to_string(),
+                retrying: true,
+            };
+            assert!(!on_relay(&[], false));
+            assert!(on_relay(&[], true));
+            for kind in ["private", "public"] {
+                assert!(on_relay(&[status(kind, InterfaceState::Connected)], false));
+                assert!(!on_relay(&[status(kind, down())], false), "{kind}");
+                assert!(on_relay(&[status(kind, down())], true), "{kind}");
+            }
+            assert!(!on_relay(
+                &[
+                    status("lan", InterfaceState::Connected),
+                    status("local", InterfaceState::Connected),
+                    status("private", InterfaceState::Connecting { dial_failure: None }),
+                ],
+                false
+            ));
+        }
+
+        /// The inputs as the watcher reads them on a LAN-only rnsd: an empty peer table,
+        /// no relay connected and no TCP client online leave the zero count told once at
+        /// the grace.
+        #[test]
+        fn a_node_with_no_peer_and_no_relay_on_a_silent_lan_is_told_once() {
+            let now = SystemTime::now();
+            let rnsd = LanReadings {
+                readings: vec![Count(0)],
+                relay_online: false,
+            };
+            let mut hint = LanSilentHint::default();
+            let tick = |hint: &mut LanSilentHint, elapsed| {
+                hint.tick(
+                    elapsed,
+                    &rnsd.readings,
+                    knows_peers([], now),
+                    on_relay(&[], rnsd.relay_online),
+                )
+            };
+            assert_eq!(tick(&mut hint, GRACE), Some(LAN_SILENT_HINT));
+            assert_eq!(tick(&mut hint, GRACE * 2), None);
         }
 
         #[test]
@@ -20453,6 +20715,7 @@ mod tests {
                     delivered: 0,
                     held: 1,
                     skipped: 0,
+                    skip_reasons: Default::default(),
                 }
             );
             assert!(
@@ -20468,6 +20731,211 @@ mod tests {
             );
 
             assert!(slot.stop().await.unwrap());
+            node.stop().await;
+        }
+
+        /// The same pathless trusted peer with no propagation node on file: the leg is
+        /// skipped, its debug line says why, and the summary names the reason.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_farewell_with_no_propagation_node_on_file_logs_why_its_leg_was_skipped() {
+            use crate::mesh::message::{FarewellOutcome, FarewellSkips};
+            use crate::mesh::trust::TrustOptions;
+
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let tmp = TempDir::new("node-farewell-no-node");
+            let runtime = start_on(&tmp, relay.port).await;
+            let slot = Arc::new(MeshSlot::default());
+            slot.install(runtime.clone()).unwrap();
+            let peer = TransportIdentity::new_from_rand(OsRng);
+            let desc = SingleInputDestination::new(peer, session_destination_name("away")).desc;
+            let destination = desc.address_hash.to_hex_string();
+            runtime.peers().observe(
+                PeerSighting {
+                    destination_hash: destination.clone(),
+                    identity_hash: desc.identity.address_hash.to_hex_string(),
+                    name_hash: hex_lower(desc.name.as_name_hash_slice()),
+                    public_key: Some(desc.identity.to_hex_string()),
+                    display_name: None,
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                SystemTime::now(),
+            );
+            runtime
+                .trust()
+                .trust_destination(
+                    slot.as_ref(),
+                    &destination,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let outcome = runtime.send_farewell().await;
+
+            assert_eq!(
+                outcome,
+                FarewellOutcome {
+                    audience: 1,
+                    delivered: 0,
+                    held: 0,
+                    skipped: 1,
+                    skip_reasons: FarewellSkips {
+                        no_propagation_node: 1,
+                        ..FarewellSkips::default()
+                    },
+                }
+            );
+            let logs = crate::testing::debug_snapshot();
+            let reason = format!(
+                "Mesh farewell for {} not held: no propagation node is filed",
+                short(&destination)
+            );
+            assert!(
+                logs.iter().any(|line| line.contains(&reason)),
+                "the skipped leg says why: {logs:#?}"
+            );
+            assert!(
+                logs.iter().any(|line| line.contains("Mesh farewell ")
+                    && line.contains(
+                        "delivered to 0, held for 0, skipped 1 (no propagation node) of 1 trusted peer(s)"
+                    )),
+                "the summary names the reason: {logs:#?}"
+            );
+
+            assert!(slot.stop().await.unwrap());
+            relay.stop().await;
+        }
+
+        /// Counts the sync requests a slot hands its idle driver.
+        #[derive(Default)]
+        struct SyncRequests(AtomicUsize);
+
+        impl IdleSink for SyncRequests {
+            fn push(&self, _note: IdleNotify) -> Result<(), IdleNotify> {
+                Ok(())
+            }
+
+            fn request_sync(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        async fn start_with_configured(
+            tmp: &TempDir,
+            port: u16,
+            configured: &[String],
+        ) -> Arc<MeshRuntime> {
+            let mut config = private_config(port);
+            config.propagation_nodes = configured.to_vec();
+            let mut session = Session::default();
+            MeshRuntime::start(
+                &config,
+                true,
+                &mut session,
+                mesh_paths(tmp),
+                NodeOptions::default(),
+            )
+            .await
+            .unwrap()
+        }
+
+        /// The node never announces, as one whose hourly announce fell before the join:
+        /// the configured hash, given in upper case, is asked for at join, the path
+        /// response's announce files it, and the join-time sync is asked for again.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_configured_node_is_filed_from_its_path_response_at_join_and_the_sync_runs_again()
+        {
+            use crate::mesh::propagation::pn_announce_app_data;
+
+            let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            node.transport
+                .set_destination_announce_app_data(
+                    &node.dest,
+                    Some(pn_announce_app_data(true, 0, 256)),
+                )
+                .await;
+            let hex = node.desc.address_hash.to_hex_string();
+            let tmp = TempDir::new("node-configured-pn");
+            let runtime = start_with_configured(&tmp, node.port, &[hex.to_uppercase()]).await;
+            assert!(runtime.propagation_nodes().select().is_err());
+            assert_eq!(
+                runtime.configured_propagation_nodes().hashes(),
+                std::slice::from_ref(&hex)
+            );
+
+            let slot = Arc::new(MeshSlot::default());
+            let syncs = Arc::new(SyncRequests::default());
+            slot.set_idle(syncs.clone());
+            slot.install(runtime.clone()).unwrap();
+
+            wait_until("the configured node to be filed", || {
+                runtime.propagation_nodes().holds(&hex, SystemTime::now())
+            })
+            .await;
+            wait_until("the join-time sync to be asked again", || {
+                syncs.0.load(Ordering::SeqCst) >= 2
+            })
+            .await;
+            assert_eq!(
+                runtime
+                    .propagation_nodes()
+                    .select_for_posting()
+                    .unwrap()
+                    .destination
+                    .address_hash
+                    .to_hex_string(),
+                hex
+            );
+
+            assert!(slot.stop().await.unwrap());
+            node.stop().await;
+        }
+
+        /// A configured hash whose path response carries no propagation announce, and
+        /// one nothing answers, are each told once however often they are asked for, and
+        /// neither is filed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_configured_hash_that_is_not_a_propagation_node_or_does_not_answer_is_told_once()
+        {
+            let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let not_a_node = node.desc.address_hash.to_hex_string();
+            let silent = crate::mesh::propagation::propagation_node_destination(
+                *TransportIdentity::new_from_rand(OsRng).as_identity(),
+            )
+            .address_hash
+            .to_hex_string();
+            let tmp = TempDir::new("node-configured-pn-unresolved");
+            let runtime =
+                start_with_configured(&tmp, node.port, &[not_a_node.clone(), silent.clone()]).await;
+
+            assert!(!runtime.resolve_configured_propagation_nodes().await);
+            assert!(!runtime.resolve_configured_propagation_nodes().await);
+
+            let now = SystemTime::now();
+            assert!(!runtime.propagation_nodes().holds(&not_a_node, now));
+            assert!(!runtime.propagation_nodes().holds(&silent, now));
+            let logs = crate::testing::info_snapshot();
+            let told = |needle: String| logs.iter().filter(|line| line.contains(&needle)).count();
+            assert_eq!(
+                told(format!(
+                    "Mesh configured propagation node {} answered its path request, but not as a propagation node; it is not filed",
+                    short(&not_a_node)
+                )),
+                1,
+                "{logs:#?}"
+            );
+            assert_eq!(
+                told(format!(
+                    "Mesh configured propagation node {} did not answer its path request within {} s; it is not filed",
+                    short(&silent),
+                    PATH_REQUEST_TIMEOUT.as_secs()
+                )),
+                1,
+                "{logs:#?}"
+            );
+
+            stop(&runtime).await;
             node.stop().await;
         }
 
@@ -20554,6 +21022,7 @@ mod tests {
                     delivered: 1,
                     held: 1,
                     skipped: 0,
+                    skip_reasons: Default::default(),
                 }
             );
             assert!(

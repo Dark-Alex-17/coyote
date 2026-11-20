@@ -133,6 +133,11 @@ pub struct MeshConfig {
     /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,
+    /// Destination hashes of propagation nodes this node asks the mesh for by path request
+    /// at join, and whenever its table holds none at a post or a sync, so it need not wait
+    /// for their next announce: a team relay that is also a propagation node, or a first
+    /// run before the node's hourly announce. Read in lower case.
+    pub propagation_nodes: Vec<String>,
     pub fetch: MeshFetch,
     pub envoy_memory: EnvoyMemoryConfig,
 }
@@ -275,6 +280,7 @@ impl Default for MeshConfig {
             request_timeout_secs: None,
             link_timeout_secs: None,
             propagation_sync_interval_secs: DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS,
+            propagation_nodes: Vec::new(),
             fetch: MeshFetch::default(),
             envoy_memory: EnvoyMemoryConfig::default(),
         }
@@ -289,6 +295,14 @@ impl MeshConfig {
     /// How often the automatic propagation sync runs, `None` while it is off.
     pub(crate) fn propagation_sync_every(&self) -> Option<Duration> {
         propagation_sync_every(self.propagation_sync_interval_secs, self.announce)
+    }
+
+    /// `propagation_nodes` in lower case, as the propagation node table keys them.
+    pub(crate) fn propagation_node_hashes(&self) -> Vec<String> {
+        self.propagation_nodes
+            .iter()
+            .map(|hash| hash.to_ascii_lowercase())
+            .collect()
     }
 
     /// Blank counts as unset and yields the built-in prompt.
@@ -385,6 +399,13 @@ impl MeshConfig {
             bail!(
                 "mesh.propagation_sync_interval_secs is {sync}, which is out of range; use 0 (manual) or up to {MAX_PROPAGATION_SYNC_INTERVAL_SECS} (one year)"
             );
+        }
+        for (i, hash) in self.propagation_nodes.iter().enumerate() {
+            if hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!(
+                    "mesh.propagation_nodes[{i}] is '{hash}', which is not a propagation node hash; use the 32 hex characters of the node's destination hash, as .mesh config show lists them"
+                );
+            }
         }
         let inline = self.fetch.inline_max_bytes;
         if !(1..=MAX_INLINE_FILE_TOTAL).contains(&inline) {
@@ -1510,6 +1531,42 @@ mod tests {
         assert_eq!(mesh.propagation_sync_every(), None);
         mesh.announce = true;
         assert_eq!(mesh.propagation_sync_every(), Some(Duration::from_secs(45)));
+    }
+
+    /// `propagation_nodes` defaults to none, takes 32 hex characters in either case and
+    /// reads them back in lower case; anything else is refused naming the entry.
+    #[test]
+    fn configured_propagation_nodes_are_hex_hashes_read_in_lower_case_and_others_refused() {
+        assert!(MeshConfig::default().propagation_nodes.is_empty());
+        let enabled = "mesh:\n  enabled: true\n  interfaces:\n    - {type: private, host: relay, port: 4242}\n";
+        let upper = "9AF2FD91".repeat(4);
+        let pinned: Config = serde_yaml::from_str(&format!(
+            "{enabled}  propagation_nodes: [{upper}, '{}']\n",
+            "0".repeat(32)
+        ))
+        .unwrap();
+        pinned.mesh.validate(true).unwrap();
+        assert_eq!(
+            pinned.mesh.propagation_node_hashes(),
+            ["9af2fd91".repeat(4), "0".repeat(32)]
+        );
+
+        for bad in [
+            "xyz",
+            &"a".repeat(31),
+            &"a".repeat(64),
+            &format!("{}g", "a".repeat(31)),
+        ] {
+            let mut mesh = pinned.mesh.clone();
+            mesh.propagation_nodes.push(bad.to_string());
+            let err = mesh.validate(true).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "mesh.propagation_nodes[2] is '{bad}', which is not a propagation node hash; use the 32 hex characters of the node's destination hash, as .mesh config show lists them"
+                )
+            );
+        }
     }
 
     /// The documented `0 = fetch only on .mesh sync` is a valid setting for an enabled

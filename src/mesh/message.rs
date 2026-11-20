@@ -1771,13 +1771,71 @@ impl Default for PeerSendOptions {
 /// What a farewell's fan-out came to within `FAREWELL_BUDGET`: how many trusted peers it
 /// was for, how many acknowledged it over a link, how many had it held by the
 /// propagation node, and how many were told nothing, the ones the budget cut off
-/// included.
+/// included. `skip_reasons` counts the skipped ones whose leg finished, by why.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FarewellOutcome {
     pub audience: usize,
     pub delivered: usize,
     pub held: usize,
     pub skipped: usize,
+    pub skip_reasons: FarewellSkips,
+}
+
+/// Why a farewell leg that finished told its peers nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FarewellSkip {
+    NoStoredKey,
+    NoPropagationNode,
+    PostFailed,
+    SendFailed,
+}
+
+/// How many trusted peers each `FarewellSkip` left untold.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FarewellSkips {
+    pub no_stored_key: usize,
+    pub no_propagation_node: usize,
+    pub post_failed: usize,
+    pub send_failed: usize,
+}
+
+impl FarewellSkips {
+    fn add(&mut self, reason: FarewellSkip, covers: usize) {
+        let count = match reason {
+            FarewellSkip::NoStoredKey => &mut self.no_stored_key,
+            FarewellSkip::NoPropagationNode => &mut self.no_propagation_node,
+            FarewellSkip::PostFailed => &mut self.post_failed,
+            FarewellSkip::SendFailed => &mut self.send_failed,
+        };
+        *count += covers;
+    }
+
+    /// The reasons for the summary line, as ` (no propagation node)` when one reason
+    /// accounts for all `skipped`, with a count per reason otherwise, and empty when
+    /// nothing finished as skipped.
+    pub(crate) fn summary(&self, skipped: usize) -> String {
+        let named: Vec<(usize, &str)> = [
+            (self.no_stored_key, "no stored key"),
+            (self.no_propagation_node, "no propagation node"),
+            (self.post_failed, "post failed"),
+            (self.send_failed, "send failed"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .collect();
+        match named.as_slice() {
+            [] => String::new(),
+            [(count, reason)] if *count == skipped => format!(" ({reason})"),
+            _ => format!(
+                " ({})",
+                named
+                    .iter()
+                    .map(|(count, reason)| format!("{count} {reason}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
 }
 
 /// Whether a message of `kind` carrying `fields` is a farewell: a bulletin whose
@@ -1955,6 +2013,24 @@ mod farewell_audience_tests {
                 ("03".to_string(), false, 1),
                 ("01".to_string(), false, 1),
             ]
+        );
+    }
+
+    /// One reason that covers every skipped peer reads bare; several, or one beside
+    /// legs the budget cut off, read with a count each.
+    #[test]
+    fn the_farewell_summary_names_each_skip_reason() {
+        let mut skips = FarewellSkips::default();
+        assert_eq!(skips.summary(0), "");
+        skips.add(FarewellSkip::NoPropagationNode, 1);
+        assert_eq!(skips.summary(1), " (no propagation node)");
+        assert_eq!(skips.summary(3), " (1 no propagation node)");
+        skips.add(FarewellSkip::NoStoredKey, 2);
+        skips.add(FarewellSkip::PostFailed, 1);
+        skips.add(FarewellSkip::SendFailed, 1);
+        assert_eq!(
+            skips.summary(5),
+            " (2 no stored key, 1 no propagation node, 1 post failed, 1 send failed)"
         );
     }
 }
@@ -2391,25 +2467,25 @@ impl MeshRuntime {
         };
         // Selected before queueing behind another post: a sender with no node to fall
         // back on is told so at once rather than after someone else's transfer.
-        let node =
-            self.propagation_nodes()
-                .select_for_posting()
-                .map_err(|_| match unreachable {
-                    Some(RequestError::Timeout { .. }) => {
-                        SendError::NoAnswer(self.no_answer(&destination))
-                    }
-                    _ => match departed {
-                        Some(Departure::Left(at)) => SendError::LeftNoPropagationNode {
-                            who: self
-                                .owner_namer()
-                                .who(self.identity_at(&destination).as_deref(), &destination)
-                                .to_string(),
-                            age: age_text(SystemTime::now(), at),
-                            destination: destination.clone(),
-                        },
-                        _ => SendError::NoPropagationNode,
-                    },
-                })?;
+        let selected = self.propagation_nodes().select_for_posting();
+        if selected.is_err() {
+            self.resolve_configured_propagation_nodes_in_background(|| {})
+                .await;
+        }
+        let node = selected.map_err(|_| match unreachable {
+            Some(RequestError::Timeout { .. }) => SendError::NoAnswer(self.no_answer(&destination)),
+            _ => match departed {
+                Some(Departure::Left(at)) => SendError::LeftNoPropagationNode {
+                    who: self
+                        .owner_namer()
+                        .who(self.identity_at(&destination).as_deref(), &destination)
+                        .to_string(),
+                    age: age_text(SystemTime::now(), at),
+                    destination: destination.clone(),
+                },
+                _ => SendError::NoPropagationNode,
+            },
+        })?;
         self.post_held(&desc, &node, message, &options.propagation, &why_not_direct)
             .await?;
         Ok(SendOutcome {
@@ -2578,27 +2654,38 @@ impl MeshRuntime {
             store_and_forward: true,
         };
         let (delivered, held) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let skip_reasons = Mutex::new(FarewellSkips::default());
         let fan_out = stream::iter(&legs).for_each_concurrent(FAREWELL_MAX_CONCURRENCY, |leg| {
-            let (delivered, held, message, transport) = (&delivered, &held, &message, &transport);
+            let (delivered, held, skip_reasons, message, transport) =
+                (&delivered, &held, &skip_reasons, &message, &transport);
             async move {
                 let via = if leg.direct {
                     self.send_peer_inner(&leg.peer.destination_hash, message, options)
                         .await
-                        .ok()
                         .map(|sent| sent.via)
+                        .map_err(|_| FarewellSkip::SendFailed)
                 } else {
                     let desc = match leg.peer.verified_destination() {
                         Some(desc) => Some(desc),
                         None => transport.destination_desc(&leg.hash).await,
                     };
-                    self.hold_farewell(desc, message, &options.propagation)
-                        .await
+                    self.hold_farewell(
+                        &leg.peer.destination_hash,
+                        desc,
+                        message,
+                        &options.propagation,
+                    )
+                    .await
                 };
                 match via {
-                    Some(PeerVia::Direct) => delivered.fetch_add(leg.covers, Ordering::Relaxed),
-                    Some(PeerVia::StoreAndForward) => held.fetch_add(leg.covers, Ordering::Relaxed),
-                    None => 0,
-                };
+                    Ok(PeerVia::Direct) => {
+                        delivered.fetch_add(leg.covers, Ordering::Relaxed);
+                    }
+                    Ok(PeerVia::StoreAndForward) => {
+                        held.fetch_add(leg.covers, Ordering::Relaxed);
+                    }
+                    Err(reason) => skip_reasons.lock().add(reason, leg.covers),
+                }
             }
         });
         let finished = tokio::time::timeout(FAREWELL_BUDGET, fan_out).await.is_ok();
@@ -2611,13 +2698,15 @@ impl MeshRuntime {
             delivered,
             held,
             skipped: audience - delivered - held,
+            skip_reasons: *skip_reasons.lock(),
         };
         debug!(
-            "Mesh farewell {} delivered to {}, held for {}, skipped {} of {} trusted peer(s){}",
+            "Mesh farewell {} delivered to {}, held for {}, skipped {}{} of {} trusted peer(s){}",
             message.id,
             outcome.delivered,
             outcome.held,
             outcome.skipped,
+            outcome.skip_reasons.summary(outcome.skipped),
             outcome.audience,
             if finished {
                 ""
@@ -2630,19 +2719,35 @@ impl MeshRuntime {
 
     /// Hands a farewell for an instance without a path to the propagation node on file,
     /// addressed by `desc`, the instance's stored key or the description the transport
-    /// still holds. `None` when there is neither, no node is filed, or the post failed.
+    /// still holds. Fails with why when there is neither, no node is filed, or the post
+    /// failed, each told at debug.
     async fn hold_farewell(
         &self,
+        destination: &str,
         desc: Option<DestinationDesc>,
         message: &OutboundPeer,
         options: &PropagationOptions,
-    ) -> Option<PeerVia> {
-        let desc = desc?;
-        let node = self.propagation_nodes().select_for_posting().ok()?;
-        self.post_held(&desc, &node, message, options, "no path is known")
+    ) -> Result<PeerVia, FarewellSkip> {
+        let dest8 = short(destination);
+        let Some(desc) = desc else {
+            debug!("Mesh farewell for {dest8} not held: no stored key or description for it");
+            return Err(FarewellSkip::NoStoredKey);
+        };
+        let Ok(node) = self.propagation_nodes().select_for_posting() else {
+            debug!("Mesh farewell for {dest8} not held: no propagation node is filed");
+            return Err(FarewellSkip::NoPropagationNode);
+        };
+        if let Err(err) = self
+            .post_held(&desc, &node, message, options, "no path is known")
             .await
-            .ok()?;
-        Some(PeerVia::StoreAndForward)
+        {
+            debug!(
+                "Mesh farewell for {dest8} not held: the post failed ({})",
+                redact_hashes(&err.to_string())
+            );
+            return Err(FarewellSkip::PostFailed);
+        }
+        Ok(PeerVia::StoreAndForward)
     }
 
     async fn report_send(

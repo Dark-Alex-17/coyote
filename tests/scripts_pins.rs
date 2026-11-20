@@ -1217,6 +1217,8 @@ fn relay_configs_explain_the_shared_instance_keys_and_leave_the_type_unset() {
 
 /// The matching-config snippet both relay scripts print after the diagnostics line is the
 /// bare `type: local` entry, with no `type: private` pointing at the 4242 listener.
+/// After it, a `--relay` run ends with one line pointing at `mesh.propagation_nodes`,
+/// printed only when a relay was given.
 #[test]
 fn relay_scripts_print_the_local_entry_as_the_matching_config() {
     let body = |name: &str, open: &str| -> String {
@@ -1247,6 +1249,15 @@ fn relay_scripts_print_the_local_entry_as_the_matching_config() {
         assert!(
             !snippet.contains("type: private"),
             "{name}'s matching-config snippet still carries `type: private`:\n{snippet}"
+        );
+        let pointer = "If that relay is also a propagation node, add its hash to mesh.propagation_nodes in config.yaml so this host files it at join; .mesh config show lists the nodes heard.";
+        let next = snippet
+            .rfind("Next: start coyote")
+            .unwrap_or_else(|| panic!("{name}'s next steps lack the Next line:\n{snippet}"));
+        assert!(
+            snippet.matches(pointer).count() == 1
+                && snippet.find(pointer).is_some_and(|at| at > next),
+            "{name}'s next steps do not end with the propagation-node pointer once:\n{snippet}"
         );
     }
 }

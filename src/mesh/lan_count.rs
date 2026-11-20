@@ -1,7 +1,8 @@
 //! How many other hosts the node's LAN interfaces reach, for the silent-LAN line and
 //! `.mesh status`. The in-process `lan` interface reads its discovery table through the
 //! transport; a `local` rnsd is asked over the RPC listener its shared instance opens,
-//! as rnstatus asks it, and its AutoInterfaces are summed.
+//! as rnstatus asks it, and its AutoInterfaces are summed. The same rnsd answer says
+//! whether rnsd sits on a TCP relay.
 
 use crate::mesh::redact_hashes;
 use async_trait::async_trait;
@@ -29,6 +30,8 @@ const DEFAULT_CONTROL_PORT: u16 = 37429;
 /// The class rnsd names an AutoInterface by. The per-host interfaces it spawns report
 /// another class, so only the parent entries are counted.
 const AUTO_INTERFACE_KIND: &str = "AutoInterface";
+/// The class rnsd names an outbound TCP connection by, a relay it dials.
+const TCP_CLIENT_INTERFACE_KIND: &str = "TCPClientInterface";
 /// The system-wide config dir rnsd and scripts/mesh-relay.sh look in first.
 const ETC_CONFIG_DIR: &str = "/etc/reticulum";
 
@@ -39,6 +42,29 @@ pub(crate) enum LanReading {
     Count(u64),
     /// The count could not be read this time.
     Unknown,
+}
+
+/// One read of every LAN interface: each one's reading, and whether the local rnsd
+/// reported a TCP client interface online.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LanReadings {
+    pub readings: Vec<LanReading>,
+    pub relay_online: bool,
+}
+
+/// One read of the local rnsd: its AutoInterfaces' summed count, `None` when it runs
+/// none, and whether any of its TCP client interfaces is online.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RnsdReading {
+    pub lan: Option<LanReading>,
+    pub relay_online: bool,
+}
+
+impl RnsdReading {
+    const UNKNOWN: Self = Self {
+        lan: Some(LanReading::Unknown),
+        relay_online: false,
+    };
 }
 
 /// How hard one read of the local rnsd tries.
@@ -66,13 +92,13 @@ pub(crate) fn known_host_total(readings: &[LanReading]) -> Option<u64> {
 /// Each LAN interface's reading: every in-process `lan` host channel in `lan_hosts`,
 /// then the local rnsd's AutoInterfaces when `rnsd` is set and runs any. A stopped
 /// transport reads nothing for its channels, since a stopped discovery leaves its last
-/// count behind.
+/// count behind. `relay_online` is the rnsd's, false without one.
 pub(crate) async fn lan_readings(
     transport: Option<&Transport>,
     lan_hosts: &[AddressHash],
     rnsd: Option<&RnsdLanReader>,
     effort: ReadEffort,
-) -> Vec<LanReading> {
+) -> LanReadings {
     let mut readings = Vec::new();
     if let Some(transport) = transport {
         for host in lan_hosts {
@@ -82,13 +108,19 @@ pub(crate) async fn lan_readings(
             });
         }
     }
+    let mut relay_online = false;
     if let Some(reader) = rnsd {
-        readings.extend(match effort {
+        let rnsd = match effort {
             ReadEffort::Patient => reader.read().await,
             ReadEffort::Quick => reader.read_quick().await,
-        });
+        };
+        readings.extend(rnsd.lan);
+        relay_online = rnsd.relay_online;
     }
-    readings
+    LanReadings {
+        readings,
+        relay_online,
+    }
 }
 
 /// Where the local rnsd's config dir is. `dir_override` is for tests, which point it at
@@ -212,11 +244,12 @@ fn resolve_target(
     Ok((rpc_endpoint(abstract_sockets, &settings, instance), key))
 }
 
-/// The interface kind and host count of one entry of rnsd's stats.
+/// The interface kind, host count and whether it is up, of one entry of rnsd's stats.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterfaceHosts {
     pub kind: String,
     pub hosts: Option<u64>,
+    pub online: bool,
 }
 
 /// Where rnsd's interface stats come from: its RPC listener, or a test's script.
@@ -247,6 +280,7 @@ impl LanStatsSource for SharedInstanceRpc {
             .map(|stat| InterfaceHosts {
                 kind: stat.kind,
                 hosts: stat.peers,
+                online: stat.online,
             })
             .collect())
     }
@@ -274,7 +308,7 @@ pub(crate) struct RnsdLanReader {
     target: Mutex<RpcTarget>,
     /// What the latest read that reached rnsd returned, for a quick read that finds
     /// another read under way.
-    last: parking_lot::Mutex<Option<LanReading>>,
+    last: parking_lot::Mutex<RnsdReading>,
 }
 
 impl RnsdLanReader {
@@ -301,26 +335,27 @@ impl RnsdLanReader {
             source,
             retry_wait,
             target: Mutex::new(RpcTarget::Unresolved),
-            last: parking_lot::Mutex::new(None),
+            last: parking_lot::Mutex::new(RnsdReading::default()),
         }
     }
 
-    /// The summed count of rnsd's AutoInterfaces; `None` when rnsd runs none, so it has
-    /// no LAN to count. A connect, a timeout or a dropped connection is tried again
-    /// `RPC_ATTEMPTS` times in all before this read is `Unknown`; a key rnsd refuses,
-    /// or a config that names none, makes every read of the run `Unknown` without a
-    /// call, and is told once at debug.
-    pub(crate) async fn read(&self) -> Option<LanReading> {
+    /// The summed count of rnsd's AutoInterfaces, `None` when rnsd runs none, so it has
+    /// no LAN to count, and whether a TCP client interface is online. A connect, a
+    /// timeout or a dropped connection is tried again `RPC_ATTEMPTS` times in all before
+    /// this read is `Unknown` with no relay online; a key rnsd refuses, or a config that
+    /// names none, makes every read of the run read so without a call, and is told once
+    /// at debug.
+    pub(crate) async fn read(&self) -> RnsdReading {
         self.read_with(ReadEffort::Patient).await
     }
 
     /// `read` for a command the user waits on: one call on `QUICK_RPC_BUDGET`, and the
     /// last read's result without a call while another read is asking rnsd.
-    pub(crate) async fn read_quick(&self) -> Option<LanReading> {
+    pub(crate) async fn read_quick(&self) -> RnsdReading {
         self.read_with(ReadEffort::Quick).await
     }
 
-    async fn read_with(&self, effort: ReadEffort) -> Option<LanReading> {
+    async fn read_with(&self, effort: ReadEffort) -> RnsdReading {
         let (attempts, budget) = match effort {
             ReadEffort::Patient => (RPC_ATTEMPTS, RPC_BUDGET),
             ReadEffort::Quick => (1, QUICK_RPC_BUDGET),
@@ -350,13 +385,18 @@ impl RnsdLanReader {
             };
         }
         let RpcTarget::Ready { dir, endpoint, key } = &*target else {
-            return Some(LanReading::Unknown);
+            return RnsdReading::UNKNOWN;
         };
         let mut attempt = 1;
         let err = loop {
             match self.source.interface_hosts(endpoint, key, budget).await {
                 Ok(entries) => {
-                    let reading = auto_interface_hosts(&entries);
+                    let reading = RnsdReading {
+                        lan: auto_interface_hosts(&entries),
+                        relay_online: entries
+                            .iter()
+                            .any(|entry| entry.kind == TCP_CLIENT_INTERFACE_KIND && entry.online),
+                    };
                     *self.last.lock() = reading;
                     return reading;
                 }
@@ -380,7 +420,7 @@ impl RnsdLanReader {
                 redact_hashes(&err.to_string())
             );
         }
-        Some(LanReading::Unknown)
+        RnsdReading::UNKNOWN
     }
 
     #[cfg(test)]
@@ -483,11 +523,19 @@ mod tests {
         InterfaceHosts {
             kind: kind.to_string(),
             hosts,
+            online: true,
         }
     }
 
     fn auto(hosts: u64) -> InterfaceHosts {
         entry(AUTO_INTERFACE_KIND, Some(hosts))
+    }
+
+    fn tcp_client(online: bool) -> InterfaceHosts {
+        InterfaceHosts {
+            online,
+            ..entry(TCP_CLIENT_INTERFACE_KIND, None)
+        }
     }
 
     fn refused() -> RpcError {
@@ -531,13 +579,64 @@ mod tests {
         let dir = keyed_dir("lan-count-zero");
         let source = Scripted::new([Ok(vec![entry("LocalServerInterface", None), auto(0)])]);
         let reader = reader_at(&dir.path, source.clone());
-        assert_eq!(reader.read().await, Some(LanReading::Count(0)));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Count(0)));
         assert_eq!(source.calls(), 1);
     }
 
+    /// rnsd on a TCP relay says so in the same stats: a `TCPClientInterface` online sets
+    /// the flag, one offline or a TCP server does not, and a quick read that finds
+    /// another read under way answers with the flag the last read saw.
+    #[tokio::test]
+    async fn the_reader_reports_whether_a_tcp_client_interface_is_online() {
+        let dir = keyed_dir("lan-count-tcp-client");
+        let source = Scripted::new([
+            Ok(vec![auto(0), tcp_client(true)]),
+            Ok(vec![
+                auto(0),
+                tcp_client(false),
+                entry("TCPServerInterface", None),
+            ]),
+            Ok(vec![tcp_client(true)]),
+        ]);
+        let reader = Arc::new(reader_at(&dir.path, source.clone()));
+        assert_eq!(
+            reader.read().await,
+            RnsdReading {
+                lan: Some(LanReading::Count(0)),
+                relay_online: true,
+            }
+        );
+        let held = source.gate.lock().await;
+        let patient = tokio::spawn({
+            let reader = reader.clone();
+            async move { reader.read().await }
+        });
+        while source.calls() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(reader.read_quick().await.relay_online, "the cached flag");
+        drop(held);
+        assert_eq!(
+            patient.await.unwrap(),
+            RnsdReading {
+                lan: Some(LanReading::Count(0)),
+                relay_online: false,
+            }
+        );
+        let readings = lan_readings(None, &[], Some(&*reader), ReadEffort::Patient).await;
+        assert_eq!(
+            readings,
+            LanReadings {
+                readings: Vec::new(),
+                relay_online: true,
+            },
+            "an rnsd with no AutoInterface still reports its relay"
+        );
+    }
+
     /// The rnsd's zero count reaches the silent-LAN check through the same readings the
-    /// watcher takes, and tells the line where the hosts-heard signal would not: a host
-    /// was heard and a `private` relay is configured.
+    /// watcher takes: it tells the line to a node that knows no peer and sits on no
+    /// relay, and not to one that does.
     #[tokio::test]
     async fn the_rnsd_zero_count_tells_the_silent_lan_line() {
         use crate::mesh::node::{LanVerdict, lan_silent_verdict};
@@ -547,13 +646,20 @@ mod tests {
         let grace = Duration::from_secs(120);
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
+        assert!(!readings.relay_online);
+        let readings = readings.readings;
         assert_eq!(readings, [LanReading::Count(0)]);
         assert_eq!(
-            lan_silent_verdict(grace, &readings, true, true),
+            lan_silent_verdict(grace, &readings, false, false),
             LanVerdict::Tell
+        );
+        assert_eq!(
+            lan_silent_verdict(grace, &readings, true, true),
+            LanVerdict::Settle
         );
 
         let readings = lan_readings(None, &[], Some(&reader), ReadEffort::Patient).await;
+        let readings = readings.readings;
         assert_eq!(readings, [LanReading::Count(1)]);
         assert_eq!(
             lan_silent_verdict(grace, &readings, false, false),
@@ -571,7 +677,7 @@ mod tests {
             entry("TCPServerInterface", Some(9)),
         ])]);
         let reader = reader_at(&dir.path, source);
-        assert_eq!(reader.read().await, Some(LanReading::Count(3)));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Count(3)));
     }
 
     #[tokio::test]
@@ -582,7 +688,7 @@ mod tests {
             entry("TCPServerInterface", None),
         ])]);
         let reader = reader_at(&dir.path, source);
-        assert_eq!(reader.read().await, None);
+        assert_eq!(reader.read().await, RnsdReading::default());
     }
 
     #[tokio::test]
@@ -590,7 +696,7 @@ mod tests {
         let dir = keyed_dir("lan-count-no-count");
         let source = Scripted::new([Ok(vec![auto(2), entry(AUTO_INTERFACE_KIND, None)])]);
         let reader = reader_at(&dir.path, source);
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Unknown));
     }
 
     #[tokio::test]
@@ -598,7 +704,7 @@ mod tests {
         let dir = keyed_dir("lan-count-retry");
         let source = Scripted::new([Err(refused()), Err(refused()), Ok(vec![auto(2)])]);
         let reader = reader_at(&dir.path, source.clone());
-        assert_eq!(reader.read().await, Some(LanReading::Count(2)));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Count(2)));
         assert_eq!(source.calls(), 3);
         assert_eq!(*source.budgets.lock(), [RPC_BUDGET; 3]);
         assert!(!reader.unavailable().await);
@@ -611,9 +717,9 @@ mod tests {
         let dir = keyed_dir("lan-count-quick");
         let source = Scripted::new([Err(refused()), Ok(vec![auto(2)])]);
         let reader = reader_at(&dir.path, source.clone());
-        assert_eq!(reader.read_quick().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read_quick().await, RnsdReading::UNKNOWN);
         assert_eq!(*source.budgets.lock(), [QUICK_RPC_BUDGET]);
-        assert_eq!(reader.read_quick().await, Some(LanReading::Count(2)));
+        assert_eq!(reader.read_quick().await.lan, Some(LanReading::Count(2)));
         assert_eq!(source.calls(), 2);
         assert!(!reader.unavailable().await);
     }
@@ -625,7 +731,7 @@ mod tests {
         let dir = keyed_dir("lan-count-quick-busy");
         let source = Scripted::new([Ok(vec![auto(3)]), Ok(vec![auto(1)]), Ok(vec![auto(0)])]);
         let reader = Arc::new(reader_at(&dir.path, source.clone()));
-        assert_eq!(reader.read_quick().await, Some(LanReading::Count(3)));
+        assert_eq!(reader.read_quick().await.lan, Some(LanReading::Count(3)));
         let held = source.gate.lock().await;
         let patient = tokio::spawn({
             let reader = reader.clone();
@@ -634,11 +740,11 @@ mod tests {
         while source.calls() < 2 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(reader.read_quick().await, Some(LanReading::Count(3)));
+        assert_eq!(reader.read_quick().await.lan, Some(LanReading::Count(3)));
         assert_eq!(source.calls(), 2);
         drop(held);
-        assert_eq!(patient.await.unwrap(), Some(LanReading::Count(1)));
-        assert_eq!(reader.read_quick().await, Some(LanReading::Count(0)));
+        assert_eq!(patient.await.unwrap().lan, Some(LanReading::Count(1)));
+        assert_eq!(reader.read_quick().await.lan, Some(LanReading::Count(0)));
         assert_eq!(source.calls(), 3);
     }
 
@@ -652,10 +758,10 @@ mod tests {
             Ok(vec![auto(0)]),
         ]);
         let reader = reader_at(&dir.path, source.clone());
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
         assert_eq!(source.calls(), 3);
         assert!(!reader.unavailable().await);
-        assert_eq!(reader.read().await, Some(LanReading::Count(0)));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Count(0)));
         assert_eq!(source.calls(), 4);
     }
 
@@ -668,11 +774,11 @@ mod tests {
             Ok(vec![auto(1)]),
         ]);
         let reader = reader_at(&dir.path, source.clone());
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
         assert_eq!(source.calls(), 1);
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
         assert_eq!(source.calls(), 2);
-        assert_eq!(reader.read().await, Some(LanReading::Count(1)));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Count(1)));
     }
 
     /// A refused key stays refused, so it is told once at debug and not asked again.
@@ -690,9 +796,9 @@ mod tests {
             let dir = keyed_dir(tag);
             let source = Scripted::new([Err(err)]);
             let reader = reader_at(&dir.path, source.clone());
-            assert_eq!(reader.read().await, Some(LanReading::Unknown), "{tag}");
+            assert_eq!(reader.read().await, RnsdReading::UNKNOWN, "{tag}");
             assert!(reader.unavailable().await, "{tag}");
-            assert_eq!(reader.read().await, Some(LanReading::Unknown), "{tag}");
+            assert_eq!(reader.read().await, RnsdReading::UNKNOWN, "{tag}");
             assert_eq!(source.calls(), 1, "{tag}");
             assert_eq!(unavailable_lines(&dir.path), 1, "{tag}");
         }
@@ -705,8 +811,8 @@ mod tests {
         let dir = root.path.join("reticulum");
         let source = Scripted::new([]);
         let reader = reader_at(&dir, source.clone());
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
         assert!(reader.unavailable().await);
         assert_eq!(source.calls(), 0);
         assert_eq!(unavailable_lines(&dir), 1);
@@ -720,7 +826,7 @@ mod tests {
         );
         let source = Scripted::new([]);
         let reader = reader_at(&dir.path, source.clone());
-        assert_eq!(reader.read().await, Some(LanReading::Unknown));
+        assert_eq!(reader.read().await, RnsdReading::UNKNOWN);
         assert!(reader.unavailable().await);
         assert_eq!(source.calls(), 0);
     }
@@ -735,7 +841,7 @@ mod tests {
         fs::write(dir.path.join("storage/transport_identity"), [7u8; 64]).unwrap();
         let source = Scripted::new([Ok(vec![auto(4)])]);
         let reader = reader_at(&dir.path, source);
-        assert_eq!(reader.read().await, Some(LanReading::Count(4)));
+        assert_eq!(reader.read().await.lan, Some(LanReading::Count(4)));
     }
 
     #[test]

@@ -20,11 +20,11 @@ use rns_transport::destination::DestinationDesc;
 use rns_transport::identity::Identity;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Upper bound on remembered propagation nodes; the least recently heard is evicted first.
 /// A mesh runs a handful of nodes, not hundreds: every one stores every message for every
@@ -40,6 +40,9 @@ pub(crate) const PROPAGATION_NODE_TTL: Duration = Duration::from_secs(4 * 360 * 
 pub(crate) const PROPAGATION_NODE_TABLE_VERSION: u64 = 1;
 
 pub(crate) const PROPAGATION_NODE_TABLE_FILE: &str = "propagation-nodes.json";
+/// The shortest gap between two rounds of path requests for the configured propagation
+/// nodes.
+pub(crate) const CONFIGURED_NODE_ASK_GAP: Duration = Duration::from_secs(60);
 
 /// `propagation-nodes.json` whole: the version first, then the nodes.
 #[derive(Serialize, Deserialize)]
@@ -386,6 +389,82 @@ impl PropagationNodeTable {
     pub(crate) fn snapshot(&self) -> Vec<PropagationNodeRecord> {
         self.inner.lock().values().cloned().collect()
     }
+
+    /// Whether the node at `destination_hex`, a lower-case hash, is on file and not aged
+    /// out at `now`.
+    pub(crate) fn holds(&self, destination_hex: &str, now: SystemTime) -> bool {
+        self.inner
+            .lock()
+            .get(destination_hex)
+            .is_some_and(|record| !record.is_expired(now))
+    }
+}
+
+/// The propagation nodes the owner lists in `mesh.propagation_nodes`, which the node asks
+/// the mesh for by path request whenever the table does not hold them.
+#[derive(Default)]
+pub(crate) struct ConfiguredPropagationNodes {
+    hashes: Vec<String>,
+    /// Set while a round of path requests is out, so a post or a sync that finds the
+    /// table empty meanwhile does not send a second one.
+    resolving: AtomicBool,
+    /// When the latest round began, so a sync retrying every few seconds with no node
+    /// filed asks at most once per `CONFIGURED_NODE_ASK_GAP`.
+    last_round: Mutex<Option<Instant>>,
+    /// The hashes already logged as unresolved in this run.
+    told: Mutex<HashSet<String>>,
+}
+
+/// One round of path requests for the configured nodes; the next may start once it is
+/// dropped.
+pub(crate) struct ResolvingRound<'a>(&'a AtomicBool);
+
+impl Drop for ResolvingRound<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl ConfiguredPropagationNodes {
+    /// `hashes` lower case, as `MeshConfig::propagation_node_hashes` reads them.
+    pub(crate) fn new(hashes: Vec<String>) -> Self {
+        Self {
+            hashes,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn hashes(&self) -> &[String] {
+        &self.hashes
+    }
+
+    /// The configured hashes `table` does not hold at `now`.
+    pub(crate) fn missing(&self, table: &PropagationNodeTable, now: SystemTime) -> Vec<String> {
+        self.hashes
+            .iter()
+            .filter(|hash| !table.holds(hash, now))
+            .cloned()
+            .collect()
+    }
+
+    /// The round of path requests beginning at `now`, `None` while another is out or
+    /// when one began within `CONFIGURED_NODE_ASK_GAP`.
+    pub(crate) fn begin_round(&self, now: Instant) -> Option<ResolvingRound<'_>> {
+        let mut last_round = self.last_round.lock();
+        if last_round
+            .is_some_and(|last| now.saturating_duration_since(last) < CONFIGURED_NODE_ASK_GAP)
+            || self.resolving.swap(true, Ordering::AcqRel)
+        {
+            return None;
+        }
+        *last_round = Some(now);
+        Some(ResolvingRound(&self.resolving))
+    }
+
+    /// Whether `hash` is unresolved for the first time in this run, so it is logged once.
+    pub(crate) fn first_telling(&self, hash: &str) -> bool {
+        self.told.lock().insert(hash.to_string())
+    }
 }
 
 /// Reads the version alone first so a file from another layout is refused by its version
@@ -507,6 +586,38 @@ mod persisted_table_tests {
             far_record.node.destination.identity.to_hex_string(),
             far.destination.identity.to_hex_string()
         );
+    }
+
+    /// A node loaded from the file is picked for a fetch and for a post exactly as by the
+    /// table that heard it, and is held until it ages out.
+    #[test]
+    fn a_node_loaded_from_disk_is_picked_for_fetch_and_post_as_the_heard_one_is() {
+        let tmp = TempDir::new("pn-table-loaded-picks");
+        let heard = load_now(&tmp).unwrap();
+        let mut near = node();
+        near.propagation_enabled = false;
+        let far = node();
+        heard.observe(near.clone(), 1, t(100));
+        heard.observe(far.clone(), 3, t(200));
+        heard.persist_if_dirty().unwrap();
+
+        let loaded = load_now(&tmp).unwrap();
+
+        let now = SystemTime::now();
+        for (label, table) in [("heard", &heard), ("loaded", &loaded)] {
+            assert_eq!(hex(&table.select().unwrap()), hex(&near), "{label}");
+            assert_eq!(
+                hex(&table.select_for_posting().unwrap()),
+                hex(&far),
+                "{label}"
+            );
+            assert!(table.holds(&hex(&far), now), "{label}");
+            assert!(!table.holds(&hex(&node()), now), "{label}");
+            assert!(
+                !table.holds(&hex(&far), t(200) + PROPAGATION_NODE_TTL),
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -1036,5 +1147,46 @@ mod tests {
                 .any(|line| line.starts_with(&ignored)),
             "no debug line starting {ignored:?}"
         );
+    }
+
+    /// The configured hashes the table does not hold are the ones asked for; one round
+    /// of asking runs at a time, at most one per `CONFIGURED_NODE_ASK_GAP`, and each
+    /// unresolved hash is told once.
+    #[test]
+    fn configured_nodes_the_table_lacks_are_asked_for_one_round_at_a_time_and_told_once() {
+        let table = PropagationNodeTable::new();
+        let filed = node(true);
+        table.observe(filed.clone(), 1, SystemTime::now());
+        let unresolved = "ab".repeat(16);
+        let configured = ConfiguredPropagationNodes::new(vec![hex(&filed), unresolved.clone()]);
+        assert_eq!(configured.hashes(), [hex(&filed), unresolved.clone()]);
+        assert_eq!(
+            configured.missing(&table, SystemTime::now()),
+            std::slice::from_ref(&unresolved)
+        );
+        assert!(
+            ConfiguredPropagationNodes::default()
+                .missing(&table, SystemTime::now())
+                .is_empty()
+        );
+
+        let t0 = Instant::now();
+        let round = configured.begin_round(t0).expect("no round is out");
+        let later = t0 + CONFIGURED_NODE_ASK_GAP;
+        assert!(
+            configured.begin_round(later).is_none(),
+            "one round at a time"
+        );
+        drop(round);
+        assert!(
+            configured
+                .begin_round(later - Duration::from_secs(1))
+                .is_none(),
+            "not within the gap"
+        );
+        assert!(configured.begin_round(later).is_some(), "the gap is up");
+
+        assert!(configured.first_telling(&unresolved));
+        assert!(!configured.first_telling(&unresolved));
     }
 }

@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -69,6 +69,9 @@ pub(crate) struct CardCadence {
     /// The node's one `STATUS_MAX_CONCURRENCY` cap, shared by the background fetches and
     /// a `mesh__peers` listing with its cards.
     permits: Arc<Semaphore>,
+    /// Woken when a fetch is deferred, so `drive_card_cadence` sleeps until the new
+    /// earliest one.
+    deferred_changed: Arc<Notify>,
     /// Added to the clock, so a test can let hours pass at once.
     #[cfg(test)]
     skew: Mutex<Duration>,
@@ -97,6 +100,9 @@ struct CadenceState {
     /// out before the contact is known to be out of date: the contact came while the ask
     /// was waiting for its answer and found no stop to lift.
     contacted: HashMap<String, Instant>,
+    /// The one fetch per destination that the interval held back, with when it is due
+    /// and the trigger it fires as.
+    deferred: HashMap<String, (Instant, CardTrigger)>,
 }
 
 impl Default for CardCadence {
@@ -106,6 +112,7 @@ impl Default for CardCadence {
             refusals: None,
             write_lock: Mutex::new(()),
             permits: Arc::new(Semaphore::new(STATUS_MAX_CONCURRENCY)),
+            deferred_changed: Arc::new(Notify::new()),
             #[cfg(test)]
             skew: Mutex::default(),
             #[cfg(test)]
@@ -162,7 +169,8 @@ impl CardCadence {
     /// trust change on this side and a contact one on the other side, so both lift a
     /// refusal first. Only the first time a session is heard in a run counts, and no
     /// destination is asked twice within `CARD_FETCH_MIN_INTERVAL`, but for a contact
-    /// that lifted a refusal.
+    /// that lifted a refusal. A `Reheard` or `OwnerGranted` the interval holds back is
+    /// deferred until the interval lapses, replacing any fetch deferred before it.
     pub(crate) fn admit(&self, destination: &str, trigger: CardTrigger, served: bool) -> bool {
         let now = self.now();
         let order = (!matches!(trigger, CardTrigger::Heard | CardTrigger::Reheard))
@@ -192,8 +200,12 @@ impl CardCadence {
             }
         };
         let admitted = Self::admits(&mut state, destination, trigger, served, now);
+        let deferred = state.deferred.contains_key(destination);
         if lifted && let Some(order) = order {
             self.save_refusals(order, state);
+        }
+        if deferred && !admitted {
+            self.deferred_changed.notify_one();
         }
         admitted
     }
@@ -213,14 +225,19 @@ impl CardCadence {
         if (!served && !asks_unserved) || state.refused.contains(destination) {
             return false;
         }
-        if state
-            .last_asked
-            .get(destination)
-            .is_some_and(|last| now.saturating_duration_since(*last) < CARD_FETCH_MIN_INTERVAL)
+        if let Some(last) = state.last_asked.get(destination).copied()
+            && now.saturating_duration_since(last) < CARD_FETCH_MIN_INTERVAL
         {
+            if matches!(trigger, CardTrigger::Reheard | CardTrigger::OwnerGranted) {
+                state.deferred.insert(
+                    destination.to_string(),
+                    (last + CARD_FETCH_MIN_INTERVAL, trigger),
+                );
+            }
             return false;
         }
         state.last_asked.insert(destination.to_string(), now);
+        state.deferred.remove(destination);
         true
     }
 
@@ -253,6 +270,7 @@ impl CardCadence {
             return true;
         }
         if state.refused.insert(destination.to_string()) {
+            state.deferred.remove(destination);
             self.save_refusals(order, state);
         }
         false
@@ -278,6 +296,7 @@ impl CardCadence {
         state.last_asked.remove(destination);
         state.contact_skipped.remove(destination);
         state.contacted.remove(destination);
+        state.deferred.remove(destination);
         if state.refused.remove(destination) {
             self.save_refusals(order, state);
         }
@@ -347,6 +366,38 @@ impl CardCadence {
         self.state.lock().refused.contains(destination)
     }
 
+    /// The session said it is leaving: a fetch deferred for it no longer goes out.
+    pub(crate) fn drop_deferred(&self, destination: &str) {
+        self.state.lock().deferred.remove(destination);
+    }
+
+    /// How long until the earliest deferred fetch is due, `None` when none is held.
+    fn next_due_in(&self) -> Option<Duration> {
+        let now = self.now();
+        self.state
+            .lock()
+            .deferred
+            .values()
+            .map(|(due_at, _)| due_at.saturating_duration_since(now))
+            .min()
+    }
+
+    /// Takes every deferred fetch that is due, with the trigger each fires as.
+    pub(crate) fn take_due(&self) -> Vec<(String, CardTrigger)> {
+        let now = self.now();
+        let mut state = self.state.lock();
+        let due: Vec<(String, CardTrigger)> = state
+            .deferred
+            .iter()
+            .filter(|(_, (due_at, _))| *due_at <= now)
+            .map(|(destination, (_, trigger))| (destination.clone(), *trigger))
+            .collect();
+        for (destination, _) in &due {
+            state.deferred.remove(destination);
+        }
+        due
+    }
+
     /// Forgets that `destination` was heard, as a new run starts out.
     #[cfg(all(test, unix))]
     pub(crate) fn forget_heard(&self, destination: &str) {
@@ -401,15 +452,39 @@ impl SiblingTrustSink for CardStopsOnSiblingTrust {
 
 /// Turns each grant into a background card fetch of every session it covers that the
 /// peer table holds: the one destination of a destination grant, every session of the
-/// identity for an identity grant.
+/// identity for an identity grant. Fires each fetch the interval deferred once it is due.
 pub(crate) async fn drive_card_cadence(
     mut grants: mpsc::UnboundedReceiver<TrustGranted>,
     runtime: Weak<MeshRuntime>,
     cancel: CancellationToken,
 ) {
+    let Some(deferred_changed) = runtime
+        .upgrade()
+        .map(|runtime| runtime.card_cadence().deferred_changed.clone())
+    else {
+        return;
+    };
     loop {
+        // A runtime that is gone has nothing due; its stop cancels this loop.
+        let due_in = runtime
+            .upgrade()
+            .and_then(|runtime| runtime.card_cadence().next_due_in());
         let grant = tokio::select! {
             () = cancel.cancelled() => break,
+            () = deferred_changed.notified() => continue,
+            () = tokio::time::sleep(due_in.unwrap_or_default()), if due_in.is_some() => {
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                for (destination, trigger) in runtime.card_cadence().take_due() {
+                    debug!(
+                        "Mesh background status card for {} ({trigger:?}): the interval has lapsed, asking now",
+                        short(&destination)
+                    );
+                    runtime.consider_card_fetch(&destination, trigger);
+                }
+                continue;
+            }
             grant = grants.recv() => match grant {
                 Some(grant) => grant,
                 None => break,
@@ -683,6 +758,74 @@ mod tests {
         cadence.refused(D);
         cadence.advance(CARD_FETCH_MIN_INTERVAL);
         assert!(!cadence.admit(D, CardTrigger::Reheard, false));
+    }
+
+    /// The case a restart under new names makes: the session is fetched, then heard
+    /// again 95 s later. The fetch the interval holds back goes out when it lapses, at
+    /// t0 + 600 s, not sooner, and once.
+    #[test]
+    fn a_reheard_inside_the_interval_is_fetched_once_when_it_lapses() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::Granted, true));
+        cadence.advance(Duration::from_secs(95));
+        assert!(!cadence.admit(D, CardTrigger::Reheard, false));
+        let due_in = cadence.next_due_in().expect("the fetch is deferred");
+        assert!(
+            due_in <= Duration::from_secs(505) && due_in > Duration::from_secs(504),
+            "due at t0 + 600 s: {due_in:?}"
+        );
+        cadence.advance(CARD_FETCH_MIN_INTERVAL - Duration::from_secs(96));
+        assert!(cadence.take_due().is_empty(), "not due a second early");
+        cadence.advance(Duration::from_secs(1));
+        let due = cadence.take_due();
+        assert_eq!(due, [(D.to_string(), CardTrigger::Reheard)]);
+        assert!(cadence.admit(&due[0].0, due[0].1, false));
+        assert!(cadence.take_due().is_empty(), "it fires once");
+        assert_eq!(cadence.next_due_in(), None);
+    }
+
+    /// One deferred fetch per destination: a later trigger replaces it, a fetch that
+    /// goes out in the meantime or a refusal drops it, and so does the session leaving.
+    #[test]
+    fn a_deferred_fetch_is_replaced_by_a_later_trigger_and_dropped_by_a_refusal_or_a_leave() {
+        let cadence = CardCadence::default();
+        assert!(cadence.admit(D, CardTrigger::Reheard, false));
+        assert!(!cadence.admit(D, CardTrigger::Reheard, false));
+        assert!(!cadence.admit(D, CardTrigger::OwnerGranted, false));
+        assert!(
+            !cadence.admit(D, CardTrigger::Heard, true),
+            "a first hearing is not deferred and leaves the deferred fetch as it is"
+        );
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert_eq!(
+            cadence.take_due(),
+            [(D.to_string(), CardTrigger::OwnerGranted)]
+        );
+
+        assert!(cadence.admit(D, CardTrigger::OwnerGranted, false));
+        assert!(!cadence.admit(D, CardTrigger::Reheard, false));
+        cadence.refused(D);
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(cadence.take_due().is_empty(), "a refusal drops it");
+
+        let other = "e".repeat(32);
+        assert!(cadence.admit(&other, CardTrigger::Reheard, false));
+        assert!(!cadence.admit(&other, CardTrigger::Reheard, false));
+        cadence.drop_deferred(&other);
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(cadence.take_due().is_empty(), "a leave drops it");
+
+        assert!(cadence.admit(&other, CardTrigger::Reheard, false));
+        assert!(!cadence.admit(&other, CardTrigger::Reheard, false));
+        cadence.advance(CARD_FETCH_MIN_INTERVAL);
+        assert!(
+            cadence.admit(&other, CardTrigger::Reheard, false),
+            "a fetch that goes out once the interval lapses"
+        );
+        assert!(
+            cadence.take_due().is_empty(),
+            "takes the deferred one's place"
+        );
     }
 
     #[test]
