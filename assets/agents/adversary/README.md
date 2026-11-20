@@ -76,7 +76,7 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   `candidate tree dirty`. Snapshot runs are never saved to `coyote-baselines`.
 - Each run record carries a `pass_condition`: `stated` when no criterion or request line naming
   the command says it passes or exits 0 and at least one positively states another condition
-  ("prints nothing", "no output", "is empty", "absent", "does not exist", "exits 1", "fails"),
+  ("prints nothing", "no output", "is empty", "absent", "does not exist", "exits 1"),
   otherwise `exit 0`. A command named nowhere (the caller's build/test/lint contract) or only in
   passing ("Verification commands: `x`") is held to exit 0. The
   verdict recomputes it from the criteria and the request, never from the record. A red run held to
