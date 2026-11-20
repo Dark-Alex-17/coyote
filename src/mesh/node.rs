@@ -1846,7 +1846,7 @@ impl MeshRuntime {
     }
 
     /// One round of `resolve_configured_nodes`, waited on. Whether a node was filed.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn resolve_configured_propagation_nodes(&self) -> bool {
         let Some(transport) = self.transport_handle().await else {
             return false;
