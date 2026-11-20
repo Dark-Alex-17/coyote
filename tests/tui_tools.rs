@@ -22,7 +22,7 @@ mod binary_tools {
     //! screen's hint. The transcript printed when the UI leaves is checked in
     //! `binary_exit` in `tui_lifecycle_and_signals.rs`.
     //! Each case runs the binary on a pseudo-terminal under a bash wrapper
-    //! that reports the exit code and `stty -a` afterwards, so the file is
+    //! that reports the exit code and `stty -a` afterwards, so the module is
     //! unix-only. The cases run one at a time: each spawn forks a session
     //! leader and takes a controlling tty, and a fork landing between another
     //! test's `openpty` and its `exec` has failed the spawn with a garbled
@@ -2508,7 +2508,7 @@ mod bottom_pane {
     //! and command colours as the terminal sees them, and the three prompt
     //! modals a tool can ask for through the prompt channel (select, checkbox,
     //! password). Colours and backgrounds are read from the raw escape stream,
-    //! so the file runs the binary on a pseudo-terminal and is unix-only. The
+    //! so the module runs the binary on a pseudo-terminal and is unix-only. The
     //! cases run one at a time: each spawn forks a session leader and takes a
     //! controlling tty.
     use std::fs;
@@ -3077,7 +3077,7 @@ mod binary {
     //! answers and clipped questions, fenced and editor-backed commands, the
     //! `!shell` arm, and the pty harness's own escape stripper. Each case
     //! runs the binary on a pseudo-terminal under a bash wrapper that reports
-    //! the exit code and `stty -a` afterwards, so the file is unix-only. How
+    //! the exit code and `stty -a` afterwards, so the module is unix-only. How
     //! the UI starts, leaves and hands the terminal back lives in
     //! `binary_lifecycle` in `tui_lifecycle_and_signals.rs`; the command
     //! menus' modals, the plain REPL's
@@ -3103,7 +3103,7 @@ mod binary {
 
     /// A tool that marks its start at `<marker>-started`, then waits (at most
     /// eight seconds) for `<marker>-release` to appear before finishing.
-    const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    const MARKED_SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
     # @option --marker! Path prefix for the start and release files.\n\
@@ -3247,7 +3247,7 @@ mod binary {
             Reply::Text("third reply m8n".to_string()),
         ]);
         write_fake_llm_config(&dir, &fake);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", MARKED_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -3321,7 +3321,7 @@ mod binary {
             Reply::Text("fixture done after sigterm".to_string()),
         ]);
         write_fake_llm_config(&dir, &fake);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", MARKED_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
         let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();

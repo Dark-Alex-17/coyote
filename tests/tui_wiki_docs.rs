@@ -1099,6 +1099,7 @@ fn tui_page_quotes_the_code() {
     let run_loop_source = src(&["tui", "run_loop.rs"]);
     let run_loop = production(&run_loop_source);
     let rewind_source = src(&["tui", "rewind.rs"]);
+    let rewind_code = production(&rewind_source);
     let main_source = src(&["main.rs"]);
     let main = production(&main_source);
     let no_tty = string_literals(&fn_body(run_loop, "pub fn ensure_tty("));
@@ -1135,7 +1136,7 @@ fn tui_page_quotes_the_code() {
     assert_eq!(footer, ["agents <n>", "jobs <n>", "no session"]);
     let bottom = src(&["tui", "bottom_pane.rs"]);
     let search = const_str(&bottom, "SEARCH_LABEL");
-    let rewind = literal_with(&rewind_source, "Rewind stops at the last ");
+    let rewind = literal_with(rewind_code, "Rewind stops at the last ");
     let barriers = string_literals(&fn_body(&cells, "pub(crate) fn kind_name("));
     assert_eq!(barriers.len(), 2);
     let roster_empty = const_str(&src(&["tui", "roster.rs"]), "EMPTY");
@@ -1145,7 +1146,7 @@ fn tui_page_quotes_the_code() {
     let welcome_keys = literal_with(production(&cells), "Empty prompt: ")
         .replace("{}{}", &format!(".{keys_command}"));
     let normal = const_str(&src(&["tui", "composer.rs"]), "NORMAL_TAG");
-    for (source, gap) in [(tui, "HOTKEY_IDLE"), (&rewind_source, "REWIND_ESC_GAP")] {
+    for (source, gap) in [(tui, "HOTKEY_IDLE"), (rewind_code, "REWIND_ESC_GAP")] {
         assert_eq!(const_expr(source, gap), "Duration::from_secs(1)", "{gap}");
     }
     assert_eq!(const_expr(tui, "FULL_OUTPUT_LIMIT"), "4 * 1024 * 1024");

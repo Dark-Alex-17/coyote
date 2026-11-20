@@ -1,5 +1,5 @@
 //! Real-process checks of the composer and the queue: readline and
-//! text-field keys, the key-help overlay, chords and its discovery hints,
+//! text-field keys, the key-help overlay with its chords and discovery hints,
 //! the queue under vi keys and headless runs, the external editor, the
 //! status line and history reset. Every module drives the binary
 //! through the shared pty harness in `common`, so the file is
@@ -13,7 +13,7 @@ mod queue_vi_and_headless {
     //! vi layer, the command highlight, Ctrl+R, backtick document commands and
     //! the headless prompter's refusal: the built binary on a pseudo-terminal
     //! and a scripted fake model where a turn has to be held open. Unix-only
-    //! and serial like its sibling pty suites.
+    //! and serial like its sibling pty modules.
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -734,7 +734,7 @@ mod readline_and_text_field_keys {
     //! `?` is typed rather than opening the key help, F1-F12 type nothing, and
     //! Ctrl+X shows the todo panel without eating the field's text or closing
     //! the question. Each case runs the binary on a pseudo-terminal, so the
-    //! file is unix-only, and the cases run one at a time.
+    //! module is unix-only, and the cases run one at a time.
     use std::time::Duration;
 
     use super::common::pty::Pty;
@@ -933,7 +933,7 @@ mod key_help_and_chords {
     //! help and the pager as they are; `?` in the history search band opens no
     //! help; under a Select modal Ctrl+X shows the todo panel while Alt+T,
     //! Ctrl+G, `?` and the function keys do nothing; the palette does not offer
-    //! `.keys`. Each case runs the binary on a pseudo-terminal, so the file is
+    //! `.keys`. Each case runs the binary on a pseudo-terminal, so the module is
     //! unix-only, and the cases run one at a time.
     use std::time::Duration;
 
@@ -1274,7 +1274,6 @@ mod key_help_and_chords {
     // the palette never offering `.keys`.
     // ---------------------------------------------------------------------
 
-    const CTRL_R: &[u8] = b"\x12";
     const CTRL_T: &[u8] = b"\x14";
     /// The pager's header for the root thread.
     const PAGER_MARK: &str = "Thread: root thread";
@@ -1471,7 +1470,7 @@ mod key_help_discovery {
     //! draft are sent as typed rather than opening the help; and function
     //! keys held with a modifier (Shift+F1, Ctrl+F2, Alt+F4, Ctrl+F5,
     //! Shift+F12) do nothing and leave no escape debris. Each case runs the
-    //! binary on a pseudo-terminal, so the file is unix-only, and the cases
+    //! binary on a pseudo-terminal, so the module is unix-only, and the cases
     //! run one at a time.
     use std::time::Duration;
 
@@ -1640,7 +1639,7 @@ mod editor_status_history_reset_and_bare_agent {
     //! headless creation gate for `.role <new>` / `.macro <new>` speaks one
     //! sentence skeleton shared with the headless prompter's refusal. The
     //! built binary on a pseudo-terminal, a scripted fake model where a tool
-    //! round is needed. Unix-only and serial like its sibling pty suites.
+    //! round is needed. Unix-only and serial like its sibling pty modules.
     use std::fs;
     use std::path::Path;
     use std::process::Stdio;

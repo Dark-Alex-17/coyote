@@ -72,6 +72,9 @@ struct Lang {
     /// Run by the cases that start with echo off, on top of their shared
     /// assertions.
     hidden_path_check: Option<fn(&str)>,
+    /// Fails when the helper fell back to an echoed read. Run by the case
+    /// interrupted the instant the prompt shows.
+    echoed_fallback_check: fn(&str),
     /// The source of a tool that reports the helper the binary exported.
     export_probe: fn(runtime: &str) -> String,
     /// The line `export_probe` prints when the export is complete.
@@ -92,6 +95,7 @@ const PYTHON: Lang = Lang {
     select_driver: python_select_driver,
     password_driver: python_password_driver,
     hidden_path_check: Some(assert_python_took_the_hidden_path),
+    echoed_fallback_check: assert_python_took_the_hidden_path,
     export_probe: python_export_probe,
     export_probe_line: "fixture py: abs=True file=True helpers=7 op=True ui=repl",
 };
@@ -110,6 +114,7 @@ const TYPESCRIPT: Lang = Lang {
     select_driver: typescript_select_driver,
     password_driver: typescript_password_driver,
     hidden_path_check: None,
+    echoed_fallback_check: assert_typescript_took_the_hidden_path,
     export_probe: typescript_export_probe,
     export_probe_line: "fixture ts: abs=true file=true helpers=9 op=true ui=repl",
 };
@@ -854,55 +859,31 @@ fn check_password_keeps_a_pre_prompt_echo_off_after_ctrl_c(lang: &Lang) {
 /// in which the hidden read has changed the mode but cannot yet undo it.
 #[test]
 fn typescript_password_restores_echo_after_an_immediate_ctrl_c() {
-    let Some(runtime) = ts_runtime() else {
-        return;
-    };
-    let dir = fresh_config_dir("tty-ts-password-intr-0ms");
-    let _guard = TempDirGuard(dir.clone());
-    let helper = dir.join("prompt-utils.ts");
-    fs::copy(TS_HELPER, &helper).unwrap();
-    let driver = dir.join("driver.ts");
-    fs::write(&driver, typescript_password_driver("pw-ts-0ms1")).unwrap();
-    let transcript = run_password_in_pty(
-        &format!(
-            "NODE_NO_WARNINGS=1 {runtime} \"{}\" \"{}\"",
-            driver.display(),
-            helper.display()
-        ),
-        "pw-ts-0ms1",
-        interrupt_immediately,
-    );
-    assert!(
-        !transcript.contains("password-length="),
-        "password returned despite the interrupt:\n{transcript}"
-    );
-    assert!(
-        !transcript.contains("Warning: Password input may be echoed."),
-        "the helper fell back to an echoed read:\n{transcript}"
-    );
-    assert_echo_restored(&transcript);
+    check_password_restores_echo_after_an_immediate_ctrl_c(&TYPESCRIPT);
 }
 
 #[test]
 fn python_password_restores_echo_after_an_immediate_ctrl_c() {
-    if which::which("python3").is_err() {
-        eprintln!("skipping: python3 not available");
+    check_password_restores_echo_after_an_immediate_ctrl_c(&PYTHON);
+}
+
+fn check_password_restores_echo_after_an_immediate_ctrl_c(lang: &Lang) {
+    let Some(runtime) = (lang.runtime)() else {
         return;
-    }
-    let dir = fresh_config_dir("tty-py-password-intr-0ms");
-    let _guard = TempDirGuard(dir.clone());
-    let driver = dir.join("driver.py");
-    fs::write(&driver, python_password_driver("pw-py-0ms1")).unwrap();
-    let transcript = run_password_in_pty(
-        &format!("python3 \"{}\" \"{PY_HELPER}\"", driver.display()),
-        "pw-py-0ms1",
-        interrupt_immediately,
+    };
+    let tag = lang.tag;
+    let marker = format!("pw-{tag}-0ms1");
+    let driver = (lang.file_command)(
+        runtime,
+        &format!("tty-{tag}-password-intr-0ms"),
+        &(lang.password_driver)(&marker),
     );
+    let transcript = run_password_in_pty(&driver.command, &marker, interrupt_immediately);
     assert!(
         !transcript.contains("password-length="),
         "password returned despite the interrupt:\n{transcript}"
     );
-    assert_python_took_the_hidden_path(&transcript);
+    (lang.echoed_fallback_check)(&transcript);
     assert_echo_restored(&transcript);
 }
 
@@ -1218,6 +1199,13 @@ fn assert_python_took_the_hidden_path(transcript: &str) {
     assert!(
         !transcript.contains("Warning: Password input may be echoed."),
         "getpass fell back to an echoed read:\n{transcript}"
+    );
+}
+
+fn assert_typescript_took_the_hidden_path(transcript: &str) {
+    assert!(
+        !transcript.contains("Warning: Password input may be echoed."),
+        "the helper fell back to an echoed read:\n{transcript}"
     );
 }
 

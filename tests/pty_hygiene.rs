@@ -6,8 +6,9 @@
 //! each spawn forks a session leader and takes a controlling tty, and a
 //! fork landing between another test's `openpty` and its `exec` has
 //! failed the spawn with a garbled errno.
-//! Next to them, a source scan: every `tui_*.rs` suite that spawns goes
-//! through the shared pty harness rather than a copy of it.
+//! Next to them, two source scans: every non-exempt `tui_*.rs` suite
+//! imports the shared pty harness rather than a copy of it, and none of
+//! them declares an item that shadows one the harness exports.
 #![cfg(unix)]
 
 mod common;
@@ -18,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 use common::pty::Pty;
+use common::source_scan::read;
 use serial_test::serial;
 
 const PTY_DEADLINE: Duration = Duration::from_secs(20);
@@ -25,20 +27,12 @@ const PTY_DEADLINE: Duration = Duration::from_secs(20);
 /// Spelled in halves: `binary_harness_pins.rs` counts every file whose
 /// code names the harness module as one of its importers.
 const HARNESS_IMPORT: &str = concat!("common::tui_", "harness");
-/// What a suite writes to start a process or open a pty, on its own or
-/// through the harness.
-const SPAWN_NEEDLES: [&str; 7] = [
-    "Pty",
-    "Command",
-    "spawn_tui",
-    "spawn_repl_under",
-    "spawn_binary_under",
-    "spawn_with_args",
-    "ttyless",
-];
 /// `tui_wiki_docs.rs` only reads sources and docs. `tui_cli_cold_start.rs`
 /// runs on every CI leg, Windows included, and the harness is unix-only.
 const HARNESS_EXEMPT: [&str; 2] = ["tui_cli_cold_start.rs", "tui_wiki_docs.rs"];
+/// Kinds of item a suite's glob import of the harness can bring in, and
+/// so the kinds a same-named local item would silently shadow.
+const ITEM_KINDS: [&str; 5] = ["fn", "const", "static", "struct", "enum"];
 
 struct TempDirGuard(PathBuf);
 
@@ -157,12 +151,9 @@ fn tui_suites(tests_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-/// The source without its comment lines, so a doc comment naming the
-/// harness or a spawn is neither an import nor a spawn.
+/// The source without its comment lines, so a comment that mentions the
+/// harness import is not mistaken for one, and an item head quoted in a
+/// doc comment is not scanned as a declared item.
 fn code_only(source: &str) -> String {
     source
         .lines()
@@ -171,15 +162,45 @@ fn code_only(source: &str) -> String {
         .join("\n")
 }
 
-/// Every `tui_*.rs` suite that starts a process or opens a pty imports
-/// the shared harness, so it cannot carry a private copy of the spawn
-/// that pins the config and cache dirs. The count of importers is checked
-/// against the suites found, so a scan that matched nothing cannot pass.
-/// It runs serially as well: the files it opens would shift the descriptor
-/// numbers the fd-leak case relies on.
+/// The name an item head declares when `line`, at any indent, opens a
+/// `fn`, `const`, `static`, `struct` or `enum`, whatever its visibility.
+fn item_name(line: &str) -> Option<&str> {
+    let mut words = line.split_whitespace().peekable();
+    if words.peek().is_some_and(|word| word.starts_with("pub")) {
+        words.next();
+    }
+    while words
+        .peek()
+        .is_some_and(|word| ["async", "unsafe", "extern"].contains(word))
+    {
+        words.next();
+    }
+    let mut kind = words.next()?;
+    if kind == "const" && words.peek() == Some(&"fn") {
+        kind = words.next()?;
+    }
+    if !ITEM_KINDS.contains(&kind) {
+        return None;
+    }
+    let mut rest = words.next()?;
+    if kind == "static" && rest == "mut" {
+        rest = words.next()?;
+    }
+    let end = rest
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| &rest[..end])
+}
+
+/// Every non-exempt `tui_*.rs` suite imports the shared harness, so a
+/// suite that spawns cannot carry a private copy of the spawn that pins
+/// the config and cache dirs. The count of importers is checked against
+/// the suites found, so a scan that matched nothing cannot pass. It runs
+/// serially as well: the files it opens would shift the descriptor numbers
+/// the fd-leak case relies on.
 #[test]
 #[serial]
-fn every_spawning_tui_suite_imports_the_shared_harness() {
+fn every_tui_suite_imports_the_shared_harness() {
     let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut suites = Vec::new();
     let mut harness_users = Vec::new();
@@ -189,16 +210,14 @@ fn every_spawning_tui_suite_imports_the_shared_harness() {
         let code = code_only(&read(&path));
         if code.contains(HARNESS_IMPORT) {
             harness_users.push(name.clone());
-        } else if !HARNESS_EXEMPT.contains(&name.as_str())
-            && SPAWN_NEEDLES.iter().any(|needle| code.contains(needle))
-        {
+        } else if !HARNESS_EXEMPT.contains(&name.as_str()) {
             unharnessed.push(name.clone());
         }
         suites.push(name);
     }
     assert!(
         unharnessed.is_empty(),
-        "these suites spawn without importing the shared harness: {unharnessed:?}"
+        "these suites do not import the shared harness: {unharnessed:?}"
     );
     let exempt: Vec<&String> = suites
         .iter()
@@ -215,5 +234,46 @@ fn every_spawning_tui_suite_imports_the_shared_harness() {
         harness_users.len(),
         suites.len(),
         exempt.len()
+    );
+}
+
+/// A suite's `use common::tui_harness::*` loses silently to any local item
+/// of the same name, so a local variant that behaves differently would
+/// swap meaning without a compile error the day the copy is deleted. Only
+/// the harness's top-level `pub` items count; suites' items count at any
+/// indent, since the suites group their cases into inline modules.
+#[test]
+#[serial]
+fn no_tui_suite_shadows_a_harness_item() {
+    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let harness_file = tests_dir.join("common").join(concat!("tui_", "harness.rs"));
+    let harness = code_only(&read(harness_file));
+    let exported: Vec<&str> = harness
+        .lines()
+        .filter(|line| line.starts_with("pub "))
+        .filter_map(item_name)
+        .collect();
+    assert!(
+        exported.len() >= 50,
+        "the harness scan found only {} pub items: {exported:?}",
+        exported.len()
+    );
+    let mut shadows = Vec::new();
+    for path in tui_suites(&tests_dir) {
+        let code = code_only(&read(&path));
+        if !code.contains(HARNESS_IMPORT) {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for item in code.lines().filter_map(item_name) {
+            if exported.contains(&item) {
+                shadows.push(format!("{name}: {item}"));
+            }
+        }
+    }
+    assert!(
+        shadows.is_empty(),
+        "these suite items shadow a harness item of the same name; rename them:\n{}",
+        shadows.join("\n")
     );
 }

@@ -12,7 +12,7 @@ mod palette_and_rewind {
     //! the terminal lender and the prompt modals: the built binary on a
     //! pseudo-terminal, a scripted fake model where a tool call is needed, and
     //! the real `prompt-utils.sh` helpers as the prompt channel's client.
-    //! Unix-only and serial like its sibling pty suites.
+    //! Unix-only and serial like its sibling pty modules.
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
@@ -930,7 +930,7 @@ mod rewind_macros_and_queue_drain {
     //! (Tab and Enter), and the vi layer's cursor clamp at the end of a line.
     //! The built binary on a pseudo-terminal, a scripted fake model where a
     //! turn has to be held open. Unix-only and serial like its sibling pty
-    //! suites.
+    //! modules.
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -1672,7 +1672,7 @@ mod hidden_verbs_history_and_barriers {
     //! command's grandchild dies on Esc while its shell still leads the
     //! group; Ctrl+D during a turn drops the queued lines. The built binary
     //! on a pseudo-terminal, a scripted fake model where a turn has to be
-    //! held open. Unix-only and serial like its sibling pty suites.
+    //! held open. Unix-only and serial like its sibling pty modules.
     use std::fs;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -2391,7 +2391,7 @@ mod mid_turn_barriers_typeahead_and_queue_swap {
     //! purges the turn queue even when the tool finishes right behind it.
     //! The built binary on a pseudo-terminal, a scripted fake model where a
     //! turn has to be held open. Unix-only and serial like its sibling pty
-    //! suites.
+    //! modules.
     use std::fs;
     use std::time::{Duration, Instant};
 
@@ -3145,7 +3145,7 @@ mod sent_line_failed_macro_and_sigterm {
     //! is not); SIGTERM with queued lines drops them even when the tool is
     //! released in the same instant. The built binary on a pseudo-terminal,
     //! a scripted fake model where a tool round or a session is needed.
-    //! Unix-only and serial like its sibling pty suites.
+    //! Unix-only and serial like its sibling pty modules.
     use std::fs;
     use std::time::{Duration, Instant};
 
@@ -3647,7 +3647,7 @@ mod success_gated_barriers_band_close_and_headless_create {
     //! `--headless --macro` refuses `.role <new>` and `.macro <new>` without
     //! creating a role or macro file or launching an editor. The built binary
     //! on a pseudo-terminal, a scripted fake model where a session has to
-    //! record exchanges. Unix-only and serial like its sibling pty suites.
+    //! record exchanges. Unix-only and serial like its sibling pty modules.
     use std::fs;
     use std::path::Path;
     use std::process::Stdio;
@@ -4264,7 +4264,7 @@ mod zombie_hold_editor_parity_and_creation_barriers {
     //! editor (no request made) is not a rewind barrier yet its file exists;
     //! `.role <new>` writes the role file with the editor's content and `n`
     //! creates nothing. The built binary on a pseudo-terminal with the
-    //! dry-run model. Unix-only and serial like its sibling pty suites.
+    //! dry-run model. Unix-only and serial like its sibling pty modules.
     use std::fs;
     use std::time::{Duration, Instant};
 

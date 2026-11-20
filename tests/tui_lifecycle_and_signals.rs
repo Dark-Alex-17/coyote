@@ -16,7 +16,7 @@ mod binary_lifecycle {
     //! shell-out, the save modal on the way out, the colour environment, a
     //! resize, and a cold start with no cache dir. Each case runs the binary
     //! on a pseudo-terminal under a bash wrapper that reports the exit code
-    //! and `stty -a` afterwards, so the file is unix-only. Turns driven by a
+    //! and `stty -a` afterwards, so the module is unix-only. Turns driven by a
     //! scripted model, paced streams, the interrupt keys and the confirm
     //! modal live in `binary` in `tui_tools.rs`; the command menus' modals, the plain
     //! REPL's type-ahead and the runs with no human to ask live in
@@ -354,7 +354,7 @@ mod binary_lifecycle {
     /// shell has the terminal back, and checks what the shell sees: the
     /// alternate screen and bracketed paste gone before the shell spoke, and
     /// a cooked tty. Returns the raw offset of the shell's `job-stopped` line.
-    fn suspend_and_check_handback(pty: &mut Pty, before_suspend: usize) -> usize {
+    fn suspend_and_check_handback_with_cursor(pty: &mut Pty, before_suspend: usize) -> usize {
         pty.send(b"\x1a").unwrap();
         let stopped = pty.wait_for("stopped-probe-done", PTY_DEADLINE).unwrap();
         let left_at = find(pty.raw(), LEAVE_ALT, before_suspend).unwrap_or_else(|| {
@@ -400,7 +400,7 @@ mod binary_lifecycle {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         let before_suspend = pty.raw().len();
-        let stopped_marker = suspend_and_check_handback(&mut pty, before_suspend);
+        let stopped_marker = suspend_and_check_handback_with_cursor(&mut pty, before_suspend);
 
         // The wrapper resumes the job with `fg` after a second.
         wait_for_re_entry(&mut pty, stopped_marker);
@@ -435,7 +435,7 @@ mod binary_lifecycle {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         let before_suspend = pty.raw().len();
-        let stopped_marker = suspend_and_check_handback(&mut pty, before_suspend);
+        let stopped_marker = suspend_and_check_handback_with_cursor(&mut pty, before_suspend);
         // The wrapper sleeps a second before `fg`; these bytes sit in the tty
         // queue until the UI is back in raw mode.
         pty.send(b"stopped-typeahead-w2q").unwrap();
@@ -471,7 +471,7 @@ mod binary_lifecycle {
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         let before_suspend = pty.raw().len();
-        let stopped_marker = suspend_and_check_handback(&mut pty, before_suspend);
+        let stopped_marker = suspend_and_check_handback_with_cursor(&mut pty, before_suspend);
         let re_entered = wait_for_re_entry(&mut pty, stopped_marker);
         assert_repainted_after(&mut pty, re_entered, "fg");
 
@@ -1340,7 +1340,7 @@ mod binary_exit {
     //! cancel still waits out a job's kill grace (the Ctrl+D case lives in
     //! `binary` in `tui_tools.rs`, the cold start in `binary_lifecycle`). Each
     //! case runs the binary on a pseudo-terminal under a bash wrapper that
-    //! reports the exit code and `stty -a` afterwards, so the file is
+    //! reports the exit code and `stty -a` afterwards, so the module is
     //! unix-only. The cases run one at a time: each spawn forks a session
     //! leader and takes a controlling tty, and a fork landing between another
     //! test's `openpty` and its `exec` has failed the spawn with a garbled
@@ -1725,7 +1725,7 @@ mod suspend_and_signals {
 
     /// Marks `<marker>-started`, then waits (at most eight seconds) for
     /// `<marker>-release` before finishing.
-    const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    const SIGNALS_SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
     # @option --marker! Path prefix for the start and release files.\n\
@@ -1772,7 +1772,7 @@ mod suspend_and_signals {
     /// The screen the UI comes back to shows its chrome again: the model and
     /// the session tokens plus whatever the composer is expected to show
     /// (`composer`: the placeholder hint when it is empty, the draft otherwise).
-    fn assert_repainted_after(
+    fn assert_chrome_repainted_after(
         pty: &mut Pty,
         re_entered: usize,
         model: &str,
@@ -1824,7 +1824,7 @@ mod suspend_and_signals {
             Reply::Text("fixture done r12-a".to_string()),
         ]);
         write_fake_llm_config_with(&dir, &fake, "");
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", SIGNALS_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -2088,7 +2088,7 @@ mod suspend_and_signals {
         fs::write(&release, b"").unwrap();
 
         let re_entered = wait_for_re_entry(&mut pty, left);
-        assert_repainted_after(
+        assert_chrome_repainted_after(
             &mut pty,
             re_entered,
             "dryrun:dry-model",
@@ -2132,7 +2132,7 @@ mod suspend_and_signals {
         pty.resize(40, 60).unwrap();
 
         let re_entered = wait_for_re_entry(&mut pty, stopped_marker);
-        assert_repainted_after(
+        assert_chrome_repainted_after(
             &mut pty,
             re_entered,
             "dryrun:dry-model",
@@ -2267,7 +2267,7 @@ mod suspend_and_signals {
             Reply::Text("never reached r12-q".to_string()),
         ]);
         write_fake_llm_config_saving(&dir, &fake, "", true);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", SIGNALS_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
         let transcript = pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -2566,51 +2566,9 @@ mod cold_start {
         spawn_tui(dir, &[])
     }
 
-    /// Waits until the whitespace-squeezed screen text contains `marker` at
-    /// or after raw offset `from`.
-    fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-        let wanted = squeezed(marker);
-        let deadline = std::time::Instant::now() + PTY_DEADLINE;
-        loop {
-            let text = pty.read_for(Duration::from_millis(200));
-            let since = strip_ansi(&String::from_utf8_lossy(
-                &pty.raw()[from.min(pty.raw().len())..],
-            ));
-            if squeezed(&since).contains(&wanted) {
-                return since;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{what}: {marker:?} never appeared on screen:\n{text}"
-            );
-        }
-    }
-
-    /// The hint, the model and the session tokens must all be on screen
-    /// again after `what`, without waiting for anything else to change.
-    fn assert_repainted_after(pty: &mut Pty, from: usize, what: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let repainted = strip_ansi(&String::from_utf8_lossy(&pty.raw()[from..]));
-            let missing: Vec<&str> = ["Type a prompt", "dryrun:dry-model", "no session"]
-                .into_iter()
-                .filter(|token| !repainted.contains(token))
-                .collect();
-            if missing.is_empty() {
-                return;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "after {what} the screen was not repainted; still missing {missing:?}. \
-             Printable bytes since: {repainted:?}"
-            );
-            pty.read_for(Duration::from_millis(200));
-        }
-    }
-
     /// Quits from an idle, empty composer and checks the common exit
     /// promises: exit 0, cooked tty, the alternate screen left exactly once.
-    fn quit_and_check(mut pty: Pty, what: &str) -> String {
+    fn quit_and_check_left_once(mut pty: Pty, what: &str) -> String {
         pty.send(b"\x04").unwrap();
         let transcript = pty.wait_for("tty-probe-done", PTY_DEADLINE).unwrap();
         assert_eq!(exit_code(&transcript), 0, "{what}:\n{transcript}");
@@ -2672,7 +2630,7 @@ mod cold_start {
         );
 
         pty.read_for(HOTKEY_GAP);
-        quit_and_check(pty, "after malformed input bytes");
+        quit_and_check_left_once(pty, "after malformed input bytes");
     }
 
     // ---------------------------------------------------------------------
@@ -2713,7 +2671,7 @@ mod cold_start {
         );
 
         pty.read_for(HOTKEY_GAP);
-        quit_and_check(pty, "after a wide-grapheme prompt");
+        quit_and_check_left_once(pty, "after a wide-grapheme prompt");
     }
 
     #[test]
@@ -2746,7 +2704,7 @@ mod cold_start {
         );
 
         pty.read_for(HOTKEY_GAP);
-        quit_and_check(pty, "after an over-width draft");
+        quit_and_check_left_once(pty, "after an over-width draft");
     }
 
     // ---------------------------------------------------------------------
@@ -2788,7 +2746,7 @@ mod cold_start {
             .expect("the transcript did not repaint after the second .info");
 
         pty.read_for(HOTKEY_GAP);
-        quit_and_check(pty, "after two .info turns");
+        quit_and_check_left_once(pty, "after two .info turns");
     }
 
     // ---------------------------------------------------------------------
@@ -2850,7 +2808,7 @@ mod cold_start {
         pty.wait_for_after("log_path", same_size_at, PTY_DEADLINE)
             .expect("keys were not handled after a resize burst back to the same size");
         pty.read_for(HOTKEY_GAP);
-        quit_and_check(pty, "after a resize burst");
+        quit_and_check_left_once(pty, "after a resize burst");
     }
 
     #[test]
@@ -2879,7 +2837,7 @@ mod cold_start {
         pty.wait_for_after("log_path", before, PTY_DEADLINE)
             .expect("keys were not handled after a tiny cold start");
         pty.read_for(HOTKEY_GAP);
-        quit_and_check(pty, "after a tiny cold start");
+        quit_and_check_left_once(pty, "after a tiny cold start");
     }
 }
 
@@ -2900,7 +2858,7 @@ mod interrupt_and_paste {
 
     /// The fake-LLM config; `save_session` is written only when `prompt_free`
     /// is set, so a dirty session asks "Save session?" on the way out otherwise.
-    fn write_fake_llm_config(dir: &Path, fake: &FakeLlm, prompt_free: bool) {
+    fn write_fake_llm_config_prompt_free(dir: &Path, fake: &FakeLlm, prompt_free: bool) {
         let vault_pass = dir.join("vault-pass");
         fs::write(&vault_pass, "test-password\n").unwrap();
         let save = if prompt_free {
@@ -2957,7 +2915,7 @@ mod interrupt_and_paste {
     /// Marks `<marker>-started`, then waits (at most thirty seconds; longer
     /// than its twins so the 7 s bounded-quit case cannot overlap the tool's
     /// own give-up) for `<marker>-release` before finishing.
-    const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    const LONG_SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
     # @option --marker! Path prefix for the start and release files.\n\
@@ -3031,7 +2989,7 @@ mod interrupt_and_paste {
             Chunk::WaitFor(release),
             Chunk::Text(" tail never shown k4t".to_string()),
         ])]);
-        write_fake_llm_config(&dir, &fake, true);
+        write_fake_llm_config_prompt_free(&dir, &fake, true);
         let marker = dir.join("agent-completed.log");
         let mut config = fs::read_to_string(dir.join("config.yaml")).unwrap();
         config.push_str(&format!(
@@ -3114,7 +3072,7 @@ mod interrupt_and_paste {
             Chunk::WaitFor(release),
             Chunk::Text(" tail never shown k4u".to_string()),
         ])]);
-        write_fake_llm_config(&dir, &fake, false);
+        write_fake_llm_config_prompt_free(&dir, &fake, false);
         let mut pty = spawn_tui(&dir, &[]);
 
         interrupt_a_held_stream(&mut pty, "partial before esc k4w");
@@ -3185,7 +3143,7 @@ mod interrupt_and_paste {
             },
             Reply::Text("fixture gated done k4g".to_string()),
         ]);
-        write_fake_llm_config(&dir, &fake, true);
+        write_fake_llm_config_prompt_free(&dir, &fake, true);
         write_tool(&dir, "fixture_confirm_rec.sh", ASKING_CONFIRM_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
@@ -3318,8 +3276,8 @@ mod interrupt_and_paste {
             },
             Reply::Text("fixture done after ctrl-d k4d".to_string()),
         ]);
-        write_fake_llm_config(&dir, &fake, true);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_fake_llm_config_prompt_free(&dir, &fake, true);
+        write_tool(&dir, "fixture_sleep.sh", LONG_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
@@ -3389,7 +3347,7 @@ mod interrupt_and_paste {
             Chunk::WaitFor(release.clone()),
             Chunk::Text(" tail tail-b8r of the reply.".to_string()),
         ])]);
-        write_fake_llm_config(&dir, &fake, true);
+        write_fake_llm_config_prompt_free(&dir, &fake, true);
         let mut pty = spawn_tui(&dir, &[]);
 
         pty.wait_for("no session", PTY_DEADLINE).unwrap();

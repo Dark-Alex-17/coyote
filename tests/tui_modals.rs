@@ -20,7 +20,7 @@ mod binary_menus {
     //! the plain REPL or the full-screen UI from the `ui:` key and `--tui` /
     //! `--repl`, never from `COYOTE_UI`. Each case runs the binary on a
     //! pseudo-terminal under a bash wrapper that reports the exit code and
-    //! `stty -a` afterwards, so the file is unix-only. The cases run one at a time:
+    //! `stty -a` afterwards, so the module is unix-only. The cases run one at a time:
     //! each spawn forks a session leader and takes a controlling tty, and a
     //! fork landing between another test's `openpty` and its `exec` has
     //! failed the spawn with a garbled errno.
@@ -4094,7 +4094,7 @@ mod binary_wizards {
     //! the UI leaves in `binary_exit` in `tui_lifecycle_and_signals.rs`).
     //! Each case runs the binary
     //! on a pseudo-terminal under a bash wrapper that reports the exit code
-    //! and `stty -a` afterwards, so the file is unix-only. The cases run one
+    //! and `stty -a` afterwards, so the module is unix-only. The cases run one
     //! at a time: each spawn forks a session leader and takes a controlling
     //! tty, and a fork landing between another test's `openpty` and its
     //! `exec` has failed the spawn with a garbled errno.
@@ -7304,7 +7304,7 @@ mod modal_extremes_and_editor_failure {
 
     /// Asks one yes/no question through the prompt protocol, records its
     /// own pid at `<out>.pid` first and the answer at `<out>` afterwards.
-    const RECORDING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
+    const PID_RECORDING_CONFIRM_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Ask the user before continuing and record the answer.\n\
     # @option --out! Where to write the answer.\n\
@@ -7359,7 +7359,7 @@ mod modal_extremes_and_editor_failure {
     /// the session tokens plus whatever the composer is expected to show.
     /// Tokens are compared with whitespace squeezed out: a cell-by-cell
     /// repaint moves the cursor between words instead of writing spaces.
-    fn assert_repainted_after(
+    fn assert_chrome_repainted_squeezed_after(
         pty: &mut Pty,
         re_entered: usize,
         model: &str,
@@ -7407,7 +7407,7 @@ mod modal_extremes_and_editor_failure {
             Reply::Text("fixture done m6d".to_string()),
         ]);
         write_fake_llm_config(dir, &fake);
-        write_tool(dir, "fixture_confirm_rec.sh", RECORDING_CONFIRM_TOOL);
+        write_tool(dir, "fixture_confirm_rec.sh", PID_RECORDING_CONFIRM_TOOL);
         fake
     }
 
@@ -7678,7 +7678,13 @@ mod modal_extremes_and_editor_failure {
     /// still in the composer and keys handled; the draft is then cleared and
     /// the usual clean exit follows.
     fn assert_back_with_draft_and_quit(mut pty: Pty, re_entered: usize, draft: &str, what: &str) {
-        assert_repainted_after(&mut pty, re_entered, "dryrun:dry-model", draft, what);
+        assert_chrome_repainted_squeezed_after(
+            &mut pty,
+            re_entered,
+            "dryrun:dry-model",
+            draft,
+            what,
+        );
         // The draft must be cleared before Ctrl+D is the quit chord.
         pty.send(b"\x03").unwrap();
         pty.read_for(HOTKEY_GAP);

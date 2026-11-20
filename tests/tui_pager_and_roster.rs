@@ -79,29 +79,9 @@ mod transcript {
 
     const CHIP: &str = "End=follow";
 
-    /// Waits until the whitespace-squeezed screen text contains `marker` at
-    /// or after raw offset `from`.
-    fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &str) -> String {
-        let wanted = squeezed(marker);
-        let deadline = std::time::Instant::now() + PTY_DEADLINE;
-        loop {
-            let text = pty.read_for(Duration::from_millis(200));
-            let since = strip_ansi(&String::from_utf8_lossy(
-                &pty.raw()[from.min(pty.raw().len())..],
-            ));
-            if squeezed(&since).contains(&wanted) {
-                return since;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{what}: {marker:?} never appeared on screen; searched since offset {from}:\n{since}\nlast read:\n{text}"
-            );
-        }
-    }
-
     /// Ctrl+L clears the screen and repaints everything, so the bytes after it
     /// are the whole visible frame as it stands. Returns that frame squeezed.
-    fn repaint(pty: &mut Pty) -> String {
+    fn ctrl_l_repaint(pty: &mut Pty) -> String {
         let at = pty.raw().len();
         pty.send(CTRL_L).unwrap();
         pty.read_for(Duration::from_secs(1));
@@ -252,7 +232,7 @@ mod transcript {
         wait_for_squeezed_after(&mut pty, "bye welcome-marker", before, "the first reply");
         pty.read_for(Duration::from_millis(500));
 
-        let repainted = repaint(&mut pty);
+        let repainted = ctrl_l_repaint(&mut pty);
         assert!(
             repainted.contains(&squeezed("bye welcome-marker")),
             "the repaint after the first reply does not show the reply:\n{repainted}"
@@ -276,7 +256,7 @@ mod transcript {
     fn the_welcome_block_names_the_model_and_survives_typing() {
         let (_guard, mut pty) = boot("welcome-typing", &[]);
 
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         for fact in [
             concat!("coyote ", env!("CARGO_PKG_VERSION")),
             "model: dryrun:dry-model",
@@ -291,7 +271,7 @@ mod transcript {
 
         pty.send(b"typed-but-not-sent").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&squeezed("typed-but-not-sent")),
             "the composer did not echo the typed text:\n{frame}"
@@ -305,7 +285,7 @@ mod transcript {
         pty.send(b"\r").unwrap();
         wait_for_squeezed_after(&mut pty, "typed-but-not-sent", before, "the first prompt");
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(&squeezed("Tip: Press Ctrl-C")),
             "the welcome block is still on screen after the first submitted line:\n{frame}"
@@ -359,7 +339,7 @@ mod transcript {
 
         pty.send(b".session scratch\r").unwrap();
         pty.read_for(Duration::from_secs(1));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(".scratch."),
             "the status row does not name the scratch session:\n{frame}"
@@ -375,7 +355,7 @@ mod transcript {
         wait_for_squeezed_after(&mut pty, "reply-bravo-yy", before, "the second reply");
         pty.read_for(Duration::from_millis(500));
 
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         for cell in [
             ">alphamarkerone",
             "reply-alpha-xx",
@@ -390,7 +370,7 @@ mod transcript {
 
         pty.send(b".undo\r").unwrap();
         pty.read_for(Duration::from_secs(1));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(">bravomarkertwo"),
             ".undo left the second exchange's user cell on screen:\n{frame}"
@@ -447,7 +427,7 @@ mod transcript {
         for _ in 0..6 {
             pty.send(PAGE_DOWN).unwrap();
             pty.read_for(Duration::from_millis(400));
-            frame = repaint(&mut pty);
+            frame = ctrl_l_repaint(&mut pty);
             if !frame.contains(CHIP) {
                 break;
             }
@@ -487,7 +467,7 @@ mod transcript {
 
         pty.send(END).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(CHIP),
             "End did not clear the follow chip after a wheel scroll:\n{frame}"
@@ -518,7 +498,7 @@ mod transcript {
 
         pty.send(b"draftG").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(CHIP),
             "G typed into a draft moved the view:\n{frame}"
@@ -532,7 +512,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"G").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(CHIP),
             "Shift+G on the empty composer did not follow the bottom (the chip is still up):\n{frame}"
@@ -582,7 +562,7 @@ mod transcript {
         );
 
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&squeezed("the answer n7p")),
             "the answer is not on screen:\n{frame}"
@@ -696,7 +676,7 @@ mod transcript {
         );
         pty.read_for(Duration::from_millis(500));
 
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         let names = frame.matches("job__list").count();
         assert_eq!(
             names, 1,
@@ -757,7 +737,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(500));
 
         let output = squeezed("clicked output c4v");
-        let folded = repaint(&mut pty);
+        let folded = ctrl_l_repaint(&mut pty);
         assert!(
             folded.contains("fixture_echo("),
             "no folded header names the echo tool:\n{folded}"
@@ -790,7 +770,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(click.as_bytes()).unwrap();
         pty.read_for(Duration::from_millis(400));
-        let opened = repaint(&mut pty);
+        let opened = ctrl_l_repaint(&mut pty);
         assert!(
             opened.contains(&output),
             "a left click on the tool header's screen row {header_row} did not open the folded \
@@ -804,7 +784,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(click.as_bytes()).unwrap();
         pty.read_for(Duration::from_millis(400));
-        let refolded = repaint(&mut pty);
+        let refolded = ctrl_l_repaint(&mut pty);
         assert!(
             !refolded.contains(&output),
             "a second click on row {header_row} did not fold the row again:\n{refolded}"
@@ -841,7 +821,7 @@ mod transcript {
         }
         pty.read_for(Duration::from_millis(500));
 
-        let wide = repaint(&mut pty);
+        let wide = ctrl_l_repaint(&mut pty);
         let counts: Vec<usize> = (1..=2)
             .map(|n| wide.matches(&format!("rewrapmark{n:02}")).count())
             .collect();
@@ -853,7 +833,7 @@ mod transcript {
         for (rows, cols) in [(70u16, 50u16), (70, 100), (70, 64), (70, 100)] {
             pty.resize(rows, cols).unwrap();
             pty.read_for(Duration::from_millis(700));
-            let frame = repaint(&mut pty);
+            let frame = ctrl_l_repaint(&mut pty);
             for n in 1..=2 {
                 let marker = format!("rewrapmark{n:02}");
                 let seen = frame.matches(&marker).count();
@@ -938,7 +918,7 @@ mod transcript {
         );
     }
 
-    /// Same shape as `SLEEP_TOOL`, but it writes an error and exits non-zero
+    /// Same shape as `STDERR_SLEEP_TOOL`, but it writes an error and exits non-zero
     /// once it has marked its start.
     const FAIL_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
@@ -978,7 +958,7 @@ mod transcript {
             Reply::Text("after focus reply-n2p".to_string()),
         ]);
         write_fake_llm_config(&dir, &fake);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", STDERR_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.read_for(Duration::from_millis(300));
@@ -1017,7 +997,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let opened = repaint(&mut pty);
+        let opened = ctrl_l_repaint(&mut pty);
         assert!(
             opened.contains(&output),
             "Enter on the focused tool row did not open it (no tool output on screen):\n{opened}"
@@ -1030,7 +1010,7 @@ mod transcript {
         // Enter again folds it.
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let refolded = repaint(&mut pty);
+        let refolded = ctrl_l_repaint(&mut pty);
         assert!(
             !refolded.contains(&output),
             "a second Enter did not fold the opened row:\n{refolded}"
@@ -1041,7 +1021,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(400));
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let unfocused = repaint(&mut pty);
+        let unfocused = ctrl_l_repaint(&mut pty);
         assert!(
             !unfocused.contains(&output),
             "Enter after Esc still toggled the row, so Esc did not clear the focus:\n{unfocused}"
@@ -1063,7 +1043,7 @@ mod transcript {
             "the reply to the draft sent over a focused row",
         );
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(">draftwinsk7q"),
             "the draft did not become a user cell:\n{frame}"
@@ -1130,7 +1110,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let opened = repaint(&mut pty);
+        let opened = ctrl_l_repaint(&mut pty);
         assert!(
             opened.matches("boom-error-q8x").count() > errors_folded,
             "the opened failed row does not show the tool's error (folded: {errors_folded}):\n{opened}"
@@ -1174,7 +1154,7 @@ mod transcript {
         replies.push(Reply::Text("late reply tail-v6c".to_string()));
         let fake = FakeLlm::start(replies);
         write_fake_llm_config(&dir, &fake);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", STDERR_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.read_for(Duration::from_millis(300));
@@ -1232,7 +1212,7 @@ mod transcript {
 
         pty.send(END).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&late),
             "End did not bring the late reply into view:\n{frame}"
@@ -1280,7 +1260,7 @@ mod transcript {
         );
         pty.read_for(Duration::from_millis(800));
 
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("todo__init") && !frame.contains("todo__add"),
             "a todo call took a transcript row:\n{frame}"
@@ -1293,7 +1273,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let panel = repaint(&mut pty);
+        let panel = ctrl_l_repaint(&mut pty);
         assert!(
             panel.contains("Todo"),
             "Ctrl+X did not open the Todo panel:\n{panel}"
@@ -1343,7 +1323,7 @@ mod transcript {
             "the answer after reasoning",
         );
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(&squeezed("Thinking for")),
             "the Thinking row is still up after the answer landed:\n{frame}"
@@ -1361,7 +1341,7 @@ mod transcript {
     fn ctrl_x_shows_and_hides_the_todo_panel() {
         let (_guard, mut pty) = boot("ctrl-x", &[]);
 
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("Todo"),
             "the Todo panel is open before Ctrl+X was pressed:\n{frame}"
@@ -1369,7 +1349,7 @@ mod transcript {
 
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains("Todo"),
             "Ctrl+X did not open the Todo panel:\n{frame}"
@@ -1377,7 +1357,7 @@ mod transcript {
 
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("Todo"),
             "a second Ctrl+X did not close the Todo panel:\n{frame}"
@@ -1405,7 +1385,7 @@ mod transcript {
             wait_for_squeezed_after(pty, &marker, before, "a filler prompt");
             pty.read_for(Duration::from_millis(300));
         }
-        let frame = repaint(pty);
+        let frame = ctrl_l_repaint(pty);
         assert!(
             !frame.contains(CHIP),
             "the follow chip is up while the view follows the bottom:\n{frame}"
@@ -1429,7 +1409,7 @@ mod transcript {
 
         pty.send(END).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("End=follow"),
             "End did not clear the follow chip:\n{frame}"
@@ -1450,7 +1430,7 @@ mod transcript {
             "a prompt sent while scrolled up",
         );
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("End=follow"),
             "the view did not follow the line just sent:\n{frame}"
@@ -1472,7 +1452,7 @@ mod transcript {
     /// eight seconds) for `<marker>-release` to appear before finishing. Its
     /// result goes to `LLM_OUTPUT` (a file the runner reads back for the
     /// model); the progress line on stderr is what the transcript can show.
-    const SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
+    const STDERR_SLEEP_TOOL: &str = "#!/usr/bin/env bash\n\
     \n\
     # @describe Wait until released.\n\
     # @option --marker! Path prefix for the start and release files.\n\
@@ -1512,7 +1492,7 @@ mod transcript {
             Reply::Text("fixture done tail-r7q".to_string()),
         ]);
         write_fake_llm_config(&dir, &fake);
-        write_tool(&dir, "fixture_sleep.sh", SLEEP_TOOL);
+        write_tool(&dir, "fixture_sleep.sh", STDERR_SLEEP_TOOL);
         let mut pty = spawn_tui(&dir, &[]);
         pty.wait_for("no session", PTY_DEADLINE).unwrap();
         pty.read_for(Duration::from_millis(300));
@@ -1524,7 +1504,7 @@ mod transcript {
             "the tool's start marker",
         );
         pty.read_for(Duration::from_millis(500));
-        let running = repaint(&mut pty);
+        let running = ctrl_l_repaint(&mut pty);
         assert!(
             running.contains("fixture_sleep"),
             "no cell names the running tool:\n{running}"
@@ -1538,7 +1518,7 @@ mod transcript {
             "the reply after the tool",
         );
         pty.read_for(Duration::from_millis(500));
-        let finished = repaint(&mut pty);
+        let finished = ctrl_l_repaint(&mut pty);
         let names = finished.matches("fixture_sleep").count();
         assert_eq!(
             names, 1,
@@ -1604,7 +1584,7 @@ mod transcript {
 
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains("Todo"),
             "Ctrl+X did not open the Todo panel:\n{frame}"
@@ -1633,7 +1613,7 @@ mod transcript {
 
         pty.resize(24, 80).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&squeezed("Tip: Press Ctrl-C")),
             "the welcome block did not come back after growing the terminal:\n{frame}"
@@ -1671,7 +1651,7 @@ mod transcript {
             .unwrap();
         wait_for_squeezed_after(&mut pty, "emoji-marker-v5", before, "the emoji prompt");
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains('\u{2714}') && frame.contains('\u{1F44D}'),
             "the emoji graphemes did not survive into the transcript:\n{frame}"
@@ -1705,7 +1685,7 @@ mod transcript {
         pty.send(b"solomarker one\r").unwrap();
         wait_for_squeezed_after(&mut pty, "reply-solo-zz", before, "the only reply");
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(&squeezed("Tip: Press Ctrl-C")),
             "the welcome block is up with a turn on screen:\n{frame}"
@@ -1713,7 +1693,7 @@ mod transcript {
 
         pty.send(b".undo\r").unwrap();
         pty.read_for(Duration::from_secs(1));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("reply-solo-zz") && !frame.contains(">solomarkerone"),
             ".undo left the only exchange on screen:\n{frame}"
@@ -1757,7 +1737,7 @@ mod transcript {
         // Unscrolled, empty composer: G is a letter.
         pty.send(b"Gx7").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains("Gx7"),
             "Shift+G on an unscrolled empty composer was swallowed instead of typed:\n{frame}"
@@ -1775,7 +1755,7 @@ mod transcript {
         wait_for_squeezed_after(&mut pty, "End = follow", before, "the chip after PgUp");
         pty.send(b"G").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(CHIP),
             "Shift+G while scrolled on an empty composer did not follow the bottom:\n{frame}"
@@ -1788,7 +1768,7 @@ mod transcript {
         // Right after the jump the view follows again: G is a letter once more.
         pty.send(b"Gx7").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains("Gx7"),
             "Shift+G right after a jump was swallowed instead of typed:\n{frame}"
@@ -1827,7 +1807,7 @@ mod transcript {
             "the Thinking row appeared only after the fake gave up holding the stream"
         );
         pty.read_for(Duration::from_millis(500));
-        let held = repaint(&mut pty);
+        let held = ctrl_l_repaint(&mut pty);
         assert!(
             !held.contains("<think>") && !held.contains("</think>"),
             "a think tag is on screen while the span is still open:\n{held}"
@@ -1845,7 +1825,7 @@ mod transcript {
             "a think tag was painted when the late close arrived:\n{after}"
         );
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains(&squeezed("the answer n7p")),
             "the answer is not on screen:\n{frame}"
@@ -1884,7 +1864,7 @@ mod transcript {
         loop {
             pty.read_for(Duration::from_millis(300));
             if fake.served() >= 1 {
-                let frame = repaint(&mut pty);
+                let frame = ctrl_l_repaint(&mut pty);
                 if !frame.contains(&squeezed("Thinking for"))
                     && !frame.contains(&squeezed("Esc to interrupt"))
                 {
@@ -1896,7 +1876,7 @@ mod transcript {
                 "the reasoning-only turn never finished"
             );
         }
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("<think>") && !frame.contains("</think>"),
             "a think tag is on screen after a reasoning-only reply:\n{frame}"
@@ -1991,7 +1971,7 @@ mod transcript {
         }
         fs::write(&release, b"").unwrap();
         pty.read_for(Duration::from_secs(1));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(&squeezed("Esc to interrupt")),
             "the turn is still running after Esc:\n{frame}"
@@ -2011,7 +1991,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(300));
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let opened = repaint(&mut pty);
+        let opened = ctrl_l_repaint(&mut pty);
         assert!(
             opened.contains(&output),
             "Ctrl+Up then Enter after the interrupt did not open the tool row:\n{opened}"
@@ -2022,7 +2002,7 @@ mod transcript {
         pty.read_for(Duration::from_millis(400));
         pty.send(b"\r").unwrap();
         pty.read_for(Duration::from_millis(500));
-        let unfocused = repaint(&mut pty);
+        let unfocused = ctrl_l_repaint(&mut pty);
         assert!(
             !unfocused.contains(&output),
             "Esc on the idle UI did not clear the focus:\n{unfocused}"
@@ -2080,7 +2060,7 @@ mod transcript {
 
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains("Todo"),
             "Ctrl+X under the Confirm modal did not open the Todo panel:\n{frame}"
@@ -2088,7 +2068,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains("Todo"),
             "a second Ctrl+X under the Confirm modal did not close the Todo panel:\n{frame}"
@@ -2106,7 +2086,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(END).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(CHIP),
             "End under the Confirm modal did not clear the follow chip:\n{frame}"
@@ -2172,7 +2152,7 @@ mod transcript {
 
         pty.send(CTRL_X).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             frame.contains("Todo"),
             "Ctrl+X under the Input modal did not open the Todo panel:\n{frame}"
@@ -2193,7 +2173,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(END).unwrap();
         pty.read_for(Duration::from_millis(500));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(CHIP),
             "End under the Input modal did not clear the follow chip:\n{frame}"
@@ -2206,7 +2186,7 @@ mod transcript {
         pty.read_for(HOTKEY_GAP);
         pty.send(ESC).unwrap();
         pty.read_for(Duration::from_secs(1));
-        let frame = repaint(&mut pty);
+        let frame = ctrl_l_repaint(&mut pty);
         assert!(
             !frame.contains(&squeezed("Enter = answer")),
             "Esc did not close the Input modal:\n{frame}"
@@ -2590,7 +2570,7 @@ mod binary_threads {
     /// The thread picker's band of a repainted frame: from its header down to
     /// the key legend under the list, so a word elsewhere on screen does not
     /// count as a picker row's.
-    fn picker_band(frame: &str) -> &str {
+    fn thread_picker_band(frame: &str) -> &str {
         let header = frame
             .rfind("Esc = back")
             .unwrap_or_else(|| panic!("the picker's header is not on screen:\n{frame}"));
@@ -2618,21 +2598,21 @@ mod binary_threads {
     }
 
     fn children_files(dir: &Path) -> Vec<PathBuf> {
-        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        fn walk_children(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = fs::read_dir(dir) else {
                 return;
             };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    walk(&path, out);
+                    walk_children(&path, out);
                 } else if path.parent().and_then(Path::file_name) == Some("children".as_ref()) {
                     out.push(path);
                 }
             }
         }
         let mut out = Vec::new();
-        walk(dir, &mut out);
+        walk_children(dir, &mut out);
         out
     }
 
@@ -2787,7 +2767,7 @@ mod binary_threads {
             "Threads  Enter = open  Esc = back",
             "Tab did not open the picker",
         );
-        let kid_row = row_after(picker_band(&picker), "kid").unwrap_or_else(|| {
+        let kid_row = row_after(thread_picker_band(&picker), "kid").unwrap_or_else(|| {
             panic!(
                 "the picker does not list the running kid (child files on disk: {:?}):\n{picker}",
                 children_files(&scene.dir.join("cache"))
@@ -3068,7 +3048,7 @@ mod binary_threads {
             "Tab did not open the picker",
         );
         assert!(
-            squeezed(picker_band(&picker)).contains("running"),
+            squeezed(thread_picker_band(&picker)).contains("running"),
             "the picker does not list the second kid as running on a later turn:\n{picker}"
         );
         // Open the second kid's thread: try each row under the root thread.
@@ -4049,7 +4029,7 @@ mod footer_counts_help_popup_completion_and_scroll {
     //! an agent's argument rows carry a kind column; a wheel notch and
     //! Shift+Up scroll the transcript one row, and mouse reporting never asks
     //! for any-motion tracking. Each case runs the binary on a
-    //! pseudo-terminal, so the file is unix-only, and the cases run one at a
+    //! pseudo-terminal, so the module is unix-only, and the cases run one at a
     //! time.
     use std::fs;
     use std::path::Path;
@@ -4668,7 +4648,7 @@ mod popup_colours_scroll_hold_and_child_jobs {
     //! wheel notch down scrolls back one row; a view scrolled up holds still
     //! while the reply below it keeps streaming; and the footer's `jobs` count
     //! follows a background job a spawned sub-agent starts. Each case runs the
-    //! binary on a pseudo-terminal, so the file is unix-only, and the cases
+    //! binary on a pseudo-terminal, so the module is unix-only, and the cases
     //! run one at a time.
     use std::fs;
     use std::path::Path;
@@ -4829,7 +4809,7 @@ mod popup_colours_scroll_hold_and_child_jobs {
     }
 
     /// A full repaint, which leaves the scroll position alone.
-    fn repaint(pty: &mut Pty) -> String {
+    fn ctrl_l_frame(pty: &mut Pty) -> String {
         pty.read_for(Duration::from_millis(400));
         let from = pty.raw().len();
         pty.send(CTRL_L).unwrap();
@@ -4839,7 +4819,7 @@ mod popup_colours_scroll_hold_and_child_jobs {
 
     /// The topmost transcript row of a full repaint.
     fn top_row(pty: &mut Pty) -> u32 {
-        let frame = repaint(pty);
+        let frame = ctrl_l_frame(pty);
         *visible_rows(&frame)
             .iter()
             .min()
@@ -4920,7 +4900,7 @@ mod popup_colours_scroll_hold_and_child_jobs {
         // its absence means the whole reply has arrived under the held view.
         let deadline = Instant::now() + PTY_DEADLINE;
         loop {
-            let frame = repaint(&mut pty);
+            let frame = ctrl_l_frame(&mut pty);
             if !squeezed(&frame).contains("Esctointerrupt") {
                 break;
             }
@@ -4935,7 +4915,7 @@ mod popup_colours_scroll_hold_and_child_jobs {
             "the scrolled view moved while the reply streamed on: row-{held:03} -> row-{after:03}"
         );
         pty.send(END).unwrap();
-        let bottom = repaint(&mut pty);
+        let bottom = ctrl_l_frame(&mut pty);
         let bottom = squeezed(&bottom);
         assert!(
             bottom.contains("row-160") && bottom.contains("allrowssent"),
@@ -5071,13 +5051,13 @@ mod popup_colours_scroll_hold_and_child_jobs {
 
 mod scroll_bursts_and_cell_boundaries {
     //! Real-process checks written from the TUI's user-facing contract, not
-    //! its code, for scrolling cases the files next door leave open: a burst
+    //! its code, for scrolling cases the modules next door leave open: a burst
     //! of wheel notches that lands in one read scrolls exactly as many rows as
     //! there were notches, Shift+Down scrolls back one row and End jumps back
     //! to the newest output; and scrolling a notch at a time through a
     //! transcript of several turns never jumps more than one row, even where
     //! one reply ends and the next prompt begins. Each case runs the binary on
-    //! a pseudo-terminal, so the file is unix-only, and the cases run one at a
+    //! a pseudo-terminal, so the module is unix-only, and the cases run one at a
     //! time.
     use std::time::Duration;
 
