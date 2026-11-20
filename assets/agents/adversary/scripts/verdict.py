@@ -15,7 +15,8 @@ the request by pass_condition.py, is stated as something other than exit 0,
 when parsed criteria name it and every one of them ends MET or INSPECTED;
 both are reported as advisory red runs. A stated red run that no parsed
 criterion names blocks, and so does a red run that timed out (exit -1) or was
-killed by a signal (exit 128 or above), whatever its stated condition. A
+killed by a signal (exit 128 or above), whatever its stated condition or
+baseline status. A
 run that exited 0 under a stated condition is judged the same way as a
 stated red run and is never a green run. A
 command the runner's deadline skipped is
@@ -337,7 +338,8 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
 
     A red run is a record that exited nonzero (including the -1 TIMEOUT
     sentinel). A "pre-existing" one is reported in its own section. A
-    "tree-state" one blocks unless every criterion naming it ends MET or
+    red run that timed out or was killed by a signal blocks whatever its
+    baseline. A "tree-state" one blocks unless every criterion naming it ends MET or
     INSPECTED, and is otherwise advisory. For the rest the pass condition is recomputed
     from `criteria` and `request`, never read from the record, so a recorded
     run replays the same. A red run held to exit 0, timed out or killed by a
@@ -383,11 +385,12 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
                 (out if blocks else advisory).append(text)
             continue
         outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
-        if baseline_status(r) == "tree-state":
+        judged = not killed_or_timed_out(code)
+        if judged and baseline_status(r) == "tree-state":
             blocks, text = tree_state_red(r, outcome, condition["criteria"], by_id)
             (out if blocks else advisory).append(text)
             continue
-        if condition["condition"] == STATED and not killed_or_timed_out(code):
+        if judged and condition["condition"] == STATED:
             blocks, text = stated_red(r, outcome, condition, by_id)
             (out if blocks else advisory).append(text)
             continue
