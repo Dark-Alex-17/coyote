@@ -26,12 +26,14 @@ emitting an extra `verification_commands` key cannot overwrite the declared
 value: the undeclared key is dropped before it reaches state.
 
 Budget: commands run sequentially, so TOTAL runtime is bounded by a deadline
-(TOTAL_DEADLINE_SECS = 3300s). The deadline starts once the review-stack lock
-is acquired or its bounded wait (STACK_LOCK_WAIT_SECS = 1200s) gives up, so
-the run_checks node's 4600s timeout covers 1200 + 3300 plus margin for the
-baseline worktree cleanup. Without it, a handful of hanging commands
-(4 x 900s) would blow the
-NODE timeout and the executor would kill this script from OUTSIDE — the
+(TOTAL_DEADLINE_SECS = 3180s). Once the review-stack lock is acquired or its
+bounded wait (STACK_LOCK_WAIT_SECS = 1200s) gives up, the pre-run tree
+capture (below) gets SNAPSHOT_GIT_TIMEOUT_SECS = 120s of its own, and the
+deadline starts when it ends, so the capture never takes time from the
+declared commands. The run_checks node's 4600s timeout covers 1200 + 120 +
+3180 plus margin for the baseline worktree cleanup. Without the deadline, a
+handful of hanging commands (4 x 900s) would blow the NODE timeout and the
+executor would kill this script from OUTSIDE -- the
 in-script degradation would never fire. Each command gets
 min(PER_COMMAND_TIMEOUT_SECS, remaining budget); commands the deadline
 leaves no budget for are recorded as {"cmd", "skipped": "deadline"} entries,
@@ -89,8 +91,9 @@ snapshot, deadline spent) keeps the live run's classification against the
 base, with ", candidate tree dirty" appended to its note; the snapshot's own
 output is never compared with the base, since ignored files missing from both
 clean checkouts would fake a match. Snapshot runs are never saved. Each
-snapshot git call is capped at SNAPSHOT_GIT_TIMEOUT_SECS and by the deadline.
-Both worktrees are removed together.
+snapshot git call after the declared commands is capped at
+SNAPSHOT_GIT_TIMEOUT_SECS and by the deadline. Both worktrees are removed
+together.
 
 Process hygiene: commands run through the shell. On POSIX each command gets
 its own session (start_new_session) and a timeout SIGKILLs the whole process
@@ -141,7 +144,7 @@ except ImportError:  # non-POSIX (Windows): advisory flock unavailable
     fcntl = None
 
 PER_COMMAND_TIMEOUT_SECS = 900
-TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3300)
+TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3180)
 STACK_LOCK_PATH = os.environ.get("ADVERSARY_STACK_LOCK_PATH") or os.path.expanduser(
     "~/.cache/coyote/review-stack.lock"
 )
@@ -759,10 +762,10 @@ def main():
     )
     results = []
     _stack_lock = acquire_stack_lock() if cmds else None  # noqa: F841 — held until exit
-    deadline = time.monotonic() + TOTAL_DEADLINE_SECS
     work = tempfile.mkdtemp(prefix="adversary-run-checks-")
     try:
-        before = tree_before(proj, work, deadline)
+        before = tree_before(proj, work, time.monotonic() + SNAPSHOT_GIT_TIMEOUT_SECS)
+        deadline = time.monotonic() + TOTAL_DEADLINE_SECS
         outputs = {}
         for i, cmd in enumerate(cmds):
             remaining = left(deadline)
