@@ -73,7 +73,7 @@ commit of that pre-run tree is built: HEAD plus every tracked and untracked
 file that is not ignored, through a temporary GIT_INDEX_FILE, write-tree and
 commit-tree, so the real index and refs are never touched. This writes
 unreferenced objects (among them the blobs of untracked, non-ignored files)
-into the repository's object store, where git's own gc collects them. When
+into the repository's object database, where git's own gc collects them. When
 `git status` fails or `core.sparseCheckout` is true (a sparse index cannot be
 snapshotted whole), no snapshot is taken and every red record's note gains
 ", candidate tree state unknown". After the declared commands run, a dirty

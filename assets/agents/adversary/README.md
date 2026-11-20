@@ -69,7 +69,7 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
 - Before the first declared command runs, the runner reads `git status --porcelain`. When it
   lists anything, a snapshot commit of that pre-run tree (HEAD plus every tracked and untracked
   file that is not ignored) is built through a temporary index, so the real index and refs are
-  untouched; its objects stay unreferenced in the repository's object store. After the commands
+  untouched; its objects stay unreferenced in the repository's object database. After the commands
   run, a dirty live tree is written the same way and its tree id compared with the pre-run one;
   on a clean tree `git status --porcelain` is read again. When the tree changed, no red run gets
   `tree-state` and each note ends `the declared commands modified the tree`. Otherwise, on a
