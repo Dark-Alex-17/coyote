@@ -1895,6 +1895,34 @@ mod tests {
         }
     }
 
+    /// Overlay wins over modal and band, modal over band, band over composer.
+    #[test]
+    fn layer_takes_the_topmost_open_layer() {
+        let overlay = Some(OverlayKind::Help);
+        let modal = Some(ModalKind::Input);
+        let popup = Some(PopupKind::Palette);
+        let help = Layer::Overlay(OverlayKind::Help);
+        let input = Layer::Modal(ModalKind::Input);
+        let palette = Layer::Band(PopupKind::Palette);
+        let cases = [
+            (None, None, None, Layer::Composer),
+            (None, None, popup, palette),
+            (None, modal, None, input),
+            (None, modal, popup, input),
+            (overlay, None, None, help),
+            (overlay, None, popup, help),
+            (overlay, modal, None, help),
+            (overlay, modal, popup, help),
+        ];
+        for (overlay, modal, popup, expected) in cases {
+            assert_eq!(
+                layer(overlay, modal, popup),
+                expected,
+                "{overlay:?} {modal:?} {popup:?}"
+            );
+        }
+    }
+
     /// Ctrl+T opens the pager over an idle or busy composer, never under a
     /// question; Alt+T toggles the roster the same way, and a text field
     /// takes it as typing. Ctrl+G is bound to nothing: the text area it

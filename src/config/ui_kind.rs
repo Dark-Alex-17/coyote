@@ -82,11 +82,11 @@ mod tests {
         assert_eq!(ctx.ui_kind(), UiKind::Repl);
     }
 
-    /// No human is present when headless, even if the UI flag is somehow
-    /// still set, so headless wins.
+    /// No human is present when headless, even while the UI owns the
+    /// terminal, so headless wins.
     #[test]
     #[serial]
-    fn headless_outranks_the_tui_flag() {
+    fn headless_outranks_the_tui_owner() {
         let _acp_off = AtomicFlagGuard::set(&ACP_SERVER, false);
         let _headless_on = AtomicFlagGuard::set(&HEADLESS, true);
         let _tui_on = crate::tui::OwnerGuard::tui_for_test();

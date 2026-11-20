@@ -353,8 +353,7 @@ pub(super) struct OutputTail {
     pub(super) full: FullOutput,
 }
 
-/// What a job's row and an agent's row both hold: the task's state, the
-/// calls folded into the row, and whether the row is open.
+/// The parts a job row and an agent row share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TaskRow<S> {
     pub(super) status: S,

@@ -24,7 +24,6 @@ pub(crate) struct Lender {
     thread: ThreadId,
 }
 
-/// `RequestContext::ui_kind` reads it through `active`.
 static OWNER: Mutex<Owner> = Mutex::new(Owner::Shell);
 
 /// A duplicate of the terminal taken before the screen was entered.
@@ -33,6 +32,12 @@ static OWNER: Mutex<Owner> = Mutex::new(Owner::Shell);
 /// this one explicitly. `None` when the duplicate could not be taken.
 #[cfg(unix)]
 static TTY_OUT: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
+
+#[cfg(all(test, unix))]
+pub(super) fn tty_out_fd_for_test() -> Option<std::os::fd::RawFd> {
+    use std::os::fd::AsRawFd;
+    TTY_OUT.get()?.as_ref().map(AsRawFd::as_raw_fd)
+}
 
 pub(crate) fn owner() -> Owner {
     OWNER
@@ -71,17 +76,17 @@ impl OwnerGuard {
 
     /// A UI that owns the terminal but whose inbox is closed, the way it
     /// is during teardown. The loop thread is not the caller's, so a lend
-    /// fails as not lending rather than as a wait on itself. Restores the
-    /// previous owner on drop; tests using it must serialize (`#[serial]`).
+    /// fails as not lending rather than as a wait on itself. Tests using it
+    /// must serialize (`#[serial]`).
     #[cfg(test)]
     pub(crate) fn tui_for_test() -> Self {
+        static FOREIGN_THREAD: std::sync::OnceLock<ThreadId> = std::sync::OnceLock::new();
         let (tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let thread = std::thread::spawn(|| {}).thread().id();
+        let thread = *FOREIGN_THREAD.get_or_init(|| std::thread::spawn(|| {}).thread().id());
         Self::lending_for_test(tx, thread)
     }
 
-    /// A UI whose loop on `thread` reads `tx`. Restores the previous owner
-    /// on drop.
+    /// A UI whose loop on `thread` reads `tx`.
     #[cfg(test)]
     pub(super) fn lending_for_test(tx: UnboundedSender<UiMsg>, thread: ThreadId) -> Self {
         Self {
@@ -89,7 +94,6 @@ impl OwnerGuard {
         }
     }
 
-    /// The shell owns the terminal. Restores the previous owner on drop.
     #[cfg(test)]
     pub(crate) fn shell_for_test() -> Self {
         Self {

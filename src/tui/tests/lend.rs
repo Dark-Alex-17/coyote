@@ -1,7 +1,7 @@
 use super::*;
-#[cfg(unix)]
-use crate::tui::lend::dup_tty_out;
 use crate::tui::lend::{NOT_LENDING, OwnerGuard};
+#[cfg(unix)]
+use crate::tui::lend::{dup_tty_out, remember_tty, tty_out_fd_for_test};
 #[cfg(unix)]
 use std::sync::atomic::Ordering;
 
@@ -41,6 +41,58 @@ fn the_lent_tty_fd_is_cloexec() {
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
     assert_ne!(flags, -1, "{}", std::io::Error::last_os_error());
     assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+}
+
+/// The terminal duplicate is taken once per process: a later
+/// `remember_tty`, after the owner has come and gone, keeps the same
+/// descriptor, or keeps none if none could be taken.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_tty_duplicate_is_taken_once_and_outlives_owner_changes() {
+    remember_tty();
+    let first = tty_out_fd_for_test();
+    drop(OwnerGuard::tui_for_test());
+    remember_tty();
+    assert_eq!(tty_out_fd_for_test(), first);
+}
+
+/// The loop's own guard makes the UI the owner with an open inbox, and
+/// hands the terminal back to the shell on drop.
+#[test]
+#[serial]
+fn the_loop_guard_owns_the_terminal_until_dropped() {
+    let (tx, _rx) = unbounded_channel();
+    let guard = OwnerGuard::tui(tx);
+    assert!(active());
+    assert!(ensure_terminal_lendable().is_ok());
+    assert!(notice(NoticeKind::Routing, "hello".to_string()));
+    drop(guard);
+    assert!(!active());
+}
+
+#[test]
+#[serial]
+fn nested_owner_guards_restore_the_owner_they_replaced() {
+    let outer = OwnerGuard::tui_for_test();
+    let inner = OwnerGuard::shell_for_test();
+    assert!(!active());
+    drop(inner);
+    assert!(active());
+    drop(outer);
+    assert!(!active());
+}
+
+#[test]
+#[serial]
+fn an_owner_guard_restores_the_owner_when_its_scope_panics() {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _tui_on = OwnerGuard::tui_for_test();
+        assert!(active());
+        panic!("unwinding through the guard");
+    }));
+    assert!(outcome.is_err());
+    assert!(!active());
 }
 
 /// With the UI owning the terminal but its inbox closed (as during
