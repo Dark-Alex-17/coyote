@@ -89,20 +89,6 @@ pub(crate) fn active() -> bool {
     TUI_ACTIVE.load(Ordering::SeqCst)
 }
 
-/// Test-only harness hook: when set to `1`, a turn's work task sleeps
-/// past `EXIT_CANCEL_WAIT` after the turn is done, ignoring the abort,
-/// so a pty test can check the bounded exit path that leaves a turn
-/// behind. Debug builds only; a release binary ignores it.
-#[cfg(debug_assertions)]
-const STUBBORN_TURN_ENV: &str = "COYOTE_TUI_STUBBORN_TURN";
-
-/// Test-only harness hook: when set to `1`, the exit work panics once its
-/// output is captured, so a pty test can check the panic's message
-/// reaches the restored terminal. Debug builds only; a release binary
-/// ignores it.
-#[cfg(debug_assertions)]
-const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
-
 /// How long the composer must have been untouched before a bare hotkey
 /// counts as a modal answer, so a keystroke meant for the composer never
 /// confirms a prompt that appeared under it.

@@ -1581,14 +1581,14 @@ pub fn wait_for_squeezed_after(pty: &mut Pty, marker: &str, from: usize, what: &
     let deadline = std::time::Instant::now() + PTY_DEADLINE;
     let wanted = squeezed(marker);
     loop {
-        pty.read_for(Duration::from_millis(200));
+        let last_read = pty.read_for(Duration::from_millis(200));
         let text = since(pty, from);
         if squeezed(&text).contains(&wanted) {
             return text;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{what} never appeared:\n{text}"
+            "{what}: {marker:?} never appeared on screen; searched since offset {from}:\n{text}\nlast read:\n{last_read}"
         );
     }
 }

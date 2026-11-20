@@ -37,7 +37,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::source_scan::{fn_body, read, repo_root, src, string_literals};
+use common::source_scan::{const_str, fn_body, read, repo_root, src, string_literals};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test tui_wiki_docs`";
@@ -113,23 +113,6 @@ fn production(source: &str) -> &str {
     source
         .find("\n#[cfg(test)]\nmod tests")
         .map_or(source, |at| &source[..at])
-}
-
-/// The value of the string constant `name` in `source`, whatever its
-/// visibility and whether it is typed `&str` or `&'static str`.
-fn const_str(source: &str, name: &str) -> String {
-    let head = format!("const {name}: &");
-    let start = source
-        .find(&head)
-        .unwrap_or_else(|| panic!("the source declares {name}"));
-    let rest = &source[start + head.len()..];
-    let value = &rest[rest.find(" =").expect("a const has a value") + 2..];
-    let end = value
-        .find("\";")
-        .unwrap_or_else(|| panic!("{name} ends with `;`"));
-    let mut literals = string_literals(&value[..=end]);
-    assert_eq!(literals.len(), 1, "{name} is one string literal");
-    literals.remove(0)
 }
 
 /// The right-hand side of `const {name}: <type> = <value>;` in `source`.

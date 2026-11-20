@@ -6,8 +6,6 @@ use super::rewind::{is_undo, rewind_barrier, undo_opener};
 use super::roster::{RosterRow, RosterSources};
 use super::sink::UiMsg;
 use super::{App, CONTROL_TASK_WAIT, TurnStatus, cells, pager, render};
-#[cfg(debug_assertions)]
-use super::{PANIC_AT_EXIT_ENV, STUBBORN_TURN_ENV};
 use crate::config::RequestContext;
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
 use crate::events::NoticeKind;
@@ -22,6 +20,20 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::{JoinHandle, JoinSet};
+
+/// Test-only harness hook: when set to `1`, a turn's work task sleeps
+/// past `EXIT_CANCEL_WAIT` after the turn is done, ignoring the abort,
+/// so a pty test can check the bounded exit path that leaves a turn
+/// behind. Debug builds only; a release binary ignores it.
+#[cfg(debug_assertions)]
+const STUBBORN_TURN_ENV: &str = "COYOTE_TUI_STUBBORN_TURN";
+
+/// Test-only harness hook: when set to `1`, the exit work panics once its
+/// output is captured, so a pty test can check the panic's message
+/// reaches the restored terminal. Debug builds only; a release binary
+/// ignores it.
+#[cfg(debug_assertions)]
+const PANIC_AT_EXIT_ENV: &str = "COYOTE_TUI_PANIC_AT_EXIT";
 
 /// What one line produced on the work task.
 #[derive(Debug, Default)]

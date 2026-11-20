@@ -730,7 +730,8 @@ impl Transcript {
 
     /// Late command output arrives one pipe read at a time; consecutive
     /// chunks join the trailing Routing cell instead of each taking a
-    /// cell of their own, and the cell keeps only its newest text.
+    /// cell of their own, but only when that cell sits at or after index
+    /// `merge_from`, and the cell keeps only its newest text.
     pub(super) fn push_notice(&mut self, merge_from: usize, kind: NoticeKind, mut text: String) {
         if kind != NoticeKind::Routing {
             self.push(Cell::notice(kind, text));

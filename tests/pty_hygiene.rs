@@ -26,7 +26,7 @@ const PTY_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Spelled in halves: `binary_harness_pins.rs` counts every file whose
 /// code names the harness module as one of its importers.
-const HARNESS_IMPORT: &str = concat!("common::tui_", "harness");
+const HARNESS: &str = concat!("tui_", "harness");
 /// `tui_wiki_docs.rs` only reads sources and docs. `tui_cli_cold_start.rs`
 /// runs on every CI leg, Windows included, and the harness is unix-only.
 const HARNESS_EXEMPT: [&str; 2] = ["tui_cli_cold_start.rs", "tui_wiki_docs.rs"];
@@ -151,15 +151,25 @@ fn tui_suites(tests_dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The source without its comment lines, so a comment that mentions the
-/// harness import is not mistaken for one, and an item head quoted in a
-/// doc comment is not scanned as a declared item.
+/// The source without its comment lines and `mod` declarations, so a
+/// comment that mentions the harness or `common/mod.rs` declaring it is not
+/// mistaken for an import, and an item head quoted in a doc comment is not
+/// scanned as a declared item.
 fn code_only(source: &str) -> String {
     source
         .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
+        .filter(|line| {
+            let line = line.trim_start();
+            let declares_module =
+                (line.starts_with("mod ") || line.starts_with("pub mod ")) && line.ends_with(';');
+            !(line.starts_with("//") || declares_module)
+        })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn uses_harness(code: &str) -> bool {
+    code.contains(HARNESS)
 }
 
 /// The name an item head declares when `line`, at any indent, opens a
@@ -194,10 +204,10 @@ fn item_name(line: &str) -> Option<&str> {
 
 /// Every non-exempt `tui_*.rs` suite imports the shared harness, so a
 /// suite that spawns cannot carry a private copy of the spawn that pins
-/// the config and cache dirs. The count of importers is checked against
-/// the suites found, so a scan that matched nothing cannot pass. It runs
-/// serially as well: the files it opens would shift the descriptor numbers
-/// the fd-leak case relies on.
+/// the config and cache dirs. A scan that matched nothing cannot pass:
+/// every exempt suite must be found, and at least the six group suites
+/// must import the harness. It runs serially as well: the files it opens
+/// would shift the descriptor numbers the fd-leak case relies on.
 #[test]
 #[serial]
 fn every_tui_suite_imports_the_shared_harness() {
@@ -208,7 +218,7 @@ fn every_tui_suite_imports_the_shared_harness() {
     for path in tui_suites(&tests_dir) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let code = code_only(&read(&path));
-        if code.contains(HARNESS_IMPORT) {
+        if uses_harness(&code) {
             harness_users.push(name.clone());
         } else if !HARNESS_EXEMPT.contains(&name.as_str()) {
             unharnessed.push(name.clone());
@@ -229,11 +239,10 @@ fn every_tui_suite_imports_the_shared_harness() {
         "an exempt suite is gone from tests/: found {exempt:?} of {HARNESS_EXEMPT:?}"
     );
     assert!(
-        !suites.is_empty() && harness_users.len() >= suites.len() - exempt.len(),
-        "{} harness users among {} suites, {} of them exempt\nusers: {harness_users:?}\nsuites: {suites:?}",
+        harness_users.len() >= 6,
+        "only {} harness users among {} suites\nusers: {harness_users:?}\nsuites: {suites:?}",
         harness_users.len(),
-        suites.len(),
-        exempt.len()
+        suites.len()
     );
 }
 
@@ -241,7 +250,9 @@ fn every_tui_suite_imports_the_shared_harness() {
 /// of the same name, so a local variant that behaves differently would
 /// swap meaning without a compile error the day the copy is deleted. Only
 /// the harness's top-level `pub` items count; suites' items count at any
-/// indent, since the suites group their cases into inline modules.
+/// indent, since the suites group their cases into inline modules. The
+/// harness scan must find at least 50 items, so a scan that matched
+/// nothing cannot pass.
 #[test]
 #[serial]
 fn no_tui_suite_shadows_a_harness_item() {
@@ -261,7 +272,7 @@ fn no_tui_suite_shadows_a_harness_item() {
     let mut shadows = Vec::new();
     for path in tui_suites(&tests_dir) {
         let code = code_only(&read(&path));
-        if !code.contains(HARNESS_IMPORT) {
+        if !uses_harness(&code) {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().into_owned();

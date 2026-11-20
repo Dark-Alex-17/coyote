@@ -57,18 +57,56 @@ pub fn string_literals(source: &str) -> Vec<String> {
     literals
 }
 
-/// The value of `const {name}: &str = "...";` in `source`, whatever its
-/// visibility.
+/// Every `"..."` literal in `source`, in order, paired with the text that
+/// follows its closing quote. `\"`, `\\` and `\n` are unescaped and a `\` line
+/// continuation is dropped the way rustc drops it.
+pub fn string_literals_with_rest(source: &str) -> Vec<(String, &str)> {
+    let mut literals = Vec::new();
+    let mut chars = source.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut literal = String::new();
+        loop {
+            match chars.next() {
+                Some((at, '"')) => {
+                    literals.push((literal, &source[at + 1..]));
+                    break;
+                }
+                Some((_, '\\')) => match chars.next() {
+                    Some((_, escaped @ ('"' | '\\'))) => literal.push(escaped),
+                    Some((_, 'n')) => literal.push('\n'),
+                    Some((_, '\n')) => {
+                        while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    other => panic!(
+                        "unexpected escape {other:?} in {literal:?}; extend string_literals_with_rest in tests/common/source_scan.rs"
+                    ),
+                },
+                Some((_, c)) => literal.push(c),
+                None => panic!("unterminated string literal: {literal:?}"),
+            }
+        }
+    }
+    literals
+}
+
+/// The value of the string constant `name` in `source`, whatever its
+/// visibility and whether it is typed `&str` or `&'static str`.
 pub fn const_str(source: &str, name: &str) -> String {
-    let head = format!("const {name}: &str = ");
+    let head = format!("const {name}: &");
     let start = source
         .find(&head)
         .unwrap_or_else(|| panic!("the source declares {name}"));
     let rest = &source[start + head.len()..];
-    let end = rest
-        .find(';')
+    let value = &rest[rest.find(" =").expect("a const has a value") + 2..];
+    let end = value
+        .find("\";")
         .unwrap_or_else(|| panic!("{name} ends with `;`"));
-    let mut literals = string_literals(&rest[..=end]);
+    let mut literals = string_literals(&value[..=end]);
     assert_eq!(literals.len(), 1, "{name} is one string literal");
     literals.remove(0)
 }

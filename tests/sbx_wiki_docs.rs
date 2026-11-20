@@ -34,7 +34,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use common::source_scan::{const_str, fn_body, read, repo_root, src};
+use common::source_scan::{const_str, fn_body, read, repo_root, src, string_literals_with_rest};
 
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test sbx_wiki_docs`";
@@ -93,43 +93,6 @@ fn wiki_pages(wiki: &Path) -> Vec<PathBuf> {
         .collect();
     pages.sort();
     pages
-}
-
-/// Every `"..."` literal in `source`, in order, paired with the text that
-/// follows its closing quote. `\"`, `\\` and `\n` are unescaped and a `\` line
-/// continuation is dropped the way rustc drops it.
-fn string_literals(source: &str) -> Vec<(String, &str)> {
-    let mut literals = Vec::new();
-    let mut chars = source.char_indices().peekable();
-    while let Some((_, c)) = chars.next() {
-        if c != '"' {
-            continue;
-        }
-        let mut literal = String::new();
-        loop {
-            match chars.next() {
-                Some((at, '"')) => {
-                    literals.push((literal, &source[at + 1..]));
-                    break;
-                }
-                Some((_, '\\')) => match chars.next() {
-                    Some((_, escaped @ ('"' | '\\'))) => literal.push(escaped),
-                    Some((_, 'n')) => literal.push('\n'),
-                    Some((_, '\n')) => {
-                        while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
-                            chars.next();
-                        }
-                    }
-                    other => panic!(
-                        "unexpected escape {other:?} in {literal:?}; extend string_literals in tests/sbx_wiki_docs.rs"
-                    ),
-                },
-                Some((_, c)) => literal.push(c),
-                None => panic!("unterminated string literal: {literal:?}"),
-            }
-        }
-    }
-    literals
 }
 
 /// The text under `heading`, a `## ` or `### ` line of `page`, up to the next
@@ -227,7 +190,7 @@ fn min_sbx_version() -> String {
 /// `<found>` and the floor filled in.
 fn refusal_sentence() -> String {
     let body = fn_body(&src(&["sandbox", "mod.rs"]), "fn check_sbx_version(");
-    let (template, _) = string_literals(&body)
+    let (template, _) = string_literals_with_rest(&body)
         .into_iter()
         .find(|(literal, _)| literal.starts_with("sbx v{major}"))
         .expect("check_sbx_version bails with the too-old sentence");
@@ -241,7 +204,7 @@ fn refusal_sentence() -> String {
 /// from is the one followed by `.to_string()` or by the `format!` arguments.
 fn root_labels() -> Vec<String> {
     let body = fn_body(&src(&["sandbox", "mixins.rs"]), "fn roots(");
-    let literals = string_literals(&body);
+    let literals = string_literals_with_rest(&body);
     let labels: Vec<String> = literals
         .iter()
         .filter(|(_, after)| after.starts_with(".to_string()") || after.starts_with(','))
@@ -256,7 +219,7 @@ fn root_labels() -> Vec<String> {
         .count();
     assert_eq!(
         labels.len() + joined,
-        string_literals(&body).len(),
+        string_literals_with_rest(&body).len(),
         "every literal in `fn roots` is a label or a joined segment"
     );
     let last_push = body.rfind("roots.push((paths::kits_dir(").unwrap();
@@ -280,7 +243,7 @@ fn table_path(config: &str, label: &str) -> String {
     // `mixins::roots`), so that segment is scraped from the walk itself.
     let nested_hooks = {
         let roots = fn_body(&src(&["sandbox", "mixins.rs"]), "fn roots(");
-        let joined: Vec<String> = string_literals(&roots)
+        let joined: Vec<String> = string_literals_with_rest(&roots)
             .into_iter()
             .filter(|(_, after)| after.starts_with(')'))
             .map(|(literal, _)| literal)
@@ -332,7 +295,7 @@ fn override_env_name() -> String {
         &src(&["config", "paths.rs"]),
         "pub fn sandbox_kit_override(",
     );
-    let (key, _) = string_literals(&body)
+    let (key, _) = string_literals_with_rest(&body)
         .into_iter()
         .find(|(literal, _)| body.contains(&format!("get_env_name(\"{literal}\")")))
         .expect("sandbox_kit_override reads one get_env_name key");
@@ -345,7 +308,7 @@ fn override_env_name() -> String {
     let bin = manifest
         .find("[[bin]]")
         .expect("Cargo.toml declares the bin");
-    let (crate_name, _) = string_literals(&manifest[bin..])
+    let (crate_name, _) = string_literals_with_rest(&manifest[bin..])
         .into_iter()
         .next()
         .expect("the bin table names the crate");
@@ -461,7 +424,7 @@ fn requirements_quote_the_version_floor_and_the_refusal_sentence() {
 fn argv_blocks_match_the_create_and_run_builders() {
     let source = src(&["sandbox", "mod.rs"]);
     let flags = |head: &str| -> Vec<String> {
-        string_literals(&fn_body(&source, head))
+        string_literals_with_rest(&fn_body(&source, head))
             .into_iter()
             .filter(|(literal, after)| after.starts_with(".to_string()") && !literal.contains(' '))
             .map(|(literal, _)| literal)
@@ -651,7 +614,7 @@ fn kit_counts(kit_src: &str, yaml: &str) -> (usize, usize, usize) {
 /// inside `source`, with each `{...}` placeholder replaced in order by the
 /// matching entry of `fill`.
 fn format_template(source: &str, prefix: &str, fill: &[&str]) -> String {
-    let (template, _) = string_literals(source)
+    let (template, _) = string_literals_with_rest(source)
         .into_iter()
         .find(|(literal, _)| literal.starts_with(prefix))
         .unwrap_or_else(|| panic!("the source formats a string starting {prefix:?}"));
@@ -938,7 +901,7 @@ fn usage_probe_discovery_section_quotes_the_refusal_and_log_sentences() {
         "Applying ",
         &["2"],
     );
-    let none = string_literals(&fn_body(&mixins, "pub(crate) fn log_discovery("))
+    let none = string_literals_with_rest(&fn_body(&mixins, "pub(crate) fn log_discovery("))
         .into_iter()
         .map(|(literal, _)| literal)
         .find(|literal| literal.starts_with("No sbx kits"))
@@ -1295,7 +1258,7 @@ fn usage_probe_requirements_describe_the_lenient_version_gate() {
     let installed = fn_body(&source, "fn ensure_sbx_installed(");
     let lenient_arms = [&check, &installed]
         .iter()
-        .flat_map(|body| string_literals(body))
+        .flat_map(|body| string_literals_with_rest(body))
         .filter(|(literal, _)| literal.ends_with("; proceeding"))
         .count();
     assert_eq!(
@@ -1501,7 +1464,7 @@ fn usage_probe_common_failures_name_real_refusals_that_precede_sbx_create() {
         body.match_indices("bail!(")
             .map(|(at, _)| {
                 let rest = &body[at..];
-                string_literals(rest)
+                string_literals_with_rest(rest)
                     .into_iter()
                     .next()
                     .map(|(literal, _)| literal)
@@ -1719,7 +1682,7 @@ fn usage_probe_other_pages_spell_the_kit_roots_of_the_walk() {
     assert!(functions.starts_with(&functions_root));
     let paths_src = src(&["config", "paths.rs"]);
     let (handle_template, _) =
-        string_literals(&fn_body(&paths_src, "pub(crate) fn rag_kit_handle("))
+        string_literals_with_rest(&fn_body(&paths_src, "pub(crate) fn rag_kit_handle("))
             .into_iter()
             .next()
             .expect("rag_kit_handle formats one literal");
@@ -1934,7 +1897,7 @@ fn usage_probe_env_page_describes_the_override_as_a_workload_kit() {
     let sbx_kits = const_str(&config, "SBX_KITS_DIR_NAME");
     let generated = const_str(&src(&["sandbox", "mcp_credentials.rs"]), "MCP_MIXIN_NAME");
     let sysinfo = fn_body(&src(&["config", "request_context.rs"]), "pub fn sysinfo(");
-    let (info_row, _) = string_literals(&sysinfo)
+    let (info_row, _) = string_literals_with_rest(&sysinfo)
         .into_iter()
         .find(|(_, after)| after.starts_with(", display_path(&paths::sbx_kits_dir())"))
         .expect("`--info` reports paths::sbx_kits_dir() in a row");
@@ -2035,11 +1998,12 @@ fn kit_example_blocks(page: &str) -> Vec<String> {
 /// as names), and no page attaches to a sandbox with `sbx run ... --kit`.
 #[test]
 fn usage_probe_every_page_spells_kit_dirs_by_handle_and_never_runs_with_kit() {
-    let run: Vec<String> = string_literals(&fn_body(&src(&["sandbox", "mod.rs"]), "fn run_args("))
-        .into_iter()
-        .filter(|(_, after)| after.starts_with(".to_string()"))
-        .map(|(literal, _)| literal)
-        .collect();
+    let run: Vec<String> =
+        string_literals_with_rest(&fn_body(&src(&["sandbox", "mod.rs"]), "fn run_args("))
+            .into_iter()
+            .filter(|(_, after)| after.starts_with(".to_string()"))
+            .map(|(literal, _)| literal)
+            .collect();
     assert_eq!(run, ["run", "--name"], "Coyote's run argv carries no kit");
     let kits = const_str(&src(&["config", "mod.rs"]), "KITS_DIR_NAME");
 

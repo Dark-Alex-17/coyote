@@ -9,3 +9,4 @@ assets/sbx-kit/** text eol=lf
 assets/functions/kits/** text eol=lf
 tests/fixtures/turn_driver/* text eol=lf
 src/tui/snapshots/*.snap text eol=lf
+src/tui/tests/snapshots/*.snap text eol=lf

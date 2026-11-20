@@ -3676,7 +3676,7 @@ const NEEDLES: [&str; 14] = [
     "InquirePrompter::new(",
 ];
 
-/// Every function outside this module whose body makes one of the
+/// Every function outside `src/tui` whose body makes one of the
 /// [`NEEDLES`] calls.
 fn keyboard_readers() -> Vec<KeyboardReader> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3877,7 +3877,7 @@ fn a_double_slash_inside_a_string_is_not_a_comment() {
     assert!(reader.gated);
 }
 
-/// Every direct keyboard reader outside this module either checks the
+/// Every direct keyboard reader outside `src/tui` either checks the
 /// TUI flag or is listed here with the reason it stays REPL-only, so
 /// a new reader cannot appear without a decision about the TUI.
 #[test]
