@@ -2306,8 +2306,9 @@ fn a_red_run_held_to_exit_0_or_named_nowhere_still_blocks() {
 /// Naming a command without stating a condition other than exit 0 holds it
 /// to exit 0, so request prose that merely lists it cannot make it advisory.
 /// Only a backticked span equal to the command names it, only that span's
-/// own clause states its condition, and a naming line that says it passes
-/// wins over one that states another condition.
+/// own clause states its condition, and only with the command as the subject:
+/// a clause saying what the command checks states nothing. A naming line that
+/// says it passes wins over one that states another condition.
 #[test]
 fn a_red_run_named_without_a_stated_condition_is_held_to_exit_0() {
     if missing(&["python3"]) {
@@ -2356,6 +2357,24 @@ fn a_red_run_named_without_a_stated_condition_is_held_to_exit_0() {
             "no-warnings",
             "sh lint.sh",
             "`sh lint.sh` reports no warnings",
+            "",
+        ),
+        (
+            "checks-exit-1",
+            "pytest tests/test_cli.py",
+            "`pytest tests/test_cli.py` checks the CLI exits 1 on bad input",
+            "",
+        ),
+        (
+            "covers-absent",
+            "cargo test x",
+            "`cargo test x` covers the absent-file case",
+            "",
+        ),
+        (
+            "when-empty",
+            "sh list.sh",
+            "`sh list.sh` prints the header when the list is empty",
             "",
         ),
     ] {
