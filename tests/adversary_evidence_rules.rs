@@ -2088,6 +2088,46 @@ fn a_red_run_whose_criterion_states_no_output_blocks_only_when_that_criterion_is
     }
 }
 
+/// Exiting 0 proves nothing about a stated condition: the run is gated by the
+/// criteria naming it, and it is not the green run an ENVIRONMENT inspection
+/// needs to count as met.
+#[test]
+fn an_exit_0_run_whose_criterion_states_another_condition_is_not_green() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-exit-0");
+    let cmd = "test -e build/tmp";
+    let c6 = "`test -e build/tmp` exits 1 (the file is absent)";
+    let state = judged_state(
+        &[("c1", "does c1", "MET"), ("c6", c6, "UNMET")],
+        json!([green(cmd)]),
+    );
+    let text = report(&dir.0, "stated-exit-0-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Verification run `{cmd}` -- exit 0 (not green; the criteria naming it state a pass \
+             condition other than exit 0 and are not all met: c6 UNMET; baseline on the diff \
+             base: none recorded)"
+        )),
+        "{text}"
+    );
+
+    let mut state = judged_state(
+        &[("c1", "does c1", "INSPECTED"), ("c6", c6, "MET")],
+        json!([green(cmd)]),
+    );
+    state["crit_verdicts"][0]["no_test_reason"] =
+        json!("ENVIRONMENT: declare sh test.sh via the verification_commands variable");
+    let text = report(&dir.0, "stated-exit-0-floor", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains("Criteria: 1/2 met") && text.contains("nothing was executed"),
+        "{text}"
+    );
+}
+
 /// A timeout or a signal exit says nothing about the stated condition, so it
 /// blocks even when the criterion naming the command is met.
 #[test]

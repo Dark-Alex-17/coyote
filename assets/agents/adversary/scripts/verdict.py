@@ -16,6 +16,8 @@ when parsed criteria name it and every one of them ends MET or INSPECTED;
 both are reported as advisory red runs. A stated red run that no parsed
 criterion names blocks, and so does a red run that timed out (exit -1) or was
 killed by a signal (exit 128 or above), whatever its stated condition. A
+run that exited 0 under a stated condition is judged the same way as a
+stated red run and is never a green run. A
 command the runner's deadline skipped is
 reported as not run and does not block by itself: the criterion checks judge
 the criteria it covers. An ENVIRONMENT runner-error marker blocks when
@@ -23,7 +25,7 @@ commands were declared, since the declared commands never ran.
 An INSPECTED verdict whose no_test_reason starts with "ENVIRONMENT:" (an
 execution criterion judged from the diff because no recorded run covered
 it) counts as met only when at least one recorded run is green (exit 0, not
-skipped); otherwise it is PARTIAL with a complaint naming the command to
+skipped, held to exit 0); otherwise it is PARTIAL with a complaint naming the command to
 declare, so nothing executed never conforms.
 Holistic complaints block unless they carry `blocking: false`, or are scope
 drift whose every location path lies under the configured `debris_exclude`
@@ -210,9 +212,16 @@ def unverified_faults(verdicts):
     ]
 
 
-def green_run(exec_results):
+def green_run(exec_results, criteria, request):
+    """Some recorded run exited 0 and is held to exit 0; exiting 0 proves nothing about a
+    stated condition."""
+    from pass_condition import EXIT_0, resolve
+
     return isinstance(exec_results, list) and any(
-        isinstance(r, dict) and not r.get("skipped") and r.get("exit") == 0
+        isinstance(r, dict)
+        and not r.get("skipped")
+        and r.get("exit") == 0
+        and resolve(r.get("cmd"), criteria, request)["condition"] == EXIT_0
         for r in exec_results
     )
 
@@ -223,9 +232,9 @@ def declared_command(reason):
     return (m.group(1) if m else rest).strip()
 
 
-def demote_unexecuted(verdicts, exec_results):
+def demote_unexecuted(verdicts, exec_results, criteria, request):
     """PARTIAL for each ENVIRONMENT-INSPECTED verdict when no recorded run is green."""
-    if green_run(exec_results):
+    if green_run(exec_results, criteria, request):
         return verdicts
     out = []
     for v in verdicts:
@@ -336,7 +345,8 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
     condition a parsed criterion states blocks unless every criterion naming
     it has a final status MET or INSPECTED in `verdicts`, and is otherwise
     advisory with their evidence as the reason; one whose condition only the
-    request states blocks. A record the deadline skipped is
+    request states blocks. A run that exited 0 under a stated condition is
+    gated the same way. A record the deadline skipped is
     not a run and yields nothing here. An "ENVIRONMENT: ..." runner-error
     marker with a non-empty declaration is one complaint: the declared
     commands never ran. Other string markers ("none declared",
@@ -366,10 +376,13 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
             continue
         cmd = r.get("cmd", "?")
         code = r.get("exit")
+        condition = resolve(cmd, criteria, request)
         if code == 0:
+            if condition["condition"] == STATED:
+                blocks, text = stated_red(r, "exit 0", condition, by_id)
+                (out if blocks else advisory).append(text)
             continue
         outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
-        condition = resolve(cmd, criteria, request)
         if baseline_status(r) == "tree-state":
             blocks, text = tree_state_red(r, outcome, condition["criteria"], by_id)
             (out if blocks else advisory).append(text)
@@ -416,13 +429,14 @@ def tree_state_red(record, outcome, ids, by_id):
 
 
 def stated_red(record, outcome, condition, by_id):
-    """(blocks, text) for a red run whose pass condition is stated as something other than
-    exit 0 by the parsed criteria naming it, or only by the request when none does."""
+    """(blocks, text) for a red or exit-0 run whose pass condition is stated as something
+    other than exit 0 by the parsed criteria naming it, or only by the request when none does."""
     cmd = record.get("cmd", "?")
+    recorded = "recorded FAIL" if record.get("exit") != 0 else "not green"
     ids = condition["criteria"]
     if not ids:
         return True, (
-            f"Verification run `{cmd}` -- {outcome} (recorded FAIL; its pass condition is stated "
+            f"Verification run `{cmd}` -- {outcome} ({recorded}; its pass condition is stated "
             f"only in the request (\"{condition['line']}\") and no acceptance criterion names it; "
             f"{baseline_text(record)})"
         )
@@ -431,7 +445,7 @@ def stated_red(record, outcome, condition, by_id):
         return False, f"- `{cmd}` -- {outcome} -- {met_reasons(naming, by_id)} -- {baseline_text(record)}"
     statuses = ", ".join(f"{cid} {status}" for cid, status in naming)
     return True, (
-        f"Verification run `{cmd}` -- {outcome} (recorded FAIL; the criteria naming it state a "
+        f"Verification run `{cmd}` -- {outcome} ({recorded}; the criteria naming it state a "
         f"pass condition other than exit 0 and are not all met: {statuses}; {baseline_text(record)})"
     )
 
@@ -559,7 +573,9 @@ def main():
     state = load_state()
     verdicts = [v for v in (state.get("crit_verdicts") or []) if isinstance(v, dict)]
     verdicts = apply_format_rulings(verdicts, state.get("format_rulings"))
-    verdicts = demote_unexecuted(verdicts, state.get("exec_results"))
+    verdicts = demote_unexecuted(
+        verdicts, state.get("exec_results"), state.get("criteria"), state.get("initial_prompt")
+    )
     holistic = [c for c in (state.get("extra_complaints") or []) if isinstance(c, dict)]
     excludes = configured_excludes(state)
     outside = outside_names(state, excludes) if excludes else set()
