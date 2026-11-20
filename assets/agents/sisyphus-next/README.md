@@ -109,12 +109,12 @@ from the brief, never from a hard-coded toolchain):
 
 ```
 $ grep -nE '\b(cargo|npm|pnpm|yarn|go (test|build)|pytest|mvn|gradle|make)\b' scripts/*.py
-scripts/gates.py:3155:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
-scripts/smoke_test.py:3216:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
-scripts/smoke_test.py:3217:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
-scripts/smoke_test.py:3423:             "make: *** [check] Error 1")
-scripts/smoke_test.py:3428:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
-scripts/smoke_test.py:3429:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
+scripts/gates.py:3210:        lines += ["Observability pass: make these alert-as-code / instrumentation changes following the repo's existing "
+scripts/smoke_test.py:3340:u = gates.ci_gate({"git_report": "ok\nANOMALY: commits I did not make\n", "git_task": {"return_to": "final_report"}, "run_dir": TMP, "anomalies_log": []})
+scripts/smoke_test.py:3341:check("ci_gate: ANOMALY: lines harvested from git_report", any("commits I did not make" in e for e in u.get("anomalies_log", [])))
+scripts/smoke_test.py:3547:             "make: *** [check] Error 1")
+scripts/smoke_test.py:3552:            "Last node output:\nonly the next subtask can fix this\n\nLast build output:\nRan: make build\n"
+scripts/smoke_test.py:3553:            f"Ran in: {CARRY}\n\nLast tests output:\nRan: make check\nRan in: {CARRY}\nExit code: 2\n\n{out}\n")
 ```
 
 The lone `gates.py` hit is the English verb `make` in one prompt sentence; the five
@@ -178,7 +178,7 @@ no earlier turns, `assess` does so straight away.
 Typed replies: a reply to an escalation is matched to an option by number or text first. The
 first reply that names no option goes to the `interpret_reply` llm node with the question,
 the reply and the instructions the kind accepts (`ACCEPTED_INSTRUCTIONS`: `answer` for
-`clarify` and `design_ask`, `design` for `design_choice`, `amendment` for `plan_defect`,
+`clarify` and `design_ask`, `design` for `design_choice`, `amendment` and `fix` for `plan_defect`,
 `recipe` for `probe_gap`, `rescope` for `scope_breach`, `path` for `handoff_confirm` and
 `handoff_path`, `answer` for `clarify_cap`, `here` for `sizing_cap`). `interpret_route` acts
 on the verdict: an option counts only when the
@@ -334,6 +334,18 @@ strikeout to proceeding without the change. Proceeding without a strikeout's cha
 only in a subtask whose failed attempt was saved under its own strikeout ref; elsewhere, and
 when security blocks at the ceiling, the question is a hard trigger with nothing recommended.
 
+A `plan_defect` (the triage model marks an escalated finding `kind: plan_defect` when it says
+the plan or a criterion itself is impossible or contradictory) offers four options: amend the
+criterion in place, a fix round because the plan is not at fault (the stated fix, else the
+whole finding, goes to the coder), accept the defect unresolved and proceed (a follow-up), or
+stop. Amendments and fix rounds share one count; amending is recommended below
+`STRIKE_LIMIT` (3) and accepting from then on, and Stop is never recommended. A navigator's
+Stop pick on a `plan_defect` that carries a note of its own goes to the reply interpreter, which
+reads the note against every option, instead of stopping as picked. A default amendment (a bare or
+headless pick, which states none) takes the adversary's finding; when that finding names a
+backticked command the criteria do not quote whole, it is recorded as a follow-up note
+instead of being applied.
+
 A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
 attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and
 puts back only the paths it changed, index included; if that save fails, or elsewhere, it
@@ -373,6 +385,12 @@ is a tag. `other:` and `deleted:` items are human-attention lines and are record
 during review and NOT adopted, in the report and the publish text; an unavailable list, or a
 path that is not one line free of control characters (skipped, never quoted), is an attention
 line too.
+
+Every gauntlet prompt names, above the plan block, the probe-written tests still in the
+worktree and not committed (the adoption round's own line names those it adopts), so the lanes
+review them as part of the change rather than as leftover files. Whenever the worktree is
+uncommitted the prompt also says so, since the work stays uncommitted until it is published
+while the diff base is a commit.
 
 At the top of `pr_gate` each probe-written path is settled against the last passing round's
 `code_tree`: one still in the worktree and unchanged since that tree was reviewed by that round

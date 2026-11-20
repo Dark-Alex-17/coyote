@@ -1949,6 +1949,10 @@ nodes:
         accept; an adversary complaint that the PLAN itself is the root cause
         (an impossible or contradictory criterion - never "fixed" by changing
         scope); a finding re-raised despite a cited rejection on record.
+      `kind` on an escalated blocker names what it is: plan_defect when the
+      finding says the plan or a criterion itself is impossible or
+      contradictory, probe_gap when the environment, not the code, keeps the
+      usage probe from running, finding otherwise.
       A debris finding (non-ASCII punctuation / planning vocabulary on added
       lines) is a fix, except a glyph that is the point or a line that must name
       the needles - then the coder marks it debris-exempt and you record the
@@ -1985,6 +1989,9 @@ nodes:
                 enum: [fix, reject, defer, escalate]
               citation: { type: string }
               reason: { type: string }
+              kind:
+                type: string
+                enum: [plan_defect, probe_gap, finding]
             required: [finding, action]
         debris_exemptions_new:
           type: array

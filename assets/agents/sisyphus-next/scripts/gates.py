@@ -1695,7 +1695,11 @@ def consult_route(state):
             # "Narrow the scope first: only the code files" opens with an option's own text; its note goes with it
             led, note = split_option_led(value, options, True)
             choice = _pick_with_note(value, options) or (f"{led}: {note}" if led and note else led)
-        if choice:
+        # a plan_defect Stop the navigator qualifies in its own words is read, never taken as picked: the words may
+        # clear the plan, which the fix-round option covers
+        qualified_stop = bool(kind == "plan_defect" and choice and options and _is_stop_text(choice)
+                              and _stated_reason(choice, options) != NO_STATED_REASON)
+        if choice and not qualified_stop:
             u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0,
                       "answer_source": "navigator"})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
@@ -1704,7 +1708,9 @@ def consult_route(state):
         # an answer in the navigator's own words, or one whose later numbers may name other options, is read by the
         # reply interpreter, never handed to the owner blind: unasked, the owner's headless answer would take the
         # recommended option whatever the navigator said
-        why = "may name more than one option" if ambiguous else "names no option by number or text"
+        why = ("may name more than one option" if ambiguous
+               else "picks a stop with a note of its own" if qualified_stop
+               else "names no option by number or text")
         ledger(state, u, f"consult: {kind}: the navigator's answer {why} -> interpret: {value}")
         u.update({"last_answer_text": value, "reply_accepts": _accepts_text(kind), "reply_source": "navigator",
                   "reply_author": "navigator", "reply_interpreted": False, "answer_source": "navigator"})
@@ -1855,12 +1861,19 @@ def parse_answer(state):
     return u
 
 
+# The plan itself as the root cause: amend the criterion in place, run a fix round because the plan is not at fault,
+# accept the defect unresolved and move on, or stop.
+PLAN_DEFECT_CONTINUE = "Continue; treat the criterion as amended (state the amendment)"
+PLAN_DEFECT_FIX = "Not a plan defect: fix round (state the fix)"
+PLAN_DEFECT_ACCEPT = "Accept the plan defect unresolved and proceed (state the reason)"
+PLAN_DEFECT_STOP = "Stop; the plan needs amending (report it)"
+
 # The instruction shapes a typed reply may carry, per escalation kind; any other instruction reads as unclear.
 ACCEPTED_INSTRUCTIONS = {
     "clarify": ("answer",),
     "design_choice": ("design",),
     "design_ask": ("answer",),
-    "plan_defect": ("amendment",),
+    "plan_defect": ("amendment", "fix"),
     "probe_gap": ("recipe",),
     "scope_breach": ("rescope",),
     "handoff_confirm": ("path",),
@@ -1874,6 +1887,7 @@ INSTRUCTION_HELP = {
     "answer": "answer the question in the user's own words; value: the answer",
     "design": "follow a different approach than the options offer; value: the approach",
     "amendment": "continue with the criterion amended as described; value: the amendment",
+    "fix": "the plan is not at fault: run a fix round as described instead of amending; value: the fix",
     "recipe": "supply what the probe needs to run (recipe, fixture, mock); value: what to provide",
     "rescope": "proceed with the task's scope re-declared as described; value: the new scope",
     "path": "use the handoff file at a path; value: the path",
@@ -1883,10 +1897,11 @@ INSTRUCTION_HELP = {
 # How an applied text instruction reads as an answer, in the words apply_answer keys on. The free-form shapes carry
 # the owner's own words verbatim.
 INSTRUCTION_ANSWERS = {"answer": "{}", "design": "Use this approach instead: {}",
-                       "amendment": "Continue; treat the criterion as amended: {}", "recipe": "Supply it: {}",
+                       "amendment": "Continue; treat the criterion as amended: {}", "fix": PLAN_DEFECT_FIX + ": {}",
+                       "recipe": "Supply it: {}",
                        "rescope": "Proceed: scope re-declared to include: {}", "narrow": SIZING_NARROW_PREFIX + "{}",
                        "here": SIZING_HERE_REASON + ": {}"}
-FREE_FORM_SHAPES = ("answer", "design", "amendment", "recipe", "rescope", "narrow", "here")
+FREE_FORM_SHAPES = ("answer", "design", "amendment", "fix", "recipe", "rescope", "narrow", "here")
 
 
 def _accepts_text(kind):
@@ -2227,6 +2242,24 @@ _CONTINUE_WORD_RE = re.compile(r"\b(?:continue|treat|amendment|amended|proceed|a
 _STOP_WORD_RE = re.compile(r"\b(?:stop|abort|halt|discontinue)")
 
 
+def _plan_criteria(state):
+    """The criteria a plan_defect amendment would change: the current subtask's criteria and amendments in the
+    subtask phase, else spec_text, else (the final review) every subtask's."""
+    if not _subtask_phase(state):
+        return (state.get("spec_text") or "").strip() or "\n".join(
+            str(c) for s in as_list(state.get("subtasks")) for c in as_list(_subtask_at([s], 0).get("acceptance_criteria")))
+    s = _subtask_at(as_list(state.get("subtasks")), max(as_int(state.get("subtask_index")) - 1, 0))
+    return "\n".join([str(c) for c in as_list(s.get("acceptance_criteria"))]
+                     + [t for t, _ in map(_amendment, as_list(s.get("amendments")))])
+
+
+def _unlisted_commands(text, criteria):
+    """The backticked commands in `text` (two words or more, as _declares_gate reads a command) that `criteria` does
+    not quote verbatim as a whole command."""
+    return [c for c in re.findall(r"`([^`\n]+)`", text or "") if len(c.split()) >= 2
+            and not re.search(r"(?<![^\s`])" + re.escape(c.strip()) + r"(?![^\s`])", criteria or "")]
+
+
 def _says_continue(said):
     """The first continue word decides: it continues unless a negation precedes it in its clause."""
     for clause in re.split(r"[.;,:!?()\n\u2014\u2013]|\s-\s", said.replace("\u2019", "'")):
@@ -2462,21 +2495,47 @@ def apply_answer(state):
     elif kind == "plan_defect":
         # an amendment often mentions stopping ("continue; stop retrying on 5xx"), so only a reply that is or leads
         # with a stop stops; a reply negating its continue ("do not proceed") stops; one naming no side is asked again
-        said = (_named_option(answer, options) or answer).strip().lower()
+        named = _named_option(answer, options)
+        said = (named or answer).strip().lower()
         leads_stop = stop or said.startswith(("stop", "abort"))
         a = "continue" if _says_continue(said) and not leads_stop else "stop"
-        if not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
+        used = as_int(state.get("plan_defect_continues"))
+        reason = _stated_reason(answer, options)
+        if named == PLAN_DEFECT_ACCEPT:
+            why = (esc.get("evidence") or "(no finding recorded)") if reason == NO_STATED_REASON else reason
+            u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
+                f"Plan defect accepted unresolved at the user's say-so: {why}"]
+            ledger(state, u, f"plan defect: accepted unresolved after {used}/{STRIKE_LIMIT} continues: "
+                             f"{tail(why, 300)}")
+            u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
+        elif named == PLAN_DEFECT_FIX:
+            # the fix is the stated one, else the adversary's finding whole: a trimmed finding can lose its command
+            fix = (esc.get("evidence") or "(no finding recorded)") if reason == NO_STATED_REASON else reason
+            u.update({"plan_defect_continues": used + 1, "fix_source": "plan_defect_fix", "fix_note": fix})
+            ledger(state, u, f"plan defect: not a plan defect; fix round ({used + 1}/{STRIKE_LIMIT} continues used"
+                             + (", past the cap at the user's pick" if used + 1 > STRIKE_LIMIT else "")
+                             + f"): {tail(fix, 300)}")
+            u["_next"] = "compose_fix"
+        elif not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
             _reask_unmatched(state, u, esc, answer, "says neither stop nor continue")
         elif a == "continue":
-            u["plan_defect_continues"] = as_int(state.get("plan_defect_continues")) + 1
-            if _stated_reason(answer, options) == NO_STATED_REASON:
+            u["plan_defect_continues"] = used + 1
+            unlisted = []
+            if reason == NO_STATED_REASON:
                 # a bare or headless pick states no amendment, so the run amends the criterion to the adversary's finding
                 author = "default"
-                answer = f"{answer}: {tail(esc.get('evidence') or '', 300) or '(no finding recorded)'}"
+                finding = esc.get("evidence") or ""
+                answer = f"{answer}: {tail(finding, 300) or '(no finding recorded)'}"
+                # a command nobody stated would become a criterion the review runs, so it is only noted
+                unlisted = _unlisted_commands(finding, _plan_criteria(state))
             else:
                 author = "navigator" if state.get("answer_source") == "navigator" else "user"
             tag = AMENDMENT_AUTHORS[author][1]
-            if _subtask_phase(state):
+            if unlisted:
+                note = f"Plan note (a default amendment, not applied: it names a command the criteria do not): {answer}"
+                u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [note]
+                ledger(state, u, note)
+            elif _subtask_phase(state):
                 # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
                 subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
                 cur = max(as_int(state.get("subtask_index")) - 1, 0)
@@ -2900,10 +2959,6 @@ def inbox_route(state):
 REJECTED_CONTINUE = "Plan again with these changes (state them)"
 REJECTED_STOP = "Stop and report"
 
-# The plan itself as the root cause: amend the criterion in place, or stop.
-PLAN_DEFECT_CONTINUE = "Continue; treat the criterion as amended (state the amendment)"
-PLAN_DEFECT_STOP = "Stop; the plan needs amending (report it)"
-
 
 def _coder_error_tail(result):
     m = re.search(r"(Verification gate error:.*)", result, re.S)
@@ -3156,6 +3211,9 @@ def compose_fix(state):
                   "rule conventions (ordinary code changes; the usual review gates apply):", state.get("obs_coder_brief") or ""]
     elif src == "probe_gap":
         lines += ["Provide the local-run recipe / fixture the usage probe needs, as the user described:", note]
+    elif src == "plan_defect_fix":
+        lines += ["The adversary reported the plan as the root cause; the reply ruled the plan is not at fault. Keep "
+                  "every acceptance criterion as written and apply this change:", note]
     elif src == "ci":
         lines += ["CI is red on the PR. Fix the failure below (evidence pack verbatim):", state.get("ci_evidence") or ""]
         if (state.get("ci_diagnosis") or "").strip():
@@ -3834,6 +3892,16 @@ def build_gauntlet_prompt(state):
         # above the plan block, so the gauntlet never reads it as an acceptance criterion
         lines.append(f"Probe-written tests adopted into the change under review (written in review round "
                      f"{_rounds_of(due)}; review them as part of the change): {_paths_of(due)}")
+    written = _probe_tests_in_tree(state, root, base, {str(d.get("path")) for d in due})
+    if written:
+        lines.append(f"Probe-written tests in the change under review (written by this review's probe lane in round "
+                     f"{_rounds_of(written)}; part of the change, not leftover files): {_paths_of(written)}")
+    tree_dirty = _code_tree_dirty(state, root)
+    if tree_dirty:
+        # lanes otherwise read a red clean-tree command as a regression of the code
+        lines.append("Tree state: the change under review is uncommitted in the worktree until it is published"
+                     + (", probe-written tests included" if written or adopting else "")
+                     + "; the diff base is a commit.")
     full = truthy(state.get("full_gauntlet_due"))
     if full:
         u["full_gauntlet_due"] = False
@@ -3886,7 +3954,7 @@ def build_gauntlet_prompt(state):
         if prior:
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
         last = rounds[-1] if isinstance(rounds[-1], dict) else {}
-        dirty = _code_tree_dirty(state, root)
+        dirty = tree_dirty
         if full:
             ledger(state, u, f"gauntlet: round {n} runs the full gauntlet after the pipeline escalation: no re-review "
                              "delta or settled lanes")
@@ -4316,8 +4384,11 @@ def triage_route(state):
     u["lane_block_streak"] = streak
     if escalations:
         e = escalations[0]
-        kind = e.get("kind") or ("plan_defect" if re.search(r"plan|criterion", str(e.get("reason", "")) + str(e.get("finding", "")), re.I)
-                                 and _lane_of(e, str(e.get("finding", ""))) == "adversary" else "yellow_findings")
+        kind = e.get("kind") if e.get("kind") in ("plan_defect", "probe_gap") else "yellow_findings"
+        if e.get("kind") not in ("plan_defect", "probe_gap", "finding") \
+                and _lane_of(e, str(e.get("finding", ""))) == "adversary":
+            ledger(state, u, f"triage: an escalated adversary finding carries no known kind ({e.get('kind')!r}); "
+                             f"asked as a review warning: {tail(str(e.get('finding', '')), 200)}")
         if kind == "probe_gap":
             esc = escalation("probe_gap", "The usage probe is INCONCLUSIVE: the environment, not the code, blocks it. "
                                           "Supply the missing recipe/fixture/mock and re-run, or surface the gap?",
@@ -4327,15 +4398,21 @@ def triage_route(state):
                              evidence=str(e.get("finding", "")))
         elif kind == "plan_defect":
             used = as_int(state.get("plan_defect_continues"))
-            # continue is recommended below the cap, so a headless run amends in place instead of stopping; past
-            # the cap Stop is, so it never amends forever
+            # amending is recommended below the cap and accepting at it, so a headless run never stops on a plan
+            # defect nor amends forever; amendments and fix rounds share the one count
             spent = used >= STRIKE_LIMIT
             note = f"{used}/{STRIKE_LIMIT} continues used in this run"
             esc = escalation("plan_defect", "The adversary reports the PLAN itself as the root cause (impossible or "
-                                            "contradictory criterion). Never fixed by changing scope: amend the plan, or stop?",
+                                            "contradictory criterion). Never fixed by changing scope: amend the plan, "
+                                            "fix the code if the plan is not at fault, accept it unresolved, or stop?",
                              [option(PLAN_DEFECT_CONTINUE, not spent,
                                      f"the criterion is amended in place with the stated amendment; {note}"),
-                              option(PLAN_DEFECT_STOP, spent)],
+                              option(PLAN_DEFECT_FIX, False,
+                                     f"the criterion stands and the coder fixes the code as stated; counted as a "
+                                     f"continue; {note}"),
+                              option(PLAN_DEFECT_ACCEPT, spent, "recorded as a follow-up with the stated reason; "
+                                                                "the run goes on"),
+                              option(PLAN_DEFECT_STOP)],
                              evidence=str(e.get("finding", "")))
         else:
             esc = escalation("yellow_findings", "A review warning at production rigor: fix it, or accept it as scoped-out?",
@@ -4429,6 +4506,26 @@ def _paths_of(entries):
 
 def _rounds_of(entries):
     return ", ".join(str(r) for r in dict.fromkeys(as_dict(e).get("round") for e in entries))
+
+
+def _probe_tests_in_tree(state, root, base, skip=()):
+    """The probe-written tests (latest round per path) in the worktree that differ from `base` (else from HEAD),
+    minus `skip`: an earlier subtask's tests are already in that subtask's snapshot base."""
+    latest = {}
+    for t in as_list(state.get("probe_tests")):
+        path = str(as_dict(t).get("path") or "")
+        if path and path not in skip:
+            latest[path] = as_dict(t)
+    if not latest:
+        return []
+    tree = _worktree_tree(root) if base else ""
+    code, out, _ = (git(root, "diff-tree", "-r", "-z", "--name-only", base, tree, "--", *_literal(latest)) if tree
+                    else (1, "", ""))
+    dirty = set(_nul_names(out)) if code == 0 else None
+    if dirty is None:
+        code, out, _ = git(root, "status", "--porcelain", "-z", "--untracked-files=all", "--", *_literal(latest))
+        dirty = {e[3:] for e in out.split("\0") if len(e) > 3} if code == 0 else set()
+    return [latest[p] for p in latest if p in dirty and os.path.exists(os.path.join(root, p))]
 
 
 def _start_probe_adoption(state, u):
