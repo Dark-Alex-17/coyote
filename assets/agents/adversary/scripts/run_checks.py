@@ -65,19 +65,32 @@ named a test id and the failure output hashes alike. The red record gains
 "tree-state", "exit", "note"}. not-run means no comparison happened (no diff
 base, deadline spent, worktree or helper failure, base run timed out); it
 blocks like a regression, so a missing comparison never passes.
-When `git status --porcelain` lists anything, every red record that did not
-time out first runs once more, inside the same deadline and in the same
-subdirectory, in a second detached worktree (hooks disabled the same way) of a
-snapshot commit of the live tree: HEAD plus every tracked and untracked file
-that is not ignored, built through a temporary GIT_INDEX_FILE and commit-tree,
-so the real index and refs are never touched. A command that exits 0 there
-gets baseline status "tree-state" and no base run: it is red only in the
-uncommitted live tree. Any other snapshot outcome (red, timed out, no snapshot,
-deadline spent) keeps the live run's classification against the base, with
-", candidate tree dirty" appended to its note; the snapshot's own output is
-never compared with the base, since ignored files missing from both clean
-checkouts would fake a match. Snapshot runs are never saved. Both worktrees
-are removed together.
+Tree state: after the review-stack lock and before the first declared command
+runs, `git status --porcelain` is read. When it lists anything, a snapshot
+commit of that pre-run tree is built: HEAD plus every tracked and untracked
+file that is not ignored, through a temporary GIT_INDEX_FILE, write-tree and
+commit-tree, so the real index and refs are never touched. This writes
+unreferenced objects (among them the blobs of untracked, non-ignored files)
+into the repository's object store, where git's own gc collects them. When
+`git status` fails or `core.sparseCheckout` is true (a sparse index cannot be
+snapshotted whole), no snapshot is taken and every red record's note gains
+", candidate tree state unknown". After the declared commands run, the live
+tree is written the same way into a second temporary index and its tree id is
+compared with the pre-run one (HEAD's tree when the tree was clean). When they
+differ, the declared commands modified the tree (a regenerate-then-diff
+command, say), no red record gets "tree-state", and each note gains ", the
+declared commands modified the tree". Otherwise, on a dirty tree, every red
+record that did not time out runs once more, inside the same deadline and in
+the same subdirectory, in a second detached worktree (hooks disabled the same
+way) of the pre-run snapshot commit. A command that exits 0 there gets
+baseline status "tree-state", a null exit and no base run: it is red only in
+the uncommitted live tree. Any other snapshot outcome (red, timed out, no
+snapshot, deadline spent) keeps the live run's classification against the
+base, with ", candidate tree dirty" appended to its note; the snapshot's own
+output is never compared with the base, since ignored files missing from both
+clean checkouts would fake a match. Snapshot runs are never saved. Each
+snapshot git call is capped at SNAPSHOT_GIT_TIMEOUT_SECS and by the deadline.
+Both worktrees are removed together.
 
 Process hygiene: commands run through the shell. On POSIX each command gets
 its own session (start_new_session) and a timeout SIGKILLs the whole process
@@ -137,12 +150,15 @@ GATE_LIB = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "..", "coder", "scripts", "gate_lib.sh"
 )
 GIT_CLEANUP_TIMEOUT_SECS = 20
+SNAPSHOT_GIT_TIMEOUT_SECS = 120
 GATE_CALL_MIN_TIMEOUT_SECS = 10
 BASE_RUN_FORMAT = 1
 TREE_STATE_NOTE = (
     "candidate tree dirty: red only in the live tree; the same content on a clean checkout exits 0"
 )
 DIRTY_TREE_NOTE = ", candidate tree dirty"
+UNKNOWN_TREE_NOTE = ", candidate tree state unknown"
+MODIFIED_TREE_NOTE = ", the declared commands modified the tree"
 SNAPSHOT_IDENTITY = {
     "GIT_AUTHOR_NAME": "adversary",
     "GIT_AUTHOR_EMAIL": "adversary@localhost.invalid",
@@ -438,54 +454,95 @@ def add_worktree(top, path, commit, work, deadline):
     )
 
 
-def tree_dirty(top, deadline):
+def snapshot_budget(deadline):
+    return min(SNAPSHOT_GIT_TIMEOUT_SECS, left(deadline))
+
+
+def sparse_checkout(top, deadline):
     try:
-        return bool(git_text(["--no-optional-locks", "status", "--porcelain"], top, left(deadline)))
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return git_text(["config", "--bool", "core.sparseCheckout"], top, snapshot_budget(deadline)) == "true"
+    except RuntimeError:
         return False
 
 
-def snapshot_commit(top, work, deadline):
-    """A commit of the live tree whose parent is HEAD, built in a temporary index."""
-    env = dict(os.environ, GIT_INDEX_FILE=os.path.join(work, "snapshot-index"), **SNAPSHOT_IDENTITY)
-    git_text(["read-tree", "HEAD"], top, left(deadline), env)
-    git_text(["add", "-A"], top, left(deadline), env)
-    tree = git_text(["write-tree"], top, left(deadline), env)
-    return git_text(
-        ["commit-tree", "--no-gpg-sign", "-p", "HEAD", "-m", "adversary snapshot", tree],
-        top,
-        left(deadline),
-        env,
-    )
+def snapshot_tree(top, work, index, deadline):
+    """The tree id of HEAD plus the live tree's tracked and untracked, non-ignored files,
+    written through the temporary index file `index` under `work`."""
+    env = dict(os.environ, GIT_INDEX_FILE=os.path.join(work, index))
+    git_text(["read-tree", "HEAD"], top, snapshot_budget(deadline), env)
+    git_text(["add", "-A"], top, snapshot_budget(deadline), env)
+    return git_text(["write-tree"], top, snapshot_budget(deadline), env)
 
 
-def rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, saved_runs, worktrees):
-    """Run each red command once more on a snapshot of a dirty live tree and give the
-    ones that exit 0 there a tree-state baseline; return the reds this applied to."""
-    if left(deadline) <= 0 or not tree_dirty(top, deadline):
-        return []
-    tree = os.path.join(work, "snapshot")
+def tree_before(proj, work, deadline):
+    """The live tree before any declared command runs: {"top", "dirty", "tree", "commit"}.
+    "dirty" is None when the tree state cannot be read; "tree" is None when a dirty tree
+    could not be snapshotted."""
+    unknown = {"top": None, "dirty": None, "tree": None, "commit": None}
     try:
-        commit = snapshot_commit(top, work, deadline)
-        worktrees.append(tree)
-        add_worktree(top, tree, commit, work, deadline)
+        top = git_text(["rev-parse", "--show-toplevel"], proj, snapshot_budget(deadline))
+        if sparse_checkout(top, deadline):
+            return unknown
+        status = git_text(["--no-optional-locks", "status", "--porcelain"], top, snapshot_budget(deadline))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        return unknown
+    if not status:
+        try:
+            tree = git_text(["rev-parse", "HEAD^{tree}"], top, snapshot_budget(deadline))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            return unknown
+        return {"top": top, "dirty": False, "tree": tree, "commit": None}
+    try:
+        tree = snapshot_tree(top, work, "before-index", deadline)
+        commit = git_text(
+            ["commit-tree", "--no-gpg-sign", "-p", "HEAD", "-m", "adversary snapshot", tree],
+            top,
+            snapshot_budget(deadline),
+            dict(os.environ, **SNAPSHOT_IDENTITY),
+        )
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         sys.stderr.write(f"WARN: no snapshot of the dirty tree to rerun red commands in: {e}\n")
-        return reds
+        return {"top": top, "dirty": True, "tree": None, "commit": None}
+    return {"top": top, "dirty": True, "tree": tree, "commit": commit}
+
+
+def tree_outcome(before, work, deadline):
+    """(the pre-run snapshot commit to rerun red commands on, or None; the suffix for the
+    note of every red record that does not get a tree-state baseline)."""
+    if before["dirty"] is None:
+        return None, UNKNOWN_TREE_NOTE
+    dirty = DIRTY_TREE_NOTE if before["dirty"] else ""
+    if before["tree"] is None:
+        return None, dirty
+    try:
+        after = snapshot_tree(before["top"], work, "after-index", deadline)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"WARN: the live tree could not be compared with its pre-run state: {e}\n")
+        return None, UNKNOWN_TREE_NOTE + dirty
+    if after != before["tree"]:
+        return None, MODIFIED_TREE_NOTE + dirty
+    return before["commit"], dirty
+
+
+def rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, commit, worktrees):
+    """Run each red command once more on the pre-run snapshot `commit` and give the ones
+    that exit 0 there a tree-state baseline."""
+    if left(deadline) <= 0:
+        return
+    tree = os.path.join(work, "snapshot")
+    worktrees.append(tree)
+    try:
+        add_worktree(top, tree, commit, work, deadline)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write(f"WARN: no snapshot worktree to rerun red commands in: {e}\n")
+        return
     snap_proj = os.path.join(tree, subdir)
     for i in reds:
         remaining = left(deadline)
         if remaining <= 0 or not os.path.isdir(snap_proj):
             break
-        cmd = results[i]["cmd"]
-        if run_one(cmd, snap_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix)["exit"] == 0:
-            saved = load_base_run(saved_runs, cmd)
-            results[i]["baseline"] = {
-                "status": "tree-state",
-                "exit": saved[0] if saved else None,
-                "note": TREE_STATE_NOTE,
-            }
-    return reds
+        if run_one(results[i]["cmd"], snap_proj, min(PER_COMMAND_TIMEOUT_SECS, remaining), prefix)["exit"] == 0:
+            results[i]["baseline"] = {"status": "tree-state", "exit": None, "note": TREE_STATE_NOTE}
 
 
 # A saved base run freezes one sample of a flaky base: later rounds compare
@@ -558,10 +615,10 @@ def save_base_run(saved_runs, cmd, base, base_path, deadline):
         os.unlink(tmp)
 
 
-def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
+def attach_baselines(results, outputs, state, proj, prefix, deadline, work, before):
     """Give every red record a `baseline` from one run at the diff base, reusing a saved
     run of the same command on the same base tree instead of running it again, unless a
-    snapshot of a dirty live tree shows the red is tree state."""
+    snapshot of the dirty pre-run tree shows the red is tree state."""
     reds = [i for i, r in enumerate(results) if not r.get("skipped") and r.get("exit") != 0]
     for i in reds:
         if results[i]["exit"] == -1:
@@ -569,6 +626,15 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
     reds = [i for i in reds if results[i]["exit"] != -1]
     if not reds:
         return
+    commit, suffix = tree_outcome(before, work, deadline)
+    classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, commit)
+    for i in reds:
+        baseline = results[i]["baseline"]
+        if baseline["status"] != "tree-state":
+            baseline["note"] += suffix
+
+
+def classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, commit):
     diff_base = state.get("diff_base")
     diff_base = diff_base.strip() if isinstance(diff_base, str) else ""
     if not diff_base:
@@ -589,17 +655,14 @@ def attach_baselines(results, outputs, state, proj, prefix, deadline, work):
     saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
     worktrees = []
     try:
-        dirty = rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, saved_runs, worktrees)
+        if commit:
+            rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, commit, worktrees)
         reds = [i for i in reds if "baseline" not in results[i]]
         if reds:
             compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, deadline, work, saved_runs, worktrees)
     finally:
         for tree in worktrees:
             remove_worktree(top, tree)
-    for i in dirty:
-        baseline = results[i]["baseline"]
-        if baseline["status"] != "tree-state":
-            baseline["note"] += DIRTY_TREE_NOTE
 
 
 def compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, deadline, work, saved_runs, worktrees):
@@ -698,6 +761,7 @@ def main():
     deadline = time.monotonic() + TOTAL_DEADLINE_SECS
     work = tempfile.mkdtemp(prefix="adversary-run-checks-")
     try:
+        before = tree_before(proj, work, deadline)
         outputs = {}
         for i, cmd in enumerate(cmds):
             remaining = left(deadline)
@@ -710,7 +774,7 @@ def main():
             )
             results[-1]["pass_condition"] = resolve(cmd, state.get("criteria"), state.get("initial_prompt"))
         try:
-            attach_baselines(results, outputs, state, proj, prefix, deadline, work)
+            attach_baselines(results, outputs, state, proj, prefix, deadline, work, before)
         except Exception as e:  # noqa: BLE001 -- the recorded runs outlive a baseline failure
             for r in results:
                 if not r.get("skipped") and r.get("exit") != 0 and "baseline" not in r:
