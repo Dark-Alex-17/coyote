@@ -18,11 +18,13 @@ import re
 CRITERION_PASS_RE = re.compile(r"\b(pass(es|ing)?|succeed(s|ed)?|green|exits?\s+(with\s+)?(code\s+|status\s+)?0)\b", re.I)
 CRITERION_FAIL_RE = re.compile(r"\b(fail(s|ed)?|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9]|non-?zero|rejected|refuse[sd]?)\b", re.I)
 # Matched against normalised prose, where an apostrophe has become a double quote.
+# Words that ordinary instructions use in passing ("if it fails", "the missing
+# case") are left out: a request line carrying them must not release a red run.
 STATED_RE = re.compile(
     r"\b((prints?|outputs?|shows?|returns?|reports?|lists?|finds?)\s+(nothing|no\s+\w+)"
     r"|no\s+(output|match(es)?|lines|results)|is\s+empty|empty\s+output"
-    r"|absent|missing|does\s+not\s+exist|doesn\"t\s+exist|not\s+present"
-    r"|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9]|fails|non-?zero)\b",
+    r"|absent|does\s+not\s+exist|doesn\"t\s+exist|not\s+present"
+    r"|exits?\s+(with\s+)?(code\s+|status\s+)?[1-9])\b",
     re.I,
 )
 EXIT_0 = "exit 0"
