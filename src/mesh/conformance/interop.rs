@@ -2594,7 +2594,7 @@ async fn two_sessions_of_one_user_dialing_a_transport_relay_directly_over_tcp() 
 /// A node attached to an rnsd that runs an AutoInterface reads that rnsd's LAN host
 /// count over its RPC listener: 0, on a discovery group no other host joins. Read with a
 /// wrong `rpc_key` the same rnsd is unavailable for the run and told at debug only, and
-/// the silent-LAN check falls back to hosts heard rather than telling a silent LAN.
+/// the silent-LAN check, reading no count there, stays quiet for a known peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn a_node_reads_the_lan_host_count_of_its_rnsd() {

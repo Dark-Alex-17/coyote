@@ -3089,6 +3089,10 @@ mod tests {
             .await
             .err();
             let returned = StdInstant::now();
+            if outcome != Some(PropagationError::Cancelled) {
+                canceller.abort();
+                panic!("the post ended with {outcome:?}, not cancelled");
+            }
             let elapsed = returned.saturating_duration_since(canceller.await.unwrap());
             assert_eq!(outcome, Some(PropagationError::Cancelled));
             assert!(

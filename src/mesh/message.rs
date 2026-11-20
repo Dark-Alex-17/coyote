@@ -1790,6 +1790,17 @@ pub(crate) enum FarewellSkip {
     SendFailed,
 }
 
+/// Why a direct farewell leg that failed told its peers nothing: a leg whose link
+/// failed falls back to the propagation node, so finding none is that reason.
+fn farewell_skip_of(err: &SendError) -> FarewellSkip {
+    match err {
+        SendError::NoPropagationNode | SendError::LeftNoPropagationNode { .. } => {
+            FarewellSkip::NoPropagationNode
+        }
+        _ => FarewellSkip::SendFailed,
+    }
+}
+
 /// How many trusted peers each `FarewellSkip` left untold.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct FarewellSkips {
@@ -2013,6 +2024,26 @@ mod farewell_audience_tests {
                 ("03".to_string(), false, 1),
                 ("01".to_string(), false, 1),
             ]
+        );
+    }
+
+    /// A direct leg whose link failed and found no propagation node to fall back on is
+    /// skipped for that reason; any other failure is a failed send.
+    #[test]
+    fn a_direct_farewell_leg_with_no_propagation_node_is_skipped_for_that_reason() {
+        assert_eq!(
+            farewell_skip_of(&SendError::NoPropagationNode),
+            FarewellSkip::NoPropagationNode
+        );
+        let left = SendError::LeftNoPropagationNode {
+            destination: "ab".repeat(16),
+            who: "Bob / desk".to_string(),
+            age: "2m ago".to_string(),
+        };
+        assert_eq!(farewell_skip_of(&left), FarewellSkip::NoPropagationNode);
+        assert_eq!(
+            farewell_skip_of(&SendError::Propagation(PropagationError::Cancelled)),
+            FarewellSkip::SendFailed
         );
     }
 
@@ -2663,7 +2694,14 @@ impl MeshRuntime {
                     self.send_peer_inner(&leg.peer.destination_hash, message, options)
                         .await
                         .map(|sent| sent.via)
-                        .map_err(|_| FarewellSkip::SendFailed)
+                        .map_err(|err| {
+                            debug!(
+                                "Mesh farewell for {} not delivered: {}",
+                                short(&leg.peer.destination_hash),
+                                redact_hashes(&err.to_string())
+                            );
+                            farewell_skip_of(&err)
+                        })
                 } else {
                     let desc = match leg.peer.verified_destination() {
                         Some(desc) => Some(desc),

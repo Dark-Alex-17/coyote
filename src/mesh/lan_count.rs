@@ -431,7 +431,7 @@ impl RnsdLanReader {
 
 fn tell_unavailable(reason: &str) {
     debug!(
-        "Mesh could not read the local rnsd's interface stats: {}; the silent-LAN check falls back to hosts heard",
+        "Mesh could not read the local rnsd's interface stats: {}; the silent-LAN check reads no count there and stays quiet only for a known peer or a relay",
         redact_hashes(reason)
     );
 }
@@ -675,6 +675,40 @@ mod tests {
             lan_silent_verdict(grace, &readings, false, false),
             LanVerdict::Settle
         );
+    }
+
+    /// The watcher's tick keeps the line quiet over a zero count when the rnsd reports a
+    /// TCP client online, or when a peer is known, and tells it when neither holds.
+    #[tokio::test]
+    async fn a_tick_over_a_zero_count_stays_quiet_on_a_relay_or_with_a_known_peer() {
+        use crate::mesh::node::{LanSilentHint, LanSilentInputs};
+        let grace = Duration::from_secs(120);
+        for (relay_online, knows_peers, told) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let dir = keyed_dir("lan-count-tick-quiet");
+            let source = Scripted::new([Ok(vec![auto(0), tcp_client(relay_online)])]);
+            let reader = reader_at(&dir.path, source);
+            let mut hint = LanSilentHint::default();
+            let line = hint
+                .read_and_tick(
+                    || lan_readings(None, &[], Some(&reader), ReadEffort::Patient),
+                    || LanSilentInputs {
+                        elapsed: grace,
+                        knows_peers,
+                        interfaces: Vec::new(),
+                    },
+                )
+                .await;
+            assert_eq!(
+                line.is_some(),
+                told,
+                "relay {relay_online}, peers {knows_peers}"
+            );
+            assert!(hint.settled());
+        }
     }
 
     /// A reader on the real retry wait, at `dir`.

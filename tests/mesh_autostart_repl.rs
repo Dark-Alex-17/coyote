@@ -412,14 +412,19 @@ fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
         let captures = session
             .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
             .unwrap_or_else(|err| {
-                // What came instead, so a timeout says what the REPL printed.
+                // What came instead, so a timeout says what the REPL printed: at most
+                // 3 s of further reads, the last 2000 characters of them.
                 session.set_expect_timeout(Some(Duration::from_secs(1)));
+                let deadline = Instant::now() + Duration::from_secs(3);
                 let mut pending = String::new();
-                while let Ok(rest) = session.expect(Regex(r"(?s).+")) {
-                    pending.push_str(&strip_escapes(rest.as_bytes()));
+                while Instant::now() < deadline {
+                    match session.expect(Regex(r"(?s).+")) {
+                        Ok(rest) => pending.push_str(&strip_escapes(rest.as_bytes())),
+                        Err(_) => break,
+                    }
                 }
-                let tail = pending.len().saturating_sub(2000);
-                let pending = pending.get(tail..).unwrap_or(&pending);
+                let skip = pending.chars().count().saturating_sub(2000);
+                let pending: String = pending.chars().skip(skip).collect();
                 panic!(
                     "waiting for {pattern:?}: {err}; read before it: {:?}; pending: {pending:?}",
                     strip_escapes(&before)
@@ -428,29 +433,11 @@ fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
         let involved = captures.as_bytes();
         let split = captures.before().len();
         let query = b"\x1b[6n";
-        if captures.get(0).unwrap_or_default() == query {
-            // One reply per query the read held, each judged by the bytes that
-            // led up to it; the queries themselves are escape sequences the
-            // text helpers strip, so the whole read goes into `before`.
-            let mut from = 0;
-            while let Some(at) = involved[from..]
-                .windows(query.len())
-                .position(|window| window == query)
-            {
-                let at = from + at;
-                session
-                    .send(cursor_position_reply(&involved[..at]))
-                    .expect("reply to the cursor position query");
-                from = at + query.len();
-            }
-            before.extend_from_slice(involved);
-            continue;
-        }
-        // A query that came in the same read as the match, ahead of it, is answered
-        // too: left unanswered it would cost the REPL its query timeout and leave every
-        // later reply one behind.
+        // One reply per query the read held, wherever it sits, each judged by the bytes
+        // that led up to it: a query left unanswered would cost the REPL its query
+        // timeout and leave every later reply one behind.
         let mut from = 0;
-        while let Some(at) = involved[from..split]
+        while let Some(at) = involved[from..]
             .windows(query.len())
             .position(|window| window == query)
         {
@@ -459,6 +446,12 @@ fn wait_for_match(session: &mut Target, pattern: &str) -> (Vec<u8>, Vec<u8>) {
                 .send(cursor_position_reply(&involved[..at]))
                 .expect("reply to the cursor position query");
             from = at + query.len();
+        }
+        if captures.get(0).unwrap_or_default() == query {
+            // The queries themselves are escape sequences the text helpers strip, so
+            // the whole read goes into `before`.
+            before.extend_from_slice(involved);
+            continue;
         }
         before.extend_from_slice(&involved[..split]);
         return (before, involved[split..].to_vec());

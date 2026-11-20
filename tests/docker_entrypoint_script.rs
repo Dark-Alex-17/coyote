@@ -837,7 +837,7 @@ fn a_daemon_that_ignores_term_is_killed_after_the_bounded_wait() {
     assert_eq!(code, 8, "{stderr}");
     assert!(
         elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
-        "bounded wait (25 x 0.2 s) then KILL; took {elapsed:?}"
+        "bounded wait (5 s by the clock) then KILL; took {elapsed:?}"
     );
 }
 

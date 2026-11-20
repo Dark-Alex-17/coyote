@@ -305,6 +305,22 @@ impl PropagationNodeTable {
         }
     }
 
+    /// Files the announce that answered this node's own path request for a configured
+    /// propagation node: the owner named the node, and the request was this node's, so
+    /// the answer files it as heard at `now`, an aged-out record included. Why it was not
+    /// filed otherwise.
+    pub(crate) fn file_configured(
+        &self,
+        destination: &DestinationDesc,
+        app_data: &[u8],
+        hops: u8,
+        now: SystemTime,
+    ) -> Result<(), PropagationNodeError> {
+        let node = PropagationNode::from_announce(destination, app_data)?;
+        self.observe(node, hops, now);
+        Ok(())
+    }
+
     /// Files a path response: a known node keeps its `last_seen`, anything else is
     /// observed as a first sighting.
     fn refresh_route(&self, node: PropagationNode, hops: u8, now: SystemTime) -> PeerChange {
@@ -1060,6 +1076,42 @@ mod tests {
             debug_snapshot().iter().any(|line| line == &evicted),
             "no debug line {evicted:?}"
         );
+    }
+
+    /// The answer to a configured node's own path request files it as heard at that
+    /// moment, so a record that aged out is held again where a plain path response
+    /// would leave it aged out; an announce that is no propagation node's is refused.
+    #[test]
+    fn a_configured_nodes_own_path_response_files_an_aged_out_record_afresh() {
+        let table = PropagationNodeTable::new();
+        let pn = desc("propagation");
+        let key = pn.address_hash.to_hex_string();
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 2, false, t(1)));
+        let aged = t(1) + PROPAGATION_NODE_TTL + Duration::from_secs(1);
+        assert!(!table.holds(&key, aged));
+
+        assert!(table.observe_announce(&pn, &pn_announce_app_data(true, 8, 256), 3, true, aged));
+        assert!(
+            !table.holds(&key, aged),
+            "a plain path response is no sighting"
+        );
+
+        assert_eq!(
+            table.file_configured(&pn, &pn_announce_app_data(true, 8, 256), 3, aged),
+            Ok(())
+        );
+        assert!(
+            table.holds(&key, aged),
+            "the configured node's own answer is"
+        );
+        assert_eq!(table.snapshot().pop().unwrap().hops, 3);
+
+        let coyote = desc("delivery");
+        assert_eq!(
+            table.file_configured(&coyote, b"not a pn", 1, aged),
+            Err(PropagationNodeError::NotAPropagationNode)
+        );
+        assert!(!table.holds(&coyote.address_hash.to_hex_string(), aged));
     }
 
     /// A path response refreshes a known node's record and hops but not its `last_seen`,

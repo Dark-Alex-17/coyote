@@ -59,7 +59,8 @@ use crate::mesh::pending::{
 };
 use crate::mesh::people::{Namer, People, Who, YOU, hash_after};
 use crate::mesh::propagation::{
-    self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
+    self, OutboundMessage, PropagationError, PropagationNode, PropagationNodeError,
+    PropagationOptions,
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::{
@@ -157,7 +158,7 @@ const LOCAL_RECONNECT_WAIT: Duration = Duration::from_secs(2);
 /// has settled.
 const LAN_SILENT_GRACE_SECS: u64 = 120;
 /// The idle line for a LAN that stayed silent through `LAN_SILENT_GRACE_SECS`: its
-/// count read zero, or no count could be read and nothing was heard over it.
+/// count read zero or could not be read, on a node that knows no peer and sits on no relay.
 const LAN_SILENT_HINT: &str = "No other Coyote host found on your LAN in 2 min. Many Wi-Fi routers block the multicast Coyote uses to find other hosts; a TCP relay works instead - see https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment#when-the-lan-is-silent.";
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
@@ -4155,14 +4156,7 @@ async fn watch_interfaces(
                     () = cancel.cancelled() => return,
                     hint = lan_silent.read_and_tick(
                         || runtime.lan_readings(ReadEffort::Patient),
-                        || LanSilentInputs {
-                            elapsed: runtime.joined_at().elapsed().unwrap_or_default(),
-                            knows_peers: knows_peers(
-                                runtime.peers().snapshot().iter().map(|peer| peer.last_seen),
-                                SystemTime::now(),
-                            ),
-                            interfaces: runtime.interface_states(),
-                        },
+                        || lan_silent_inputs(&runtime, SystemTime::now()),
                     ) => hint,
                 };
                 if let Some(hint) = hint {
@@ -4325,6 +4319,20 @@ pub(super) fn lan_silent_verdict(
         return LanVerdict::Wait;
     }
     LanVerdict::Tell
+}
+
+/// What the silent-LAN check reads from `runtime` at `now` besides the LAN counts: the
+/// time since join, whether its peer table, rows loaded from disk included, knows a
+/// peer, and its interfaces' states.
+fn lan_silent_inputs(runtime: &MeshRuntime, now: SystemTime) -> LanSilentInputs {
+    LanSilentInputs {
+        elapsed: now.duration_since(runtime.joined_at()).unwrap_or_default(),
+        knows_peers: knows_peers(
+            runtime.peers().snapshot().iter().map(|peer| peer.last_seen),
+            now,
+        ),
+        interfaces: runtime.interface_states(),
+    }
 }
 
 /// Whether the peer table holds a row heard within `PEER_TTL` of `now`, from `last_seen`
@@ -4792,8 +4800,9 @@ async fn request_path_to_node<E>(
 }
 
 /// Asks the mesh for a path to each configured propagation node `table` does not hold and
-/// files the announce each path response carries through `observe_announce`, as any
-/// heard one, waiting up to `PATH_REQUEST_TIMEOUT` for them all. A hash answered by an
+/// files the announce each path response carries as heard now, through
+/// `PropagationNodeTable::file_configured`, so an aged-out record is filed afresh too,
+/// waiting up to `PATH_REQUEST_TIMEOUT` for them all. A hash answered by an
 /// announce that is not a usable propagation node's, or not answered at all, is logged
 /// once per run and not filed. Whether a node was filed; `false` at once while another
 /// round is out or one began within `CONFIGURED_NODE_ASK_GAP`, and as soon as `cancel`
@@ -4844,24 +4853,31 @@ async fn resolve_configured_nodes(
             continue;
         }
         let now = SystemTime::now();
-        table.observe_announce(
-            &desc,
-            event.app_data.as_slice(),
-            event.hops,
-            event.is_path_response,
-            now,
-        );
-        if table.holds(&hash, now) {
-            debug!(
-                "Mesh filed configured propagation node {} from its path response",
-                short(&hash)
-            );
-            filed = true;
-        } else if configured.first_telling(&hash) {
-            info!(
-                "Mesh configured propagation node {} answered its path request, but not as a propagation node; it is not filed",
-                short(&hash)
-            );
+        match table.file_configured(&desc, event.app_data.as_slice(), event.hops, now) {
+            Ok(()) => {
+                debug!(
+                    "Mesh filed configured propagation node {} from its path response",
+                    short(&hash)
+                );
+                filed = true;
+            }
+            Err(PropagationNodeError::NotAPropagationNode) => {
+                if configured.first_telling(&hash) {
+                    info!(
+                        "Mesh configured propagation node {} answered its path request, but not as a propagation node; it is not filed",
+                        short(&hash)
+                    );
+                }
+            }
+            Err(err) => {
+                if configured.first_telling(&hash) {
+                    info!(
+                        "Mesh configured propagation node {} answered its path request with an announce it could not use ({}); it is not filed",
+                        short(&hash),
+                        redact_hashes(&err.to_string())
+                    );
+                }
+            }
         }
     }
     for hash in pending {
@@ -20780,6 +20796,7 @@ mod tests {
             use crate::mesh::message::{FarewellOutcome, FarewellSkips};
             use crate::mesh::trust::TrustOptions;
 
+            crate::testing::install_log_collector();
             let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
             let tmp = TempDir::new("node-farewell-no-node");
             let runtime = start_on(&tmp, relay.port).await;
@@ -20931,12 +20948,43 @@ mod tests {
             node.stop().await;
         }
 
-        /// A configured hash whose path response carries no propagation announce, and
+        /// A sync that finds no node filed asks the mesh for the configured one in the
+        /// background: that sync still reports no node, and the node is filed after it.
+        /// The node was never installed in a slot, so no round ran at join.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_sync_with_no_node_filed_asks_for_the_configured_one_in_the_background() {
+            use crate::mesh::propagation::pn_announce_app_data;
+
+            let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            node.transport
+                .set_destination_announce_app_data(
+                    &node.dest,
+                    Some(pn_announce_app_data(true, 0, 256)),
+                )
+                .await;
+            let hex = node.desc.address_hash.to_hex_string();
+            let tmp = TempDir::new("node-configured-pn-at-sync");
+            let runtime = start_with_configured(&tmp, node.port, std::slice::from_ref(&hex)).await;
+            let sink = Arc::new(CountingSink::default());
+
+            let err = runtime.fetch_propagated(&*sink).await.unwrap_err();
+            assert!(matches!(err, FetchError::NoPropagationNode), "{err:?}");
+            wait_until("the configured node to be filed after the sync", || {
+                runtime.propagation_nodes().holds(&hex, SystemTime::now())
+            })
+            .await;
+
+            stop(&runtime).await;
+            node.stop().await;
+        }
+
+        /// A configured hash whose path response carries an announce it cannot use, and
         /// one nothing answers, are each told once however often they are asked for, and
         /// neither is filed.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_configured_hash_that_is_not_a_propagation_node_or_does_not_answer_is_told_once()
         {
+            crate::testing::install_log_collector();
             let node = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
             let not_a_node = node.desc.address_hash.to_hex_string();
             let silent = crate::mesh::propagation::propagation_node_destination(
@@ -20958,7 +21006,7 @@ mod tests {
             let told = |needle: String| logs.iter().filter(|line| line.contains(&needle)).count();
             assert_eq!(
                 told(format!(
-                    "Mesh configured propagation node {} answered its path request, but not as a propagation node; it is not filed",
+                    "Mesh configured propagation node {} answered its path request with an announce it could not use (",
                     short(&not_a_node)
                 )),
                 1,
@@ -20976,6 +21024,60 @@ mod tests {
 
             stop(&runtime).await;
             node.stop().await;
+        }
+
+        /// A row kept in `peers.json` from an earlier run, heard within `PEER_TTL`, is a
+        /// known peer to the silent-LAN check of the node that loads it; one older than
+        /// that is not.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_peer_row_loaded_from_disk_within_the_ttl_keeps_the_silent_lan_line_quiet() {
+            let relay = PostingNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
+            for (age, known) in [
+                (PEER_TTL / 2, true),
+                (PEER_TTL + Duration::from_secs(60), false),
+            ] {
+                let tmp = TempDir::new("node-silent-lan-persisted-peers");
+                let now = SystemTime::now();
+                let path =
+                    crate::mesh::mesh_cache_dir(&mesh_paths(&tmp).cache_dir).join("peers.json");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let earlier = PeerTable::load(path, now).unwrap();
+                let peer = TransportIdentity::new_from_rand(OsRng);
+                let desc = SingleInputDestination::new(peer, session_destination_name("kept")).desc;
+                earlier.observe(
+                    PeerSighting {
+                        destination_hash: desc.address_hash.to_hex_string(),
+                        identity_hash: desc.identity.address_hash.to_hex_string(),
+                        name_hash: hex_lower(desc.name.as_name_hash_slice()),
+                        public_key: Some(desc.identity.to_hex_string()),
+                        display_name: None,
+                        protocol_version: 1,
+                        hops: 2,
+                    },
+                    now - age,
+                );
+                earlier.persist_if_dirty().unwrap();
+
+                let runtime = start_on(&tmp, relay.port).await;
+                let inputs = lan_silent_inputs(&runtime, SystemTime::now());
+                assert_eq!(inputs.knows_peers, known, "a row {age:?} old");
+                assert_eq!(
+                    lan_silent_verdict(
+                        Duration::from_secs(LAN_SILENT_GRACE_SECS),
+                        &[LanReading::Count(0)],
+                        inputs.knows_peers,
+                        false,
+                    ),
+                    if known {
+                        LanVerdict::Settle
+                    } else {
+                        LanVerdict::Tell
+                    },
+                    "a row {age:?} old"
+                );
+                stop(&runtime).await;
+            }
+            relay.stop().await;
         }
 
         /// A farewell to a reachable peer, one without a path and one that already left:
