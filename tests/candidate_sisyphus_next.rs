@@ -3114,6 +3114,37 @@ fn criterion_commands_block_is_identical_to_architect_nexts() {
     );
 }
 
+/// The `CRITERION_PASS_RE = ` and `CRITERION_FAIL_RE = ` lines of a script.
+fn criterion_regex_lines(script: &Path) -> Vec<String> {
+    let text = fs::read_to_string(script).unwrap();
+    let lines: Vec<String> = ["CRITERION_PASS_RE = ", "CRITERION_FAIL_RE = "]
+        .iter()
+        .filter_map(|name| {
+            text.lines()
+                .find(|l| l.starts_with(name))
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(lines.len(), 2, "{}: {lines:?}", script.display());
+    lines
+}
+
+/// The adversary decides whether a criterion holds its command to exit 0 by
+/// the same pass/fail wording rule the -next agents use to pick criterion
+/// commands, so the three copies of the two patterns stay byte-identical.
+#[test]
+fn the_adversary_pass_condition_regexes_are_identical_to_the_next_agents() {
+    let adversary =
+        criterion_regex_lines(&agents_dir().join("adversary/scripts/pass_condition.py"));
+    for agent in [CANDIDATE, "architect-next"] {
+        assert_eq!(
+            adversary,
+            criterion_regex_lines(&agents_dir().join(agent).join("scripts/_lib.py")),
+            "adversary's pass_condition.py regexes differ from {agent}'s _lib.py (left: adversary)"
+        );
+    }
+}
+
 /// A review round declares the exit-code command a criterion quotes as one
 /// more verification run after the brief's own, and ledgers it; the `git
 /// status` span, whose exit does not decide its criterion, stays out.
