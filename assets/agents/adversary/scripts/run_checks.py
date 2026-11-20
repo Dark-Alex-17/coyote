@@ -26,12 +26,12 @@ emitting an extra `verification_commands` key cannot overwrite the declared
 value: the undeclared key is dropped before it reaches state.
 
 Budget: commands run sequentially, so TOTAL runtime is bounded by a deadline
-(TOTAL_DEADLINE_SECS = 3180s). Once the review-stack lock is acquired or its
+(TOTAL_DEADLINE_SECS = 3120s). Once the review-stack lock is acquired or its
 bounded wait (STACK_LOCK_WAIT_SECS = 1200s) gives up, the pre-run tree
 capture (below) gets SNAPSHOT_GIT_TIMEOUT_SECS = 120s of its own, and the
 deadline starts when it ends, so the capture never takes time from the
 declared commands. The run_checks node's 4600s timeout covers 1200 + 120 +
-3180 plus margin for the baseline worktree cleanup. Without the deadline, a
+3120 plus margin for the baseline worktree cleanup. Without the deadline, a
 handful of hanging commands (4 x 900s) would blow the NODE timeout and the
 executor would kill this script from OUTSIDE -- the
 in-script degradation would never fire. Each command gets
@@ -74,15 +74,19 @@ file that is not ignored, through a temporary GIT_INDEX_FILE, write-tree and
 commit-tree, so the real index and refs are never touched. This writes
 unreferenced objects (among them the blobs of untracked, non-ignored files)
 into the repository's object database, where git's own gc collects them. When
-`git status` fails or `core.sparseCheckout` is true (a sparse index cannot be
-snapshotted whole), no snapshot is taken and every red record's note gains
-", candidate tree state unknown". After the declared commands run, a dirty
+`git status` fails, no snapshot is taken and every red record's note gains
+", candidate tree state unknown". When `core.sparseCheckout` is true (a sparse
+index cannot be snapshotted whole), a dirty tree takes no snapshot and every
+red record's note gains ", candidate tree dirty". After the declared commands run, a dirty
 tree is written the same way into a second temporary index and its tree id is
 compared with the pre-run one; a clean one only has `git status` read again.
+When that second write fails, each note gains ", candidate tree dirty, whether
+the declared commands modified it is unknown" and nothing is rerun.
 When the tree changed, the declared commands modified it (a regenerate-then-diff
 command, say), no red record gets "tree-state", and each note gains ", the
 declared commands modified the tree". Otherwise, on a dirty tree, every red
-record that did not time out runs once more, inside the same deadline and in
+record that neither timed out nor was killed by a signal (exit 128 or above)
+runs once more, inside the same deadline and in
 the same subdirectory, in a second detached worktree (hooks disabled the same
 way) of the pre-run snapshot commit. A command that exits 0 there gets
 baseline status "tree-state", a null exit and no base run: it is red only in
@@ -144,7 +148,7 @@ except ImportError:  # non-POSIX (Windows): advisory flock unavailable
     fcntl = None
 
 PER_COMMAND_TIMEOUT_SECS = 900
-TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3180)
+TOTAL_DEADLINE_SECS = float(os.environ.get("ADVERSARY_RUN_CHECKS_DEADLINE_SECS") or 3120)
 STACK_LOCK_PATH = os.environ.get("ADVERSARY_STACK_LOCK_PATH") or os.path.expanduser(
     "~/.cache/coyote/review-stack.lock"
 )
@@ -161,6 +165,7 @@ TREE_STATE_NOTE = (
 )
 DIRTY_TREE_NOTE = ", candidate tree dirty"
 UNKNOWN_TREE_NOTE = ", candidate tree state unknown"
+UNKNOWN_CHANGE_NOTE = ", candidate tree dirty, whether the declared commands modified it is unknown"
 MODIFIED_TREE_NOTE = ", the declared commands modified the tree"
 SNAPSHOT_IDENTITY = {
     "GIT_AUTHOR_NAME": "adversary",
@@ -484,13 +489,14 @@ def tree_before(proj, work, deadline):
     unknown = {"top": None, "dirty": None, "tree": None, "commit": None}
     try:
         top = git_text(["rev-parse", "--show-toplevel"], proj, snapshot_budget(deadline))
-        if sparse_checkout(top, deadline):
-            return unknown
+        sparse = sparse_checkout(top, deadline)
         status = git_text(["--no-optional-locks", "status", "--porcelain"], top, snapshot_budget(deadline))
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return unknown
     if not status:
         return {"top": top, "dirty": False, "tree": None, "commit": None}
+    if sparse:
+        return {"top": top, "dirty": True, "tree": None, "commit": None}
     try:
         tree = snapshot_tree(top, work, "before-index", deadline)
         commit = git_text(
@@ -522,7 +528,7 @@ def tree_outcome(before, work, deadline):
         after = snapshot_tree(before["top"], work, "after-index", deadline)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         sys.stderr.write(f"WARN: the live tree could not be compared with its pre-run state: {e}\n")
-        return None, UNKNOWN_TREE_NOTE + DIRTY_TREE_NOTE
+        return None, UNKNOWN_CHANGE_NOTE
     if after != before["tree"]:
         return None, MODIFIED_TREE_NOTE + DIRTY_TREE_NOTE
     return before["commit"], DIRTY_TREE_NOTE
@@ -659,8 +665,9 @@ def classify_reds(results, outputs, reds, state, proj, prefix, deadline, work, c
     saved_runs = base_run_store(proj, diff_base, subdir, prefix, deadline)
     worktrees = []
     try:
-        if commit:
-            rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, commit, worktrees)
+        rerunnable = [i for i in reds if results[i]["exit"] < 128] if commit else []
+        if rerunnable:
+            rerun_on_snapshot(results, rerunnable, top, subdir, prefix, deadline, work, commit, worktrees)
         reds = [i for i in reds if "baseline" not in results[i]]
         if reds:
             compare_with_base(results, outputs, reds, diff_base, top, subdir, prefix, deadline, work, saved_runs, worktrees)

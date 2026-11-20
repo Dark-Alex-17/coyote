@@ -2893,6 +2893,172 @@ fn a_tree_state_red_blocks_unless_the_criteria_naming_it_are_met() {
     );
 }
 
+/// A signal exit says nothing about the tree state either, so it blocks even
+/// with a tree-state baseline.
+#[test]
+fn a_signal_killed_red_run_blocks_despite_a_tree_state_baseline() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("tree-state-killed");
+    let cmd = "sh gen.sh && git diff --exit-code";
+    let note = "candidate tree dirty: red only in the live tree; the same content on a clean \
+                checkout exits 0";
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        json!([{"cmd": cmd, "exit": 137, "duration_s": 0.1, "tail": "Killed",
+                "baseline": {"status": "tree-state", "exit": null, "note": note}}]),
+    );
+    let text = report(&dir.0, "tree-state-killed", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "1. Verification run `{cmd}` \u{2014} exit 137 (recorded FAIL; a red declared command \
+             that did not already fail on the diff base blocks CONFORMS; baseline on the diff \
+             base: tree-state, {note})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
+
+/// A command killed by a signal in the live tree is not rerun on the pre-run
+/// snapshot, so exiting 0 there cannot give it a tree-state baseline.
+#[cfg(unix)]
+#[test]
+fn a_signal_killed_red_run_is_not_rerun_on_the_snapshot() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("dirty-killed");
+    let (_, sub, base) = uncommitted_change(&dir.0);
+    let cmd = "if test -f local.cfg; then sh -c 'kill -KILL $$'; exit $?; fi";
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "dirty-killed",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [cmd],
+            "diff_base": base,
+        }),
+        &NO_GIT_CONFIG,
+    );
+    let record = &out["exec_results"][0];
+    assert_eq!(record["exit"], 137, "{out}");
+    assert_eq!(record["baseline"]["status"], "regression", "{out}");
+    assert!(
+        record["baseline"]["note"]
+            .as_str()
+            .unwrap()
+            .ends_with(", candidate tree dirty"),
+        "{out}"
+    );
+}
+
+/// A PATH whose first entry is a git shim running the shell `prelude` before
+/// it hands the call to the real git.
+#[cfg(unix)]
+fn git_shim_path(dir: &Path, prelude: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let real_git = which::which("git").unwrap();
+    let bin = dir.join("shim-bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\n{prelude}\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default())
+}
+
+/// A sparse checkout takes no snapshot, yet a dirty one is still reported
+/// dirty; a `git status` that fails leaves the tree state unknown.
+#[cfg(unix)]
+#[test]
+fn a_dirty_sparse_checkout_is_noted_dirty_and_a_failed_status_unknown() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("sparse-dirty");
+    let (repo, _) = repo_with_base_script(&dir.0, "exit 0\n");
+    git(&repo, &["config", "core.sparseCheckout", "true"]);
+    fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
+    let state = json!({
+        "project_dir": repo.to_string_lossy(),
+        "verification_commands": ["sh check.sh"],
+    });
+    let (path, log) = logging_git_path(&dir.0);
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let out = script(&dir.0, "run_checks.py", "sparse-dirty", &state, &envs);
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"],
+        "no diff base was resolved, so nothing to compare against, candidate tree dirty",
+        "{out}"
+    );
+    assert_eq!(git_calls(&log, "commit-tree"), 0, "{out}");
+
+    git(&repo, &["config", "--unset", "core.sparseCheckout"]);
+    let failing = git_shim_path(&dir.0, "case \"$*\" in *status*) exit 1 ;; esac");
+    let envs = [
+        ("PATH", failing.as_str()),
+        NO_GIT_CONFIG[0],
+        NO_GIT_CONFIG[1],
+    ];
+    let out = script(&dir.0, "run_checks.py", "status-fails", &state, &envs);
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"],
+        "no diff base was resolved, so nothing to compare against, candidate tree state unknown",
+        "{out}"
+    );
+}
+
+/// When the dirty tree cannot be written again after the run, whether the
+/// declared commands modified it is unknown and nothing is rerun.
+#[cfg(unix)]
+#[test]
+fn a_failed_post_run_snapshot_leaves_the_dirty_tree_change_unknown() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("post-run-snapshot-fails");
+    let (repo, _) = repo_with_base_script(&dir.0, "exit 0\n");
+    fs::write(repo.join("notes.txt"), "untracked\n").unwrap();
+    let marker = dir.0.join("ran");
+    let path = git_shim_path(
+        &dir.0,
+        &format!(
+            "case \"$*\" in *write-tree*) test -e '{}' && exit 1 ;; esac",
+            marker.display()
+        ),
+    );
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "post-run-snapshot-fails",
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": [format!("touch '{}'; sh check.sh", marker.display())],
+        }),
+        &[("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]],
+    );
+    assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
+    assert_eq!(
+        out["exec_results"][0]["baseline"]["note"],
+        "no diff base was resolved, so nothing to compare against, candidate tree dirty, \
+         whether the declared commands modified it is unknown",
+        "{out}"
+    );
+}
+
 #[test]
 fn each_run_record_carries_the_pass_condition_its_criteria_state() {
     if missing(&["python3"]) {
