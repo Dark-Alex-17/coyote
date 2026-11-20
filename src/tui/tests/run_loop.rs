@@ -1,10 +1,10 @@
 use super::*;
-#[cfg(unix)]
-use crate::tui::run_loop::Termination;
 use crate::tui::run_loop::{
-    DumpRoute, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished, dump_route, edit_in_editor,
-    flush_typeahead, join_unattended, purge_turn_queue, quit_abort,
+    DumpRoute, Join, Leave, TYPEAHEAD_LIMIT, Task, Unfinished, dump_route, flush_typeahead,
+    join_unattended, purge_turn_queue, quit_abort,
 };
+#[cfg(unix)]
+use crate::tui::run_loop::{Termination, edit_in_editor};
 
 /// The loop's half of the drop: the user's lines come off the queue
 /// the running turn reads, a task's notification stays for the exit

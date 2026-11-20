@@ -1,7 +1,7 @@
 use super::*;
+use crate::tui::lend::NOT_LENDING;
 #[cfg(unix)]
-use crate::tui::lend::dup_tty_out;
-use crate::tui::lend::{NOT_LENDING, set_lender};
+use crate::tui::lend::{dup_tty_out, set_lender};
 
 /// Registers a lender on its own thread that runs every job it is
 /// sent, the way the loop does with the screen released, and counts
