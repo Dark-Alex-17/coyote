@@ -279,8 +279,10 @@ nodes:
       judged ONLY against the recorded verification runs in your prompt — you
       have no execution tools BY DESIGN and must never claim to have run
       anything yourself:
-      - a recorded green run (exit 0) of a command covering the criterion is
-        the proving evidence — MET, citing that run (the command + exit 0).
+      - a recorded green run (exit 0, and its record's
+        `pass_condition.condition` is `exit 0`) of a command covering the
+        criterion is the proving evidence -- MET, citing that run (the
+        command + exit 0).
       - a recorded failing run covering the criterion, whose record's
         `pass_condition.condition` is `exit 0`, is UNMET, citing the
         recorded exit code and output tail. A failing record may carry a
@@ -294,8 +296,9 @@ nodes:
         exist, exits 1), and no naming line says it passes or exits 0; a
         clause saying what the command checks states nothing. Any other command
         is held to exit 0. Judge a stated record from its recorded exit code
-        and output tail against that condition. Your status and evidence are
-        the reason the deterministic verdict shows for that red run.
+        and output tail against that condition, an exit 0 included: it is
+        not a green run. Your status and evidence are the reason the
+        deterministic verdict shows for that run.
       - a red record whose `baseline.status` is `tree-state` exited 0 on a
         snapshot of the pre-run live tree checked out clean, and the declared
         commands left the tree unchanged, so its red is an

@@ -96,6 +96,7 @@ the `Debris:` line echoes the lint's summary as evidence that it ran.
   above). A red run whose condition parsed criteria state blocks unless every criterion naming it
   ends MET or INSPECTED, and its complaint names those criteria and statuses. A red run whose
   condition only the request states blocks, and its complaint quotes the request line. A stated
+  run that exited 0 is gated the same way and is never a green run. A stated
   run whose criteria are met is listed under `Advisory red runs (not blocking):`, and so is a
   `tree-state` run unless a criterion naming it ends neither MET nor INSPECTED (one about the
   uncommitted tree itself, say), which blocks and names those criteria and statuses.
