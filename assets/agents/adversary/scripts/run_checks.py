@@ -74,10 +74,10 @@ unreferenced objects (among them the blobs of untracked, non-ignored files)
 into the repository's object store, where git's own gc collects them. When
 `git status` fails or `core.sparseCheckout` is true (a sparse index cannot be
 snapshotted whole), no snapshot is taken and every red record's note gains
-", candidate tree state unknown". After the declared commands run, the live
+", candidate tree state unknown". After the declared commands run, a dirty
 tree is written the same way into a second temporary index and its tree id is
-compared with the pre-run one (HEAD's tree when the tree was clean). When they
-differ, the declared commands modified the tree (a regenerate-then-diff
+compared with the pre-run one; a clean one only has `git status` read again.
+When the tree changed, the declared commands modified it (a regenerate-then-diff
 command, say), no red record gets "tree-state", and each note gains ", the
 declared commands modified the tree". Otherwise, on a dirty tree, every red
 record that did not time out runs once more, inside the same deadline and in
@@ -487,11 +487,7 @@ def tree_before(proj, work, deadline):
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
         return unknown
     if not status:
-        try:
-            tree = git_text(["rev-parse", "HEAD^{tree}"], top, snapshot_budget(deadline))
-        except (OSError, RuntimeError, subprocess.TimeoutExpired):
-            return unknown
-        return {"top": top, "dirty": False, "tree": tree, "commit": None}
+        return {"top": top, "dirty": False, "tree": None, "commit": None}
     try:
         tree = snapshot_tree(top, work, "before-index", deadline)
         commit = git_text(
@@ -511,17 +507,22 @@ def tree_outcome(before, work, deadline):
     note of every red record that does not get a tree-state baseline)."""
     if before["dirty"] is None:
         return None, UNKNOWN_TREE_NOTE
-    dirty = DIRTY_TREE_NOTE if before["dirty"] else ""
+    if not before["dirty"]:
+        try:
+            status = git_text(["--no-optional-locks", "status", "--porcelain"], before["top"], snapshot_budget(deadline))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            return None, UNKNOWN_TREE_NOTE
+        return None, MODIFIED_TREE_NOTE if status else ""
     if before["tree"] is None:
-        return None, dirty
+        return None, DIRTY_TREE_NOTE
     try:
         after = snapshot_tree(before["top"], work, "after-index", deadline)
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
         sys.stderr.write(f"WARN: the live tree could not be compared with its pre-run state: {e}\n")
-        return None, UNKNOWN_TREE_NOTE + dirty
+        return None, UNKNOWN_TREE_NOTE + DIRTY_TREE_NOTE
     if after != before["tree"]:
-        return None, MODIFIED_TREE_NOTE + dirty
-    return before["commit"], dirty
+        return None, MODIFIED_TREE_NOTE + DIRTY_TREE_NOTE
+    return before["commit"], DIRTY_TREE_NOTE
 
 
 def rerun_on_snapshot(results, reds, top, subdir, prefix, deadline, work, commit, worktrees):

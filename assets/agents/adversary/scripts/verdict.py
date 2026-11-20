@@ -8,8 +8,9 @@ verification runs, and zero implementation-debris hits from debris_lint.py.
 A red run (nonzero exit or timeout) blocks unless run_checks.py found the
 same failure on the diff base (baseline status "pre-existing"); those are
 reported in their own section. A red run whose baseline status is
-"tree-state" (it exits 0 on a snapshot of the pre-run tree) does not block,
-and neither does one whose pass condition, recomputed from the criteria and
+"tree-state" (it exits 0 on a snapshot of the pre-run tree) does not block
+unless a parsed criterion naming it ends neither MET nor INSPECTED, and
+neither does one whose pass condition, recomputed from the criteria and
 the request by pass_condition.py, is stated as something other than exit 0,
 when parsed criteria name it and every one of them ends MET or INSPECTED;
 both are reported as advisory red runs. A stated red run that no parsed
@@ -326,8 +327,9 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
     recorded by run_checks.py, and one report line per red run that does not block.
 
     A red run is a record that exited nonzero (including the -1 TIMEOUT
-    sentinel). A "pre-existing" one is reported in its own section and a
-    "tree-state" one is advisory. For the rest the pass condition is recomputed
+    sentinel). A "pre-existing" one is reported in its own section. A
+    "tree-state" one blocks unless every criterion naming it ends MET or
+    INSPECTED, and is otherwise advisory. For the rest the pass condition is recomputed
     from `criteria` and `request`, never read from the record, so a recorded
     run replays the same. A red run held to exit 0, timed out or killed by a
     signal blocks and the complaint names the baseline outcome. One whose pass
@@ -367,10 +369,11 @@ def exec_run_complaints(exec_results, declared, criteria=None, request="", verdi
         if code == 0:
             continue
         outcome = "TIMEOUT (exit -1)" if code == -1 else f"exit {code}"
-        if baseline_status(r) == "tree-state":
-            advisory.append(f"- `{cmd}` -- {outcome} -- {baseline_text(r)}")
-            continue
         condition = resolve(cmd, criteria, request)
+        if baseline_status(r) == "tree-state":
+            blocks, text = tree_state_red(r, outcome, condition["criteria"], by_id)
+            (out if blocks else advisory).append(text)
+            continue
         if condition["condition"] == STATED and not killed_or_timed_out(code):
             blocks, text = stated_red(r, outcome, condition, by_id)
             (out if blocks else advisory).append(text)
@@ -386,6 +389,32 @@ def killed_or_timed_out(code):
     return type(code) is int and (code == -1 or code >= 128)
 
 
+def naming_judged_met(ids, by_id):
+    """(every criterion in `ids` ends MET or INSPECTED, [(id, final status)] per criterion)."""
+    naming = [(cid, final_status(by_id.get(cid))) for cid in ids]
+    return all(status in ("MET", "INSPECTED") for _, status in naming), naming
+
+
+def met_reasons(naming, by_id):
+    return "; ".join(f"{cid} {status}: {str_field(by_id[cid], 'evidence')}" for cid, status in naming)
+
+
+def tree_state_red(record, outcome, ids, by_id):
+    """(blocks, text) for a red run that exits 0 on a clean checkout of the same content.
+    A criterion naming the command may be about the uncommitted tree itself (files the
+    change must leave untouched), so such a run blocks unless those criteria all end met."""
+    cmd = record.get("cmd", "?")
+    met, naming = naming_judged_met(ids, by_id)
+    if met:
+        reasons = f"{met_reasons(naming, by_id)} -- " if naming else ""
+        return False, f"- `{cmd}` -- {outcome} -- {reasons}{baseline_text(record)}"
+    statuses = ", ".join(f"{cid} {status}" for cid, status in naming)
+    return True, (
+        f"Verification run `{cmd}` -- {outcome} (recorded FAIL; red only in the uncommitted live "
+        f"tree, and the criteria naming it are not all met: {statuses}; {baseline_text(record)})"
+    )
+
+
 def stated_red(record, outcome, condition, by_id):
     """(blocks, text) for a red run whose pass condition is stated as something other than
     exit 0 by the parsed criteria naming it, or only by the request when none does."""
@@ -397,10 +426,9 @@ def stated_red(record, outcome, condition, by_id):
             f"only in the request (\"{condition['line']}\") and no acceptance criterion names it; "
             f"{baseline_text(record)})"
         )
-    naming = [(cid, final_status(by_id.get(cid))) for cid in ids]
-    if all(status in ("MET", "INSPECTED") for _, status in naming):
-        reasons = "; ".join(f"{cid} {status}: {str_field(by_id[cid], 'evidence')}" for cid, status in naming)
-        return False, f"- `{cmd}` -- {outcome} -- {reasons} -- {baseline_text(record)}"
+    met, naming = naming_judged_met(ids, by_id)
+    if met:
+        return False, f"- `{cmd}` -- {outcome} -- {met_reasons(naming, by_id)} -- {baseline_text(record)}"
     statuses = ", ".join(f"{cid} {status}" for cid, status in naming)
     return True, (
         f"Verification run `{cmd}` -- {outcome} (recorded FAIL; the criteria naming it state a "
