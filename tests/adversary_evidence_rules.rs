@@ -519,6 +519,8 @@ fn a_base_run_that_times_out_is_never_saved() {
     }
     let dir = fixture_dir("saved-base-timeout");
     let (repo, base) = repo_with_base_script(&dir.0, "exec sleep 30\n");
+    // The base run must start before the deadline ends it, after the git
+    // calls that set up its worktree, which a loaded host can slow to seconds.
     let out = script(
         &dir.0,
         "run_checks.py",
@@ -528,7 +530,7 @@ fn a_base_run_that_times_out_is_never_saved() {
             "verification_commands": ["sh check.sh"],
             "diff_base": base,
         }),
-        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "3")],
+        &[("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "10")],
     );
     assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
     assert_eq!(
@@ -946,6 +948,45 @@ fn a_timed_out_run_skips_the_baseline_and_later_commands_get_no_budget() {
         results[1].get("exit").is_none() && results[1].get("baseline").is_none(),
         "{out}"
     );
+}
+
+/// A git shim that takes 3 s over `git status` makes the pre-run tree
+/// capture outlast the 2 s deadline, which must not skip the first command.
+#[cfg(unix)]
+#[test]
+fn the_pre_run_tree_capture_does_not_spend_the_deadline() {
+    use std::os::unix::fs::PermissionsExt;
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("capture-deadline");
+    let (repo, _) = repo_with_base_script(&dir.0, "exit 0\n");
+    let real_git = which::which("git").unwrap();
+    let bin = dir.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        bin.join("git"),
+        format!(
+            "#!/bin/sh\ncase \"$*\" in *status*) sleep 3 ;; esac\nexec '{}' \"$@\"\n",
+            real_git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(bin.join("git"), fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), env::var("PATH").unwrap_or_default());
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "capture-deadline",
+        &json!({"project_dir": repo.to_string_lossy(), "verification_commands": ["echo ran"]}),
+        &[
+            ("PATH", path.as_str()),
+            ("ADVERSARY_RUN_CHECKS_DEADLINE_SECS", "2"),
+        ],
+    );
+    let record = &out["exec_results"][0];
+    assert!(record.get("skipped").is_none(), "{out}");
+    assert_eq!(record["exit"], 0, "{out}");
 }
 
 #[test]
@@ -2678,6 +2719,118 @@ fn a_command_that_modifies_the_tree_gets_no_tree_state_baseline() {
         ),
         (1, 0),
         "{clean}"
+    );
+}
+
+/// On a clean committed tree a command that rewrites a tracked file and exits
+/// 1 gets no tree-state baseline. The tree's `git status` is read again after
+/// the run; the tree is never written into a temporary index.
+#[cfg(unix)]
+#[test]
+fn a_command_that_dirties_a_clean_tree_is_seen_in_its_status() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let dir = fixture_dir("clean-dirtied");
+    let (repo, base) = repo_with_base_script(&dir.0, "exit 0\n");
+    let (path, log) = logging_git_path(&dir.0);
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "clean-dirtied",
+        &json!({
+            "project_dir": repo.to_string_lossy(),
+            "verification_commands": ["sh check.sh; s=$?; echo '# rewritten' >> check.sh; exit $s"],
+            "diff_base": base,
+        }),
+        &envs,
+    );
+    assert_eq!(out["exec_results"][0]["exit"], 1, "{out}");
+    assert_eq!(
+        out["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, the declared commands modified the tree"}),
+        "{out}"
+    );
+    assert_eq!(git(&repo, &["status", "--porcelain"]), "M check.sh");
+    assert_eq!(
+        (
+            git_calls(&log, "write-tree"),
+            git_calls(&log, "commit-tree")
+        ),
+        (0, 0),
+        "{out}"
+    );
+}
+
+/// A tree-state red blocks while a criterion naming the command is not met,
+/// since that criterion may be about the uncommitted tree itself. With every
+/// naming criterion met, their evidence is the advisory reason; a run no
+/// criterion names stays advisory.
+#[test]
+fn a_tree_state_red_blocks_unless_the_criteria_naming_it_are_met() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("tree-state-criteria");
+    let cmd = "git diff --exit-code";
+    let note = "candidate tree dirty: red only in the live tree; the same content on a clean \
+                checkout exits 0";
+    let baseline = format!("baseline on the diff base: tree-state, {note}");
+    let record = json!([{"cmd": cmd, "exit": 1, "duration_s": 0.1,
+                         "tail": "diff --git a/gen.txt b/gen.txt",
+                         "baseline": {"status": "tree-state", "exit": null, "note": note}}]);
+    let names = format!("the change leaves `{cmd}` clean");
+    let shows = format!("`{cmd}` shows no diff");
+
+    let state = judged_state(
+        &[("c1", names.as_str(), "UNMET"), ("c2", "does c2", "MET")],
+        record.clone(),
+    );
+    let text = report(&dir.0, "tree-state-unmet", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "2. Verification run `{cmd}` -- exit 1 (recorded FAIL; red only in the uncommitted \
+             live tree, and the criteria naming it are not all met: c1 UNMET; {baseline})"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+
+    let state = judged_state(
+        &[
+            ("c1", names.as_str(), "MET"),
+            ("c2", shows.as_str(), "INSPECTED"),
+        ],
+        record.clone(),
+    );
+    let text = report(&dir.0, "tree-state-met", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Advisory red runs (not blocking):\n- `{cmd}` -- exit 1 -- c1 MET: c1 holds: \
+             lib/report.src:3; c2 INSPECTED: c2 holds: lib/report.src:3 -- {baseline}\n"
+        )),
+        "{text}"
+    );
+
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        record,
+    );
+    let text = report(&dir.0, "tree-state-unnamed", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Advisory red runs (not blocking):\n- `{cmd}` -- exit 1 -- {baseline}\n"
+        )),
+        "{text}"
     );
 }
 
