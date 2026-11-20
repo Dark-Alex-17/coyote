@@ -430,7 +430,7 @@ fn tool_events() -> Vec<(String, String)> {
 fn key_context_marker(line: &str, current: Option<&str>) -> Option<Option<&'static str>> {
     let opened = match line {
         _ if line.starts_with("pub(crate) fn map_key(") => Some("Anywhere"),
-        "if let Some(mode) = ctx.pager {" => Some("Transcript"),
+        "let modal = match ctx.layer() {" => Some("Transcript"),
         _ if line.starts_with("Some(ModalKind::Confirm") => Some("Confirm"),
         "ModalKind::Input" => Some("Text field"),
         "custom_field_open: false," => Some("List"),
@@ -533,10 +533,10 @@ fn arm_chords(pattern: &str, guard: &str, action: &str) -> Vec<String> {
 }
 
 /// An arm line of a keyed block that binds no named key: a wildcard that
-/// swallows the key or hands it on as typing, or the close of a multi-line
-/// modal pattern.
+/// swallows the key or hands it on as typing, the close of a multi-line
+/// modal pattern, or an arm on the screen layer rather than the key.
 fn non_key_arm(line: &str) -> bool {
-    if matches!(line, ") => match code {" | ") => {") {
+    if matches!(line, ") => match code {" | ") => {") || line.starts_with("Layer::") {
         return true;
     }
     let Some(rest) = line.strip_prefix('_') else {

@@ -5,7 +5,7 @@ use super::redirect::FdRedirect;
 use super::rewind::{is_undo, rewind_barrier, undo_opener};
 use super::roster::{RosterRow, RosterSources};
 use super::sink::UiMsg;
-use super::{App, CONTROL_TASK_WAIT, TurnStatus, cells, pager, render};
+use super::{App, CONTROL_TASK_WAIT, Overlay, TurnStatus, cells, pager, render};
 use crate::config::RequestContext;
 use crate::config::child_sessions::{ChildMeta, ChildSessionRoot, ChildStatus};
 use crate::events::NoticeKind;
@@ -555,7 +555,7 @@ impl App {
             return;
         };
         let file = root.child_session_file(&session_id);
-        if self.pager.as_ref().is_some_and(Pager::shows_root) {
+        if self.pager().is_some_and(Pager::shows_root) {
             cells::release_full_output_caches(self.transcript.cells_for_layout().0);
         }
         self.open_pager(Pager::child(session_id.clone(), agent, file.clone()));
@@ -565,7 +565,7 @@ impl App {
     /// Asks for a read of the child on show. Nothing is read once the
     /// exit has begun; the pager keeps what it has.
     pub(super) fn read_open_child(&mut self, session_id: String, file: PathBuf) {
-        let Some(pager) = self.pager.as_mut() else {
+        let Some(Overlay::Pager(pager)) = self.overlay.as_mut() else {
             return;
         };
         if self.control.is_none() {
@@ -608,13 +608,13 @@ impl App {
                 }
             },
         };
-        if let Some(pager) = self.pager.as_mut() {
+        if let Some(pager) = self.pager_mut() {
             pager.open_picker(rows, note);
         }
     }
 
     pub(super) fn choose_thread(&mut self) {
-        let Some(row) = self.pager.as_mut().and_then(Pager::take_picked) else {
+        let Some(row) = self.pager_mut().and_then(Pager::take_picked) else {
             return;
         };
         match row.session_id {

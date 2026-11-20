@@ -49,6 +49,38 @@ pub(crate) enum PagerMode {
     Picker,
 }
 
+/// What is drawn over the transcript and takes the keys, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlayKind {
+    /// Covers the whole screen.
+    Pager(PagerMode),
+    /// Covers the transcript; the bottom pane stays in sight under it.
+    Help,
+}
+
+/// The layer that takes the keys: whichever of these is open first, in
+/// this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layer {
+    Overlay(OverlayKind),
+    Modal(ModalKind),
+    Band(PopupKind),
+    Composer,
+}
+
+pub(crate) fn layer(
+    overlay: Option<OverlayKind>,
+    modal: Option<ModalKind>,
+    popup: Option<PopupKind>,
+) -> Layer {
+    match (overlay, modal, popup) {
+        (Some(overlay), _, _) => Layer::Overlay(overlay),
+        (None, Some(modal), _) => Layer::Modal(modal),
+        (None, None, Some(popup)) => Layer::Band(popup),
+        (None, None, None) => Layer::Composer,
+    }
+}
+
 /// The vi layer's mode; the composer under emacs bindings has none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViMode {
@@ -107,25 +139,23 @@ pub(crate) struct KeyContext {
     pub(crate) focused: bool,
     pub(crate) popup: Option<PopupKind>,
     pub(crate) vi: Option<ViMode>,
-    /// The pager covers the whole screen and takes every key but the
+    /// The pager or the key help; either takes every key but the
     /// terminal's own.
-    pub(crate) pager: Option<PagerMode>,
-    /// The key help covers the whole screen the way the pager does.
-    pub(crate) help: bool,
+    pub(crate) overlay: Option<OverlayKind>,
 }
 
 impl KeyContext {
+    pub(crate) fn layer(&self) -> Layer {
+        layer(self.overlay, self.modal, self.popup)
+    }
+
     /// Whether a plain `?` on the composer opens the help: only an empty
     /// composer with nothing open over it (no band, question, pager or
     /// help) gives it up. Anywhere else it is typing, vi normal mode's
     /// swallowing included. The status strip advertises `?` by the same
     /// test.
     pub(crate) fn question_mark_opens_help(&self) -> bool {
-        self.composer_empty
-            && self.popup.is_none()
-            && self.modal.is_none()
-            && self.pager.is_none()
-            && !self.help
+        self.composer_empty && self.layer() == Layer::Composer
     }
 }
 
@@ -550,12 +580,12 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         KeyCode::Char('l') if ctrl => return Action::ScheduleFrame,
         _ => {}
     }
-    if let Some(mode) = ctx.pager {
-        return pager_key(key, code, mode);
-    }
-    if ctx.help {
-        return help_key(key, code);
-    }
+    let modal = match ctx.layer() {
+        Layer::Overlay(OverlayKind::Pager(mode)) => return pager_key(key, code, mode),
+        Layer::Overlay(OverlayKind::Help) => return help_key(key, code),
+        Layer::Modal(modal) => Some(modal),
+        Layer::Band(_) | Layer::Composer => None,
+    };
     match code {
         KeyCode::Char('x') if ctrl => return Action::ToggleTodo,
         KeyCode::PageUp => return Action::ScrollPage(-1),
@@ -565,7 +595,7 @@ pub(crate) fn map_key(key: KeyEvent, ctx: &KeyContext) -> Action {
         KeyCode::End if ctx.scrolled => return Action::ScrollToBottom,
         _ => {}
     }
-    match ctx.modal {
+    match modal {
         Some(ModalKind::Confirm { default, tool }) => {
             let answerable = ctx.idle_ok && ctx.question_fully_shown;
             match code {
@@ -868,8 +898,7 @@ mod tests {
         focused: false,
         popup: None,
         vi: None,
-        pager: None,
-        help: false,
+        overlay: None,
     };
 
     #[test]
@@ -1999,16 +2028,16 @@ mod tests {
     #[test]
     fn pager_keys() {
         let browse = KeyContext {
-            pager: Some(PagerMode::Browse),
+            overlay: Some(OverlayKind::Pager(PagerMode::Browse)),
             turn_running: true,
             ..IDLE
         };
         let find = KeyContext {
-            pager: Some(PagerMode::Find),
+            overlay: Some(OverlayKind::Pager(PagerMode::Find)),
             ..IDLE
         };
         let picker = KeyContext {
-            pager: Some(PagerMode::Picker),
+            overlay: Some(OverlayKind::Pager(PagerMode::Picker)),
             ..IDLE
         };
         let shift = |c: char| press(KeyCode::Char(c), KeyModifiers::SHIFT);
@@ -2183,20 +2212,23 @@ mod tests {
         ..VI_NORMAL_EMPTY
     };
     const BROWSE: KeyContext = KeyContext {
-        pager: Some(PagerMode::Browse),
+        overlay: Some(OverlayKind::Pager(PagerMode::Browse)),
         ..IDLE
     };
     const FIND: KeyContext = KeyContext {
-        pager: Some(PagerMode::Find),
+        overlay: Some(OverlayKind::Pager(PagerMode::Find)),
         ..IDLE
     };
     const PICKER: KeyContext = KeyContext {
-        pager: Some(PagerMode::Picker),
+        overlay: Some(OverlayKind::Pager(PagerMode::Picker)),
         ..IDLE
     };
-    const HELP: KeyContext = KeyContext { help: true, ..IDLE };
+    const HELP: KeyContext = KeyContext {
+        overlay: Some(OverlayKind::Help),
+        ..IDLE
+    };
     const RUNNING_HELP: KeyContext = KeyContext {
-        help: true,
+        overlay: Some(OverlayKind::Help),
         ..RUNNING_TYPING
     };
 

@@ -1371,7 +1371,7 @@ fn the_roster_ticks_only_while_no_pager_covers_it() {
     harness.app.frame_drawn();
     assert!(harness.app.frames.due_at().is_some(), "no roster tick");
 
-    harness.app.pager = Some(Pager::root());
+    harness.app.overlay = Some(Overlay::Pager(Box::new(Pager::root())));
     harness.render();
     harness.app.frame_drawn();
     assert_eq!(harness.app.frames.due_at(), None);
@@ -3248,9 +3248,9 @@ fn dot_keys_is_recalled_in_the_session_but_never_written_to_the_history_file() {
     submit(&mut harness, "hello");
     harness.type_text(".keys");
     assert_eq!(harness.press(KeyCode::Enter), None);
-    assert!(harness.app.help.is_some(), ".keys opens the help");
+    assert!(harness.app.help_mut().is_some(), ".keys opens the help");
     assert_eq!(harness.press(KeyCode::Esc), None);
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
     assert_eq!(ComposerHistory::load(&path).unwrap().search(""), ["hello"]);
     assert_eq!(harness.press(KeyCode::Up), None);
@@ -4195,7 +4195,7 @@ fn ctrl_t_shows_a_tools_whole_output_and_q_closes_it() {
     assert!(frame.contains("count 01"), "{frame}");
     assert!(frame.contains("Thread: root thread"), "{frame}");
     harness.press(KeyCode::Char('q'));
-    assert!(harness.app.pager.is_none());
+    assert!(harness.app.pager().is_none());
     assert_eq!(harness.draw(), before);
 }
 
@@ -4396,13 +4396,13 @@ fn the_pager_shows_a_stray_calls_whole_output() {
 fn a_question_closes_the_pager() {
     let mut harness = Harness::standalone(80, 24);
     press_ctrl(&mut harness, 't');
-    assert!(harness.app.pager.is_some());
+    assert!(harness.app.pager().is_some());
     let (reply, _answer) = mpsc::channel();
     harness.app.handle_msg(UiMsg::Prompt {
         req: Box::new(confirm_request(None)),
         reply,
     });
-    assert!(harness.app.pager.is_none());
+    assert!(harness.app.pager().is_none());
     assert!(harness.draw().contains("Proceed? tui-x7x"));
 }
 
@@ -4422,12 +4422,12 @@ fn question_mark_opens_the_key_help_and_esc_closes_it() {
         .app
         .handle_input(TermInput::Paste("pasted".to_string()));
     assert_eq!(harness.press(KeyCode::Esc), None);
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
     assert_eq!(harness.app.composer_text(), "");
     assert!(harness.draw().contains(IDLE_STATUS_WITH_HELP));
 
     harness.type_text("why?");
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
     assert_eq!(harness.app.composer_text(), "why?");
 }
 
@@ -4672,15 +4672,15 @@ fn the_keys_command_opens_the_help_instead_of_reaching_the_repl() {
         let mut harness = Harness::new(80, 24, config, FooterInfo::default());
         harness.type_text(line);
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
-        assert!(harness.app.help.is_some(), "{line}");
+        assert!(harness.app.help_mut().is_some(), "{line}");
         assert_eq!(harness.app.composer_text(), "");
         harness.press(KeyCode::Char('q'));
-        assert!(harness.app.help.is_none());
+        assert!(harness.app.help_mut().is_none());
 
         harness.app.begin_turn("work", false);
         harness.type_text(line);
         assert_eq!(harness.press(KeyCode::Enter), None, "{line}");
-        assert!(harness.app.help.is_some(), "{line}");
+        assert!(harness.app.help_mut().is_some(), "{line}");
         assert!(harness.app.queued.is_empty(), "{line}");
     }
 }
@@ -4697,16 +4697,16 @@ fn a_keys_macro_takes_the_keys_command_from_the_help() {
         harness.press(KeyCode::Enter),
         Some(Command::Submit(".keys".to_string()))
     );
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
 
     harness.press(KeyCode::Char('?'));
-    assert!(harness.app.help.is_some());
+    assert!(harness.app.help_mut().is_some());
     harness.press(KeyCode::Char('q'));
 
     harness.app.begin_turn("work", false);
     harness.type_text(".keys");
     assert_eq!(harness.press(KeyCode::Enter), None);
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
     assert_eq!(
         harness
             .app
@@ -4741,7 +4741,7 @@ fn the_keys_command_is_the_whole_line_or_nothing() {
             Some(Command::Submit(line.to_string())),
             "{line:?}"
         );
-        assert!(harness.app.help.is_none(), "{line:?}");
+        assert!(harness.app.help_mut().is_none(), "{line:?}");
     }
 }
 
@@ -4765,7 +4765,7 @@ fn alt_up_over_a_keys_draft_opens_the_help_instead_of_holding_it() {
             draft: None,
         })
     );
-    assert!(harness.app.help.is_some());
+    assert!(harness.app.help_mut().is_some());
     assert!(harness.app.queued.is_empty());
     assert_eq!(harness.app.composer_text(), "first");
 }
@@ -4776,14 +4776,14 @@ fn alt_up_over_a_keys_draft_opens_the_help_instead_of_holding_it() {
 fn opening_the_pager_closes_the_key_help() {
     let mut harness = Harness::standalone(80, 24);
     harness.press(KeyCode::Char('?'));
-    assert!(harness.app.help.is_some());
+    assert!(harness.app.help_mut().is_some());
     harness.app.open_pager(Pager::root());
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
     let frame = harness.draw();
     assert!(frame.contains("Tab threads"), "{frame}");
     assert!(!frame.contains("Suspend to the shell"), "{frame}");
     harness.press(KeyCode::Char('q'));
-    assert!(harness.app.pager.is_none());
+    assert!(harness.app.pager().is_none());
     assert!(harness.draw().contains(IDLE_STATUS_WITH_HELP));
 }
 
@@ -4793,13 +4793,13 @@ fn opening_the_pager_closes_the_key_help() {
 fn a_question_closes_the_key_help() {
     let mut harness = Harness::standalone(80, 24);
     harness.press(KeyCode::Char('?'));
-    assert!(harness.app.help.is_some());
+    assert!(harness.app.help_mut().is_some());
     let (reply, _answer) = mpsc::channel();
     harness.app.handle_msg(UiMsg::Prompt {
         req: Box::new(confirm_request(None)),
         reply,
     });
-    assert!(harness.app.help.is_none());
+    assert!(harness.app.help_mut().is_none());
     assert!(harness.draw().contains("Proceed? tui-x7x"));
 }
 
@@ -5006,7 +5006,7 @@ fn an_idle_chat_ticks_only_while_the_footer_counts_a_task() {
         harness.app.frame_drawn();
         assert!(harness.app.frames.due_at().is_some());
 
-        harness.app.pager = Some(Pager::root());
+        harness.app.overlay = Some(Overlay::Pager(Box::new(Pager::root())));
         harness.render();
         harness.app.frame_drawn();
         assert_eq!(harness.app.frames.due_at(), None, "the pager has no footer");

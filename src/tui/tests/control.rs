@@ -639,7 +639,7 @@ fn the_picker_opens_a_childs_thread_through_the_keys() {
         harness.draw();
         assert!(laid_out(&mut harness));
         harness.press(KeyCode::Esc);
-        assert!(harness.app.pager.is_none());
+        assert!(harness.app.pager().is_none());
         assert!(!laid_out(&mut harness));
 
         press_ctrl(&mut harness, 't');
@@ -729,6 +729,6 @@ fn a_session_id_with_a_path_in_it_is_refused() {
     harness
         .app
         .open_child("../../etc".to_string(), "reviewer".to_string());
-    assert!(harness.app.pager.is_none());
+    assert!(harness.app.pager().is_none());
     assert!(harness.app.take_control_requests().is_empty());
 }

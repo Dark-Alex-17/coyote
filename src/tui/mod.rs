@@ -54,7 +54,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use events::{Clock, FrameScheduler, TermInput};
 use help::Help;
 use history::ComposerHistory;
-use keys::{Action, KeyContext, PagerMode, PopupKind, ViMode};
+use keys::{Action, KeyContext, Layer, OverlayKind, PagerMode, PopupKind, ViMode};
 #[cfg(test)]
 pub(crate) use lend::OwnerGuard;
 use lend::{Owner, owner};
@@ -211,6 +211,29 @@ impl FooterInfo {
     }
 }
 
+/// What is drawn over the transcript while open: Ctrl+T's full-screen
+/// pager, or the key help over the transcript's rows.
+enum Overlay {
+    Pager(Box<Pager>),
+    Help(Help),
+}
+
+impl Overlay {
+    fn kind(&self) -> OverlayKind {
+        match self {
+            Overlay::Pager(pager) => OverlayKind::Pager(pager.mode()),
+            Overlay::Help(_) => OverlayKind::Help,
+        }
+    }
+
+    fn scroll(&mut self, delta: i32) {
+        match self {
+            Overlay::Pager(pager) => pager.scroll(delta),
+            Overlay::Help(help) => help.scroll(delta),
+        }
+    }
+}
+
 struct TurnStatus {
     started: Instant,
     busy: Option<String>,
@@ -350,10 +373,7 @@ pub(crate) struct App {
     last_esc: Option<Instant>,
     config: Arc<AppConfig>,
     prompt_memory: Arc<PromptMemory>,
-    /// Ctrl+T's full-screen view, drawn over everything while open.
-    pager: Option<Pager>,
-    /// The key help, drawn over everything while open.
-    help: Option<Help>,
+    overlay: Option<Overlay>,
     /// The generation of the newest child read asked for.
     child_reads: u64,
     roster_sources: RosterSources,
@@ -442,8 +462,7 @@ impl App {
             last_esc: None,
             config,
             prompt_memory,
-            pager: None,
-            help: None,
+            overlay: None,
             roster_sources: RosterSources::default(),
             control: None,
             child_root: None,
@@ -496,7 +515,7 @@ impl App {
                     renderer.no_color = self.renderer.no_color;
                     self.renderer = renderer;
                     self.transcript.forget_layout();
-                    if let Some(pager) = self.pager.as_mut() {
+                    if let Some(pager) = self.pager_mut() {
                         pager.forget_layout();
                     }
                     self.composer.set_background(background);
@@ -595,16 +614,48 @@ impl App {
             question_fully_shown,
             scrolled: self.transcript.scrolled(),
             focused: self.transcript.focused(),
-            popup: match self.view {
-                View::Composer => None,
-                View::Palette(_) => Some(PopupKind::Palette),
-                View::HistorySearch(_) => Some(PopupKind::HistorySearch),
-                View::Rewind(_) => Some(PopupKind::Rewind),
-                View::Roster(_) => Some(PopupKind::Roster),
-            },
+            popup: self.popup(),
             vi: self.vi_mode,
-            pager: self.pager.as_ref().map(Pager::mode),
-            help: self.help.is_some(),
+            overlay: self.overlay.as_ref().map(Overlay::kind),
+        }
+    }
+
+    fn popup(&self) -> Option<PopupKind> {
+        match self.view {
+            View::Composer => None,
+            View::Palette(_) => Some(PopupKind::Palette),
+            View::HistorySearch(_) => Some(PopupKind::HistorySearch),
+            View::Rewind(_) => Some(PopupKind::Rewind),
+            View::Roster(_) => Some(PopupKind::Roster),
+        }
+    }
+
+    fn layer(&self) -> Layer {
+        keys::layer(
+            self.overlay.as_ref().map(Overlay::kind),
+            self.prompts.front().map(PendingPrompt::kind),
+            self.popup(),
+        )
+    }
+
+    fn pager(&self) -> Option<&Pager> {
+        match &self.overlay {
+            Some(Overlay::Pager(pager)) => Some(pager),
+            _ => None,
+        }
+    }
+
+    fn pager_mut(&mut self) -> Option<&mut Pager> {
+        match &mut self.overlay {
+            Some(Overlay::Pager(pager)) => Some(pager),
+            _ => None,
+        }
+    }
+
+    fn help_mut(&mut self) -> Option<&mut Help> {
+        match &mut self.overlay {
+            Some(Overlay::Help(help)) => Some(help),
+            _ => None,
         }
     }
 
@@ -733,7 +784,7 @@ impl App {
         if let Some(line) = self.clear_sent_draft() {
             self.history.push(&line);
         }
-        self.help = Some(Help::default());
+        self.overlay = Some(Overlay::Help(Help::default()));
         true
     }
 
@@ -838,28 +889,30 @@ impl App {
                 // they use themselves (CR, CRLF or LF); the composer and
                 // the field take one shape.
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                if let Some(pager) = self.pager.as_mut() {
+                match self.layer() {
                     // Only the find field takes it; the widgets under the
                     // pager are out of sight.
-                    pager.paste(&text);
-                    self.schedule_frame();
-                    return None;
-                }
-                // The help has the keyboard, so a paste reaches nothing
-                // under it, as a typed key would not.
-                if self.help.is_some() {
-                    return None;
-                }
-                match self.prompts.front_mut() {
+                    Layer::Overlay(OverlayKind::Pager(_)) => {
+                        if let Some(pager) = self.pager_mut() {
+                            pager.paste(&text);
+                        }
+                    }
+                    // The help has the keyboard, so a paste reaches nothing
+                    // under it, as a typed key would not.
+                    Layer::Overlay(OverlayKind::Help) => return None,
                     // A confirm has no field, and the composer is hidden
                     // under the modal: a paste there would land where the
                     // user cannot see it.
-                    Some(prompt) => {
-                        if let Some(field) = prompt.field.as_mut() {
+                    Layer::Modal(_) => {
+                        if let Some(field) = self
+                            .prompts
+                            .front_mut()
+                            .and_then(|prompt| prompt.field.as_mut())
+                        {
                             field.insert_str(text.replace('\n', " "));
                         }
                     }
-                    None => {
+                    Layer::Band(_) | Layer::Composer => {
                         self.composer.insert_str(&text);
                         self.palette_dirty = true;
                     }
@@ -872,31 +925,25 @@ impl App {
                 None
             }
             TermInput::Mouse(mouse) => {
-                if let Some(pager) = self.pager.as_mut() {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => pager.scroll(-WHEEL_LINES),
-                        MouseEventKind::ScrollDown => pager.scroll(WHEEL_LINES),
+                match self.layer() {
+                    Layer::Overlay(_) => {
+                        let delta = match mouse.kind {
+                            MouseEventKind::ScrollUp => -WHEEL_LINES,
+                            MouseEventKind::ScrollDown => WHEEL_LINES,
+                            _ => return None,
+                        };
+                        if let Some(overlay) = self.overlay.as_mut() {
+                            overlay.scroll(delta);
+                        }
+                    }
+                    Layer::Modal(_) | Layer::Band(_) | Layer::Composer => match mouse.kind {
+                        MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
+                        MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            self.transcript.click(mouse.column, mouse.row)
+                        }
                         _ => return None,
-                    }
-                    self.schedule_frame();
-                    return None;
-                }
-                if let Some(help) = self.help.as_mut() {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => help.scroll(-WHEEL_LINES),
-                        MouseEventKind::ScrollDown => help.scroll(WHEEL_LINES),
-                        _ => return None,
-                    }
-                    self.schedule_frame();
-                    return None;
-                }
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => self.transcript.scroll_lines(-WHEEL_LINES),
-                    MouseEventKind::ScrollDown => self.transcript.scroll_lines(WHEEL_LINES),
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        self.transcript.click(mouse.column, mouse.row)
-                    }
-                    _ => return None,
+                    },
                 }
                 self.schedule_frame();
                 None
@@ -1135,20 +1182,20 @@ impl App {
                 None
             }
             Action::ToggleHelp => {
-                self.help = match self.help {
-                    Some(_) => None,
-                    None => Some(Help::default()),
+                self.overlay = match self.overlay {
+                    Some(Overlay::Help(_)) => None,
+                    _ => Some(Overlay::Help(Help::default())),
                 };
                 None
             }
             Action::HelpScroll(delta) => {
-                if let Some(help) = self.help.as_mut() {
+                if let Some(help) = self.help_mut() {
                     help.scroll(delta);
                 }
                 None
             }
             Action::HelpPage(direction) => {
-                if let Some(help) = self.help.as_mut() {
+                if let Some(help) = self.help_mut() {
                     help.page(direction);
                 }
                 None
@@ -1225,7 +1272,7 @@ impl App {
     }
 
     fn with_pager(&mut self, f: impl FnOnce(&mut Pager)) -> Option<Command> {
-        if let Some(pager) = self.pager.as_mut() {
+        if let Some(pager) = self.pager_mut() {
             f(pager);
         }
         None
@@ -1233,16 +1280,15 @@ impl App {
 
     /// Closes the pager and frees the lines it laid out.
     fn close_pager(&mut self) {
-        if self.pager.take().is_some() {
+        if self.pager().is_some() {
+            self.overlay = None;
             cells::release_full_output_caches(self.transcript.cells_for_layout().0);
         }
     }
 
-    /// The pager covers the whole screen, key help pop-up included, and
-    /// its keys come first, so the help never stays open under it.
+    /// Takes the key help's place if it is open.
     fn open_pager(&mut self, pager: Pager) {
-        self.help = None;
-        self.pager = Some(pager);
+        self.overlay = Some(Overlay::Pager(Box::new(pager)));
     }
 
     pub(crate) fn handle_msg(&mut self, msg: UiMsg) {
@@ -1407,8 +1453,7 @@ impl App {
                     return;
                 }
                 let reload = self
-                    .pager
-                    .as_mut()
+                    .pager_mut()
                     .and_then(|pager| pager.child_flushed(&session_id));
                 if let Some(file) = reload {
                     self.read_open_child(session_id, file);
@@ -1421,8 +1466,7 @@ impl App {
                 self.child_root = Some(root);
                 if changed
                     && self
-                        .pager
-                        .as_ref()
+                        .pager()
                         .is_some_and(|pager| pager.mode() == PagerMode::Picker)
                 {
                     self.open_thread_picker();
@@ -1437,8 +1481,7 @@ impl App {
                     warn!("Failed to read the session of child {session_id}: {err}");
                 }
                 let again = self
-                    .pager
-                    .as_mut()
+                    .pager_mut()
                     .and_then(|pager| pager.set_child_entries(&session_id, generation, result));
                 if let Some(file) = again {
                     self.read_open_child(session_id, file);
@@ -1482,7 +1525,7 @@ impl App {
         }
         let Some(turn) = self.turn.as_ref() else {
             // The key help takes the chords the idle hint names.
-            if !self.prompts.is_empty() || self.help.is_some() {
+            if !self.prompts.is_empty() || matches!(self.overlay, Some(Overlay::Help(_))) {
                 return None;
             }
             let status = if self.key_context().question_mark_opens_help() {
@@ -1505,7 +1548,7 @@ impl App {
                 secs(turn.started)
             )
         };
-        if self.prompts.is_empty() && self.help.is_none() {
+        if self.prompts.is_empty() && !matches!(self.overlay, Some(Overlay::Help(_))) {
             Some(Span::styled(format!("{state}  Esc to interrupt"), DIM))
         } else {
             Some(Span::styled(state, DIM))
@@ -1538,11 +1581,9 @@ impl App {
     pub(crate) fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
         self.frame_area = Some(area);
-        debug_assert!(
-            self.help.is_none() || self.pager.is_none(),
-            "the key help is open under the pager"
-        );
-        if let Some(pager) = self.pager.as_mut() {
+        // Matched on the field, not through `layer`, so the pager can be
+        // borrowed beside the transcript and the renderer.
+        if let Some(Overlay::Pager(pager)) = self.overlay.as_mut() {
             let generation = self.transcript.generation();
             let (cells, revisions) = self.transcript.cells_for_layout();
             let text = pager.text(cells, revisions, generation, area.width, &mut self.renderer);
@@ -1580,7 +1621,7 @@ impl App {
         if let Some(todo) = todo {
             frame.render_widget(&self.todo, todo);
         }
-        if let Some(help) = self.help.as_mut() {
+        if let Some(Overlay::Help(help)) = self.overlay.as_mut() {
             frame.render_widget(help, upper);
         }
 
@@ -1654,7 +1695,7 @@ impl App {
     pub(crate) fn frame_drawn(&mut self) {
         self.frames.frame_drawn();
         if self.turn.is_some()
-            || (self.pager.is_none()
+            || (!matches!(self.layer(), Layer::Overlay(OverlayKind::Pager(_)))
                 && (matches!(self.view, View::Roster(_))
                     || self.roster_sources.running_counts() != (0, 0)))
         {

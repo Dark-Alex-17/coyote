@@ -516,7 +516,7 @@ impl App {
         self.close_view();
         // A question is never left waiting behind the pager or the help.
         self.close_pager();
-        self.help = None;
+        self.overlay = None;
         let becomes_front = self.prompts.is_empty();
         self.prompts.push_back(PendingPrompt::new(req, reply));
         if becomes_front {
