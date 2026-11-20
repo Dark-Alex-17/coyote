@@ -47,7 +47,7 @@ use bottom_pane::{
     PaletteSnapshot, PaletteState, PaletteView, RewindTarget, RewindView, SearchState, SearchView,
     View,
 };
-use cells::{AgentStatus, Cell, JobStatus, LineCache};
+use cells::{AgentStatus, Cell, JobStatus, LineCache, TaskRow};
 use composer::{Composer, field_background};
 use control::{ControlRequest, cancel_report, is_plain_session_id};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
@@ -1370,9 +1370,7 @@ impl App {
                 Cell::Job {
                     job_id,
                     tool,
-                    status: JobStatus::Running,
-                    calls: Vec::new(),
-                    expanded: false,
+                    row: TaskRow::new(JobStatus::Running),
                     cache: LineCache::default(),
                 },
                 "job__start",
@@ -1398,9 +1396,7 @@ impl App {
                 Cell::Agent {
                     agent_id,
                     name,
-                    status: AgentStatus::Running,
-                    calls: Vec::new(),
-                    expanded: false,
+                    row: TaskRow::new(AgentStatus::Running),
                     cache: LineCache::default(),
                 },
                 "agent__spawn",

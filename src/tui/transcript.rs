@@ -5,8 +5,8 @@
 //! view follows again.
 
 use super::cells::{
-    self, AgentStatus, Cell, FoldedCall, FullOutput, JobStatus, LineCache, OutputTarget,
-    ToolStatus, append_output,
+    self, AgentStatus, Cell, FoldedCall, JobStatus, LineCache, OutputTail, TaskRow, ToolStatus,
+    append_output,
 };
 use super::render::Renderer;
 use super::{FULL_OUTPUT_BUDGET, LATE_OUTPUT_LIMIT};
@@ -614,7 +614,17 @@ impl Transcript {
                 row -= 1;
             }
         }
-        if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) = self.cell_mut(row) {
+        if let Some(
+            Cell::Job {
+                row: TaskRow { calls, .. },
+                ..
+            }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            },
+        ) = self.cell_mut(row)
+        {
             calls.push(FoldedCall::new(call_id, name));
         }
     }
@@ -631,10 +641,10 @@ impl Transcript {
         let Some(index) = self.tool_row(first_cell, call_id) else {
             return;
         };
-        let Some(Cell::Tool { status, full, .. }) = self.cell_mut(index) else {
+        let Some(Cell::Tool { status, tail, .. }) = self.cell_mut(index) else {
             return;
         };
-        let grew = full.settle();
+        let grew = tail.full.settle();
         if let ToolStatus::Running { since } = *status {
             // The hook's own measurement when it has one; the UI's clock
             // otherwise, so a failed call still shows how long it took.
@@ -671,26 +681,28 @@ impl Transcript {
                 let Cell::Tool {
                     call_id,
                     name,
-                    output,
-                    open_line,
-                    pending,
-                    full,
+                    tail,
                     ..
                 } = self.replace(index, row)
                 else {
                     unreachable!("the index was found holding a tool row");
                 };
-                let moved = full.text().len();
-                if let Some(Cell::Job { calls, .. } | Cell::Agent { calls, .. }) =
-                    self.cell_mut(index)
+                let moved = tail.full.text().len();
+                if let Some(
+                    Cell::Job {
+                        row: TaskRow { calls, .. },
+                        ..
+                    }
+                    | Cell::Agent {
+                        row: TaskRow { calls, .. },
+                        ..
+                    },
+                ) = self.cell_mut(index)
                 {
                     calls.push(FoldedCall {
                         call_id,
                         name,
-                        output,
-                        open_line,
-                        pending,
-                        full,
+                        tail,
                     });
                     self.account_full_output(
                         isize::try_from(moved).unwrap_or(isize::MAX),
@@ -707,11 +719,8 @@ impl Transcript {
             .cells()
             .iter()
             .rposition(|cell| matches!(cell, Cell::Job { job_id: id, .. } if id == job_id));
-        if let Some(Cell::Job {
-            status: current, ..
-        }) = row.and_then(|row| self.cell_mut(row))
-        {
-            *current = status;
+        if let Some(Cell::Job { row: task, .. }) = row.and_then(|row| self.cell_mut(row)) {
+            task.status = status;
         }
     }
 
@@ -720,11 +729,8 @@ impl Transcript {
             .cells()
             .iter()
             .rposition(|cell| matches!(cell, Cell::Agent { agent_id: id, .. } if id == agent_id));
-        if let Some(Cell::Agent {
-            status: current, ..
-        }) = row.and_then(|row| self.cell_mut(row))
-        {
-            *current = status;
+        if let Some(Cell::Agent { row: task, .. }) = row.and_then(|row| self.cell_mut(row)) {
+            task.status = status;
         }
     }
 
@@ -780,8 +786,9 @@ impl Transcript {
             None if in_turn => self.anonymous_tool_output_target(first_cell),
             None => None,
         };
-        if let Some((target, full)) = target {
-            let grew = full.push(&append_output(target, bytes));
+        if let Some(tail) = target {
+            let text = append_output(tail, bytes);
+            let grew = tail.full.push(&text);
             self.account_full_output(grew, FULL_OUTPUT_BUDGET);
             return;
         }
@@ -798,35 +805,22 @@ impl Transcript {
         if !continues_last {
             self.push(Cell::Text {
                 call_id,
-                lines: Vec::new(),
-                open_line: false,
-                pending: Vec::new(),
-                full: FullOutput::default(),
+                tail: OutputTail::default(),
                 cache: LineCache::default(),
             });
         }
-        let Some(Cell::Text {
-            lines,
-            open_line,
-            pending,
-            full,
-            ..
-        }) = self.last_mut()
-        else {
+        let Some(Cell::Text { tail, .. }) = self.last_mut() else {
             return;
         };
-        let grew = full.push(&append_output((lines, open_line, pending), bytes));
+        let text = append_output(tail, bytes);
+        let grew = tail.full.push(&text);
         self.account_full_output(grew, FULL_OUTPUT_BUDGET);
     }
 
-    /// The output lines of the call `call_id`: a tool row's own, within
-    /// this turn, or those of a call folded into a job's or agent's row,
+    /// The output tail of the call `call_id`: a tool row's own, within
+    /// this turn, or that of a call folded into a job's or agent's row,
     /// which a later turn's check reaches back to.
-    fn tool_output_target(
-        &mut self,
-        first_cell: usize,
-        call_id: &str,
-    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
+    fn tool_output_target(&mut self, first_cell: usize, call_id: &str) -> Option<&mut OutputTail> {
         let index = self
             .cells()
             .iter()
@@ -840,14 +834,11 @@ impl Transcript {
         self.cell_mut(index)?.output_for(call_id)
     }
 
-    /// The output lines of a call without an id, within this turn: the
+    /// The output tail of a call without an id, within this turn: the
     /// newest running tool row without one (a finished one has had all
     /// its output), or the newest such call folded into a running job's
     /// or agent's row; a finished job or agent takes nothing more.
-    fn anonymous_tool_output_target(
-        &mut self,
-        first_cell: usize,
-    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
+    fn anonymous_tool_output_target(&mut self, first_cell: usize) -> Option<&mut OutputTail> {
         let cells = self.cells();
         let index = (first_cell..cells.len())
             .rev()
@@ -855,13 +846,13 @@ impl Transcript {
                 Cell::Tool {
                     call_id, status, ..
                 } => call_id.is_empty() && matches!(status, ToolStatus::Running { .. }),
-                Cell::Job { calls, status, .. } => {
-                    matches!(status, JobStatus::Running)
-                        && calls.iter().any(|call| call.call_id.is_empty())
+                Cell::Job { row, .. } => {
+                    matches!(row.status, JobStatus::Running)
+                        && row.calls.iter().any(|call| call.call_id.is_empty())
                 }
-                Cell::Agent { calls, status, .. } => {
-                    matches!(status, AgentStatus::Running)
-                        && calls.iter().any(|call| call.call_id.is_empty())
+                Cell::Agent { row, .. } => {
+                    matches!(row.status, AgentStatus::Running)
+                        && row.calls.iter().any(|call| call.call_id.is_empty())
                 }
                 _ => false,
             })?;
@@ -978,13 +969,13 @@ mod tests {
 
     /// Appends `lines` lines of output to the tool row at `index`.
     fn grow_tool(transcript: &mut Transcript, index: usize, call_id: &str, lines: usize) {
-        let (target, _) = transcript
+        let tail = transcript
             .cell_mut(index)
             .unwrap()
             .output_for(call_id)
             .unwrap();
         let text: String = (0..lines).map(|n| format!("{call_id} out {n}\n")).collect();
-        append_output(target, text.as_bytes());
+        append_output(tail, text.as_bytes());
     }
 
     fn finish_tool(transcript: &mut Transcript, index: usize) {
@@ -1003,12 +994,12 @@ mod tests {
     fn tool_with_output(transcript: &mut Transcript, call_id: &str, text: &str) {
         transcript.push(tool(call_id));
         let index = transcript.len() - 1;
-        let (_, full) = transcript
+        let tail = transcript
             .cell_mut(index)
             .unwrap()
             .output_for(call_id)
             .unwrap();
-        let grew = full.push(text);
+        let grew = tail.full.push(text);
         transcript.account_full_output(grew, usize::MAX);
     }
 
@@ -1070,8 +1061,8 @@ mod tests {
         assert_eq!(transcript.full_output_bytes, recounted(&transcript));
 
         let mut swapped = tool("c9");
-        let (_, full) = swapped.output_for("c9").unwrap();
-        full.push("a much longer replacement output\n");
+        let tail = swapped.output_for("c9").unwrap();
+        tail.full.push("a much longer replacement output\n");
         transcript.replace(1, swapped);
         assert_eq!(transcript.full_output_bytes, 68);
         assert_eq!(transcript.full_output_bytes, recounted(&transcript));

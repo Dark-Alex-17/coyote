@@ -285,16 +285,19 @@ fn a_newline_free_tool_stream_keeps_a_bounded_tail() {
         Some("c1".to_string()),
         "tail-m3z".as_bytes(),
     );
-    let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
+    let Some(Cell::Text { tail, .. }) = harness.app.transcript.cells().last() else {
         panic!("the tool output did not land in a text cell");
     };
-    assert_eq!(lines.len(), 1);
-    assert_eq!(lines[0].len(), LATE_OUTPUT_LIMIT);
+    assert_eq!(tail.lines.len(), 1);
+    assert_eq!(tail.lines[0].len(), LATE_OUTPUT_LIMIT);
     assert!(
-        lines[0].ends_with("tail-m3z"),
+        tail.lines[0].ends_with("tail-m3z"),
         "the newest text was dropped"
     );
-    assert!(!lines[0].contains("head-m3z"), "the oldest text was kept");
+    assert!(
+        !tail.lines[0].contains("head-m3z"),
+        "the oldest text was kept"
+    );
 }
 
 #[test]
@@ -1220,10 +1223,10 @@ fn out_of_turn_tool_output_shares_one_bounded_cell() {
         b"second-q7k\n",
     );
     assert_eq!(harness.app.transcript.len(), cells_before + 1);
-    let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
+    let Some(Cell::Text { tail, .. }) = harness.app.transcript.cells().last() else {
         panic!("the output did not land in a text cell");
     };
-    assert_eq!(lines, &["first-q7k", "second-q7k"]);
+    assert_eq!(tail.lines, ["first-q7k", "second-q7k"]);
 
     let line = format!("{}\n", "z".repeat(LATE_OUTPUT_LIMIT / 4));
     for _ in 0..12 {
@@ -1235,13 +1238,13 @@ fn out_of_turn_tool_output_shares_one_bounded_cell() {
         );
     }
     assert_eq!(harness.app.transcript.len(), cells_before + 1);
-    let Some(Cell::Text { lines, .. }) = harness.app.transcript.cells().last() else {
+    let Some(Cell::Text { tail, .. }) = harness.app.transcript.cells().last() else {
         panic!("the output did not stay in its text cell");
     };
-    let total: usize = lines.iter().map(|line| line.len() + 1).sum();
+    let total: usize = tail.lines.iter().map(|line| line.len() + 1).sum();
     assert!(total <= LATE_OUTPUT_LIMIT, "{total} bytes kept");
     assert!(
-        !lines.iter().any(|line| line.contains("q7k")),
+        !tail.lines.iter().any(|line| line.contains("q7k")),
         "the oldest lines were kept"
     );
 }
@@ -1611,7 +1614,7 @@ fn a_stream_survives_a_cell_pushed_between_deltas() {
     ));
     assert!(matches!(
         &cells[2],
-        Cell::Text { call_id: None, lines, .. } if lines == &["job noise"]
+        Cell::Text { call_id: None, tail, .. } if tail.lines == ["job noise"]
     ));
     harness.app.handle_msg(UiMsg::StreamDone);
     assert!(matches!(
@@ -1727,11 +1730,11 @@ fn anonymous_tool_output_never_joins_an_older_turn() {
     assert_eq!(harness.app.transcript.len(), cells_after_first + 2);
     assert!(matches!(
         harness.app.transcript.cells().last(),
-        Some(Cell::Text { call_id: None, lines, .. }) if lines == &["second turn"]
+        Some(Cell::Text { call_id: None, tail, .. }) if tail.lines == ["second turn"]
     ));
     assert!(matches!(
         &harness.app.transcript.cells()[1],
-        Cell::Text { lines, .. } if lines == &["first turn"]
+        Cell::Text { tail, .. } if tail.lines == ["first turn"]
     ));
 }
 
@@ -1987,14 +1990,14 @@ fn a_job_takes_its_start_calls_row_and_folds_the_checks_in() {
 
     let cells = harness.app.transcript.cells();
     assert_eq!(cells.len(), 2, "one user cell and one job row");
-    let Cell::Job { status, calls, .. } = &cells[1] else {
+    let Cell::Job { row, .. } = &cells[1] else {
         panic!("the job did not take the start call's row");
     };
-    assert_eq!(*status, JobStatus::Done);
-    let names: Vec<&str> = calls.iter().map(|call| call.name.as_str()).collect();
+    assert_eq!(row.status, JobStatus::Done);
+    let names: Vec<&str> = row.calls.iter().map(|call| call.name.as_str()).collect();
     assert_eq!(names, ["job__start", "job__check"]);
-    assert_eq!(calls[0].output, ["started"]);
-    assert_eq!(calls[1].output, ["still running"]);
+    assert_eq!(row.calls[0].tail.lines, ["started"]);
+    assert_eq!(row.calls[1].tail.lines, ["still running"]);
 
     let frame = harness.draw();
     insta::assert_snapshot!("job_row_80x24", &frame);
@@ -2050,12 +2053,12 @@ fn a_later_turns_check_on_a_job_lands_on_the_jobs_row() {
 
     let cells = harness.app.transcript.cells();
     assert_eq!(cells.len(), 4, "the check added only its user line");
-    let Cell::Job { calls, .. } = &cells[1] else {
+    let Cell::Job { row, .. } = &cells[1] else {
         panic!("the job row moved");
     };
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1].name, "job__check");
-    assert_eq!(calls[1].output, ["still running"]);
+    assert_eq!(row.calls.len(), 2);
+    assert_eq!(row.calls[1].name, "job__check");
+    assert_eq!(row.calls[1].tail.lines, ["still running"]);
     assert!(matches!(&cells[3], Cell::User { .. }));
 }
 
@@ -2094,11 +2097,11 @@ fn an_agent_takes_its_spawn_calls_row_and_folds_the_collect_in() {
 
     let cells = harness.app.transcript.cells();
     assert_eq!(cells.len(), 2, "one user cell and one agent row");
-    let Cell::Agent { status, calls, .. } = &cells[1] else {
+    let Cell::Agent { row, .. } = &cells[1] else {
         panic!("the agent did not take the spawn call's row");
     };
-    assert_eq!(*status, AgentStatus::Completed);
-    let names: Vec<&str> = calls.iter().map(|call| call.name.as_str()).collect();
+    assert_eq!(row.status, AgentStatus::Completed);
+    let names: Vec<&str> = row.calls.iter().map(|call| call.name.as_str()).collect();
     assert_eq!(names, ["agent__spawn", "agent__collect"]);
 
     let frame = harness.draw();
@@ -2167,11 +2170,11 @@ fn tool_output_routes_by_call_id_past_newer_rows() {
     let cells = harness.app.transcript.cells();
     assert!(matches!(
         &cells[1],
-        Cell::Tool { call_id, output, .. } if call_id == "call-1" && output == &["from a"]
+        Cell::Tool { call_id, tail, .. } if call_id == "call-1" && tail.lines == ["from a"]
     ));
     assert!(matches!(
         &cells[2],
-        Cell::Tool { call_id, output, .. } if call_id == "call-2" && output == &["from b"]
+        Cell::Tool { call_id, tail, .. } if call_id == "call-2" && tail.lines == ["from b"]
     ));
 }
 
@@ -2198,14 +2201,11 @@ fn tool_output_split_mid_character_decodes_whole() {
             bytes: chunk.to_vec(),
         });
     }
-    let Some(Cell::Tool {
-        output, pending, ..
-    }) = harness.app.transcript.cells().get(1)
-    else {
+    let Some(Cell::Tool { tail, .. }) = harness.app.transcript.cells().get(1) else {
         panic!("the tool row is gone");
     };
-    assert_eq!(output, &["caf\u{e9}", "\u{FFFD}"]);
-    assert!(pending.is_empty());
+    assert_eq!(tail.lines, ["caf\u{e9}", "\u{FFFD}"]);
+    assert!(tail.pending.is_empty());
 }
 
 /// A model that names no call id leaves the hooks with an empty one;
@@ -2261,13 +2261,13 @@ fn anonymous_tool_output_lands_in_the_newest_running_anonymous_row() {
     assert_eq!(cells.len(), 3, "the output took no cell of its own");
     assert!(matches!(
         &cells[1],
-        Cell::Tool { name, output, status: ToolStatus::Running { .. }, .. }
-            if name == "fs_read" && output == &["from read", "late read"]
+        Cell::Tool { name, tail, status: ToolStatus::Running { .. }, .. }
+            if name == "fs_read" && tail.lines == ["from read", "late read"]
     ));
     assert!(matches!(
         &cells[2],
-        Cell::Tool { name, output, status: ToolStatus::Ok { .. }, .. }
-            if name == "fs_write" && output == &["from write"]
+        Cell::Tool { name, tail, status: ToolStatus::Ok { .. }, .. }
+            if name == "fs_write" && tail.lines == ["from write"]
     ));
 }
 
@@ -2293,10 +2293,10 @@ fn anonymous_tool_output_follows_its_call_into_a_job_row() {
     });
     let cells = harness.app.transcript.cells();
     assert_eq!(cells.len(), 2, "the output took no cell of its own");
-    let Cell::Job { calls, .. } = &cells[1] else {
+    let Cell::Job { row, .. } = &cells[1] else {
         panic!("the job did not take the start call's row");
     };
-    assert_eq!(calls[0].output, ["started"]);
+    assert_eq!(row.calls[0].tail.lines, ["started"]);
 }
 
 /// Output without an id that arrives after the job has finished is
@@ -2326,19 +2326,20 @@ fn anonymous_tool_output_never_joins_a_finished_job_row() {
         bytes: b"late\n".to_vec(),
     });
     let cells = harness.app.transcript.cells();
-    let Cell::Job { calls, .. } = &cells[1] else {
+    let Cell::Job { row, .. } = &cells[1] else {
         panic!("the job did not take the start call's row");
     };
-    assert!(calls[0].output.is_empty(), "{:?}", calls[0].output);
+    let lines = &row.calls[0].tail.lines;
+    assert!(lines.is_empty(), "{lines:?}");
     let Some(Cell::Text {
         call_id: None,
-        lines,
+        tail,
         ..
     }) = cells.last()
     else {
         panic!("the late output took no cell of its own");
     };
-    assert_eq!(lines, &["late"]);
+    assert_eq!(tail.lines, ["late"]);
 }
 
 #[test]
@@ -2367,14 +2368,20 @@ fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
     assert!(matches!(
         &cells[1],
         Cell::Job {
-            status: JobStatus::Running,
+            row: TaskRow {
+                status: JobStatus::Running,
+                ..
+            },
             ..
         }
     ));
     assert!(matches!(
         &cells[2],
         Cell::Agent {
-            status: AgentStatus::Running,
+            row: TaskRow {
+                status: AgentStatus::Running,
+                ..
+            },
             ..
         }
     ));
@@ -2385,7 +2392,10 @@ fn an_end_for_an_unknown_job_or_agent_changes_nothing() {
     assert!(matches!(
         &harness.app.transcript.cells()[1],
         Cell::Job {
-            status: JobStatus::Cancelled,
+            row: TaskRow {
+                status: JobStatus::Cancelled,
+                ..
+            },
             ..
         }
     ));
@@ -4182,10 +4192,10 @@ fn ctrl_t_shows_a_tools_whole_output_and_q_closes_it() {
     tool_output(&mut harness, "call-1", &output);
     finish_tool(&mut harness, "call-1", true, None);
     harness.app.end_turn(false, &TurnOutcome::default());
-    let Some(Cell::Tool { output: tail, .. }) = harness.app.transcript.cells().get(1) else {
+    let Some(Cell::Tool { tail, .. }) = harness.app.transcript.cells().get(1) else {
         panic!("the tool row is gone");
     };
-    assert_eq!(tail.first().map(String::as_str), Some("count 11"));
+    assert_eq!(tail.lines.first().map(String::as_str), Some("count 11"));
     let before = harness.draw();
 
     press_ctrl(&mut harness, 't');

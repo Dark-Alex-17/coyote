@@ -959,7 +959,7 @@ mod tests {
     use crate::config::child_sessions::ChildStatus;
     use crate::tui::TOOL_OUTPUT_TAIL;
     use crate::tui::cells::{
-        AgentStatus, FoldedCall, JobStatus, LineCache, ToolStatus, append_output,
+        AgentStatus, FoldedCall, JobStatus, LineCache, TaskRow, ToolStatus, append_output,
     };
     use crate::tui::transcript::Transcript;
     use chrono::{TimeZone, Utc};
@@ -997,8 +997,9 @@ mod tests {
             Instant::now(),
         );
         let output: String = (1..=lines).map(|n| format!("line {n:03}\n")).collect();
-        let (target, full) = cell.output_for("c1").unwrap();
-        full.push(&append_output(target, output.as_bytes()));
+        let tail = cell.output_for("c1").unwrap();
+        let text = append_output(tail, output.as_bytes());
+        tail.full.push(&text);
         let Cell::Tool { status, .. } = &mut cell else {
             unreachable!();
         };
@@ -1374,8 +1375,8 @@ mod tests {
     fn folded(call_id: &str, name: &str, label: &str, lines: usize) -> FoldedCall {
         let mut call = FoldedCall::new(call_id.to_string(), name.to_string());
         let output: String = (1..=lines).map(|n| format!("{label} {n:02}\n")).collect();
-        let target = (&mut call.output, &mut call.open_line, &mut call.pending);
-        call.full.push(&append_output(target, output.as_bytes()));
+        let text = append_output(&mut call.tail, output.as_bytes());
+        call.tail.full.push(&text);
         call
     }
 
@@ -1390,22 +1391,24 @@ mod tests {
             Cell::Job {
                 job_id: "job_0a1b2c3d".to_string(),
                 tool: "execute_command".to_string(),
-                status: JobStatus::Failed(
-                    "exit status 2\nstderr: no space left\nwhile writing out.bin".to_string(),
-                ),
-                calls: vec![folded("c1", "job__check", "job", lines)],
-                expanded: false,
+                row: TaskRow {
+                    calls: vec![folded("c1", "job__check", "job", lines)],
+                    ..TaskRow::new(JobStatus::Failed(
+                        "exit status 2\nstderr: no space left\nwhile writing out.bin".to_string(),
+                    ))
+                },
                 cache: LineCache::default(),
             },
             Cell::Agent {
                 agent_id: "agent_reviewer_4e5f6a7b".to_string(),
                 name: "reviewer".to_string(),
-                status: AgentStatus::Completed,
-                calls: vec![
-                    folded("c2", "agent__check", "progress", lines),
-                    folded("c3", "agent__collect", "verdict", 2),
-                ],
-                expanded: false,
+                row: TaskRow {
+                    calls: vec![
+                        folded("c2", "agent__check", "progress", lines),
+                        folded("c3", "agent__collect", "verdict", 2),
+                    ],
+                    ..TaskRow::new(AgentStatus::Completed)
+                },
                 cache: LineCache::default(),
             },
         ];

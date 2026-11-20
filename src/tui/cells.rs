@@ -329,10 +329,7 @@ pub(super) enum AgentStatus {
 pub(super) struct FoldedCall {
     pub(super) call_id: String,
     pub(super) name: String,
-    pub(super) output: Vec<String>,
-    pub(super) open_line: bool,
-    pub(super) pending: Vec<u8>,
-    pub(super) full: FullOutput,
+    pub(super) tail: OutputTail,
 }
 
 impl FoldedCall {
@@ -340,10 +337,37 @@ impl FoldedCall {
         Self {
             call_id,
             name,
-            output: Vec::new(),
-            open_line: false,
-            pending: Vec::new(),
-            full: FullOutput::default(),
+            tail: OutputTail::default(),
+        }
+    }
+}
+
+/// What a call printed: the tail of lines its row shows, whether the
+/// last of them is still open, the bytes of a character the last read
+/// cut in two, and everything, for the pager.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct OutputTail {
+    pub(super) lines: Vec<String>,
+    pub(super) open_line: bool,
+    pub(super) pending: Vec<u8>,
+    pub(super) full: FullOutput,
+}
+
+/// What a job's row and an agent's row both hold: the task's state, the
+/// calls folded into the row, and whether the row is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TaskRow<S> {
+    pub(super) status: S,
+    pub(super) calls: Vec<FoldedCall>,
+    pub(super) expanded: bool,
+}
+
+impl<S> TaskRow<S> {
+    pub(super) fn new(status: S) -> Self {
+        Self {
+            status,
+            calls: Vec::new(),
+            expanded: false,
         }
     }
 }
@@ -415,13 +439,10 @@ pub(super) enum Cell {
     },
     /// Dim lines: tool output that belongs to no tool row, such as a
     /// background job still writing after its turn ended. The cell keeps
-    /// a tail like a tool row does; `full` is everything, for the pager.
+    /// a tail like a tool row does.
     Text {
         call_id: Option<String>,
-        lines: Vec<String>,
-        open_line: bool,
-        pending: Vec<u8>,
-        full: FullOutput,
+        tail: OutputTail,
         cache: LineCache,
     },
     /// A tool call: a one-line `name(args)` header, then the narration
@@ -437,10 +458,7 @@ pub(super) enum Cell {
         args: String,
         summary: String,
         status: ToolStatus,
-        output: Vec<String>,
-        open_line: bool,
-        pending: Vec<u8>,
-        full: FullOutput,
+        tail: OutputTail,
         expanded: bool,
         bookkeeping: bool,
         cache: LineCache,
@@ -448,17 +466,13 @@ pub(super) enum Cell {
     Job {
         job_id: String,
         tool: String,
-        status: JobStatus,
-        calls: Vec<FoldedCall>,
-        expanded: bool,
+        row: TaskRow<JobStatus>,
         cache: LineCache,
     },
     Agent {
         agent_id: String,
         name: String,
-        status: AgentStatus,
-        calls: Vec<FoldedCall>,
-        expanded: bool,
+        row: TaskRow<AgentStatus>,
         cache: LineCache,
     },
     /// The boxed greeting an empty transcript shows until a line is
@@ -597,10 +611,7 @@ impl Cell {
             args: short_args(&args),
             summary,
             status: ToolStatus::Running { since },
-            output: Vec::new(),
-            open_line: false,
-            pending: Vec::new(),
-            full: FullOutput::default(),
+            tail: OutputTail::default(),
             expanded: false,
             bookkeeping,
             cache: LineCache::default(),
@@ -633,10 +644,14 @@ impl Cell {
                 ..
             }
             | Cell::Job {
-                expanded, cache, ..
+                row: TaskRow { expanded, .. },
+                cache,
+                ..
             }
             | Cell::Agent {
-                expanded, cache, ..
+                row: TaskRow { expanded, .. },
+                cache,
+                ..
             } => {
                 *expanded = !*expanded;
                 *cache = LineCache::default();
@@ -645,32 +660,25 @@ impl Cell {
         }
     }
 
-    /// Where the output of call `call_id` goes: this tool row's own
-    /// lines and whole output, or those of the call folded into this job
-    /// or agent row.
-    pub(super) fn output_for(
-        &mut self,
-        call_id: &str,
-    ) -> Option<(OutputTarget<'_>, &mut FullOutput)> {
+    /// Where the output of call `call_id` goes: this tool row's own tail,
+    /// or that of the call folded into this job or agent row.
+    pub(super) fn output_for(&mut self, call_id: &str) -> Option<&mut OutputTail> {
         match self {
             Cell::Tool {
-                call_id: id,
-                output,
-                open_line,
-                pending,
-                full,
+                call_id: id, tail, ..
+            } if id == call_id => Some(tail),
+            Cell::Job {
+                row: TaskRow { calls, .. },
                 ..
-            } if id == call_id => Some(((output, open_line, pending), full)),
-            Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
-                let call = calls
-                    .iter_mut()
-                    .rev()
-                    .find(|call| call.call_id == call_id)?;
-                Some((
-                    (&mut call.output, &mut call.open_line, &mut call.pending),
-                    &mut call.full,
-                ))
             }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            } => calls
+                .iter_mut()
+                .rev()
+                .find(|call| call.call_id == call_id)
+                .map(|call| &mut call.tail),
             _ => None,
         }
     }
@@ -679,9 +687,14 @@ impl Cell {
     pub(super) fn takes_output_of(&self, call_id: &str) -> bool {
         match self {
             Cell::Tool { call_id: id, .. } => id == call_id,
-            Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
-                calls.iter().any(|call| call.call_id == call_id)
+            Cell::Job {
+                row: TaskRow { calls, .. },
+                ..
             }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            } => calls.iter().any(|call| call.call_id == call_id),
             _ => false,
         }
     }
@@ -689,10 +702,15 @@ impl Cell {
     /// Every whole-output buffer the cell holds, oldest call first.
     fn full_outputs(&mut self) -> Vec<&mut FullOutput> {
         match self {
-            Cell::Tool { full, .. } | Cell::Text { full, .. } => vec![full],
-            Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
-                calls.iter_mut().map(|call| &mut call.full).collect()
+            Cell::Tool { tail, .. } | Cell::Text { tail, .. } => vec![&mut tail.full],
+            Cell::Job {
+                row: TaskRow { calls, .. },
+                ..
             }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            } => calls.iter_mut().map(|call| &mut call.tail.full).collect(),
             _ => Vec::new(),
         }
     }
@@ -700,10 +718,15 @@ impl Cell {
     /// The bytes every whole-output buffer of the cell keeps.
     pub(super) fn full_output_bytes(&self) -> usize {
         match self {
-            Cell::Tool { full, .. } | Cell::Text { full, .. } => full.text.len(),
-            Cell::Job { calls, .. } | Cell::Agent { calls, .. } => {
-                calls.iter().map(|call| call.full.text.len()).sum()
+            Cell::Tool { tail, .. } | Cell::Text { tail, .. } => tail.full.text.len(),
+            Cell::Job {
+                row: TaskRow { calls, .. },
+                ..
             }
+            | Cell::Agent {
+                row: TaskRow { calls, .. },
+                ..
+            } => calls.iter().map(|call| call.tail.full.text.len()).sum(),
             _ => 0,
         }
     }
@@ -814,15 +837,15 @@ impl Cell {
                 }
                 lines
             }),
-            Cell::Text { lines, cache, .. } => {
-                cache.get(width, || dim_wrapped(output_lines(lines), width))
+            Cell::Text { tail, cache, .. } => {
+                cache.get(width, || dim_wrapped(output_lines(&tail.lines), width))
             }
             Cell::Tool {
                 name,
                 args,
                 summary,
                 status,
-                output,
+                tail,
                 expanded,
                 bookkeeping,
                 cache,
@@ -844,7 +867,7 @@ impl Cell {
                     if let ToolStatus::Failed { error, .. } = status {
                         body.extend(render::preformatted_lines(error));
                     }
-                    body.extend(output_lines(output));
+                    body.extend(output_lines(&tail.lines));
                     lines.extend(dim_wrapped(body, width));
                 }
                 lines
@@ -852,30 +875,26 @@ impl Cell {
             Cell::Job {
                 job_id,
                 tool,
-                status,
-                calls,
-                expanded,
+                row,
                 cache,
             } => cache.get(width, || {
-                let (state, error) = job_state(status);
+                let (state, error) = job_state(&row.status);
                 let reserved = "job   ".len() + state.width();
                 let subject = fit_to_row(&format!("{tool} {job_id}"), reserved, width);
                 let header = format!("job {subject}  {state}");
-                row_lines(header, error, calls, *expanded, width)
+                row_lines(header, error, row, width)
             }),
             Cell::Agent {
                 agent_id,
                 name,
-                status,
-                calls,
-                expanded,
+                row,
                 cache,
             } => cache.get(width, || {
-                let (state, error) = agent_state(status);
+                let (state, error) = agent_state(&row.status);
                 let reserved = "agent   ".len() + state.width();
                 let subject = fit_to_row(&format!("{name} {agent_id}"), reserved, width);
                 let header = format!("agent {subject}  {state}");
-                row_lines(header, error, calls, *expanded, width)
+                row_lines(header, error, row, width)
             }),
             Cell::Welcome {
                 model,
@@ -890,8 +909,8 @@ impl Cell {
     /// all of a stray call's output. Every other cell reads as it does in
     /// the transcript.
     pub(super) fn full_lines(&mut self, width: u16, renderer: &mut Renderer) -> Vec<Line<'static>> {
-        if let Cell::Text { full, .. } = self {
-            return full.lines(width).to_vec();
+        if let Cell::Text { tail, .. } = self {
+            return tail.full.lines(width).to_vec();
         }
         let Some(header) = self.summary_line() else {
             return self.lines(width, renderer);
@@ -900,7 +919,7 @@ impl Cell {
             Cell::Tool {
                 summary,
                 status,
-                full,
+                tail,
                 ..
             } => {
                 let mut lines = render::plain_lines(&header, width, DIM);
@@ -909,14 +928,14 @@ impl Cell {
                     body.extend(render::preformatted_lines(error));
                 }
                 lines.extend(dim_wrapped(body, width));
-                lines.extend_from_slice(full.lines(width));
+                lines.extend_from_slice(tail.full.lines(width));
                 lines
             }
-            Cell::Job { status, calls, .. } => {
-                full_row_lines(&header, job_state(status).1, calls, width)
+            Cell::Job { row, .. } => {
+                full_row_lines(&header, job_state(&row.status).1, &mut row.calls, width)
             }
-            Cell::Agent { status, calls, .. } => {
-                full_row_lines(&header, agent_state(status).1, calls, width)
+            Cell::Agent { row, .. } => {
+                full_row_lines(&header, agent_state(&row.status).1, &mut row.calls, width)
             }
             _ => render::plain_lines(&header, width, DIM),
         }
@@ -930,24 +949,19 @@ impl Cell {
                 name, args, status, ..
             } => format!("{name}({args})  {}", tool_state(status)),
             Cell::Job {
-                job_id,
-                tool,
-                status,
-                calls,
-                ..
+                job_id, tool, row, ..
             } => with_folded(
-                format!("job {tool} {job_id}  {}", job_state(status).0),
-                calls,
+                format!("job {tool} {job_id}  {}", job_state(&row.status).0),
+                &row.calls,
             ),
             Cell::Agent {
                 agent_id,
                 name,
-                status,
-                calls,
+                row,
                 ..
             } => with_folded(
-                format!("agent {name} {agent_id}  {}", agent_state(status).0),
-                calls,
+                format!("agent {name} {agent_id}  {}", agent_state(&row.status).0),
+                &row.calls,
             ),
             _ => return None,
         };
@@ -1010,11 +1024,12 @@ fn full_row_lines(
         ));
     }
     for call in calls {
-        if call.full.text().is_empty() && call.full.dropped() == 0 {
+        let full = &mut call.tail.full;
+        if full.text().is_empty() && full.dropped() == 0 {
             continue;
         }
         lines.extend(render::plain_lines(&format!("{}:", call.name), width, DIM));
-        lines.extend_from_slice(call.full.lines(width));
+        lines.extend_from_slice(full.lines(width));
     }
     lines
 }
@@ -1045,22 +1060,21 @@ fn dim_wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 /// summarised, clipped by the view rather than wrapped; when open, the
 /// whole error and then each folded call's output. The header is the
 /// row's own text, so it is scrubbed rather than parsed for colour.
-fn row_lines(
+fn row_lines<S>(
     header: String,
     error: Option<&str>,
-    calls: &[FoldedCall],
-    expanded: bool,
+    row: &TaskRow<S>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let header = with_folded(header, calls);
+    let header = with_folded(header, &row.calls);
     let mut lines = vec![Line::from(Span::styled(render::plain_text(&header), DIM))];
-    if expanded {
+    if row.expanded {
         let mut body = Vec::new();
         if let Some(error) = error {
             body.extend(render::preformatted_lines(&format!("error: {error}")));
         }
-        for call in calls {
-            body.extend(output_lines(&call.output));
+        for call in &row.calls {
+            body.extend(output_lines(&call.tail.lines));
         }
         lines.extend(dim_wrapped(body, width));
     }
@@ -1175,10 +1189,6 @@ pub(super) fn welcome_lines(model: &str, prefix: CommandPrefix, width: u16) -> V
     lines
 }
 
-/// The lines a tool's output lands in, whether the last one is still
-/// open, and the bytes of a character the last read cut in two.
-pub(super) type OutputTarget<'a> = (&'a mut Vec<String>, &'a mut bool, &'a mut Vec<u8>);
-
 /// Decodes one read of a byte stream, carrying an incomplete trailing
 /// character over in `pending` so a sequence split across two reads
 /// still decodes. Only a sequence that can never complete becomes U+FFFD.
@@ -1213,11 +1223,18 @@ pub(super) fn push_utf8_chunk(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
     text
 }
 
-/// Appends one read of a tool's output to its lines. The read may end
-/// mid-line (`open_line`), in which case the next read continues it, or
+/// Appends one read of a tool's output to its tail's lines; the whole
+/// output is the caller's to push. The read may end mid-line
+/// (`open_line`), in which case the next read continues it, or
 /// mid-character (`pending`). The lines kept are bounded in count and in
 /// bytes, oldest dropped first. Returns the text the read decoded to.
-pub(super) fn append_output((lines, open_line, pending): OutputTarget<'_>, bytes: &[u8]) -> String {
+pub(super) fn append_output(tail: &mut OutputTail, bytes: &[u8]) -> String {
+    let OutputTail {
+        lines,
+        open_line,
+        pending,
+        ..
+    } = tail;
     let text = push_utf8_chunk(pending, bytes);
     if text.is_empty() {
         return text;
@@ -1350,14 +1367,15 @@ mod tests {
             .map(|n| FoldedCall::new(format!("c{n}"), "job__check".to_string()))
             .collect();
         for (n, call) in calls.iter_mut().enumerate() {
-            call.full.push(&format!("call {} out\n", n + 1));
+            call.tail.full.push(&format!("call {} out\n", n + 1));
         }
         let mut cell = Cell::Job {
             job_id: "job_0a1b2c3d".to_string(),
             tool: "execute_command".to_string(),
-            status: JobStatus::Running,
-            calls,
-            expanded: false,
+            row: TaskRow {
+                calls,
+                ..TaskRow::new(JobStatus::Running)
+            },
             cache: LineCache::default(),
         };
         let each = "call 1 out\n".len();
@@ -1696,17 +1714,16 @@ mod tests {
             Cell::Job {
                 job_id: "job-1".to_string(),
                 tool: "execute_command".to_string(),
-                status: JobStatus::Failed(error.clone()),
-                calls: vec![FoldedCall::new("c1".to_string(), "job__check".to_string())],
-                expanded: false,
+                row: TaskRow {
+                    calls: vec![FoldedCall::new("c1".to_string(), "job__check".to_string())],
+                    ..TaskRow::new(JobStatus::Failed(error.clone()))
+                },
                 cache: LineCache::default(),
             },
             Cell::Agent {
                 agent_id: "agent-1".to_string(),
                 name: "reviewer".to_string(),
-                status: AgentStatus::Failed(error.clone()),
-                calls: Vec::new(),
-                expanded: false,
+                row: TaskRow::new(AgentStatus::Failed(error.clone())),
                 cache: LineCache::default(),
             },
         ];
@@ -1756,8 +1773,9 @@ mod tests {
             "Call memory__search {\"query\":\"x\"}".to_string(),
             Instant::now(),
         );
-        let (target, full) = cell.output_for("c1").unwrap();
-        full.push(&append_output(target, b"remembered fact\n"));
+        let tail = cell.output_for("c1").unwrap();
+        let text = append_output(tail, b"remembered fact\n");
+        tail.full.push(&text);
         let inline: String = cell
             .lines(80, &mut renderer)
             .iter()
@@ -1801,16 +1819,14 @@ mod tests {
     /// replaced on the spot.
     #[test]
     fn output_reads_decode_across_a_split_character() {
-        let mut lines = Vec::new();
-        let mut open_line = false;
-        let mut pending = Vec::new();
-        append_output((&mut lines, &mut open_line, &mut pending), b"caf\xC3");
-        assert_eq!(lines, ["caf"]);
-        assert_eq!(pending, [0xC3]);
-        append_output((&mut lines, &mut open_line, &mut pending), b"\xA9\n");
-        assert_eq!(lines, ["caf\u{e9}"]);
-        assert!(pending.is_empty());
-        assert!(!open_line);
+        let mut tail = OutputTail::default();
+        append_output(&mut tail, b"caf\xC3");
+        assert_eq!(tail.lines, ["caf"]);
+        assert_eq!(tail.pending, [0xC3]);
+        append_output(&mut tail, b"\xA9\n");
+        assert_eq!(tail.lines, ["caf\u{e9}"]);
+        assert!(tail.pending.is_empty());
+        assert!(!tail.open_line);
 
         let mut pending = Vec::new();
         assert_eq!(push_utf8_chunk(&mut pending, b"a\xFFb"), "a\u{FFFD}b");
@@ -1825,30 +1841,26 @@ mod tests {
     /// line as it was; nothing has arrived to extend or close it.
     #[test]
     fn a_pending_only_read_keeps_the_line_open() {
-        let mut lines = Vec::new();
-        let mut open_line = false;
-        let mut pending = Vec::new();
-        append_output((&mut lines, &mut open_line, &mut pending), b"half");
-        assert!(open_line);
-        append_output((&mut lines, &mut open_line, &mut pending), b"\xF0\x9F");
-        assert!(open_line);
-        assert_eq!(lines, ["half"]);
-        append_output((&mut lines, &mut open_line, &mut pending), b"\x98\x80\n");
-        assert_eq!(lines, ["half\u{1F600}"]);
-        assert!(!open_line);
+        let mut tail = OutputTail::default();
+        append_output(&mut tail, b"half");
+        assert!(tail.open_line);
+        append_output(&mut tail, b"\xF0\x9F");
+        assert!(tail.open_line);
+        assert_eq!(tail.lines, ["half"]);
+        append_output(&mut tail, b"\x98\x80\n");
+        assert_eq!(tail.lines, ["half\u{1F600}"]);
+        assert!(!tail.open_line);
     }
 
     #[test]
     fn output_keeps_only_the_newest_tail_of_lines_in_order() {
-        let mut lines = Vec::new();
-        let mut open_line = false;
-        let mut pending = Vec::new();
+        let mut tail = OutputTail::default();
         for n in 0..25u8 {
             let line = format!("{}\n", char::from(b'a' + n));
-            append_output((&mut lines, &mut open_line, &mut pending), line.as_bytes());
+            append_output(&mut tail, line.as_bytes());
         }
-        assert_eq!(lines.len(), TOOL_OUTPUT_TAIL);
-        let kept: String = lines.concat();
+        assert_eq!(tail.lines.len(), TOOL_OUTPUT_TAIL);
+        let kept: String = tail.lines.concat();
         assert_eq!(
             kept, "fghijklmnopqrstuvwxy",
             "the oldest lines were not the ones dropped"

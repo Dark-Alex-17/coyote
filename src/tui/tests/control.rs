@@ -233,7 +233,10 @@ fn a_turn_ending_fails_its_unreported_tool_rows_and_spares_jobs() {
     assert!(matches!(
         &cells[2],
         Cell::Job {
-            status: JobStatus::Running,
+            row: TaskRow {
+                status: JobStatus::Running,
+                ..
+            },
             ..
         }
     ));
