@@ -334,6 +334,17 @@ strikeout to proceeding without the change. Proceeding without a strikeout's cha
 only in a subtask whose failed attempt was saved under its own strikeout ref; elsewhere, and
 when security blocks at the ceiling, the question is a hard trigger with nothing recommended.
 
+A `plan_defect` (the triage model marks an escalated finding `kind: plan_defect` when it says
+the plan or a criterion itself is impossible or contradictory) offers four options: amend the
+criterion in place, a fix round because the plan is not at fault (the stated fix, else the
+whole finding, goes to the coder), accept the defect unresolved and proceed (a follow-up), or
+stop. Amendments and fix rounds share one count; amending is recommended below
+`STRIKE_LIMIT` (3) and accepting from then on, and Stop is never recommended. A Stop pick whose
+own words say the plan is not defective is asked again. A default amendment (a bare or
+headless pick, which states none) takes the adversary's finding; when that finding names a
+backticked command the criteria do not quote whole, it is recorded as a follow-up note
+instead of being applied.
+
 A strikeout while the worktree holds earlier subtasks' uncommitted work saves the failed
 attempt as a commit under its own `refs/sisyphus-next/strikeout/` ref (never overwritten) and
 puts back only the paths it changed, index included; if that save fails, or elsewhere, it

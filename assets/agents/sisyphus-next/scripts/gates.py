@@ -2234,10 +2234,11 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
 
 _CONTINUE_WORD_RE = re.compile(r"\b(?:continue|treat|amendment|amended|proceed|advance)\b")
 _STOP_WORD_RE = re.compile(r"\b(?:stop|abort|halt|discontinue)")
-# a reply saying the plan is not at fault, read before its picked option: such a reply under Stop still means a fix
+# a Stop pick whose own words clear the plan contradicts itself, so it is asked again rather than taken
 _NOT_PLAN_DEFECT_RE = re.compile(r"\b(?:not|isn't)\s+a\s+plan\s+defect\b"
-                                 r"|\b(?:plan|criterion)\s+(?:is\s+not|isn't|was\s+not|wasn't)\s+defective\b"
-                                 r"|\b(?:plan|criterion)\s+is\s+fine\b", re.I)
+                                 r"|\b(?:plan|criterion|criteria)\s+(?:is|are|was|were)(?:\s+not|n't)\s+"
+                                 r"(?:defective|at\s+fault|the\s+(?:cause|problem))\b"
+                                 r"|\b(?:plan|criterion|criteria)\s+(?:is|are)\s+(?:fine|correct|sound)\b", re.I)
 
 
 def _says_not_plan_defect(answer):
@@ -2246,9 +2247,10 @@ def _says_not_plan_defect(answer):
 
 def _plan_criteria(state):
     """The criteria a plan_defect amendment would change: the current subtask's criteria and amendments in the
-    subtask phase, else spec_text."""
+    subtask phase, else spec_text, else (the final review) every subtask's."""
     if not _subtask_phase(state):
-        return state.get("spec_text") or ""
+        return (state.get("spec_text") or "").strip() or "\n".join(
+            str(c) for s in as_list(state.get("subtasks")) for c in as_list(_subtask_at([s], 0).get("acceptance_criteria")))
     s = _subtask_at(as_list(state.get("subtasks")), max(as_int(state.get("subtask_index")) - 1, 0))
     return "\n".join([str(c) for c in as_list(s.get("acceptance_criteria"))]
                      + [t for t, _ in map(_amendment, as_list(s.get("amendments")))])
@@ -2256,8 +2258,9 @@ def _plan_criteria(state):
 
 def _unlisted_commands(text, criteria):
     """The backticked commands in `text` (two words or more, as _declares_gate reads a command) that `criteria` does
-    not quote verbatim."""
-    return [c for c in re.findall(r"`([^`\n]+)`", text or "") if len(c.split()) >= 2 and c.strip() not in criteria]
+    not quote verbatim as a whole command."""
+    return [c for c in re.findall(r"`([^`\n]+)`", text or "") if len(c.split()) >= 2
+            and not re.search(r"(?<![^\s`])" + re.escape(c.strip()) + r"(?![^\s`])", criteria or "")]
 
 
 def _says_continue(said):
@@ -2501,14 +2504,14 @@ def apply_answer(state):
         a = "continue" if _says_continue(said) and not leads_stop else "stop"
         used = as_int(state.get("plan_defect_continues"))
         reason = _stated_reason(answer, options)
-        if named == PLAN_DEFECT_ACCEPT or (not named and said.startswith("accept")):
+        if named == PLAN_DEFECT_ACCEPT:
             why = (esc.get("evidence") or "(no finding recorded)") if reason == NO_STATED_REASON else reason
             u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [
                 f"Plan defect accepted unresolved at the user's say-so: {why}"]
             ledger(state, u, f"plan defect: accepted unresolved after {used}/{STRIKE_LIMIT} continues: "
                              f"{tail(why, 300)}")
             u["_next"] = "next_subtask" if _subtask_phase(state) else "observability_gate"
-        elif named == PLAN_DEFECT_FIX or (named in (None, PLAN_DEFECT_STOP) and _says_not_plan_defect(answer)):
+        elif named == PLAN_DEFECT_FIX:
             # the fix is the stated one, else the adversary's finding whole: a trimmed finding can lose its command
             fix = (esc.get("evidence") or "(no finding recorded)") if reason == NO_STATED_REASON else reason
             u.update({"plan_defect_continues": used + 1, "fix_source": "plan_defect_fix", "fix_note": fix})
@@ -2516,6 +2519,8 @@ def apply_answer(state):
                              + (", past the cap at the user's pick" if used + 1 > STRIKE_LIMIT else "")
                              + f"): {tail(fix, 300)}")
             u["_next"] = "compose_fix"
+        elif named in (None, PLAN_DEFECT_STOP) and _says_not_plan_defect(answer):
+            _reask_unmatched(state, u, esc, answer, f"says the plan is not defective, which {PLAN_DEFECT_FIX!r} covers")
         elif not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
             _reask_unmatched(state, u, esc, answer, "says neither stop nor continue")
         elif a == "continue":
@@ -2531,24 +2536,22 @@ def apply_answer(state):
             else:
                 author = "navigator" if state.get("answer_source") == "navigator" else "user"
             tag = AMENDMENT_AUTHORS[author][1]
-            entry = ("plan note (default, not applied: it names a command the criteria do not)" if unlisted
-                     else f"plan amendment ({tag})")
-            if _subtask_phase(state):
+            if unlisted:
+                note = f"Plan note (a default amendment, not applied: it names a command the criteria do not): {answer}"
+                u["follow_ups"] = list(as_list(state.get("follow_ups"))) + [note]
+                ledger(state, u, note)
+            elif _subtask_phase(state):
                 # the adversary judged the current subtask's criterion, so the amendment belongs to that subtask
                 subtasks = [dict(_subtask_at(as_list(state.get("subtasks")), i)) for i in range(len(as_list(state.get("subtasks"))))]
                 cur = max(as_int(state.get("subtask_index")) - 1, 0)
-                if unlisted:
-                    subtasks[cur]["notes"] = list(as_list(subtasks[cur].get("notes"))) + [answer]
-                else:
-                    subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [
-                        {"text": answer, "author": author}]
+                subtasks[cur]["amendments"] = list(as_list(subtasks[cur].get("amendments"))) + [
+                    {"text": answer, "author": author}]
                 _seal_subtasks(state, subtasks)
                 u["subtasks"] = subtasks
-                ledger(state, u, f"{entry} to subtask {cur + 1}: {answer}")
+                ledger(state, u, f"plan amendment ({tag}) to subtask {cur + 1}: {answer}")
             else:
-                if not unlisted:
-                    u["spec_text"] = (state.get("spec_text") or "") + "\n\n" + _amended_line(answer, author)
-                ledger(state, u, f"{entry}: {answer}")
+                u["spec_text"] = (state.get("spec_text") or "") + "\n\n" + _amended_line(answer, author)
+                ledger(state, u, f"plan amendment ({tag}): {answer}")
             u["_next"] = "build_gauntlet_prompt"
         else:
             u["failure_reason"] = f"the plan itself is the root cause of a conformance failure; the user chose to stop: {answer}"
@@ -3214,8 +3217,8 @@ def compose_fix(state):
     elif src == "probe_gap":
         lines += ["Provide the local-run recipe / fixture the usage probe needs, as the user described:", note]
     elif src == "plan_defect_fix":
-        lines += ["The adversary reported the plan as the root cause, but the plan stands: the code is at fault. "
-                  "Fix it as follows, keeping every acceptance criterion as written:", note]
+        lines += ["The adversary reported the plan as the root cause; the reply ruled the plan is not at fault. Keep "
+                  "every acceptance criterion as written and make this change:", note]
     elif src == "ci":
         lines += ["CI is red on the PR. Fix the failure below (evidence pack verbatim):", state.get("ci_evidence") or ""]
         if (state.get("ci_diagnosis") or "").strip():
@@ -3894,11 +3897,12 @@ def build_gauntlet_prompt(state):
         # above the plan block, so the gauntlet never reads it as an acceptance criterion
         lines.append(f"Probe-written tests adopted into the change under review (written in review round "
                      f"{_rounds_of(due)}; review them as part of the change): {_paths_of(due)}")
-    written = _probe_tests_in_tree(state, root, {str(d.get("path")) for d in due})
+    written = _probe_tests_in_tree(state, root, base, {str(d.get("path")) for d in due})
     if written:
         lines.append(f"Probe-written tests in the change under review (written by this review's probe lane in round "
                      f"{_rounds_of(written)}; part of the change, not leftover files): {_paths_of(written)}")
-    if _code_tree_dirty(state, root):
+    tree_dirty = _code_tree_dirty(state, root)
+    if tree_dirty:
         # lanes otherwise read a red clean-tree command as a regression of the code
         lines.append("Tree state: the change under review is uncommitted in the worktree until it is published"
                      + (", probe-written tests included" if written or adopting else "")
@@ -3955,7 +3959,7 @@ def build_gauntlet_prompt(state):
         if prior:
             lines += ["Prior review decisions:"] + [f"- {p}" for p in prior]
         last = rounds[-1] if isinstance(rounds[-1], dict) else {}
-        dirty = _code_tree_dirty(state, root)
+        dirty = tree_dirty
         if full:
             ledger(state, u, f"gauntlet: round {n} runs the full gauntlet after the pipeline escalation: no re-review "
                              "delta or settled lanes")
@@ -4386,6 +4390,10 @@ def triage_route(state):
     if escalations:
         e = escalations[0]
         kind = e.get("kind") if e.get("kind") in ("plan_defect", "probe_gap") else "yellow_findings"
+        if e.get("kind") not in ("plan_defect", "probe_gap", "finding") \
+                and _lane_of(e, str(e.get("finding", ""))) == "adversary":
+            ledger(state, u, f"triage: an escalated adversary finding carries no known kind ({e.get('kind')!r}); "
+                             f"asked as a review warning: {tail(str(e.get('finding', '')), 200)}")
         if kind == "probe_gap":
             esc = escalation("probe_gap", "The usage probe is INCONCLUSIVE: the environment, not the code, blocks it. "
                                           "Supply the missing recipe/fixture/mock and re-run, or surface the gap?",
@@ -4505,8 +4513,9 @@ def _rounds_of(entries):
     return ", ".join(str(r) for r in dict.fromkeys(as_dict(e).get("round") for e in entries))
 
 
-def _probe_tests_in_tree(state, root, skip=()):
-    """The probe-written tests (latest round per path) still in the worktree and not committed, minus `skip`."""
+def _probe_tests_in_tree(state, root, base, skip=()):
+    """The probe-written tests (latest round per path) in the worktree that differ from `base` (else from HEAD),
+    minus `skip`: an earlier subtask's tests are already in that subtask's snapshot base."""
     latest = {}
     for t in as_list(state.get("probe_tests")):
         path = str(as_dict(t).get("path") or "")
@@ -4514,8 +4523,13 @@ def _probe_tests_in_tree(state, root, skip=()):
             latest[path] = as_dict(t)
     if not latest:
         return []
-    code, out, _ = git(root, "status", "--porcelain", "-z", "--untracked-files=all", "--", *_literal(latest))
-    dirty = {e[3:] for e in out.split("\0") if len(e) > 3} if code == 0 else set()
+    tree = _worktree_tree(root) if base else ""
+    code, out, _ = (git(root, "diff-tree", "-r", "-z", "--name-only", base, tree, "--", *_literal(latest)) if tree
+                    else (1, "", ""))
+    dirty = set(_nul_names(out)) if code == 0 else None
+    if dirty is None:
+        code, out, _ = git(root, "status", "--porcelain", "-z", "--untracked-files=all", "--", *_literal(latest))
+        dirty = {e[3:] for e in out.split("\0") if len(e) > 3} if code == 0 else set()
     return [latest[p] for p in latest if p in dirty and os.path.exists(os.path.join(root, p))]
 
 
