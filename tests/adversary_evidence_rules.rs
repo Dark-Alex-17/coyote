@@ -2,13 +2,12 @@
 //! criteria met by inspection, red verification runs compared with a
 //! baseline run on the diff base or rerun on a snapshot of a dirty tree, red
 //! runs judged by the pass condition their criterion states, the run_checks
-//! deadline starting after the
-//! review-stack lock, holistic complaint severity plus the criterion
-//! format-failure fallback, the diff base and repository facts diff_facts.py
-//! records, execution criteria no recorded run covers, and replays of two
-//! recorded reviews' deterministic evidence. Each test spawns the real script
-//! with a JSON state file and skips when python3 (or bash and git, where
-//! needed) is missing.
+//! deadline starting after the review-stack lock, holistic complaint severity
+//! plus the criterion format-failure fallback, the diff base and repository
+//! facts diff_facts.py records, execution criteria no recorded run covers,
+//! and replays of two recorded reviews' deterministic evidence. Each test
+//! spawns the real script with a JSON state file and skips when python3 (or
+//! bash and git, where needed) is missing.
 
 use serde_json::{Value, json};
 use std::env;
@@ -1935,14 +1934,14 @@ fn a_full_target_criterion_covered_by_a_partial_run_conforms_only_with_that_gree
     );
 }
 
-/// A criterion verdict with `status`, carrying evidence when met and a
-/// complaint otherwise.
+/// A criterion verdict with `status`, carrying evidence when met or
+/// inspected and a complaint otherwise.
 fn judged(id: &str, text: &str, status: &str) -> Value {
-    let met = status == "MET";
+    let met = matches!(status, "MET" | "INSPECTED");
     json!({"id": id, "text": text, "status": status,
            "evidence": if met { format!("{id} holds: lib/report.src:3") } else { String::new() },
            "complaint": if met { String::new() } else { format!("{id} fails at lib/report.src:3") },
-           "no_test_reason": ""})
+           "no_test_reason": if status == "INSPECTED" { "no test observes the source text" } else { "" }})
 }
 
 /// A verdict state over parsed `criteria` (id, text, final status) and the
@@ -1975,46 +1974,133 @@ const TYPE_GREP: &str = "grep -Eiw 'REAL|FLOAT|DOUBLE|NUMERIC' schema/0003_items
 const FLOAT_GREP: &str = "grep -nE 'float32|float64' lib/a.src lib/b.src";
 
 /// An absence grep exits 1 when its criterion holds and 2 on a base where the
-/// file does not exist yet: the red run follows its criterion's verdict.
+/// file does not exist yet: the red run follows its criterion's verdict, and
+/// so does a command whose criterion states exit 1.
 #[test]
 fn a_red_run_whose_criterion_states_no_output_blocks_only_when_that_criterion_is_unmet() {
     if missing(&["python3"]) {
         return;
     }
     let dir = fixture_dir("stated-no-output");
-    let c6 = format!("`{TYPE_GREP}` prints nothing");
-    let exec = json!([
-        green("sh test.sh"),
-        red(TYPE_GREP, 1, "", 2, "exit 1 here but 2 on the diff base"),
-    ]);
-    let met_state = judged_state(
-        &[("c1", "`sh test.sh` passes", "MET"), ("c6", &c6, "MET")],
-        exec.clone(),
-    );
-    let text = report(&dir.0, "stated-met", &met_state);
-    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
-    assert!(
-        text.contains(&format!(
-            "Advisory red runs (not blocking):\n- `{TYPE_GREP}` -- exit 1 -- c6 MET: c6 holds: \
-             lib/report.src:3 -- baseline on the diff base: regression, base exit 2"
-        )),
-        "{text}"
-    );
+    let stated = [
+        (
+            TYPE_GREP.to_string(),
+            format!("`{TYPE_GREP}` prints nothing"),
+        ),
+        (
+            "test -e build/tmp".to_string(),
+            "`test -e build/tmp` exits 1 (the file is absent)".to_string(),
+        ),
+        (
+            "sh probe.sh".to_string(),
+            "`sh probe.sh` exits 1".to_string(),
+        ),
+    ];
+    for (cmd, c6) in &stated {
+        let exec = json!([
+            green("sh test.sh"),
+            red(cmd, 1, "", 2, "exit 1 here but 2 on the diff base"),
+        ]);
+        for status in ["MET", "INSPECTED"] {
+            let state = judged_state(
+                &[("c1", "`sh test.sh` passes", "MET"), ("c6", c6, status)],
+                exec.clone(),
+            );
+            let text = report(&dir.0, "stated-met", &state);
+            assert!(
+                text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"),
+                "{cmd} {status}: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Advisory red runs (not blocking):\n- `{cmd}` -- exit 1 -- c6 {status}: c6 \
+                     holds: lib/report.src:3 -- baseline on the diff base: regression, base exit 2"
+                )),
+                "{cmd} {status}: {text}"
+            );
+        }
+        for status in ["PARTIAL", "UNMET", "no verdict"] {
+            let mut state = judged_state(
+                &[("c1", "`sh test.sh` passes", "MET"), ("c6", c6, status)],
+                exec.clone(),
+            );
+            if status == "no verdict" {
+                state["crit_verdicts"] = json!([state["crit_verdicts"][0].clone()]);
+            }
+            let text = report(&dir.0, "stated-unmet", &state);
+            assert!(
+                text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+                "{cmd} {status}: {text}"
+            );
+            assert!(
+                text.contains(&format!(
+                    "Verification run `{cmd}` -- exit 1 (recorded FAIL; the criteria naming it \
+                     state a pass condition other than exit 0 and are not all met: c6 {status};"
+                )),
+                "{cmd} {status}: {text}"
+            );
+            assert!(
+                !text.contains("Advisory red runs"),
+                "{cmd} {status}: {text}"
+            );
+        }
+    }
+}
 
-    let unmet_state = judged_state(
-        &[("c1", "`sh test.sh` passes", "MET"), ("c6", &c6, "UNMET")],
-        exec,
+/// A timeout or a signal exit says nothing about the stated condition, so it
+/// blocks even when the criterion naming the command is met.
+#[test]
+fn a_timed_out_or_signal_killed_red_run_blocks_whatever_its_stated_condition() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("stated-timeout");
+    let mut timed_out = red(TYPE_GREP, -1, "TIMEOUT: no exit within 900s", 2, "");
+    timed_out["baseline"] = json!({"status": "not-run", "exit": null,
+        "note": "the command timed out here, so no comparison applies"});
+    let killed = red(
+        TYPE_GREP,
+        137,
+        "Killed",
+        2,
+        "exit 137 here but 2 on the diff base",
     );
-    let text = report(&dir.0, "stated-unmet", &unmet_state);
-    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
-    assert!(
-        text.contains(&format!(
-            "Verification run `{TYPE_GREP}` -- exit 1 (recorded FAIL; the criteria naming it \
-             state a pass condition other than exit 0 and are not all met: c6 UNMET;"
-        )),
-        "{text}"
-    );
-    assert!(!text.contains("Advisory red runs"), "{text}");
+    for (label, record, outcome, baseline) in [
+        (
+            "timeout",
+            timed_out,
+            "TIMEOUT (exit -1)",
+            "not-run, the command timed out here, so no comparison applies",
+        ),
+        (
+            "signal",
+            killed,
+            "exit 137",
+            "regression, base exit 2, exit 137 here but 2 on the diff base",
+        ),
+    ] {
+        let state = judged_state(
+            &[
+                ("c1", "`sh test.sh` passes", "MET"),
+                ("c6", &format!("`{TYPE_GREP}` prints nothing"), "MET"),
+            ],
+            json!([green("sh test.sh"), record]),
+        );
+        let text = report(&dir.0, label, &state);
+        assert!(
+            text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
+            "{label}: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "1. Verification run `{TYPE_GREP}` \u{2014} {outcome} (recorded FAIL; a red \
+                 declared command that did not already fail on the diff base blocks CONFORMS; \
+                 baseline on the diff base: {baseline})"
+            )),
+            "{label}: {text}"
+        );
+        assert!(!text.contains("Advisory red runs"), "{label}: {text}");
+    }
 }
 
 #[test]
@@ -2049,10 +2135,9 @@ fn two_absence_greps_on_one_file_whose_criteria_are_met_conform() {
 }
 
 /// The parse narrowed the plan's absence criterion to one file, so only the
-/// request names the recorded grep; a wrapper that exits 0 when the grep
-/// finds nothing is held to exit 0 by its criterion.
+/// request names the recorded grep: no criterion verdict covers its red run.
 #[test]
-fn a_red_run_named_only_by_the_request_is_left_to_the_holistic_pass() {
+fn a_red_run_whose_condition_only_the_request_states_blocks() {
     if missing(&["python3"]) {
         return;
     }
@@ -2077,25 +2162,27 @@ fn a_red_run_named_only_by_the_request_is_left_to_the_holistic_pass() {
         "## Plan\n- [ ] No floating point: `{FLOAT_GREP}` prints nothing.\n"
     ));
     let text = report(&dir.0, "request-only", &state);
-    assert!(text.starts_with("ADVERSARIAL_REVIEW: CONFORMS"), "{text}");
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
     assert!(
         text.contains(&format!(
-            "- `{FLOAT_GREP}` -- exit 2 -- its pass condition is stated only in the request, \
-             judged by the holistic pass -- baseline on the diff base: regression"
+            "1. Verification run `{FLOAT_GREP}` -- exit 2 (recorded FAIL; its pass condition is \
+             stated only in the request (\"- [ ] No floating point: `{FLOAT_GREP}` prints \
+             nothing.\") and no acceptance criterion names it; baseline on the diff base: \
+             regression, base exit 2, the failure output differs from the diff base's)"
         )),
         "{text}"
     );
+    assert!(!text.contains("Advisory red runs"), "{text}");
+}
 
-    state["extra_complaints"] = json!([{"kind": "Absence", "location": "lib/b.src",
-        "violation": "the plan's second source file is missing", "fix": "add lib/b.src",
-        "blocking": true}]);
-    let text = report(&dir.0, "request-only-holistic", &state);
-    assert!(
-        text.starts_with("ADVERSARIAL_REVIEW: DIVERGES")
-            && text.contains("1. Absence \u{2014} lib/b.src"),
-        "{text}"
-    );
-
+/// A wrapper that exits 0 when the grep finds nothing is held to exit 0 by
+/// its criterion.
+#[test]
+fn a_red_wrapper_whose_criterion_says_it_exits_0_blocks() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("wrapped-exit-0");
     let wrapped = format!(r#"sh -c "{FLOAT_GREP}; test $? -eq 1""#);
     let state = judged_state(
         &[
@@ -2177,6 +2264,9 @@ fn a_red_run_held_to_exit_0_or_named_nowhere_still_blocks() {
 
 /// Naming a command without stating a condition other than exit 0 holds it
 /// to exit 0, so request prose that merely lists it cannot make it advisory.
+/// Only a backticked span equal to the command names it, only that span's
+/// own clause states its condition, and a naming line that says it passes
+/// wins over one that states another condition.
 #[test]
 fn a_red_run_named_without_a_stated_condition_is_held_to_exit_0() {
     if missing(&["python3"]) {
@@ -2184,22 +2274,58 @@ fn a_red_run_named_without_a_stated_condition_is_held_to_exit_0() {
     }
     let dir = fixture_dir("named-in-passing");
     let note = "the command passed on the diff base";
-    let mut listed = judged_state(
-        &[("c1", "The report lists every item", "MET")],
-        json!([red("sh test.sh", 1, "1 failed", 0, note)]),
-    );
-    listed["initial_prompt"] = json!("Verification commands: `sh test.sh`\n");
-    let reviewed = judged_state(
-        &[
-            ("c1", "The report lists every item", "MET"),
-            ("c2", "`sh lint.sh` output is reviewed", "MET"),
-        ],
-        json!([red("sh lint.sh", 1, "warning", 0, note)]),
-    );
-    for (label, cmd, state) in [
-        ("listed", "sh test.sh", listed),
-        ("reviewed", "sh lint.sh", reviewed),
+    for (label, cmd, c2, request) in [
+        (
+            "listed",
+            "sh test.sh",
+            "The report is sorted",
+            "Verification commands: `sh test.sh`\n",
+        ),
+        (
+            "reviewed",
+            "sh lint.sh",
+            "`sh lint.sh` output is reviewed",
+            "",
+        ),
+        (
+            "if-it-fails",
+            "sh test.sh",
+            "The report is sorted",
+            "Run `sh test.sh`; if it fails, fix the missing case\n",
+        ),
+        (
+            "passes-wins",
+            "grep X f",
+            "`grep X f` prints nothing",
+            "`grep X f` passes\n",
+        ),
+        (
+            "longer-span",
+            "sh test.sh",
+            "`sh test.sh --all | grep X` prints nothing",
+            "",
+        ),
+        (
+            "other-span-clause",
+            "sh a.sh",
+            "`sh a.sh` rebuilds the index, then `sh b.sh` prints nothing",
+            "",
+        ),
+        (
+            "no-warnings",
+            "sh lint.sh",
+            "`sh lint.sh` reports no warnings",
+            "",
+        ),
     ] {
+        let mut state = judged_state(
+            &[
+                ("c1", "The report lists every item", "MET"),
+                ("c2", c2, "MET"),
+            ],
+            json!([red(cmd, 1, "1 failed", 0, note)]),
+        );
+        state["initial_prompt"] = json!(request);
         let text = report(&dir.0, label, &state);
         assert!(
             text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"),
@@ -2466,4 +2592,117 @@ fn only_a_dirty_tree_gets_a_snapshot_worktree() {
         "{dirty}"
     );
     assert_eq!(git(&repo, &["worktree", "list"]).lines().count(), 1);
+}
+
+/// A regenerate-then-diff command that rewrites a stale generated file
+/// changes the tree it ran in, so its red is the change's own, on a dirty
+/// tree and on a committed one alike.
+#[cfg(unix)]
+#[test]
+fn a_command_that_modifies_the_tree_gets_no_tree_state_baseline() {
+    if missing(&["python3", "bash", "git"]) {
+        return;
+    }
+    let regenerate = "sh gen.sh && git diff --exit-code";
+    let dirty_dir = fixture_dir("stale-dirty");
+    let (_, sub, base) = uncommitted_change(&dirty_dir.0);
+    fs::write(sub.join("gen.txt"), "b\n").unwrap();
+    let dirty = script(
+        &dirty_dir.0,
+        "run_checks.py",
+        "stale-dirty",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [regenerate],
+            "diff_base": base,
+        }),
+        &NO_GIT_CONFIG,
+    );
+    assert_eq!(dirty["exec_results"][0]["exit"], 1, "{dirty}");
+    assert_eq!(
+        dirty["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, the declared commands modified \
+                        the tree, candidate tree dirty"}),
+        "{dirty}"
+    );
+    let state = judged_state(
+        &[(
+            "c1",
+            "the generated file is regenerated from its sources",
+            "MET",
+        )],
+        dirty["exec_results"].clone(),
+    );
+    let text = report(&dirty_dir.0, "stale-dirty", &state);
+    assert!(text.starts_with("ADVERSARIAL_REVIEW: DIVERGES"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "1. Verification run `{regenerate}` \u{2014} exit 1 (recorded FAIL; a red declared \
+             command that did not already fail on the diff base blocks CONFORMS; baseline on the \
+             diff base: regression, base exit 0, the command passed on the diff base, the \
+             declared commands modified the tree, candidate tree dirty)"
+        )),
+        "{text}"
+    );
+
+    let clean_dir = fixture_dir("stale-clean");
+    let (repo, sub, base) = uncommitted_change(&clean_dir.0);
+    fs::write(sub.join("gen.txt"), "b\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "stale"]);
+    let (path, log) = logging_git_path(&clean_dir.0);
+    let envs = [("PATH", path.as_str()), NO_GIT_CONFIG[0], NO_GIT_CONFIG[1]];
+    let clean = script(
+        &clean_dir.0,
+        "run_checks.py",
+        "stale-clean",
+        &json!({
+            "project_dir": sub.to_string_lossy(),
+            "verification_commands": [regenerate],
+            "diff_base": base,
+        }),
+        &envs,
+    );
+    assert_eq!(
+        clean["exec_results"][0]["baseline"],
+        json!({"status": "regression", "exit": 0,
+               "note": "the command passed on the diff base, the declared commands modified \
+                        the tree"}),
+        "{clean}"
+    );
+    assert_eq!(
+        (
+            git_calls(&log, "worktree add"),
+            git_calls(&log, "commit-tree")
+        ),
+        (1, 0),
+        "{clean}"
+    );
+}
+
+#[test]
+fn each_run_record_carries_the_pass_condition_its_criteria_state() {
+    if missing(&["python3"]) {
+        return;
+    }
+    let dir = fixture_dir("pass-condition-record");
+    let cmd = "grep -n TODO notes.txt";
+    let line = format!("`{cmd}` prints nothing");
+    let out = script(
+        &dir.0,
+        "run_checks.py",
+        "pass-condition",
+        &json!({
+            "project_dir": dir.0.to_string_lossy(),
+            "verification_commands": [cmd],
+            "criteria": [{"id": "c1", "text": line}],
+        }),
+        &[],
+    );
+    assert_eq!(
+        out["exec_results"][0]["pass_condition"],
+        json!({"condition": "stated", "criteria": ["c1"], "line": line}),
+        "{out}"
+    );
 }
