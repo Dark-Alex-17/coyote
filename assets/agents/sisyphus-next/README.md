@@ -339,8 +339,9 @@ the plan or a criterion itself is impossible or contradictory) offers four optio
 criterion in place, a fix round because the plan is not at fault (the stated fix, else the
 whole finding, goes to the coder), accept the defect unresolved and proceed (a follow-up), or
 stop. Amendments and fix rounds share one count; amending is recommended below
-`STRIKE_LIMIT` (3) and accepting from then on, and Stop is never recommended. A Stop pick whose
-own words say the plan is not defective is asked again. A default amendment (a bare or
+`STRIKE_LIMIT` (3) and accepting from then on, and Stop is never recommended. A navigator's
+Stop pick that carries a note of its own (for any kind) goes to the reply interpreter, which
+reads the note against every option, instead of stopping as picked. A default amendment (a bare or
 headless pick, which states none) takes the adversary's finding; when that finding names a
 backticked command the criteria do not quote whole, it is recorded as a follow-up note
 instead of being applied.

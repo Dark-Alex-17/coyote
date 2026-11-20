@@ -708,9 +708,12 @@ _led = gates.consult_route(base_state(escalation=escalation("design_choice", "Ho
 check("answers: a navigator answer opening with an option's own text picks it and keeps the rest as its note",
       _led["_next"] == "apply_answer"
       and _led["last_answer"] == "Narrow the scope first (say how): proceed with the 4 code files and leave out the notes file")
-_comma = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 2, but keep the logs"))
-check("answers: a navigator 'Option 2, but ...' picks option 2 with the qualification as its note, never re-asked",
-      _comma["_next"] == "apply_answer" and _comma["last_answer"] == "Abort the run: but keep the logs")
+_comma = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 3, but keep the logs"))
+_comma_stop = gates.consult_route(base_state(escalation=r3, consult_result="CONSULT: ANSWER Option 2, but keep the logs"))
+check("answers: a navigator 'Option 3, but ...' picks option 3 with the qualification as its note, never re-asked; "
+      "the same qualification on a stop option is read by the reply interpreter",
+      _comma["_next"] == "apply_answer" and _comma["last_answer"] == "Narrow the scope: but keep the logs"
+      and _comma_stop["_next"] == "interpret_reply" and _comma_stop["last_answer_text"] == "Option 2, but keep the logs")
 _cmp = gates.consult_route(base_state(escalation=pd2, consult_result=(
     "CONSULT: ANSWER 2 \u2014 Continue; the criterion is amended: missing seats or seats < 1 \u2192 400")))
 check("answers: a compared value in a navigator's note ('seats < 1') is not another option number",
@@ -1719,15 +1722,18 @@ _DIRTY_ESC = {"kind": "plan_defect",
 _DIRTY_SUBS = [{"title": f"subtask {i}", "outcome": "o", "acceptance_criteria": ["`make check-generate` exits 0"]}
                for i in (1, 2, 3)]
 _DIRTY_STATE = dict(plan_defect_continues=STRIKE_LIMIT, answer_source="navigator", subtasks=_DIRTY_SUBS, subtask_index=2)
-_STOP_NOT_DEFECTIVE = (f"{_PD_STOP_TEXT}: 1 \u2014 the plan is not defective; check-generate fails only because subtask 2's "
+_STOP_NOT_DEFECTIVE = ("1 \u2014 the plan is not defective; check-generate fails only because subtask 2's "
                        "changes and the probe file are uncommitted (Makefile:29 requires a clean `git status "
                        "--porcelain`). Report it so the owner can commit, fold in or delete the probe test, and re-verify.")
-_a_state, _a = chain(base_state(escalation=_DIRTY_ESC, last_answer=_STOP_NOT_DEFECTIVE, **_DIRTY_STATE), "apply_answer")
-check("apply_answer: a reply picking Stop that says the plan is not defective is asked again, naming the fix option, "
-      "never end_blocked",
-      _a.get("_next") == "ask_dispatch" and _a_state.get("apply_reasks") == 1
-      and any("Not a plan defect: fix round" in d and "asked again" in d for d in _a_state.get("decisions", [])),
-      _a.get("_next"))
+_a = gates.consult_route(base_state(escalation=_DIRTY_ESC, consult_result=f"...\nCONSULT: ANSWER {_STOP_NOT_DEFECTIVE}",
+                                    **_DIRTY_STATE))
+_a_min = gates.consult_route(base_state(escalation=_DIRTY_ESC, **_DIRTY_STATE, consult_result=(
+    "CONSULT: ANSWER 1 \u2014 the plan is not defective; the uncommitted tree fails the clean-tree check")))
+check("consult_route: the navigator's Stop pick carrying its own note goes to the reply interpreter, never to a stop",
+      _a.get("_next") == "interpret_reply" and _a.get("last_answer_text") == _STOP_NOT_DEFECTIVE
+      and _a_min.get("_next") == "interpret_reply" and "fix: " in _a_min.get("reply_accepts", "")
+      and any("picks a stop with a note of its own" in d for d in _a_min.get("decisions", [])),
+      (_a.get("_next"), _a_min.get("_next")))
 _DIRTY_TRI = [{"finding": _DIRTY_FINDING, "action": "escalate", "lane": "adversary", "reason": "plan root cause",
                "kind": "plan_defect"}]
 _dirty_cap = gates.triage_route(base_state(triage=_DIRTY_TRI, **_DIRTY_STATE)).get("escalation", {})
@@ -1751,27 +1757,28 @@ _NAV_READ = ("Not a plan defect (the dirty working tree is the cause). Fix round
 _b_state, _b = chain(base_state(escalation=_dirty_cap, last_answer_text=_NAV_READ, reply_verdict="option",
                                 reply_option=_PD_FIX_TEXT, reply_source="navigator", **_DIRTY_STATE),
                      "interpret_route", "apply_answer", "compose_fix")
-_b_raw = gates.apply_answer(base_state(escalation=_dirty_cap, last_answer=_NAV_RAW, **_DIRTY_STATE))
+_b_raw = gates.consult_route(base_state(escalation=_dirty_cap, consult_result=f"CONSULT: ANSWER {_NAV_RAW}",
+                                        **_DIRTY_STATE))
 check("apply_answer: the navigator's not-a-plan-defect reply has a fix option to pick, which reaches a fix round with "
-      "its words; the raw reply is asked again, never end_blocked",
+      "its words; the raw reply goes to the reply interpreter",
       _PD_FIX_TEXT in [o["text"] for o in _dirty_cap.get("options", [])]
       and _b_state.get("fix_source") == "plan_defect_fix"
       and "delete web/changeplan_probe_test.ext" in _b_state.get("fix_instructions", "")
-      and _b_raw.get("_next") == "ask_dispatch",
+      and _b_raw.get("_next") == "interpret_reply",
       (_b.get("_next"), _b_raw.get("_next")))
 _fix_bare = gates.apply_answer(base_state(escalation=_dirty_cap, last_answer=_PD_FIX_TEXT, **_DIRTY_STATE))
 check("apply_answer: a bare fix pick is counted, and its fix round works the adversary's whole finding",
       _fix_bare.get("_next") == "compose_fix" and _fix_bare.get("fix_note") == _DIRTY_FINDING
       and _fix_bare.get("plan_defect_continues") == STRIKE_LIMIT + 1
       and any("past the cap at the user's pick" in d for d in _fix_bare.get("decisions", [])), _fix_bare)
-check("apply_answer: only a reply saying the plan is not defective turns a Stop into a re-ask",
-      all(gates.apply_answer(base_state(escalation=_DIRTY_ESC, last_answer=t, **_DIRTY_STATE)).get("_next") == "ask_dispatch"
-          for t in ("not a plan defect", "the plan is not defective", "this isn\u2019t a plan defect",
-                    "1: the plan is fine, the tree is dirty", "the criterion isn't defective",
-                    "Stop - the plan is not at fault", "1: the criteria are correct, the tree is dirty"))
-      and all(gates.apply_answer(base_state(escalation=_DIRTY_ESC, last_answer=t, **_DIRTY_STATE)).get("_next") == "end_blocked"
-              for t in ("1", "stop", "Stop; the plan is defective", "1: the plan needs a new criterion",
-                        "1: the plan is the cause")))
+check("consult_route: any navigator Stop pick with a note is interpreted, whatever the note says; a bare Stop pick is taken",
+      all(gates.consult_route(base_state(escalation=_DIRTY_ESC, consult_result=f"CONSULT: ANSWER {t}")).get("_next")
+          == "interpret_reply" for t in ("1 - the plan is defective", "1: the criteria are correct, the tree is dirty",
+                                         "Option 1, stop and report it. The plan is fine."))
+      and all(gates.consult_route(base_state(escalation=_DIRTY_ESC, consult_result=f"CONSULT: ANSWER {t}")).get(
+          "last_answer") == _PD_STOP_TEXT for t in ("1", "Option 1", _PD_STOP_TEXT))
+      and gates.consult_route(base_state(escalation=_DIRTY_ESC, consult_result="CONSULT: ANSWER 2 - drop the check")).get(
+          "_next") == "apply_answer")
 _ROUND_FINDING = ("adversary: DIVERGES -- complaint 1: Verification run `grep -nE 'float32|float64|math\\.Round' "
                   "src/coupon.ext src/discount.ext` \u2014 exit 2 (recorded FAIL; ... baseline on the diff base: "
                   "regression, base exit 2, the failure output differs from the diff base's)")

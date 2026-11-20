@@ -1695,7 +1695,10 @@ def consult_route(state):
             # "Narrow the scope first: only the code files" opens with an option's own text; its note goes with it
             led, note = split_option_led(value, options, True)
             choice = _pick_with_note(value, options) or (f"{led}: {note}" if led and note else led)
-        if choice:
+        # a stop the navigator qualifies in its own words is read, never taken as picked: the words may undo it
+        qualified_stop = bool(choice and options and _is_stop_text(choice)
+                              and _stated_reason(choice, options) != NO_STATED_REASON)
+        if choice and not qualified_stop:
             u.update({"last_answer": choice, "last_answer_text": choice, "navigator_reasks": 0,
                       "answer_source": "navigator"})
             ledger(state, u, f"consult: {kind}: {choice} (navigator)")
@@ -1704,7 +1707,9 @@ def consult_route(state):
         # an answer in the navigator's own words, or one whose later numbers may name other options, is read by the
         # reply interpreter, never handed to the owner blind: unasked, the owner's headless answer would take the
         # recommended option whatever the navigator said
-        why = "may name more than one option" if ambiguous else "names no option by number or text"
+        why = ("may name more than one option" if ambiguous
+               else "picks a stop with a note of its own" if qualified_stop
+               else "names no option by number or text")
         ledger(state, u, f"consult: {kind}: the navigator's answer {why} -> interpret: {value}")
         u.update({"last_answer_text": value, "reply_accepts": _accepts_text(kind), "reply_source": "navigator",
                   "reply_author": "navigator", "reply_interpreted": False, "answer_source": "navigator"})
@@ -2234,15 +2239,6 @@ def _reask_unmatched(state, u, esc, answer, why="", exhausted=None):
 
 _CONTINUE_WORD_RE = re.compile(r"\b(?:continue|treat|amendment|amended|proceed|advance)\b")
 _STOP_WORD_RE = re.compile(r"\b(?:stop|abort|halt|discontinue)")
-# a Stop pick whose own words clear the plan contradicts itself, so it is asked again rather than taken
-_NOT_PLAN_DEFECT_RE = re.compile(r"\b(?:not|isn't)\s+a\s+plan\s+defect\b"
-                                 r"|\b(?:plan|criterion|criteria)\s+(?:is|are|was|were)(?:\s+not|n't)\s+"
-                                 r"(?:defective|at\s+fault|the\s+(?:cause|problem))\b"
-                                 r"|\b(?:plan|criterion|criteria)\s+(?:is|are)\s+(?:fine|correct|sound)\b", re.I)
-
-
-def _says_not_plan_defect(answer):
-    return bool(_NOT_PLAN_DEFECT_RE.search((answer or "").replace("\u2019", "'")))
 
 
 def _plan_criteria(state):
@@ -2519,8 +2515,6 @@ def apply_answer(state):
                              + (", past the cap at the user's pick" if used + 1 > STRIKE_LIMIT else "")
                              + f"): {tail(fix, 300)}")
             u["_next"] = "compose_fix"
-        elif named in (None, PLAN_DEFECT_STOP) and _says_not_plan_defect(answer):
-            _reask_unmatched(state, u, esc, answer, f"says the plan is not defective, which {PLAN_DEFECT_FIX!r} covers")
         elif not leads_stop and not _CONTINUE_WORD_RE.search(said) and not _STOP_WORD_RE.search(said):
             _reask_unmatched(state, u, esc, answer, "says neither stop nor continue")
         elif a == "continue":
