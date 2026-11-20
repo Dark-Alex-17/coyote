@@ -3213,7 +3213,7 @@ def compose_fix(state):
         lines += ["Provide the local-run recipe / fixture the usage probe needs, as the user described:", note]
     elif src == "plan_defect_fix":
         lines += ["The adversary reported the plan as the root cause; the reply ruled the plan is not at fault. Keep "
-                  "every acceptance criterion as written and make this change:", note]
+                  "every acceptance criterion as written and apply this change:", note]
     elif src == "ci":
         lines += ["CI is red on the PR. Fix the failure below (evidence pack verbatim):", state.get("ci_evidence") or ""]
         if (state.get("ci_diagnosis") or "").strip():

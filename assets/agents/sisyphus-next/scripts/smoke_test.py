@@ -1705,7 +1705,7 @@ check("apply_answer: a stated plan_defect amendment is recorded as stated and co
 _PD_STOP_TEXT = "Stop; the plan needs amending (report it)"
 _PD_CONT_TEXT = "Continue; treat the criterion as amended (state the amendment)"
 _PD_FIX_TEXT = "Not a plan defect: fix round (state the fix)"
-_DIRTY_FINDING = ("adversary: DIVERGES -- complaint 1: Verification run `make check-generate` \u2014 exit 2 (recorded FAIL; "
+_DIRTY_FINDING = ("adversary: DIVERGES -- complaint 1: Verification run `./check-tree --generate` \u2014 exit 2 (recorded FAIL; "
                   "a red declared command that did not already fail on the diff base blocks CONFORMS; baseline on the "
                   "diff base: regression, base exit 0, the command passed on the diff base)")
 _DIRTY_ESC = {"kind": "plan_defect",
@@ -1716,7 +1716,7 @@ _DIRTY_ESC = {"kind": "plan_defect",
                            "evidence": "the criterion is amended in place with the stated amendment; 3/3 continues "
                                        "used in this run"}],
               "data": {"multiple_choice": True, "recommended_count": 1}, "evidence": _DIRTY_FINDING}
-_DIRTY_SUBS = [{"title": f"subtask {i}", "outcome": "o", "acceptance_criteria": ["`make check-generate` exits 0"]}
+_DIRTY_SUBS = [{"title": f"subtask {i}", "outcome": "o", "acceptance_criteria": ["`./check-tree --generate` exits 0"]}
                for i in (1, 2, 3)]
 _DIRTY_STATE = dict(plan_defect_continues=STRIKE_LIMIT, answer_source="navigator", subtasks=_DIRTY_SUBS, subtask_index=2)
 _STOP_NOT_DEFECTIVE = ("1 \u2014 the plan is not defective; check-generate fails only because subtask 2's "
@@ -1747,10 +1747,10 @@ _NAV_RAW = ("This isn't a plan defect, and neither option fits. The run shouldn'
             "criterion that's correct. ... **Answer:** Don't stop and don't amend. Go back to a normal fix round: 1. "
             "Move the checks in `web/changeplan_probe_test.ext` that the new test lacks into the downgrade test in "
             "`web/server_test.ext`, then delete the probe file. 2. Commit the subtask 2 changes the same way subtask "
-            "1 was committed. 3. Re-run `./run-tests` and `make check-generate`, and quote both exit codes.")
+            "1 was committed. 3. Re-run `./run-tests` and `./check-tree --generate`, and quote both exit codes.")
 _NAV_READ = ("Not a plan defect (the dirty working tree is the cause). Fix round: move the probe test's checks into "
              "server_test.ext, delete web/changeplan_probe_test.ext, commit the subtask 2 changes as subtask 1 did, "
-             "then re-run ./run-tests and make check-generate and quote both exit codes.")
+             "then re-run ./run-tests and ./check-tree --generate and quote both exit codes.")
 _b_state, _b = chain(base_state(escalation=_dirty_cap, last_answer_text=_NAV_READ, reply_verdict="option",
                                 reply_option=_PD_FIX_TEXT, reply_source="navigator", **_DIRTY_STATE),
                      "interpret_route", "apply_answer", "compose_fix")
@@ -1793,15 +1793,15 @@ check("apply_answer: a default amendment naming a command the criteria do not is
       and any("src/discount.ext" in f and f.startswith("Plan note (a default amendment, not applied")
               for f in _d_state.get("follow_ups", []))
       and "src/discount.ext" not in gates._subtask_spec(_d_state)[0], _d_state["subtasks"][0])
-_known = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `make check-generate` exit 2"),
+_known = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `./check-tree --generate` exit 2"),
                                        last_answer=_PD_CONT_TEXT, subtasks=_DIRTY_SUBS, subtask_index=2))
-_prefix = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `make check` exit 2"),
+_prefix = gates.apply_answer(base_state(escalation=dict(_round_esc, evidence="Verification run `./check-tree --gen` exit 2"),
                                         last_answer=_PD_CONT_TEXT, subtasks=_DIRTY_SUBS, subtask_index=2))
 check("apply_answer: a default amendment naming only commands the criteria quote whole is still applied; a prefix of "
       "a quoted command is a different command",
       _known.get("_next") == "build_gauntlet_prompt" and _known["subtasks"][1].get("amendments")
       and not _known.get("follow_ups")
-      and not _prefix.get("subtasks") and any("`make check`" in f for f in _prefix.get("follow_ups", [])),
+      and not _prefix.get("subtasks") and any("`./check-tree --gen`" in f for f in _prefix.get("follow_ups", [])),
       (_known.get("subtasks"), _prefix.get("follow_ups")))
 _plan_word = [{"finding": "criterion 2 contradicts the plan", "action": "escalate", "lane": "adversary", "reason": "plan root cause"}]
 check("triage_route: an escalated finding naming the plan is plan_defect only when the triage model says so",
